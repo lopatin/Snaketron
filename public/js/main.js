@@ -1,3 +1,4 @@
+(function() {
 window.addEvent('domready', function(){
 	var game = new Snaketron({
 		containerId: "snaketron",
@@ -7,6 +8,7 @@ window.addEvent('domready', function(){
 
 	var socket = io.connect("http://snaketron.com");
 	game.socket = socket;
+	io.sockets = {}; // remove global reference to socket
 
 	socket.on('start-game', function(data){
 		game.snacks = [];
@@ -30,8 +32,8 @@ window.addEvent('domready', function(){
 		if(data && data.score)
 			game.setScore(data.score);
 		if(data)
-		game.setState('menu');
-	})
+			game.setState('menu');
+	});
 
 	socket.on('snack', function(snack){
 		game.addSnack(snack);
@@ -73,14 +75,14 @@ window.addEvent('domready', function(){
 		game.setState('gameover', {draw: true});
 		if(game.iterateTimer)
 			clearInterval(game.iterateTimer);
-	})
+	});
 
 	$(document.body).addEvent('keydown', function(e){
 		if(e.key === 'space')
 			e.stop();
 		if(e.key === 'space' && game.state === 'menu')
 			game.socket.emit('random-opponent', game.username);
-	})
+	});
 	//game.addSnack({x: 30, y: 40, weight: 40});
 
 
@@ -239,7 +241,7 @@ var Snaketron = new Class({
 		var that = this;
 		this.snacks.each(function(snack){
 			if(snack.x === that.mainSnake.points[0].x && snack.y === that.mainSnake.points[0].y){
- 				that.snacks.erase(snack);
+				that.snacks.erase(snack);
 				that.socket.emit('eaten-snack', {
 					gameId: that.gameId,
 					partnerId: that.partnerId,
@@ -582,7 +584,7 @@ var Snack = new Class({
 });
 
 
-FocusTracker = {
+var FocusTracker = {
     startFocusTracking: function() {
        this.store('hasFocus', false);
        this.addEvent('focus', function() { this.store('hasFocus', true); });
@@ -600,3 +602,4 @@ function roundNumber(num, dec) {
 }
 
 Element.implement(FocusTracker);
+})();
