@@ -1,9 +1,12 @@
 use common::*;
 use wasm_bindgen::prelude::*;
 
-
 #[wasm_bindgen]
 pub fn render(game: Game, canvas: web_sys::HtmlCanvasElement) {
+
+    // log to console
+    web_sys::console::log_1(&JsValue::from_str("Rendering game"));
+
     let context = canvas
         .get_context("2d")
         .expect("Failed to get 2d context")
@@ -28,5 +31,8 @@ pub fn render(game: Game, canvas: web_sys::HtmlCanvasElement) {
             );
         }
     }
+
+
+    web_sys::console::log_1(&JsValue::from_str("Renderd game??"));
 
 }

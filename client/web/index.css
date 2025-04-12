@@ -1,0 +1,24 @@
+/* Base styles */
+body {
+    margin: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.game-container {
+    text-align: center;
+    background-color: #ffffff;
+    padding: 20px;
+    max-width: 95%; /* Responsive width */
+    width: 450px; /* Increased max width for larger screens */
+    box-sizing: border-box;
+}
+
+#gameCanvas {
+    display: block;
+    margin: 0 auto;
+    max-width: 100%;
+    height: auto;
+    /*box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.05); !* Very subtle shadow *!*/
+}

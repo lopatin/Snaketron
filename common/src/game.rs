@@ -9,6 +9,7 @@ pub struct Game {
 
 #[wasm_bindgen]
 impl Game {
+    #[wasm_bindgen]
     pub fn new(width: u16, height: u16) -> Self {
         Game { width, height }
     }
