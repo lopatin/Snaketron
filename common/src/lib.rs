@@ -1,6 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
+mod snake;
+mod arena;
+mod game;
+
+pub use snake::*;
+pub use arena::*;
+pub use game::*;
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServerTimestamp(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClientTimestamp(u64);
+
+
+pub fn add(left: u32, right: u32) -> u32 {
     left + right
 }
+
 
 #[cfg(test)]
 mod tests {

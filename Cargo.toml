@@ -1,6 +1,6 @@
 [workspace]
 members = [
     "common",
-    "snaketron-server",
-    "snaketron-client"
+    "server",
+    "client"
 ]
