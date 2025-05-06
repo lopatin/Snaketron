@@ -10,6 +10,14 @@ module.exports = {
   module: {
     rules: [
       {
+        test: /\.(js|jsx)$/, // Target both .js and .jsx files
+        exclude: /node_modules/, // IMPORTANT: Don't run babel on node_modules
+        use: {
+          loader: 'babel-loader'
+          // Babel options are read from babel.config.js by default
+        }
+      },
+      {
         test: /\.css$/i, // Regex to match .css files
         use: [
           'style-loader', // 2. Injects styles into DOM (adds <style> tags)

@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13.3
+    container_name: snaketron-postgres-test
+    platform: linux/arm64
+    environment:
+      POSTGRES_USER: snaketron
+      POSTGRES_PASSWORD: snaketron
+      POSTGRES_DB: snaketron
+    ports:
+      - "5432:5432"
+    restart: no
