@@ -1,6 +1,8 @@
-mod server;
+mod ws_server;
 mod broker;
 mod matchmaking;
+mod grpc_server;
+mod games_manager;
 
 use std::env;
 use common::*;
@@ -13,7 +15,7 @@ use sqlx::PgPool;
 use refinery::config::{Config, ConfigDbType};
 use tokio::sync::{mpsc, oneshot, watch, broadcast};
 use tokio_util::sync::CancellationToken;
-use server::*;
+use ws_server::*;
 
 mod migrations {
     use refinery::embed_migrations;

@@ -7,13 +7,31 @@ use chrono::{DateTime, Utc};
 use std::time::Duration;
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream, StreamExt};
-use tokio::sync::{broadcast, oneshot};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, oneshot, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
+use common::{GameCommand, Direction, GameEventMessage};
+use crate::games_manager::GamesManager;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WSMessage {
+    Token(String),
+    JoinGame(u32),
+    GameCommand(GameCommand),
+    Chat(String),
+    Shutdown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserToken {
+    pub user_id: i32,
+}
+
 
 pub async fn run_websocket_server(
     addr: &str,
@@ -72,7 +90,9 @@ pub async fn run_websocket_server(
     Ok(())
 }
 
+
 async fn handle_websocket_connection(
+    games_manager: GamesManager,
     stream: TcpStream,
     cancellation_token: CancellationToken
 ) -> Result<()> {
@@ -83,17 +103,41 @@ async fn handle_websocket_connection(
         .await
         .expect("Failed to accept WebSocket connection");
 
+    let mut game_command_tx: Option<broadcast::Sender<GameCommand>> = None;
+    let mut game_event_rx: Option<broadcast::Receiver<GameEventMessage>> = None;
+
+    let drop_channels = || {
+        if let Some(tx) = game_command_tx.take() {
+            info!("Dropping game command sender");
+            drop(tx);
+        }
+        if let Some(rx) = game_event_rx.take() {
+            info!("Dropping game event receiver");
+            drop(rx);
+        }
+    };
+
     let mut timeout_future: Option<Pin<Box<Sleep>>> = None;
+    let mut user_token: Option<UserToken> = None;
+    let mut game_id: Option<u32> = None;
 
     loop {
         tokio::select! {
             biased;
+
+            // The client hasn't closed the connection after being asked to do so. Force close it.
+            _ = async { timeout_future.as_mut().unwrap().await } , if timeout_future.is_some() => {
+                warn!("Timeout reached, closing connection");
+                break;
+            }
+
             _ = cancellation_token.cancelled() => {
                 // Send a Shutdown message to the client so that it can close this
                 // connection and gracefully rotate to a new one.
                 info!("Sending shutdown message to client");
-                let json_msg = serde_json::json!({"type": "shutdown"});
-                if let Err(e) = ws_stream.send(Message::Text(Utf8Bytes::from(json_msg.to_string()))).await {
+                let json_msg = serde_json::json!(WSMessage::Shutdown);
+                let shutdown_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
+                if let Err(e) = ws_stream.send(shutdown_msg).await {
                     error!("Failed to send shutdown message: {}", e);
                 }
 
@@ -104,8 +148,53 @@ async fn handle_websocket_connection(
             message = ws_stream.next() => {
                 match message {
                     Some(Ok(msg)) => {
-                        info!("Received message: {:?}", msg);
-                        // Handle the message (e.g., process it, send a response, etc.)
+                        let ws_message: WSMessage = serde_json::from_str(msg.to_text()?)?;
+                        match ws_message {
+                            WSMessage::Token(jwt_token) => {
+                                info!("Received jwt token: {}", jwt_token);
+                                match verify_jwt_token(jwt_token) {
+                                    Ok(ut) => {
+                                        info!("Token verified successfully");
+                                        user_token = Some(ut);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to verify token: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            _ if user_token.is_none() => {
+                                warn!("User token not set. Cannot process message.");
+                                continue;
+                            }
+                            WSMessage::JoinGame(id) => {
+                                info!("Joining game ID: {}", id);
+
+                                drop_channels();
+
+                                let (tx, rx) = games_manager.join_game(id).await?;
+                                game_command_tx = Some(tx);
+                                game_event_rx = Some(rx);
+                                game_id = Some(id);
+                            }
+                            WSMessage::GameCommand(command) => {
+                                info!("Received command: {:?}", command);
+
+                                if let Some(tx)  = game_command_tx.as_ref() {
+                                    tx.send(command)
+                                        .context("Failed to send game command")
+                                        .await?;
+                                } else {
+                                    warn!("Game command sender not initialized");
+                                }
+                            }
+                            WSMessage::Chat(chat_message) => {
+                                info!("Received chat message: {}", chat_message);
+                            }
+                            _ => {
+                                warn!("Unexpected message type: {:?}", ws_message);
+                            }
+                        }
                     }
                     Some(Err(e)) => {
                         error!("Error receiving message: {}", e);
@@ -118,16 +207,37 @@ async fn handle_websocket_connection(
                 }
             }
 
-            // The client hasn't closed the connection after being asked to do so. Force close it.
-            _ = async { timeout_future.as_mut().unwrap().await } , if timeout_future.is_some() => {
-                warn!("Timeout reached, closing connection");
-                break;
+            // Handle game events
+            game_event = game_event_rx.as_ref().unwrap().recv(), if game_event_rx.is_some() => {
+                match game_event {
+                    Ok(event) => {
+                        info!("Received game event: {:?}", event);
+                        let json_msg = serde_json::json!(event);
+                        let game_event_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
+                        if let Err(e) = ws_stream.send(game_event_msg).await {
+                            error!("Failed to send game event message: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving game event: {}", e);
+                        break;
+                    }
+                }
             }
+
         }
     }
 
     let _ = ws_stream.close(None).await;
+    drop_channels();
     Ok(())
+}
+
+fn verify_jwt_token(token: String) -> Result<UserToken> {
+    // TODO: Implement JWT verification logic
+    // Ok(UserToken { user_id: 0 })
+    Err(anyhow::anyhow!("JWT verification not implemented"))
 }
 
 pub async fn register_server(pool: &PgPool, region: &str) -> Result<i32> {

@@ -1,10 +1,13 @@
 mod snake;
 mod arena;
-mod game;
+mod game_state;
+mod game_engine;
+mod util;
 
 pub use snake::*;
 pub use arena::*;
-pub use game::*;
+pub use game_state::*;
+pub use game_engine::*;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
