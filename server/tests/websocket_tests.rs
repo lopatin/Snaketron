@@ -66,10 +66,10 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         
         info!("Test server built at {}", server.addr);
         
-        // Create a game
-        const TEST_GAME_ID: u32 = 123;
-        server.create_game(TEST_GAME_ID).await?;
-        info!("Game {} created", TEST_GAME_ID);
+        // Create a game with unique ID to avoid conflicts when tests run in parallel
+        let test_game_id = (rand::random::<u16>() as u32) + 400000;
+        server.create_game(test_game_id).await?;
+        info!("Game {} created", test_game_id);
         
         // Give the game loop time to start
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -83,7 +83,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         info!("Client authenticated");
         
         // Join the game
-        client.join_game(TEST_GAME_ID).await?;
+        client.join_game(test_game_id).await?;
         info!("Join game message sent");
         
         // Receive the snapshot event
@@ -97,7 +97,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
                 // Verify the game state has expected properties
                 assert_eq!(game_state.arena.width, 10);
                 assert_eq!(game_state.arena.height, 10);
-                assert_eq!(event.game_id, TEST_GAME_ID);
+                assert_eq!(event.game_id, test_game_id);
                 info!("Snapshot verified successfully");
             }
             _ => {

@@ -54,8 +54,8 @@ async fn test_cross_server_game_relay() -> Result<()> {
     .execute(&db_pool)
     .await?;
     
-    // Create game record
-    let game_id = 12345;
+    // Create game record with unique ID to avoid conflicts when tests run in parallel
+    let game_id = (rand::random::<u16>() as u32) + 100000; // Ensure it's a reasonable game ID
     sqlx::query(
         "INSERT INTO games (id, status) VALUES ($1, $2)")
     .bind(game_id as i32)
@@ -199,8 +199,8 @@ async fn test_multi_client_cross_server() -> Result<()> {
         .await?;
     }
     
-    // Create game
-    let game_id = 54321;
+    // Create game with unique ID to avoid conflicts when tests run in parallel
+    let game_id = (rand::random::<u16>() as u32) + 200000;
     sqlx::query(
         "INSERT INTO games (id, status) VALUES ($1, $2)")
     .bind(game_id as i32)
@@ -333,8 +333,8 @@ async fn test_game_server_failover() -> Result<()> {
         .await?;
     }
     
-    // Create game on server A
-    let game_id = 99999;
+    // Create game on server A with unique ID to avoid conflicts
+    let game_id = (rand::random::<u16>() as u32) + 300000;
     sqlx::query(
         "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
     .bind(game_id as i32)

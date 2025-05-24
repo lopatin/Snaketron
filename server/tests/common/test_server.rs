@@ -14,6 +14,60 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+/// Test context that ensures proper cleanup of test data
+pub struct TestContext {
+    pub db_pool: PgPool,
+    pub server_ids: Vec<Uuid>,
+    pub game_ids: Vec<u32>,
+}
+
+impl TestContext {
+    pub async fn new() -> Result<Self> {
+        let db_pool = TestServerBuilder::create_test_db().await?;
+        Ok(Self {
+            db_pool,
+            server_ids: Vec::new(),
+            game_ids: Vec::new(),
+        })
+    }
+    
+    pub fn track_server(&mut self, server_id: Uuid) {
+        self.server_ids.push(server_id);
+    }
+    
+    pub fn track_game(&mut self, game_id: u32) {
+        self.game_ids.push(game_id);
+    }
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        // Clean up test data when the context is dropped
+        let pool = self.db_pool.clone();
+        let server_ids = self.server_ids.clone();
+        let game_ids = self.game_ids.clone();
+        
+        // Spawn a task to clean up since Drop is sync
+        tokio::spawn(async move {
+            // Clean up games first (due to foreign key constraints)
+            for game_id in game_ids {
+                let _ = sqlx::query("DELETE FROM games WHERE id = $1")
+                    .bind(game_id as i32)
+                    .execute(&pool)
+                    .await;
+            }
+            
+            // Then clean up servers
+            for server_id in server_ids {
+                let _ = sqlx::query("DELETE FROM servers WHERE id = $1")
+                    .bind(server_id)
+                    .execute(&pool)
+                    .await;
+            }
+        });
+    }
+}
+
 /// Test server builder for configuring test scenarios
 pub struct TestServerBuilder {
     port: u16,
@@ -81,10 +135,6 @@ impl TestServerBuilder {
             .set_db_name("snaketron");
         
         migrations::migrations::runner().run_async(&mut config).await?;
-        
-        // Clean up test data
-        sqlx::query("DELETE FROM games").execute(&pool).await?;
-        sqlx::query("DELETE FROM servers").execute(&pool).await?;
         
         Ok(pool)
     }

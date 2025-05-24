@@ -44,3 +44,4 @@ tonic-build = "0.12.3"
 
 [dev-dependencies]
 jsonwebtoken = "9.3"
+rand = "0.8"

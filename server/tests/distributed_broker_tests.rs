@@ -31,8 +31,8 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     // Create broker
     let broker = DistributedBroker::new(db_pool.clone(), server_id.clone());
     
-    // Create a game
-    let game_id = 123;
+    // Create a game with unique ID to avoid conflicts
+    let game_id = (rand::random::<u16>() as u32) + 500000;
     sqlx::query("INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
         .bind(game_id as i32)
         .bind("active")
@@ -97,8 +97,8 @@ async fn test_distributed_broker_remote_game_lookup() -> Result<()> {
         .await?;
     }
     
-    // Create game on remote server
-    let game_id = 456;
+    // Create game on remote server with unique ID
+    let game_id = (rand::random::<u16>() as u32) + 600000;
     sqlx::query(
         "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
     .bind(game_id as i32)
@@ -144,8 +144,8 @@ async fn test_distributed_broker_caching() -> Result<()> {
     .execute(&db_pool)
     .await?;
     
-    // Create game
-    let game_id = 789;
+    // Create game with unique ID
+    let game_id = (rand::random::<u16>() as u32) + 700000;
     sqlx::query(
         "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
     .bind(game_id as i32)
@@ -188,12 +188,13 @@ async fn test_multiple_games_on_different_servers() -> Result<()> {
         .await?;
     }
     
-    // Create games on different servers
+    // Create games on different servers with unique IDs
+    let base_id = (rand::random::<u16>() as u32) * 1000 + 800000;
     let games = vec![
-        (101, server1_id.clone()),
-        (102, server1_id.clone()),
-        (201, server2_id.clone()),
-        (202, server2_id.clone()),
+        (base_id + 1, server1_id.clone()),
+        (base_id + 2, server1_id.clone()),
+        (base_id + 3, server2_id.clone()),
+        (base_id + 4, server2_id.clone()),
     ];
     
     for (game_id, server_id) in &games {
@@ -211,16 +212,16 @@ async fn test_multiple_games_on_different_servers() -> Result<()> {
     let broker2 = DistributedBroker::new(db_pool.clone(), server2_id.clone());
     
     // Verify game locations from broker1's perspective
-    assert!(broker1.is_game_local(101).await?);
-    assert!(broker1.is_game_local(102).await?);
-    assert!(!broker1.is_game_local(201).await?);
-    assert!(!broker1.is_game_local(202).await?);
+    assert!(broker1.is_game_local(games[0].0).await?);
+    assert!(broker1.is_game_local(games[1].0).await?);
+    assert!(!broker1.is_game_local(games[2].0).await?);
+    assert!(!broker1.is_game_local(games[3].0).await?);
     
     // Verify game locations from broker2's perspective  
-    assert!(!broker2.is_game_local(101).await?);
-    assert!(!broker2.is_game_local(102).await?);
-    assert!(broker2.is_game_local(201).await?);
-    assert!(broker2.is_game_local(202).await?);
+    assert!(!broker2.is_game_local(games[0].0).await?);
+    assert!(!broker2.is_game_local(games[1].0).await?);
+    assert!(broker2.is_game_local(games[2].0).await?);
+    assert!(broker2.is_game_local(games[3].0).await?);
     
     Ok(())
 }
