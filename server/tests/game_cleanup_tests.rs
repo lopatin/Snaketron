@@ -11,6 +11,9 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
     let env = TestEnvironment::new(1).await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
+    // Create test users in the database
+    env.create_test_users(2).await?;
+    
     // Create a game with two players
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
@@ -56,6 +59,9 @@ async fn test_cleanup_finished_game() -> Result<()> {
     let env = TestEnvironment::new(1).await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
+    // Create test users in the database
+    env.create_test_users(2).await?;
+    
     // Create a game
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
@@ -99,6 +105,9 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
     let env = TestEnvironment::new(1).await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
+    // Create test users in the database
+    env.create_test_users(2).await?;
+    
     // Create clients that queue but never get matched
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
@@ -133,6 +142,9 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
 async fn test_multiple_games_cleanup() -> Result<()> {
     let env = TestEnvironment::new(1).await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Create test users in the database
+    env.create_test_users(6).await?;
     
     // Create multiple games concurrently
     let mut game_ids = Vec::new();
