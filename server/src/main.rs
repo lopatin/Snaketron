@@ -1,8 +1,3 @@
-mod ws_server;
-mod matchmaking;
-mod grpc_server;
-mod games_manager;
-
 use std::env;
 use common::*;
 use chrono::{DateTime, Utc};
@@ -15,8 +10,8 @@ use refinery::config::{Config, ConfigDbType};
 use tokio::sync::{mpsc, oneshot, watch, broadcast, Mutex};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use ws_server::*;
-use crate::games_manager::GamesManager;
+use server::ws_server::*;
+use server::games_manager::GamesManager;
 
 mod migrations {
     use refinery::embed_migrations;

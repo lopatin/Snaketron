@@ -3,6 +3,14 @@ name = "server"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
 [dependencies]
 common = { path = "../common" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -28,6 +36,10 @@ tonic = "0.12.3"
 tokio-stream = "0.1.17"
 prost = "0.13.5"
 async-trait = "0.1"
+jsonwebtoken = "9.3"
 
 [build-dependencies]
 tonic-build = "0.12.3"
+
+[dev-dependencies]
+jsonwebtoken = "9.3"
