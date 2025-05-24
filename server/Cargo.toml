@@ -27,6 +27,7 @@ gethostname = "1"
 tonic = "0.12.3"
 tokio-stream = "0.1.17"
 prost = "0.13.5"
+async-trait = "0.1"
 
 [build-dependencies]
 tonic-build = "0.12.3"

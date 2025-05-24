@@ -26,11 +26,29 @@ pub enum WSMessage {
     GameCommand(GameCommand),
     Chat(String),
     Shutdown,
+    Ping,
+    Pong,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserToken {
     pub user_id: i32,
+}
+
+// JWT verification trait for dependency injection
+#[async_trait::async_trait]
+pub trait JwtVerifier: Send + Sync {
+    async fn verify(&self, token: &str) -> Result<UserToken>;
+}
+
+// Default implementation that always fails
+pub struct DefaultJwtVerifier;
+
+#[async_trait::async_trait]
+impl JwtVerifier for DefaultJwtVerifier {
+    async fn verify(&self, _token: &str) -> Result<UserToken> {
+        Err(anyhow::anyhow!("JWT verification not implemented"))
+    }
 }
 
 // Connection state machine
@@ -57,14 +75,40 @@ enum ConnectionState {
     },
 }
 
+impl ConnectionState {
+    // Extract game channels if in game state
+    fn take_game_channels(&mut self) -> Option<(broadcast::Sender<GameCommandMessage>, broadcast::Receiver<GameEventMessage>)> {
+        match std::mem::replace(self, ConnectionState::Unauthenticated) {
+            ConnectionState::InGame { user_token, command_tx, event_rx, .. } => {
+                *self = ConnectionState::Authenticated { user_token };
+                Some((command_tx, event_rx))
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
 
 pub async fn run_websocket_server(
     addr: &str,
     games_manager: Arc<Mutex<GamesManager>>,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
+    jwt_verifier: Arc<dyn JwtVerifier>
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
+    run_websocket_server_with_listener(listener, games_manager, cancellation_token, jwt_verifier).await
+}
+
+pub async fn run_websocket_server_with_listener(
+    listener: TcpListener,
+    games_manager: Arc<Mutex<GamesManager>>,
+    cancellation_token: CancellationToken,
+    jwt_verifier: Arc<dyn JwtVerifier>
+) -> Result<()> {
 
     let mut connection_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
 
@@ -83,7 +127,8 @@ pub async fn run_websocket_server(
                         info!("Accepted connection from: {}", peer_addr);
                         let connection_token = cancellation_token.child_token();
                         let games_manager_clone = games_manager.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, stream, connection_token));
+                        let jwt_verifier_clone = jwt_verifier.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, stream, connection_token, jwt_verifier_clone));
                         connection_handles.push(handle);
                     }
 
@@ -121,7 +166,8 @@ pub async fn run_websocket_server(
 async fn handle_websocket_connection(
     games_manager: Arc<Mutex<GamesManager>>,
     stream: TcpStream,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
+    jwt_verifier: Arc<dyn JwtVerifier>
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
@@ -149,7 +195,7 @@ async fn handle_websocket_connection(
             }
 
             // Handle cancellation token
-            _ = cancellation_token.cancelled() => {
+            _ = cancellation_token.cancelled(), if !shutdown_started => {
                 // Send a Shutdown message to the client
                 info!("Sending shutdown message to client");
                 let json_msg = serde_json::json!(WSMessage::Shutdown);
@@ -172,15 +218,36 @@ async fn handle_websocket_connection(
             message = ws_stream.next() => {
                 match message {
                     Some(Ok(msg)) => {
-                        let ws_message: WSMessage = serde_json::from_str(msg.to_text()?)?;
+                        // Check if it's a close message
+                        if msg.is_close() {
+                            info!("Received close message from client");
+                            break;
+                        }
+                        
+                        // Try to parse as text message
+                        let text = match msg.to_text() {
+                            Ok(text) => text,
+                            Err(_) => {
+                                // Not a text message, ignore
+                                continue;
+                            }
+                        };
+                        
+                        let ws_message: WSMessage = match serde_json::from_str(text) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                error!("Failed to parse WebSocket message: {}", e);
+                                continue;
+                            }
+                        };
                         
                         // Process message based on current state
-                        state = match state {
+                        state = match std::mem::replace(&mut state, ConnectionState::Unauthenticated) {
                             ConnectionState::Unauthenticated => {
                                 match ws_message {
                                     WSMessage::Token(jwt_token) => {
                                         info!("Received jwt token: {}", jwt_token);
-                                        match verify_jwt_token(jwt_token) {
+                                        match jwt_verifier.verify(&jwt_token).await {
                                             Ok(user_token) => {
                                                 info!("Token verified successfully");
                                                 ConnectionState::Authenticated { user_token }
@@ -190,6 +257,15 @@ async fn handle_websocket_connection(
                                                 break;
                                             }
                                         }
+                                    }
+                                    WSMessage::Ping => {
+                                        // Respond with Pong even in unauthenticated state
+                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                                        if let Err(e) = ws_stream.send(pong_msg).await {
+                                            error!("Failed to send pong: {}", e);
+                                            break;
+                                        }
+                                        ConnectionState::Unauthenticated
                                     }
                                     _ => {
                                         warn!("Cannot process message in unauthenticated state");
@@ -216,6 +292,15 @@ async fn handle_websocket_connection(
                                                 ConnectionState::Authenticated { user_token }
                                             }
                                         }
+                                    }
+                                    WSMessage::Ping => {
+                                        // Respond with Pong
+                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                                        if let Err(e) = ws_stream.send(pong_msg).await {
+                                            error!("Failed to send pong: {}", e);
+                                            break;
+                                        }
+                                        ConnectionState::Authenticated { user_token }
                                     }
                                     _ => {
                                         warn!("Unexpected message in authenticated state: {:?}", ws_message);
@@ -264,6 +349,15 @@ async fn handle_websocket_connection(
                                                 ConnectionState::Authenticated { user_token }
                                             }
                                         }
+                                    }
+                                    WSMessage::Ping => {
+                                        // Respond with Pong
+                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                                        if let Err(e) = ws_stream.send(pong_msg).await {
+                                            error!("Failed to send pong: {}", e);
+                                            break;
+                                        }
+                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
                                     }
                                     _ => {
                                         warn!("Unexpected message in game state: {:?}", ws_message);
@@ -322,7 +416,7 @@ async fn handle_websocket_connection(
     let _ = ws_stream.close(None).await;
     
     // Drop any active game channels
-    if let ConnectionState::InGame { command_tx, event_rx, .. } = state {
+    if let Some((command_tx, event_rx)) = state.take_game_channels() {
         info!("Dropping game channels on disconnect");
         drop(command_tx);
         drop(event_rx);
@@ -331,11 +425,6 @@ async fn handle_websocket_connection(
     Ok(())
 }
 
-fn verify_jwt_token(token: String) -> Result<UserToken> {
-    // TODO: Implement JWT verification logic
-    // Ok(UserToken { user_id: 0 })
-    Err(anyhow::anyhow!("JWT verification not implemented"))
-}
 
 pub async fn register_server(pool: &PgPool, region: &str) -> Result<i32> {
     info!("Registering server instance");
@@ -405,5 +494,291 @@ pub async fn run_heartbeat_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub mod test_utils {
+    use super::*;
+    use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+    use tokio::net::TcpStream as TokioTcpStream;
+    use std::collections::HashMap;
+    use tokio::task::JoinHandle;
+    
+    /// Mock JWT verifier for testing
+    pub struct MockJwtVerifier {
+        expected_tokens: HashMap<String, UserToken>,
+    }
+    
+    impl MockJwtVerifier {
+        pub fn new() -> Self {
+            Self {
+                expected_tokens: HashMap::new(),
+            }
+        }
+        
+        pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+            self.expected_tokens.insert(token.to_string(), UserToken { user_id });
+            self
+        }
+        
+        /// Creates a mock verifier that accepts any token
+        pub fn accept_any() -> Self {
+            Self {
+                expected_tokens: HashMap::new(),
+            }
+        }
+    }
+    
+    #[async_trait::async_trait]
+    impl JwtVerifier for MockJwtVerifier {
+        async fn verify(&self, token: &str) -> Result<UserToken> {
+            if self.expected_tokens.is_empty() {
+                // Accept any token mode
+                Ok(UserToken { user_id: 1 })
+            } else if let Some(user_token) = self.expected_tokens.get(token) {
+                Ok(user_token.clone())
+            } else {
+                Err(anyhow::anyhow!("Invalid token"))
+            }
+        }
+    }
+    
+    /// Test server builder for configuring test scenarios
+    pub struct TestServerBuilder {
+        port: u16,
+        jwt_verifier: Option<Arc<dyn JwtVerifier>>,
+    }
+    
+    impl TestServerBuilder {
+        pub fn new() -> Self {
+            Self {
+                port: 0, // 0 means random available port
+                jwt_verifier: None,
+            }
+        }
+        
+        pub fn with_port(mut self, port: u16) -> Self {
+            self.port = port;
+            self
+        }
+        
+        pub fn with_mock_auth(mut self) -> Self {
+            self.jwt_verifier = Some(Arc::new(MockJwtVerifier::accept_any()));
+            self
+        }
+        
+        pub fn with_jwt_verifier(mut self, verifier: Arc<dyn JwtVerifier>) -> Self {
+            self.jwt_verifier = Some(verifier);
+            self
+        }
+        
+        pub async fn build(self) -> Result<TestServer> {
+            let addr = format!("127.0.0.1:{}", self.port);
+            let listener = TcpListener::bind(&addr).await?;
+            let actual_addr = listener.local_addr()?;
+            
+            let games_manager = Arc::new(Mutex::new(GamesManager::new()));
+            let cancellation_token = CancellationToken::new();
+            let jwt_verifier = self.jwt_verifier.unwrap_or_else(|| Arc::new(DefaultJwtVerifier));
+            
+            let games_manager_clone = games_manager.clone();
+            let cancellation_token_clone = cancellation_token.clone();
+            
+            // Spawn the server in a separate task
+            let server_handle = tokio::spawn(async move {
+                run_websocket_server_with_listener(
+                    listener,
+                    games_manager_clone,
+                    cancellation_token_clone,
+                    jwt_verifier,
+                ).await
+            });
+            
+            // Give the server a moment to start
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            let ws_addr = format!("ws://{}", actual_addr);
+            info!("Test server started at {}", ws_addr);
+            
+            Ok(TestServer {
+                addr: ws_addr,
+                games_manager,
+                cancellation_token,
+                server_handle,
+            })
+        }
+    }
+    
+    /// Represents a running test server
+    pub struct TestServer {
+        pub addr: String,
+        pub games_manager: Arc<Mutex<GamesManager>>,
+        cancellation_token: CancellationToken,
+        server_handle: JoinHandle<Result<()>>,
+    }
+    
+    impl TestServer {
+        pub async fn connect_client(&self) -> Result<TestClient> {
+            let (ws_stream, _) = connect_async(&self.addr).await?;
+            Ok(TestClient {
+                ws: ws_stream,
+                user_id: None,
+            })
+        }
+        
+        pub async fn shutdown(self) -> Result<()> {
+            self.cancellation_token.cancel();
+            self.server_handle.await??;
+            Ok(())
+        }
+    }
+    
+    /// Test client wrapper for easier testing
+    pub struct TestClient {
+        ws: WebSocketStream<MaybeTlsStream<TokioTcpStream>>,
+        pub user_id: Option<i32>,
+    }
+    
+    impl TestClient {
+        pub async fn authenticate(&mut self, token: &str) -> Result<()> {
+            self.send_message(WSMessage::Token(token.to_string())).await?;
+            // In a real test, we'd wait for a response or check connection state
+            self.user_id = Some(1); // Mock user ID
+            Ok(())
+        }
+        
+        pub async fn send_ping(&mut self) -> Result<()> {
+            self.send_message(WSMessage::Ping).await
+        }
+        
+        pub async fn expect_pong(&mut self) -> Result<()> {
+            let msg = self.receive_message().await?;
+            match msg {
+                WSMessage::Pong => Ok(()),
+                _ => Err(anyhow::anyhow!("Expected Pong, got {:?}", msg)),
+            }
+        }
+        
+        pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+            self.send_message(WSMessage::JoinGame(game_id)).await
+        }
+        
+        pub async fn send_message(&mut self, msg: WSMessage) -> Result<()> {
+            let json = serde_json::to_string(&msg)?;
+            self.ws.send(Message::Text(json.into())).await?;
+            Ok(())
+        }
+        
+        pub async fn receive_message(&mut self) -> Result<WSMessage> {
+            let timeout = tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await;
+            match timeout {
+                Ok(Some(msg)) => {
+                    match msg? {
+                        Message::Text(text) => {
+                            Ok(serde_json::from_str(&text)?)
+                        }
+                        _ => Err(anyhow::anyhow!("Unexpected message type")),
+                    }
+                }
+                Ok(None) => Err(anyhow::anyhow!("Connection closed")),
+                Err(_) => Err(anyhow::anyhow!("Timeout waiting for message")),
+            }
+        }
+        
+        pub async fn disconnect(mut self) -> Result<()> {
+            self.ws.close(None).await?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_utils::*;
+    
+    #[tokio::test]
+    async fn test_simple_connection() -> Result<()> {
+        // Initialize tracing for tests
+        let _ = tracing_subscriber::fmt::try_init();
+        
+        // Test just starting and stopping a server
+        tokio::time::timeout(Duration::from_secs(5), async {
+            info!("Creating test server");
+            
+            let games_manager = Arc::new(Mutex::new(GamesManager::new()));
+            let cancellation_token = CancellationToken::new();
+            let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
+            
+            let cancellation_token_clone = cancellation_token.clone();
+            let server_handle = tokio::spawn(async move {
+                run_websocket_server(
+                    "127.0.0.1:8888",
+                    games_manager,
+                    cancellation_token_clone,
+                    jwt_verifier,
+                ).await
+            });
+            
+            // Give server time to start
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            info!("Server started, shutting down");
+            
+            // Shutdown
+            cancellation_token.cancel();
+            
+            // Wait for server to finish
+            let result = server_handle.await?;
+            info!("Server shutdown result: {:?}", result);
+            
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out"))?
+    }
+    
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ping_pong() -> Result<()> {
+        // Wrap the entire test in a timeout
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // Initialize tracing for tests
+            let _ = tracing_subscriber::fmt::try_init();
+            
+            info!("Starting ping/pong test");
+            
+            // Create and start test server
+            let server = TestServerBuilder::new()
+                .with_port(0)  // Random available port
+                .with_mock_auth()  // Accept any token
+                .build()
+                .await?;
+            
+            info!("Test server built, connecting client to {}", server.addr);
+            
+            // Connect a client
+            let mut client = server.connect_client().await?;
+            
+            info!("Client connected, sending ping");
+            
+            // Send ping
+            client.send_ping().await?;
+            
+            info!("Ping sent, expecting pong");
+            
+            // Expect pong response
+            client.expect_pong().await?;
+            
+            info!("Pong received, test successful");
+            
+            // Cleanup
+            client.disconnect().await?;
+            server.shutdown().await?;
+            
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 10 seconds"))?
     }
 }

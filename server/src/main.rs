@@ -89,10 +89,13 @@ async fn main() -> Result<()> {
     // GamesManager
     let games_manager = Arc::new(Mutex::new(GamesManager::new()));
 
+    // Create JWT verifier (using default implementation for now)
+    let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn JwtVerifier>;
+
     // Websocket server
     let websocket_cancellation_token = cancellation_token.clone();
     let external_server_handle = tokio::spawn(async move {
-        run_websocket_server(&ws_addr, games_manager, websocket_cancellation_token).await
+        run_websocket_server(&ws_addr, games_manager, websocket_cancellation_token, jwt_verifier).await
     });
 
 

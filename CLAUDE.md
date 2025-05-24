@@ -66,8 +66,42 @@ cargo build --bin server --release
 # Run server tests
 cargo test -p server
 
+# Run tests with debug output
+RUST_LOG=info cargo test -p server -- --nocapture
+
+# Run specific test
+cargo test -p server test_ping_pong
+
 # Watch for changes and rebuild
 cargo watch -x "run --bin server"
+```
+
+### Testing
+
+The server includes a comprehensive WebSocket testing framework:
+
+- **Test Utilities**: Located in `server/src/ws_server.rs::test_utils`
+- **Mock JWT Verifier**: Allows testing without real authentication
+- **Test Server Builder**: Creates in-memory servers on random ports
+- **Test Client**: Simplified WebSocket client for testing
+- **Timeout Protection**: All tests have 10-second timeouts to prevent hanging
+
+Example test pattern:
+```rust
+#[tokio::test]
+async fn test_websocket_functionality() -> Result<()> {
+    let server = TestServerBuilder::new()
+        .with_mock_auth()
+        .build()
+        .await?;
+    
+    let mut client = server.connect_client().await?;
+    // Test your WebSocket functionality here
+    
+    client.disconnect().await?;
+    server.shutdown().await?;
+    Ok(())
+}
 ```
 
 ### Client Development
