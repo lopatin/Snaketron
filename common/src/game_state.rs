@@ -11,6 +11,7 @@ pub enum GameCommand {
     Tick,
     Turn { snake_id: u32, direction: Direction },
     PositionQueueReplace { snake_id: u32, positions: VecDeque<Position> },
+    RequestSnapshot,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -22,7 +23,6 @@ pub struct GameEventMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(tag = "type", content = "data")]
 pub enum GameEvent {
     SnakeTurned { snake_id: u32, direction: Direction },
     SnakeDied { snake_id: u32 },
@@ -229,6 +229,11 @@ impl GameState {
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     self.apply_event(GameEvent::PositionQueueUpdate { snake_id, positions }, Some(&mut out));
                 }
+            }
+            
+            GameCommand::RequestSnapshot => {
+                // This command doesn't change state, just triggers a snapshot event
+                // The snapshot will be sent by the game loop
             }
         }
 

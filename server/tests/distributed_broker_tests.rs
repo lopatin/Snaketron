@@ -33,9 +33,10 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Create a game
     let game_id = 123;
-    sqlx::query("INSERT INTO games (id, status) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
         .bind(game_id as i32)
         .bind("active")
+        .bind(Uuid::parse_str(&server_id)?)
         .execute(&db_pool)
         .await?;
     

@@ -70,6 +70,7 @@ async fn test_cross_server_game_relay() -> Result<()> {
     {
         let mut gm = games_manager_b.lock().await;
         gm.start_game(game_id).await?;
+        println!("Game {} started on Server B", game_id);
     }
     
     // Verify game is registered to Server B
@@ -100,7 +101,7 @@ async fn test_cross_server_game_relay() -> Result<()> {
     // Start Server A with WebSocket
     let broker_a = Arc::new(DistributedBroker::new(db_pool.clone(), server_a_id.to_string()));
     let games_manager_a = Arc::new(Mutex::new(GamesManager::new_with_broker(broker_a.clone())));
-    let jwt_verifier = Arc::new(common::mock_jwt::MockJwtVerifier::new());
+    let jwt_verifier = Arc::new(common::mock_jwt::MockJwtVerifier::accept_any());
     let ws_cancellation_a = CancellationToken::new();
     
     let ws_server_a = tokio::spawn({
@@ -127,17 +128,22 @@ async fn test_cross_server_game_relay() -> Result<()> {
     client.authenticate(1).await?;
     
     // Join game (which is running on Server B)
+    println!("Client joining game {} on remote server", game_id);
     client.send_message(server::ws_server::WSMessage::JoinGame(game_id)).await?;
     
     // Wait for game snapshot
+    println!("Waiting for game snapshot...");
     let snapshot_received = tokio::time::timeout(
         Duration::from_secs(5),
         async {
             loop {
                 if let Some(msg) = client.receive_game_event().await? {
+                    println!("Received event: {:?}", msg.event);
                     if matches!(msg.event, ::common::GameEvent::Snapshot { .. }) {
                         return Ok::<bool, anyhow::Error>(true);
                     }
+                } else {
+                    println!("No event received");
                 }
             }
         }
@@ -220,7 +226,7 @@ async fn test_multi_client_cross_server() -> Result<()> {
     // Start all servers
     let mut server_handles = vec![];
     let mut cancellation_tokens = vec![];
-    let jwt_verifier = Arc::new(common::mock_jwt::MockJwtVerifier::new());
+    let jwt_verifier = Arc::new(common::mock_jwt::MockJwtVerifier::accept_any());
     
     for (idx, (id, ws_port, grpc_port)) in servers.iter().enumerate() {
         let broker = Arc::new(DistributedBroker::new(db_pool.clone(), id.to_string()));

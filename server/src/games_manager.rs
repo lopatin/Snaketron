@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
-use common::{GameCommandMessage, GameEventMessage, GameEngine, GameState, server_process_incoming_command};
+use common::{GameCommandMessage, GameEventMessage, GameEngine, GameState, server_process_incoming_command, GameCommand, GameEvent};
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
@@ -110,12 +110,27 @@ impl GamesManager {
                 _ = interval.tick() => {
                     // Process all pending commands
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        let events = server_process_incoming_command(&mut engine, cmd);
-                        for event in events {
-                            // Broadcast event through broker
-                            if event_broker.publish_event(game_id, event).await.is_err() {
-                                // Error publishing event
+                        // Check if this is a snapshot request
+                        if matches!(cmd.command, GameCommand::RequestSnapshot) {
+                            // Send snapshot event
+                            let snapshot = engine.get_committed_state().clone();
+                            let snapshot_event = GameEventMessage {
+                                game_id,
+                                tick: snapshot.tick,
+                                user_id: None,
+                                event: GameEvent::Snapshot { game_state: snapshot },
+                            };
+                            if event_broker.publish_event(game_id, snapshot_event).await.is_err() {
                                 break;
+                            }
+                        } else {
+                            let events = server_process_incoming_command(&mut engine, cmd);
+                            for event in events {
+                                // Broadcast event through broker
+                                if event_broker.publish_event(game_id, event).await.is_err() {
+                                    // Error publishing event
+                                    break;
+                                }
                             }
                         }
                     }
@@ -155,6 +170,19 @@ impl GamesManager {
             let (cmd_tx, mut cmd_rx) = broadcast::channel(32);
             let event_rx = broker.subscribe_events(game_id).await?;
             
+            // Give the subscription a moment to establish
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            // Send a special command to request game snapshot
+            // This will trigger the game to send a snapshot event
+            let snapshot_request = GameCommandMessage {
+                tick: 0,
+                received_order: 0,
+                user_id: 0, // System command
+                command: GameCommand::RequestSnapshot,
+            };
+            broker.publish_command(game_id, snapshot_request).await?;
+            
             // Spawn a task to forward commands through the broker
             let broker_clone = broker.clone();
             tokio::spawn(async move {
@@ -179,6 +207,16 @@ impl GamesManager {
     }
     
     pub async fn get_game_snapshot(&self, game_id: u32) -> Result<GameState> {
+        // Check if we have a broker and if the game is remote
+        if let Some(broker) = &self.broker {
+            if !broker.is_game_local(game_id).await? {
+                // For remote games, we need to fetch via gRPC
+                // For now, return a placeholder error
+                return Err(anyhow::anyhow!("Remote game snapshot not yet implemented"));
+            }
+        }
+        
+        // Local game - use snapshot channel
         let snapshot_tx = self.snapshot_txs.get(&game_id)
             .ok_or_else(|| anyhow::anyhow!("Game not found"))?;
         
@@ -212,12 +250,27 @@ impl GamesManager {
                 _ = interval.tick() => {
                     // Process all pending commands
                     while let Ok(cmd) = cmd_rx.try_recv() {
-                        let events = server_process_incoming_command(&mut engine, cmd);
-                        for event in events {
-                            // Broadcast event to all connected clients
-                            if event_tx.send(event).is_err() {
-                                // No receivers, game might be abandoned
+                        // Check if this is a snapshot request
+                        if matches!(cmd.command, GameCommand::RequestSnapshot) {
+                            // Send snapshot event
+                            let snapshot = engine.get_committed_state().clone();
+                            let snapshot_event = GameEventMessage {
+                                game_id,
+                                tick: snapshot.tick,
+                                user_id: None,
+                                event: GameEvent::Snapshot { game_state: snapshot },
+                            };
+                            if event_tx.send(snapshot_event).is_err() {
                                 break;
+                            }
+                        } else {
+                            let events = server_process_incoming_command(&mut engine, cmd);
+                            for event in events {
+                                // Broadcast event to all connected clients
+                                if event_tx.send(event).is_err() {
+                                    // No receivers, game might be abandoned
+                                    break;
+                                }
                             }
                         }
                     }

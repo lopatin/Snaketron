@@ -241,9 +241,11 @@ impl DistributedBroker {
         
         // Check if we already have a stream
         if streams.contains_key(server_id) {
+            println!("Already have stream to server {}", server_id);
             return Ok(());
         }
         
+        println!("Creating new stream to server {}", server_id);
         // Get gRPC client
         let mut client = self.get_grpc_client(server_id).await?;
         
@@ -288,10 +290,24 @@ impl DistributedBroker {
         
         match message.message {
             Some(Message::Event(event)) => {
-                // Deserialize and broadcast event locally
-                if let Ok(event_msg) = bincode::deserialize::<GameEventMessage>(&event.event_data) {
+                // Deserialize just the event, then reconstruct the message
+                if let Ok((game_event, _)) = bincode::serde::decode_from_slice::<common::GameEvent, bincode::config::Configuration>(&event.event_data, bincode::config::standard()) {
+                    let event_msg = GameEventMessage {
+                        game_id: event.game_id,
+                        tick: event.tick,
+                        user_id: event.user_id.map(|id| id as u32),
+                        event: game_event,
+                    };
+                    println!("Broker: Received event from remote server for game {} tick {}", event.game_id, event_msg.tick);
                     // Forward to local subscribers
-                    let _ = self.local_broker.publish_event(event.game_id, event_msg).await;
+                    if let Err(e) = self.local_broker.publish_event(event.game_id, event_msg).await {
+                        println!("Broker: Error publishing event locally: {:?}", e);
+                    }
+                } else {
+                    println!("Broker: Failed to deserialize event from remote, data len: {}", event.event_data.len());
+                    if let Err(e) = bincode::serde::decode_from_slice::<common::GameEvent, bincode::config::Configuration>(&event.event_data, bincode::config::standard()) {
+                        println!("Broker: Deserialization error: {:?}", e);
+                    }
                 }
             }
             Some(Message::Command(cmd)) => {
@@ -316,6 +332,7 @@ impl GameMessageBroker for DistributedBroker {
     async fn publish_command(&self, game_id: u32, command: GameCommandMessage) -> Result<()> {
         // Check if game is local
         if self.local_broker.is_game_local(game_id).await? {
+            println!("Publishing command to local game {}: {:?}", game_id, command.command);
             return self.local_broker.publish_command(game_id, command).await;
         }
         
@@ -330,7 +347,7 @@ impl GameMessageBroker for DistributedBroker {
             self.ensure_stream_to_server(&server_id).await?;
             
             // Serialize command
-            let command_data = bincode::serialize(&command.command)?;
+            let command_data = bincode::serde::encode_to_vec(&command.command, bincode::config::standard())?;
             
             // Create gRPC message
             let grpc_command = game_relay::GameCommand {
@@ -360,6 +377,7 @@ impl GameMessageBroker for DistributedBroker {
     async fn subscribe_events(&self, game_id: u32) -> Result<broadcast::Receiver<GameEventMessage>> {
         // Check if game is local
         if self.is_game_local(game_id).await? {
+            println!("Game {} is local, subscribing locally", game_id);
             return self.local_broker.subscribe_events(game_id).await;
         }
         
@@ -368,6 +386,7 @@ impl GameMessageBroker for DistributedBroker {
         // 2. Send subscribe message
         // 3. Create local event channel that will receive forwarded events
         
+        println!("Game {} is remote, setting up remote subscription", game_id);
         if let Some(server_id) = self.lookup_game_server(game_id).await? {
             // Ensure stream exists
             self.ensure_stream_to_server(&server_id).await?;
