@@ -4,6 +4,21 @@ use async_trait::async_trait;
 use server::ws_server::{JwtVerifier, UserToken};
 
 /// Mock JWT verifier for testing
+/// 
+/// This verifier can operate in two modes:
+/// 1. **Strict mode**: Only accepts specific pre-configured tokens
+///    ```
+///    MockJwtVerifier::new()
+///        .with_token("valid_token", 42)  // Maps "valid_token" to user_id 42
+///    ```
+/// 
+/// 2. **Accept-any mode**: Accepts any token string and maps it to user_id 1
+///    ```
+///    MockJwtVerifier::accept_any()
+///    ```
+///    
+/// For most tests, use accept_any mode with TestClient::authenticate(user_id).
+/// For auth-specific tests, use strict mode with TestClient::authenticate_with_token(token).
 pub struct MockJwtVerifier {
     expected_tokens: HashMap<String, UserToken>,
 }
@@ -20,7 +35,8 @@ impl MockJwtVerifier {
         self
     }
     
-    /// Creates a mock verifier that accepts any token
+    /// Creates a mock verifier that accepts any token as user_id 1
+    /// Use this for most tests where authentication details don't matter
     pub fn accept_any() -> Self {
         Self {
             expected_tokens: HashMap::new(),
@@ -32,8 +48,13 @@ impl MockJwtVerifier {
 impl JwtVerifier for MockJwtVerifier {
     async fn verify(&self, token: &str) -> Result<UserToken> {
         if self.expected_tokens.is_empty() {
-            // Accept any token mode
-            Ok(UserToken { user_id: 1 })
+            // Accept any token mode - try to parse token as user_id
+            if let Ok(user_id) = token.parse::<i32>() {
+                Ok(UserToken { user_id })
+            } else {
+                // If not a number, just use user_id 1
+                Ok(UserToken { user_id: 1 })
+            }
         } else if let Some(user_token) = self.expected_tokens.get(token) {
             Ok(user_token.clone())
         } else {

@@ -142,8 +142,9 @@ async fn test_authenticated_connection() -> Result<()> {
         let mut client = server.connect_client().await?;
         info!("Client connected");
         
-        // Authenticate with valid token
-        client.authenticate(1).await?;
+        // Authenticate with the token that the mock verifier expects
+        // The mock verifier is configured with token "valid_token" -> user_id 42
+        client.authenticate_with_token("valid_token").await?;
         info!("Client authenticated with valid token");
         
         // Test that authenticated client can send ping

@@ -22,10 +22,16 @@ impl TestClient {
     }
     
     pub async fn authenticate(&mut self, user_id: i32) -> Result<()> {
-        // For testing, we use the user_id as the token
-        self.send_message(WSMessage::Token(user_id.to_string())).await?;
-        // In a real test, we'd wait for a response or check connection state
+        // For testing with mock auth, we use the user_id as the token
+        self.authenticate_with_token(&user_id.to_string()).await?;
         self.user_id = Some(user_id);
+        Ok(())
+    }
+    
+    pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
+        // Send the exact token string - useful for testing specific JWT tokens
+        self.send_message(WSMessage::Token(token.to_string())).await?;
+        // In a real test, we'd wait for a response or check connection state
         Ok(())
     }
     

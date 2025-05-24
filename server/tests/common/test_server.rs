@@ -33,6 +33,10 @@ impl TestServerBuilder {
         self
     }
     
+    /// Use mock authentication that accepts any token
+    /// When a client sends a numeric token (e.g., "123"), it maps to that user_id
+    /// When a client sends a non-numeric token, it maps to user_id 1
+    /// This is the recommended mode for most tests
     pub fn with_mock_auth(mut self) -> Self {
         self.jwt_verifier = Some(Arc::new(MockJwtVerifier::accept_any()));
         self
