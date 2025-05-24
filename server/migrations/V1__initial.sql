@@ -36,9 +36,11 @@ CREATE TABLE game_requests (
     server_id UUID NOT NULL,
     user_id INT NOT NULL UNIQUE,
     game_type JSONB NOT NULL,
+    game_id INT DEFAULT NULL,
     request_time TIMESTAMP NOT NULL DEFAULT NOW(),
     FOREIGN KEY (server_id) REFERENCES servers(id),
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE SET NULL
 );
 
 CREATE TABLE game_players (

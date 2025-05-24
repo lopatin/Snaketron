@@ -8,28 +8,56 @@ use self::common::{TestEnvironment, TestClient};
 
 #[tokio::test]
 async fn test_distributed_broker_local_game() -> Result<()> {
+    // Initialize tracing for tests
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .try_init();
+    
+    println!("Starting test environment...");
     // Start a single server
     let env = TestEnvironment::new(1).await?;
+    println!("Test environment created");
+    
+    // Create test users
+    println!("Creating test users...");
+    env.create_test_users(2).await?;
+    println!("Test users created");
+    
     let server_addr = env.ws_addr(0).expect("Server should exist");
+    println!("Server address: {}", server_addr);
     
     // Connect two clients
+    println!("Connecting client 1...");
     let mut client1 = TestClient::connect(&server_addr).await?;
+    println!("Client 1 connected");
+    println!("Connecting client 2...");
     let mut client2 = TestClient::connect(&server_addr).await?;
+    println!("Client 2 connected");
     
     // Authenticate clients
+    println!("Authenticating client 1...");
     client1.authenticate(1).await?;
+    println!("Client 1 authenticated");
+    println!("Authenticating client 2...");
     client2.authenticate(2).await?;
+    println!("Client 2 authenticated");
     
     // Queue both clients for a match
+    println!("Queueing client 1 for match...");
+    let game_type = GameType::FreeForAll { max_players: 2 };
     client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+        game_type: game_type.clone()
     }).await?;
+    println!("Client 1 queued");
     
+    println!("Queueing client 2 for match...");
     client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+        game_type 
     }).await?;
+    println!("Client 2 queued");
     
     // Wait for match to be created
+    println!("Waiting for match to be created...");
     let game_id = timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(msg) = client1.receive_message().await {

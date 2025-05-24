@@ -110,6 +110,62 @@ async fn remove_from_matchmaking_queue(
     Ok(())
 }
 
+async fn poll_for_match(pool: PgPool, user_id: i32, ws_tx: mpsc::Sender<Message>) {
+    info!("Starting match polling for user {}", user_id);
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let timeout = tokio::time::sleep(Duration::from_secs(30)); // Stop polling after 30 seconds
+    tokio::pin!(timeout);
+    
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                // Check if user has been matched
+                match check_for_match(&pool, user_id).await {
+                    Ok(Some(game_id)) => {
+                        info!("User {} matched to game {}", user_id, game_id);
+                        // Send MatchFound message
+                        let msg = WSMessage::MatchFound { game_id: game_id as u32 };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws_tx.send(Message::Text(json.into())).await;
+                        }
+                        break;
+                    }
+                    Ok(None) => {
+                        // No match yet, continue polling
+                        trace!("No match yet for user {}", user_id);
+                    }
+                    Err(e) => {
+                        error!("Error checking for match: {}", e);
+                        break;
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                info!("Match polling timeout for user {}", user_id);
+                break;
+            }
+        }
+    }
+    info!("Stopped polling for user {}", user_id);
+}
+
+async fn check_for_match(pool: &PgPool, user_id: i32) -> Result<Option<i32>> {
+    let game_id: Option<i32> = sqlx::query_scalar(
+        r#"
+        SELECT game_id
+        FROM game_requests
+        WHERE user_id = $1 AND game_id IS NOT NULL
+        ORDER BY request_time DESC
+        LIMIT 1
+        "#
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    
+    Ok(game_id)
+}
+
 async fn get_current_server_id(pool: &PgPool) -> Result<Uuid> {
     // In a real implementation, this would be stored when the server starts
     // For now, get the first server or create one
@@ -269,6 +325,9 @@ async fn handle_websocket_connection(
         .await
         .expect("Failed to accept WebSocket connection");
 
+    // Create a channel for sending messages to the WebSocket
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(32);
+    
     // Start in unauthenticated state
     let mut state = ConnectionState::Unauthenticated;
     
@@ -307,6 +366,14 @@ async fn handle_websocket_connection(
                 };
             }
 
+            // Handle messages from the channel (to send to client)
+            Some(msg) = ws_rx.recv() => {
+                if let Err(e) = ws_stream.send(msg).await {
+                    error!("Failed to send message to client: {}", e);
+                    break;
+                }
+            }
+            
             // Handle incoming WebSocket messages
             message = ws_stream.next() => {
                 match message {
@@ -424,6 +491,14 @@ async fn handle_websocket_connection(
                                         if let Err(e) = add_to_matchmaking_queue(&db_pool, user_token.user_id, game_type).await {
                                             error!("Failed to add user to matchmaking queue: {}", e);
                                         }
+                                        
+                                        // Start polling for match
+                                        let poll_pool = db_pool.clone();
+                                        let poll_user_id = user_token.user_id;
+                                        let poll_tx = ws_tx.clone();
+                                        tokio::spawn(async move {
+                                            poll_for_match(poll_pool, poll_user_id, poll_tx).await;
+                                        });
                                         
                                         ConnectionState::Authenticated { user_token }
                                     }

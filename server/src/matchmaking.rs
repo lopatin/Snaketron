@@ -2,11 +2,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::{error, info, trace, warn};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::games_manager::GamesManager;
+use crate::player_connections::PlayerConnectionManager;
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
 const MAX_PLAYERS: usize = 10;
-const INITIAL_GAME_STATE: i32 = 0; // 0 = Waiting to start
+// Initial game state will be null
 
 // MMR matching ranges that expand over time
 const MMR_RANGES: [(i32, i32); 4] = [
@@ -43,7 +47,12 @@ struct ServerLoad {
 }
 
 /// Main matchmaking loop that runs on each server
-pub async fn run_matchmaking_loop(pool: PgPool, server_id: uuid::Uuid) {
+pub async fn run_matchmaking_loop(
+    pool: PgPool, 
+    server_id: uuid::Uuid,
+    games_manager: Arc<Mutex<GamesManager>>,
+    player_connections: Arc<PlayerConnectionManager>,
+) {
     info!(?server_id, "Starting adaptive matchmaking loop");
 
     let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -58,24 +67,44 @@ pub async fn run_matchmaking_loop(pool: PgPool, server_id: uuid::Uuid) {
         }
 
         // Try to create matches for different game types
-        for game_type in &[1, 2, 3] {
-            match create_adaptive_match(&pool, *game_type).await {
+        let game_types = vec![
+            serde_json::json!({"FreeForAll": {"max_players": 2}}),
+            serde_json::json!({"FreeForAll": {"max_players": 10}}),
+            serde_json::json!({"TeamMatch": {"per_team": 2}}),
+        ];
+        
+        for game_type in &game_types {
+            match create_adaptive_match(&pool, game_type.clone(), server_id).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
-                        game_type,
+                        game_type = ?game_type,
                         player_count = players.len(),
                         "Created match successfully"
                     );
+                    
+                    info!("About to start game {} and notify players {:?}", game_id, players);
+                    
+                    // Start the game on this server
+                    if let Err(e) = games_manager.lock().await.start_game(game_id as u32).await {
+                        error!(game_id, error = %e, "Failed to start game");
+                        continue;
+                    }
+                    
+                    info!("Game {} started successfully", game_id);
+                    
+                    // Notify players that match was found
+                    player_connections.notify_match_found(&players, game_id as u32).await;
+                    info!("Players notified of match {}", game_id);
                 }
                 Ok(None) => {
-                    trace!(game_type, "No suitable match found");
+                    trace!(game_type = ?game_type, "No suitable match found");
                 }
                 Err(e) if is_serialization_error(&e) => {
-                    trace!(game_type, "Serialization conflict, will retry next tick");
+                    trace!(game_type = ?game_type, "Serialization conflict, will retry next tick");
                 }
                 Err(e) => {
-                    error!(game_type, error = %e, "Matchmaking error");
+                    error!(game_type = ?game_type, error = %e, "Matchmaking error");
                 }
             }
         }
@@ -102,20 +131,25 @@ async fn update_heartbeat(pool: &PgPool, server_id: uuid::Uuid) -> Result<(), sq
 /// Create an adaptive match using expanding skill ranges
 async fn create_adaptive_match(
     pool: &PgPool,
-    game_type: i32,
+    game_type: serde_json::Value,
+    server_id: uuid::Uuid,
 ) -> Result<Option<(i32, Vec<i32>)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
 
+
     // Get the oldest waiting player to determine match urgency
     let oldest_wait: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
+        SELECT CASE 
+            WHEN COUNT(*) = 0 THEN NULL
+            ELSE EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
+        END
         FROM game_requests
         WHERE game_type = $1 AND game_id IS NULL
         "#
     )
-    .bind(game_type)
+    .bind(&game_type)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -128,37 +162,61 @@ async fn create_adaptive_match(
         .unwrap_or(WAIT_THRESHOLDS.len() - 1);
 
     let (min_mmr_diff, max_mmr_diff) = MMR_RANGES.get(tier).copied().unwrap_or((0, 1000));
-    let min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
+    let base_min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
+    
+    // For game types with max_players, never require more than max_players
+    let min_players = match &game_type {
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::Object(ffa_obj)) = obj.get("FreeForAll") {
+                if let Some(serde_json::Value::Number(max)) = ffa_obj.get("max_players") {
+                    if let Some(max_val) = max.as_u64() {
+                        base_min_players.min(max_val as usize)
+                    } else {
+                        base_min_players
+                    }
+                } else {
+                    base_min_players
+                }
+            } else {
+                base_min_players
+            }
+        }
+        _ => base_min_players
+    };
 
     // Find matching players
     let players: Vec<MatchmakingPlayer> = sqlx::query_as(
         r#"
-        WITH player_pool AS (
+        WITH available_players AS (
             SELECT 
                 gr.id as game_request_id,
                 gr.user_id,
                 u.mmr,
-                EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds,
-                AVG(u.mmr) OVER() as avg_mmr
+                EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds
             FROM game_requests gr
             JOIN users u ON gr.user_id = u.id
             WHERE gr.game_type = $1 AND gr.game_id IS NULL
             ORDER BY gr.request_time ASC
             LIMIT $2
             FOR UPDATE OF gr SKIP LOCKED
+        ),
+        player_stats AS (
+            SELECT AVG(mmr) as avg_mmr
+            FROM available_players
         )
         SELECT 
-            game_request_id,
-            user_id,
-            mmr,
-            wait_seconds
-        FROM player_pool
-        WHERE ABS(mmr - avg_mmr) <= $3
-        ORDER BY wait_seconds DESC
+            ap.game_request_id,
+            ap.user_id,
+            ap.mmr,
+            ap.wait_seconds
+        FROM available_players ap
+        CROSS JOIN player_stats ps
+        WHERE ABS(ap.mmr - ps.avg_mmr) <= $3
+        ORDER BY ap.wait_seconds DESC
         LIMIT $4
         "#
     )
-    .bind(game_type)
+    .bind(&game_type)
     .bind(MAX_PLAYERS as i32 * 2) // Fetch more to filter by MMR
     .bind(max_mmr_diff)
     .bind(MAX_PLAYERS as i32)
@@ -176,26 +234,19 @@ async fn create_adaptive_match(
     let user_ids: Vec<i32> = matched_players.iter().map(|p| p.user_id).collect();
     let request_ids: Vec<i32> = matched_players.iter().map(|p| p.game_request_id).collect();
 
-    // Select least loaded server
-    let server_id = select_least_loaded_server(&mut tx).await?;
+    // Use the current server (no need to select least loaded in this version)
 
-    // Create the game with proper game_type JSONB
-    let game_type_json = match game_type {
-        1 => serde_json::json!({"FreeForAll": {"max_players": 10}}),
-        2 => serde_json::json!({"TeamMatch": {"per_team": 2}}),
-        _ => serde_json::json!({"FreeForAll": {"max_players": 10}}),
-    };
+    // Use the game_type that was passed in
     
     let game_id: i32 = sqlx::query_scalar(
         r#"
         INSERT INTO games (server_id, game_type, game_state, status, created_at, last_activity)
-        VALUES ($1, $2, $3, 'waiting', NOW(), NOW())
+        VALUES ($1, $2, NULL, 'waiting', NOW(), NOW())
         RETURNING id
         "#
     )
     .bind(server_id)
-    .bind(game_type_json)
-    .bind(INITIAL_GAME_STATE)
+    .bind(&game_type)
     .fetch_one(&mut *tx)
     .await?;
 

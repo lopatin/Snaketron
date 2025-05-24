@@ -8,6 +8,7 @@ use uuid::Uuid;
 use server::{
     ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
     games_manager::GamesManager,
+    game_broker::{LocalBroker, GameMessageBroker},
     matchmaking::run_matchmaking_loop,
     game_cleanup::run_cleanup_service,
 };
@@ -102,7 +103,41 @@ impl TestEnvironment {
         
         migrations::migrations::runner().run_async(&mut config).await?;
         
+        // Clean up any stale test data
+        sqlx::query("DELETE FROM game_requests")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM game_players")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM games WHERE status = 'waiting' OR status = 'completed'")
+            .execute(&pool)
+            .await?;
+            
         Ok(pool)
+    }
+    
+    /// Create test users in the database
+    pub async fn create_test_users(&self, count: usize) -> Result<()> {
+        // Clear any existing game requests first
+        sqlx::query("DELETE FROM game_requests")
+            .execute(&self.db_pool)
+            .await?;
+            
+        for i in 1..=count {
+            sqlx::query(
+                r#"
+                INSERT INTO users (id, username, password_hash, mmr)
+                VALUES ($1, $2, 'test_hash', 1000)
+                ON CONFLICT (id) DO NOTHING
+                "#
+            )
+            .bind(i as i32)
+            .bind(format!("test_user_{}", i))
+            .execute(&self.db_pool)
+            .await?;
+        }
+        Ok(())
     }
 }
 
@@ -113,7 +148,9 @@ impl TestServerInstance {
         let ws_addr = format!("127.0.0.1:{}", ws_port);
         
         // Register server in database
+        println!("Registering server in database...");
         let server_id = register_server(&db_pool, &region).await?;
+        println!("Server registered with ID: {}", server_id);
         
         let cancellation_token = CancellationToken::new();
         let mut handles = Vec::new();
@@ -126,8 +163,9 @@ impl TestServerInstance {
             let _ = run_heartbeat_loop(heartbeat_pool, heartbeat_server_id, heartbeat_token).await;
         }));
         
-        // Start games manager
-        let games_manager = Arc::new(Mutex::new(GamesManager::new()));
+        // Start games manager with local broker
+        let broker = Arc::new(LocalBroker::new()) as Arc<dyn GameMessageBroker>;
+        let games_manager = Arc::new(Mutex::new(GamesManager::new_with_broker(broker)));
         
         // Create mock JWT verifier for tests
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
@@ -141,11 +179,18 @@ impl TestServerInstance {
             let _ = run_websocket_server(&ws_addr_clone, ws_games_manager, ws_pool, ws_token, jwt_verifier).await;
         }));
         
+        // Create player connection manager
+        let player_connections = Arc::new(server::player_connections::PlayerConnectionManager::new());
+        
         // Start matchmaking service
+        println!("Starting matchmaking service...");
         let matchmaking_pool = db_pool.clone();
         let matchmaking_server_id = server_id.clone();
+        let matchmaking_games_manager = games_manager.clone();
+        let matchmaking_player_connections = player_connections.clone();
         handles.push(tokio::spawn(async move {
-            run_matchmaking_loop(matchmaking_pool, matchmaking_server_id).await;
+            println!("Matchmaking loop starting for server {}", matchmaking_server_id);
+            run_matchmaking_loop(matchmaking_pool, matchmaking_server_id, matchmaking_games_manager, matchmaking_player_connections).await;
         }));
         
         // Start cleanup service

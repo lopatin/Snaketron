@@ -88,17 +88,28 @@ async fn main() -> Result<()> {
     // Create JWT verifier (using default implementation for now)
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn JwtVerifier>;
 
+    // Player connection manager
+    let player_connections = Arc::new(server::player_connections::PlayerConnectionManager::new());
+    
     // Websocket server
     let websocket_cancellation_token = cancellation_token.clone();
     let db_pool_clone = db_pool.clone();
+    let websocket_games_manager = games_manager.clone();
     let external_server_handle = tokio::spawn(async move {
-        run_websocket_server(&ws_addr, games_manager, db_pool_clone, websocket_cancellation_token, jwt_verifier).await
+        run_websocket_server(&ws_addr, websocket_games_manager, db_pool_clone, websocket_cancellation_token, jwt_verifier).await
     });
     
     // Matchmaking service
     let matchmaking_pool = db_pool.clone();
+    let matchmaking_games_manager = games_manager.clone();
+    let matchmaking_player_connections = player_connections.clone();
     let matchmaking_handle = tokio::spawn(async move {
-        server::matchmaking::run_matchmaking_loop(matchmaking_pool, server_id).await;
+        server::matchmaking::run_matchmaking_loop(
+            matchmaking_pool, 
+            server_id,
+            matchmaking_games_manager,
+            matchmaking_player_connections
+        ).await;
         Ok::<(), anyhow::Error>(())
     });
     
