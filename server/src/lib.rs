@@ -1,3 +1,4 @@
+pub mod game_broker;
 pub mod games_manager;
 pub mod grpc_server;
 pub mod matchmaking;

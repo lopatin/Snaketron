@@ -21,10 +21,11 @@ impl TestClient {
         })
     }
     
-    pub async fn authenticate(&mut self, token: &str) -> Result<()> {
-        self.send_message(WSMessage::Token(token.to_string())).await?;
+    pub async fn authenticate(&mut self, user_id: i32) -> Result<()> {
+        // For testing, we use the user_id as the token
+        self.send_message(WSMessage::Token(user_id.to_string())).await?;
         // In a real test, we'd wait for a response or check connection state
-        self.user_id = Some(1); // Mock user ID
+        self.user_id = Some(user_id);
         Ok(())
     }
     
@@ -66,19 +67,25 @@ impl TestClient {
         }
     }
     
-    pub async fn receive_game_event(&mut self) -> Result<GameEventMessage> {
-        let timeout = tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await;
+    pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+        let timeout = tokio::time::timeout(Duration::from_millis(100), self.ws.next()).await;
         match timeout {
             Ok(Some(msg)) => {
                 match msg? {
                     Message::Text(text) => {
-                        Ok(serde_json::from_str(&text)?)
+                        // Try to parse as GameEventMessage
+                        if let Ok(event) = serde_json::from_str::<GameEventMessage>(&text) {
+                            Ok(Some(event))
+                        } else {
+                            // Might be a different message type
+                            Ok(None)
+                        }
                     }
-                    _ => Err(anyhow::anyhow!("Unexpected message type")),
+                    _ => Ok(None),
                 }
             }
             Ok(None) => Err(anyhow::anyhow!("Connection closed")),
-            Err(_) => Err(anyhow::anyhow!("Timeout waiting for game event")),
+            Err(_) => Ok(None), // Timeout is ok, just no message
         }
     }
     

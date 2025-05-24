@@ -10,6 +10,9 @@ use server::ws_server::{JwtVerifier, DefaultJwtVerifier, run_websocket_server_wi
 use server::games_manager::GamesManager;
 use super::mock_jwt::MockJwtVerifier;
 use super::test_client::TestClient;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
 
 /// Test server builder for configuring test scenarios
 pub struct TestServerBuilder {
@@ -38,6 +41,44 @@ impl TestServerBuilder {
     pub fn with_jwt_verifier(mut self, verifier: Arc<dyn JwtVerifier>) -> Self {
         self.jwt_verifier = Some(verifier);
         self
+    }
+    
+    /// Get a random available port
+    pub fn get_random_port() -> u16 {
+        // Create a temporary TcpListener to get an available port
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+    
+    /// Create a test database pool
+    pub async fn create_test_db() -> Result<PgPool> {
+        // Use test database credentials from environment or defaults
+        let db_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/snaketron_test".to_string());
+        
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await?;
+        
+        // Run migrations
+        refinery::embed_migrations!("../migrations");
+        let mut config = refinery::config::Config::new(refinery::config::ConfigDbType::Postgres)
+            .set_db_user("postgres")
+            .set_db_pass("postgres")
+            .set_db_host("localhost")
+            .set_db_port("5432")
+            .set_db_name("snaketron_test");
+        
+        migrations::runner().run_async(&mut config).await?;
+        
+        // Clean up test data
+        sqlx::query!("DELETE FROM games").execute(&pool).await?;
+        sqlx::query!("DELETE FROM servers").execute(&pool).await?;
+        
+        Ok(pool)
     }
     
     pub async fn build(self) -> Result<TestServer> {

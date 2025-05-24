@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package game_relay;
+
+service GameRelay {
+  // Stream commands and events between servers
+  rpc StreamGameMessages(stream GameMessage) returns (stream GameMessage);
+  
+  // Get game snapshot from remote server
+  rpc GetGameSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+}
+
+message GameMessage {
+  oneof message {
+    GameCommand command = 1;
+    GameEvent event = 2;
+    Subscribe subscribe = 3;
+    Unsubscribe unsubscribe = 4;
+  }
+}
+
+message GameCommand {
+  uint32 game_id = 1;
+  uint32 tick = 2;
+  int32 user_id = 3;
+  bytes command_data = 4; // Bincode-serialized common::GameCommand
+}
+
+message GameEvent {
+  uint32 game_id = 1;
+  uint32 tick = 2;
+  optional int32 user_id = 3;
+  bytes event_data = 4; // Bincode-serialized common::GameEvent
+}
+
+message Subscribe {
+  uint32 game_id = 1;
+  bool commands = 2;
+  bool events = 3;
+}
+
+message Unsubscribe {
+  uint32 game_id = 1;
+}
+
+message GetSnapshotRequest {
+  uint32 game_id = 1;
+}
+
+message GetSnapshotResponse {
+  bytes game_state = 1; // Bincode-serialized common::GameState
+}

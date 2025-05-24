@@ -6,11 +6,14 @@ use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
+use std::sync::Arc;
+use crate::game_broker::GameMessageBroker;
 
 pub struct GamesManager {
     command_txs: HashMap<u32, broadcast::Sender<GameCommandMessage>>,
     event_txs: HashMap<u32, broadcast::Sender<GameEventMessage>>,
     snapshot_txs: HashMap<u32, mpsc::Sender<oneshot::Sender<GameState>>>,
+    broker: Option<Arc<dyn GameMessageBroker>>,
 }
 
 impl GamesManager {
@@ -19,6 +22,16 @@ impl GamesManager {
             command_txs: HashMap::new(),
             event_txs: HashMap::new(),
             snapshot_txs: HashMap::new(),
+            broker: None,
+        }
+    }
+    
+    pub fn new_with_broker(broker: Arc<dyn GameMessageBroker>) -> Self {
+        GamesManager {
+            command_txs: HashMap::new(),
+            event_txs: HashMap::new(),
+            snapshot_txs: HashMap::new(),
+            broker: Some(broker),
         }
     }
 

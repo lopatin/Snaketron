@@ -1,9 +1,10 @@
 fn main() {
-    let iface_files = &["proto/stream_exchange.proto"];
+    let iface_files = &["proto/stream_exchange.proto", "proto/game_relay.proto"];
     let dirs = &["."];
 
     tonic_build::configure()
         .build_client(true)
+        .build_server(true)
         .compile_protos(iface_files, dirs)
         .unwrap_or_else(|e| panic!("protobuf compilation failed: {}", e));
 

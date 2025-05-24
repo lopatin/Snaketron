@@ -1,3 +1,100 @@
+use anyhow::{Context, Result};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tracing::{error, info, warn};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+use crate::game_broker::{GameMessageBroker, game_relay};
+use game_relay::game_relay_server::{GameRelay, GameRelayServer};
+use game_relay::{GameMessage, GetSnapshotRequest, GetSnapshotResponse};
+
+type GameMessageStream = Pin<Box<dyn Stream<Item = Result<GameMessage, Status>> + Send>>;
+
+pub struct GameRelayService {
+    broker: Arc<dyn GameMessageBroker>,
+}
+
+impl GameRelayService {
+    pub fn new(broker: Arc<dyn GameMessageBroker>) -> Self {
+        Self { broker }
+    }
+}
+
+#[tonic::async_trait]
+impl GameRelay for GameRelayService {
+    type StreamGameMessagesStream = GameMessageStream;
+
+    async fn stream_game_messages(
+        &self,
+        request: Request<Streaming<GameMessage>>,
+    ) -> Result<Response<Self::StreamGameMessagesStream>, Status> {
+        let client_addr = request.remote_addr();
+        let mut client_stream = request.into_inner();
+        info!(client_address = ?client_addr, "New game relay connection");
+
+        let (response_tx, response_rx) = mpsc::channel(32);
+
+        // Handle incoming messages from remote server
+        tokio::spawn(async move {
+            while let Some(result) = client_stream.next().await {
+                match result {
+                    Ok(game_message) => {
+                        // TODO: Process incoming game messages
+                        // This would involve:
+                        // 1. Deserializing commands/events from bincode
+                        // 2. Routing them through the broker
+                        // 3. Handling subscriptions
+                        info!("Received game message: {:?}", game_message);
+                    }
+                    Err(status) => {
+                        error!(?status, "Error receiving game message");
+                        break;
+                    }
+                }
+            }
+            info!(client_address = ?client_addr, "Game relay stream ended");
+        });
+
+        let output_stream = ReceiverStream::new(response_rx);
+        Ok(Response::new(Box::pin(output_stream) as Self::StreamGameMessagesStream))
+    }
+
+    async fn get_game_snapshot(
+        &self,
+        request: Request<GetSnapshotRequest>,
+    ) -> Result<Response<GetSnapshotResponse>, Status> {
+        let game_id = request.into_inner().game_id;
+        
+        // TODO: Implement snapshot retrieval
+        // This would check if game is local and return its snapshot
+        
+        Err(Status::unimplemented("Game snapshot not yet implemented"))
+    }
+}
+
+pub async fn run_game_relay_server(
+    addr: &str,
+    broker: Arc<dyn GameMessageBroker>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    let service = GameRelayService::new(broker);
+    let svc = GameRelayServer::new(service);
+    
+    info!("Game relay gRPC server starting on {}", addr);
+    
+    Server::builder()
+        .add_service(svc)
+        .serve_with_shutdown(addr.parse()?, cancellation_token.cancelled())
+        .await
+        .context("Game relay gRPC server failed")?;
+    
+    info!("Game relay gRPC server shut down");
+    Ok(())
+}
+
+// Keep the old commented code for reference
 // use anyhow::{Context, Result};
 // use tokio::sync::mpsc;
 // use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
