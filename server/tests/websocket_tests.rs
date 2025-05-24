@@ -79,7 +79,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         info!("Client connected");
         
         // Authenticate the client
-        client.authenticate("test_token").await?;
+        client.authenticate(1).await?;
         info!("Client authenticated");
         
         // Join the game
@@ -88,6 +88,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         
         // Receive the snapshot event
         let event = client.receive_game_event().await?;
+        let event = event.ok_or_else(|| anyhow::anyhow!("Expected game event, got None"))?;
         info!("Received event: {:?}", event);
         
         // Verify it's a snapshot event
@@ -142,7 +143,7 @@ async fn test_authenticated_connection() -> Result<()> {
         info!("Client connected");
         
         // Authenticate with valid token
-        client.authenticate("valid_token").await?;
+        client.authenticate(1).await?;
         info!("Client authenticated with valid token");
         
         // Test that authenticated client can send ping

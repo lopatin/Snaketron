@@ -56,27 +56,31 @@ impl TestServerBuilder {
     pub async fn create_test_db() -> Result<PgPool> {
         // Use test database credentials from environment or defaults
         let db_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/snaketron_test".to_string());
+            .unwrap_or_else(|_| "postgres://snaketron:snaketron@localhost:5432/snaketron".to_string());
         
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&db_url)
             .await?;
         
-        // Run migrations
-        refinery::embed_migrations!("../migrations");
+        // Run migrations using the embedded migrations from main.rs pattern
+        mod migrations {
+            use refinery::embed_migrations;
+            embed_migrations!("./migrations");
+        }
+        
         let mut config = refinery::config::Config::new(refinery::config::ConfigDbType::Postgres)
-            .set_db_user("postgres")
-            .set_db_pass("postgres")
+            .set_db_user("snaketron")
+            .set_db_pass("snaketron")
             .set_db_host("localhost")
             .set_db_port("5432")
-            .set_db_name("snaketron_test");
+            .set_db_name("snaketron");
         
-        migrations::runner().run_async(&mut config).await?;
+        migrations::migrations::runner().run_async(&mut config).await?;
         
         // Clean up test data
-        sqlx::query!("DELETE FROM games").execute(&pool).await?;
-        sqlx::query!("DELETE FROM servers").execute(&pool).await?;
+        sqlx::query("DELETE FROM games").execute(&pool).await?;
+        sqlx::query("DELETE FROM servers").execute(&pool).await?;
         
         Ok(pool)
     }

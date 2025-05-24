@@ -35,18 +35,72 @@ impl GameRelay for GameRelayService {
         info!(client_address = ?client_addr, "New game relay connection");
 
         let (response_tx, response_rx) = mpsc::channel(32);
+        let broker = self.broker.clone();
+        let response_tx_clone = response_tx.clone();
 
         // Handle incoming messages from remote server
         tokio::spawn(async move {
             while let Some(result) = client_stream.next().await {
                 match result {
                     Ok(game_message) => {
-                        // TODO: Process incoming game messages
-                        // This would involve:
-                        // 1. Deserializing commands/events from bincode
-                        // 2. Routing them through the broker
-                        // 3. Handling subscriptions
-                        info!("Received game message: {:?}", game_message);
+                        use game_relay::game_message::Message;
+                        
+                        match game_message.message {
+                            Some(Message::Command(cmd)) => {
+                                // Deserialize and forward command to local game
+                                if let Ok(command) = bincode::deserialize::<common::GameCommand>(&cmd.command_data) {
+                                    let cmd_msg = common::GameCommandMessage {
+                                        tick: cmd.tick,
+                                        received_order: 0, // Will be assigned by game engine
+                                        user_id: cmd.user_id as u32,
+                                        command,
+                                    };
+                                    
+                                    if let Err(e) = broker.publish_command(cmd.game_id, cmd_msg).await {
+                                        error!("Failed to forward command: {:?}", e);
+                                    }
+                                }
+                            }
+                            Some(Message::Subscribe(sub)) => {
+                                // Remote server wants to subscribe to a game
+                                if sub.events {
+                                    info!("Remote server subscribing to events for game {}", sub.game_id);
+                                    
+                                    // Subscribe to local game events and forward them
+                                    if let Ok(mut event_rx) = broker.subscribe_events(sub.game_id).await {
+                                        let tx = response_tx_clone.clone();
+                                        let game_id = sub.game_id;
+                                        
+                                        tokio::spawn(async move {
+                                            while let Ok(event_msg) = event_rx.recv().await {
+                                                // Serialize and forward event
+                                                if let Ok(event_data) = bincode::serialize(&event_msg) {
+                                                    let grpc_event = game_relay::GameEvent {
+                                                        game_id,
+                                                        tick: event_msg.tick,
+                                                        user_id: event_msg.user_id.map(|id| id as i32),
+                                                        event_data,
+                                                    };
+                                                    
+                                                    let message = game_relay::GameMessage {
+                                                        message: Some(game_relay::game_message::Message::Event(grpc_event)),
+                                                    };
+                                                    
+                                                    if tx.send(Ok(message)).await.is_err() {
+                                                        break; // Client disconnected
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Some(Message::Unsubscribe(unsub)) => {
+                                // Remote server unsubscribing from game
+                                info!("Remote server unsubscribing from game {}", unsub.game_id);
+                            }
+                            _ => {}
+                        }
                     }
                     Err(status) => {
                         error!(?status, "Error receiving game message");
@@ -67,10 +121,21 @@ impl GameRelay for GameRelayService {
     ) -> Result<Response<GetSnapshotResponse>, Status> {
         let game_id = request.into_inner().game_id;
         
-        // TODO: Implement snapshot retrieval
-        // This would check if game is local and return its snapshot
-        
-        Err(Status::unimplemented("Game snapshot not yet implemented"))
+        // Check if game is local
+        match self.broker.is_game_local(game_id).await {
+            Ok(true) => {
+                // For now, we don't have direct access to GamesManager here
+                // In a real implementation, we'd need to coordinate with GamesManager
+                // to get snapshots. For testing, return unimplemented.
+                Err(Status::unimplemented("Snapshot retrieval not yet implemented"))
+            }
+            Ok(false) => {
+                Err(Status::not_found(format!("Game {} not found on this server", game_id)))
+            }
+            Err(e) => {
+                Err(Status::internal(format!("Error checking game location: {}", e)))
+            }
+        }
     }
 }
 

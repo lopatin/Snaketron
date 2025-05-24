@@ -1,17 +1,17 @@
 use anyhow::Result;
 use server::game_broker::{GameMessageBroker, DistributedBroker};
 use server::games_manager::GamesManager;
-use server::ws_server::{run_websocket_server, DefaultJwtVerifier, JwtVerifier};
-use common::{GameCommand, GameCommandMessage, GameEventMessage, GameEvent, Direction};
-use tokio::sync::{Mutex, oneshot};
+use server::ws_server::{run_websocket_server, JwtVerifier};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use std::sync::Arc;
 use uuid::Uuid;
 use std::time::Duration;
 
 // Import test utilities
+#[path = "common/mod.rs"]
 mod common;
-use common::{TestServerBuilder, TestClient};
+use self::common::{TestServerBuilder, TestClient};
 
 /// Test that a client connected to Server A can play a game running on Server B
 #[tokio::test]
@@ -24,15 +24,15 @@ async fn test_cross_server_game_relay() -> Result<()> {
     let server_a_port = TestServerBuilder::get_random_port();
     let server_a_grpc_port = TestServerBuilder::get_random_port();
     
-    sqlx::query!(
-        "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-        server_a_id,
-        "localhost",
-        server_a_port as i32,
-        server_a_grpc_port as i32,
-        "test"
-    )
+    sqlx::query(
+        "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+    .bind(server_a_id)
+    .bind("test-server-a")
+    .bind("localhost")
+    .bind(server_a_port as i32)
+    .bind(server_a_grpc_port as i32)
+    .bind("test")
     .execute(&db_pool)
     .await?;
     
@@ -41,25 +41,24 @@ async fn test_cross_server_game_relay() -> Result<()> {
     let server_b_port = TestServerBuilder::get_random_port();
     let server_b_grpc_port = TestServerBuilder::get_random_port();
     
-    sqlx::query!(
-        "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-        server_b_id,
-        "localhost",
-        server_b_port as i32,
-        server_b_grpc_port as i32,
-        "test"
-    )
+    sqlx::query(
+        "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+    .bind(server_b_id)
+    .bind("test-server-b")
+    .bind("localhost")
+    .bind(server_b_port as i32)
+    .bind(server_b_grpc_port as i32)
+    .bind("test")
     .execute(&db_pool)
     .await?;
     
     // Create game record
     let game_id = 12345;
-    sqlx::query!(
-        "INSERT INTO games (id, status) VALUES ($1, $2)",
-        game_id as i32,
-        "waiting"
-    )
+    sqlx::query(
+        "INSERT INTO games (id, status) VALUES ($1, $2)")
+    .bind(game_id as i32)
+    .bind("waiting")
     .execute(&db_pool)
     .await?;
     
@@ -74,13 +73,12 @@ async fn test_cross_server_game_relay() -> Result<()> {
     }
     
     // Verify game is registered to Server B
-    let game_location = sqlx::query!(
-        "SELECT server_id FROM games WHERE id = $1",
-        game_id as i32
-    )
+    let game_location: Option<Uuid> = sqlx::query_scalar(
+        "SELECT server_id FROM games WHERE id = $1")
+    .bind(game_id as i32)
     .fetch_one(&db_pool)
     .await?;
-    assert_eq!(game_location.server_id, Some(server_b_id));
+    assert_eq!(game_location, Some(server_b_id));
     
     // Start gRPC server on Server B
     let grpc_cancellation_b = CancellationToken::new();
@@ -137,7 +135,7 @@ async fn test_cross_server_game_relay() -> Result<()> {
         async {
             loop {
                 if let Some(msg) = client.receive_game_event().await? {
-                    if matches!(msg.event, GameEvent::Snapshot { .. }) {
+                    if matches!(msg.event, ::common::GameEvent::Snapshot { .. }) {
                         return Ok::<bool, anyhow::Error>(true);
                     }
                 }
@@ -149,7 +147,7 @@ async fn test_cross_server_game_relay() -> Result<()> {
     
     // Send a command (turn snake)
     client.send_message(server::ws_server::WSMessage::GameCommand(
-        GameCommand::Turn { snake_id: 1, direction: Direction::Up }
+        ::common::GameCommand::Turn { snake_id: 1, direction: ::common::Direction::Up }
     )).await?;
     
     // Wait for turn event
@@ -158,8 +156,8 @@ async fn test_cross_server_game_relay() -> Result<()> {
         async {
             loop {
                 if let Some(msg) = client.receive_game_event().await? {
-                    if let GameEvent::SnakeTurned { snake_id, direction } = msg.event {
-                        if snake_id == 1 && direction == Direction::Up {
+                    if let ::common::GameEvent::SnakeTurned { snake_id, direction } = msg.event {
+                        if snake_id == 1 && direction == ::common::Direction::Up {
                             return Ok::<bool, anyhow::Error>(true);
                         }
                     }
@@ -197,26 +195,25 @@ async fn test_multi_client_cross_server() -> Result<()> {
     
     // Register all servers
     for (id, ws_port, grpc_port) in &servers {
-        sqlx::query!(
-            "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-            id,
-            "localhost",
-            *ws_port as i32,
-            *grpc_port as i32,
-            "test"
-        )
+        sqlx::query(
+            "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+        .bind(id)
+        .bind("test-server")
+        .bind("localhost")
+        .bind(*ws_port as i32)
+        .bind(*grpc_port as i32)
+        .bind("test")
         .execute(&db_pool)
         .await?;
     }
     
     // Create game
     let game_id = 54321;
-    sqlx::query!(
-        "INSERT INTO games (id, status) VALUES ($1, $2)",
-        game_id as i32,
-        "waiting"
-    )
+    sqlx::query(
+        "INSERT INTO games (id, status) VALUES ($1, $2)")
+    .bind(game_id as i32)
+    .bind("waiting")
     .execute(&db_pool)
     .await?;
     
@@ -285,7 +282,7 @@ async fn test_multi_client_cross_server() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(msg) = client.receive_game_event().await? {
-                    if matches!(msg.event, GameEvent::Snapshot { .. }) {
+                    if matches!(msg.event, ::common::GameEvent::Snapshot { .. }) {
                         break;
                     }
                 }
@@ -298,7 +295,7 @@ async fn test_multi_client_cross_server() -> Result<()> {
     
     // Client 0 sends a command
     clients[0].send_message(server::ws_server::WSMessage::GameCommand(
-        GameCommand::Turn { snake_id: 1, direction: Direction::Left }
+        ::common::GameCommand::Turn { snake_id: 1, direction: ::common::Direction::Left }
     )).await?;
     
     // All clients should receive the turn event
@@ -308,8 +305,8 @@ async fn test_multi_client_cross_server() -> Result<()> {
             async {
                 loop {
                     if let Some(msg) = client.receive_game_event().await? {
-                        if let GameEvent::SnakeTurned { snake_id, direction } = msg.event {
-                            if snake_id == 1 && direction == Direction::Left {
+                        if let ::common::GameEvent::SnakeTurned { snake_id, direction } = msg.event {
+                            if snake_id == 1 && direction == ::common::Direction::Left {
                                 return Ok::<bool, anyhow::Error>(true);
                             }
                         }
@@ -352,27 +349,26 @@ async fn test_game_server_failover() -> Result<()> {
     let server_b_id = Uuid::new_v4();
     
     for (id, port) in [(server_a_id, 8080), (server_b_id, 8081)] {
-        sqlx::query!(
-            "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-            id,
-            "localhost",
-            port,
-            port + 1000,
-            "test"
-        )
+        sqlx::query(
+            "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+        .bind(id)
+        .bind("test-server")
+        .bind("localhost")
+        .bind(port)
+        .bind(port + 1000)
+        .bind("test")
         .execute(&db_pool)
         .await?;
     }
     
     // Create game on server A
     let game_id = 99999;
-    sqlx::query!(
-        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)",
-        game_id as i32,
-        "active",
-        server_a_id
-    )
+    sqlx::query(
+        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
+    .bind(game_id as i32)
+    .bind("active")
+    .bind(server_a_id)
     .execute(&db_pool)
     .await?;
     
@@ -384,10 +380,9 @@ async fn test_game_server_failover() -> Result<()> {
     assert_eq!(broker_b.get_game_location(game_id).await?, Some(server_a_id.to_string()));
     
     // Simulate server A going down by updating its heartbeat to be old
-    sqlx::query!(
-        "UPDATE servers SET last_heartbeat = NOW() - INTERVAL '5 minutes' WHERE id = $1",
-        server_a_id
-    )
+    sqlx::query(
+        "UPDATE servers SET last_heartbeat = NOW() - INTERVAL '5 minutes' WHERE id = $1")
+    .bind(server_a_id)
     .execute(&db_pool)
     .await?;
     

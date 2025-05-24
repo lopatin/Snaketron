@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Result;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, mpsc};
 use common::{GameCommandMessage, GameEventMessage};
 use sqlx::PgPool;
 use tonic::transport::Channel;
+use tokio_stream::StreamExt;
 
 // Re-export the generated proto types
 pub mod game_relay {
@@ -33,9 +34,13 @@ pub trait GameMessageBroker: Send + Sync {
     
     /// Check if a game is hosted locally
     async fn is_game_local(&self, game_id: u32) -> Result<bool>;
+    
+    /// Get self as Any for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Local in-memory broker for single-server deployment
+#[derive(Clone)]
 pub struct LocalBroker {
     command_txs: Arc<Mutex<HashMap<u32, broadcast::Sender<GameCommandMessage>>>>,
     event_txs: Arc<Mutex<HashMap<u32, broadcast::Sender<GameEventMessage>>>>,
@@ -120,9 +125,14 @@ impl GameMessageBroker for LocalBroker {
         let txs = self.command_txs.lock().await;
         Ok(txs.contains_key(&game_id))
     }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Distributed broker for multi-server deployment
+#[derive(Clone)]
 pub struct DistributedBroker {
     local_broker: LocalBroker,
     grpc_clients: Arc<Mutex<HashMap<String, GameRelayClient<Channel>>>>,
@@ -130,6 +140,10 @@ pub struct DistributedBroker {
     server_id: String,
     /// Cache of game locations (game_id -> server_id)
     game_locations: Arc<Mutex<HashMap<u32, String>>>,
+    /// Active gRPC streams to remote servers (server_id -> stream sender)
+    remote_streams: Arc<Mutex<HashMap<String, mpsc::Sender<game_relay::GameMessage>>>>,
+    /// Remote event receivers (game_id -> event receiver)
+    remote_event_rxs: Arc<Mutex<HashMap<u32, broadcast::Receiver<GameEventMessage>>>>,
 }
 
 impl DistributedBroker {
@@ -140,6 +154,8 @@ impl DistributedBroker {
             db_pool,
             server_id,
             game_locations: Arc::new(Mutex::new(HashMap::new())),
+            remote_streams: Arc::new(Mutex::new(HashMap::new())),
+            remote_event_rxs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
@@ -218,6 +234,75 @@ impl DistributedBroker {
         clients.insert(server_id.to_string(), client.clone());
         Ok(client)
     }
+    
+    /// Establish a bidirectional stream to a remote server
+    async fn ensure_stream_to_server(&self, server_id: &str) -> Result<()> {
+        let mut streams = self.remote_streams.lock().await;
+        
+        // Check if we already have a stream
+        if streams.contains_key(server_id) {
+            return Ok(());
+        }
+        
+        // Get gRPC client
+        let mut client = self.get_grpc_client(server_id).await?;
+        
+        // Create channel for sending messages
+        let (tx, rx) = mpsc::channel(32);
+        
+        // Start the bidirectional stream
+        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let response = client.stream_game_messages(request_stream).await?;
+        let mut response_stream = response.into_inner();
+        
+        // Store the sender
+        streams.insert(server_id.to_string(), tx);
+        
+        // Spawn task to handle incoming messages from remote server
+        let server_id_clone = server_id.to_string();
+        let broker = self.clone(); // We need Clone trait
+        tokio::spawn(async move {
+            while let Some(result) = response_stream.next().await {
+                match result {
+                    Ok(game_message) => {
+                        // Handle incoming message from remote server
+                        broker.handle_remote_message(game_message).await;
+                    }
+                    Err(e) => {
+                        eprintln!("Error receiving from server {}: {:?}", server_id_clone, e);
+                        break;
+                    }
+                }
+            }
+            // Clean up stream on error
+            let mut streams = broker.remote_streams.lock().await;
+            streams.remove(&server_id_clone);
+        });
+        
+        Ok(())
+    }
+    
+    /// Handle incoming message from remote server
+    async fn handle_remote_message(&self, message: game_relay::GameMessage) {
+        use game_relay::game_message::Message;
+        
+        match message.message {
+            Some(Message::Event(event)) => {
+                // Deserialize and broadcast event locally
+                if let Ok(event_msg) = bincode::deserialize::<GameEventMessage>(&event.event_data) {
+                    // Forward to local subscribers
+                    let _ = self.local_broker.publish_event(event.game_id, event_msg).await;
+                }
+            }
+            Some(Message::Command(cmd)) => {
+                // This shouldn't happen in normal flow (commands go TO remote)
+                eprintln!("Received unexpected command from remote: game_id={}", cmd.game_id);
+            }
+            _ => {
+                // Subscribe/unsubscribe handled elsewhere
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -241,17 +326,76 @@ impl GameMessageBroker for DistributedBroker {
                 return self.local_broker.publish_command(game_id, command).await;
             }
             
-            // TODO: Implement gRPC forwarding
-            // For now, return error
-            return Err(anyhow::anyhow!("Remote command forwarding not yet implemented"));
+            // Ensure we have a stream to the remote server
+            self.ensure_stream_to_server(&server_id).await?;
+            
+            // Serialize command
+            let command_data = bincode::serialize(&command.command)?;
+            
+            // Create gRPC message
+            let grpc_command = game_relay::GameCommand {
+                game_id,
+                tick: command.tick,
+                user_id: command.user_id as i32,
+                command_data,
+            };
+            
+            let message = game_relay::GameMessage {
+                message: Some(game_relay::game_message::Message::Command(grpc_command)),
+            };
+            
+            // Send via stream
+            let streams = self.remote_streams.lock().await;
+            if let Some(tx) = streams.get(&server_id) {
+                tx.send(message).await?;
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Failed to get stream to server {}", server_id))
+            }
+        } else {
+            Err(anyhow::anyhow!("Game {} not found on any server", game_id))
         }
-        
-        Err(anyhow::anyhow!("Game {} not found on any server", game_id))
     }
     
     async fn subscribe_events(&self, game_id: u32) -> Result<broadcast::Receiver<GameEventMessage>> {
-        // For now, we only support subscribing to local games
-        self.local_broker.subscribe_events(game_id).await
+        // Check if game is local
+        if self.is_game_local(game_id).await? {
+            return self.local_broker.subscribe_events(game_id).await;
+        }
+        
+        // For remote games, we need to:
+        // 1. Ensure stream to remote server
+        // 2. Send subscribe message
+        // 3. Create local event channel that will receive forwarded events
+        
+        if let Some(server_id) = self.lookup_game_server(game_id).await? {
+            // Ensure stream exists
+            self.ensure_stream_to_server(&server_id).await?;
+            
+            // Send subscribe message
+            let subscribe = game_relay::Subscribe {
+                game_id,
+                commands: false,
+                events: true,
+            };
+            
+            let message = game_relay::GameMessage {
+                message: Some(game_relay::game_message::Message::Subscribe(subscribe)),
+            };
+            
+            let streams = self.remote_streams.lock().await;
+            if let Some(tx) = streams.get(&server_id) {
+                tx.send(message).await?;
+            }
+            
+            // Create a local channel for this remote game if it doesn't exist
+            self.local_broker.create_game_channels(game_id).await?;
+            
+            // Now we can subscribe to the local channel which will receive forwarded events
+            self.local_broker.subscribe_events(game_id).await
+        } else {
+            Err(anyhow::anyhow!("Game {} not found", game_id))
+        }
     }
     
     async fn publish_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
@@ -270,6 +414,10 @@ impl GameMessageBroker for DistributedBroker {
         } else {
             Ok(false)
         }
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

@@ -1,13 +1,12 @@
 use anyhow::Result;
-use sqlx::PgPool;
-use server::game_broker::{GameMessageBroker, DistributedBroker, LocalBroker};
-use common::{GameCommandMessage, GameEventMessage, GameCommand, GameEvent, Position};
+use server::game_broker::{GameMessageBroker, DistributedBroker};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 // Import test utilities
+#[path = "common/mod.rs"]
 mod common;
-use common::TestServerBuilder;
+use self::common::TestServerBuilder;
 
 #[tokio::test]
 async fn test_distributed_broker_local_game() -> Result<()> {
@@ -16,15 +15,16 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     let server_id = Uuid::new_v4().to_string();
     
     // Register server in database
-    sqlx::query!(
-        "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-        Uuid::parse_str(&server_id)?,
-        "localhost",
-        8080,
-        9090,
-        "test"
+    sqlx::query(
+        "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())"
     )
+    .bind(Uuid::parse_str(&server_id)?)
+    .bind("test-server")
+    .bind("localhost")
+    .bind(8080)
+    .bind(9090)
+    .bind("test")
     .execute(&db_pool)
     .await?;
     
@@ -33,13 +33,11 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Create a game
     let game_id = 123;
-    sqlx::query!(
-        "INSERT INTO games (id, status) VALUES ($1, $2)",
-        game_id as i32,
-        "active"
-    )
-    .execute(&db_pool)
-    .await?;
+    sqlx::query("INSERT INTO games (id, status) VALUES ($1, $2)")
+        .bind(game_id as i32)
+        .bind("active")
+        .execute(&db_pool)
+        .await?;
     
     // Create game channels (this should also update the database)
     broker.create_game_channels(game_id).await?;
@@ -50,11 +48,11 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Test command pub/sub
     let mut cmd_rx = broker.subscribe_commands(game_id).await?;
-    let test_cmd = GameCommandMessage {
-        game_id,
+    let test_cmd = ::common::GameCommandMessage {
         tick: 100,
+        received_order: 1,
         user_id: 1,
-        command: GameCommand::Tick,
+        command: ::common::GameCommand::Tick,
     };
     broker.publish_command(game_id, test_cmd.clone()).await?;
     
@@ -63,11 +61,11 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Test event pub/sub
     let mut evt_rx = broker.subscribe_events(game_id).await?;
-    let test_evt = GameEventMessage {
+    let test_evt = ::common::GameEventMessage {
         game_id,
         tick: 101,
         user_id: Some(1),
-        event: GameEvent::FoodSpawned { position: Position { x: 10, y: 20 } },
+        event: ::common::GameEvent::FoodSpawned { position: ::common::Position { x: 10, y: 20 } },
     };
     broker.publish_event(game_id, test_evt.clone()).await?;
     
@@ -85,27 +83,26 @@ async fn test_distributed_broker_remote_game_lookup() -> Result<()> {
     
     // Register both servers
     for (id, port) in [(local_server_id.clone(), 8080), (remote_server_id.clone(), 8081)] {
-        sqlx::query!(
-            "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-            Uuid::parse_str(&id)?,
-            "localhost",
-            port,
-            port + 1000,
-            "test"
-        )
+        sqlx::query(
+            "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+        .bind(Uuid::parse_str(&id)?)
+        .bind("test-server")
+        .bind("localhost")
+        .bind(port)
+        .bind(port + 1000)
+        .bind("test")
         .execute(&db_pool)
         .await?;
     }
     
     // Create game on remote server
     let game_id = 456;
-    sqlx::query!(
-        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)",
-        game_id as i32,
-        "active",
-        Uuid::parse_str(&remote_server_id)?
-    )
+    sqlx::query(
+        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
+    .bind(game_id as i32)
+    .bind("active")
+    .bind(Uuid::parse_str(&remote_server_id)?)
     .execute(&db_pool)
     .await?;
     
@@ -117,11 +114,11 @@ async fn test_distributed_broker_remote_game_lookup() -> Result<()> {
     assert_eq!(broker.get_game_location(game_id).await?, Some(remote_server_id));
     
     // Publishing to remote game should fail (not implemented yet)
-    let test_cmd = GameCommandMessage {
-        game_id,
+    let test_cmd = ::common::GameCommandMessage {
         tick: 200,
+        received_order: 1,
         user_id: 2,
-        command: GameCommand::Tick,
+        command: ::common::GameCommand::Tick,
     };
     assert!(broker.publish_command(game_id, test_cmd).await.is_err());
     
@@ -134,26 +131,25 @@ async fn test_distributed_broker_caching() -> Result<()> {
     let server_id = Uuid::new_v4().to_string();
     
     // Register server
-    sqlx::query!(
-        "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-        Uuid::parse_str(&server_id)?,
-        "localhost",
-        8080,
-        9090,
-        "test"
-    )
+    sqlx::query(
+        "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+    .bind(Uuid::parse_str(&server_id)?)
+    .bind("test-server")
+    .bind("localhost")
+    .bind(8080)
+    .bind(9090)
+    .bind("test")
     .execute(&db_pool)
     .await?;
     
     // Create game
     let game_id = 789;
-    sqlx::query!(
-        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)",
-        game_id as i32,
-        "active",
-        Uuid::parse_str(&server_id)?
-    )
+    sqlx::query(
+        "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
+    .bind(game_id as i32)
+    .bind("active")
+    .bind(Uuid::parse_str(&server_id)?)
     .execute(&db_pool)
     .await?;
     
@@ -178,15 +174,15 @@ async fn test_multiple_games_on_different_servers() -> Result<()> {
     
     // Register servers
     for (id, port) in [(server1_id.clone(), 8080), (server2_id.clone(), 8081)] {
-        sqlx::query!(
-            "INSERT INTO servers (id, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
-            Uuid::parse_str(&id)?,
-            "localhost",
-            port,
-            port + 1000,
-            "test"
-        )
+        sqlx::query(
+            "INSERT INTO servers (id, hostname, host, ws_port, grpc_port, region, created_at, last_heartbeat) 
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())")
+        .bind(Uuid::parse_str(&id)?)
+        .bind("test-server")
+        .bind("localhost")
+        .bind(port)
+        .bind(port + 1000)
+        .bind("test")
         .execute(&db_pool)
         .await?;
     }
@@ -200,12 +196,11 @@ async fn test_multiple_games_on_different_servers() -> Result<()> {
     ];
     
     for (game_id, server_id) in &games {
-        sqlx::query!(
-            "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)",
-            *game_id as i32,
-            "active",
-            Uuid::parse_str(server_id)?
-        )
+        sqlx::query(
+            "INSERT INTO games (id, status, server_id) VALUES ($1, $2, $3)")
+        .bind(*game_id as i32)
+        .bind("active")
+        .bind(Uuid::parse_str(server_id)?)
         .execute(&db_pool)
         .await?;
     }
