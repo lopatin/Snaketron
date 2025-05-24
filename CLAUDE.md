@@ -44,6 +44,9 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 ## Project Structure
 - The _old directory can be fully ignored for all purposes
 
+## Development Notes
+- When developing migrations, just update the V1 migration, instead of adding a new one. And then, when necessary to run tests, clear / restart the db docker container before running them if necessary.
+
 ## Commands
 
 ### Database
@@ -127,3 +130,9 @@ cargo build --all
 # Run all tests
 cargo test --all
 ```
+
+### Development Best Practices
+- Make sure that `cargo test` passes before committing any changes
+
+### Testing Guidelines
+- Server integration tests should not access the DB directly, they should emulate what the main method would do on servers, which do their own maintenance rather than needing it to be in a test harness.

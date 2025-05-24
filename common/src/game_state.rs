@@ -52,6 +52,14 @@ pub enum GameType {
     FreeForAll { max_players: u8 },
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum GameStatus {
+    Waiting,    // Created, waiting for players to connect
+    Active,     // Game in progress
+    Finished,   // Game completed normally
+    Abandoned,  // All players disconnected
+}
+
 impl GameType {
     pub fn is_duel(&self) -> bool {
         self == &GameType::TeamMatch { per_team: 1 }

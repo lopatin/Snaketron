@@ -4,6 +4,7 @@ use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 use std::time::Duration;
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream, StreamExt};
@@ -19,7 +20,7 @@ use tungstenite::Utf8Bytes;
 use common::{GameCommand, GameCommandMessage, Direction, GameEvent, GameEventMessage};
 use crate::games_manager::GamesManager;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum WSMessage {
     Token(String),
     JoinGame(u32),
@@ -28,6 +29,10 @@ pub enum WSMessage {
     Shutdown,
     Ping,
     Pong,
+    // Matchmaking messages
+    QueueForMatch { game_type: common::GameType },
+    LeaveQueue,
+    MatchFound { game_id: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,6 +53,89 @@ pub struct DefaultJwtVerifier;
 impl JwtVerifier for DefaultJwtVerifier {
     async fn verify(&self, _token: &str) -> Result<UserToken> {
         Err(anyhow::anyhow!("JWT verification not implemented"))
+    }
+}
+
+async fn add_to_matchmaking_queue(
+    pool: &PgPool,
+    user_id: i32,
+    game_type: common::GameType,
+) -> Result<()> {
+    // First, get the current server ID (we need to know which server the user is connected to)
+    // For now, we'll use a placeholder. In a real implementation, this would be passed down.
+    let server_id = get_current_server_id(pool).await?;
+    
+    // Remove any existing queue entry for this user
+    sqlx::query(
+        "DELETE FROM game_requests WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    
+    // Insert new queue entry
+    sqlx::query(
+        r#"
+        INSERT INTO game_requests (server_id, user_id, game_type, request_time)
+        VALUES ($1, $2, $3, NOW())
+        "#
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .bind(serde_json::to_value(&game_type)?)
+    .execute(pool)
+    .await?;
+    
+    info!("User {} added to matchmaking queue for game type {:?}", user_id, game_type);
+    Ok(())
+}
+
+async fn remove_from_matchmaking_queue(
+    pool: &PgPool,
+    user_id: i32,
+) -> Result<()> {
+    let result = sqlx::query(
+        "DELETE FROM game_requests WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    
+    if result.rows_affected() > 0 {
+        info!("User {} removed from matchmaking queue", user_id);
+    } else {
+        info!("User {} was not in matchmaking queue", user_id);
+    }
+    
+    Ok(())
+}
+
+async fn get_current_server_id(pool: &PgPool) -> Result<Uuid> {
+    // In a real implementation, this would be stored when the server starts
+    // For now, get the first server or create one
+    let server_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM servers ORDER BY created_at DESC LIMIT 1"
+    )
+    .fetch_optional(pool)
+    .await?;
+    
+    match server_id {
+        Some(id) => Ok(id),
+        None => {
+            // Create a default server for testing
+            let id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO servers (id, address, last_heartbeat, current_game_count, max_game_capacity)
+                VALUES ($1, $2, NOW(), 0, 100)
+                "#
+            )
+            .bind(id)
+            .bind("127.0.0.1:8080")
+            .execute(pool)
+            .await?;
+            Ok(id)
+        }
     }
 }
 
@@ -92,20 +180,23 @@ impl ConnectionState {
 }
 
 
+
 pub async fn run_websocket_server(
     addr: &str,
     games_manager: Arc<Mutex<GamesManager>>,
+    db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
-    run_websocket_server_with_listener(listener, games_manager, cancellation_token, jwt_verifier).await
+    run_websocket_server_with_listener(listener, games_manager, db_pool, cancellation_token, jwt_verifier).await
 }
 
 pub async fn run_websocket_server_with_listener(
     listener: TcpListener,
     games_manager: Arc<Mutex<GamesManager>>,
+    db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>
 ) -> Result<()> {
@@ -128,7 +219,8 @@ pub async fn run_websocket_server_with_listener(
                         let connection_token = cancellation_token.child_token();
                         let games_manager_clone = games_manager.clone();
                         let jwt_verifier_clone = jwt_verifier.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, stream, connection_token, jwt_verifier_clone));
+                        let db_pool_clone = db_pool.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, db_pool_clone, stream, connection_token, jwt_verifier_clone));
                         connection_handles.push(handle);
                     }
 
@@ -165,6 +257,7 @@ pub async fn run_websocket_server_with_listener(
 
 async fn handle_websocket_connection(
     games_manager: Arc<Mutex<GamesManager>>,
+    db_pool: PgPool,
     stream: TcpStream,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>
@@ -324,6 +417,26 @@ async fn handle_websocket_connection(
                                             }
                                         }
                                     }
+                                    WSMessage::QueueForMatch { game_type } => {
+                                        info!("User {} queuing for match type: {:?}", user_token.user_id, game_type);
+                                        
+                                        // Add to matchmaking queue
+                                        if let Err(e) = add_to_matchmaking_queue(&db_pool, user_token.user_id, game_type).await {
+                                            error!("Failed to add user to matchmaking queue: {}", e);
+                                        }
+                                        
+                                        ConnectionState::Authenticated { user_token }
+                                    }
+                                    WSMessage::LeaveQueue => {
+                                        info!("User {} leaving matchmaking queue", user_token.user_id);
+                                        
+                                        // Remove from matchmaking queue
+                                        if let Err(e) = remove_from_matchmaking_queue(&db_pool, user_token.user_id).await {
+                                            error!("Failed to remove user from matchmaking queue: {}", e);
+                                        }
+                                        
+                                        ConnectionState::Authenticated { user_token }
+                                    }
                                     WSMessage::Ping => {
                                         // Respond with Pong
                                         let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
@@ -457,43 +570,42 @@ async fn handle_websocket_connection(
 }
 
 
-pub async fn register_server(pool: &PgPool, region: &str) -> Result<i32> {
+pub async fn register_server(pool: &PgPool, _region: &str) -> Result<Uuid> {
     info!("Registering server instance");
-    let hostname = gethostname::gethostname()
-        .into_string()
-        .unwrap_or_else(|_| "unknown".to_string());
+    
+    let server_id = Uuid::new_v4();
+    let address = "127.0.0.1:8080"; // In production, this would be the actual server address
 
     // Insert a new record and return the generated ID
-    let server_id: i32 = sqlx::query_scalar(
+    sqlx::query(
         r#"
-        INSERT INTO servers (hostname, region)
-        VALUES ($1, $2)
-        RETURNING id
+        INSERT INTO servers (id, address, last_heartbeat, current_game_count, max_game_capacity)
+        VALUES ($1, $2, NOW(), 0, 100)
         "#
     )
-        .bind::<&str>(&hostname)
-        .bind::<&str>(region)
-        .fetch_one(pool)
+        .bind(server_id)
+        .bind(address)
+        .execute(pool)
         .await
         .context("Failed to register server in database")?;
 
-    info!(server_id, %hostname, "Server registered successfully with ID");
+    info!(?server_id, address, "Server registered successfully");
     Ok(server_id)
 }
 
 pub async fn run_heartbeat_loop(
     pool: PgPool,
-    server_id: i32,
+    server_id: Uuid,
     cancellation_token: CancellationToken
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
-    info!(server_id, "Starting heartbeat loop");
+    info!(?server_id, "Starting heartbeat loop");
 
     loop {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                info!(server_id, "Heartbeat shutdown received");
+                info!(?server_id, "Heartbeat shutdown received");
                 break;
             }
 
@@ -508,22 +620,23 @@ pub async fn run_heartbeat_loop(
                     "#
                 )
                     .bind::<DateTime<Utc>>(now)
-                    .bind::<i32>(server_id)
+                    .bind(server_id)
                     .execute(&pool)
                     .await
                 {
                     Ok(result) => {
                         if result.rows_affected() == 1 {
-                            trace!(server_id, timestamp = %now, "Heartbeat sent successfully.");
+                            trace!(?server_id, timestamp = %now, "Heartbeat sent successfully.");
                         } else {
-                            warn!(server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
+                            warn!(?server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
                         }
                     }
                     Err(e) => {
-                        error!(server_id, error = %e, "Failed to send heartbeat");
+                        error!(?server_id, error = %e, "Failed to send heartbeat");
                     }
                 }
             }
         }
     }
 }
+

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use server::ws_server::*;
 use server::games_manager::GamesManager;
+use uuid::Uuid;
 
 mod migrations {
     use refinery::embed_migrations;
@@ -70,7 +71,7 @@ async fn main() -> Result<()> {
 
     // Register server
     let server_id = register_server(&db_pool, region.as_str()).await?;
-    info!(server_id, "Server registered in database");
+    info!(?server_id, "Server registered in database");
 
     let cancellation_token = CancellationToken::new();
 
@@ -89,8 +90,23 @@ async fn main() -> Result<()> {
 
     // Websocket server
     let websocket_cancellation_token = cancellation_token.clone();
+    let db_pool_clone = db_pool.clone();
     let external_server_handle = tokio::spawn(async move {
-        run_websocket_server(&ws_addr, games_manager, websocket_cancellation_token, jwt_verifier).await
+        run_websocket_server(&ws_addr, games_manager, db_pool_clone, websocket_cancellation_token, jwt_verifier).await
+    });
+    
+    // Matchmaking service
+    let matchmaking_pool = db_pool.clone();
+    let matchmaking_handle = tokio::spawn(async move {
+        server::matchmaking::run_matchmaking_loop(matchmaking_pool, server_id).await;
+        Ok::<(), anyhow::Error>(())
+    });
+    
+    // Game cleanup service
+    let cleanup_pool = db_pool.clone();
+    let cleanup_token = cancellation_token.clone();
+    let cleanup_handle = tokio::spawn(async move {
+        server::game_cleanup::run_cleanup_service(cleanup_pool, cleanup_token).await
     });
 
 
@@ -99,7 +115,20 @@ async fn main() -> Result<()> {
 
     info!("Received shutdown signal. Shutting down.");
     cancellation_token.cancel();
-    heartbeat_loop.await?;
-    external_server_handle.await?
+    
+    // Wait for all services to complete
+    let (heartbeat_result, external_result, matchmaking_result, cleanup_result) = tokio::join!(
+        heartbeat_loop,
+        external_server_handle,
+        matchmaking_handle,
+        cleanup_handle
+    );
+    
+    heartbeat_result?;
+    external_result??;
+    matchmaking_result??;
+    cleanup_result??;
+    
+    Ok(())
 }
 

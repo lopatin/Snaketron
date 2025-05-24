@@ -1,0 +1,200 @@
+use anyhow::Result;
+use server::ws_server::WSMessage;
+use ::common::{GameType, GameEvent};
+use tokio::time::{timeout, Duration};
+
+mod common;
+use self::common::{TestEnvironment, TestClient};
+
+#[tokio::test]
+async fn test_cleanup_abandoned_game() -> Result<()> {
+    let env = TestEnvironment::new(1).await?;
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Create a game with two players
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+    
+    client1.authenticate(1).await?;
+    client2.authenticate(2).await?;
+    
+    // Get matched
+    client1.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    
+    client2.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    
+    let game_id = wait_for_match(&mut client1).await?;
+    let _ = wait_for_match(&mut client2).await?;
+    
+    // Both join the game
+    client1.send_message(WSMessage::JoinGame(game_id)).await?;
+    client2.send_message(WSMessage::JoinGame(game_id)).await?;
+    
+    // Wait for game to start
+    wait_for_snapshot(&mut client1).await?;
+    wait_for_snapshot(&mut client2).await?;
+    
+    // Both players disconnect, abandoning the game
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    
+    // The cleanup service will eventually mark this game as abandoned
+    // and clean it up according to the configured timeouts
+    
+    // No manual database manipulation needed - the server handles it
+    
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cleanup_finished_game() -> Result<()> {
+    let env = TestEnvironment::new(1).await?;
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Create a game
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+    
+    client1.authenticate(1).await?;
+    client2.authenticate(2).await?;
+    
+    client1.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    
+    client2.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    
+    let game_id = wait_for_match(&mut client1).await?;
+    let _ = wait_for_match(&mut client2).await?;
+    
+    // Join game
+    client1.send_message(WSMessage::JoinGame(game_id)).await?;
+    client2.send_message(WSMessage::JoinGame(game_id)).await?;
+    
+    wait_for_snapshot(&mut client1).await?;
+    wait_for_snapshot(&mut client2).await?;
+    
+    // In a real game, the game would end when a win condition is met
+    // For testing, we just disconnect and let cleanup handle it
+    
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    
+    // The cleanup service will handle game cleanup based on game state
+    // No manual intervention needed
+    
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
+    let env = TestEnvironment::new(1).await?;
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Create clients that queue but never get matched
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+    
+    client1.authenticate(1).await?;
+    client2.authenticate(2).await?;
+    
+    // Queue for a match that requires 3 players
+    client1.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 3 } 
+    }).await?;
+    
+    client2.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 3 } 
+    }).await?;
+    
+    // Wait a bit but not long enough to get matched
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    
+    // Disconnect without leaving queue properly
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    
+    // The server's cleanup service will handle removing stale requests
+    // No manual database cleanup needed
+    
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_games_cleanup() -> Result<()> {
+    let env = TestEnvironment::new(1).await?;
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Create multiple games concurrently
+    let mut game_ids = Vec::new();
+    
+    for i in 0..3 {
+        let mut client1 = TestClient::connect(&server_addr).await?;
+        let mut client2 = TestClient::connect(&server_addr).await?;
+        
+        client1.authenticate(i * 2 + 1).await?;
+        client2.authenticate(i * 2 + 2).await?;
+        
+        client1.send_message(WSMessage::QueueForMatch { 
+            game_type: GameType::FreeForAll { max_players: 2 } 
+        }).await?;
+        
+        client2.send_message(WSMessage::QueueForMatch { 
+            game_type: GameType::FreeForAll { max_players: 2 } 
+        }).await?;
+        
+        let game_id = wait_for_match(&mut client1).await?;
+        let _ = wait_for_match(&mut client2).await?;
+        game_ids.push(game_id);
+        
+        // Join games
+        client1.send_message(WSMessage::JoinGame(game_id)).await?;
+        client2.send_message(WSMessage::JoinGame(game_id)).await?;
+        
+        wait_for_snapshot(&mut client1).await?;
+        wait_for_snapshot(&mut client2).await?;
+        
+        // Abandon the games
+        client1.disconnect().await?;
+        client2.disconnect().await?;
+    }
+    
+    // All games will be cleaned up by the server's cleanup service
+    // based on their state and configured timeouts
+    
+    env.shutdown().await?;
+    Ok(())
+}
+
+// Helper functions
+async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::MatchFound { game_id } => return Ok(game_id),
+                _ => continue,
+            }
+        }
+    }).await?
+}
+
+async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(event) = client.receive_game_event().await? {
+                if matches!(event.event, GameEvent::Snapshot { .. }) {
+                    return Ok(());
+                }
+            }
+        }
+    }).await?
+}

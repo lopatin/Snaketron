@@ -37,14 +37,14 @@ struct MatchmakingPlayer {
 
 #[derive(sqlx::FromRow, Debug)]
 struct ServerLoad {
-    id: i32,
+    id: uuid::Uuid,
     current_game_count: i32,
     max_game_capacity: i32,
 }
 
 /// Main matchmaking loop that runs on each server
-pub async fn run_matchmaking_loop(pool: PgPool, server_id: i32) {
-    info!(server_id, "Starting adaptive matchmaking loop");
+pub async fn run_matchmaking_loop(pool: PgPool, server_id: uuid::Uuid) {
+    info!(?server_id, "Starting adaptive matchmaking loop");
 
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -54,7 +54,7 @@ pub async fn run_matchmaking_loop(pool: PgPool, server_id: i32) {
         
         // Update server heartbeat
         if let Err(e) = update_heartbeat(&pool, server_id).await {
-            error!(server_id, error = %e, "Failed to update heartbeat");
+            error!(?server_id, error = %e, "Failed to update heartbeat");
         }
 
         // Try to create matches for different game types
@@ -83,7 +83,7 @@ pub async fn run_matchmaking_loop(pool: PgPool, server_id: i32) {
 }
 
 /// Update server heartbeat
-async fn update_heartbeat(pool: &PgPool, server_id: i32) -> Result<(), sqlx::Error> {
+async fn update_heartbeat(pool: &PgPool, server_id: uuid::Uuid) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -179,16 +179,22 @@ async fn create_adaptive_match(
     // Select least loaded server
     let server_id = select_least_loaded_server(&mut tx).await?;
 
-    // Create the game
+    // Create the game with proper game_type JSONB
+    let game_type_json = match game_type {
+        1 => serde_json::json!({"FreeForAll": {"max_players": 10}}),
+        2 => serde_json::json!({"TeamMatch": {"per_team": 2}}),
+        _ => serde_json::json!({"FreeForAll": {"max_players": 10}}),
+    };
+    
     let game_id: i32 = sqlx::query_scalar(
         r#"
-        INSERT INTO games (server_id, game_type, game_state, created_at)
-        VALUES ($1, $2, $3, NOW())
+        INSERT INTO games (server_id, game_type, game_state, status, created_at, last_activity)
+        VALUES ($1, $2, $3, 'waiting', NOW(), NOW())
         RETURNING id
         "#
     )
     .bind(server_id)
-    .bind(game_type)
+    .bind(game_type_json)
     .bind(INITIAL_GAME_STATE)
     .fetch_one(&mut *tx)
     .await?;
@@ -197,13 +203,13 @@ async fn create_adaptive_match(
     for (idx, user_id) in user_ids.iter().enumerate() {
         sqlx::query(
             r#"
-            INSERT INTO game_players (game_id, user_id, player_number, joined_at)
+            INSERT INTO game_players (game_id, user_id, team_id, joined_at)
             VALUES ($1, $2, $3, NOW())
             "#
         )
         .bind(game_id)
         .bind(user_id)
-        .bind(idx as i32)
+        .bind(idx as i32 % 2)  // Alternate teams for now
         .execute(&mut *tx)
         .await?;
     }
@@ -247,7 +253,7 @@ async fn create_adaptive_match(
     
     info!(
         game_id,
-        server_id,
+        ?server_id,
         player_count = matched_players.len(),
         avg_mmr,
         max_wait_seconds = max_wait,
@@ -261,7 +267,7 @@ async fn create_adaptive_match(
 /// Select the least loaded healthy server
 async fn select_least_loaded_server(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<i32, sqlx::Error> {
+) -> Result<uuid::Uuid, sqlx::Error> {
     let server: ServerLoad = sqlx::query_as(
         r#"
         SELECT id, current_game_count, max_game_capacity

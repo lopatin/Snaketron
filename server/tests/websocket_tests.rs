@@ -67,7 +67,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         info!("Test server built at {}", server.addr);
         
         // Create a game with unique ID to avoid conflicts when tests run in parallel
-        let test_game_id = (rand::random::<u16>() as u32) + 400000;
+        let test_game_id = common::generate_unique_game_id();
         server.create_game(test_game_id).await?;
         info!("Game {} created", test_game_id);
         
