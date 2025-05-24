@@ -281,7 +281,7 @@ async fn handle_websocket_connection(
                                         let games_mgr = games_manager.lock().await;
                                         match games_mgr.join_game(game_id).await {
                                             Ok((command_tx, event_rx)) => {
-                                                // Get the current game snapshot
+                                                // Try to get the current game snapshot (for local games)
                                                 match games_mgr.get_game_snapshot(game_id).await {
                                                     Ok(game_state) => {
                                                         // Send snapshot to client
@@ -297,6 +297,7 @@ async fn handle_websocket_connection(
                                                             error!("Failed to send snapshot: {}", e);
                                                             ConnectionState::Authenticated { user_token }
                                                         } else {
+                                                            info!("WS: Transitioning to InGame state for game {} (local)", game_id);
                                                             ConnectionState::InGame {
                                                                 user_token,
                                                                 game_id,
@@ -306,8 +307,14 @@ async fn handle_websocket_connection(
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        error!("Failed to get game snapshot: {}", e);
-                                                        ConnectionState::Authenticated { user_token }
+                                                        // For remote games, we'll get the snapshot as an event
+                                                        info!("Could not get local snapshot ({}), transitioning to InGame state for game {} anyway", e, game_id);
+                                                        ConnectionState::InGame {
+                                                            user_token,
+                                                            game_id,
+                                                            command_tx,
+                                                            event_rx,
+                                                        }
                                                     }
                                                 }
                                             }
@@ -416,7 +423,7 @@ async fn handle_websocket_connection(
             } => {
                 match game_event {
                     Ok(event) => {
-                        info!("Received game event: {:?}", event);
+                        info!("WS: Received game event for game {}: {:?}", event.game_id, event.event);
                         let json_msg = serde_json::json!(event);
                         let game_event_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
                         if let Err(e) = ws_stream.send(game_event_msg).await {

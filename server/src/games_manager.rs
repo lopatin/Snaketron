@@ -168,7 +168,9 @@ impl GamesManager {
         if let Some(broker) = &self.broker {
             // Create wrapper channels that forward through the broker
             let (cmd_tx, mut cmd_rx) = broadcast::channel(32);
-            let event_rx = broker.subscribe_events(game_id).await?;
+            let event_rx = broker.subscribe_events(game_id).await.map_err(|e| {
+                e
+            })?;
             
             // Give the subscription a moment to establish
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -181,7 +183,9 @@ impl GamesManager {
                 user_id: 0, // System command
                 command: GameCommand::RequestSnapshot,
             };
-            broker.publish_command(game_id, snapshot_request).await?;
+            broker.publish_command(game_id, snapshot_request).await.map_err(|e| {
+                e
+            })?;
             
             // Spawn a task to forward commands through the broker
             let broker_clone = broker.clone();

@@ -65,18 +65,15 @@ impl GameRelay for GameRelayService {
                                 // Remote server wants to subscribe to a game
                                 if sub.events {
                                     info!("Remote server subscribing to events for game {}", sub.game_id);
-                                    println!("gRPC: Remote server subscribing to events for game {}", sub.game_id);
                                     
                                     // Subscribe to local game events and forward them
                                     if let Ok(mut event_rx) = broker.subscribe_events(sub.game_id).await {
-                                        println!("gRPC: Successfully subscribed to game {} events", sub.game_id);
                                         let tx = response_tx_clone.clone();
                                         let game_id = sub.game_id;
                                         
                                         tokio::spawn(async move {
                                             while let Ok(event_msg) = event_rx.recv().await {
                                                 // Serialize just the event, not the whole message
-                                                println!("gRPC: Serializing event: {:?}", event_msg.event);
                                                 if let Ok(event_data) = bincode::serde::encode_to_vec(&event_msg.event, bincode::config::standard()) {
                                                     let grpc_event = game_relay::GameEvent {
                                                         game_id,
@@ -89,7 +86,6 @@ impl GameRelay for GameRelayService {
                                                         message: Some(game_relay::game_message::Message::Event(grpc_event)),
                                                     };
                                                     
-                                                    println!("gRPC: Forwarding event for game {} tick {}", game_id, event_msg.tick);
                                                     if tx.send(Ok(message)).await.is_err() {
                                                         break; // Client disconnected
                                                     }

@@ -16,6 +16,7 @@ use self::common::{TestServerBuilder, TestClient};
 /// Test that a client connected to Server A can play a game running on Server B
 #[tokio::test]
 async fn test_cross_server_game_relay() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
     // Create shared test database
     let db_pool = TestServerBuilder::create_test_db().await?;
     
@@ -189,6 +190,7 @@ async fn test_cross_server_game_relay() -> Result<()> {
 /// Test multiple clients on different servers playing the same game
 #[tokio::test]
 async fn test_multi_client_cross_server() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
     // Create shared test database
     let db_pool = TestServerBuilder::create_test_db().await?;
     

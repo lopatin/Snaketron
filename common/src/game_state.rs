@@ -47,7 +47,6 @@ pub struct GameProperties {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(tag = "type", content = "data")]
 pub enum GameType {
     TeamMatch { per_team: u8 },
     FreeForAll { max_players: u8 },

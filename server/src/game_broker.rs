@@ -54,16 +54,19 @@ impl LocalBroker {
         }
     }
     
-    /// Create channels for a new game
+    /// Create channels for a new game (only if they don't exist)
     pub async fn create_game_channels(&self, game_id: u32) -> Result<()> {
-        let (command_tx, _) = broadcast::channel(32);
-        let (event_tx, _) = broadcast::channel(32);
-        
         let mut cmd_txs = self.command_txs.lock().await;
         let mut evt_txs = self.event_txs.lock().await;
         
-        cmd_txs.insert(game_id, command_tx);
-        evt_txs.insert(game_id, event_tx);
+        // Only create channels if they don't already exist
+        if !cmd_txs.contains_key(&game_id) {
+            let (command_tx, _) = broadcast::channel(32);
+            let (event_tx, _) = broadcast::channel(32);
+            
+            cmd_txs.insert(game_id, command_tx);
+            evt_txs.insert(game_id, event_tx);
+        }
         
         Ok(())
     }
@@ -142,7 +145,7 @@ pub struct DistributedBroker {
     game_locations: Arc<Mutex<HashMap<u32, String>>>,
     /// Active gRPC streams to remote servers (server_id -> stream sender)
     remote_streams: Arc<Mutex<HashMap<String, mpsc::Sender<game_relay::GameMessage>>>>,
-    /// Remote event receivers (game_id -> event receiver)
+    /// Remote event receivers kept alive to prevent channel closure (game_id -> event receiver)
     remote_event_rxs: Arc<Mutex<HashMap<u32, broadcast::Receiver<GameEventMessage>>>>,
 }
 
@@ -241,11 +244,9 @@ impl DistributedBroker {
         
         // Check if we already have a stream
         if streams.contains_key(server_id) {
-            println!("Already have stream to server {}", server_id);
             return Ok(());
         }
         
-        println!("Creating new stream to server {}", server_id);
         // Get gRPC client
         let mut client = self.get_grpc_client(server_id).await?;
         
@@ -298,15 +299,12 @@ impl DistributedBroker {
                         user_id: event.user_id.map(|id| id as u32),
                         event: game_event,
                     };
-                    println!("Broker: Received event from remote server for game {} tick {}", event.game_id, event_msg.tick);
                     // Forward to local subscribers
-                    if let Err(e) = self.local_broker.publish_event(event.game_id, event_msg).await {
-                        println!("Broker: Error publishing event locally: {:?}", e);
+                    if let Err(e) = self.local_broker.publish_event(event.game_id, event_msg.clone()).await {
+                    } else {
                     }
                 } else {
-                    println!("Broker: Failed to deserialize event from remote, data len: {}", event.event_data.len());
                     if let Err(e) = bincode::serde::decode_from_slice::<common::GameEvent, bincode::config::Configuration>(&event.event_data, bincode::config::standard()) {
-                        println!("Broker: Deserialization error: {:?}", e);
                     }
                 }
             }
@@ -331,8 +329,7 @@ impl GameMessageBroker for DistributedBroker {
     
     async fn publish_command(&self, game_id: u32, command: GameCommandMessage) -> Result<()> {
         // Check if game is local
-        if self.local_broker.is_game_local(game_id).await? {
-            println!("Publishing command to local game {}: {:?}", game_id, command.command);
+        if self.is_game_local(game_id).await? {
             return self.local_broker.publish_command(game_id, command).await;
         }
         
@@ -377,8 +374,7 @@ impl GameMessageBroker for DistributedBroker {
     async fn subscribe_events(&self, game_id: u32) -> Result<broadcast::Receiver<GameEventMessage>> {
         // Check if game is local
         if self.is_game_local(game_id).await? {
-            println!("Game {} is local, subscribing locally", game_id);
-            return self.local_broker.subscribe_events(game_id).await;
+                return self.local_broker.subscribe_events(game_id).await;
         }
         
         // For remote games, we need to:
@@ -386,7 +382,6 @@ impl GameMessageBroker for DistributedBroker {
         // 2. Send subscribe message
         // 3. Create local event channel that will receive forwarded events
         
-        println!("Game {} is remote, setting up remote subscription", game_id);
         if let Some(server_id) = self.lookup_game_server(game_id).await? {
             // Ensure stream exists
             self.ensure_stream_to_server(&server_id).await?;
@@ -406,9 +401,20 @@ impl GameMessageBroker for DistributedBroker {
             if let Some(tx) = streams.get(&server_id) {
                 tx.send(message).await?;
             }
+            drop(streams); // Release lock before sleeping
+            
+            // Give the remote server time to process the subscribe message
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             
             // Create a local channel for this remote game if it doesn't exist
             self.local_broker.create_game_channels(game_id).await?;
+            
+            // Subscribe to keep the channel alive
+            let keeper_rx = self.local_broker.subscribe_events(game_id).await?;
+            
+            // Store the keeper receiver to prevent channel closure
+            let mut remote_rxs = self.remote_event_rxs.lock().await;
+            remote_rxs.insert(game_id, keeper_rx);
             
             // Now we can subscribe to the local channel which will receive forwarded events
             self.local_broker.subscribe_events(game_id).await
