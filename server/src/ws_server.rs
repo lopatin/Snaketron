@@ -16,7 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
-use common::{GameCommand, GameCommandMessage, Direction, GameEventMessage};
+use common::{GameCommand, GameCommandMessage, Direction, GameEvent, GameEventMessage};
 use crate::games_manager::GamesManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -278,13 +278,37 @@ async fn handle_websocket_connection(
                                 match ws_message {
                                     WSMessage::JoinGame(game_id) => {
                                         info!("Joining game ID: {}", game_id);
-                                        match games_manager.lock().await.join_game(game_id).await {
+                                        let games_mgr = games_manager.lock().await;
+                                        match games_mgr.join_game(game_id).await {
                                             Ok((command_tx, event_rx)) => {
-                                                ConnectionState::InGame {
-                                                    user_token,
-                                                    game_id,
-                                                    command_tx,
-                                                    event_rx,
+                                                // Get the current game snapshot
+                                                match games_mgr.get_game_snapshot(game_id).await {
+                                                    Ok(game_state) => {
+                                                        // Send snapshot to client
+                                                        let snapshot_event = GameEventMessage {
+                                                            game_id,
+                                                            tick: game_state.tick,
+                                                            user_id: None,
+                                                            event: GameEvent::Snapshot { game_state },
+                                                        };
+                                                        
+                                                        let snapshot_msg = Message::Text(serde_json::to_string(&snapshot_event)?.into());
+                                                        if let Err(e) = ws_stream.send(snapshot_msg).await {
+                                                            error!("Failed to send snapshot: {}", e);
+                                                            ConnectionState::Authenticated { user_token }
+                                                        } else {
+                                                            ConnectionState::InGame {
+                                                                user_token,
+                                                                game_id,
+                                                                command_tx,
+                                                                event_rx,
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to get game snapshot: {}", e);
+                                                        ConnectionState::Authenticated { user_token }
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -627,6 +651,11 @@ pub mod test_utils {
             })
         }
         
+        pub async fn create_game(&self, game_id: u32) -> Result<()> {
+            let mut games_manager = self.games_manager.lock().await;
+            games_manager.start_game(game_id).await
+        }
+        
         pub async fn shutdown(self) -> Result<()> {
             self.cancellation_token.cancel();
             self.server_handle.await??;
@@ -683,6 +712,22 @@ pub mod test_utils {
                 }
                 Ok(None) => Err(anyhow::anyhow!("Connection closed")),
                 Err(_) => Err(anyhow::anyhow!("Timeout waiting for message")),
+            }
+        }
+        
+        pub async fn receive_game_event(&mut self) -> Result<GameEventMessage> {
+            let timeout = tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await;
+            match timeout {
+                Ok(Some(msg)) => {
+                    match msg? {
+                        Message::Text(text) => {
+                            Ok(serde_json::from_str(&text)?)
+                        }
+                        _ => Err(anyhow::anyhow!("Unexpected message type")),
+                    }
+                }
+                Ok(None) => Err(anyhow::anyhow!("Connection closed")),
+                Err(_) => Err(anyhow::anyhow!("Timeout waiting for game event")),
             }
         }
         
@@ -771,6 +816,72 @@ mod tests {
             client.expect_pong().await?;
             
             info!("Pong received, test successful");
+            
+            // Cleanup
+            client.disconnect().await?;
+            server.shutdown().await?;
+            
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 10 seconds"))?
+    }
+    
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_join_game_receives_snapshot() -> Result<()> {
+        // Wrap the entire test in a timeout
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // Initialize tracing for tests
+            let _ = tracing_subscriber::fmt::try_init();
+            
+            info!("Starting join game snapshot test");
+            
+            // Create and start test server
+            let server = TestServerBuilder::new()
+                .with_port(0)  // Random available port
+                .with_mock_auth()  // Accept any token
+                .build()
+                .await?;
+            
+            info!("Test server built at {}", server.addr);
+            
+            // Create a game
+            const TEST_GAME_ID: u32 = 123;
+            server.create_game(TEST_GAME_ID).await?;
+            info!("Game {} created", TEST_GAME_ID);
+            
+            // Give the game loop time to start
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            // Connect a client
+            let mut client = server.connect_client().await?;
+            info!("Client connected");
+            
+            // Authenticate the client
+            client.authenticate("test_token").await?;
+            info!("Client authenticated");
+            
+            // Join the game
+            client.join_game(TEST_GAME_ID).await?;
+            info!("Join game message sent");
+            
+            // Receive the snapshot event
+            let event = client.receive_game_event().await?;
+            info!("Received event: {:?}", event);
+            
+            // Verify it's a snapshot event
+            match event.event {
+                GameEvent::Snapshot { game_state } => {
+                    // Verify the game state has expected properties
+                    assert_eq!(game_state.arena.width, 10);
+                    assert_eq!(game_state.arena.height, 10);
+                    assert_eq!(event.game_id, TEST_GAME_ID);
+                    info!("Snapshot verified successfully");
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Expected Snapshot event, got {:?}", event.event));
+                }
+            }
             
             // Cleanup
             client.disconnect().await?;

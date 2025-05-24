@@ -63,7 +63,8 @@ impl GameEngine {
     /// Can be called from a very fast interval loop or requestAnimationFrame.
     pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<GameEvent>> {
         let predicted_target_tick = ((ts_ms - self.start_ms) / self.tick_duration_ms as i64) as u32;
-        let lagged_target_tick = predicted_target_tick - (self.committed_state_lag_ms / self.tick_duration_ms) as u32;
+        let lag_ticks = (self.committed_state_lag_ms / self.tick_duration_ms) as u32;
+        let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
         let mut out: Vec<GameEvent> = Vec::new();
 
         while self.committed_state.current_tick() < lagged_target_tick {
@@ -157,6 +158,10 @@ impl GameEngine {
     // --- JSON Getters for WASM ---
     pub fn get_predicted_state_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&self.predicted_state)?)
+    }
+    
+    pub fn get_committed_state(&self) -> &GameState {
+        &self.committed_state
     }
     
     pub fn get_committed_state_json(&self) -> Result<String> {
