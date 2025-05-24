@@ -1,160 +1,316 @@
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use sqlx::{types::chrono::NaiveDateTime, Executor, PgPool, Postgres, Row, Transaction};
+use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::{error, info, trace, warn};
 
-pub async fn run_matchmaking_loop(pool: PgPool, server_id: i32) {
-    info!(server_id, "Starting matchmaking loop");
+// --- Configuration Constants ---
+const MIN_PLAYERS: usize = 2;
+const MAX_PLAYERS: usize = 10;
+const INITIAL_GAME_STATE: i32 = 0; // 0 = Waiting to start
 
-    let mut interval = tokio::time::interval(Duration::from_secs(4));
+// MMR matching ranges that expand over time
+const MMR_RANGES: [(i32, i32); 4] = [
+    (0, 100),    // 0-5 seconds: Very close skill
+    (0, 250),    // 5-10 seconds: Close skill
+    (0, 500),    // 10-20 seconds: Moderate difference
+    (0, 1000),   // 20+ seconds: Any skill level
+];
+
+// Wait time thresholds (in seconds)
+const WAIT_THRESHOLDS: [i64; 4] = [5, 10, 20, 30];
+
+// Minimum players based on wait time
+const MIN_PLAYERS_BY_WAIT: [usize; 4] = [
+    10,  // 0-5s: Try for full matches
+    6,   // 5-10s: Accept partial matches
+    4,   // 10-20s: Accept smaller matches
+    2,   // 20s+: Accept any match
+];
+
+#[derive(sqlx::FromRow, Debug)]
+struct MatchmakingPlayer {
+    game_request_id: i32,
+    user_id: i32,
+    mmr: i32,
+    wait_seconds: i64,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+struct ServerLoad {
+    id: i32,
+    current_game_count: i32,
+    max_game_capacity: i32,
+}
+
+/// Main matchmaking loop that runs on each server
+pub async fn run_matchmaking_loop(pool: PgPool, server_id: i32) {
+    info!(server_id, "Starting adaptive matchmaking loop");
+
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         interval.tick().await;
-        let now = Utc::now();
+        
+        // Update server heartbeat
+        if let Err(e) = update_heartbeat(&pool, server_id).await {
+            error!(server_id, error = %e, "Failed to update heartbeat");
+        }
 
-        // match sqlx::query(
-        //     r#"
-        //     UPDATE servers
-        //     SET last_heartbeat = $1
-        //     WHERE id = $2
-        //     "#
-        // )
-        //     .bind::<DateTime<Utc>>(now)
-        //     .bind::<i32>(server_id)
-        //     .execute(&pool)
-        //     .await
-        // {
-        //     Ok(result) => {
-        //         if result.rows_affected() == 1 {
-        //             trace!(server_id, timestamp = %now, "Heartbeat sent successfully.");
-        //         } else {
-        //             warn!(server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
-        //         }
-        //     }
-        //     Err(e) => {
-        //         error!(server_id, error = %e, "Failed to send heartbeat");
-        //     }
-        // }
+        // Try to create matches for different game types
+        for game_type in &[1, 2, 3] {
+            match create_adaptive_match(&pool, *game_type).await {
+                Ok(Some((game_id, players))) => {
+                    info!(
+                        game_id,
+                        game_type,
+                        player_count = players.len(),
+                        "Created match successfully"
+                    );
+                }
+                Ok(None) => {
+                    trace!(game_type, "No suitable match found");
+                }
+                Err(e) if is_serialization_error(&e) => {
+                    trace!(game_type, "Serialization conflict, will retry next tick");
+                }
+                Err(e) => {
+                    error!(game_type, error = %e, "Matchmaking error");
+                }
+            }
+        }
     }
 }
 
-
-
-// --- Configuration Constants ---
-const MATCH_SIZE: usize = 10;
-const BRONZE_MIN_MMR: i32 = 0;
-const BRONZE_MAX_MMR: i32 = 999;
-const INITIAL_GAME_STATE: i32 = 0; // Example state: 0 = Pending Start
-
-// Structure to hold selected player info temporarily
-#[derive(sqlx::FromRow, Debug)]
-struct PotentialPlayer {
-    game_request_id: i32,
-    user_id: i32,
-    mmr: i32,
-    request_time: NaiveDateTime,
-}
-
-/// Attempts to find and create a match for a given game type and target mmr.
-/// Prioritizes players who have been waiting longer.
-pub async fn match_players_for_rank(
-    pool: &PgPool,
-    game_type: i32,
-    rank: i32,
-) -> Result<Option<(i32, Vec<i32>)>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;").await?;
-
-    // Select potential players
-    let players: Vec<PotentialPlayer> = sqlx::query_as(
+/// Update server heartbeat
+async fn update_heartbeat(pool: &PgPool, server_id: i32) -> Result<(), sqlx::Error> {
+    let now = Utc::now();
+    sqlx::query(
         r#"
-        SELECT
-            gr.id as game_request_id,
-            gr.user_id,
-            u.mmr,
-            gr.request_time
-        FROM game_requests gr
-        JOIN users u ON gr.user_id = u.id
-        WHERE
-            u.mmr >= $1 AND gr.game_type = $2
-        ORDER BY gr.request_time ASC
-        LIMIT $3
-        FOR UPDATE OF gr SKIP LOCKED
+        UPDATE servers
+        SET last_heartbeat = $1
+        WHERE id = $2
         "#
     )
-        .bind::<i32>(rank)
-        .bind::<i32>(game_type)
-        .bind::<i64>(MATCH_SIZE as i64) // LIMIT expects i64
-        .fetch_all(&mut *tx) // Use &mut *tx to borrow the transaction mutably
-        .await?;
+    .bind(now)
+    .bind(server_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
-    // Check if enough players were found
-    if players.len() < MATCH_SIZE {
-        // Not enough players found, rollback the transaction and return None
+/// Create an adaptive match using expanding skill ranges
+async fn create_adaptive_match(
+    pool: &PgPool,
+    game_type: i32,
+) -> Result<Option<(i32, Vec<i32>)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
+
+    // Get the oldest waiting player to determine match urgency
+    let oldest_wait: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
+        FROM game_requests
+        WHERE game_type = $1 AND game_id IS NULL
+        "#
+    )
+    .bind(game_type)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let wait_seconds = oldest_wait.unwrap_or(0);
+
+    // Determine which tier of matching to use based on wait time
+    let tier = WAIT_THRESHOLDS
+        .iter()
+        .position(|&threshold| wait_seconds < threshold)
+        .unwrap_or(WAIT_THRESHOLDS.len() - 1);
+
+    let (min_mmr_diff, max_mmr_diff) = MMR_RANGES.get(tier).copied().unwrap_or((0, 1000));
+    let min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
+
+    // Find matching players
+    let players: Vec<MatchmakingPlayer> = sqlx::query_as(
+        r#"
+        WITH player_pool AS (
+            SELECT 
+                gr.id as game_request_id,
+                gr.user_id,
+                u.mmr,
+                EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds,
+                AVG(u.mmr) OVER() as avg_mmr
+            FROM game_requests gr
+            JOIN users u ON gr.user_id = u.id
+            WHERE gr.game_type = $1 AND gr.game_id IS NULL
+            ORDER BY gr.request_time ASC
+            LIMIT $2
+            FOR UPDATE OF gr SKIP LOCKED
+        )
+        SELECT 
+            game_request_id,
+            user_id,
+            mmr,
+            wait_seconds
+        FROM player_pool
+        WHERE ABS(mmr - avg_mmr) <= $3
+        ORDER BY wait_seconds DESC
+        LIMIT $4
+        "#
+    )
+    .bind(game_type)
+    .bind(MAX_PLAYERS as i32 * 2) // Fetch more to filter by MMR
+    .bind(max_mmr_diff)
+    .bind(MAX_PLAYERS as i32)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // Check if we have enough players
+    if players.len() < min_players {
         tx.rollback().await?;
-        info!(
-            "Not enough players for Bronze match (found {}), rolling back.",
-            players.len()
-        );
         return Ok(None);
     }
 
-    info!("Found {} suitable players for a Bronze match.", players.len());
+    // Take up to MAX_PLAYERS players
+    let matched_players: Vec<_> = players.into_iter().take(MAX_PLAYERS).collect();
+    let user_ids: Vec<i32> = matched_players.iter().map(|p| p.user_id).collect();
+    let request_ids: Vec<i32> = matched_players.iter().map(|p| p.game_request_id).collect();
 
-    // Extract user IDs and game request IDs
-    let matched_user_ids: Vec<i32> = players.iter().map(|p| p.user_id).collect();
-    let game_request_ids: Vec<i32> = players.iter().map(|p| p.game_request_id).collect();
+    // Select least loaded server
+    let server_id = select_least_loaded_server(&mut tx).await?;
 
-    // Create the new game instance
-    let new_game_id: i32 = sqlx::query_scalar(
+    // Create the game
+    let game_id: i32 = sqlx::query_scalar(
         r#"
-        INSERT INTO games (server_id, game_type, game_state)
-        VALUES ($1, $2, $3)
+        INSERT INTO games (server_id, game_type, game_state, created_at)
+        VALUES ($1, $2, $3, NOW())
         RETURNING id
         "#
     )
-        // .bind::<i32>(server_id_for_new_game)
-        .bind::<i32>(game_type)
-        .bind::<i32>(INITIAL_GAME_STATE)
-        .fetch_one(&mut *tx)
+    .bind(server_id)
+    .bind(game_type)
+    .bind(INITIAL_GAME_STATE)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Insert players into game_players table
+    for (idx, user_id) in user_ids.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO game_players (game_id, user_id, player_number, joined_at)
+            VALUES ($1, $2, $3, NOW())
+            "#
+        )
+        .bind(game_id)
+        .bind(user_id)
+        .bind(idx as i32)
+        .execute(&mut *tx)
         .await?;
+    }
 
-    info!("Created new game with ID: {}", new_game_id);
-
-    // Remove the matched game requests
-    let deleted_rows = sqlx::query(
+    // Update game requests to mark them as matched
+    let updated = sqlx::query(
         r#"
-        DELETE FROM game_requests
-        WHERE id = ANY($1)
+        UPDATE game_requests
+        SET game_id = $1
+        WHERE id = ANY($2)
         "#
     )
-        .bind::<Vec<i32>>(game_request_ids) // Bind the game_request_ids vector
-        .execute(&mut *tx) // Use &mut *tx
-        .await?
-        .rows_affected();
+    .bind(game_id)
+    .bind(&request_ids)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
 
-    if deleted_rows != MATCH_SIZE as u64 {
-        // This shouldn't happen if the transaction isolation works correctly,
-        // but as a safeguard, rollback if the number of deleted rows doesn't match.
+    if updated != request_ids.len() as u64 {
         tx.rollback().await?;
-        error!(
-            "Error: Deleted {} game requests, but expected {}. Rolling back transaction.",
-            deleted_rows, MATCH_SIZE
-        );
-
-        // Consider returning a specific error type here
         return Err(sqlx::Error::RowNotFound);
     }
 
-    info!("Removed {} game requests.", deleted_rows);
+    // Increment server game count
+    sqlx::query(
+        r#"
+        UPDATE servers
+        SET current_game_count = current_game_count + 1
+        WHERE id = $1
+        "#
+    )
+    .bind(server_id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
+    // Log match details
+    let avg_mmr = matched_players.iter().map(|p| p.mmr).sum::<i32>() / matched_players.len() as i32;
+    let max_wait = matched_players.iter().map(|p| p.wait_seconds).max().unwrap_or(0);
+    
     info!(
-        "Successfully created game {} for users: {:?}",
-        new_game_id, matched_user_ids
+        game_id,
+        server_id,
+        player_count = matched_players.len(),
+        avg_mmr,
+        max_wait_seconds = max_wait,
+        mmr_range = max_mmr_diff,
+        "Match created"
     );
 
-    Ok(Some((new_game_id, matched_user_ids)))
+    Ok(Some((game_id, user_ids)))
+}
+
+/// Select the least loaded healthy server
+async fn select_least_loaded_server(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<i32, sqlx::Error> {
+    let server: ServerLoad = sqlx::query_as(
+        r#"
+        SELECT id, current_game_count, max_game_capacity
+        FROM servers
+        WHERE last_heartbeat > NOW() - INTERVAL '30 seconds'
+          AND current_game_count < max_game_capacity
+        ORDER BY 
+            CAST(current_game_count AS FLOAT) / NULLIF(max_game_capacity, 0) ASC,
+            RANDOM()
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        "#
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| sqlx::Error::RowNotFound)?;
+
+    Ok(server.id)
+}
+
+/// Check if an error is a serialization failure
+fn is_serialization_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db_err) => {
+            // PostgreSQL serialization failure error code is 40001
+            db_err.code().map(|c| c == "40001").unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Optional: Clean up stale game requests
+pub async fn cleanup_stale_requests(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM game_requests
+        WHERE request_time < NOW() - INTERVAL '1 hour'
+          AND game_id IS NULL
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Optional: Rebalance games across servers
+pub async fn rebalance_server_loads(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // This could be implemented to move games from overloaded servers
+    // to less loaded ones, but would require careful state synchronization
+    Ok(())
 }

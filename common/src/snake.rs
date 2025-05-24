@@ -10,7 +10,6 @@ pub enum Direction {
     Right,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Position {
     pub x: i16,
