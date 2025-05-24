@@ -8,14 +8,15 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, mpsc};
+use tokio::sync::{broadcast, oneshot, mpsc, Mutex};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
-use common::{GameCommand, Direction, GameEventMessage};
+use common::{GameCommand, GameCommandMessage, Direction, GameEventMessage};
 use crate::games_manager::GamesManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,9 +33,34 @@ pub struct UserToken {
     pub user_id: i32,
 }
 
+// Connection state machine
+enum ConnectionState {
+    // Initial state - waiting for authentication
+    Unauthenticated,
+    
+    // Authenticated but not in a game
+    Authenticated { 
+        user_token: UserToken 
+    },
+    
+    // Authenticated and connected to a game
+    InGame {
+        user_token: UserToken,
+        game_id: u32,
+        command_tx: broadcast::Sender<GameCommandMessage>,
+        event_rx: broadcast::Receiver<GameEventMessage>,
+    },
+    
+    // Connection is shutting down
+    ShuttingDown {
+        timeout: Pin<Box<Sleep>>,
+    },
+}
+
 
 pub async fn run_websocket_server(
     addr: &str,
+    games_manager: Arc<Mutex<GamesManager>>,
     cancellation_token: CancellationToken
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -56,7 +82,8 @@ pub async fn run_websocket_server(
                     Ok((stream, peer_addr)) => {
                         info!("Accepted connection from: {}", peer_addr);
                         let connection_token = cancellation_token.child_token();
-                        let handle = tokio::spawn(handle_websocket_connection(stream, connection_token));
+                        let games_manager_clone = games_manager.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, stream, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -92,7 +119,7 @@ pub async fn run_websocket_server(
 
 
 async fn handle_websocket_connection(
-    games_manager: GamesManager,
+    games_manager: Arc<Mutex<GamesManager>>,
     stream: TcpStream,
     cancellation_token: CancellationToken
 ) -> Result<()> {
@@ -103,37 +130,27 @@ async fn handle_websocket_connection(
         .await
         .expect("Failed to accept WebSocket connection");
 
-    let mut game_command_tx: Option<broadcast::Sender<GameCommand>> = None;
-    let mut game_event_rx: Option<broadcast::Receiver<GameEventMessage>> = None;
-
-    let drop_channels = || {
-        if let Some(tx) = game_command_tx.take() {
-            info!("Dropping game command sender");
-            drop(tx);
-        }
-        if let Some(rx) = game_event_rx.take() {
-            info!("Dropping game event receiver");
-            drop(rx);
-        }
-    };
-
-    let mut timeout_future: Option<Pin<Box<Sleep>>> = None;
-    let mut user_token: Option<UserToken> = None;
-    let mut game_id: Option<u32> = None;
+    // Start in unauthenticated state
+    let mut state = ConnectionState::Unauthenticated;
+    
+    // Create a shutdown timeout that starts as a never-completing future
+    let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
+    tokio::pin!(shutdown_timeout);
+    let mut shutdown_started = false;
 
     loop {
         tokio::select! {
             biased;
-
-            // The client hasn't closed the connection after being asked to do so. Force close it.
-            _ = async { timeout_future.as_mut().unwrap().await } , if timeout_future.is_some() => {
-                warn!("Timeout reached, closing connection");
+            
+            // Handle shutdown timeout
+            _ = &mut shutdown_timeout, if shutdown_started => {
+                warn!("Shutdown timeout reached, closing connection");
                 break;
             }
 
+            // Handle cancellation token
             _ = cancellation_token.cancelled() => {
-                // Send a Shutdown message to the client so that it can close this
-                // connection and gracefully rotate to a new one.
+                // Send a Shutdown message to the client
                 info!("Sending shutdown message to client");
                 let json_msg = serde_json::json!(WSMessage::Shutdown);
                 let shutdown_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
@@ -141,60 +158,125 @@ async fn handle_websocket_connection(
                     error!("Failed to send shutdown message: {}", e);
                 }
 
-                timeout_future = Some(Box::pin(tokio::time::sleep(Duration::from_secs(10))));
+                // Start shutdown timeout
+                shutdown_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
+                shutdown_started = true;
+                
+                // Transition to shutting down state
+                state = ConnectionState::ShuttingDown {
+                    timeout: Box::pin(tokio::time::sleep(Duration::from_secs(10))),
+                };
             }
 
-            // Handle messages
+            // Handle incoming WebSocket messages
             message = ws_stream.next() => {
                 match message {
                     Some(Ok(msg)) => {
                         let ws_message: WSMessage = serde_json::from_str(msg.to_text()?)?;
-                        match ws_message {
-                            WSMessage::Token(jwt_token) => {
-                                info!("Received jwt token: {}", jwt_token);
-                                match verify_jwt_token(jwt_token) {
-                                    Ok(ut) => {
-                                        info!("Token verified successfully");
-                                        user_token = Some(ut);
+                        
+                        // Process message based on current state
+                        state = match state {
+                            ConnectionState::Unauthenticated => {
+                                match ws_message {
+                                    WSMessage::Token(jwt_token) => {
+                                        info!("Received jwt token: {}", jwt_token);
+                                        match verify_jwt_token(jwt_token) {
+                                            Ok(user_token) => {
+                                                info!("Token verified successfully");
+                                                ConnectionState::Authenticated { user_token }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to verify token: {}", e);
+                                                break;
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to verify token: {}", e);
-                                        break;
+                                    _ => {
+                                        warn!("Cannot process message in unauthenticated state");
+                                        ConnectionState::Unauthenticated
                                     }
                                 }
                             }
-                            _ if user_token.is_none() => {
-                                warn!("User token not set. Cannot process message.");
-                                continue;
-                            }
-                            WSMessage::JoinGame(id) => {
-                                info!("Joining game ID: {}", id);
-
-                                drop_channels();
-
-                                let (tx, rx) = games_manager.join_game(id).await?;
-                                game_command_tx = Some(tx);
-                                game_event_rx = Some(rx);
-                                game_id = Some(id);
-                            }
-                            WSMessage::GameCommand(command) => {
-                                info!("Received command: {:?}", command);
-
-                                if let Some(tx)  = game_command_tx.as_ref() {
-                                    tx.send(command)
-                                        .context("Failed to send game command")
-                                        .await?;
-                                } else {
-                                    warn!("Game command sender not initialized");
+                            
+                            ConnectionState::Authenticated { user_token } => {
+                                match ws_message {
+                                    WSMessage::JoinGame(game_id) => {
+                                        info!("Joining game ID: {}", game_id);
+                                        match games_manager.lock().await.join_game(game_id).await {
+                                            Ok((command_tx, event_rx)) => {
+                                                ConnectionState::InGame {
+                                                    user_token,
+                                                    game_id,
+                                                    command_tx,
+                                                    event_rx,
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to join game: {}", e);
+                                                ConnectionState::Authenticated { user_token }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        warn!("Unexpected message in authenticated state: {:?}", ws_message);
+                                        ConnectionState::Authenticated { user_token }
+                                    }
                                 }
                             }
-                            WSMessage::Chat(chat_message) => {
-                                info!("Received chat message: {}", chat_message);
+                            
+                            ConnectionState::InGame { user_token, game_id, command_tx, event_rx } => {
+                                match ws_message {
+                                    WSMessage::GameCommand(command) => {
+                                        info!("Received command: {:?}", command);
+                                        
+                                        let cmd_msg = GameCommandMessage {
+                                            tick: 0, // Will be set by game engine
+                                            received_order: 0, // Will be set by game engine
+                                            user_id: user_token.user_id as u32,
+                                            command,
+                                        };
+                                        
+                                        if let Err(e) = command_tx.send(cmd_msg) {
+                                            warn!("Failed to send game command: {}", e);
+                                        }
+                                        
+                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
+                                    }
+                                    WSMessage::JoinGame(new_game_id) => {
+                                        info!("Switching from game {} to game {}", game_id, new_game_id);
+                                        
+                                        // Leave current game by dropping channels
+                                        drop(command_tx);
+                                        drop(event_rx);
+                                        
+                                        // Join new game
+                                        match games_manager.lock().await.join_game(new_game_id).await {
+                                            Ok((command_tx, event_rx)) => {
+                                                ConnectionState::InGame {
+                                                    user_token,
+                                                    game_id: new_game_id,
+                                                    command_tx,
+                                                    event_rx,
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to join new game: {}", e);
+                                                ConnectionState::Authenticated { user_token }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        warn!("Unexpected message in game state: {:?}", ws_message);
+                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
+                                    }
+                                }
                             }
-                            _ => {
-                                warn!("Unexpected message type: {:?}", ws_message);
+                            
+                            ConnectionState::ShuttingDown { timeout } => {
+                                // Ignore all messages during shutdown
+                                ConnectionState::ShuttingDown { timeout }
                             }
-                        }
+                        };
                     }
                     Some(Err(e)) => {
                         error!("Error receiving message: {}", e);
@@ -207,8 +289,13 @@ async fn handle_websocket_connection(
                 }
             }
 
-            // Handle game events
-            game_event = game_event_rx.as_ref().unwrap().recv(), if game_event_rx.is_some() => {
+            // Handle game events from the game engine
+            game_event = async {
+                match &mut state {
+                    ConnectionState::InGame { event_rx, .. } => event_rx.recv().await,
+                    _ => std::future::pending().await,
+                }
+            } => {
                 match game_event {
                     Ok(event) => {
                         info!("Received game event: {:?}", event);
@@ -221,16 +308,26 @@ async fn handle_websocket_connection(
                     }
                     Err(e) => {
                         error!("Error receiving game event: {}", e);
-                        break;
+                        // Game channel closed, transition back to authenticated state
+                        if let ConnectionState::InGame { user_token, .. } = state {
+                            state = ConnectionState::Authenticated { user_token };
+                        }
                     }
                 }
             }
-
         }
     }
 
+    // Clean up connection
     let _ = ws_stream.close(None).await;
-    drop_channels();
+    
+    // Drop any active game channels
+    if let ConnectionState::InGame { command_tx, event_rx, .. } = state {
+        info!("Dropping game channels on disconnect");
+        drop(command_tx);
+        drop(event_rx);
+    }
+    
     Ok(())
 }
 

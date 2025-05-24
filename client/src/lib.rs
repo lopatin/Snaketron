@@ -1,11 +1,97 @@
 mod render;
 
-pub use render::*;
-pub use common::*;
-
 use wasm_bindgen::prelude::*;
+use common::{GameEngine, GameCommand, Direction};
+use serde_json;
+
+/// The main client-side game interface exposed to JavaScript.
+/// This wraps the GameEngine and provides a clean WASM boundary.
+#[wasm_bindgen]
+pub struct GameClient {
+    engine: GameEngine,
+}
 
 #[wasm_bindgen]
-pub fn run(a: u32, b: u32) -> u32 {
-    add(a, b)
+impl GameClient {
+    /// Creates a new game client instance
+    #[wasm_bindgen(constructor)]
+    pub fn new(game_id: u32, start_ms: i64) -> Self {
+        // Set panic hook for better error messages in browser console
+        console_error_panic_hook::set_once();
+        
+        GameClient {
+            engine: GameEngine::new(game_id, start_ms),
+        }
+    }
+
+    /// Set the local player ID
+    #[wasm_bindgen(js_name = setLocalPlayerId)]
+    pub fn set_local_player_id(&mut self, player_id: u32) {
+        self.engine.set_local_player_id(player_id);
+    }
+
+    /// Run the game engine until the specified timestamp
+    /// Returns a JSON array of game events that occurred
+    #[wasm_bindgen(js_name = runUntil)]
+    pub fn run_until(&mut self, ts_ms: i64) -> Result<String, JsValue> {
+        let events = self.engine.run_until(ts_ms)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        serde_json::to_string(&events)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Process a turn command for a snake
+    #[wasm_bindgen(js_name = processTurn)]
+    pub fn process_turn(&mut self, snake_id: u32, direction: &str) -> Result<(), JsValue> {
+        let dir = match direction {
+            "Up" => Direction::Up,
+            "Down" => Direction::Down,
+            "Left" => Direction::Left,
+            "Right" => Direction::Right,
+            _ => return Err(JsValue::from_str("Invalid direction")),
+        };
+
+        let command = GameCommand::Turn { snake_id, direction: dir };
+        
+        // For client-side, we'd typically add this to pending commands
+        // The actual implementation would depend on your networking setup
+        Ok(())
+    }
+
+    /// Get the current game state as JSON
+    #[wasm_bindgen(js_name = getGameStateJson)]
+    pub fn get_game_state_json(&self) -> Result<String, JsValue> {
+        self.engine.get_predicted_state_json()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Get the committed (server-authoritative) state as JSON
+    #[wasm_bindgen(js_name = getCommittedStateJson)]
+    pub fn get_committed_state_json(&self) -> Result<String, JsValue> {
+        self.engine.get_committed_state_json()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Get the event log as JSON
+    #[wasm_bindgen(js_name = getEventLogJson)]
+    pub fn get_event_log_json(&self) -> Result<String, JsValue> {
+        self.engine.get_event_log_json()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Get the current tick number
+    #[wasm_bindgen(js_name = getCurrentTick)]
+    pub fn get_current_tick(&self) -> u32 {
+        self.engine.current_tick()
+    }
+
+    /// Get the game ID
+    #[wasm_bindgen(js_name = getGameId)]
+    pub fn get_game_id(&self) -> u32 {
+        self.engine.game_id()
+    }
 }
+
+/// Render functions exposed to JavaScript
+pub use render::render_game;

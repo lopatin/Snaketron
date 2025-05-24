@@ -27,7 +27,7 @@ impl Position {
 pub struct Snake {
     /// `body` is a compressed representation of the snake.
     /// It contains the head, turns, and tail positions.
-    pub body: VecDeque<Position>,
+    pub body: Vec<Position>,
     pub direction: Direction,
     pub is_alive: bool,
     pub food: u32,
@@ -36,11 +36,11 @@ pub struct Snake {
 impl Snake {
 
     pub fn head(&self) -> Result<&Position> {
-        self.body.front().context("Snake has no head")
+        self.body.get(0).context("Snake has no head")
     }
 
     pub fn tail(&self) -> Result<&Position> {
-        self.body.back().context("Snake has no tail")
+        self.body.last().context("Snake has no tail")
     }
 
     pub fn step_forward(&mut self) {
@@ -48,26 +48,26 @@ impl Snake {
             return;
         }
 
-        let current_head_pos = self.body.front_mut().unwrap();
+        let current_head = self.body[0];
         let (new_head_x, new_head_y) = match self.direction {
-            Direction::Up => (current_head_pos.x, current_head_pos.y - 1),
-            Direction::Down => (current_head_pos.x, current_head_pos.y + 1),
-            Direction::Left => (current_head_pos.x - 1, current_head_pos.y),
-            Direction::Right => (current_head_pos.x + 1, current_head_pos.y),
+            Direction::Up => (current_head.x, current_head.y - 1),
+            Direction::Down => (current_head.x, current_head.y + 1),
+            Direction::Left => (current_head.x - 1, current_head.y),
+            Direction::Right => (current_head.x + 1, current_head.y),
         };
 
         // New head position
         let p0 = Position { x: new_head_x, y: new_head_y };
-        let p1 = &self.body[0];
-        let p2 = &self.body[1];
+        let p1 = self.body[0];
+        let p2 = self.body[1];
 
         // If new head is collinear, update the head position in place.
         // Otherwise, push the new head position to the front of the body.
         if (p0.x == p1.x && p1.x == p2.x) || (p0.y == p1.y && p1.y == p2.y) {
-            current_head_pos.x = p0.x;
-            current_head_pos.y = p0.y;
+            self.body[0].x = p0.x;
+            self.body[0].y = p0.y;
         } else {
-            self.body.push_front(p0);
+            self.body.insert(0, p0);
         }
 
         if self.food > 0 {
@@ -75,8 +75,9 @@ impl Snake {
             self.food -= 1;
         } else {
             // Snake does not grow: tail moves forward.
-            let tail_end_pos = self.body.back_mut().unwrap();
-            let point_before_tail = self.body[self.body.len() - 2];
+            let tail_idx = self.body.len() - 1;
+            let point_before_tail = self.body[tail_idx - 1];
+            let tail_end_pos = &mut self.body[tail_idx];
 
             // Move tail_end_pos one step towards point_before_tail
             if tail_end_pos.x < point_before_tail.x {
@@ -91,7 +92,7 @@ impl Snake {
 
             // Remove the last element of the body if is identical to the point before tail
             if *tail_end_pos == point_before_tail {
-                self.body.pop_back();
+                self.body.pop();
             }
         }
     }

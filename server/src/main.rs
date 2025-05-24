@@ -1,5 +1,4 @@
 mod ws_server;
-mod broker;
 mod matchmaking;
 mod grpc_server;
 mod games_manager;
@@ -13,9 +12,11 @@ use tokio::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use refinery::config::{Config, ConfigDbType};
-use tokio::sync::{mpsc, oneshot, watch, broadcast};
+use tokio::sync::{mpsc, oneshot, watch, broadcast, Mutex};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use ws_server::*;
+use crate::games_manager::GamesManager;
 
 mod migrations {
     use refinery::embed_migrations;
@@ -85,13 +86,15 @@ async fn main() -> Result<()> {
     let heartbeat_loop= tokio::spawn(
         run_heartbeat_loop(heartbeat_pool, heartbeat_server_id, heartbeat_cancellation_token));
 
+    // GamesManager
+    let games_manager = Arc::new(Mutex::new(GamesManager::new()));
+
     // Websocket server
     let websocket_cancellation_token = cancellation_token.clone();
     let external_server_handle = tokio::spawn(async move {
-        run_websocket_server(&ws_addr, websocket_cancellation_token).await
+        run_websocket_server(&ws_addr, games_manager, websocket_cancellation_token).await
     });
 
-    // Establish gRPC connections to the other servers in the region
 
     info!("Server started. Waiting for shutdown signal.");
     tokio::signal::ctrl_c().await?;
