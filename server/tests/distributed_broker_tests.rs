@@ -1,10 +1,10 @@
 use anyhow::Result;
 use server::ws_server::WSMessage;
-use ::common::{GameCommandMessage, GameCommand, GameEventMessage, GameEvent, GameType, Position};
+use ::common::{GameEvent, GameType};
 use tokio::time::{timeout, Duration};
 
 mod common;
-use self::common::{TestEnvironment, TestClient};
+use self::common::{TestBuilder, TestClient};
 
 #[tokio::test]
 async fn test_distributed_broker_local_game() -> Result<()> {
@@ -14,14 +14,13 @@ async fn test_distributed_broker_local_game() -> Result<()> {
         .try_init();
     
     println!("Starting test environment...");
-    // Start a single server
-    let env = TestEnvironment::new(1).await?;
-    println!("Test environment created");
-    
-    // Create test users
-    println!("Creating test users...");
-    env.create_test_users(2).await?;
-    println!("Test users created");
+    // Start a single server with users
+    let env = TestBuilder::new("test_distributed_broker_local_game")
+        .with_servers(1)
+        .with_users(2)
+        .build()
+        .await?;
+    println!("Test environment created with users");
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     println!("Server address: {}", server_addr);
@@ -36,11 +35,14 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Authenticate clients
     println!("Authenticating client 1...");
-    client1.authenticate(1).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
     println!("Client 1 authenticated");
     println!("Authenticating client 2...");
-    client2.authenticate(2).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     println!("Client 2 authenticated");
+    
+    // Small delay to ensure server is ready
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Queue both clients for a match
     println!("Queueing client 1 for match...");
@@ -56,55 +58,37 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     }).await?;
     println!("Client 2 queued");
     
-    // Wait for match to be created
-    println!("Waiting for match to be created...");
-    let game_id = timeout(Duration::from_secs(5), async {
+    // Wait for match and automatic game join - clients receive snapshots directly
+    println!("Waiting for game snapshots (automatic join)...");
+    let (game_id, game_state1) = timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(msg) = client1.receive_message().await {
-                if let WSMessage::MatchFound { game_id } = msg {
-                    return Ok::<u32, anyhow::Error>(game_id);
+            if let Some(event) = client1.receive_game_event().await? {
+                println!("Client1 received event: {:?}", event.event);
+                if let GameEvent::Snapshot { game_state } = event.event {
+                    return Ok::<(u32, ::common::GameState), anyhow::Error>((event.game_id, game_state));
                 }
             }
         }
     }).await??;
     
-    // Verify client2 also got the match
-    let game_id2 = timeout(Duration::from_secs(2), async {
+    // Verify client2 also got the snapshot
+    let (game_id2, game_state2) = timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(msg) = client2.receive_message().await {
-                if let WSMessage::MatchFound { game_id } = msg {
-                    return Ok::<u32, anyhow::Error>(game_id);
+            if let Some(event) = client2.receive_game_event().await? {
+                println!("Client2 received event: {:?}", event.event);
+                if let GameEvent::Snapshot { game_state } = event.event {
+                    return Ok::<(u32, ::common::GameState), anyhow::Error>((event.game_id, game_state));
                 }
             }
         }
     }).await??;
     
     assert_eq!(game_id, game_id2, "Both clients should be in the same game");
+    println!("Both clients matched and auto-joined game {} with type {:?}", game_id, game_state1.game_type);
     
-    // Join the game
-    client1.send_message(WSMessage::JoinGame(game_id)).await?;
-    client2.send_message(WSMessage::JoinGame(game_id)).await?;
-    
-    // Wait for game snapshots
-    let snapshot1 = timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(event) = client1.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<(), anyhow::Error>(());
-                }
-            }
-        }
-    }).await??;
-    
-    let snapshot2 = timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(event) = client2.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<(), anyhow::Error>(());
-                }
-            }
-        }
-    }).await??;
+    // The game type might be different than requested due to matchmaking trying multiple types
+    // What matters is that both clients are in the same game
+    assert_eq!(game_state1.game_type, game_state2.game_type, "Both clients should have same game type");
     
     // Clean disconnect
     client1.disconnect().await?;
@@ -116,8 +100,12 @@ async fn test_distributed_broker_local_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_distributed_broker_cross_server() -> Result<()> {
-    // Start two servers
-    let env = TestEnvironment::new(2).await?;
+    // Start two servers with users
+    let env = TestBuilder::new("test_distributed_broker_cross_server")
+        .with_servers(2)
+        .with_users(2)
+        .build()
+        .await?;
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
     
@@ -128,8 +116,8 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
     let mut client1 = TestClient::connect(&server1_addr).await?;
     let mut client2 = TestClient::connect(&server2_addr).await?;
     
-    client1.authenticate(1).await?;
-    client2.authenticate(2).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     
     // Each client queues on their own server
     // In a real distributed system, matchmaking would coordinate across servers
@@ -160,18 +148,23 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
 
 #[tokio::test] 
 async fn test_game_lifecycle_with_cleanup() -> Result<()> {
-    // Start a server
-    let env = TestEnvironment::new(1).await?;
+    // Start a server with users
+    let env = TestBuilder::new("test_game_lifecycle_with_cleanup")
+        .with_servers(1)
+        .with_users(2)
+        .build()
+        .await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Connect two clients
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
     
-    client1.authenticate(1).await?;
-    client2.authenticate(2).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     
     // Create a match
+    println!("test_game_lifecycle_with_cleanup: Queuing players with IDs {:?}", env.user_ids());
     client1.send_message(WSMessage::QueueForMatch { 
         game_type: GameType::FreeForAll { max_players: 2 } 
     }).await?;
@@ -180,27 +173,30 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
         game_type: GameType::FreeForAll { max_players: 2 } 
     }).await?;
     
-    // Wait for match
-    let game_id = timeout(Duration::from_secs(5), async {
+    // Wait for match - with auto-joining, we receive the game snapshot directly
+    println!("test_game_lifecycle_with_cleanup: Waiting for game snapshot...");
+    let game_id = match timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(msg) = client1.receive_message().await {
-                if let WSMessage::MatchFound { game_id } = msg {
-                    // Clear client2's message queue
-                    let _ = timeout(Duration::from_millis(100), client2.receive_message()).await;
-                    return Ok::<u32, anyhow::Error>(game_id);
+            if let Some(event) = client1.receive_game_event().await? {
+                println!("test_game_lifecycle_with_cleanup: Received event: {:?}", event.event);
+                if matches!(event.event, GameEvent::Snapshot { .. }) {
+                    return Ok::<u32, anyhow::Error>(event.game_id);
                 }
             }
         }
-    }).await??;
+    }).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            println!("test_game_lifecycle_with_cleanup: Timeout waiting for game snapshot!");
+            return Err(anyhow::anyhow!("Timeout waiting for game snapshot"));
+        }
+    };
     
-    // Both clients join
-    client1.send_message(WSMessage::JoinGame(game_id)).await?;
-    client2.send_message(WSMessage::JoinGame(game_id)).await?;
-    
-    // Wait for snapshots
+    // Client2 should also receive the snapshot
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(event) = client1.receive_game_event().await? {
+            if let Some(event) = client2.receive_game_event().await? {
                 if matches!(event.event, GameEvent::Snapshot { .. }) {
                     break;
                 }

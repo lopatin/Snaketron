@@ -149,7 +149,8 @@ impl GameState {
             GameCommand::Tick => {
 
                 if self.tick == 0 {
-
+                    // Emit snapshot on first tick
+                    out.push(GameEvent::Snapshot { game_state: self.clone() });
                 }
 
                 // Take a snapshot of the existing snakes to rollback dead ones after movement

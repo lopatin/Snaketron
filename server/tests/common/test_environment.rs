@@ -1,237 +1,175 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use sqlx::{PgPool, postgres::PgPoolOptions};
-use uuid::Uuid;
 use server::{
-    ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
-    games_manager::GamesManager,
-    game_broker::{LocalBroker, GameMessageBroker},
-    matchmaking::run_matchmaking_loop,
-    game_cleanup::run_cleanup_service,
+    game_server::{GameServer, GameServerBuilder},
+    ws_server::JwtVerifier,
 };
-use super::mock_jwt::MockJwtVerifier;
-use std::time::Duration;
+use super::{mock_jwt::MockJwtVerifier, test_database::TestDatabaseGuard};
+use tracing::info;
 
-/// A test environment that runs real server instances
+/// A test environment that manages game servers and database isolation
 pub struct TestEnvironment {
-    servers: Vec<TestServerInstance>,
-    db_pool: PgPool,
-}
-
-/// A single server instance in the test environment
-pub struct TestServerInstance {
-    pub server_id: Uuid,
-    pub ws_port: u16,
-    pub ws_addr: String,
-    cancellation_token: CancellationToken,
-    handles: Vec<JoinHandle<()>>,
+    /// Test database (automatically cleaned up)
+    db_guard: TestDatabaseGuard,
+    /// Game servers running in this environment
+    servers: Vec<GameServer>,
+    /// User IDs created for testing
+    user_ids: Vec<i32>,
+    /// Test name for debugging
+    test_name: String,
 }
 
 impl TestEnvironment {
-    /// Create a new test environment with the specified number of servers
-    pub async fn new(num_servers: usize) -> Result<Self> {
-        // Initialize database
-        let db_pool = Self::setup_test_database().await?;
-        
-        let mut servers = Vec::new();
-        
-        for i in 0..num_servers {
-            let server = TestServerInstance::start(
-                db_pool.clone(),
-                format!("test-server-{}", i),
-            ).await?;
-            servers.push(server);
-        }
-        
-        // Give servers time to fully start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        Ok(Self {
-            servers,
-            db_pool,
-        })
+    /// Get the WebSocket address for a server by index
+    pub fn ws_addr(&self, index: usize) -> Option<String> {
+        self.servers.get(index).map(|s| format!("ws://{}", s.ws_addr()))
+    }
+    
+    /// Get the gRPC address for a server by index
+    pub fn grpc_addr(&self, index: usize) -> Option<String> {
+        self.servers.get(index)
+            .and_then(|s| s.grpc_addr())
+            .map(|addr| addr.to_string())
     }
     
     /// Get a reference to a server by index
-    pub fn server(&self, index: usize) -> Option<&TestServerInstance> {
+    pub fn server(&self, index: usize) -> Option<&GameServer> {
         self.servers.get(index)
     }
     
-    /// Get the WebSocket address for a server
-    pub fn ws_addr(&self, index: usize) -> Option<String> {
-        self.servers.get(index).map(|s| s.ws_addr.clone())
+    /// Get all user IDs created for this test
+    pub fn user_ids(&self) -> &[i32] {
+        &self.user_ids
     }
     
-    /// Get the database pool (for assertions only, not for data manipulation)
-    pub fn db_pool(&self) -> &PgPool {
-        &self.db_pool
-    }
-    
-    /// Shutdown all servers gracefully
+    /// Shutdown all servers and clean up the database
     pub async fn shutdown(mut self) -> Result<()> {
+        info!("Shutting down test environment: {}", self.test_name);
+        
+        // Shutdown all servers
         for server in self.servers.drain(..) {
             server.shutdown().await?;
         }
-        Ok(())
-    }
-    
-    async fn setup_test_database() -> Result<PgPool> {
-        // Use test database credentials from environment or defaults
-        let db_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://snaketron:snaketron@localhost:5432/snaketron".to_string());
         
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
-        
-        // Run migrations
-        mod migrations {
-            use refinery::embed_migrations;
-            embed_migrations!("./migrations");
-        }
-        
-        let mut config = refinery::config::Config::new(refinery::config::ConfigDbType::Postgres)
-            .set_db_user("snaketron")
-            .set_db_pass("snaketron")
-            .set_db_host("localhost")
-            .set_db_port("5432")
-            .set_db_name("snaketron");
-        
-        migrations::migrations::runner().run_async(&mut config).await?;
-        
-        // Clean up any stale test data
-        sqlx::query("DELETE FROM game_requests")
-            .execute(&pool)
-            .await?;
-        sqlx::query("DELETE FROM game_players")
-            .execute(&pool)
-            .await?;
-        sqlx::query("DELETE FROM games WHERE status = 'waiting' OR status = 'completed'")
-            .execute(&pool)
-            .await?;
-            
-        Ok(pool)
-    }
-    
-    /// Create test users in the database
-    pub async fn create_test_users(&self, count: usize) -> Result<()> {
-        // Clear any existing game requests first
-        sqlx::query("DELETE FROM game_requests")
-            .execute(&self.db_pool)
-            .await?;
-            
-        for i in 1..=count {
-            sqlx::query(
-                r#"
-                INSERT INTO users (id, username, password_hash, mmr)
-                VALUES ($1, $2, 'test_hash', 1000)
-                ON CONFLICT (id) DO NOTHING
-                "#
-            )
-            .bind(i as i32)
-            .bind(format!("test_user_{}", i))
-            .execute(&self.db_pool)
-            .await?;
-        }
+        // Database cleanup happens automatically when db_guard is dropped
         Ok(())
     }
 }
 
-impl TestServerInstance {
-    async fn start(db_pool: PgPool, region: String) -> Result<Self> {
-        // Find an available port
-        let ws_port = Self::get_available_port();
-        let ws_addr = format!("127.0.0.1:{}", ws_port);
-        
-        // Register server in database
-        println!("Registering server in database...");
-        let server_id = register_server(&db_pool, &region).await?;
-        println!("Server registered with ID: {}", server_id);
-        
-        let cancellation_token = CancellationToken::new();
-        let mut handles = Vec::new();
-        
-        // Start heartbeat loop
-        let heartbeat_pool = db_pool.clone();
-        let heartbeat_server_id = server_id.clone();
-        let heartbeat_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_heartbeat_loop(heartbeat_pool, heartbeat_server_id, heartbeat_token).await;
-        }));
-        
-        // Start games manager with local broker
-        let broker = Arc::new(LocalBroker::new()) as Arc<dyn GameMessageBroker>;
-        let games_manager = Arc::new(Mutex::new(GamesManager::new_with_broker(broker)));
-        
-        // Create mock JWT verifier for tests
-        let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
-        
-        // Start WebSocket server
-        let ws_games_manager = games_manager.clone();
-        let ws_pool = db_pool.clone();
-        let ws_token = cancellation_token.clone();
-        let ws_addr_clone = ws_addr.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_websocket_server(&ws_addr_clone, ws_games_manager, ws_pool, ws_token, jwt_verifier).await;
-        }));
-        
-        // Create player connection manager
-        let player_connections = Arc::new(server::player_connections::PlayerConnectionManager::new());
-        
-        // Start matchmaking service
-        println!("Starting matchmaking service...");
-        let matchmaking_pool = db_pool.clone();
-        let matchmaking_server_id = server_id.clone();
-        let matchmaking_games_manager = games_manager.clone();
-        let matchmaking_player_connections = player_connections.clone();
-        handles.push(tokio::spawn(async move {
-            println!("Matchmaking loop starting for server {}", matchmaking_server_id);
-            run_matchmaking_loop(matchmaking_pool, matchmaking_server_id, matchmaking_games_manager, matchmaking_player_connections).await;
-        }));
-        
-        // Start cleanup service
-        let cleanup_pool = db_pool.clone();
-        let cleanup_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_cleanup_service(cleanup_pool, cleanup_token).await;
-        }));
-        
-        Ok(Self {
-            server_id,
-            ws_port,
-            ws_addr: format!("ws://{}", ws_addr),
-            cancellation_token,
-            handles,
-        })
+/// Builder for creating test environments with proper isolation
+pub struct TestEnvironmentBuilder {
+    test_name: String,
+    num_servers: usize,
+    num_users: usize,
+    use_distributed_broker: bool,
+    jwt_verifier: Option<Arc<dyn JwtVerifier>>,
+}
+
+impl TestEnvironmentBuilder {
+    /// Create a new test environment builder
+    pub fn new(test_name: &str) -> Self {
+        Self {
+            test_name: test_name.to_string(),
+            num_servers: 1,
+            num_users: 0,
+            use_distributed_broker: false,
+            jwt_verifier: None,
+        }
     }
     
-    async fn shutdown(self) -> Result<()> {
-        // Cancel all services
-        self.cancellation_token.cancel();
+    /// Set the number of servers to create
+    pub fn with_servers(mut self, count: usize) -> Self {
+        self.num_servers = count;
+        self
+    }
+    
+    /// Set the number of test users to create
+    pub fn with_users(mut self, count: usize) -> Self {
+        self.num_users = count;
+        self
+    }
+    
+    /// Enable distributed broker for multi-server tests
+    pub fn with_distributed_broker(mut self) -> Self {
+        self.use_distributed_broker = true;
+        self
+    }
+    
+    /// Set a custom JWT verifier (defaults to MockJwtVerifier)
+    pub fn with_jwt_verifier(mut self, verifier: Arc<dyn JwtVerifier>) -> Self {
+        self.jwt_verifier = Some(verifier);
+        self
+    }
+    
+    /// Build and start the test environment
+    pub async fn build(self) -> Result<TestEnvironment> {
+        info!("Building test environment for: {}", self.test_name);
         
-        // Wait for all services to complete with timeout
-        for handle in self.handles {
-            match tokio::time::timeout(Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => eprintln!("Service panicked during shutdown: {:?}", e),
-                Err(_) => eprintln!("Service shutdown timed out"),
-            }
+        // Create isolated test database
+        let db_guard = TestDatabaseGuard::new(&self.test_name).await
+            .context("Failed to create test database")?;
+        
+        // Get default JWT verifier if not provided
+        let jwt_verifier = self.jwt_verifier
+            .unwrap_or_else(|| Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>);
+        
+        // Create servers
+        let mut servers = Vec::new();
+        for i in 0..self.num_servers {
+            let server = GameServerBuilder::new()
+                .with_db_url(db_guard.url().to_string())
+                .with_region("test-region".to_string())
+                .with_jwt_verifier(jwt_verifier.clone())
+                .with_distributed_broker(self.use_distributed_broker)
+                .build()
+                .await
+                .context(format!("Failed to start server {}", i))?;
+            
+            info!("Started server {} with ID {} on {}", 
+                i, server.id(), server.ws_addr());
+            
+            servers.push(server);
         }
         
-        Ok(())
-    }
-    
-    fn get_available_port() -> u16 {
-        // Create a temporary TcpListener to get an available port
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        // Add a small delay to ensure OS has released the port
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        port
+        // Create test users
+        let mut user_ids = Vec::new();
+        if self.num_users > 0 {
+            let pool = db_guard.pool();
+            
+            for i in 0..self.num_users {
+                let user_id = create_test_user(pool, i).await
+                    .context(format!("Failed to create test user {}", i))?;
+                user_ids.push(user_id);
+            }
+            
+            info!("Created {} test users", user_ids.len());
+        }
+        
+        Ok(TestEnvironment {
+            db_guard,
+            servers,
+            user_ids,
+            test_name: self.test_name,
+        })
     }
 }
+
+/// Create a test user in the database
+async fn create_test_user(pool: &sqlx::PgPool, index: usize) -> Result<i32> {
+    let username = format!("test_user_{}", index);
+    let user_id: i32 = sqlx::query_scalar(
+        r#"
+        INSERT INTO users (username, password_hash, mmr)
+        VALUES ($1, 'test_hash', 1000)
+        RETURNING id
+        "#
+    )
+    .bind(&username)
+    .fetch_one(pool)
+    .await?;
+    
+    Ok(user_id)
+}
+
+/// Convenience type alias for the builder
+pub type TestBuilder = TestEnvironmentBuilder;

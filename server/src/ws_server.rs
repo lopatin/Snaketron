@@ -25,6 +25,7 @@ pub enum WSMessage {
     Token(String),
     JoinGame(u32),
     GameCommand(GameCommand),
+    GameEvent(GameEventMessage),
     Chat(String),
     Shutdown,
     Ping,
@@ -242,11 +243,12 @@ pub async fn run_websocket_server(
     games_manager: Arc<Mutex<GamesManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
-    jwt_verifier: Arc<dyn JwtVerifier>
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
-    run_websocket_server_with_listener(listener, games_manager, db_pool, cancellation_token, jwt_verifier).await
+    run_websocket_server_with_listener(listener, games_manager, db_pool, cancellation_token, jwt_verifier, player_connections).await
 }
 
 pub async fn run_websocket_server_with_listener(
@@ -254,7 +256,8 @@ pub async fn run_websocket_server_with_listener(
     games_manager: Arc<Mutex<GamesManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
-    jwt_verifier: Arc<dyn JwtVerifier>
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
 ) -> Result<()> {
 
     let mut connection_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -276,7 +279,8 @@ pub async fn run_websocket_server_with_listener(
                         let games_manager_clone = games_manager.clone();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, db_pool_clone, stream, connection_token, jwt_verifier_clone));
+                        let player_connections_clone = player_connections.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, db_pool_clone, stream, connection_token, jwt_verifier_clone, player_connections_clone));
                         connection_handles.push(handle);
                     }
 
@@ -316,7 +320,8 @@ async fn handle_websocket_connection(
     db_pool: PgPool,
     stream: TcpStream,
     cancellation_token: CancellationToken,
-    jwt_verifier: Arc<dyn JwtVerifier>
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
@@ -409,7 +414,9 @@ async fn handle_websocket_connection(
                                         info!("Received jwt token: {}", jwt_token);
                                         match jwt_verifier.verify(&jwt_token).await {
                                             Ok(user_token) => {
-                                                info!("Token verified successfully");
+                                                info!("Token verified successfully, user_id: {}", user_token.user_id);
+                                                // Register the player connection
+                                                player_connections.register(user_token.user_id, ws_tx.clone()).await;
                                                 ConnectionState::Authenticated { user_token }
                                             }
                                             Err(e) => {
@@ -520,6 +527,40 @@ async fn handle_websocket_connection(
                                             break;
                                         }
                                         ConnectionState::Authenticated { user_token }
+                                    }
+                                    WSMessage::GameEvent(event_msg) => {
+                                        // Handle game events - specifically initial snapshot from matchmaking
+                                        if let GameEvent::Snapshot { ref game_state } = event_msg.event {
+                                            info!("Received game snapshot for game {} - auto-joining", event_msg.game_id);
+                                            
+                                            // Join the game to get the channels
+                                            let games_mgr = games_manager.lock().await;
+                                            match games_mgr.join_game(event_msg.game_id).await {
+                                                Ok((command_tx, event_rx)) => {
+                                                    // Forward the snapshot to the client
+                                                    let snapshot_msg = Message::Text(serde_json::to_string(&event_msg)?.into());
+                                                    if let Err(e) = ws_stream.send(snapshot_msg).await {
+                                                        error!("Failed to forward snapshot: {}", e);
+                                                        ConnectionState::Authenticated { user_token }
+                                                    } else {
+                                                        info!("WS: Auto-joined game {} after matchmaking", event_msg.game_id);
+                                                        ConnectionState::InGame {
+                                                            user_token,
+                                                            game_id: event_msg.game_id,
+                                                            command_tx,
+                                                            event_rx,
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to auto-join game {}: {}", event_msg.game_id, e);
+                                                    ConnectionState::Authenticated { user_token }
+                                                }
+                                            }
+                                        } else {
+                                            warn!("Received non-snapshot game event while authenticated: {:?}", event_msg.event);
+                                            ConnectionState::Authenticated { user_token }
+                                        }
                                     }
                                     _ => {
                                         warn!("Unexpected message in authenticated state: {:?}", ws_message);
@@ -633,6 +674,15 @@ async fn handle_websocket_connection(
 
     // Clean up connection
     let _ = ws_stream.close(None).await;
+    
+    // Unregister the player connection if authenticated
+    match &state {
+        ConnectionState::Authenticated { user_token } | ConnectionState::InGame { user_token, .. } => {
+            player_connections.unregister(user_token.user_id).await;
+            info!("Unregistered player connection for user {}", user_token.user_id);
+        }
+        _ => {}
+    }
     
     // Drop any active game channels
     if let Some((command_tx, event_rx)) = state.take_game_channels() {

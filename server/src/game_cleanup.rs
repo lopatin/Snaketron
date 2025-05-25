@@ -35,23 +35,8 @@ pub async fn run_cleanup_service(
 pub async fn cleanup_games(pool: &PgPool) -> Result<()> {
     // Start a transaction for atomic cleanup
     let mut tx = pool.begin().await?;
-    
-    // 1. Delete finished games older than 5 minutes
-    let finished_deleted = sqlx::query(
-        r#"
-        DELETE FROM games
-        WHERE status = 'finished' 
-        AND ended_at < NOW() - INTERVAL '5 minutes'
-        "#
-    )
-    .execute(&mut *tx)
-    .await?;
-    
-    if finished_deleted.rows_affected() > 0 {
-        info!("Deleted {} finished games", finished_deleted.rows_affected());
-    }
-    
-    // 2. Delete waiting games with no players older than 2 minutes
+
+    // Delete waiting games with no players older than 2 minutes
     let waiting_deleted = sqlx::query(
         r#"
         DELETE FROM games g

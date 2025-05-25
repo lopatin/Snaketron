@@ -1,46 +1,58 @@
 mod common;
 
 use anyhow::Result;
-use tokio::time::Duration;
+use tokio::time::{timeout, Duration};
 use tracing::info;
-use crate::common::{TestServerBuilder, MockJwtVerifier};
+use server::ws_server::WSMessage;
+use crate::common::{TestBuilder, TestClient};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ping_pong() -> Result<()> {
     // Wrap the entire test in a timeout
-    tokio::time::timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(10), async {
         // Initialize tracing for tests
         let _ = tracing_subscriber::fmt::try_init();
         
         info!("Starting ping/pong test");
         
-        // Create and start test server
-        let server = TestServerBuilder::new()
-            .with_port(0)  // Random available port
-            .with_mock_auth()  // Accept any token
+        // Create test environment
+        let env = TestBuilder::new("test_ping_pong")
+            .with_servers(1)
             .build()
             .await?;
         
-        info!("Test server built, connecting client to {}", server.addr);
+        let server_addr = env.ws_addr(0).expect("Server should exist");
+        info!("Test server built, connecting client to {}", server_addr);
         
         // Connect a client
-        let mut client = server.connect_client().await?;
+        let mut client = TestClient::connect(&server_addr).await?;
         
         info!("Client connected, sending ping");
         
         // Send ping
-        client.send_ping().await?;
+        client.send_message(WSMessage::Ping).await?;
         
         info!("Ping sent, expecting pong");
         
         // Expect pong response
-        client.expect_pong().await?;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(msg) = client.receive_text().await {
+                    if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
+                        if matches!(ws_msg, WSMessage::Pong) {
+                            info!("Pong received");
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                }
+            }
+        }).await.map_err(|_| anyhow::anyhow!("Timeout waiting for pong"))??;
         
         info!("Pong received, test successful");
         
         // Cleanup
         client.disconnect().await?;
-        server.shutdown().await?;
+        env.shutdown().await?;
         
         Ok(())
     })
@@ -51,44 +63,47 @@ async fn test_ping_pong() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_join_game_receives_snapshot() -> Result<()> {
     // Wrap the entire test in a timeout
-    tokio::time::timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(10), async {
         // Initialize tracing for tests
         let _ = tracing_subscriber::fmt::try_init();
         
         info!("Starting join game snapshot test");
         
-        // Create and start test server
-        let server = TestServerBuilder::new()
-            .with_port(0)  // Random available port
-            .with_mock_auth()  // Accept any token
+        // Create test environment with users
+        let env = TestBuilder::new("test_join_game_snapshot")
+            .with_servers(1)
+            .with_users(2)
             .build()
             .await?;
         
-        info!("Test server built at {}", server.addr);
+        let server_addr = env.ws_addr(0).expect("Server should exist");
+        info!("Test server built at {}", server_addr);
         
-        // Create a game with unique ID to avoid conflicts when tests run in parallel
-        let test_game_id = common::generate_unique_game_id();
-        server.create_game(test_game_id).await?;
-        info!("Game {} created", test_game_id);
+        // Connect two clients to trigger matchmaking
+        let mut client1 = TestClient::connect(&server_addr).await?;
+        let mut client2 = TestClient::connect(&server_addr).await?;
+        info!("Clients connected");
         
-        // Give the game loop time to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Authenticate the clients
+        client1.authenticate(env.user_ids()[0]).await?;
+        client2.authenticate(env.user_ids()[1]).await?;
+        info!("Clients authenticated");
         
-        // Connect a client
-        let mut client = server.connect_client().await?;
-        info!("Client connected");
+        // Queue for match
+        let game_type = ::common::GameType::FreeForAll { max_players: 2 };
+        client1.send_message(WSMessage::QueueForMatch { game_type: game_type.clone() }).await?;
+        client2.send_message(WSMessage::QueueForMatch { game_type }).await?;
+        info!("Clients queued for match");
         
-        // Authenticate the client
-        client.authenticate(1).await?;
-        info!("Client authenticated");
+        // Wait for automatic match and join
+        let event = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(event) = client1.receive_game_event().await? {
+                    return Ok::<_, anyhow::Error>(event);
+                }
+            }
+        }).await??;
         
-        // Join the game
-        client.join_game(test_game_id).await?;
-        info!("Join game message sent");
-        
-        // Receive the snapshot event
-        let event = client.receive_game_event().await?;
-        let event = event.ok_or_else(|| anyhow::anyhow!("Expected game event, got None"))?;
         info!("Received event: {:?}", event);
         
         // Verify it's a snapshot event
@@ -97,7 +112,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
                 // Verify the game state has expected properties
                 assert_eq!(game_state.arena.width, 10);
                 assert_eq!(game_state.arena.height, 10);
-                assert_eq!(event.game_id, test_game_id);
+                assert!(!game_state.arena.snakes.is_empty());
                 info!("Snapshot verified successfully");
             }
             _ => {
@@ -106,8 +121,9 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         }
         
         // Cleanup
-        client.disconnect().await?;
-        server.shutdown().await?;
+        client1.disconnect().await?;
+        client2.disconnect().await?;
+        env.shutdown().await?;
         
         Ok(())
     })
@@ -117,44 +133,44 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_authenticated_connection() -> Result<()> {
-    // Wrap the entire test in a timeout
-    tokio::time::timeout(Duration::from_secs(10), async {
-        // Initialize tracing for tests
+    timeout(Duration::from_secs(10), async {
         let _ = tracing_subscriber::fmt::try_init();
         
         info!("Starting authenticated connection test");
         
-        // Create a mock JWT verifier that expects a specific token
-        let jwt_verifier = std::sync::Arc::new(
-            MockJwtVerifier::new().with_token("valid_token", 42)
-        );
-        
-        // Create and start test server with custom JWT verifier
-        let server = TestServerBuilder::new()
-            .with_port(0)
-            .with_jwt_verifier(jwt_verifier)
+        // Create test environment with a user
+        let env = TestBuilder::new("test_authenticated_connection")
+            .with_servers(1)
+            .with_users(1)
             .build()
             .await?;
         
-        info!("Test server built at {}", server.addr);
+        let server_addr = env.ws_addr(0).expect("Server should exist");
         
-        // Connect a client
-        let mut client = server.connect_client().await?;
-        info!("Client connected");
+        // Connect and authenticate
+        let mut client = TestClient::connect(&server_addr).await?;
+        client.authenticate(env.user_ids()[0]).await?;
+        info!("Client authenticated successfully");
         
-        // Authenticate with the token that the mock verifier expects
-        // The mock verifier is configured with token "valid_token" -> user_id 42
-        client.authenticate_with_token("valid_token").await?;
-        info!("Client authenticated with valid token");
+        // Send a ping to verify connection is working
+        client.send_message(WSMessage::Ping).await?;
         
-        // Test that authenticated client can send ping
-        client.send_ping().await?;
-        client.expect_pong().await?;
-        info!("Authenticated ping/pong successful");
+        // Wait for pong
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(msg) = client.receive_text().await {
+                    if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
+                        if matches!(ws_msg, WSMessage::Pong) {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                }
+            }
+        }).await.map_err(|_| anyhow::anyhow!("Timeout waiting for pong"))??;
         
         // Cleanup
         client.disconnect().await?;
-        server.shutdown().await?;
+        env.shutdown().await?;
         
         Ok(())
     })

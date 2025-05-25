@@ -95,20 +95,23 @@ async fn main() -> Result<()> {
     let websocket_cancellation_token = cancellation_token.clone();
     let db_pool_clone = db_pool.clone();
     let websocket_games_manager = games_manager.clone();
+    let websocket_player_connections = player_connections.clone();
     let external_server_handle = tokio::spawn(async move {
-        run_websocket_server(&ws_addr, websocket_games_manager, db_pool_clone, websocket_cancellation_token, jwt_verifier).await
+        run_websocket_server(&ws_addr, websocket_games_manager, db_pool_clone, websocket_cancellation_token, jwt_verifier, websocket_player_connections).await
     });
     
     // Matchmaking service
     let matchmaking_pool = db_pool.clone();
     let matchmaking_games_manager = games_manager.clone();
     let matchmaking_player_connections = player_connections.clone();
+    let matchmaking_token = cancellation_token.clone();
     let matchmaking_handle = tokio::spawn(async move {
         server::matchmaking::run_matchmaking_loop(
             matchmaking_pool, 
             server_id,
             matchmaking_games_manager,
-            matchmaking_player_connections
+            matchmaking_player_connections,
+            matchmaking_token
         ).await;
         Ok::<(), anyhow::Error>(())
     });

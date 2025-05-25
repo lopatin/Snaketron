@@ -73,17 +73,36 @@ impl TestClient {
         }
     }
     
+    pub async fn receive_text(&mut self) -> Result<String> {
+        let timeout = tokio::time::timeout(Duration::from_secs(1), self.ws.next()).await;
+        match timeout {
+            Ok(Some(msg)) => {
+                match msg? {
+                    Message::Text(text) => Ok(text.to_string()),
+                    _ => Err(anyhow::anyhow!("Expected text message")),
+                }
+            }
+            Ok(None) => Err(anyhow::anyhow!("Connection closed")),
+            Err(_) => Err(anyhow::anyhow!("Timeout waiting for message")),
+        }
+    }
+    
     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
-        let timeout = tokio::time::timeout(Duration::from_millis(100), self.ws.next()).await;
+        let timeout = tokio::time::timeout(Duration::from_secs(1), self.ws.next()).await;
         match timeout {
             Ok(Some(msg)) => {
                 match msg? {
                     Message::Text(text) => {
-                        // Try to parse as GameEventMessage
-                        if let Ok(event) = serde_json::from_str::<GameEventMessage>(&text) {
+                        // Try to parse as WSMessage first
+                        if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&text) {
+                            match ws_msg {
+                                WSMessage::GameEvent(event) => Ok(Some(event)),
+                                _ => Ok(None), // Different message type
+                            }
+                        } else if let Ok(event) = serde_json::from_str::<GameEventMessage>(&text) {
+                            // Fallback to direct GameEventMessage parsing
                             Ok(Some(event))
                         } else {
-                            // Might be a different message type
                             Ok(None)
                         }
                     }

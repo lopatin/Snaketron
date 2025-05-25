@@ -4,22 +4,23 @@ use ::common::{GameType, GameEvent};
 use tokio::time::{timeout, Duration};
 
 mod common;
-use self::common::{TestEnvironment, TestClient};
+use self::common::{TestBuilder, TestClient};
 
 #[tokio::test]
 async fn test_cleanup_abandoned_game() -> Result<()> {
-    let env = TestEnvironment::new(1).await?;
+    let env = TestBuilder::new("test_cleanup_abandoned_game")
+        .with_servers(1)
+        .with_users(2)
+        .build()
+        .await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
-    
-    // Create test users in the database
-    env.create_test_users(2).await?;
     
     // Create a game with two players
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
     
-    client1.authenticate(1).await?;
-    client2.authenticate(2).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     
     // Get matched
     client1.send_message(WSMessage::QueueForMatch { 
@@ -32,6 +33,11 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
     
     let game_id = wait_for_match(&mut client1).await?;
     let _ = wait_for_match(&mut client2).await?;
+    
+    // Give the server time to start the game after matchmaking
+    // This delay is needed because the WebSocket handler polls the database
+    // and may find the match before the matchmaking service has started the game
+    tokio::time::sleep(Duration::from_secs(5)).await;
     
     // Both join the game
     client1.send_message(WSMessage::JoinGame(game_id)).await?;
@@ -56,18 +62,19 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_cleanup_finished_game() -> Result<()> {
-    let env = TestEnvironment::new(1).await?;
+    let env = TestBuilder::new("test_cleanup_finished_game")
+        .with_servers(1)
+        .with_users(2)
+        .build()
+        .await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
-    
-    // Create test users in the database
-    env.create_test_users(2).await?;
     
     // Create a game
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
     
-    client1.authenticate(1).await?;
-    client2.authenticate(2).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     
     client1.send_message(WSMessage::QueueForMatch { 
         game_type: GameType::FreeForAll { max_players: 2 } 
@@ -79,6 +86,11 @@ async fn test_cleanup_finished_game() -> Result<()> {
     
     let game_id = wait_for_match(&mut client1).await?;
     let _ = wait_for_match(&mut client2).await?;
+    
+    // Give the server time to start the game after matchmaking
+    // This delay is needed because the WebSocket handler polls the database
+    // and may find the match before the matchmaking service has started the game
+    tokio::time::sleep(Duration::from_secs(5)).await;
     
     // Join game
     client1.send_message(WSMessage::JoinGame(game_id)).await?;
@@ -102,18 +114,19 @@ async fn test_cleanup_finished_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
-    let env = TestEnvironment::new(1).await?;
+    let env = TestBuilder::new("test_cleanup_stale_matchmaking_requests")
+        .with_servers(1)
+        .with_users(2)
+        .build()
+        .await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
-    
-    // Create test users in the database
-    env.create_test_users(2).await?;
     
     // Create clients that queue but never get matched
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
     
-    client1.authenticate(1).await?;
-    client2.authenticate(2).await?;
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
     
     // Queue for a match that requires 3 players
     client1.send_message(WSMessage::QueueForMatch { 
@@ -140,11 +153,12 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiple_games_cleanup() -> Result<()> {
-    let env = TestEnvironment::new(1).await?;
+    let env = TestBuilder::new("test_multiple_games_cleanup")
+        .with_servers(1)
+        .with_users(6)
+        .build()
+        .await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
-    
-    // Create test users in the database
-    env.create_test_users(6).await?;
     
     // Create multiple games concurrently
     let mut game_ids = Vec::new();
@@ -153,8 +167,8 @@ async fn test_multiple_games_cleanup() -> Result<()> {
         let mut client1 = TestClient::connect(&server_addr).await?;
         let mut client2 = TestClient::connect(&server_addr).await?;
         
-        client1.authenticate(i * 2 + 1).await?;
-        client2.authenticate(i * 2 + 2).await?;
+        client1.authenticate(env.user_ids()[i * 2]).await?;
+        client2.authenticate(env.user_ids()[i * 2 + 1]).await?;
         
         client1.send_message(WSMessage::QueueForMatch { 
             game_type: GameType::FreeForAll { max_players: 2 } 
@@ -167,6 +181,11 @@ async fn test_multiple_games_cleanup() -> Result<()> {
         let game_id = wait_for_match(&mut client1).await?;
         let _ = wait_for_match(&mut client2).await?;
         game_ids.push(game_id);
+        
+        // Give the server time to start the game after matchmaking
+        // This delay is needed because the WebSocket handler polls the database
+        // and may find the match before the matchmaking service has started the game
+        tokio::time::sleep(Duration::from_secs(5)).await;
         
         // Join games
         client1.send_message(WSMessage::JoinGame(game_id)).await?;

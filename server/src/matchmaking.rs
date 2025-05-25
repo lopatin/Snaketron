@@ -4,6 +4,7 @@ use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::{error, info, trace, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use crate::games_manager::GamesManager;
 use crate::player_connections::PlayerConnectionManager;
 
@@ -52,6 +53,7 @@ pub async fn run_matchmaking_loop(
     server_id: uuid::Uuid,
     games_manager: Arc<Mutex<GamesManager>>,
     player_connections: Arc<PlayerConnectionManager>,
+    cancellation_token: CancellationToken,
 ) {
     info!(?server_id, "Starting adaptive matchmaking loop");
 
@@ -59,7 +61,15 @@ pub async fn run_matchmaking_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                info!("Matchmaking loop received shutdown signal");
+                break;
+            }
+            _ = interval.tick() => {
+                // Continue with matchmaking logic
+            }
+        }
         
         // Update server heartbeat
         if let Err(e) = update_heartbeat(&pool, server_id).await {
@@ -67,9 +77,11 @@ pub async fn run_matchmaking_loop(
         }
 
         // Try to create matches for different game types
+        // Note: In production, this could be configurable
         let game_types = vec![
             serde_json::json!({"FreeForAll": {"max_players": 2}}),
-            serde_json::json!({"FreeForAll": {"max_players": 10}}),
+            serde_json::json!({"FreeForAll": {"max_players": 4}}),
+            serde_json::json!({"TeamMatch": {"per_team": 1}}),
             serde_json::json!({"TeamMatch": {"per_team": 2}}),
         ];
         
@@ -93,9 +105,9 @@ pub async fn run_matchmaking_loop(
                     
                     info!("Game {} started successfully", game_id);
                     
-                    // Notify players that match was found
-                    player_connections.notify_match_found(&players, game_id as u32).await;
-                    info!("Players notified of match {}", game_id);
+                    // Notify players and automatically join them to the game
+                    player_connections.notify_match_found_and_join(&players, game_id as u32, games_manager.clone()).await;
+                    info!("Players joined to game {} and sent initial snapshot", game_id);
                 }
                 Ok(None) => {
                     trace!(game_type = ?game_type, "No suitable match found");
@@ -139,6 +151,7 @@ async fn create_adaptive_match(
 
 
     // Get the oldest waiting player to determine match urgency
+    // For production (test_context IS NULL), match only with other production players
     let oldest_wait: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT CASE 
@@ -146,7 +159,7 @@ async fn create_adaptive_match(
             ELSE EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
         END
         FROM game_requests
-        WHERE game_type = $1 AND game_id IS NULL
+        WHERE game_type = $1 AND game_id IS NULL AND test_context IS NULL
         "#
     )
     .bind(&game_type)
@@ -184,55 +197,76 @@ async fn create_adaptive_match(
         _ => base_min_players
     };
 
-    // Find matching players
-    let players: Vec<MatchmakingPlayer> = sqlx::query_as(
+    // Find matching players - use INNER JOIN to ensure we only get valid users
+    // For production, only match players with test_context IS NULL
+    let players_result = sqlx::query_as::<_, MatchmakingPlayer>(
         r#"
-        WITH available_players AS (
-            SELECT 
-                gr.id as game_request_id,
-                gr.user_id,
-                u.mmr,
-                EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds
-            FROM game_requests gr
-            JOIN users u ON gr.user_id = u.id
-            WHERE gr.game_type = $1 AND gr.game_id IS NULL
-            ORDER BY gr.request_time ASC
-            LIMIT $2
-            FOR UPDATE OF gr SKIP LOCKED
-        ),
-        player_stats AS (
-            SELECT AVG(mmr) as avg_mmr
-            FROM available_players
-        )
         SELECT 
-            ap.game_request_id,
-            ap.user_id,
-            ap.mmr,
-            ap.wait_seconds
-        FROM available_players ap
-        CROSS JOIN player_stats ps
-        WHERE ABS(ap.mmr - ps.avg_mmr) <= $3
-        ORDER BY ap.wait_seconds DESC
-        LIMIT $4
+            gr.id as game_request_id,
+            gr.user_id,
+            u.mmr,
+            EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds
+        FROM game_requests gr
+        INNER JOIN users u ON gr.user_id = u.id
+        WHERE gr.game_type = $1 
+            AND gr.game_id IS NULL
+            AND gr.test_context IS NULL
+        ORDER BY gr.request_time ASC
+        LIMIT $2
+        FOR UPDATE OF gr SKIP LOCKED
         "#
     )
     .bind(&game_type)
-    .bind(MAX_PLAYERS as i32 * 2) // Fetch more to filter by MMR
-    .bind(max_mmr_diff)
     .bind(MAX_PLAYERS as i32)
     .fetch_all(&mut *tx)
-    .await?;
+    .await;
+    
+    let players = match players_result {
+        Ok(p) => p,
+        Err(e) => {
+            // Log the error but don't fail - just skip this game type
+            trace!(?game_type, error = %e, "No matching players found");
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    };
+    
+    // If no players found, return early
+    if players.is_empty() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    
+    // Filter by MMR difference if we have multiple players
+    let filtered_players = if players.len() > 1 {
+        let avg_mmr: i32 = players.iter()
+            .map(|p| p.mmr)
+            .sum::<i32>() / players.len() as i32;
+        
+        players.into_iter()
+            .filter(|p| (p.mmr - avg_mmr).abs() <= max_mmr_diff)
+            .collect()
+    } else {
+        players
+    };
 
     // Check if we have enough players
-    if players.len() < min_players {
+    if filtered_players.len() < min_players {
         tx.rollback().await?;
         return Ok(None);
     }
 
     // Take up to MAX_PLAYERS players
-    let matched_players: Vec<_> = players.into_iter().take(MAX_PLAYERS).collect();
-    let user_ids: Vec<i32> = matched_players.iter().map(|p| p.user_id).collect();
-    let request_ids: Vec<i32> = matched_players.iter().map(|p| p.game_request_id).collect();
+    let matched_players: Vec<_> = filtered_players.into_iter()
+        .take(MAX_PLAYERS)
+        .collect();
+    
+    let user_ids: Vec<i32> = matched_players.iter()
+        .map(|p| p.user_id)
+        .collect();
+    let request_ids: Vec<i32> = matched_players.iter()
+        .map(|p| p.game_request_id)
+        .collect();
 
     // Use the current server (no need to select least loaded in this version)
 
@@ -299,8 +333,13 @@ async fn create_adaptive_match(
     tx.commit().await?;
 
     // Log match details
-    let avg_mmr = matched_players.iter().map(|p| p.mmr).sum::<i32>() / matched_players.len() as i32;
-    let max_wait = matched_players.iter().map(|p| p.wait_seconds).max().unwrap_or(0);
+    let avg_mmr = matched_players.iter()
+        .map(|p| p.mmr)
+        .sum::<i32>() / matched_players.len() as i32;
+    let max_wait = matched_players.iter()
+        .map(|p| p.wait_seconds)
+        .max()
+        .unwrap_or(0);
     
     info!(
         game_id,
