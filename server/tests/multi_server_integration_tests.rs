@@ -4,16 +4,18 @@ use ::common::{GameType, GameEvent};
 use tokio::time::{timeout, Duration};
 
 mod common;
-use self::common::{TestBuilder, TestEnvironment, TestClient};
+use self::common::{TestEnvironment, TestClient};
 
 #[tokio::test]
 async fn test_multiple_servers_independent_games() -> Result<()> {
     // Start 3 servers with 6 users (2 per server)
-    let env = TestBuilder::new("test_multiple_servers_independent_games")
-        .with_servers(3)
-        .with_users(6)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_multiple_servers_independent_games").await?;
+    for _ in 0..3 {
+        env.add_server(false).await?;
+    }
+    for _ in 0..6 {
+        env.create_user().await?;
+    }
     
     // Create games on each server independently
     for server_idx in 0..3 {
@@ -35,17 +37,11 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
             game_type: GameType::FreeForAll { max_players: 2 } 
         }).await?;
         
-        // Get matched
-        let game_id = wait_for_match(&mut client1).await?;
-        let _ = wait_for_match(&mut client2).await?;
+        // Wait for game to start (auto-join after match)
+        let game_id1 = wait_for_game_start(&mut client1).await?;
+        let game_id2 = wait_for_game_start(&mut client2).await?;
         
-        // Join game
-        client1.send_message(WSMessage::JoinGame(game_id)).await?;
-        client2.send_message(WSMessage::JoinGame(game_id)).await?;
-        
-        // Verify game starts
-        wait_for_snapshot(&mut client1).await?;
-        wait_for_snapshot(&mut client2).await?;
+        assert_eq!(game_id1, game_id2, "Both clients should be in the same game");
         
         // Disconnect
         client1.disconnect().await?;
@@ -60,11 +56,12 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
 #[tokio::test]
 async fn test_server_load_distribution() -> Result<()> {
     // Start 2 servers with 8 users
-    let env = TestBuilder::new("test_server_load_distribution")
-        .with_servers(2)
-        .with_users(8)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_server_load_distribution").await?;
+    env.add_server(false).await?;
+    env.add_server(false).await?;
+    for _ in 0..8 {
+        env.create_user().await?;
+    }
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
     
@@ -104,12 +101,12 @@ async fn test_server_load_distribution() -> Result<()> {
     // Each server should create 2 games (4 players / 2 per game)
     let mut game_ids_server1 = Vec::new();
     for client in &mut clients_server1 {
-        game_ids_server1.push(wait_for_match(client).await?);
+        game_ids_server1.push(wait_for_game_start(client).await?);
     }
     
     let mut game_ids_server2 = Vec::new();
     for client in &mut clients_server2 {
-        game_ids_server2.push(wait_for_match(client).await?);
+        game_ids_server2.push(wait_for_game_start(client).await?);
     }
     
     // Verify games were created on each server
@@ -136,11 +133,10 @@ async fn test_server_load_distribution() -> Result<()> {
 #[tokio::test]
 async fn test_server_isolation() -> Result<()> {
     // Start 2 servers with 1 user
-    let env = TestBuilder::new("test_server_isolation")
-        .with_servers(2)
-        .with_users(1)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_server_isolation").await?;
+    env.add_server(false).await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
     
@@ -183,7 +179,12 @@ async fn test_server_isolation() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_operations_multiple_servers() -> Result<()> {
     // Start 2 servers
-    let env = TestBuilder::new("test_concurrent_games_on_multiple_servers").with_servers(2).with_users(8).build().await?;
+    let mut env = TestEnvironment::new("test_concurrent_games_on_multiple_servers").await?;
+    env.add_server(false).await?;
+    env.add_server(false).await?;
+    for _ in 0..8 {
+        env.create_user().await?;
+    }
     
     // Run concurrent operations on both servers
     let mut handles = Vec::new();
@@ -219,14 +220,10 @@ async fn test_concurrent_operations_multiple_servers() -> Result<()> {
                         game_type: GameType::FreeForAll { max_players: 2 } 
                     }).await?;
                     
-                    let game_id = wait_for_match(&mut client1).await?;
-                    let _ = wait_for_match(&mut client2).await?;
+                    let game_id1 = wait_for_game_start(&mut client1).await?;
+                    let game_id2 = wait_for_game_start(&mut client2).await?;
                     
-                    client1.send_message(WSMessage::JoinGame(game_id)).await?;
-                    client2.send_message(WSMessage::JoinGame(game_id)).await?;
-                    
-                    wait_for_snapshot(&mut client1).await?;
-                    wait_for_snapshot(&mut client2).await?;
+                    assert_eq!(game_id1, game_id2, "Both clients should be in the same game");
                     
                     client1.disconnect().await?;
                     client2.disconnect().await?;
@@ -257,23 +254,12 @@ async fn test_concurrent_operations_multiple_servers() -> Result<()> {
 }
 
 // Helper functions
-async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
+async fn wait_for_game_start(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(10), async {
-        loop {
-            match client.receive_message().await? {
-                WSMessage::MatchFound { game_id } => return Ok(game_id),
-                _ => continue,
-            }
-        }
-    }).await?
-}
-
-async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
-    timeout(Duration::from_secs(120), async {
         loop {
             if let Some(event) = client.receive_game_event().await? {
                 if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok(());
+                    return Ok(event.game_id);
                 }
             }
         }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use server::{
-    game_server::{GameServer, GameServerBuilder},
+    game_server::{GameServer, start_test_server},
     ws_server::JwtVerifier,
 };
 use super::{mock_jwt::MockJwtVerifier, test_database::TestDatabaseGuard};
@@ -20,6 +20,88 @@ pub struct TestEnvironment {
 }
 
 impl TestEnvironment {
+    /// Create a new test environment with an isolated database
+    pub async fn new(test_name: &str) -> Result<Self> {
+        info!("Creating test environment for: {}", test_name);
+        
+        // Create isolated test database
+        let db_guard = TestDatabaseGuard::new(test_name).await
+            .context("Failed to create test database")?;
+        
+        Ok(Self {
+            db_guard,
+            servers: Vec::new(),
+            user_ids: Vec::new(),
+            test_name: test_name.to_string(),
+        })
+    }
+    
+    /// Get the database URL for this test environment
+    pub fn db_url(&self) -> &str {
+        self.db_guard.url()
+    }
+    
+    /// Get the database pool for this test environment
+    pub fn db_pool(&self) -> &sqlx::PgPool {
+        self.db_guard.pool()
+    }
+    
+    /// Add a server to this test environment
+    pub async fn add_server(&mut self, use_distributed_broker: bool) -> Result<usize> {
+        let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
+        
+        let server = start_test_server(
+            self.db_url(),
+            jwt_verifier,
+            use_distributed_broker
+        )
+        .await
+        .context("Failed to start server")?;
+        
+        let index = self.servers.len();
+        info!("Started server {} with ID {} on {}", index, server.id(), server.ws_addr());
+        
+        self.servers.push(server);
+        Ok(index)
+    }
+    
+    /// Add a server with custom JWT verifier
+    pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>, use_distributed_broker: bool) -> Result<usize> {
+        let server = start_test_server(
+            self.db_url(),
+            jwt_verifier,
+            use_distributed_broker
+        )
+        .await
+        .context("Failed to start server")?;
+        
+        let index = self.servers.len();
+        info!("Started server {} with ID {} on {}", index, server.id(), server.ws_addr());
+        
+        self.servers.push(server);
+        Ok(index)
+    }
+    
+    /// Create a test user in the database
+    pub async fn create_user(&mut self) -> Result<i32> {
+        let index = self.user_ids.len();
+        let username = format!("test_user_{}", index);
+        let user_id: i32 = sqlx::query_scalar(
+            r#"
+            INSERT INTO users (username, password_hash, mmr)
+            VALUES ($1, 'test_hash', 1000)
+            RETURNING id
+            "#
+        )
+        .bind(&username)
+        .fetch_one(self.db_pool())
+        .await?;
+        
+        self.user_ids.push(user_id);
+        info!("Created test user {} with ID {}", username, user_id);
+        Ok(user_id)
+    }
+    
     /// Get the WebSocket address for a server by index
     pub fn ws_addr(&self, index: usize) -> Option<String> {
         self.servers.get(index).map(|s| format!("ws://{}", s.ws_addr()))
@@ -56,119 +138,3 @@ impl TestEnvironment {
     }
 }
 
-/// Builder for creating test environments with proper isolation
-pub struct TestEnvironmentBuilder {
-    test_name: String,
-    num_servers: usize,
-    num_users: usize,
-    use_distributed_broker: bool,
-    jwt_verifier: Option<Arc<dyn JwtVerifier>>,
-}
-
-impl TestEnvironmentBuilder {
-    /// Create a new test environment builder
-    pub fn new(test_name: &str) -> Self {
-        Self {
-            test_name: test_name.to_string(),
-            num_servers: 1,
-            num_users: 0,
-            use_distributed_broker: false,
-            jwt_verifier: None,
-        }
-    }
-    
-    /// Set the number of servers to create
-    pub fn with_servers(mut self, count: usize) -> Self {
-        self.num_servers = count;
-        self
-    }
-    
-    /// Set the number of test users to create
-    pub fn with_users(mut self, count: usize) -> Self {
-        self.num_users = count;
-        self
-    }
-    
-    /// Enable distributed broker for multi-server tests
-    pub fn with_distributed_broker(mut self) -> Self {
-        self.use_distributed_broker = true;
-        self
-    }
-    
-    /// Set a custom JWT verifier (defaults to MockJwtVerifier)
-    pub fn with_jwt_verifier(mut self, verifier: Arc<dyn JwtVerifier>) -> Self {
-        self.jwt_verifier = Some(verifier);
-        self
-    }
-    
-    /// Build and start the test environment
-    pub async fn build(self) -> Result<TestEnvironment> {
-        info!("Building test environment for: {}", self.test_name);
-        
-        // Create isolated test database
-        let db_guard = TestDatabaseGuard::new(&self.test_name).await
-            .context("Failed to create test database")?;
-        
-        // Get default JWT verifier if not provided
-        let jwt_verifier = self.jwt_verifier
-            .unwrap_or_else(|| Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>);
-        
-        // Create servers
-        let mut servers = Vec::new();
-        for i in 0..self.num_servers {
-            let server = GameServerBuilder::new()
-                .with_db_url(db_guard.url().to_string())
-                .with_region("test-region".to_string())
-                .with_jwt_verifier(jwt_verifier.clone())
-                .with_distributed_broker(self.use_distributed_broker)
-                .build()
-                .await
-                .context(format!("Failed to start server {}", i))?;
-            
-            info!("Started server {} with ID {} on {}", i, server.id(), server.ws_addr());
-            
-            servers.push(server);
-        }
-        
-        // Create test users
-        let mut user_ids = Vec::new();
-        if self.num_users > 0 {
-            let pool = db_guard.pool();
-            
-            for i in 0..self.num_users {
-                let user_id = create_test_user(pool, i).await
-                    .context(format!("Failed to create test user {}", i))?;
-                user_ids.push(user_id);
-            }
-            
-            info!("Created {} test users", user_ids.len());
-        }
-        
-        Ok(TestEnvironment {
-            db_guard,
-            servers,
-            user_ids,
-            test_name: self.test_name,
-        })
-    }
-}
-
-/// Create a test user in the database
-async fn create_test_user(pool: &sqlx::PgPool, index: usize) -> Result<i32> {
-    let username = format!("test_user_{}", index);
-    let user_id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO users (username, password_hash, mmr)
-        VALUES ($1, 'test_hash', 1000)
-        RETURNING id
-        "#
-    )
-    .bind(&username)
-    .fetch_one(pool)
-    .await?;
-    
-    Ok(user_id)
-}
-
-/// Convenience type alias for the builder
-pub type TestBuilder = TestEnvironmentBuilder;

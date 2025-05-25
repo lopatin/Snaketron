@@ -5,7 +5,7 @@ use tokio::time::{timeout, Duration};
 use tracing::info;
 
 mod common;
-use self::common::{TestBuilder, TestClient};
+use self::common::{TestEnvironment, TestClient};
 
 #[tokio::test]
 async fn test_distributed_broker_local_game() -> Result<()> {
@@ -15,12 +15,15 @@ async fn test_distributed_broker_local_game() -> Result<()> {
         .try_init();
     
     println!("Starting test environment...");
-    // Start a single server with users
-    let env = TestBuilder::new("test_distributed_broker_local_game")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    // Create test environment
+    let mut env = TestEnvironment::new("test_distributed_broker_local_game").await?;
+    
+    // Add a server
+    env.add_server(false).await?;
+    
+    // Create users
+    let user1_id = env.create_user().await?;
+    let user2_id = env.create_user().await?;
     println!("Test environment created with users");
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
@@ -36,10 +39,10 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     
     // Authenticate clients
     println!("Authenticating client 1...");
-    client1.authenticate(env.user_ids()[0]).await?;
+    client1.authenticate(user1_id).await?;
     println!("Client 1 authenticated");
     println!("Authenticating client 2...");
-    client2.authenticate(env.user_ids()[1]).await?;
+    client2.authenticate(user2_id).await?;
     println!("Client 2 authenticated");
     
     // Small delay to ensure server is ready
@@ -101,12 +104,17 @@ async fn test_distributed_broker_local_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_distributed_broker_cross_server() -> Result<()> {
-    // Start two servers with users
-    let env = TestBuilder::new("test_distributed_broker_cross_server")
-        .with_servers(2)
-        .with_users(2)
-        .build()
-        .await?;
+    // Create test environment with two servers
+    let mut env = TestEnvironment::new("test_distributed_broker_cross_server").await?;
+    
+    // Add two servers
+    env.add_server(false).await?;
+    env.add_server(false).await?;
+    
+    // Create users
+    let user1_id = env.create_user().await?;
+    let user2_id = env.create_user().await?;
+    
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
     
@@ -117,8 +125,8 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
     let mut client1 = TestClient::connect(&server1_addr).await?;
     let mut client2 = TestClient::connect(&server2_addr).await?;
     
-    client1.authenticate(env.user_ids()[0]).await?;
-    client2.authenticate(env.user_ids()[1]).await?;
+    client1.authenticate(user1_id).await?;
+    client2.authenticate(user2_id).await?;
     
     // Each client queues on their own server
     // In a real distributed system, matchmaking would coordinate across servers
@@ -149,23 +157,27 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
 
 #[tokio::test] 
 async fn test_game_lifecycle_with_cleanup() -> Result<()> {
-    // Start a server with users
-    let env = TestBuilder::new("test_game_lifecycle_with_cleanup")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    // Create test environment
+    let mut env = TestEnvironment::new("test_game_lifecycle_with_cleanup").await?;
+    
+    // Add a server
+    env.add_server(false).await?;
+    
+    // Create users
+    let user1_id = env.create_user().await?;
+    let user2_id = env.create_user().await?;
+    
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Connect two clients
     let mut client1 = TestClient::connect(&server_addr).await?;
     let mut client2 = TestClient::connect(&server_addr).await?;
     
-    client1.authenticate(env.user_ids()[0]).await?;
-    client2.authenticate(env.user_ids()[1]).await?;
+    client1.authenticate(user1_id).await?;
+    client2.authenticate(user2_id).await?;
     
     // Create a match
-    println!("test_game_lifecycle_with_cleanup: Queuing players with IDs {:?}", env.user_ids());
+    println!("test_game_lifecycle_with_cleanup: Queuing players with IDs {} and {}", user1_id, user2_id);
     client1.send_message(WSMessage::QueueForMatch { 
         game_type: GameType::FreeForAll { max_players: 2 } 
     }).await?;

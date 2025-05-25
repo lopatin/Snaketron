@@ -4,15 +4,14 @@ use ::common::{GameType, GameEvent};
 use tokio::time::{timeout, Duration};
 
 mod common;
-use self::common::{TestBuilder, TestClient};
+use self::common::{TestEnvironment, TestClient};
 
 #[tokio::test]
 async fn test_cleanup_abandoned_game() -> Result<()> {
-    let env = TestBuilder::new("test_cleanup_abandoned_game")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_cleanup_abandoned_game").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Create a game with two players
@@ -62,11 +61,10 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_cleanup_finished_game() -> Result<()> {
-    let env = TestBuilder::new("test_cleanup_finished_game")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_cleanup_finished_game").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Create a game
@@ -114,11 +112,10 @@ async fn test_cleanup_finished_game() -> Result<()> {
 
 #[tokio::test]
 async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
-    let env = TestBuilder::new("test_cleanup_stale_matchmaking_requests")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_cleanup_stale_matchmaking_requests").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Create clients that queue but never get matched
@@ -153,11 +150,11 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiple_games_cleanup() -> Result<()> {
-    let env = TestBuilder::new("test_multiple_games_cleanup")
-        .with_servers(1)
-        .with_users(6)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_multiple_games_cleanup").await?;
+    env.add_server(false).await?;
+    for _ in 0..6 {
+        env.create_user().await?;
+    }
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
     // Create multiple games concurrently

@@ -5,7 +5,7 @@ use tokio::time::{timeout, Duration};
 use futures_util::future::join_all;
 
 mod common;
-use self::common::{TestBuilder, TestClient};
+use self::common::{TestEnvironment, TestClient};
 
 #[tokio::test]
 async fn test_minimal() -> Result<()> {
@@ -19,11 +19,10 @@ async fn test_minimal() -> Result<()> {
 #[tokio::test]
 async fn test_simple_two_player_match() -> Result<()> {
     // Simple test with just 2 players to debug matchmaking
-    let env = TestBuilder::new("test_simple_two_player_match")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_simple_two_player_match").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -86,11 +85,10 @@ async fn test_simple_two_player_match() -> Result<()> {
 
 #[tokio::test]
 async fn test_basic_matchmaking() -> Result<()> {
-    let env = TestBuilder::new("test_basic_matchmaking")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -123,11 +121,9 @@ async fn test_basic_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_leave_queue() -> Result<()> {
-    let env = TestBuilder::new("test_leave_queue")
-        .with_servers(1)
-        .with_users(1)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_leave_queue").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -154,11 +150,11 @@ async fn test_leave_queue() -> Result<()> {
 
 #[tokio::test]
 async fn test_team_matchmaking() -> Result<()> {
-    let env = TestBuilder::new("test_team_matchmaking")
-        .with_servers(1)
-        .with_users(4)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_team_matchmaking").await?;
+    env.add_server(false).await?;
+    for _ in 0..4 {
+        env.create_user().await?;
+    }
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -197,11 +193,11 @@ async fn test_team_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_matchmaking() -> Result<()> {
-    let env = TestBuilder::new("test_concurrent_matchmaking")
-        .with_servers(1)
-        .with_users(10)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_concurrent_matchmaking").await?;
+    env.add_server(false).await?;
+    for _ in 0..10 {
+        env.create_user().await?;
+    }
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -244,11 +240,10 @@ async fn test_concurrent_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_disconnect_during_queue() -> Result<()> {
-    let env = TestBuilder::new("test_disconnect_during_queue")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_disconnect_during_queue").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
@@ -282,11 +277,10 @@ async fn test_disconnect_during_queue() -> Result<()> {
 
 #[tokio::test]
 async fn test_rejoin_active_game() -> Result<()> {
-    let env = TestBuilder::new("test_rejoin_active_game")
-        .with_servers(1)
-        .with_users(2)
-        .build()
-        .await?;
+    let mut env = TestEnvironment::new("test_rejoin_active_game").await?;
+    env.add_server(false).await?;
+    env.create_user().await?;
+    env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     

@@ -216,109 +216,45 @@ impl GameServer {
     }
 }
 
-/// Builder for creating GameServer instances with custom configuration
-pub struct GameServerBuilder {
-    db_url: Option<String>,
-    ws_port: Option<u16>,
-    grpc_port: Option<u16>,
-    region: String,
-    jwt_verifier: Option<Arc<dyn JwtVerifier>>,
+/// Helper function to start a game server for testing
+/// Creates a database pool and determines ports automatically
+pub async fn start_test_server(
+    db_url: &str,
+    jwt_verifier: Arc<dyn JwtVerifier>,
     use_distributed_broker: bool,
-}
+) -> Result<GameServer> {
+    // Create database pool
+    let db_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(db_url)
+        .await
+        .context("Failed to connect to database")?;
 
-impl GameServerBuilder {
-    /// Create a new builder with default values
-    pub fn new() -> Self {
-        Self {
-            db_url: None,
-            ws_port: None,
-            grpc_port: None,
-            region: "default".to_string(),
-            jwt_verifier: None,
-            use_distributed_broker: false,
-        }
-    }
+    // Get available ports
+    let ws_port = get_available_port();
+    let ws_addr = format!("127.0.0.1:{}", ws_port);
 
-    /// Set the database URL
-    pub fn with_db_url(mut self, url: String) -> Self {
-        self.db_url = Some(url);
-        self
-    }
+    let grpc_addr = if use_distributed_broker {
+        let grpc_port = get_available_port();
+        Some(format!("127.0.0.1:{}", grpc_port))
+    } else {
+        None
+    };
 
-    /// Set the WebSocket port (will bind to 127.0.0.1)
-    pub fn with_ws_port(mut self, port: u16) -> Self {
-        self.ws_port = Some(port);
-        self
-    }
+    let config = GameServerConfig {
+        db_pool,
+        ws_addr,
+        grpc_addr,
+        region: "test-region".to_string(),
+        jwt_verifier,
+        use_distributed_broker,
+    };
 
-    /// Set the gRPC port (will bind to 127.0.0.1)
-    pub fn with_grpc_port(mut self, port: u16) -> Self {
-        self.grpc_port = Some(port);
-        self
-    }
-
-    /// Set the server region
-    pub fn with_region(mut self, region: String) -> Self {
-        self.region = region;
-        self
-    }
-
-    /// Set the JWT verifier
-    pub fn with_jwt_verifier(mut self, verifier: Arc<dyn JwtVerifier>) -> Self {
-        self.jwt_verifier = Some(verifier);
-        self
-    }
-
-    /// Enable distributed broker (requires gRPC)
-    pub fn with_distributed_broker(mut self, enabled: bool) -> Self {
-        self.use_distributed_broker = enabled;
-        self
-    }
-
-    /// Build and start the game server
-    pub async fn build(self) -> Result<GameServer> {
-        // Create database pool
-        let db_url = self.db_url
-            .unwrap_or_else(|| std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://snaketron:snaketron@localhost:5432/snaketron".to_string()));
-        
-        let db_pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await
-            .context("Failed to connect to database")?;
-
-        // Determine WebSocket address
-        let ws_port = self.ws_port.unwrap_or_else(|| get_available_port());
-        let ws_addr = format!("127.0.0.1:{}", ws_port);
-
-        // Determine gRPC address if needed
-        let grpc_addr = if self.use_distributed_broker || self.grpc_port.is_some() {
-            let grpc_port = self.grpc_port.unwrap_or_else(|| get_available_port());
-            Some(format!("127.0.0.1:{}", grpc_port))
-        } else {
-            None
-        };
-
-        // Get JWT verifier
-        let jwt_verifier = self.jwt_verifier
-            .expect("JWT verifier must be provided");
-
-        let config = GameServerConfig {
-            db_pool,
-            ws_addr,
-            grpc_addr,
-            region: self.region,
-            jwt_verifier,
-            use_distributed_broker: self.use_distributed_broker,
-        };
-
-        GameServer::start(config).await
-    }
+    GameServer::start(config).await
 }
 
 /// Get an available port by binding to port 0
-fn get_available_port() -> u16 {
+pub fn get_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
