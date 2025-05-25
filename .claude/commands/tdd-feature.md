@@ -1,10 +1,29 @@
-Act as an expert software engineer and analyze the code to let me know what changes would need to be made in the design of the data structures and code so that the following requirements are met: $ARGUMENTS
+Act as an expert software engineer and analyze the code to determine what architectural changes, data structure modifications, and implementation updates are required to satisfy the following requirements: $ARGUMENTS
 
-- When designing the code, keep in mind that the high level architectural decisions must be adhered to. Also focus on providing a simple and elegant solution that reduces duplication and complexity. The pieces should "fit into place".
-- Ask for clarification of my intentions if you are unsure of what I mean or would prefer.
+Design Principles:
+- Maintain existing high-level architectural patterns and constraints
+- Prioritize simplicity, elegance, and DRY (Don't Repeat Yourself) principles
+- Code should be written so that an AI can easily understand and modify it
+- Ensure components integrate seamlessly with minimal coupling
+- Request clarification for any ambiguous requirements or implementation details
 
-## Phases
+Development Workflow:
 
-- **Phase 1**: Come up with a design and an implementation plan. Get sign-off from me regarding the design and plan for testing.
-- **Phase 2**: Implement the unit tests (changes or additions) to test the new design. They should fail because the code is not implemented yet.
-- **Phase 3**: Implement the code, adhering to the design agreed on, to make the tests pass.
+**Phase 1 - Design & Planning**
+- Analyze current implementation and identify necessary changes
+- Propose data structure modifications and architectural adjustments
+- Create detailed implementation plan with clear milestones
+- Document testing strategy and edge cases
+- Obtain approval before proceeding
+
+**Phase 2 - Test-Driven Development**
+- Write comprehensive unit tests for the proposed changes
+- Include both positive and negative test cases
+- Ensure tests fail initially (red phase of TDD)
+- Cover edge cases and boundary conditions
+
+**Phase 3 - Implementation**
+- Implement the approved design incrementally
+- Follow the agreed-upon architecture strictly
+- Ensure all tests pass (green phase of TDD)
+- Refactor for clarity and maintainability while keeping tests green

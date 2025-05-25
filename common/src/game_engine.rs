@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::{BinaryHeap, VecDeque};
-use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage};
+use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType};
 
 pub struct GameEngine {
     game_id: u32,
@@ -39,10 +39,14 @@ impl GameEngine {
     }
 
     pub fn new_with_seed(game_id: u32, start_ms: i64, rng_seed: u64) -> Self {
+        Self::new_with_seed_and_type(game_id, start_ms, rng_seed, GameType::TeamMatch { per_team: 1 })
+    }
+    
+    pub fn new_with_seed_and_type(game_id: u32, start_ms: i64, rng_seed: u64, game_type: GameType) -> Self {
         GameEngine {
             game_id,
-            committed_state: GameState::new(10, 10, Some(rng_seed)),
-            predicted_state: Some(GameState::new(10, 10, None)), // Client prediction doesn't need RNG
+            committed_state: GameState::new_with_type(10, 10, game_type.clone(), Some(rng_seed)),
+            predicted_state: Some(GameState::new_with_type(10, 10, game_type, None)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
             pending_commands: BinaryHeap::new(),
             tick_duration_ms: 300,

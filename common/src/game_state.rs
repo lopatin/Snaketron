@@ -103,6 +103,10 @@ impl PartialOrd for GameCommandMessage {
 
 impl GameState {
     pub fn new(width: u16, height: u16, rng_seed: Option<u64>) -> Self {
+        Self::new_with_type(width, height, GameType::TeamMatch { per_team: 1 }, rng_seed)
+    }
+    
+    pub fn new_with_type(width: u16, height: u16, game_type: GameType, rng_seed: Option<u64>) -> Self {
         GameState {
             tick: 0,
             arena: Arena {
@@ -111,7 +115,7 @@ impl GameState {
                 snakes: Vec::new(),
                 food: Vec::new(),
             },
-            game_type: GameType::TeamMatch { per_team: 1 },
+            game_type,
             properties: GameProperties {
                 available_food_target: 5,
             },

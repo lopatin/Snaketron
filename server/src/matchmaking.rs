@@ -76,14 +76,21 @@ pub async fn run_matchmaking_loop(
             error!(?server_id, error = %e, "Failed to update heartbeat");
         }
 
-        // Try to create matches for different game types
-        // Note: In production, this could be configurable
-        let game_types = vec![
-            serde_json::json!({"FreeForAll": {"max_players": 2}}),
-            serde_json::json!({"FreeForAll": {"max_players": 4}}),
-            serde_json::json!({"TeamMatch": {"per_team": 1}}),
-            serde_json::json!({"TeamMatch": {"per_team": 2}}),
-        ];
+        // Get distinct game types that have waiting players
+        let game_types: Vec<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT game_type
+            FROM game_requests
+            WHERE game_id IS NULL
+            ORDER BY game_type
+            "#
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, "Failed to fetch waiting game types");
+            vec![]
+        });
         
         for game_type in &game_types {
             match create_adaptive_match(&pool, game_type.clone(), server_id).await {
@@ -151,7 +158,6 @@ async fn create_adaptive_match(
 
 
     // Get the oldest waiting player to determine match urgency
-    // For production (test_context IS NULL), match only with other production players
     let oldest_wait: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT CASE 
@@ -159,7 +165,7 @@ async fn create_adaptive_match(
             ELSE EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
         END
         FROM game_requests
-        WHERE game_type = $1 AND game_id IS NULL AND test_context IS NULL
+        WHERE game_type = $1 AND game_id IS NULL
         "#
     )
     .bind(&game_type)
@@ -198,7 +204,6 @@ async fn create_adaptive_match(
     };
 
     // Find matching players - use INNER JOIN to ensure we only get valid users
-    // For production, only match players with test_context IS NULL
     let players_result = sqlx::query_as::<_, MatchmakingPlayer>(
         r#"
         SELECT 
@@ -210,7 +215,6 @@ async fn create_adaptive_match(
         INNER JOIN users u ON gr.user_id = u.id
         WHERE gr.game_type = $1 
             AND gr.game_id IS NULL
-            AND gr.test_context IS NULL
         ORDER BY gr.request_time ASC
         LIMIT $2
         FOR UPDATE OF gr SKIP LOCKED

@@ -131,43 +131,45 @@ async fn test_server_load_distribution() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_server_isolation() -> Result<()> {
-    // Start 2 servers with 1 user
-    let mut env = TestEnvironment::new("test_server_isolation").await?;
+async fn test_cross_server_matchmaking() -> Result<()> {
+    // Test that players on different servers in the same region CAN be matched together
+    let mut env = TestEnvironment::new("test_cross_server_matchmaking").await?;
     env.add_server(false).await?;
     env.add_server(false).await?;
+    env.create_user().await?;
     env.create_user().await?;
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
     
-    // Connect client to server 1
+    // Connect clients to different servers
     let mut client1 = TestClient::connect(&server1_addr).await?;
-    client1.authenticate(env.user_ids()[0]).await?;
+    let mut client2 = TestClient::connect(&server2_addr).await?;
     
-    // Queue on server 1
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+    
+    // Queue both clients for the same game type
+    println!("Queueing client1 for match");
     client1.send_message(WSMessage::QueueForMatch { 
         game_type: GameType::FreeForAll { max_players: 2 } 
     }).await?;
     
-    // Connect client to server 2
-    let mut client2 = TestClient::connect(&server2_addr).await?;
-    client2.authenticate(2).await?;
-    
-    // Queue on server 2 with same game type
+    println!("Queueing client2 for match");
     client2.send_message(WSMessage::QueueForMatch { 
         game_type: GameType::FreeForAll { max_players: 2 } 
     }).await?;
     
-    // Without cross-server matchmaking, they shouldn't be matched together
-    let match_result = timeout(Duration::from_secs(3), wait_for_match(&mut client1)).await;
-    assert!(match_result.is_err(), "Client 1 shouldn't get matched without another player on same server");
+    // Wait a bit for matchmaking to process
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("Waiting for matches...");
     
-    let match_result = timeout(Duration::from_secs(1), wait_for_match(&mut client2)).await;
-    assert!(match_result.is_err(), "Client 2 shouldn't get matched without another player on same server");
+    // They SHOULD be matched together even though they're on different servers
+    let game_id1 = wait_for_game_start(&mut client1).await?;
+    println!("Client1 got game_id: {}", game_id1);
+    let game_id2 = wait_for_game_start(&mut client2).await?;
+    println!("Client2 got game_id: {}", game_id2);
     
-    // Clean up
-    client1.send_message(WSMessage::LeaveQueue).await?;
-    client2.send_message(WSMessage::LeaveQueue).await?;
+    assert_eq!(game_id1, game_id2, "Both clients should be in the same game despite being on different servers");
     
     client1.disconnect().await?;
     client2.disconnect().await?;
@@ -257,6 +259,20 @@ async fn test_concurrent_operations_multiple_servers() -> Result<()> {
 async fn wait_for_game_start(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(10), async {
         loop {
+            if let Some(event) = client.receive_game_event().await? {
+                println!("Received event: {:?}", event.event);
+                if matches!(event.event, GameEvent::Snapshot { .. }) {
+                    return Ok(event.game_id);
+                }
+            }
+        }
+    }).await?
+}
+
+async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            // With auto-joining, we now receive a game snapshot directly
             if let Some(event) = client.receive_game_event().await? {
                 if matches!(event.event, GameEvent::Snapshot { .. }) {
                     return Ok(event.game_id);
