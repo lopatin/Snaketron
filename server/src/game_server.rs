@@ -9,7 +9,7 @@ use tracing::{info, error};
 
 use crate::{
     ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
-    games_manager::GamesManager,
+    game_manager::GameManager,
     game_broker::{GameMessageBroker, LocalBroker, DistributedBroker},
     matchmaking::run_matchmaking_loop,
     game_cleanup::run_cleanup_service,
@@ -93,7 +93,7 @@ impl GameServer {
         };
 
         // Create games manager
-        let games_manager = Arc::new(Mutex::new(GamesManager::new_with_broker(broker.clone())));
+        let games_manager = Arc::new(Mutex::new(GameManager::new_with_broker(broker.clone())));
 
         // Create player connection manager
         let player_connections = Arc::new(PlayerConnectionManager::new());

@@ -5,7 +5,7 @@ use tracing::{error, info, trace, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use crate::games_manager::GamesManager;
+use crate::game_manager::GameManager;
 use crate::player_connections::PlayerConnectionManager;
 
 // --- Configuration Constants ---
@@ -49,9 +49,9 @@ struct ServerLoad {
 
 /// Main matchmaking loop that runs on each server
 pub async fn run_matchmaking_loop(
-    pool: PgPool, 
+    pool: PgPool,
     server_id: uuid::Uuid,
-    games_manager: Arc<Mutex<GamesManager>>,
+    games_manager: Arc<Mutex<GameManager>>,
     player_connections: Arc<PlayerConnectionManager>,
     cancellation_token: CancellationToken,
 ) {

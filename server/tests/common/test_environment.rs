@@ -125,8 +125,7 @@ impl TestEnvironmentBuilder {
                 .await
                 .context(format!("Failed to start server {}", i))?;
             
-            info!("Started server {} with ID {} on {}", 
-                i, server.id(), server.ws_addr());
+            info!("Started server {} with ID {} on {}", i, server.id(), server.ws_addr());
             
             servers.push(server);
         }

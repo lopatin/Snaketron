@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use crate::ws_server::WSMessage;
-use crate::games_manager::GamesManager;
+use crate::game_manager::GameManager;
 use common::{GameEventMessage, GameEvent};
 
 /// Manages WebSocket connections for players
@@ -50,7 +50,7 @@ impl PlayerConnectionManager {
         &self, 
         player_ids: &[i32], 
         game_id: u32, 
-        games_manager: Arc<Mutex<GamesManager>>
+        games_manager: Arc<Mutex<GameManager>>
     ) {
         let connections = self.connections.read().await;
         

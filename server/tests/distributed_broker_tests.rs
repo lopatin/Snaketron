@@ -2,6 +2,7 @@ use anyhow::Result;
 use server::ws_server::WSMessage;
 use ::common::{GameEvent, GameType};
 use tokio::time::{timeout, Duration};
+use tracing::info;
 
 mod common;
 use self::common::{TestBuilder, TestClient};
@@ -175,7 +176,7 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     
     // Wait for match - with auto-joining, we receive the game snapshot directly
     println!("test_game_lifecycle_with_cleanup: Waiting for game snapshot...");
-    let game_id = match timeout(Duration::from_secs(30), async {
+    let game_id = match timeout(Duration::from_secs(5), async {
         loop {
             if let Some(event) = client1.receive_game_event().await? {
                 println!("test_game_lifecycle_with_cleanup: Received event: {:?}", event.event);
@@ -213,10 +214,7 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     
     // Disconnect second client
     client2.disconnect().await?;
-    
-    // Game cleanup happens automatically via the cleanup service
-    // No manual database manipulation needed
-    
+
     env.shutdown().await?;
     Ok(())
 }

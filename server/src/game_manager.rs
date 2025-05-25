@@ -7,16 +7,16 @@ use std::sync::Arc;
 use crate::game_broker::GameMessageBroker;
 
 
-pub struct GamesManager {
+pub struct GameManager {
     command_txs: HashMap<u32, broadcast::Sender<GameCommandMessage>>,
     event_txs: HashMap<u32, broadcast::Sender<GameEventMessage>>,
     snapshot_txs: HashMap<u32, mpsc::Sender<oneshot::Sender<GameState>>>,
     broker: Option<Arc<dyn GameMessageBroker>>,
 }
 
-impl GamesManager {
+impl GameManager {
     pub fn new() -> Self {
-        GamesManager {
+        GameManager {
             command_txs: HashMap::new(),
             event_txs: HashMap::new(),
             snapshot_txs: HashMap::new(),
@@ -25,7 +25,7 @@ impl GamesManager {
     }
     
     pub fn new_with_broker(broker: Arc<dyn GameMessageBroker>) -> Self {
-        GamesManager {
+        GameManager {
             command_txs: HashMap::new(),
             event_txs: HashMap::new(),
             snapshot_txs: HashMap::new(),

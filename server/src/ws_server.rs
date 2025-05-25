@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use common::{GameCommand, GameCommandMessage, Direction, GameEvent, GameEventMessage};
-use crate::games_manager::GamesManager;
+use crate::game_manager::GameManager;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum WSMessage {
@@ -240,7 +240,7 @@ impl ConnectionState {
 
 pub async fn run_websocket_server(
     addr: &str,
-    games_manager: Arc<Mutex<GamesManager>>,
+    games_manager: Arc<Mutex<GameManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -253,7 +253,7 @@ pub async fn run_websocket_server(
 
 pub async fn run_websocket_server_with_listener(
     listener: TcpListener,
-    games_manager: Arc<Mutex<GamesManager>>,
+    games_manager: Arc<Mutex<GameManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -316,7 +316,7 @@ pub async fn run_websocket_server_with_listener(
 
 
 async fn handle_websocket_connection(
-    games_manager: Arc<Mutex<GamesManager>>,
+    games_manager: Arc<Mutex<GameManager>>,
     db_pool: PgPool,
     stream: TcpStream,
     cancellation_token: CancellationToken,
