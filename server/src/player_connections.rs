@@ -54,21 +54,46 @@ impl PlayerConnectionManager {
     ) {
         let connections = self.connections.read().await;
         
-        // Get the game snapshot first
-        let games_mgr = games_manager.lock().await;
-        let game_snapshot = match games_mgr.get_game_snapshot(game_id).await {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                tracing::error!(game_id, error = %e, "Failed to get game snapshot for matched players");
+        // Get the game snapshot with retry logic (game might be initializing)
+        let mut game_snapshot = None;
+        for attempt in 0..5 {
+            let games_mgr = games_manager.lock().await;
+            match games_mgr.get_game_snapshot(game_id).await {
+                Ok(snapshot) => {
+                    game_snapshot = Some(snapshot);
+                    break;
+                }
+                Err(e) if attempt < 4 => {
+                    drop(games_mgr);
+                    tracing::debug!(game_id, attempt, error = %e, "Game not ready yet, retrying...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    tracing::error!(game_id, error = %e, "Failed to get game snapshot for matched players after retries");
+                    return;
+                }
+            }
+        }
+        
+        let game_snapshot = match game_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                tracing::error!(game_id, "Failed to get game snapshot after all retries");
                 return;
             }
         };
-        drop(games_mgr);
         
-        // Send each player the game snapshot directly
+        // Send each player the match found notification and game snapshot
         for &user_id in player_ids {
             if let Some(sender) = connections.get(&user_id) {
-                // Send the snapshot event
+                // First send MatchFound notification
+                let match_msg = WSMessage::MatchFound { game_id };
+                if let Ok(json) = serde_json::to_string(&match_msg) {
+                    let _ = sender.send(Message::Text(json.into())).await;
+                    tracing::debug!(user_id, game_id, "Sent MatchFound notification");
+                }
+                
+                // Then send the snapshot event
                 let snapshot_event = GameEventMessage {
                     game_id,
                     tick: game_snapshot.tick,

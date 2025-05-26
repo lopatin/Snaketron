@@ -19,7 +19,7 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_distributed_broker_local_game").await?;
     
     // Add a server
-    env.add_server(false).await?;
+    env.add_server().await?;
     
     // Create users
     let user1_id = env.create_user().await?;
@@ -108,8 +108,8 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
     let mut env = TestEnvironment::new("test_distributed_broker_cross_server").await?;
     
     // Add two servers
-    env.add_server(false).await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
+    env.add_server().await?;
     
     // Create users
     let user1_id = env.create_user().await?;
@@ -161,7 +161,7 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     let mut env = TestEnvironment::new("test_game_lifecycle_with_cleanup").await?;
     
     // Add a server
-    env.add_server(false).await?;
+    env.add_server().await?;
     
     // Create users
     let user1_id = env.create_user().await?;

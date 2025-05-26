@@ -11,7 +11,7 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
     // Start 3 servers with 6 users (2 per server)
     let mut env = TestEnvironment::new("test_multiple_servers_independent_games").await?;
     for _ in 0..3 {
-        env.add_server(false).await?;
+        env.add_server().await?;
     }
     for _ in 0..6 {
         env.create_user().await?;
@@ -37,6 +37,9 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
             game_type: GameType::FreeForAll { max_players: 2 } 
         }).await?;
         
+        // Wait a bit for game discovery to process
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
         // Wait for game to start (auto-join after match)
         let game_id1 = wait_for_game_start(&mut client1).await?;
         let game_id2 = wait_for_game_start(&mut client2).await?;
@@ -57,8 +60,8 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
 async fn test_server_load_distribution() -> Result<()> {
     // Start 2 servers with 8 users
     let mut env = TestEnvironment::new("test_server_load_distribution").await?;
-    env.add_server(false).await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
+    env.add_server().await?;
     for _ in 0..8 {
         env.create_user().await?;
     }
@@ -98,6 +101,9 @@ async fn test_server_load_distribution() -> Result<()> {
         }).await?;
     }
     
+    // Wait for game discovery to process
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    
     // Each server should create 2 games (4 players / 2 per game)
     let mut game_ids_server1 = Vec::new();
     for client in &mut clients_server1 {
@@ -112,10 +118,12 @@ async fn test_server_load_distribution() -> Result<()> {
     // Verify games were created on each server
     game_ids_server1.sort();
     game_ids_server1.dedup();
+    println!("Server 1 game IDs: {:?}", game_ids_server1);
     assert_eq!(game_ids_server1.len(), 2, "Server 1 should have 2 games");
     
     game_ids_server2.sort();
     game_ids_server2.dedup();
+    println!("Server 2 game IDs: {:?}", game_ids_server2);
     assert_eq!(game_ids_server2.len(), 2, "Server 2 should have 2 games");
     
     // Disconnect all clients
@@ -134,8 +142,8 @@ async fn test_server_load_distribution() -> Result<()> {
 async fn test_cross_server_matchmaking() -> Result<()> {
     // Test that players on different servers in the same region CAN be matched together
     let mut env = TestEnvironment::new("test_cross_server_matchmaking").await?;
-    env.add_server(false).await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
@@ -182,8 +190,8 @@ async fn test_cross_server_matchmaking() -> Result<()> {
 async fn test_concurrent_operations_multiple_servers() -> Result<()> {
     // Start 2 servers
     let mut env = TestEnvironment::new("test_concurrent_games_on_multiple_servers").await?;
-    env.add_server(false).await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
+    env.add_server().await?;
     for _ in 0..8 {
         env.create_user().await?;
     }
@@ -262,11 +270,17 @@ async fn wait_for_game_start(client: &mut TestClient) -> Result<u32> {
             if let Some(event) = client.receive_game_event().await? {
                 println!("Received event: {:?}", event.event);
                 if matches!(event.event, GameEvent::Snapshot { .. }) {
+                    println!("Got game start for game ID: {}", event.game_id);
                     return Ok(event.game_id);
                 }
+            } else {
+                println!("No event received");
             }
         }
-    }).await?
+    }).await.map_err(|_| {
+        println!("Timeout waiting for game start");
+        anyhow::anyhow!("Timeout waiting for game start")
+    })?
 }
 
 async fn wait_for_match(client: &mut TestClient) -> Result<u32> {

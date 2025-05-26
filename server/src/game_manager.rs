@@ -34,13 +34,16 @@ impl GameManager {
     }
 
     pub async fn start_game(&mut self, id: u32) -> Result<()> {
+        // Check if game is already running
+        if self.snapshot_txs.contains_key(&id) {
+            return Ok(()); // Game already running, nothing to do
+        }
+        
         // Check if we're using a broker
         if let Some(broker) = &self.broker {
-            // For DistributedBroker, create game channels (registers in DB)
-            if let Some(dist_broker) = broker.as_any().downcast_ref::<crate::game_broker::DistributedBroker>() {
-                dist_broker.create_game_channels(id).await?;
-            } else if let Some(local_broker) = broker.as_any().downcast_ref::<crate::game_broker::LocalBroker>() {
-                local_broker.create_game_channels(id).await?;
+            // For GameBroker, create game channels (registers in DB)
+            if let Some(game_broker) = broker.as_any().downcast_ref::<crate::game_broker::GameBroker>() {
+                game_broker.create_game_channels(id).await?;
             }
             
             let start_ms = chrono::Utc::now().timestamp_millis();

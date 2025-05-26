@@ -68,10 +68,6 @@ async fn main() -> Result<()> {
     
     let grpc_addr = env::var("SNAKETRON_GRPC_PORT").ok()
         .map(|port| format!("0.0.0.0:{}", port));
-    
-    let use_distributed_broker = env::var("SNAKETRON_USE_DISTRIBUTED_BROKER")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
 
     // Create JWT verifier
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;
@@ -83,7 +79,6 @@ async fn main() -> Result<()> {
         grpc_addr,
         region,
         jwt_verifier,
-        use_distributed_broker,
     };
 
     // Start the game server

@@ -17,7 +17,7 @@ async fn test_ping_pong() -> Result<()> {
         
         // Create test environment
         let mut env = TestEnvironment::new("test_ping_pong").await?;
-        env.add_server(false).await?;
+        env.add_server().await?;
         
         let server_addr = env.ws_addr(0).expect("Server should exist");
         info!("Test server built, connecting client to {}", server_addr);
@@ -69,7 +69,7 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         
         // Create test environment with users
         let mut env = TestEnvironment::new("test_join_game_snapshot").await?;
-        env.add_server(false).await?;
+        env.add_server().await?;
         env.create_user().await?;
         env.create_user().await?;
         
@@ -137,7 +137,7 @@ async fn test_authenticated_connection() -> Result<()> {
         
         // Create test environment with a user
         let mut env = TestEnvironment::new("test_authenticated_connection").await?;
-        env.add_server(false).await?;
+        env.add_server().await?;
         env.create_user().await?;
         
         let server_addr = env.ws_addr(0).expect("Server should exist");

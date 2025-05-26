@@ -9,7 +9,7 @@ use self::common::{TestEnvironment, TestClient};
 #[tokio::test]
 async fn test_cleanup_abandoned_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_abandoned_game").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
@@ -62,7 +62,7 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
 #[tokio::test]
 async fn test_cleanup_finished_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_finished_game").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
@@ -113,7 +113,7 @@ async fn test_cleanup_finished_game() -> Result<()> {
 #[tokio::test]
 async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_stale_matchmaking_requests").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     let server_addr = env.ws_addr(0).expect("Server should exist");
@@ -151,7 +151,7 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
 #[tokio::test]
 async fn test_multiple_games_cleanup() -> Result<()> {
     let mut env = TestEnvironment::new("test_multiple_games_cleanup").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     for _ in 0..6 {
         env.create_user().await?;
     }

@@ -20,7 +20,7 @@ async fn test_minimal() -> Result<()> {
 async fn test_simple_two_player_match() -> Result<()> {
     // Simple test with just 2 players to debug matchmaking
     let mut env = TestEnvironment::new("test_simple_two_player_match").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     
@@ -86,7 +86,7 @@ async fn test_simple_two_player_match() -> Result<()> {
 #[tokio::test]
 async fn test_basic_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     
@@ -122,7 +122,7 @@ async fn test_basic_matchmaking() -> Result<()> {
 #[tokio::test]
 async fn test_leave_queue() -> Result<()> {
     let mut env = TestEnvironment::new("test_leave_queue").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
@@ -151,7 +151,7 @@ async fn test_leave_queue() -> Result<()> {
 #[tokio::test]
 async fn test_team_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_team_matchmaking").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     for _ in 0..4 {
         env.create_user().await?;
     }
@@ -194,7 +194,7 @@ async fn test_team_matchmaking() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_concurrent_matchmaking").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     for _ in 0..10 {
         env.create_user().await?;
     }
@@ -241,7 +241,7 @@ async fn test_concurrent_matchmaking() -> Result<()> {
 #[tokio::test]
 async fn test_disconnect_during_queue() -> Result<()> {
     let mut env = TestEnvironment::new("test_disconnect_during_queue").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     
@@ -278,7 +278,7 @@ async fn test_disconnect_during_queue() -> Result<()> {
 #[tokio::test]
 async fn test_rejoin_active_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_rejoin_active_game").await?;
-    env.add_server(false).await?;
+    env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
     

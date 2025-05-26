@@ -2,11 +2,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::{error, info, trace, warn};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use crate::game_manager::GameManager;
-use crate::player_connections::PlayerConnectionManager;
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
@@ -51,8 +47,6 @@ struct ServerLoad {
 pub async fn run_matchmaking_loop(
     pool: PgPool,
     server_id: uuid::Uuid,
-    games_manager: Arc<Mutex<GameManager>>,
-    player_connections: Arc<PlayerConnectionManager>,
     cancellation_token: CancellationToken,
 ) {
     info!(?server_id, "Starting adaptive matchmaking loop");
@@ -99,22 +93,8 @@ pub async fn run_matchmaking_loop(
                         game_id,
                         game_type = ?game_type,
                         player_count = players.len(),
-                        "Created match successfully"
+                        "Created match successfully - game will be started by assigned server"
                     );
-                    
-                    info!("About to start game {} and notify players {:?}", game_id, players);
-                    
-                    // Start the game on this server
-                    if let Err(e) = games_manager.lock().await.start_game(game_id as u32).await {
-                        error!(game_id, error = %e, "Failed to start game");
-                        continue;
-                    }
-                    
-                    info!("Game {} started successfully", game_id);
-                    
-                    // Notify players and automatically join them to the game
-                    player_connections.notify_match_found_and_join(&players, game_id as u32, games_manager.clone()).await;
-                    info!("Players joined to game {} and sent initial snapshot", game_id);
                 }
                 Ok(None) => {
                     trace!(game_type = ?game_type, "No suitable match found");
@@ -184,23 +164,23 @@ async fn create_adaptive_match(
     let base_min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
     
     // For game types with max_players, never require more than max_players
-    let min_players = match &game_type {
+    let (min_players, max_players_for_game) = match &game_type {
         serde_json::Value::Object(obj) => {
             if let Some(serde_json::Value::Object(ffa_obj)) = obj.get("FreeForAll") {
                 if let Some(serde_json::Value::Number(max)) = ffa_obj.get("max_players") {
                     if let Some(max_val) = max.as_u64() {
-                        base_min_players.min(max_val as usize)
+                        (base_min_players.min(max_val as usize), max_val as usize)
                     } else {
-                        base_min_players
+                        (base_min_players, MAX_PLAYERS)
                     }
                 } else {
-                    base_min_players
+                    (base_min_players, MAX_PLAYERS)
                 }
             } else {
-                base_min_players
+                (base_min_players, MAX_PLAYERS)
             }
         }
-        _ => base_min_players
+        _ => (base_min_players, MAX_PLAYERS)
     };
 
     // Find matching players - use INNER JOIN to ensure we only get valid users
@@ -260,9 +240,9 @@ async fn create_adaptive_match(
         return Ok(None);
     }
 
-    // Take up to MAX_PLAYERS players
+    // Take up to max_players_for_game players
     let matched_players: Vec<_> = filtered_players.into_iter()
-        .take(MAX_PLAYERS)
+        .take(max_players_for_game)
         .collect();
     
     let user_ids: Vec<i32> = matched_players.iter()

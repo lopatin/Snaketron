@@ -47,13 +47,12 @@ impl TestEnvironment {
     }
     
     /// Add a server to this test environment
-    pub async fn add_server(&mut self, use_distributed_broker: bool) -> Result<usize> {
+    pub async fn add_server(&mut self) -> Result<usize> {
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
         
         let server = start_test_server(
             self.db_url(),
-            jwt_verifier,
-            use_distributed_broker
+            jwt_verifier
         )
         .await
         .context("Failed to start server")?;
@@ -66,11 +65,10 @@ impl TestEnvironment {
     }
     
     /// Add a server with custom JWT verifier
-    pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>, use_distributed_broker: bool) -> Result<usize> {
+    pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
         let server = start_test_server(
             self.db_url(),
-            jwt_verifier,
-            use_distributed_broker
+            jwt_verifier
         )
         .await
         .context("Failed to start server")?;

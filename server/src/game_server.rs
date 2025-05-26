@@ -10,9 +10,10 @@ use tracing::{info, error};
 use crate::{
     ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
     game_manager::GameManager,
-    game_broker::{GameMessageBroker, LocalBroker, DistributedBroker},
+    game_broker::{GameMessageBroker, GameBroker},
     matchmaking::run_matchmaking_loop,
     game_cleanup::run_cleanup_service,
+    game_discovery::run_game_discovery_loop,
     player_connections::PlayerConnectionManager,
     grpc_server::run_game_relay_server,
 };
@@ -30,8 +31,6 @@ pub struct GameServerConfig {
     pub region: String,
     /// JWT verifier for authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
-    /// Whether to use distributed broker (requires gRPC)
-    pub use_distributed_broker: bool,
 }
 
 /// A complete game server instance with all components
@@ -59,7 +58,6 @@ impl GameServer {
             grpc_addr,
             region,
             jwt_verifier,
-            use_distributed_broker,
         } = config;
 
         // Register server in database
@@ -81,16 +79,11 @@ impl GameServer {
         }));
 
         // Create game message broker
-        let broker: Arc<dyn GameMessageBroker> = if use_distributed_broker && grpc_addr.is_some() {
-            info!("Creating distributed broker");
-            Arc::new(DistributedBroker::new(
-                db_pool.clone(),
-                server_id.to_string(),
-            ))
-        } else {
-            info!("Creating local broker");
-            Arc::new(LocalBroker::new())
-        };
+        info!("Creating game broker");
+        let broker: Arc<dyn GameMessageBroker> = Arc::new(GameBroker::new(
+            db_pool.clone(),
+            server_id.to_string(),
+        ));
 
         // Create games manager
         let games_manager = Arc::new(Mutex::new(GameManager::new_with_broker(broker.clone())));
@@ -100,19 +93,17 @@ impl GameServer {
 
         // Start gRPC server if configured
         if let Some(grpc_addr_str) = &grpc_addr {
-            if use_distributed_broker {
-                info!("Starting gRPC server on {}", grpc_addr_str);
-                
-                let grpc_broker = broker.clone();
-                let grpc_token = cancellation_token.clone();
-                let grpc_addr_clone = grpc_addr_str.clone();
-                
-                handles.push(tokio::spawn(async move {
-                    if let Err(e) = run_game_relay_server(&grpc_addr_clone, grpc_broker, grpc_token).await {
-                        error!("Game relay gRPC server error: {}", e);
-                    }
-                }));
-            }
+            info!("Starting gRPC server on {}", grpc_addr_str);
+            
+            let grpc_broker = broker.clone();
+            let grpc_token = cancellation_token.clone();
+            let grpc_addr_clone = grpc_addr_str.clone();
+            
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = run_game_relay_server(&grpc_addr_clone, grpc_broker, grpc_token).await {
+                    error!("Game relay gRPC server error: {}", e);
+                }
+            }));
         }
 
         // Start WebSocket server
@@ -137,16 +128,29 @@ impl GameServer {
         info!("Starting matchmaking service");
         let matchmaking_pool = db_pool.clone();
         let matchmaking_server_id = server_id.clone();
-        let matchmaking_games_manager = games_manager.clone();
-        let matchmaking_player_connections = player_connections.clone();
         let matchmaking_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             run_matchmaking_loop(
                 matchmaking_pool,
                 matchmaking_server_id,
-                matchmaking_games_manager,
-                matchmaking_player_connections,
                 matchmaking_token,
+            ).await;
+        }));
+
+        // Start game discovery service
+        info!("Starting game discovery service");
+        let discovery_pool = db_pool.clone();
+        let discovery_server_id = server_id.clone();
+        let discovery_games_manager = games_manager.clone();
+        let discovery_player_connections = player_connections.clone();
+        let discovery_token = cancellation_token.clone();
+        handles.push(tokio::spawn(async move {
+            run_game_discovery_loop(
+                discovery_pool,
+                discovery_server_id,
+                discovery_games_manager,
+                discovery_player_connections,
+                discovery_token,
             ).await;
         }));
 
@@ -221,7 +225,6 @@ impl GameServer {
 pub async fn start_test_server(
     db_url: &str,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    use_distributed_broker: bool,
 ) -> Result<GameServer> {
     // Create database pool
     let db_pool = PgPoolOptions::new()
@@ -234,12 +237,8 @@ pub async fn start_test_server(
     let ws_port = get_available_port();
     let ws_addr = format!("127.0.0.1:{}", ws_port);
 
-    let grpc_addr = if use_distributed_broker {
-        let grpc_port = get_available_port();
-        Some(format!("127.0.0.1:{}", grpc_port))
-    } else {
-        None
-    };
+    // For tests, we don't need gRPC server
+    let grpc_addr = None;
 
     let config = GameServerConfig {
         db_pool,
@@ -247,7 +246,6 @@ pub async fn start_test_server(
         grpc_addr,
         region: "test-region".to_string(),
         jwt_verifier,
-        use_distributed_broker,
     };
 
     GameServer::start(config).await
