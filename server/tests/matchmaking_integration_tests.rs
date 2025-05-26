@@ -158,7 +158,7 @@ async fn test_team_matchmaking() -> Result<()> {
     
     let server_addr = env.ws_addr(0).expect("Server should exist");
     
-    // Connect 4 clients for 2v2
+    // Connect 4 clients
     let mut clients = Vec::new();
     for i in 0..4 {
         let mut client = TestClient::connect(&server_addr).await?;
@@ -166,10 +166,10 @@ async fn test_team_matchmaking() -> Result<()> {
         clients.push(client);
     }
     
-    // All queue for team match
+    // All queue for match
     for client in &mut clients {
         client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::TeamMatch { per_team: 2 } 
+            game_type: GameType::FreeForAll { max_players: 4 } 
         }).await?;
     }
     
@@ -182,7 +182,7 @@ async fn test_team_matchmaking() -> Result<()> {
     // All should be in same game
     let first_game_id = game_ids[0];
     assert!(game_ids.iter().all(|&id| id == first_game_id), 
-            "All players should be in same team match");
+            "All 4 players should be matched to the same game");
     
     for client in clients {
         client.disconnect().await?;
@@ -325,10 +325,19 @@ async fn test_rejoin_active_game() -> Result<()> {
 async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(10), async {
         loop {
-            // With auto-joining, we now receive a game snapshot directly
-            if let Some(event) = client.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok(event.game_id);
+            // First we should get MatchFound, then GameEvent::Snapshot
+            match client.receive_message().await? {
+                WSMessage::MatchFound { game_id } => {
+                    // Just log and continue to wait for the snapshot
+                    continue;
+                }
+                WSMessage::GameEvent(event) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        return Ok(event.game_id);
+                    }
+                }
+                _ => {
+                    // Ignore other messages
                 }
             }
         }
