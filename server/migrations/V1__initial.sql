@@ -1,6 +1,7 @@
 CREATE TABLE servers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     address VARCHAR(255) NOT NULL,
+    grpc_address VARCHAR(255),
     last_heartbeat TIMESTAMP NOT NULL DEFAULT NOW(),
     current_game_count INT NOT NULL DEFAULT 0,
     max_game_capacity INT NOT NULL DEFAULT 100,

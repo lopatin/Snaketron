@@ -97,20 +97,12 @@ impl TestClient {
                         if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&text) {
                             match ws_msg {
                                 WSMessage::GameEvent(event) => Ok(Some(event)),
-                                WSMessage::MatchFound { game_id } => {
-                                    println!("DEBUG: Received MatchFound for game {}", game_id);
-                                    Ok(None) // Continue waiting for game event
-                                }
-                                _ => {
-                                    println!("DEBUG: Received other message: {:?}", ws_msg);
-                                    Ok(None) // Different message type
-                                }
+                                _ => Ok(None) // Different message type
                             }
                         } else if let Ok(event) = serde_json::from_str::<GameEventMessage>(&text) {
                             // Fallback to direct GameEventMessage parsing
                             Ok(Some(event))
                         } else {
-                            println!("DEBUG: Could not parse message: {}", text);
                             Ok(None)
                         }
                     }

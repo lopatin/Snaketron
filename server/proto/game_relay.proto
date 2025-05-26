@@ -8,6 +8,9 @@ service GameRelay {
   
   // Get game snapshot from remote server
   rpc GetGameSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  
+  // Notify players on this server about a match
+  rpc NotifyMatchFound(NotifyMatchRequest) returns (NotifyMatchResponse);
 }
 
 message GameMessage {
@@ -49,4 +52,15 @@ message GetSnapshotRequest {
 
 message GetSnapshotResponse {
   bytes game_state = 1; // Bincode-serialized common::GameState
+}
+
+message NotifyMatchRequest {
+  repeated int32 player_ids = 1;
+  uint32 game_id = 2;
+  string game_host_server_id = 3;
+}
+
+message NotifyMatchResponse {
+  bool success = 1;
+  repeated int32 notified_players = 2;
 }

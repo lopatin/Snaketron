@@ -96,11 +96,12 @@ impl GameServer {
             info!("Starting gRPC server on {}", grpc_addr_str);
             
             let grpc_broker = broker.clone();
+            let grpc_player_connections = player_connections.clone();
             let grpc_token = cancellation_token.clone();
             let grpc_addr_clone = grpc_addr_str.clone();
             
             handles.push(tokio::spawn(async move {
-                if let Err(e) = run_game_relay_server(&grpc_addr_clone, grpc_broker, grpc_token).await {
+                if let Err(e) = run_game_relay_server(&grpc_addr_clone, grpc_broker, grpc_player_connections, grpc_token).await {
                     error!("Game relay gRPC server error: {}", e);
                 }
             }));
@@ -226,6 +227,15 @@ pub async fn start_test_server(
     db_url: &str,
     jwt_verifier: Arc<dyn JwtVerifier>,
 ) -> Result<GameServer> {
+    start_test_server_with_grpc(db_url, jwt_verifier, false).await
+}
+
+/// Helper function to start a game server for testing with optional gRPC
+pub async fn start_test_server_with_grpc(
+    db_url: &str,
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+) -> Result<GameServer> {
     // Create database pool
     let db_pool = PgPoolOptions::new()
         .max_connections(5)
@@ -237,8 +247,13 @@ pub async fn start_test_server(
     let ws_port = get_available_port();
     let ws_addr = format!("127.0.0.1:{}", ws_port);
 
-    // For tests, we don't need gRPC server
-    let grpc_addr = None;
+    // Enable gRPC if requested
+    let grpc_addr = if enable_grpc {
+        let grpc_port = get_available_port();
+        Some(format!("127.0.0.1:{}", grpc_port))
+    } else {
+        None
+    };
 
     let config = GameServerConfig {
         db_pool,

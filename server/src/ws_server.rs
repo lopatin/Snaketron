@@ -17,7 +17,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
-use common::{GameCommand, GameCommandMessage, Direction, GameEvent, GameEventMessage};
+use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage};
 use crate::game_manager::GameManager;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -474,8 +474,21 @@ async fn handle_websocket_connection(
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        // For remote games, we'll get the snapshot as an event
-                                                        info!("Could not get local snapshot ({}), transitioning to InGame state for game {} anyway", e, game_id);
+                                                        // For remote games, request a snapshot
+                                                        info!("Could not get local snapshot ({}), requesting snapshot for remote game {}", e, game_id);
+                                                        
+                                                        // Send RequestSnapshot command
+                                                        let snapshot_request = GameCommandMessage {
+                                                            tick: 0,
+                                                            received_order: 0,
+                                                            user_id: user_token.user_id as u32,
+                                                            command: GameCommand::RequestSnapshot,
+                                                        };
+                                                        
+                                                        if let Err(e) = command_tx.send(snapshot_request) {
+                                                            error!("Failed to request snapshot: {}", e);
+                                                        }
+                                                        
                                                         ConnectionState::InGame {
                                                             user_token,
                                                             game_id,

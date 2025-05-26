@@ -5,6 +5,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::ws_server::WSMessage;
 use crate::game_manager::GameManager;
 use common::{GameEventMessage, GameEvent};
+use tracing::{info, debug, error};
 
 /// Manages WebSocket connections for players
 pub struct PlayerConnectionManager {
@@ -126,5 +127,40 @@ impl PlayerConnectionManager {
                 }
             }
         }
+    }
+    
+    /// Get which players are connected locally
+    pub async fn get_connected_players(&self, player_ids: &[i32]) -> Vec<i32> {
+        let connections = self.connections.read().await;
+        player_ids.iter()
+            .copied()
+            .filter(|id| connections.contains_key(id))
+            .collect()
+    }
+    
+    /// Notify specific players that they've been matched (used for cross-server notifications)
+    pub async fn notify_remote_match_found(
+        &self, 
+        player_ids: &[i32], 
+        game_id: u32,
+        game_host_server_id: &str,
+    ) -> Vec<i32> {
+        let connections = self.connections.read().await;
+        let mut notified = Vec::new();
+        
+        for &user_id in player_ids {
+            if let Some(sender) = connections.get(&user_id) {
+                // Send MatchFound notification
+                let match_msg = WSMessage::MatchFound { game_id };
+                if let Ok(json) = serde_json::to_string(&match_msg) {
+                    if sender.send(Message::Text(json.into())).await.is_ok() {
+                        notified.push(user_id);
+                        info!(user_id, game_id, game_host_server_id, "Sent cross-server MatchFound notification");
+                    }
+                }
+            }
+        }
+        
+        notified
     }
 }

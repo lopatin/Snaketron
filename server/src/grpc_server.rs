@@ -8,17 +8,19 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use crate::game_broker::{GameMessageBroker, game_relay};
 use game_relay::game_relay_server::{GameRelay, GameRelayServer};
-use game_relay::{GameMessage, GetSnapshotRequest, GetSnapshotResponse};
+use game_relay::{GameMessage, GetSnapshotRequest, GetSnapshotResponse, NotifyMatchRequest, NotifyMatchResponse};
+use crate::player_connections::PlayerConnectionManager;
 
 type GameMessageStream = Pin<Box<dyn Stream<Item = Result<GameMessage, Status>> + Send>>;
 
 pub struct GameRelayService {
     broker: Arc<dyn GameMessageBroker>,
+    player_connections: Arc<PlayerConnectionManager>,
 }
 
 impl GameRelayService {
-    pub fn new(broker: Arc<dyn GameMessageBroker>) -> Self {
-        Self { broker }
+    pub fn new(broker: Arc<dyn GameMessageBroker>, player_connections: Arc<PlayerConnectionManager>) -> Self {
+        Self { broker, player_connections }
     }
 }
 
@@ -137,14 +139,44 @@ impl GameRelay for GameRelayService {
             }
         }
     }
+    
+    async fn notify_match_found(
+        &self,
+        request: Request<NotifyMatchRequest>,
+    ) -> Result<Response<NotifyMatchResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            game_id = req.game_id,
+            game_host = %req.game_host_server_id,
+            player_ids = ?req.player_ids,
+            "Received cross-server match notification"
+        );
+        
+        // Notify local players that are in the list
+        let notified_players = self.player_connections
+            .notify_remote_match_found(&req.player_ids, req.game_id, &req.game_host_server_id)
+            .await;
+        
+        info!(
+            game_id = req.game_id,
+            notified_count = notified_players.len(),
+            "Notified local players about cross-server match"
+        );
+        
+        Ok(Response::new(NotifyMatchResponse {
+            success: !notified_players.is_empty(),
+            notified_players,
+        }))
+    }
 }
 
 pub async fn run_game_relay_server(
     addr: &str,
     broker: Arc<dyn GameMessageBroker>,
+    player_connections: Arc<PlayerConnectionManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
-    let service = GameRelayService::new(broker);
+    let service = GameRelayService::new(broker, player_connections);
     let svc = GameRelayServer::new(service);
     
     info!("Game relay gRPC server starting on {}", addr);

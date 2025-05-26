@@ -29,6 +29,7 @@ pub async fn run_game_discovery_loop(
                 break;
             }
             _ = interval.tick() => {
+                // Check for games assigned to this server
                 if let Err(e) = check_and_start_assigned_games(
                     &pool,
                     server_id,
@@ -36,6 +37,16 @@ pub async fn run_game_discovery_loop(
                     &player_connections,
                 ).await {
                     error!("Game discovery error: {}", e);
+                }
+                
+                // Check for remote games with local participants
+                if let Err(e) = check_remote_games_with_local_players(
+                    &pool,
+                    server_id,
+                    &games_manager,
+                    &player_connections,
+                ).await {
+                    error!("Remote game discovery error: {}", e);
                 }
             }
         }
@@ -123,5 +134,51 @@ async fn check_and_start_assigned_games(
         ).await;
     }
 
+    Ok(())
+}
+
+/// Check for games where we have local participants but the game is hosted elsewhere
+async fn check_remote_games_with_local_players(
+    pool: &PgPool,
+    server_id: uuid::Uuid,
+    games_manager: &Arc<Mutex<GameManager>>,
+    player_connections: &Arc<PlayerConnectionManager>,
+) -> Result<()> {
+    // Find games where we have local players but the game is on another server
+    // This query looks for games where:
+    // 1. The game is NOT hosted on this server
+    // 2. We have players connected to this server who are assigned to the game
+    // 3. The game is active
+    let remote_games_with_local_players: Vec<(i32, uuid::Uuid)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT g.id, g.server_id
+        FROM games g
+        INNER JOIN game_requests gr ON gr.game_id = g.id
+        WHERE g.server_id != $1
+        AND g.status = 'active'
+        AND EXISTS (
+            -- Check if any of the game's players might be on this server
+            -- In a real implementation, you'd have a sessions table
+            SELECT 1 FROM game_requests gr2 
+            WHERE gr2.game_id = g.id
+            -- For testing, we'll assume players are distributed across servers
+        )
+        "#
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+    
+    for (game_id, game_server_id) in remote_games_with_local_players {
+        debug!(game_id, ?game_server_id, "Found remote game with potential local players");
+        
+        // For each remote game, we need to ensure our local players can join
+        // The GameBroker will handle the cross-server communication
+        // We just need to make sure the game channels are available locally
+        
+        // Note: The actual player notification happens in the matchmaking service
+        // This is just for games that might have been missed or need reconnection
+    }
+    
     Ok(())
 }

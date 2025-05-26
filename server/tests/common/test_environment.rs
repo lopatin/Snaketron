@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use server::{
-    game_server::{GameServer, start_test_server},
+    game_server::{GameServer, start_test_server, start_test_server_with_grpc},
     ws_server::JwtVerifier,
 };
 use super::{mock_jwt::MockJwtVerifier, test_database::TestDatabaseGuard};
@@ -48,17 +48,44 @@ impl TestEnvironment {
     
     /// Add a server to this test environment
     pub async fn add_server(&mut self) -> Result<usize> {
+        self.add_server_with_grpc(false).await
+    }
+    
+    /// Add a server to this test environment with optional gRPC
+    pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<usize> {
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
         
-        let server = start_test_server(
+        let server = start_test_server_with_grpc(
             self.db_url(),
-            jwt_verifier
+            jwt_verifier,
+            enable_grpc
         )
         .await
         .context("Failed to start server")?;
         
         let index = self.servers.len();
-        info!("Started server {} with ID {} on {}", index, server.id(), server.ws_addr());
+        info!(
+            "Started server {} with ID {} on {} (gRPC: {:?})", 
+            index, 
+            server.id(), 
+            server.ws_addr(),
+            server.grpc_addr()
+        );
+        
+        // If gRPC is enabled, update the database with the gRPC address
+        if let Some(grpc_addr) = server.grpc_addr() {
+            sqlx::query(
+                r#"
+                UPDATE servers 
+                SET grpc_address = $1 
+                WHERE id = $2
+                "#
+            )
+            .bind(grpc_addr)
+            .bind(server.id())
+            .execute(self.db_pool())
+            .await?;
+        }
         
         self.servers.push(server);
         Ok(index)
