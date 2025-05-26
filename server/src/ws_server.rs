@@ -210,7 +210,7 @@ enum ConnectionState {
     InGame {
         user_token: UserToken,
         game_id: u32,
-        command_tx: broadcast::Sender<GameCommandMessage>,
+        command_tx: mpsc::Sender<GameCommandMessage>,
         event_rx: broadcast::Receiver<GameEventMessage>,
     },
     
@@ -222,7 +222,7 @@ enum ConnectionState {
 
 impl ConnectionState {
     // Extract game channels if in game state
-    fn take_game_channels(&mut self) -> Option<(broadcast::Sender<GameCommandMessage>, broadcast::Receiver<GameEventMessage>)> {
+    fn take_game_channels(&mut self) -> Option<(mpsc::Sender<GameCommandMessage>, broadcast::Receiver<GameEventMessage>)> {
         match std::mem::replace(self, ConnectionState::Unauthenticated) {
             ConnectionState::InGame { user_token, command_tx, event_rx, .. } => {
                 *self = ConnectionState::Authenticated { user_token };
@@ -485,7 +485,7 @@ async fn handle_websocket_connection(
                                                             command: GameCommand::RequestSnapshot,
                                                         };
                                                         
-                                                        if let Err(e) = command_tx.send(snapshot_request) {
+                                                        if let Err(e) = command_tx.send(snapshot_request).await {
                                                             error!("Failed to request snapshot: {}", e);
                                                         }
                                                         
@@ -594,7 +594,7 @@ async fn handle_websocket_connection(
                                             command,
                                         };
                                         
-                                        if let Err(e) = command_tx.send(cmd_msg) {
+                                        if let Err(e) = command_tx.send(cmd_msg).await {
                                             warn!("Failed to send game command: {}", e);
                                         }
                                         

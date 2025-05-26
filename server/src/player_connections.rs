@@ -4,8 +4,7 @@ use tokio::sync::{mpsc, RwLock, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use crate::ws_server::WSMessage;
 use crate::game_manager::GameManager;
-use common::{GameEventMessage, GameEvent};
-use tracing::{info, debug, error};
+use tracing::info;
 
 /// Manages WebSocket connections for players
 pub struct PlayerConnectionManager {
@@ -46,71 +45,24 @@ impl PlayerConnectionManager {
         }
     }
     
-    /// Notify players that they've been matched and automatically join them to the game
+    /// Notify players that they've been matched
     pub async fn notify_match_found_and_join(
         &self, 
         player_ids: &[i32], 
         game_id: u32, 
-        games_manager: Arc<Mutex<GameManager>>
+        _games_manager: Arc<Mutex<GameManager>>
     ) {
         let connections = self.connections.read().await;
         
-        // Get the game snapshot with retry logic (game might be initializing)
-        let mut game_snapshot = None;
-        for attempt in 0..5 {
-            let games_mgr = games_manager.lock().await;
-            match games_mgr.get_game_snapshot(game_id).await {
-                Ok(snapshot) => {
-                    game_snapshot = Some(snapshot);
-                    break;
-                }
-                Err(e) if attempt < 4 => {
-                    drop(games_mgr);
-                    tracing::debug!(game_id, attempt, error = %e, "Game not ready yet, retrying...");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                }
-                Err(e) => {
-                    tracing::error!(game_id, error = %e, "Failed to get game snapshot for matched players after retries");
-                    return;
-                }
-            }
-        }
-        
-        let game_snapshot = match game_snapshot {
-            Some(snapshot) => snapshot,
-            None => {
-                tracing::error!(game_id, "Failed to get game snapshot after all retries");
-                return;
-            }
-        };
-        
-        // Send each player the match found notification and game snapshot
+        // Send each player the match found notification
+        // The game will send its own snapshot when they join
         for &user_id in player_ids {
             if let Some(sender) = connections.get(&user_id) {
-                // First send MatchFound notification
+                // Send MatchFound notification
                 let match_msg = WSMessage::MatchFound { game_id };
                 if let Ok(json) = serde_json::to_string(&match_msg) {
                     let _ = sender.send(Message::Text(json.into())).await;
-                    tracing::debug!(user_id, game_id, "Sent MatchFound notification");
-                }
-                
-                // Then send the snapshot event
-                let snapshot_event = GameEventMessage {
-                    game_id,
-                    tick: game_snapshot.tick,
-                    user_id: Some(user_id as u32),
-                    event: GameEvent::Snapshot { 
-                        game_state: game_snapshot.clone() 
-                    },
-                };
-                
-                // Send snapshot wrapped in GameEvent message
-                let game_event_msg = WSMessage::GameEvent(snapshot_event);
-                if let Ok(json) = serde_json::to_string(&game_event_msg) {
-                    let _ = sender.send(Message::Text(json.into())).await;
-                    tracing::info!(user_id, game_id, "Sent initial game snapshot to matched player");
-                } else {
-                    tracing::error!(user_id, game_id, "Failed to serialize game event message");
+                    tracing::info!(user_id, game_id, "Sent MatchFound notification");
                 }
             }
         }

@@ -19,6 +19,7 @@ message GameMessage {
     GameEvent event = 2;
     Subscribe subscribe = 3;
     Unsubscribe unsubscribe = 4;
+    GameSnapshot snapshot = 5;
   }
 }
 
@@ -44,6 +45,11 @@ message Subscribe {
 
 message Unsubscribe {
   uint32 game_id = 1;
+}
+
+message GameSnapshot {
+  uint32 game_id = 1;
+  bytes game_state = 2; // Bincode-serialized common::GameState
 }
 
 message GetSnapshotRequest {

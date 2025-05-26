@@ -111,6 +111,9 @@ async fn check_and_start_assigned_games(
             .await?;
             continue;
         }
+        
+        // Give the game loop a moment to start and be ready for snapshot requests
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Get players for this game from game_requests
         let player_ids: Vec<i32> = sqlx::query_scalar(

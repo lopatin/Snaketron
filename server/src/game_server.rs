@@ -86,7 +86,7 @@ impl GameServer {
         ));
 
         // Create games manager
-        let games_manager = Arc::new(Mutex::new(GameManager::new_with_broker(broker.clone())));
+        let games_manager = Arc::new(Mutex::new(GameManager::new(broker.clone())));
 
         // Create player connection manager
         let player_connections = Arc::new(PlayerConnectionManager::new());

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Result;
-use tokio::sync::{broadcast, Mutex, mpsc};
-use common::{GameCommandMessage, GameEventMessage};
+use tokio::sync::{broadcast, Mutex, mpsc, oneshot};
+use common::{GameCommandMessage, GameEventMessage, GameState, GameEvent};
 use sqlx::PgPool;
 use tonic::transport::Channel;
 use tokio_stream::StreamExt;
@@ -14,9 +14,20 @@ pub mod game_relay {
 
 use game_relay::game_relay_client::GameRelayClient;
 
+/// Unified handle for interacting with a game, regardless of whether it's local or remote
+pub struct GameHandle {
+    pub game_id: u32,
+    pub command_tx: mpsc::Sender<GameCommandMessage>,
+    pub event_rx: broadcast::Receiver<GameEventMessage>,
+    pub snapshot_tx: mpsc::Sender<oneshot::Sender<GameState>>,
+}
+
 /// Trait for abstracting message distribution between game servers
 #[async_trait::async_trait]
 pub trait GameMessageBroker: Send + Sync {
+    /// Join a game and get a unified handle for interacting with it
+    async fn join_game(&self, game_id: u32) -> Result<GameHandle>;
+    
     /// Subscribe to commands for a specific game
     async fn subscribe_commands(&self, game_id: u32) -> Result<broadcast::Receiver<GameCommandMessage>>;
     
@@ -44,6 +55,7 @@ pub trait GameMessageBroker: Send + Sync {
 struct LocalChannels {
     command_txs: Arc<Mutex<HashMap<u32, broadcast::Sender<GameCommandMessage>>>>,
     event_txs: Arc<Mutex<HashMap<u32, broadcast::Sender<GameEventMessage>>>>,
+    snapshot_txs: Arc<Mutex<HashMap<u32, mpsc::Sender<oneshot::Sender<GameState>>>>>,
 }
 
 impl LocalChannels {
@@ -51,33 +63,43 @@ impl LocalChannels {
         Self {
             command_txs: Arc::new(Mutex::new(HashMap::new())),
             event_txs: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_txs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
     /// Create channels for a new game (only if they don't exist)
-    async fn create_game_channels(&self, game_id: u32) -> Result<()> {
+    /// Returns the snapshot sender and receiver for the game
+    async fn create_game_channels(&self, game_id: u32) -> Result<(mpsc::Sender<oneshot::Sender<GameState>>, mpsc::Receiver<oneshot::Sender<GameState>>)> {
         let mut cmd_txs = self.command_txs.lock().await;
         let mut evt_txs = self.event_txs.lock().await;
+        let mut snap_txs = self.snapshot_txs.lock().await;
         
         // Only create channels if they don't already exist
         if !cmd_txs.contains_key(&game_id) {
             let (command_tx, _) = broadcast::channel(32);
             let (event_tx, _) = broadcast::channel(32);
+            let (snapshot_tx, snapshot_rx) = mpsc::channel(32);
             
             cmd_txs.insert(game_id, command_tx);
             evt_txs.insert(game_id, event_tx);
+            snap_txs.insert(game_id, snapshot_tx.clone());
+            
+            Ok((snapshot_tx, snapshot_rx))
+        } else {
+            // Game already exists, return error
+            Err(anyhow::anyhow!("Game {} already exists", game_id))
         }
-        
-        Ok(())
     }
     
     /// Remove channels for a game
     async fn remove_game_channels(&self, game_id: u32) -> Result<()> {
         let mut cmd_txs = self.command_txs.lock().await;
         let mut evt_txs = self.event_txs.lock().await;
+        let mut snap_txs = self.snapshot_txs.lock().await;
         
         cmd_txs.remove(&game_id);
         evt_txs.remove(&game_id);
+        snap_txs.remove(&game_id);
         
         Ok(())
     }
@@ -116,6 +138,13 @@ impl LocalChannels {
         let txs = self.command_txs.lock().await;
         txs.contains_key(&game_id)
     }
+    
+    async fn get_snapshot_sender(&self, game_id: u32) -> Result<mpsc::Sender<oneshot::Sender<GameState>>> {
+        let txs = self.snapshot_txs.lock().await;
+        txs.get(&game_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Game {} not found", game_id))
+    }
 }
 
 /// Game message broker that handles both local and distributed messaging
@@ -147,9 +176,10 @@ impl GameBroker {
     }
     
     /// Create channels for a new local game and register in database
-    pub async fn create_game_channels(&self, game_id: u32) -> Result<()> {
-        // Create local channels
-        self.local_channels.create_game_channels(game_id).await?;
+    /// Returns the snapshot sender and receiver for the game
+    pub async fn create_game_channels(&self, game_id: u32) -> Result<(mpsc::Sender<oneshot::Sender<GameState>>, mpsc::Receiver<oneshot::Sender<GameState>>)> {
+        // Create local channels and get snapshot sender/receiver
+        let (snapshot_tx, snapshot_rx) = self.local_channels.create_game_channels(game_id).await?;
         
         // Register game location in database
         let server_uuid = uuid::Uuid::parse_str(&self.server_id)?;
@@ -163,7 +193,7 @@ impl GameBroker {
         let mut locations = self.game_locations.lock().await;
         locations.insert(game_id, self.server_id.clone());
         
-        Ok(())
+        Ok((snapshot_tx, snapshot_rx))
     }
     
     /// Remove channels for a game
@@ -281,6 +311,32 @@ impl GameBroker {
         Ok(())
     }
     
+    /// Broadcast a game snapshot to all connected remote servers
+    pub async fn broadcast_snapshot(&self, game_id: u32, snapshot: GameState) -> Result<()> {
+        // Serialize snapshot
+        let snapshot_data = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())?;
+        
+        // Create gRPC message
+        let grpc_snapshot = game_relay::GameSnapshot {
+            game_id,
+            game_state: snapshot_data,
+        };
+        
+        let message = game_relay::GameMessage {
+            message: Some(game_relay::game_message::Message::Snapshot(grpc_snapshot)),
+        };
+        
+        // Send to all remote servers that have streams
+        let streams = self.remote_streams.lock().await;
+        for (server_id, tx) in streams.iter() {
+            if let Err(e) = tx.send(message.clone()).await {
+                eprintln!("Failed to send snapshot to server {}: {:?}", server_id, e);
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// Handle incoming message from remote server
     async fn handle_remote_message(&self, message: game_relay::GameMessage) {
         use game_relay::game_message::Message;
@@ -296,17 +352,30 @@ impl GameBroker {
                         event: game_event,
                     };
                     // Forward to local subscribers
-                    if let Err(e) = self.local_channels.publish_event(event.game_id, event_msg.clone()).await {
+                    if let Err(_e) = self.local_channels.publish_event(event.game_id, event_msg.clone()).await {
                     } else {
                     }
                 } else {
-                    if let Err(e) = bincode::serde::decode_from_slice::<common::GameEvent, bincode::config::Configuration>(&event.event_data, bincode::config::standard()) {
+                    if let Err(_e) = bincode::serde::decode_from_slice::<common::GameEvent, bincode::config::Configuration>(&event.event_data, bincode::config::standard()) {
                     }
                 }
             }
             Some(Message::Command(cmd)) => {
                 // This shouldn't happen in normal flow (commands go TO remote)
                 eprintln!("Received unexpected command from remote: game_id={}", cmd.game_id);
+            }
+            Some(Message::Snapshot(snapshot)) => {
+                // Handle incoming snapshot from remote server
+                if let Ok((game_state, _)) = bincode::serde::decode_from_slice::<GameState, bincode::config::Configuration>(&snapshot.game_state, bincode::config::standard()) {
+                    // Create a snapshot event and forward to local subscribers
+                    let snapshot_event = GameEventMessage {
+                        game_id: snapshot.game_id,
+                        tick: game_state.tick,
+                        user_id: None,
+                        event: GameEvent::Snapshot { game_state },
+                    };
+                    let _ = self.local_channels.publish_event(snapshot.game_id, snapshot_event).await;
+                }
             }
             _ => {
                 // Subscribe/unsubscribe handled elsewhere
@@ -317,6 +386,110 @@ impl GameBroker {
 
 #[async_trait::async_trait]
 impl GameMessageBroker for GameBroker {
+    async fn join_game(&self, game_id: u32) -> Result<GameHandle> {
+        // Create channel for commands - commands will be forwarded to the appropriate destination
+        let (command_tx, mut command_rx) = mpsc::channel(32);
+        
+        // Subscribe to events (handles both local and remote games)
+        let event_rx = self.subscribe_events(game_id).await?;
+        
+        // Create channel for snapshot requests
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<GameState>>(32);
+        
+        // Check if game is local or remote
+        let is_local = self.is_game_local(game_id).await?;
+        
+        if is_local {
+            // For local games, forward commands directly to the local channels
+            let broker_clone = self.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = command_rx.recv().await {
+                    let _ = broker_clone.publish_command(game_id, cmd).await;
+                }
+            });
+            
+            // Forward snapshot requests to the game's snapshot channel
+            match self.local_channels.get_snapshot_sender(game_id).await {
+                Ok(local_snapshot_tx) => {
+                    tokio::spawn(async move {
+                        while let Some(response_tx) = snapshot_rx.recv().await {
+                            let _ = local_snapshot_tx.send(response_tx).await;
+                        }
+                    });
+                }
+                Err(_) => {
+                    // Game might not be fully initialized yet
+                    // Return a channel that will error when used
+                    tokio::spawn(async move {
+                        while let Some(response_tx) = snapshot_rx.recv().await {
+                            // Drop the response_tx to signal error
+                            drop(response_tx);
+                        }
+                    });
+                }
+            }
+        } else {
+            // For remote games, forward commands through the broker
+            let broker_clone = self.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = command_rx.recv().await {
+                    let _ = broker_clone.publish_command(game_id, cmd).await;
+                }
+            });
+            
+            // For remote games, handle snapshot requests via gRPC
+            if let Some(server_id) = self.lookup_game_server(game_id).await? {
+                let mut client = self.get_grpc_client(&server_id).await?;
+                tokio::spawn(async move {
+                    while let Some(response_tx) = snapshot_rx.recv().await {
+                        // Make gRPC call to get snapshot
+                        let request = game_relay::GetSnapshotRequest { game_id };
+                        match client.get_game_snapshot(request).await {
+                            Ok(response) => {
+                                let response = response.into_inner();
+                                if let Ok((game_state, _)) = bincode::serde::decode_from_slice::<GameState, bincode::config::Configuration>(
+                                    &response.game_state,
+                                    bincode::config::standard()
+                                ) {
+                                    let _ = response_tx.send(game_state);
+                                } else {
+                                    // Failed to decode, drop the sender
+                                    drop(response_tx);
+                                }
+                            }
+                            Err(_) => {
+                                // Failed to get snapshot, drop the sender
+                                drop(response_tx);
+                            }
+                        }
+                    }
+                });
+            } else {
+                // Game server not found, return error
+                return Err(anyhow::anyhow!("Game {} not found on any server", game_id));
+            }
+        }
+        
+        // Create the handle
+        let handle = GameHandle {
+            game_id,
+            command_tx: command_tx.clone(),
+            event_rx,
+            snapshot_tx,
+        };
+        
+        // Send an initial snapshot request to get the current game state
+        let snapshot_request = GameCommandMessage {
+            tick: 0,
+            received_order: 0,
+            user_id: 0, // System command
+            command: common::GameCommand::RequestSnapshot,
+        };
+        let _ = command_tx.send(snapshot_request).await;
+        
+        Ok(handle)
+    }
+    
     async fn subscribe_commands(&self, game_id: u32) -> Result<broadcast::Receiver<GameCommandMessage>> {
         // For now, we only support subscribing to local games
         // Remote subscriptions would require establishing a gRPC stream
