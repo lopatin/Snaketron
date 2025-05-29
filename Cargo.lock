@@ -1863,6 +1863,7 @@ dependencies = [
  "jsonwebtoken",
  "once_cell",
  "prost",
+ "prost-build",
  "rand 0.8.5",
  "refinery",
  "serde",

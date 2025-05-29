@@ -4,17 +4,28 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 use crate::game_broker::GameMessageBroker;
+use crate::replica_manager::{ReplicaManager, ReplicationCommand};
+use tracing::{debug, info, warn};
 
 
 pub struct GameManager {
     broker: Arc<dyn GameMessageBroker>,
+    replica_manager: Option<Arc<ReplicaManager>>,
+    server_id: String,
 }
 
 impl GameManager {
-    pub fn new(broker: Arc<dyn GameMessageBroker>) -> Self {
+    pub fn new(broker: Arc<dyn GameMessageBroker>, server_id: String) -> Self {
         GameManager {
             broker,
+            replica_manager: None,
+            server_id,
         }
+    }
+    
+    pub fn with_replica_manager(mut self, replica_manager: Arc<ReplicaManager>) -> Self {
+        self.replica_manager = Some(replica_manager);
+        self
     }
 
     pub async fn start_game(&mut self, id: u32) -> Result<()> {
@@ -44,10 +55,12 @@ impl GameManager {
         // Subscribe to commands through broker
         let command_rx = self.broker.subscribe_commands(id).await?;
         let event_broker = self.broker.clone();
+        let replica_manager = self.replica_manager.clone();
+        let server_id = self.server_id.clone();
         
         // Spawn the game loop
         tokio::spawn(async move {
-            Self::run_game_loop(id, game, command_rx, event_broker, snapshot_rx).await;
+            Self::run_game_loop(id, game, command_rx, event_broker, snapshot_rx, replica_manager, server_id).await;
         });
         
         Ok(())
@@ -59,7 +72,10 @@ impl GameManager {
         mut cmd_rx: broadcast::Receiver<GameCommandMessage>,
         event_broker: Arc<dyn GameMessageBroker>,
         mut snapshot_rx: mpsc::Receiver<oneshot::Sender<GameState>>,
+        replica_manager: Option<Arc<ReplicaManager>>,
+        server_id: String,
     ) {
+        let mut game_version: u64 = 0;
         let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
         let mut snapshot_broadcast_interval = tokio::time::interval(Duration::from_secs(5)); // Broadcast snapshot every 5 seconds
         snapshot_broadcast_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -84,6 +100,8 @@ impl GameManager {
                 
                 // Handle game tick
                 _ = interval.tick() => {
+                    let mut state_changed = false;
+                    
                     // Process all pending commands
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         // Check if this is a snapshot request
@@ -101,6 +119,9 @@ impl GameManager {
                             }
                         } else {
                             let events = server_process_incoming_command(&mut engine, cmd);
+                            if !events.is_empty() {
+                                state_changed = true;
+                            }
                             for event in events {
                                 // Broadcast event through broker
                                 if event_broker.publish_event(game_id, event).await.is_err() {
@@ -115,6 +136,9 @@ impl GameManager {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     match engine.run_until(now_ms) {
                         Ok(events) => {
+                            if !events.is_empty() {
+                                state_changed = true;
+                            }
                             for event in events {
                                 let event_msg = GameEventMessage {
                                     game_id,
@@ -130,6 +154,27 @@ impl GameManager {
                         }
                         Err(e) => {
                             eprintln!("Error running game tick: {:?}", e);
+                        }
+                    }
+                    
+                    // Send replication event if state changed
+                    if state_changed {
+                        if let Some(ref replica_manager) = replica_manager {
+                            game_version += 1;
+                            let state = engine.get_committed_state().clone();
+                            let tick = engine.current_tick();
+                            
+                            let replication_cmd = ReplicationCommand::UpdateGameState {
+                                game_id,
+                                state,
+                                version: game_version,
+                                tick,
+                                source_server: server_id.clone(),
+                            };
+                            
+                            if let Err(e) = replica_manager.get_replication_sender().send(replication_cmd).await {
+                                warn!("Failed to send replication command: {}", e);
+                            }
                         }
                     }
                 }

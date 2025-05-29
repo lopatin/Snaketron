@@ -8,9 +8,13 @@ use tonic::transport::Channel;
 use tokio_stream::StreamExt;
 
 // Re-export the generated proto types
+#[cfg(not(feature = "skip-proto"))]
 pub mod game_relay {
     tonic::include_proto!("game_relay");
 }
+
+#[cfg(feature = "skip-proto")]
+pub use crate::grpc_stub::game_relay;
 
 use game_relay::game_relay_client::GameRelayClient;
 
@@ -265,7 +269,15 @@ impl GameBroker {
     }
     
     /// Establish a bidirectional stream to a remote server
+    #[allow(unused_variables)]
     async fn ensure_stream_to_server(&self, server_id: &str) -> Result<()> {
+        #[cfg(feature = "skip-proto")]
+        {
+            return Err(anyhow::anyhow!("gRPC streaming not available without proto compilation"));
+        }
+        
+        #[cfg(not(feature = "skip-proto"))]
+        {
         let mut streams = self.remote_streams.lock().await;
         
         // Check if we already have a stream
@@ -281,7 +293,7 @@ impl GameBroker {
         
         // Start the bidirectional stream
         let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let response = client.stream_game_messages(request_stream).await?;
+        let response = client.stream_game_messages(tonic::Request::new(request_stream)).await?;
         let mut response_stream = response.into_inner();
         
         // Store the sender
@@ -309,6 +321,7 @@ impl GameBroker {
         });
         
         Ok(())
+        } // End of cfg(not(feature = "skip-proto"))
     }
     
     /// Broadcast a game snapshot to all connected remote servers
@@ -444,7 +457,7 @@ impl GameMessageBroker for GameBroker {
                     while let Some(response_tx) = snapshot_rx.recv().await {
                         // Make gRPC call to get snapshot
                         let request = game_relay::GetSnapshotRequest { game_id };
-                        match client.get_game_snapshot(request).await {
+                        match client.get_game_snapshot(tonic::Request::new(request)).await {
                             Ok(response) => {
                                 let response = response.into_inner();
                                 if let Ok((game_state, _)) = bincode::serde::decode_from_slice::<GameState, bincode::config::Configuration>(

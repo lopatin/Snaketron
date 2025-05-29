@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, Mutex};
+use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use crate::ws_server::WSMessage;
 use crate::game_manager::GameManager;
@@ -50,7 +50,7 @@ impl PlayerConnectionManager {
         &self, 
         player_ids: &[i32], 
         game_id: u32, 
-        _games_manager: Arc<Mutex<GameManager>>
+        _games_manager: Arc<RwLock<GameManager>>
     ) {
         let connections = self.connections.read().await;
         
@@ -114,5 +114,28 @@ impl PlayerConnectionManager {
         }
         
         notified
+    }
+    
+    /// Broadcast shutdown notice to all connected players
+    pub async fn broadcast_shutdown_notice(&self, grace_period_seconds: u32) {
+        let connections = self.connections.read().await;
+        
+        // Create shutdown message
+        let shutdown_msg = WSMessage::ServerShutdown {
+            reason: "Server is shutting down for maintenance".to_string(),
+            grace_period_seconds,
+        };
+        
+        if let Ok(json) = serde_json::to_string(&shutdown_msg) {
+            let text_msg = Message::Text(json.into());
+            
+            for (user_id, sender) in connections.iter() {
+                if let Err(e) = sender.send(text_msg.clone()).await {
+                    info!(user_id, "Failed to send shutdown notice: {}", e);
+                } else {
+                    info!(user_id, "Sent shutdown notice");
+                }
+            }
+        }
     }
 }

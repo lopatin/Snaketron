@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use sqlx::PgPool;
@@ -13,7 +13,7 @@ use crate::player_connections::PlayerConnectionManager;
 pub async fn run_game_discovery_loop(
     pool: PgPool,
     server_id: uuid::Uuid,
-    games_manager: Arc<Mutex<GameManager>>,
+    games_manager: Arc<RwLock<GameManager>>,
     player_connections: Arc<PlayerConnectionManager>,
     cancellation_token: CancellationToken,
 ) {
@@ -57,7 +57,7 @@ pub async fn run_game_discovery_loop(
 async fn check_and_start_assigned_games(
     pool: &PgPool,
     server_id: uuid::Uuid,
-    games_manager: &Arc<Mutex<GameManager>>,
+    games_manager: &Arc<RwLock<GameManager>>,
     player_connections: &Arc<PlayerConnectionManager>,
 ) -> Result<()> {
     // Find games assigned to this server that aren't running yet
@@ -96,7 +96,7 @@ async fn check_and_start_assigned_games(
         }
         
         // Start the game
-        if let Err(e) = games_manager.lock().await.start_game(game_id as u32).await {
+        if let Err(e) = games_manager.write().await.start_game(game_id as u32).await {
             error!(game_id, error = %e, "Failed to start assigned game");
             // Revert status on failure
             sqlx::query(
@@ -144,7 +144,7 @@ async fn check_and_start_assigned_games(
 async fn check_remote_games_with_local_players(
     pool: &PgPool,
     server_id: uuid::Uuid,
-    games_manager: &Arc<Mutex<GameManager>>,
+    games_manager: &Arc<RwLock<GameManager>>,
     player_connections: &Arc<PlayerConnectionManager>,
 ) -> Result<()> {
     // Find games where we have local players but the game is on another server

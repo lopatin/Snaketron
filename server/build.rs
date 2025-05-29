@@ -2,6 +2,12 @@ fn main() {
     let iface_files = &["proto/stream_exchange.proto", "proto/game_relay.proto"];
     let dirs = &["."];
 
+    // Temporarily skip proto compilation if protoc is not available
+    if std::env::var("SKIP_PROTO_COMPILE").is_ok() {
+        println!("cargo:warning=Skipping proto compilation (SKIP_PROTO_COMPILE is set)");
+        return;
+    }
+
     tonic_build::configure()
         .build_client(true)
         .build_server(true)

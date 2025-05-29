@@ -1,9 +1,14 @@
+pub mod authority_transfer;
 pub mod game_broker;
 pub mod game_cleanup;
 pub mod game_discovery;
 pub mod game_server;
 pub mod game_manager;
 pub mod grpc_server;
+#[cfg(feature = "skip-proto")]
+pub mod grpc_stub;
 pub mod matchmaking;
 pub mod player_connections;
+pub mod replica_manager;
+pub mod service_manager;
 pub mod ws_server;

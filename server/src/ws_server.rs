@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, mpsc, Mutex};
+use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
@@ -34,6 +34,15 @@ pub enum WSMessage {
     QueueForMatch { game_type: common::GameType },
     LeaveQueue,
     MatchFound { game_id: u32 },
+    // High availability messages
+    ServerShutdown { 
+        reason: String,
+        grace_period_seconds: u32,
+    },
+    AuthorityTransfer {
+        game_id: u32,
+        new_server_url: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -240,7 +249,7 @@ impl ConnectionState {
 
 pub async fn run_websocket_server(
     addr: &str,
-    games_manager: Arc<Mutex<GameManager>>,
+    games_manager: Arc<RwLock<GameManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -253,7 +262,7 @@ pub async fn run_websocket_server(
 
 pub async fn run_websocket_server_with_listener(
     listener: TcpListener,
-    games_manager: Arc<Mutex<GameManager>>,
+    games_manager: Arc<RwLock<GameManager>>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -316,7 +325,7 @@ pub async fn run_websocket_server_with_listener(
 
 
 async fn handle_websocket_connection(
-    games_manager: Arc<Mutex<GameManager>>,
+    games_manager: Arc<RwLock<GameManager>>,
     db_pool: PgPool,
     stream: TcpStream,
     cancellation_token: CancellationToken,
@@ -445,7 +454,7 @@ async fn handle_websocket_connection(
                                 match ws_message {
                                     WSMessage::JoinGame(game_id) => {
                                         info!("Joining game ID: {}", game_id);
-                                        let games_mgr = games_manager.lock().await;
+                                        let games_mgr = games_manager.read().await;
                                         match games_mgr.join_game(game_id).await {
                                             Ok((command_tx, event_rx)) => {
                                                 // Try to get the current game snapshot (for local games)
@@ -547,7 +556,7 @@ async fn handle_websocket_connection(
                                             info!("Received game snapshot for game {} - auto-joining", event_msg.game_id);
                                             
                                             // Join the game to get the channels
-                                            let games_mgr = games_manager.lock().await;
+                                            let games_mgr = games_manager.read().await;
                                             match games_mgr.join_game(event_msg.game_id).await {
                                                 Ok((command_tx, event_rx)) => {
                                                     // Forward the snapshot to the client
@@ -608,7 +617,7 @@ async fn handle_websocket_connection(
                                         drop(event_rx);
                                         
                                         // Join new game
-                                        match games_manager.lock().await.join_game(new_game_id).await {
+                                        match games_manager.read().await.join_game(new_game_id).await {
                                             Ok((command_tx, event_rx)) => {
                                                 ConnectionState::InGame {
                                                     user_token,

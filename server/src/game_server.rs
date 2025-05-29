@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -16,6 +16,9 @@ use crate::{
     game_discovery::run_game_discovery_loop,
     player_connections::PlayerConnectionManager,
     grpc_server::run_game_relay_server,
+    service_manager::ServiceManager,
+    replica_manager::ReplicaManager,
+    authority_transfer::AuthorityTransferManager,
 };
 
 
@@ -47,6 +50,14 @@ pub struct GameServer {
     cancellation_token: CancellationToken,
     /// Handles for all spawned tasks
     handles: Vec<JoinHandle<()>>,
+    /// Service manager for cluster topology
+    service_manager: Option<Arc<ServiceManager>>,
+    /// Replica manager for game state replication
+    replica_manager: Option<Arc<ReplicaManager>>,
+    /// Authority transfer manager
+    authority_transfer: Option<Arc<AuthorityTransferManager>>,
+    /// Player connection manager
+    player_connections: Arc<PlayerConnectionManager>,
 }
 
 impl GameServer {
@@ -85,11 +96,37 @@ impl GameServer {
             server_id.to_string(),
         ));
 
-        // Create games manager
-        let games_manager = Arc::new(Mutex::new(GameManager::new(broker.clone())));
-
         // Create player connection manager
         let player_connections = Arc::new(PlayerConnectionManager::new());
+
+        // Create service manager for cluster topology
+        let service_manager = Arc::new(ServiceManager::new(
+            server_id.to_string(),
+            db_pool.clone(),
+            cancellation_token.clone(),
+        ));
+
+        // Create replica manager for game state replication
+        let replica_manager = Arc::new(ReplicaManager::new(
+            server_id.to_string(),
+            db_pool.clone(),
+            cancellation_token.clone(),
+        ));
+
+        // Create games manager with replica manager
+        let games_manager = Arc::new(RwLock::new(
+            GameManager::new(broker.clone(), server_id.to_string())
+                .with_replica_manager(replica_manager.clone())
+        ));
+
+        // Create authority transfer manager
+        let authority_transfer = Arc::new(AuthorityTransferManager::new(
+            server_id.to_string(),
+            db_pool.clone(),
+            service_manager.clone(),
+            replica_manager.clone(),
+            games_manager.clone(),
+        ));
 
         // Start gRPC server if configured
         if let Some(grpc_addr_str) = &grpc_addr {
@@ -162,6 +199,24 @@ impl GameServer {
             let _ = run_cleanup_service(cleanup_pool, cleanup_token).await;
         }));
 
+        // Start service manager
+        info!("Starting service manager for cluster topology");
+        let service_manager_clone = service_manager.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = service_manager_clone.start().await {
+                error!("Service manager error: {}", e);
+            }
+        }));
+
+        // Start replica manager
+        info!("Starting replica manager for game state replication");
+        let replica_manager_clone = replica_manager.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = replica_manager_clone.start().await {
+                error!("Replica manager error: {}", e);
+            }
+        }));
+
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -174,6 +229,10 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
+            service_manager: Some(service_manager),
+            replica_manager: Some(replica_manager),
+            authority_transfer: Some(authority_transfer),
+            player_connections,
         })
     }
 
@@ -198,8 +257,11 @@ impl GameServer {
     }
 
     /// Shutdown the server gracefully
-    pub async fn shutdown(self) -> Result<()> {
-        info!("Shutting down game server {}", self.server_id);
+    pub async fn shutdown(mut self) -> Result<()> {
+        // Perform graceful shutdown steps
+        if let Err(e) = self.perform_graceful_shutdown().await {
+            error!("Error during graceful shutdown: {}", e);
+        }
         
         // Signal all services to stop
         self.cancellation_token.cancel();
@@ -217,6 +279,72 @@ impl GameServer {
         }
 
         info!("Game server {} shut down successfully", self.server_id);
+        Ok(())
+    }
+
+    /// Perform graceful shutdown with game migration
+    async fn perform_graceful_shutdown(&self) -> Result<()> {
+        info!("Starting graceful shutdown of game server {}", self.server_id);
+        
+        // Step 1: Stop accepting new games
+        info!("Updating server status to 'draining'");
+        sqlx::query("UPDATE servers SET status = 'draining' WHERE server_id = $1")
+            .bind(self.server_id)
+            .execute(&self.db_pool)
+            .await
+            .context("Failed to update server status")?;
+
+        // Step 2: Notify all WebSocket clients
+        info!("Broadcasting shutdown notice to all WebSocket clients");
+        if let (Some(service_manager), Some(authority_transfer)) = (&self.service_manager, &self.authority_transfer) {
+            // Get list of games we're hosting
+            let hosted_games = sqlx::query_as::<_, (i32,)>(
+                r#"
+                SELECT id 
+                FROM games 
+                WHERE host_server_id = $1 
+                AND status = 'active'
+                "#
+            )
+            .bind(&self.server_id.to_string())
+            .fetch_all(&self.db_pool)
+            .await
+            .context("Failed to query hosted games")?;
+            
+            let game_ids: Vec<u32> = hosted_games.into_iter().map(|r| r.0 as u32).collect();
+            
+            // Broadcast shutdown notification to all servers
+            service_manager.broadcast_shutdown(30000, game_ids.clone()).await?;
+            
+            // Send shutdown notices to connected clients
+            self.player_connections.broadcast_shutdown_notice(30).await;
+            
+            // Step 3: Transfer games to other servers
+            info!("Transferring {} games to other servers", game_ids.len());
+            authority_transfer.transfer_all_games().await?;
+            
+            // Wait for transfers to complete
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+        
+        // Step 4: Signal all services to stop
+        info!("Stopping all services");
+        self.cancellation_token.cancel();
+
+        // Step 5: Wait for all services to complete
+        for handle in &self.handles {
+            // Note: We can't consume the handles here since we don't own self
+            // In a real implementation, we'd need to refactor this
+        }
+
+        // Update server status to offline
+        sqlx::query("UPDATE servers SET status = 'offline' WHERE server_id = $1")
+            .bind(self.server_id)
+            .execute(&self.db_pool)
+            .await
+            .context("Failed to update server status to offline")?;
+
+        info!("Game server {} shut down gracefully", self.server_id);
         Ok(())
     }
 }

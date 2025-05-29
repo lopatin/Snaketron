@@ -11,6 +11,15 @@ service GameRelay {
   
   // Notify players on this server about a match
   rpc NotifyMatchFound(NotifyMatchRequest) returns (NotifyMatchResponse);
+  
+  // Replicate game state for high availability
+  rpc ReplicateGameState(stream ReplicationEvent) returns (stream ReplicationAck);
+  
+  // Transfer authority of a game to another server
+  rpc TransferAuthority(AuthorityTransferRequest) returns (AuthorityTransferResponse);
+  
+  // Notify other servers about impending shutdown
+  rpc NotifyShutdown(ShutdownNotification) returns (ShutdownAck);
 }
 
 message GameMessage {
@@ -69,4 +78,62 @@ message NotifyMatchRequest {
 message NotifyMatchResponse {
   bool success = 1;
   repeated int32 notified_players = 2;
+}
+
+// High Availability Messages
+
+message ReplicationEvent {
+  uint32 game_id = 1;
+  uint64 version = 2;
+  string source_server_id = 3;
+  
+  oneof event {
+    GameStateUpdate state_update = 4;
+    AuthorityChange authority_change = 5;
+    GameDeleted game_deleted = 6;
+  }
+}
+
+message GameStateUpdate {
+  bytes game_state = 1; // Bincode-serialized common::GameState
+  uint32 tick = 2;
+}
+
+message AuthorityChange {
+  string new_authority_server_id = 1;
+  string reason = 2; // "failover", "graceful_shutdown", "load_balance"
+}
+
+message GameDeleted {
+  string reason = 1;
+}
+
+message ReplicationAck {
+  uint32 game_id = 1;
+  uint64 version = 2;
+  bool success = 3;
+  optional string error = 4;
+}
+
+message AuthorityTransferRequest {
+  uint32 game_id = 1;
+  string from_server_id = 2;
+  string to_server_id = 3;
+  string reason = 4;
+}
+
+message AuthorityTransferResponse {
+  bool accepted = 1;
+  optional string error = 2;
+}
+
+message ShutdownNotification {
+  string server_id = 1;
+  uint32 grace_period_ms = 2;
+  repeated uint32 affected_game_ids = 3;
+}
+
+message ShutdownAck {
+  bool acknowledged = 1;
+  repeated uint32 accepted_game_ids = 2;
 }

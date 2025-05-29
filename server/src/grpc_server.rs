@@ -176,19 +176,29 @@ pub async fn run_game_relay_server(
     player_connections: Arc<PlayerConnectionManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
-    let service = GameRelayService::new(broker, player_connections);
-    let svc = GameRelayServer::new(service);
+    #[cfg(feature = "skip-proto")]
+    {
+        info!("Game relay gRPC server skipped (proto compilation disabled)");
+        cancellation_token.cancelled().await;
+        return Ok(());
+    }
     
-    info!("Game relay gRPC server starting on {}", addr);
-    
-    Server::builder()
-        .add_service(svc)
-        .serve_with_shutdown(addr.parse()?, cancellation_token.cancelled())
-        .await
-        .context("Game relay gRPC server failed")?;
-    
-    info!("Game relay gRPC server shut down");
-    Ok(())
+    #[cfg(not(feature = "skip-proto"))]
+    {
+        let service = GameRelayService::new(broker, player_connections);
+        let svc = GameRelayServer::new(service);
+        
+        info!("Game relay gRPC server starting on {}", addr);
+        
+        Server::builder()
+            .add_service(svc)
+            .serve_with_shutdown(addr.parse()?, cancellation_token.cancelled())
+            .await
+            .context("Game relay gRPC server failed")?;
+        
+        info!("Game relay gRPC server shut down");
+        Ok(())
+    }
 }
 
 // Keep the old commented code for reference
