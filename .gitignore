@@ -2,3 +2,4 @@
 target
 client/web/node_modules
 .env
+states
