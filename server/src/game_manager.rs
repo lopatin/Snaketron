@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 use crate::game_broker::GameMessageBroker;
 use crate::replica_manager::{ReplicaManager, ReplicationCommand};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 
 pub struct GameManager {
@@ -29,9 +29,19 @@ impl GameManager {
     }
 
     pub async fn start_game(&mut self, id: u32) -> Result<()> {
-        // Check if game is already running by trying to check if it's local
-        if let Ok(true) = self.broker.is_game_local(id).await {
-            return Ok(()); // Game already running locally
+        info!("GameManager: start_game called for game {}", id);
+        
+        // Check if game channels already exist (game is actually running)
+        // We need to try subscribing to see if channels exist
+        match self.broker.subscribe_events(id).await {
+            Ok(_) => {
+                info!("GameManager: Game {} already has channels, skipping start", id);
+                return Ok(()); // Game already running
+            }
+            Err(_) => {
+                info!("GameManager: Game {} channels don't exist, starting game", id);
+                // Continue with starting the game
+            }
         }
         
         // Create the game engine
@@ -41,6 +51,7 @@ impl GameManager {
             .unwrap()
             .as_nanos() as u64;
         let game = GameEngine::new_with_seed(id, start_ms, rng_seed);
+        info!("GameManager: Created game engine for game {}", id);
         
         // For GameBroker, create game channels (registers in DB) and get snapshot receiver
         let snapshot_rx = if let Some(game_broker) = self.broker.as_any().downcast_ref::<crate::game_broker::GameBroker>() {
@@ -59,7 +70,9 @@ impl GameManager {
         let server_id = self.server_id.clone();
         
         // Spawn the game loop
+        info!("GameManager: Spawning game loop for game {}", id);
         tokio::spawn(async move {
+            info!("GameManager: Game loop started for game {}", id);
             Self::run_game_loop(id, game, command_rx, event_broker, snapshot_rx, replica_manager, server_id).await;
         });
         
@@ -79,6 +92,23 @@ impl GameManager {
         let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
         let mut snapshot_broadcast_interval = tokio::time::interval(Duration::from_secs(5)); // Broadcast snapshot every 5 seconds
         snapshot_broadcast_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        info!("GameManager: run_game_loop called for game {}", game_id);
+        
+        // Send initial snapshot immediately
+        let initial_snapshot = engine.get_committed_state().clone();
+        let initial_event = GameEventMessage {
+            game_id,
+            tick: initial_snapshot.tick,
+            user_id: None,
+            event: GameEvent::Snapshot { game_state: initial_snapshot },
+        };
+        info!("GameManager: Publishing initial snapshot for game {}", game_id);
+        if let Err(e) = event_broker.publish_event(game_id, initial_event).await {
+            warn!(game_id, error = %e, "Failed to send initial game snapshot");
+        } else {
+            info!(game_id, "Successfully sent initial game snapshot");
+        }
         
         loop {
             tokio::select! {
@@ -106,6 +136,7 @@ impl GameManager {
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         // Check if this is a snapshot request
                         if matches!(cmd.command, GameCommand::RequestSnapshot) {
+                            info!(game_id, "Processing RequestSnapshot command");
                             // Send snapshot event
                             let snapshot = engine.get_committed_state().clone();
                             let snapshot_event = GameEventMessage {
@@ -114,8 +145,11 @@ impl GameManager {
                                 user_id: None,
                                 event: GameEvent::Snapshot { game_state: snapshot },
                             };
-                            if event_broker.publish_event(game_id, snapshot_event).await.is_err() {
+                            if let Err(e) = event_broker.publish_event(game_id, snapshot_event).await {
+                                error!(game_id, error = %e, "Failed to publish snapshot");
                                 break;
+                            } else {
+                                info!(game_id, "Published snapshot in response to RequestSnapshot");
                             }
                         } else {
                             let events = server_process_incoming_command(&mut engine, cmd);

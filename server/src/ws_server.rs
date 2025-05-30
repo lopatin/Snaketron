@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
@@ -245,6 +245,260 @@ impl ConnectionState {
     }
 }
 
+// Helper to process WebSocket messages and return the new state
+// This avoids the std::mem::replace pattern that causes race conditions
+async fn process_ws_message(
+    state: ConnectionState,
+    ws_message: WSMessage,
+    jwt_verifier: &Arc<dyn JwtVerifier>,
+    player_connections: &Arc<crate::player_connections::PlayerConnectionManager>,
+    games_manager: &Arc<RwLock<GameManager>>,
+    db_pool: &PgPool,
+    ws_tx: &mpsc::Sender<Message>,
+    ws_stream: &mut WebSocketStream<TcpStream>,
+) -> Result<ConnectionState> {
+    use tracing::debug;
+    let state_str = match &state {
+        ConnectionState::Unauthenticated => "Unauthenticated",
+        ConnectionState::Authenticated { .. } => "Authenticated",
+        ConnectionState::InGame { game_id, .. } => {
+            debug!("Processing message in InGame({})", game_id);
+            "InGame"
+        },
+        ConnectionState::ShuttingDown { .. } => "ShuttingDown",
+    };
+    debug!("Processing message: {:?} in state: {}", ws_message, state_str);
+    
+    match state {
+        ConnectionState::Unauthenticated => {
+            match ws_message {
+                WSMessage::Token(jwt_token) => {
+                    info!("Received jwt token: {}", jwt_token);
+                    match jwt_verifier.verify(&jwt_token).await {
+                        Ok(user_token) => {
+                            info!("Token verified successfully, user_id: {}", user_token.user_id);
+                            // Register the player connection
+                            player_connections.register(user_token.user_id, ws_tx.clone()).await;
+                            Ok(ConnectionState::Authenticated { user_token })
+                        }
+                        Err(e) => {
+                            error!("Failed to verify token: {}", e);
+                            Err(anyhow::anyhow!("Authentication failed"))
+                        }
+                    }
+                }
+                WSMessage::Ping => {
+                    // Respond with Pong even in unauthenticated state
+                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                    ws_stream.send(pong_msg).await?;
+                    Ok(ConnectionState::Unauthenticated)
+                }
+                _ => {
+                    warn!("Cannot process message in unauthenticated state");
+                    Ok(ConnectionState::Unauthenticated)
+                }
+            }
+        }
+        ConnectionState::Authenticated { user_token } => {
+            match ws_message {
+                WSMessage::JoinGame(game_id) => {
+                    info!("Joining game ID: {}", game_id);
+                    
+                    // Retry join_game a few times in case the game is still being initialized
+                    let mut join_result = None;
+                    for attempt in 0..5 {
+                        if attempt > 0 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        
+                        let games_mgr = games_manager.read().await;
+                        match games_mgr.join_game(game_id).await {
+                            Ok((command_tx, event_rx)) => {
+                                join_result = Some((command_tx, event_rx));
+                                break;
+                            }
+                            Err(e) if attempt < 4 => {
+                                info!("Join game attempt {} failed ({}), retrying...", attempt + 1, e);
+                                drop(games_mgr); // Release the lock before sleeping
+                            }
+                            Err(e) => {
+                                error!("Failed to join game after {} attempts: {}", attempt + 1, e);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    match join_result {
+                        Some((command_tx, event_rx)) => {
+                            info!("Successfully joined game {}", game_id);
+                            let games_mgr = games_manager.read().await;
+                            
+                            // Try to get initial game state
+                            match games_mgr.get_game_snapshot(game_id).await {
+                                Ok(snapshot) => {
+                                    // Send initial state to client
+                                    let event = GameEventMessage {
+                                        game_id,
+                                        tick: snapshot.tick,
+                                        user_id: None,
+                                        event: GameEvent::Snapshot { game_state: snapshot },
+                                    };
+                                    let msg = WSMessage::GameEvent(event);
+                                    let json_msg = serde_json::to_string(&msg)?;
+                                    ws_stream.send(Message::Text(json_msg.into())).await?;
+                                    
+                                    info!("WS: Transitioning to InGame state for game {} (local)", game_id);
+                                    debug!("WS: Event receiver channel created for game {}", game_id);
+                                    Ok(ConnectionState::InGame {
+                                        user_token,
+                                        game_id,
+                                        command_tx,
+                                        event_rx,
+                                    })
+                                }
+                                Err(e) => {
+                                    // For remote games, request a snapshot
+                                    info!("Could not get local snapshot ({}), requesting snapshot for remote game {}", e, game_id);
+                                    
+                                    // Send RequestSnapshot command
+                                    let snapshot_request = GameCommandMessage {
+                                        tick: 0,
+                                        received_order: 0,
+                                        user_id: user_token.user_id as u32,
+                                        command: GameCommand::RequestSnapshot,
+                                    };
+                                    
+                                    if let Err(e) = command_tx.send(snapshot_request).await {
+                                        error!("Failed to request snapshot: {}", e);
+                                    } else {
+                                        info!("Sent RequestSnapshot command for game {}", game_id);
+                                    }
+                                    
+                                    info!("WS: Transitioning to InGame state for game {} after join", game_id);
+                                    debug!("WS: Event receiver channel created for remote game {}", game_id);
+                                    Ok(ConnectionState::InGame {
+                                        user_token,
+                                        game_id,
+                                        command_tx,
+                                        event_rx,
+                                    })
+                                }
+                            }
+                        }
+                        None => {
+                            error!("Failed to join game {}", game_id);
+                            Ok(ConnectionState::Authenticated { user_token })
+                        }
+                    }
+                }
+                WSMessage::QueueForMatch { game_type } => {
+                    info!("User {} queuing for match type: {:?}", user_token.user_id, game_type);
+                    
+                    // Add to matchmaking queue
+                    if let Err(e) = add_to_matchmaking_queue(db_pool, user_token.user_id, game_type).await {
+                        error!("Failed to add user to matchmaking queue: {}", e);
+                    }
+                    
+                    // Start polling for match
+                    let poll_pool = db_pool.clone();
+                    let poll_user_id = user_token.user_id;
+                    let poll_tx = ws_tx.clone();
+                    tokio::spawn(async move {
+                        poll_for_match(poll_pool, poll_user_id, poll_tx).await;
+                    });
+                    
+                    Ok(ConnectionState::Authenticated { user_token })
+                }
+                WSMessage::LeaveQueue => {
+                    info!("User {} leaving matchmaking queue", user_token.user_id);
+                    
+                    // Remove from matchmaking queue
+                    if let Err(e) = remove_from_matchmaking_queue(db_pool, user_token.user_id).await {
+                        error!("Failed to remove user from matchmaking queue: {}", e);
+                    }
+                    
+                    Ok(ConnectionState::Authenticated { user_token })
+                }
+                WSMessage::Ping => {
+                    // Respond with Pong
+                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                    ws_stream.send(pong_msg).await?;
+                    Ok(ConnectionState::Authenticated { user_token })
+                }
+                WSMessage::GameEvent(event_msg) => {
+                    // Handle game events - specifically initial snapshot from matchmaking
+                    if let GameEvent::Snapshot { ref game_state } = event_msg.event {
+                        info!("Received game snapshot for game {} - auto-joining", event_msg.game_id);
+                        
+                        // Join the game to get the channels
+                        let games_mgr = games_manager.read().await;
+                        match games_mgr.join_game(event_msg.game_id).await {
+                            Ok((command_tx, event_rx)) => {
+                                // Forward the snapshot to the client
+                                let snapshot_msg = Message::Text(serde_json::to_string(&event_msg)?.into());
+                                ws_stream.send(snapshot_msg).await?;
+                                
+                                info!("WS: Auto-joined game {} after matchmaking", event_msg.game_id);
+                                Ok(ConnectionState::InGame {
+                                    user_token,
+                                    game_id: event_msg.game_id,
+                                    command_tx,
+                                    event_rx,
+                                })
+                            }
+                            Err(e) => {
+                                error!("Failed to auto-join game {}: {}", event_msg.game_id, e);
+                                Ok(ConnectionState::Authenticated { user_token })
+                            }
+                        }
+                    } else {
+                        warn!("Unexpected game event while authenticated: {:?}", event_msg);
+                        Ok(ConnectionState::Authenticated { user_token })
+                    }
+                }
+                _ => {
+                    warn!("Unexpected message in authenticated state: {:?}", ws_message);
+                    Ok(ConnectionState::Authenticated { user_token })
+                }
+            }
+        }
+        ConnectionState::InGame { user_token, game_id, command_tx, event_rx } => {
+            match ws_message {
+                WSMessage::GameCommand(cmd) => {
+                    let game_command = GameCommandMessage {
+                        tick: 0,
+                        received_order: 0,
+                        user_id: user_token.user_id as u32,
+                        command: cmd,
+                    };
+                    
+                    if let Err(e) = command_tx.send(game_command).await {
+                        error!("Failed to send command: {}", e);
+                        // Game might have ended, transition back to authenticated
+                        Ok(ConnectionState::Authenticated { user_token })
+                    } else {
+                        Ok(ConnectionState::InGame { user_token, game_id, command_tx, event_rx })
+                    }
+                }
+                WSMessage::Ping => {
+                    // Respond with Pong
+                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                    ws_stream.send(pong_msg).await?;
+                    Ok(ConnectionState::InGame { user_token, game_id, command_tx, event_rx })
+                }
+                _ => {
+                    warn!("Unexpected message in game state: {:?}", ws_message);
+                    Ok(ConnectionState::InGame { user_token, game_id, command_tx, event_rx })
+                }
+            }
+        }
+        ConnectionState::ShuttingDown { timeout } => {
+            // Ignore all messages during shutdown
+            Ok(ConnectionState::ShuttingDown { timeout })
+        }
+    }
+}
+
 
 
 pub async fn run_websocket_server(
@@ -351,9 +605,15 @@ async fn handle_websocket_connection(
     let mut shutdown_started = false;
 
     loop {
+        let state_name = match &state {
+            ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
+            ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
+            ConnectionState::InGame { game_id, .. } => format!("InGame({})", game_id),
+            ConnectionState::ShuttingDown { .. } => "ShuttingDown".to_string(),
+        };
+        debug!("WS: Select loop iteration, current state: {}", state_name);
+        
         tokio::select! {
-            biased;
-            
             // Handle shutdown timeout
             _ = &mut shutdown_timeout, if shutdown_started => {
                 warn!("Shutdown timeout reached, closing connection");
@@ -415,246 +675,42 @@ async fn handle_websocket_connection(
                             }
                         };
                         
-                        // Process message based on current state
-                        state = match std::mem::replace(&mut state, ConnectionState::Unauthenticated) {
-                            ConnectionState::Unauthenticated => {
-                                match ws_message {
-                                    WSMessage::Token(jwt_token) => {
-                                        info!("Received jwt token: {}", jwt_token);
-                                        match jwt_verifier.verify(&jwt_token).await {
-                                            Ok(user_token) => {
-                                                info!("Token verified successfully, user_id: {}", user_token.user_id);
-                                                // Register the player connection
-                                                player_connections.register(user_token.user_id, ws_tx.clone()).await;
-                                                ConnectionState::Authenticated { user_token }
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to verify token: {}", e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    WSMessage::Ping => {
-                                        // Respond with Pong even in unauthenticated state
-                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                                        if let Err(e) = ws_stream.send(pong_msg).await {
-                                            error!("Failed to send pong: {}", e);
-                                            break;
-                                        }
-                                        ConnectionState::Unauthenticated
-                                    }
-                                    _ => {
-                                        warn!("Cannot process message in unauthenticated state");
-                                        ConnectionState::Unauthenticated
-                                    }
-                                }
+                        // Process message based on current state using the new helper function
+                        debug!("WS: Processing message: {:?}", ws_message);
+                        
+                        let process_result = process_ws_message(
+                            state,
+                            ws_message,
+                            &jwt_verifier,
+                            &player_connections,
+                            &games_manager,
+                            &db_pool,
+                            &ws_tx,
+                            &mut ws_stream,
+                        ).await;
+                        
+                        match process_result {
+                            Ok(new_state) => {
+                                state = new_state;
+                                let new_state_name = match &state {
+                                    ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
+                                    ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
+                                    ConnectionState::InGame { game_id, .. } => format!("InGame({})", game_id),
+                                    ConnectionState::ShuttingDown { .. } => "ShuttingDown".to_string(),
+                                };
+                                debug!("WS: State after processing message: {}", new_state_name);
                             }
-                            
-                            ConnectionState::Authenticated { user_token } => {
-                                match ws_message {
-                                    WSMessage::JoinGame(game_id) => {
-                                        info!("Joining game ID: {}", game_id);
-                                        let games_mgr = games_manager.read().await;
-                                        match games_mgr.join_game(game_id).await {
-                                            Ok((command_tx, event_rx)) => {
-                                                // Try to get the current game snapshot (for local games)
-                                                match games_mgr.get_game_snapshot(game_id).await {
-                                                    Ok(game_state) => {
-                                                        // Send snapshot to client
-                                                        let snapshot_event = GameEventMessage {
-                                                            game_id,
-                                                            tick: game_state.tick,
-                                                            user_id: None,
-                                                            event: GameEvent::Snapshot { game_state },
-                                                        };
-                                                        
-                                                        let snapshot_msg = Message::Text(serde_json::to_string(&snapshot_event)?.into());
-                                                        if let Err(e) = ws_stream.send(snapshot_msg).await {
-                                                            error!("Failed to send snapshot: {}", e);
-                                                            ConnectionState::Authenticated { user_token }
-                                                        } else {
-                                                            info!("WS: Transitioning to InGame state for game {} (local)", game_id);
-                                                            ConnectionState::InGame {
-                                                                user_token,
-                                                                game_id,
-                                                                command_tx,
-                                                                event_rx,
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        // For remote games, request a snapshot
-                                                        info!("Could not get local snapshot ({}), requesting snapshot for remote game {}", e, game_id);
-                                                        
-                                                        // Send RequestSnapshot command
-                                                        let snapshot_request = GameCommandMessage {
-                                                            tick: 0,
-                                                            received_order: 0,
-                                                            user_id: user_token.user_id as u32,
-                                                            command: GameCommand::RequestSnapshot,
-                                                        };
-                                                        
-                                                        if let Err(e) = command_tx.send(snapshot_request).await {
-                                                            error!("Failed to request snapshot: {}", e);
-                                                        }
-                                                        
-                                                        ConnectionState::InGame {
-                                                            user_token,
-                                                            game_id,
-                                                            command_tx,
-                                                            event_rx,
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to join game: {}", e);
-                                                ConnectionState::Authenticated { user_token }
-                                            }
-                                        }
-                                    }
-                                    WSMessage::QueueForMatch { game_type } => {
-                                        info!("User {} queuing for match type: {:?}", user_token.user_id, game_type);
-                                        
-                                        // Add to matchmaking queue
-                                        if let Err(e) = add_to_matchmaking_queue(&db_pool, user_token.user_id, game_type).await {
-                                            error!("Failed to add user to matchmaking queue: {}", e);
-                                        }
-                                        
-                                        // Start polling for match
-                                        let poll_pool = db_pool.clone();
-                                        let poll_user_id = user_token.user_id;
-                                        let poll_tx = ws_tx.clone();
-                                        tokio::spawn(async move {
-                                            poll_for_match(poll_pool, poll_user_id, poll_tx).await;
-                                        });
-                                        
-                                        ConnectionState::Authenticated { user_token }
-                                    }
-                                    WSMessage::LeaveQueue => {
-                                        info!("User {} leaving matchmaking queue", user_token.user_id);
-                                        
-                                        // Remove from matchmaking queue
-                                        if let Err(e) = remove_from_matchmaking_queue(&db_pool, user_token.user_id).await {
-                                            error!("Failed to remove user from matchmaking queue: {}", e);
-                                        }
-                                        
-                                        ConnectionState::Authenticated { user_token }
-                                    }
-                                    WSMessage::Ping => {
-                                        // Respond with Pong
-                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                                        if let Err(e) = ws_stream.send(pong_msg).await {
-                                            error!("Failed to send pong: {}", e);
-                                            break;
-                                        }
-                                        ConnectionState::Authenticated { user_token }
-                                    }
-                                    WSMessage::GameEvent(event_msg) => {
-                                        // Handle game events - specifically initial snapshot from matchmaking
-                                        if let GameEvent::Snapshot { ref game_state } = event_msg.event {
-                                            info!("Received game snapshot for game {} - auto-joining", event_msg.game_id);
-                                            
-                                            // Join the game to get the channels
-                                            let games_mgr = games_manager.read().await;
-                                            match games_mgr.join_game(event_msg.game_id).await {
-                                                Ok((command_tx, event_rx)) => {
-                                                    // Forward the snapshot to the client
-                                                    let snapshot_msg = Message::Text(serde_json::to_string(&event_msg)?.into());
-                                                    if let Err(e) = ws_stream.send(snapshot_msg).await {
-                                                        error!("Failed to forward snapshot: {}", e);
-                                                        ConnectionState::Authenticated { user_token }
-                                                    } else {
-                                                        info!("WS: Auto-joined game {} after matchmaking", event_msg.game_id);
-                                                        ConnectionState::InGame {
-                                                            user_token,
-                                                            game_id: event_msg.game_id,
-                                                            command_tx,
-                                                            event_rx,
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to auto-join game {}: {}", event_msg.game_id, e);
-                                                    ConnectionState::Authenticated { user_token }
-                                                }
-                                            }
-                                        } else {
-                                            warn!("Received non-snapshot game event while authenticated: {:?}", event_msg.event);
-                                            ConnectionState::Authenticated { user_token }
-                                        }
-                                    }
-                                    _ => {
-                                        warn!("Unexpected message in authenticated state: {:?}", ws_message);
-                                        ConnectionState::Authenticated { user_token }
-                                    }
-                                }
+                            Err(e) => {
+                                error!("Error processing message: {}", e);
+                                // Need to handle the error without losing state
+                                // Since process_ws_message consumed state, we need to set it to a valid value
+                                state = ConnectionState::Unauthenticated;
+                                break;
                             }
-                            
-                            ConnectionState::InGame { user_token, game_id, command_tx, event_rx } => {
-                                match ws_message {
-                                    WSMessage::GameCommand(command) => {
-                                        info!("Received command: {:?}", command);
-                                        
-                                        let cmd_msg = GameCommandMessage {
-                                            tick: 0, // Will be set by game engine
-                                            received_order: 0, // Will be set by game engine
-                                            user_id: user_token.user_id as u32,
-                                            command,
-                                        };
-                                        
-                                        if let Err(e) = command_tx.send(cmd_msg).await {
-                                            warn!("Failed to send game command: {}", e);
-                                        }
-                                        
-                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
-                                    }
-                                    WSMessage::JoinGame(new_game_id) => {
-                                        info!("Switching from game {} to game {}", game_id, new_game_id);
-                                        
-                                        // Leave current game by dropping channels
-                                        drop(command_tx);
-                                        drop(event_rx);
-                                        
-                                        // Join new game
-                                        match games_manager.read().await.join_game(new_game_id).await {
-                                            Ok((command_tx, event_rx)) => {
-                                                ConnectionState::InGame {
-                                                    user_token,
-                                                    game_id: new_game_id,
-                                                    command_tx,
-                                                    event_rx,
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to join new game: {}", e);
-                                                ConnectionState::Authenticated { user_token }
-                                            }
-                                        }
-                                    }
-                                    WSMessage::Ping => {
-                                        // Respond with Pong
-                                        let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                                        if let Err(e) = ws_stream.send(pong_msg).await {
-                                            error!("Failed to send pong: {}", e);
-                                            break;
-                                        }
-                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
-                                    }
-                                    _ => {
-                                        warn!("Unexpected message in game state: {:?}", ws_message);
-                                        ConnectionState::InGame { user_token, game_id, command_tx, event_rx }
-                                    }
-                                }
-                            }
-                            
-                            ConnectionState::ShuttingDown { timeout } => {
-                                // Ignore all messages during shutdown
-                                ConnectionState::ShuttingDown { timeout }
-                            }
-                        };
+                        }
+                        
                     }
-                    Some(Err(e)) => {
+                    Some(Err(e)) => {i
                         error!("Error receiving message: {}", e);
                         break;
                     }
@@ -668,25 +724,43 @@ async fn handle_websocket_connection(
             // Handle game events from the game engine
             game_event = async {
                 match &mut state {
-                    ConnectionState::InGame { event_rx, .. } => event_rx.recv().await,
-                    _ => std::future::pending().await,
+                    ConnectionState::InGame { event_rx, game_id, .. } => {
+                        debug!("WS: Event receiver poll initiated for game {}", game_id);
+                        let result = event_rx.recv().await;
+                        debug!("WS: Event receiver poll completed for game {}, result: {:?}", 
+                               game_id, result.is_ok());
+                        result
+                    },
+                    _ => {
+                        debug!("WS: Not in game state, event receiver not polled");
+                        std::future::pending().await
+                    },
                 }
             } => {
+                debug!("WS: Game event branch triggered");
                 match game_event {
                     Ok(event) => {
                         info!("WS: Received game event for game {}: {:?}", event.game_id, event.event);
-                        let json_msg = serde_json::json!(event);
-                        let game_event_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
+                        debug!("WS: Event details - tick: {:?}, type: {:?}", 
+                               event.tick, std::mem::discriminant(&event.event));
+                        let wrapped_event = WSMessage::GameEvent(event);
+                        let game_event_msg = Message::Text(serde_json::to_string(&wrapped_event)?.into());
+                        debug!("WS: Sending game event message to client");
                         if let Err(e) = ws_stream.send(game_event_msg).await {
                             error!("Failed to send game event message: {}", e);
                             break;
                         }
+                        debug!("WS: Game event message sent successfully");
                     }
                     Err(e) => {
                         error!("Error receiving game event: {}", e);
                         // Game channel closed, transition back to authenticated state
-                        if let ConnectionState::InGame { user_token, .. } = state {
-                            state = ConnectionState::Authenticated { user_token };
+                        match &state {
+                            ConnectionState::InGame { user_token, .. } => {
+                                let token = user_token.clone();
+                                state = ConnectionState::Authenticated { user_token: token };
+                            }
+                            _ => {}
                         }
                     }
                 }

@@ -11,6 +11,7 @@ fn main() {
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
+        .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(iface_files, dirs)
         .unwrap_or_else(|e| panic!("protobuf compilation failed: {}", e));
 

@@ -6,6 +6,7 @@ use common::{GameCommandMessage, GameEventMessage, GameState, GameEvent};
 use sqlx::PgPool;
 use tonic::transport::Channel;
 use tokio_stream::StreamExt;
+use tracing::{info, warn, error};
 
 // Re-export the generated proto types
 #[cfg(not(feature = "skip-proto"))]
@@ -88,6 +89,7 @@ impl LocalChannels {
             evt_txs.insert(game_id, event_tx);
             snap_txs.insert(game_id, snapshot_tx.clone());
             
+            tracing::info!("LocalChannels: Created channels for game {}", game_id);
             Ok((snapshot_tx, snapshot_rx))
         } else {
             // Game already exists, return error
@@ -127,13 +129,18 @@ impl LocalChannels {
         let txs = self.event_txs.lock().await;
         let tx = txs.get(&game_id)
             .ok_or_else(|| anyhow::anyhow!("Game {} not found", game_id))?;
-        Ok(tx.subscribe())
+        let rx = tx.subscribe();
+        let subscriber_count = tx.receiver_count();
+        tracing::info!("LocalChannels: Subscribed to events for game {}, now {} subscribers", game_id, subscriber_count);
+        Ok(rx)
     }
     
     async fn publish_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
         let txs = self.event_txs.lock().await;
         let tx = txs.get(&game_id)
             .ok_or_else(|| anyhow::anyhow!("Game {} not found", game_id))?;
+        let subscriber_count = tx.receiver_count();
+        tracing::info!("LocalChannels: Publishing event for game {} to {} subscribers: {:?}", game_id, subscriber_count, event.event);
         let _ = tx.send(event)?;
         Ok(())
     }
@@ -182,8 +189,10 @@ impl GameBroker {
     /// Create channels for a new local game and register in database
     /// Returns the snapshot sender and receiver for the game
     pub async fn create_game_channels(&self, game_id: u32) -> Result<(mpsc::Sender<oneshot::Sender<GameState>>, mpsc::Receiver<oneshot::Sender<GameState>>)> {
+        tracing::info!("GameBroker: Creating game channels for game {}", game_id);
         // Create local channels and get snapshot sender/receiver
         let (snapshot_tx, snapshot_rx) = self.local_channels.create_game_channels(game_id).await?;
+        tracing::info!("GameBroker: Successfully created channels for game {}", game_id);
         
         // Register game location in database
         let server_uuid = uuid::Uuid::parse_str(&self.server_id)?;
@@ -251,17 +260,20 @@ impl GameBroker {
         
         // Look up server's gRPC address
         let server_uuid = uuid::Uuid::parse_str(server_id)?;
-        let row = sqlx::query_as::<_, (String, Option<i32>)>(
-            "SELECT host, grpc_port FROM servers WHERE id = $1"
+        let row = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT grpc_address FROM servers WHERE id = $1"
         )
         .bind(server_uuid)
         .fetch_one(&self.db_pool)
         .await?;
         
-        let grpc_port = row.1
-            .ok_or_else(|| anyhow::anyhow!("Server {} has no gRPC port configured", server_id))?;
+        let grpc_address = row.0
+            .ok_or_else(|| anyhow::anyhow!("Server {} has no gRPC address configured", server_id))?;
+        if grpc_address.is_empty() {
+            return Err(anyhow::anyhow!("Server {} has empty gRPC address", server_id));
+        }
         
-        let addr = format!("http://{}:{}", row.0, grpc_port);
+        let addr = grpc_address;
         let client = GameRelayClient::connect(addr).await?;
         
         clients.insert(server_id.to_string(), client.clone());
@@ -404,7 +416,9 @@ impl GameMessageBroker for GameBroker {
         let (command_tx, mut command_rx) = mpsc::channel(32);
         
         // Subscribe to events (handles both local and remote games)
+        tracing::info!("GameBroker: join_game subscribing to events for game {}", game_id);
         let event_rx = self.subscribe_events(game_id).await?;
+        tracing::info!("GameBroker: join_game successfully subscribed to events for game {}", game_id);
         
         // Create channel for snapshot requests
         let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<oneshot::Sender<GameState>>(32);
@@ -556,7 +570,13 @@ impl GameMessageBroker for GameBroker {
     async fn subscribe_events(&self, game_id: u32) -> Result<broadcast::Receiver<GameEventMessage>> {
         // Check if game is local
         if self.is_game_local(game_id).await? {
-                return self.local_channels.subscribe_events(game_id).await;
+                tracing::info!("GameBroker: Subscribing to local events for game {}", game_id);
+                let result = self.local_channels.subscribe_events(game_id).await;
+                match &result {
+                    Ok(_) => tracing::info!("GameBroker: Successfully subscribed to local events for game {}", game_id),
+                    Err(e) => tracing::error!("GameBroker: Failed to subscribe to local events for game {}: {}", game_id, e),
+                }
+                return result;
         }
         
         // For remote games, we need to:
@@ -608,6 +628,7 @@ impl GameMessageBroker for GameBroker {
     async fn publish_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
         // Events are always published locally (by the game loop)
         // They will be forwarded to remote subscribers via gRPC
+        tracing::info!("GameBroker: Publishing event for game {}: {:?}", game_id, event.event);
         self.local_channels.publish_event(game_id, event).await
     }
     

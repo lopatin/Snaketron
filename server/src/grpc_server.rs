@@ -27,6 +27,7 @@ impl GameRelayService {
 #[tonic::async_trait]
 impl GameRelay for GameRelayService {
     type StreamGameMessagesStream = GameMessageStream;
+    type ReplicateGameStateStream = Pin<Box<dyn Stream<Item = Result<game_relay::ReplicationAck, Status>> + Send>>;
 
     async fn stream_game_messages(
         &self,
@@ -166,6 +167,70 @@ impl GameRelay for GameRelayService {
         Ok(Response::new(NotifyMatchResponse {
             success: !notified_players.is_empty(),
             notified_players,
+        }))
+    }
+    
+    async fn replicate_game_state(
+        &self,
+        request: Request<Streaming<game_relay::ReplicationEvent>>,
+    ) -> Result<Response<Self::ReplicateGameStateStream>, Status> {
+        let mut _stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(32);
+        
+        // For now, just acknowledge all replication events
+        // In a full implementation, this would coordinate with ReplicaManager
+        tokio::spawn(async move {
+            while let Some(result) = _stream.next().await {
+                match result {
+                    Ok(event) => {
+                        let ack = game_relay::ReplicationAck {
+                            game_id: event.game_id,
+                            version: event.version,
+                            success: true,
+                            error: None,
+                        };
+                        if tx.send(Ok(ack)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving replication event: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+        
+        let output_stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(output_stream) as Self::ReplicateGameStateStream))
+    }
+    
+    async fn transfer_authority(
+        &self,
+        request: Request<game_relay::AuthorityTransferRequest>,
+    ) -> Result<Response<game_relay::AuthorityTransferResponse>, Status> {
+        let _req = request.into_inner();
+        
+        // For now, always accept authority transfers
+        // In a full implementation, this would coordinate with GameManager
+        Ok(Response::new(game_relay::AuthorityTransferResponse {
+            accepted: true,
+            error: None,
+        }))
+    }
+    
+    async fn notify_shutdown(
+        &self,
+        request: Request<game_relay::ShutdownNotification>,
+    ) -> Result<Response<game_relay::ShutdownAck>, Status> {
+        let req = request.into_inner();
+        info!("Received shutdown notification from server {}", req.server_id);
+        
+        // Acknowledge all games for now
+        // In a full implementation, this would trigger failover procedures
+        Ok(Response::new(game_relay::ShutdownAck {
+            acknowledged: true,
+            accepted_game_ids: req.affected_game_ids,
         }))
     }
 }
