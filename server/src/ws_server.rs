@@ -710,7 +710,7 @@ async fn handle_websocket_connection(
                         }
                         
                     }
-                    Some(Err(e)) => {i
+                    Some(Err(e)) => {
                         error!("Error receiving message: {}", e);
                         break;
                     }
