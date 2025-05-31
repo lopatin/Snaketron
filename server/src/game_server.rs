@@ -13,7 +13,8 @@ use crate::{
     game_broker::{GameMessageBroker, GameBroker},
     matchmaking::run_matchmaking_loop,
     game_cleanup::run_cleanup_service,
-    game_discovery::run_game_discovery_loop,
+    game_discovery::{run_game_discovery_loop, run_game_discovery_with_raft},
+    game_executor::run_game_executor,
     player_connections::PlayerConnectionManager,
     grpc_server::run_game_relay_server,
     service_manager::ServiceManager,
@@ -248,22 +249,46 @@ impl GameServer {
             ).await;
         }));
 
-        // Start game discovery service
+        // Start game discovery service with Raft
         info!("Starting game discovery service");
         let discovery_pool = db_pool.clone();
-        let discovery_server_id = server_id.clone();
-        let discovery_games_manager = games_manager.clone();
-        let discovery_player_connections = player_connections.clone();
+        let discovery_server_id = server_id.to_string();
+        let discovery_raft_node = raft_node.clone();
         let discovery_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
-            run_game_discovery_loop(
+            if let Err(e) = run_game_discovery_with_raft(
                 discovery_pool,
                 discovery_server_id,
-                discovery_games_manager,
-                discovery_player_connections,
+                discovery_raft_node,
                 discovery_token,
-            ).await;
+            ).await {
+                error!("Game discovery service error: {}", e);
+            }
         }));
+        
+        // Start game executor service if Raft is enabled
+        if let Some(raft_node_ref) = &raft_node {
+            info!("Starting game executor service");
+            let executor_server_id = server_id.to_string();
+            let executor_raft_node = raft_node_ref.clone();
+            let executor_games_manager = games_manager.clone();
+            let executor_player_connections = player_connections.clone();
+            let executor_db_pool = db_pool.clone();
+            let executor_token = cancellation_token.clone();
+            
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = run_game_executor(
+                    executor_server_id,
+                    executor_raft_node,
+                    executor_games_manager,
+                    executor_player_connections,
+                    executor_db_pool,
+                    executor_token,
+                ).await {
+                    error!("Game executor service error: {}", e);
+                }
+            }));
+        }
 
         // Start cleanup service
         let cleanup_pool = db_pool.clone();

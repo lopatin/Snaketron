@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tracing::{debug, error, info};
 use anyhow::{Context, Result};
@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use crate::game_manager::GameManager;
 use tokio::sync::RwLock as TokioRwLock;
 use crate::replica_manager::{ReplicaManager, ReplicationCommand};
-use super::types::{ClientRequest, ClientResponse, RaftNodeId};
+use super::types::{ClientRequest, ClientResponse, RaftNodeId, StateChangeEvent};
 use super::state_machine::{GameStateMachine, StateMachineSnapshot};
 
 /// In-memory snapshot that avoids serialization overhead
@@ -168,6 +168,11 @@ impl GameRaftStorage {
             state_machine,
             membership: Arc::new(RwLock::new(MembershipConfig::new_initial(raft_node_id))),
         }
+    }
+    
+    /// Set the event sender for state change notifications
+    pub async fn set_event_sender(&self, tx: broadcast::Sender<StateChangeEvent>) {
+        self.state_machine.write().await.set_event_sender(tx);
     }
     
     /// Clean up old snapshots, keeping only the most recent ones

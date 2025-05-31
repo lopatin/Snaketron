@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, debug};
 
 use crate::game_manager::GameManager;
@@ -18,7 +18,7 @@ use tokio::sync::RwLock as TokioRwLock;
 pub use storage::GameRaftStorage;
 pub use network::GameRaftNetwork;
 pub use state_machine::{GameStateMachine, StateMachineRequest, StateMachineResponse};
-pub use types::{RaftNodeId, ClientRequest, ClientResponse};
+pub use types::{RaftNodeId, ClientRequest, ClientResponse, StateChangeEvent};
 
 pub type GameRaft = Raft<ClientRequest, ClientResponse, GameRaftNetwork, GameRaftStorage>;
 
@@ -39,6 +39,8 @@ pub struct RaftNode {
     pub metrics: Arc<RwLock<RaftMetrics>>,
     /// Track learner nodes and their progress
     learners: Arc<RwLock<HashMap<NodeId, LearnerProgress>>>,
+    /// Broadcast channel for state change events
+    state_change_tx: broadcast::Sender<StateChangeEvent>,
 }
 
 impl RaftNode {
@@ -96,6 +98,12 @@ impl RaftNode {
         
         let metrics = Arc::new(RwLock::new(raft.metrics().borrow().clone()));
         
+        // Create broadcast channel for state changes
+        let (state_change_tx, _) = broadcast::channel(1024);
+        
+        // Connect the event sender to the storage/state machine
+        storage.set_event_sender(state_change_tx.clone()).await;
+        
         Ok(Self {
             id: node_id,
             raft,
@@ -103,6 +111,7 @@ impl RaftNode {
             network,
             metrics,
             learners: Arc::new(RwLock::new(HashMap::new())),
+            state_change_tx,
         })
     }
     
@@ -212,6 +221,22 @@ impl RaftNode {
     // Deprecated: Use add_learner for safer cluster expansion
     pub async fn add_node(&self, node_id: RaftNodeId, addr: String) -> Result<()> {
         self.add_learner(node_id.0, addr).await
+    }
+    
+    /// Subscribe to state change events
+    pub async fn subscribe_state_changes(&self) -> broadcast::Receiver<StateChangeEvent> {
+        self.state_change_tx.subscribe()
+    }
+    
+    /// Emit a state change event (called by the state machine)
+    pub fn emit_state_change(&self, event: StateChangeEvent) {
+        // Ignore send errors (no receivers)
+        let _ = self.state_change_tx.send(event);
+    }
+    
+    /// Get a reference to the state change sender for the state machine
+    pub fn get_state_change_sender(&self) -> broadcast::Sender<StateChangeEvent> {
+        self.state_change_tx.clone()
     }
     
     pub async fn remove_node(&self, node_id: RaftNodeId) -> Result<()> {

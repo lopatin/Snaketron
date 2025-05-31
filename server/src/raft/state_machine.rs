@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+use tokio::sync::broadcast;
 
 use crate::game_manager::GameManager;
 use tokio::sync::RwLock as TokioRwLock;
 use crate::replica_manager::{GameReplica, ReplicaManager, ReplicationCommand};
-use super::types::{ClientRequest, ClientResponse, RaftNodeId};
+use super::types::{ClientRequest, ClientResponse, RaftNodeId, StateChangeEvent};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateMachineSnapshot {
@@ -46,6 +47,9 @@ pub struct GameStateMachine {
     // Application state
     last_applied_index: Option<u64>,
     server_registry: HashMap<String, ServerRegistration>,
+    
+    // Event emitter
+    event_tx: Option<broadcast::Sender<StateChangeEvent>>,
 }
 
 impl GameStateMachine {
@@ -60,6 +64,19 @@ impl GameStateMachine {
             replica_manager,
             last_applied_index: None,
             server_registry: HashMap::new(),
+            event_tx: None,
+        }
+    }
+    
+    /// Set the event sender for state change notifications
+    pub fn set_event_sender(&mut self, tx: broadcast::Sender<StateChangeEvent>) {
+        self.event_tx = Some(tx);
+    }
+    
+    /// Emit a state change event
+    fn emit_event(&self, event: StateChangeEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
         }
     }
     
@@ -79,8 +96,8 @@ impl GameStateMachine {
                 self.apply_authority_transfer(*game_id, from_server.clone(), to_server.clone(), reason.clone()).await?
             }
             
-            ClientRequest::CreateGame { game_id, initial_state, authority_server } => {
-                self.apply_create_game(*game_id, initial_state.clone(), authority_server.clone()).await?
+            ClientRequest::CreateGame { game_id, initial_state, authority_server, players, discovery_source, discovered_at } => {
+                self.apply_create_game(*game_id, initial_state.clone(), authority_server.clone(), players.clone(), discovery_source.clone(), *discovered_at).await?
             }
             
             ClientRequest::DeleteGame { game_id, reason } => {
@@ -163,17 +180,15 @@ impl GameStateMachine {
             .handle_replication_command(command)
             .await?;
         
-        // If we're becoming the authority, start the game
-        if to_server == self.node_id.0 {
-            if let Some(replica) = self.replica_manager.get_replica(game_id).await {
-                self.game_manager.read().await.accept_authority_transfer(game_id, replica.state).await?;
-            }
-        }
+        // Emit state change event
+        self.emit_event(StateChangeEvent::AuthorityTransferred {
+            game_id,
+            from: from_server.clone(),
+            to: to_server.clone(),
+        });
         
-        // If we're losing authority, stop the game
-        if from_server == self.node_id.0 {
-            self.game_manager.read().await.release_authority(game_id).await?;
-        }
+        // Note: The GameExecutorService will handle authority transfers
+        // when it receives the AuthorityTransferred event
         
         Ok(ClientResponse::AuthorityTransferred { new_authority: to_server })
     }
@@ -183,8 +198,12 @@ impl GameStateMachine {
         game_id: u32,
         initial_state: GameState,
         authority_server: String,
+        players: Vec<u32>,
+        discovery_source: String,
+        discovered_at: i64,
     ) -> Result<ClientResponse> {
-        info!("Creating game {} with authority on {}", game_id, authority_server);
+        info!("Creating game {} with authority on {} (discovered by {} at {})", 
+              game_id, authority_server, discovery_source, discovered_at);
         
         // Create replica
         let replica = GameReplica {
@@ -198,11 +217,15 @@ impl GameStateMachine {
         
         self.replica_manager.add_replica(replica).await?;
         
-        // If we're the authority, start the game
-        if authority_server == self.node_id.0 {
-            let mut gm = self.game_manager.write().await;
-            gm.start_game(game_id).await?;
-        }
+        // Emit state change event
+        self.emit_event(StateChangeEvent::GameAssigned {
+            game_id,
+            authority: authority_server.clone(),
+            players: players.clone(),
+        });
+        
+        // Note: The GameExecutorService will handle starting the game
+        // when it receives the GameAssigned event
         
         Ok(ClientResponse::GameCreated { game_id })
     }
@@ -214,11 +237,6 @@ impl GameStateMachine {
     ) -> Result<ClientResponse> {
         info!("Deleting game {} (reason: {})", game_id, reason);
         
-        // Stop game if we're running it
-        if self.game_manager.read().await.is_authority_for(game_id).await {
-            self.game_manager.read().await.stop_game(game_id).await?;
-        }
-        
         // Remove replica
         let command = ReplicationCommand::DeleteGame {
             game_id,
@@ -229,6 +247,12 @@ impl GameStateMachine {
         self.replica_manager
             .handle_replication_command(command)
             .await?;
+        
+        // Emit state change event
+        self.emit_event(StateChangeEvent::GameDeleted { game_id });
+        
+        // Note: The GameExecutorService will handle stopping the game
+        // when it receives the GameDeleted event
         
         Ok(ClientResponse::GameDeleted)
     }
@@ -244,12 +268,17 @@ impl GameStateMachine {
         info!("Registering server {}: {}:{}", server_id, host, port);
         
         self.server_registry.insert(server_id.clone(), ServerRegistration {
-            server_id,
+            server_id: server_id.clone(),
             host,
             port,
             grpc_port,
             max_capacity,
             last_heartbeat: std::time::Instant::now(),
+        });
+        
+        // Emit state change event
+        self.emit_event(StateChangeEvent::ServerRegistered {
+            server_id,
         });
         
         Ok(ClientResponse::ServerRegistered)
@@ -269,6 +298,12 @@ impl GameStateMachine {
     async fn apply_remove_server(&mut self, server_id: String) -> Result<ClientResponse> {
         info!("Removing server {}", server_id);
         self.server_registry.remove(&server_id);
+        
+        // Emit state change event
+        self.emit_event(StateChangeEvent::ServerRemoved {
+            server_id,
+        });
+        
         Ok(ClientResponse::ServerRemoved)
     }
     

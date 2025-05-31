@@ -2,6 +2,7 @@ pub mod authority_transfer;
 pub mod game_broker;
 pub mod game_cleanup;
 pub mod game_discovery;
+pub mod game_executor;
 pub mod game_server;
 pub mod game_manager;
 pub mod grpc_server;
