@@ -272,41 +272,50 @@ impl GameStateMachine {
         Ok(ClientResponse::ServerRemoved)
     }
     
-    pub async fn take_snapshot(&self) -> Result<(Option<u64>, Vec<u8>)> {
+    /// Take a direct snapshot without serialization
+    pub async fn take_direct_snapshot(&self) -> Result<StateMachineSnapshot> {
         let replicas = self.replica_manager.get_all_replicas().await;
         
-        let snapshot = StateMachineSnapshot {
+        Ok(StateMachineSnapshot {
             last_applied_index: self.last_applied_index,
             game_replicas: replicas.into_iter().map(|r| (r.game_id, r)).collect(),
             server_registry: self.server_registry.clone(),
-        };
-        
-        let data = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())?;
-        Ok((self.last_applied_index, data))
+        })
     }
     
-    pub async fn restore_snapshot(&mut self, data: &[u8]) -> Result<()> {
-        let (snapshot, _): (StateMachineSnapshot, _) = bincode::serde::decode_from_slice(data, bincode::config::standard())?;
-        
+    /// Restore from a direct snapshot
+    pub async fn restore_from_snapshot(&mut self, snapshot: &StateMachineSnapshot) -> Result<()> {
         info!("Restoring from snapshot with {} games and {} servers",
             snapshot.game_replicas.len(),
             snapshot.server_registry.len()
         );
         
         self.last_applied_index = snapshot.last_applied_index;
-        self.server_registry = snapshot.server_registry;
+        self.server_registry = snapshot.server_registry.clone();
         
         // Restore game replicas
-        for (game_id, replica) in snapshot.game_replicas {
+        for (game_id, replica) in &snapshot.game_replicas {
             self.replica_manager.add_replica(replica.clone()).await?;
             
             // Start game if we're the authority
             if replica.authority_server == self.node_id.0 {
                 let mut gm = self.game_manager.write().await;
-                gm.start_game(game_id).await?;
+                gm.start_game(*game_id).await?;
             }
         }
         
         Ok(())
+    }
+    
+    // Keep old methods for compatibility during migration
+    pub async fn take_snapshot(&self) -> Result<(Option<u64>, Vec<u8>)> {
+        let snapshot = self.take_direct_snapshot().await?;
+        let data = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())?;
+        Ok((self.last_applied_index, data))
+    }
+    
+    pub async fn restore_snapshot(&mut self, data: &[u8]) -> Result<()> {
+        let (snapshot, _): (StateMachineSnapshot, _) = bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+        self.restore_from_snapshot(&snapshot).await
     }
 }

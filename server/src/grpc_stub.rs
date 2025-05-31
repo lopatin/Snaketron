@@ -289,7 +289,7 @@ pub mod game_relay {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RaftAppendEntries {
         pub term: u64,
-        pub leader_id: u64,
+        pub leader_id: String,
         pub prev_log_index: u64,
         pub prev_log_term: u64,
         pub entries: Vec<u8>,
@@ -308,7 +308,7 @@ pub mod game_relay {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RaftVoteRequest {
         pub term: u64,
-        pub candidate_id: u64,
+        pub candidate_id: String,
         pub last_log_index: u64,
         pub last_log_term: u64,
     }
@@ -322,7 +322,7 @@ pub mod game_relay {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RaftInstallSnapshot {
         pub term: u64,
-        pub leader_id: u64,
+        pub leader_id: String,
         pub last_included_index: u64,
         pub last_included_term: u64,
         pub offset: u64,

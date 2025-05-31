@@ -135,28 +135,45 @@ impl GameServer {
         ));
         
         // Initialize Raft node
-        let raft_node = if grpc_addr.is_some() {
+        let raft_node = if let Some(ref grpc_addr_str) = grpc_addr {
             info!("Initializing Raft consensus node");
             
-            // Convert peer addresses to RaftNodeIds
-            let initial_members: Vec<RaftNodeId> = if raft_peers.is_empty() {
-                // This is the first node
-                vec![RaftNodeId(server_id.to_string())]
+            let raft_node = if raft_peers.is_empty() {
+                // This is the first node - initialize as leader
+                info!("Starting as first node in cluster");
+                let initial_members = vec![RaftNodeId(server_id.to_string())];
+                Arc::new(
+                    RaftNode::new(
+                        server_id.to_string(),
+                        games_manager.clone(),
+                        replica_manager.clone(),
+                        initial_members,
+                    ).await.context("Failed to create Raft node")?
+                )
             } else {
-                // Join existing cluster
-                raft_peers.into_iter()
-                    .map(|peer| RaftNodeId(peer))
-                    .collect()
+                // Join existing cluster as learner
+                info!("Joining existing cluster as learner");
+                let raft_node = Arc::new(
+                    RaftNode::new(
+                        server_id.to_string(),
+                        games_manager.clone(),
+                        replica_manager.clone(),
+                        vec![], // Start with empty membership, will be added as learner
+                    ).await.context("Failed to create Raft node")?
+                );
+                
+                // Contact one of the existing nodes to join as learner
+                // In production, this would involve:
+                // 1. Discovering the leader through the peers
+                // 2. Requesting to join as a learner
+                // 3. Waiting for synchronization
+                // 4. Being promoted to voting member
+                
+                // For now, we'll note this needs to be implemented
+                info!("TODO: Implement learner join protocol");
+                
+                raft_node
             };
-            
-            let raft_node = Arc::new(
-                RaftNode::new(
-                    server_id.to_string(),
-                    games_manager.clone(),
-                    replica_manager.clone(),
-                    initial_members,
-                ).await.context("Failed to create Raft node")?
-            );
             
             // async-raft manages its own internal timers, no tick needed
             

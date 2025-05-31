@@ -7,7 +7,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use tokio::sync::RwLock;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tracing::{debug, error, info};
 use anyhow::{Context, Result};
 
@@ -15,14 +19,108 @@ use crate::game_manager::GameManager;
 use tokio::sync::RwLock as TokioRwLock;
 use crate::replica_manager::{ReplicaManager, ReplicationCommand};
 use super::types::{ClientRequest, ClientResponse, RaftNodeId};
-use super::state_machine::GameStateMachine;
+use super::state_machine::{GameStateMachine, StateMachineSnapshot};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GameSnapshot {
+/// In-memory snapshot that avoids serialization overhead
+#[derive(Clone, Debug)]
+pub struct InMemorySnapshot {
     pub index: u64,
     pub term: u64,
     pub membership: MembershipConfig,
-    pub data: Vec<u8>,
+    pub state: StateMachineSnapshot,
+}
+
+/// A reader for in-memory snapshots that implements AsyncRead/AsyncWrite/AsyncSeek
+pub struct InMemorySnapshotReader {
+    snapshot: Arc<InMemorySnapshot>,
+    serialized: Vec<u8>,
+    position: usize,
+}
+
+impl InMemorySnapshotReader {
+    pub fn new(snapshot: Arc<InMemorySnapshot>) -> io::Result<Self> {
+        // For compatibility with async-raft, we still need to serialize for transport
+        // but we avoid doing this during normal operations
+        let serialized = bincode::serde::encode_to_vec(
+            &snapshot.state,
+            bincode::config::standard()
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        Ok(Self {
+            snapshot,
+            serialized,
+            position: 0,
+        })
+    }
+}
+
+impl AsyncRead for InMemorySnapshotReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = self.serialized.len() - self.position;
+        let to_read = remaining.min(buf.remaining());
+        
+        if to_read > 0 {
+            buf.put_slice(&self.serialized[self.position..self.position + to_read]);
+            self.position += to_read;
+        }
+        
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for InMemorySnapshotReader {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Snapshots are read-only"
+        )))
+    }
+    
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for InMemorySnapshotReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let new_pos = match position {
+            io::SeekFrom::Start(pos) => pos as usize,
+            io::SeekFrom::End(offset) => {
+                let len = self.serialized.len() as i64;
+                (len + offset) as usize
+            }
+            io::SeekFrom::Current(offset) => {
+                let current = self.position as i64;
+                (current + offset) as usize
+            }
+        };
+        
+        if new_pos > self.serialized.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Seek position out of bounds"
+            ));
+        }
+        
+        self.position = new_pos;
+        Ok(())
+    }
+    
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.position as u64))
+    }
 }
 
 #[derive(Clone)]
@@ -34,8 +132,9 @@ pub struct GameRaftStorage {
     voted_for: Arc<RwLock<Option<u64>>>,
     log: Arc<RwLock<BTreeMap<u64, Entry<ClientRequest>>>>,
     
-    // Raft snapshot state
-    snapshot: Arc<RwLock<Option<GameSnapshot>>>,
+    // In-memory snapshots - store multiple for history
+    snapshots: Arc<RwLock<BTreeMap<u64, Arc<InMemorySnapshot>>>>,
+    max_snapshots: usize,
     
     // Application state machine
     state_machine: Arc<RwLock<GameStateMachine>>,
@@ -64,16 +163,28 @@ impl GameRaftStorage {
             current_term: Arc::new(RwLock::new(0)),
             voted_for: Arc::new(RwLock::new(None)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
-            snapshot: Arc::new(RwLock::new(None)),
+            snapshots: Arc::new(RwLock::new(BTreeMap::new())),
+            max_snapshots: 3, // Keep last 3 snapshots
             state_machine,
             membership: Arc::new(RwLock::new(MembershipConfig::new_initial(raft_node_id))),
+        }
+    }
+    
+    /// Clean up old snapshots, keeping only the most recent ones
+    async fn cleanup_old_snapshots(&self) {
+        let mut snapshots = self.snapshots.write().await;
+        while snapshots.len() > self.max_snapshots {
+            if let Some((&oldest_index, _)) = snapshots.iter().next() {
+                snapshots.remove(&oldest_index);
+                debug!("Removed old snapshot at index {}", oldest_index);
+            }
         }
     }
 }
 
 #[async_trait]
 impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
-    type Snapshot = std::io::Cursor<Vec<u8>>;
+    type Snapshot = InMemorySnapshotReader;
     type ShutdownError = std::io::Error;
 
     async fn get_membership_config(&self) -> Result<MembershipConfig> {
@@ -190,10 +301,11 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
 
     async fn do_log_compaction(&self) -> Result<CurrentSnapshotData<Self::Snapshot>> {
         let sm = self.state_machine.read().await;
-        let (last_applied_log, snapshot_data) = sm.take_snapshot().await
+        let state_snapshot = sm.take_direct_snapshot().await
             .context("Failed to create snapshot")?;
         
         let membership = self.membership.read().await.clone();
+        let term = *self.current_term.read().await;
         
         let last_log = self.log.read().await
             .values()
@@ -201,22 +313,27 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
             .map(|e| (e.index, e.term))
             .unwrap_or((0, 0));
         
-        let snapshot = GameSnapshot {
+        let snapshot = Arc::new(InMemorySnapshot {
             index: last_log.0,
             term: last_log.1,
             membership: membership.clone(),
-            data: snapshot_data,
-        };
+            state: state_snapshot,
+        });
         
-        *self.snapshot.write().await = Some(snapshot.clone());
+        // Store in memory and clean up old snapshots
+        self.snapshots.write().await.insert(snapshot.index, snapshot.clone());
+        self.cleanup_old_snapshots().await;
         
-        info!("Created snapshot at index {}", last_log.0);
+        info!("Created in-memory snapshot at index {}", last_log.0);
+        
+        let reader = InMemorySnapshotReader::new(snapshot.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to create snapshot reader: {}", e))?;
         
         Ok(CurrentSnapshotData {
             term: snapshot.term,
             index: snapshot.index,
-            membership: snapshot.membership,
-            snapshot: Box::new(std::io::Cursor::new(snapshot.data)),
+            membership: snapshot.membership.clone(),
+            snapshot: Box::new(reader),
         })
     }
 
@@ -231,30 +348,38 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         index: u64,
         term: u64,
         delete_through: Option<u64>,
-        id: String,
+        _id: String,
         snapshot: Box<Self::Snapshot>,
     ) -> Result<()> {
+        // Read the serialized snapshot data
         let mut data = Vec::new();
-        let mut cursor = snapshot;
-        std::io::Read::read_to_end(&mut *cursor, &mut data)
+        let mut snapshot = snapshot;
+        tokio::io::AsyncReadExt::read_to_end(&mut *snapshot, &mut data).await
             .context("Failed to read snapshot")?;
+        
+        // Deserialize the state machine snapshot
+        let (state_snapshot, _): (StateMachineSnapshot, _) = 
+            bincode::serde::decode_from_slice(&data, bincode::config::standard())
+            .context("Failed to deserialize snapshot")?;
         
         // Get current membership to preserve it
         let membership = self.membership.read().await.clone();
         
-        let snapshot = GameSnapshot {
+        let snapshot = Arc::new(InMemorySnapshot {
             index,
             term,
             membership,
-            data,
-        };
+            state: state_snapshot,
+        });
         
         // Restore state machine from snapshot
         let mut sm = self.state_machine.write().await;
-        sm.restore_snapshot(&snapshot.data).await
+        sm.restore_from_snapshot(&snapshot.state).await
             .context("Failed to restore snapshot")?;
         
-        *self.snapshot.write().await = Some(snapshot);
+        // Store in memory
+        self.snapshots.write().await.insert(snapshot.index, snapshot);
+        self.cleanup_old_snapshots().await;
         
         // Delete old log entries
         if let Some(through) = delete_through {
@@ -266,13 +391,21 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
     }
 
     async fn get_current_snapshot(&self) -> Result<Option<CurrentSnapshotData<Self::Snapshot>>> {
-        let snapshot = self.snapshot.read().await;
+        let snapshots = self.snapshots.read().await;
         
-        Ok(snapshot.as_ref().map(|s| CurrentSnapshotData {
-            term: s.term,
-            index: s.index,
-            membership: s.membership.clone(),
-            snapshot: Box::new(std::io::Cursor::new(s.data.clone())),
-        }))
+        // Get the most recent snapshot
+        if let Some((&_, snapshot)) = snapshots.iter().last() {
+            let reader = InMemorySnapshotReader::new(snapshot.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to create snapshot reader: {}", e))?;
+            
+            Ok(Some(CurrentSnapshotData {
+                term: snapshot.term,
+                index: snapshot.index,
+                membership: snapshot.membership.clone(),
+                snapshot: Box::new(reader),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }

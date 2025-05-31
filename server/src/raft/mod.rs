@@ -3,11 +3,13 @@ pub mod network;
 pub mod state_machine;
 pub mod types;
 
-use async_raft::{Config, Raft, RaftMetrics, raft::ClientWriteRequest, raft::ClientWriteResponse};
+use async_raft::{Config, Raft, RaftMetrics, raft::ClientWriteRequest, raft::ClientWriteResponse, raft::MembershipConfig, NodeId};
 use anyhow::Result;
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::time::Instant;
 use tokio::sync::RwLock;
+use tracing::{info, debug};
 
 use crate::game_manager::GameManager;
 use crate::replica_manager::ReplicaManager;
@@ -20,12 +22,23 @@ pub use types::{RaftNodeId, ClientRequest, ClientResponse};
 
 pub type GameRaft = Raft<ClientRequest, ClientResponse, GameRaftNetwork, GameRaftStorage>;
 
+/// Track learner progress
+#[derive(Clone, Debug)]
+pub struct LearnerProgress {
+    pub node_id: NodeId,
+    pub matched_index: u64,
+    pub started_at: Instant,
+    pub last_updated: Instant,
+}
+
 pub struct RaftNode {
     pub id: RaftNodeId,
     pub raft: Arc<GameRaft>,
     pub storage: Arc<GameRaftStorage>,
     pub network: Arc<GameRaftNetwork>,
     pub metrics: Arc<RwLock<RaftMetrics>>,
+    /// Track learner nodes and their progress
+    learners: Arc<RwLock<HashMap<NodeId, LearnerProgress>>>,
 }
 
 impl RaftNode {
@@ -89,6 +102,7 @@ impl RaftNode {
             storage,
             network,
             metrics,
+            learners: Arc::new(RwLock::new(HashMap::new())),
         })
     }
     
@@ -110,18 +124,94 @@ impl RaftNode {
         }
     }
     
-    pub async fn add_node(&self, node_id: RaftNodeId, addr: String) -> Result<()> {
-        let raft_id = node_id.0.parse::<u64>().unwrap_or(0);
+    /// Add a new node as a learner (non-voting member)
+    pub async fn add_learner(&self, node_id: String, addr: String) -> Result<()> {
+        let raft_id = node_id.parse::<u64>().unwrap_or_else(|_| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            node_id.hash(&mut hasher);
+            hasher.finish()
+        });
+        
+        info!("Adding node {} as learner at {}", node_id, addr);
+        
+        // Add to network peers
         self.network.add_peer(raft_id, addr).await;
+        
+        // Add as non-voter (learner)
         self.raft.add_non_voter(raft_id).await?;
         
-        // Get current membership and add new node
+        // Track the learner
+        let mut learners = self.learners.write().await;
+        learners.insert(raft_id, LearnerProgress {
+            node_id: raft_id,
+            matched_index: 0,
+            started_at: Instant::now(),
+            last_updated: Instant::now(),
+        });
+        
+        Ok(())
+    }
+    
+    /// Check if a learner is caught up and ready for promotion
+    pub async fn is_learner_caught_up(&self, node_id: &str) -> bool {
+        let raft_id = node_id.parse::<u64>().unwrap_or(0);
+        let learners = self.learners.read().await;
+        let metrics = self.raft.metrics();
+        let current_metrics = metrics.borrow();
+        
+        if let Some(learner) = learners.get(&raft_id) {
+            // Check if learner is within 10 entries of the leader's log
+            let leader_last_log = current_metrics.last_log_index;
+            let is_caught_up = leader_last_log.saturating_sub(learner.matched_index) <= 10;
+            
+            // Also check that learner has been stable for at least 5 seconds
+            let is_stable = learner.last_updated.elapsed().as_secs() >= 5;
+            
+            is_caught_up && is_stable
+        } else {
+            false
+        }
+    }
+    
+    /// Promote a learner to a voting member
+    pub async fn promote_learner(&self, node_id: String) -> Result<()> {
+        let raft_id = node_id.parse::<u64>().unwrap_or(0);
+        
+        if !self.is_learner_caught_up(&node_id).await {
+            return Err(anyhow::anyhow!("Learner {} is not caught up yet", node_id));
+        }
+        
+        info!("Promoting learner {} to voting member", node_id);
+        
+        // Get current membership and add as voting member
         let metrics = self.raft.metrics();
         let mut members = metrics.borrow().membership_config.members.clone();
         members.insert(raft_id);
         
+        // Change membership to include the learner as a voter
         self.raft.change_membership(members).await?;
+        
+        // Remove from learner tracking
+        self.learners.write().await.remove(&raft_id);
+        
         Ok(())
+    }
+    
+    /// Update learner progress (called by the leader)
+    pub async fn update_learner_progress(&self, node_id: NodeId, matched_index: u64) {
+        let mut learners = self.learners.write().await;
+        if let Some(learner) = learners.get_mut(&node_id) {
+            learner.matched_index = matched_index;
+            learner.last_updated = Instant::now();
+            debug!("Updated learner {} progress to index {}", node_id, matched_index);
+        }
+    }
+    
+    // Deprecated: Use add_learner for safer cluster expansion
+    pub async fn add_node(&self, node_id: RaftNodeId, addr: String) -> Result<()> {
+        self.add_learner(node_id.0, addr).await
     }
     
     pub async fn remove_node(&self, node_id: RaftNodeId) -> Result<()> {
