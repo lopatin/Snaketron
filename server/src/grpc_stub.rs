@@ -48,6 +48,11 @@ pub mod game_relay {
                 unimplemented!("Proto compilation required")
             }
             
+            pub async fn raft_rpc(&mut self, _request: tonic::Request<super::RaftMessage>) 
+                -> Result<tonic::Response<super::RaftMessage>, tonic::Status> {
+                unimplemented!("Proto compilation required")
+            }
+            
             pub async fn stream_game_messages(&mut self, _request: tonic::Request<tonic::Streaming<super::GameMessage>>) 
                 -> Result<tonic::Response<tonic::Streaming<super::GameMessage>>, tonic::Status> {
                 unimplemented!("Proto compilation required")
@@ -81,6 +86,39 @@ pub mod game_relay {
                 &'life0 self,
                 request: tonic::Request<super::NotifyMatchRequest>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::NotifyMatchResponse>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn raft_rpc<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::RaftMessage>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::RaftMessage>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            type ReplicateGameStateStream;
+            fn replicate_game_state<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<tonic::Streaming<super::ReplicationEvent>>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<Self::ReplicateGameStateStream>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn transfer_authority<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::AuthorityTransferRequest>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::AuthorityTransferResponse>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn notify_shutdown<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::ShutdownNotification>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::ShutdownAck>, tonic::Status>> + Send + 'async_trait>>
             where
                 'life0: 'async_trait,
                 Self: 'async_trait;
@@ -226,5 +264,119 @@ pub mod game_relay {
     pub struct ShutdownAck {
         pub acknowledged: bool,
         pub accepted_game_ids: Vec<u32>,
+    }
+    
+    // Raft consensus messages
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftMessage {
+        pub message: Option<raft_message::Message>,
+    }
+    
+    pub mod raft_message {
+        use super::*;
+        
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        pub enum Message {
+            AppendEntries(RaftAppendEntries),
+            AppendResponse(RaftAppendEntriesResponse),
+            VoteRequest(RaftVoteRequest),
+            VoteResponse(RaftVoteResponse),
+            InstallSnapshot(RaftInstallSnapshot),
+            SnapshotResponse(RaftInstallSnapshotResponse),
+        }
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftAppendEntries {
+        pub term: u64,
+        pub leader_id: u64,
+        pub prev_log_index: u64,
+        pub prev_log_term: u64,
+        pub entries: Vec<u8>,
+        pub leader_commit: u64,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftAppendEntriesResponse {
+        pub term: u64,
+        pub success: bool,
+        pub has_conflict: bool,
+        pub conflict_term: u64,
+        pub conflict_index: u64,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftVoteRequest {
+        pub term: u64,
+        pub candidate_id: u64,
+        pub last_log_index: u64,
+        pub last_log_term: u64,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftVoteResponse {
+        pub term: u64,
+        pub vote_granted: bool,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftInstallSnapshot {
+        pub term: u64,
+        pub leader_id: u64,
+        pub last_included_index: u64,
+        pub last_included_term: u64,
+        pub offset: u64,
+        pub data: Vec<u8>,
+        pub done: bool,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftInstallSnapshotResponse {
+        pub term: u64,
+    }
+    
+    // Replication messages
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct ReplicationEvent {
+        pub game_id: u32,
+        pub version: u64,
+        pub source_server_id: String,
+        pub event: Option<replication_event::Event>,
+    }
+    
+    pub mod replication_event {
+        use super::*;
+        
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        pub enum Event {
+            StateUpdate(GameStateUpdate),
+            AuthorityChange(AuthorityChange),
+            GameDeleted(GameDeleted),
+        }
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct GameStateUpdate {
+        pub game_state: Vec<u8>,
+        pub tick: u32,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct AuthorityChange {
+        pub new_authority_server_id: String,
+        pub reason: String,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct GameDeleted {
+        pub reason: String,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct ReplicationAck {
+        pub game_id: u32,
+        pub version: u64,
+        pub success: bool,
+        pub error: Option<String>,
     }
 }

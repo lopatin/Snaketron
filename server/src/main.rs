@@ -72,6 +72,18 @@ async fn main() -> Result<()> {
     // Create JWT verifier
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;
 
+    // Parse Raft peers from environment
+    let raft_peers: Vec<String> = env::var("SNAKETRON_RAFT_PEERS")
+        .ok()
+        .map(|peers| peers.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    
+    if !raft_peers.is_empty() {
+        info!("Joining Raft cluster with peers: {:?}", raft_peers);
+    } else {
+        info!("Starting as first Raft node");
+    }
+
     // Create server configuration
     let config = GameServerConfig {
         db_pool,
@@ -79,6 +91,7 @@ async fn main() -> Result<()> {
         grpc_addr,
         region,
         jwt_verifier,
+        raft_peers,
     };
 
     // Start the game server

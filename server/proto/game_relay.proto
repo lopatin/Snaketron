@@ -20,6 +20,9 @@ service GameRelay {
   
   // Notify other servers about impending shutdown
   rpc NotifyShutdown(ShutdownNotification) returns (ShutdownAck);
+  
+  // Raft consensus RPCs
+  rpc RaftRPC(RaftMessage) returns (RaftMessage);
 }
 
 message GameMessage {
@@ -136,4 +139,60 @@ message ShutdownNotification {
 message ShutdownAck {
   bool acknowledged = 1;
   repeated uint32 accepted_game_ids = 2;
+}
+
+// Raft consensus messages
+
+message RaftMessage {
+  oneof message {
+    RaftAppendEntries append_entries = 1;
+    RaftAppendEntriesResponse append_response = 2;
+    RaftVoteRequest vote_request = 3;
+    RaftVoteResponse vote_response = 4;
+    RaftInstallSnapshot install_snapshot = 5;
+    RaftInstallSnapshotResponse snapshot_response = 6;
+  }
+}
+
+message RaftAppendEntries {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  bytes entries = 5; // Serialized Vec<Entry<ClientRequest>>
+  uint64 leader_commit = 6;
+}
+
+message RaftAppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  bool has_conflict = 3;
+  uint64 conflict_term = 4;
+  uint64 conflict_index = 5;
+}
+
+message RaftVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RaftVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message RaftInstallSnapshot {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool done = 7;
+}
+
+message RaftInstallSnapshotResponse {
+  uint64 term = 1;
 }

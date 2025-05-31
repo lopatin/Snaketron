@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use common::{GameState, GameEvent};
 use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,12 +9,13 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameReplica {
     pub game_id: u32,
     pub state: GameState,
     pub version: u64,
     pub authority_server: String,
+    #[serde(skip, default = "Instant::now")]
     pub last_update: Instant,
     pub tick: u32,
 }
@@ -382,6 +384,19 @@ impl ReplicaManager {
         } else {
             false
         }
+    }
+    
+    // New methods for Raft integration
+    
+    pub async fn handle_replication_command(&self, command: ReplicationCommand) -> Result<()> {
+        self.replication_tx.send(command).await
+            .context("Failed to send replication command")
+    }
+    
+    pub async fn add_replica(&self, replica: GameReplica) -> Result<()> {
+        let mut replicas = self.replicas.write().await;
+        replicas.insert(replica.game_id, replica);
+        Ok(())
     }
 }
 

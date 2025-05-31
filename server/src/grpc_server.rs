@@ -233,6 +233,15 @@ impl GameRelay for GameRelayService {
             accepted_game_ids: req.affected_game_ids,
         }))
     }
+    
+    async fn raft_rpc(
+        &self,
+        request: Request<game_relay::RaftMessage>,
+    ) -> Result<Response<game_relay::RaftMessage>, Status> {
+        // This will be implemented when we have the Raft node available
+        // For now, return an error
+        Err(Status::unimplemented("Raft RPC not yet implemented"))
+    }
 }
 
 pub async fn run_game_relay_server(

@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 use crate::{
     ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
@@ -19,6 +19,7 @@ use crate::{
     service_manager::ServiceManager,
     replica_manager::ReplicaManager,
     authority_transfer::AuthorityTransferManager,
+    raft::{RaftNode, RaftNodeId},
 };
 
 
@@ -34,6 +35,8 @@ pub struct GameServerConfig {
     pub region: String,
     /// JWT verifier for authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
+    /// Initial Raft cluster members (empty for first node)
+    pub raft_peers: Vec<String>,
 }
 
 /// A complete game server instance with all components
@@ -58,6 +61,8 @@ pub struct GameServer {
     authority_transfer: Option<Arc<AuthorityTransferManager>>,
     /// Player connection manager
     player_connections: Arc<PlayerConnectionManager>,
+    /// Raft consensus node
+    raft_node: Option<Arc<RaftNode>>,
 }
 
 impl GameServer {
@@ -69,6 +74,7 @@ impl GameServer {
             grpc_addr,
             region,
             jwt_verifier,
+            raft_peers,
         } = config;
 
         // Register server in database
@@ -127,6 +133,38 @@ impl GameServer {
             replica_manager.clone(),
             games_manager.clone(),
         ));
+        
+        // Initialize Raft node
+        let raft_node = if grpc_addr.is_some() {
+            info!("Initializing Raft consensus node");
+            
+            // Convert peer addresses to RaftNodeIds
+            let initial_members: Vec<RaftNodeId> = if raft_peers.is_empty() {
+                // This is the first node
+                vec![RaftNodeId(server_id.to_string())]
+            } else {
+                // Join existing cluster
+                raft_peers.into_iter()
+                    .map(|peer| RaftNodeId(peer))
+                    .collect()
+            };
+            
+            let raft_node = Arc::new(
+                RaftNode::new(
+                    server_id.to_string(),
+                    games_manager.clone(),
+                    replica_manager.clone(),
+                    initial_members,
+                ).await.context("Failed to create Raft node")?
+            );
+            
+            // async-raft manages its own internal timers, no tick needed
+            
+            Some(raft_node)
+        } else {
+            warn!("Raft not initialized: gRPC address not configured");
+            None
+        };
 
         // Start gRPC server if configured
         if let Some(grpc_addr_str) = &grpc_addr {
@@ -233,6 +271,7 @@ impl GameServer {
             replica_manager: Some(replica_manager),
             authority_transfer: Some(authority_transfer),
             player_connections,
+            raft_node,
         })
     }
 
@@ -389,6 +428,7 @@ pub async fn start_test_server_with_grpc(
         grpc_addr,
         region: "test-region".to_string(),
         jwt_verifier,
+        raft_peers: vec![], // Single node for tests
     };
 
     GameServer::start(config).await

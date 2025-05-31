@@ -235,4 +235,29 @@ impl GameManager {
         response_rx.await
             .map_err(|_| anyhow::anyhow!("Failed to receive snapshot"))
     }
+    
+    // Methods for Raft integration
+    
+    pub async fn stop_game(&self, game_id: u32) -> Result<()> {
+        // TODO: Implement graceful game shutdown
+        info!("Stopping game {}", game_id);
+        Ok(())
+    }
+    
+    pub async fn is_authority_for(&self, game_id: u32) -> bool {
+        // Check if we have active game channels for this game
+        self.broker.subscribe_events(game_id).await.is_ok()
+    }
+    
+    pub async fn accept_authority_transfer(&self, game_id: u32, _state: GameState) -> Result<()> {
+        info!("Accepting authority for game {}", game_id);
+        // For now, just start the game normally
+        // TODO: Implement starting game with given state
+        Ok(())
+    }
+    
+    pub async fn release_authority(&self, game_id: u32) -> Result<()> {
+        info!("Releasing authority for game {}", game_id);
+        self.stop_game(game_id).await
+    }
 }

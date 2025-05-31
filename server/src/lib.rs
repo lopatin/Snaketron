@@ -9,6 +9,7 @@ pub mod grpc_server;
 pub mod grpc_stub;
 pub mod matchmaking;
 pub mod player_connections;
+pub mod raft;
 pub mod replica_manager;
 pub mod service_manager;
 pub mod ws_server;
