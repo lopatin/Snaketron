@@ -23,6 +23,13 @@ service GameRelay {
   
   // Raft consensus RPCs
   rpc RaftRPC(RaftMessage) returns (RaftMessage);
+  
+  // Leader discovery
+  rpc GetRaftStatus(Empty) returns (RaftStatusResponse);
+  
+  // Learner management
+  rpc RequestJoinAsLearner(JoinAsLearnerRequest) returns (JoinAsLearnerResponse);
+  rpc RequestPromotion(PromotionRequest) returns (PromotionResponse);
 }
 
 message GameMessage {
@@ -195,4 +202,38 @@ message RaftInstallSnapshot {
 
 message RaftInstallSnapshotResponse {
   uint64 term = 1;
+}
+
+// Empty message for requests with no parameters
+message Empty {}
+
+// Leader discovery messages
+message RaftStatusResponse {
+  bool is_leader = 1;
+  string leader_id = 2;
+  string leader_addr = 3;
+  uint64 current_term = 4;
+  uint64 last_log_index = 5;
+  uint64 last_applied = 6;
+}
+
+// Learner join messages
+message JoinAsLearnerRequest {
+  string node_id = 1;
+  string grpc_addr = 2;
+}
+
+message JoinAsLearnerResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// Promotion messages
+message PromotionRequest {
+  string node_id = 1;
+}
+
+message PromotionResponse {
+  bool promoted = 1;
+  string reason = 2;
 }

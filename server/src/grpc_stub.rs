@@ -90,14 +90,6 @@ pub mod game_relay {
                 'life0: 'async_trait,
                 Self: 'async_trait;
                 
-            fn raft_rpc<'life0, 'async_trait>(
-                &'life0 self,
-                request: tonic::Request<super::RaftMessage>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::RaftMessage>, tonic::Status>> + Send + 'async_trait>>
-            where
-                'life0: 'async_trait,
-                Self: 'async_trait;
-                
             type ReplicateGameStateStream;
             fn replicate_game_state<'life0, 'async_trait>(
                 &'life0 self,
@@ -119,6 +111,38 @@ pub mod game_relay {
                 &'life0 self,
                 request: tonic::Request<super::ShutdownNotification>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::ShutdownAck>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn raft_rpc<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::RaftMessage>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::RaftMessage>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn get_raft_status<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::Empty>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::RaftStatusResponse>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn request_join_as_learner<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::JoinAsLearnerRequest>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::JoinAsLearnerResponse>, tonic::Status>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+                
+            fn request_promotion<'life0, 'async_trait>(
+                &'life0 self,
+                request: tonic::Request<super::PromotionRequest>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<super::PromotionResponse>, tonic::Status>> + Send + 'async_trait>>
             where
                 'life0: 'async_trait,
                 Self: 'async_trait;
@@ -333,6 +357,46 @@ pub mod game_relay {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RaftInstallSnapshotResponse {
         pub term: u64,
+    }
+    
+    // Empty message
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct Empty {}
+    
+    // Leader discovery messages
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct RaftStatusResponse {
+        pub is_leader: bool,
+        pub leader_id: String,
+        pub leader_addr: String,
+        pub current_term: u64,
+        pub last_log_index: u64,
+        pub last_applied: u64,
+    }
+    
+    // Learner join messages
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct JoinAsLearnerRequest {
+        pub node_id: String,
+        pub grpc_addr: String,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct JoinAsLearnerResponse {
+        pub accepted: bool,
+        pub reason: String,
+    }
+    
+    // Promotion messages
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct PromotionRequest {
+        pub node_id: String,
+    }
+    
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct PromotionResponse {
+        pub promoted: bool,
+        pub reason: String,
     }
     
     // Replication messages

@@ -10,17 +10,33 @@ use crate::game_broker::{GameMessageBroker, game_relay};
 use game_relay::game_relay_server::{GameRelay, GameRelayServer};
 use game_relay::{GameMessage, GetSnapshotRequest, GetSnapshotResponse, NotifyMatchRequest, NotifyMatchResponse};
 use crate::player_connections::PlayerConnectionManager;
+use crate::raft::RaftNode;
 
 type GameMessageStream = Pin<Box<dyn Stream<Item = Result<GameMessage, Status>> + Send>>;
 
 pub struct GameRelayService {
     broker: Arc<dyn GameMessageBroker>,
     player_connections: Arc<PlayerConnectionManager>,
+    raft_node: Option<Arc<RaftNode>>,
+    server_id: String,
+    grpc_addr: String,
 }
 
 impl GameRelayService {
-    pub fn new(broker: Arc<dyn GameMessageBroker>, player_connections: Arc<PlayerConnectionManager>) -> Self {
-        Self { broker, player_connections }
+    pub fn new(
+        broker: Arc<dyn GameMessageBroker>, 
+        player_connections: Arc<PlayerConnectionManager>,
+        raft_node: Option<Arc<RaftNode>>,
+        server_id: String,
+        grpc_addr: String,
+    ) -> Self {
+        Self { 
+            broker, 
+            player_connections,
+            raft_node,
+            server_id,
+            grpc_addr,
+        }
     }
 }
 
@@ -242,12 +258,120 @@ impl GameRelay for GameRelayService {
         // For now, return an error
         Err(Status::unimplemented("Raft RPC not yet implemented"))
     }
+    
+    async fn get_raft_status(
+        &self,
+        _request: Request<game_relay::Empty>,
+    ) -> Result<Response<game_relay::RaftStatusResponse>, Status> {
+        if let Some(raft_node) = &self.raft_node {
+            let is_leader = raft_node.is_leader().await;
+            let metrics = raft_node.metrics.read().await;
+            
+            let response = game_relay::RaftStatusResponse {
+                is_leader,
+                leader_id: if is_leader { 
+                    self.server_id.clone() 
+                } else { 
+                    metrics.current_leader.map(|id| id.to_string()).unwrap_or_default()
+                },
+                leader_addr: if is_leader {
+                    self.grpc_addr.clone()
+                } else {
+                    // In production, we'd look up the leader's address
+                    String::new()
+                },
+                current_term: metrics.current_term,
+                last_log_index: metrics.last_log_index,
+                last_applied: metrics.last_applied,
+            };
+            
+            Ok(Response::new(response))
+        } else {
+            Err(Status::unavailable("Raft not initialized"))
+        }
+    }
+    
+    async fn request_join_as_learner(
+        &self,
+        request: Request<game_relay::JoinAsLearnerRequest>,
+    ) -> Result<Response<game_relay::JoinAsLearnerResponse>, Status> {
+        if let Some(raft_node) = &self.raft_node {
+            let req = request.into_inner();
+            
+            // Only leader can add learners
+            if !raft_node.is_leader().await {
+                return Ok(Response::new(game_relay::JoinAsLearnerResponse {
+                    accepted: false,
+                    reason: "Not the leader".to_string(),
+                }));
+            }
+            
+            // Add the node as a learner
+            match raft_node.add_learner(req.node_id.clone(), req.grpc_addr).await {
+                Ok(_) => {
+                    info!("Added {} as learner", req.node_id);
+                    Ok(Response::new(game_relay::JoinAsLearnerResponse {
+                        accepted: true,
+                        reason: String::new(),
+                    }))
+                }
+                Err(e) => {
+                    error!("Failed to add learner: {}", e);
+                    Ok(Response::new(game_relay::JoinAsLearnerResponse {
+                        accepted: false,
+                        reason: e.to_string(),
+                    }))
+                }
+            }
+        } else {
+            Err(Status::unavailable("Raft not initialized"))
+        }
+    }
+    
+    async fn request_promotion(
+        &self,
+        request: Request<game_relay::PromotionRequest>,
+    ) -> Result<Response<game_relay::PromotionResponse>, Status> {
+        if let Some(raft_node) = &self.raft_node {
+            let req = request.into_inner();
+            
+            // Only leader can promote learners
+            if !raft_node.is_leader().await {
+                return Ok(Response::new(game_relay::PromotionResponse {
+                    promoted: false,
+                    reason: "Not the leader".to_string(),
+                }));
+            }
+            
+            // Promote the learner
+            match raft_node.promote_learner(req.node_id.clone()).await {
+                Ok(_) => {
+                    info!("Promoted {} to voting member", req.node_id);
+                    Ok(Response::new(game_relay::PromotionResponse {
+                        promoted: true,
+                        reason: String::new(),
+                    }))
+                }
+                Err(e) => {
+                    warn!("Failed to promote learner: {}", e);
+                    Ok(Response::new(game_relay::PromotionResponse {
+                        promoted: false,
+                        reason: e.to_string(),
+                    }))
+                }
+            }
+        } else {
+            Err(Status::unavailable("Raft not initialized"))
+        }
+    }
 }
 
 pub async fn run_game_relay_server(
     addr: &str,
     broker: Arc<dyn GameMessageBroker>,
     player_connections: Arc<PlayerConnectionManager>,
+    raft_node: Option<Arc<RaftNode>>,
+    server_id: String,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     #[cfg(feature = "skip-proto")]
@@ -259,7 +383,13 @@ pub async fn run_game_relay_server(
     
     #[cfg(not(feature = "skip-proto"))]
     {
-        let service = GameRelayService::new(broker, player_connections);
+        let service = GameRelayService::new(
+            broker, 
+            player_connections,
+            raft_node,
+            server_id,
+            addr.to_string(),
+        );
         let svc = GameRelayServer::new(service);
         
         info!("Game relay gRPC server starting on {}", addr);

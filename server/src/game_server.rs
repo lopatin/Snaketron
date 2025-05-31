@@ -20,6 +20,7 @@ use crate::{
     replica_manager::ReplicaManager,
     authority_transfer::AuthorityTransferManager,
     raft::{RaftNode, RaftNodeId},
+    learner_join::LearnerJoinProtocol,
 };
 
 
@@ -162,16 +163,24 @@ impl GameServer {
                     ).await.context("Failed to create Raft node")?
                 );
                 
-                // Contact one of the existing nodes to join as learner
-                // In production, this would involve:
-                // 1. Discovering the leader through the peers
-                // 2. Requesting to join as a learner
-                // 3. Waiting for synchronization
-                // 4. Being promoted to voting member
+                // Execute join protocol in background
+                let join_protocol = LearnerJoinProtocol::new(
+                    server_id.to_string(),
+                    grpc_addr_str.clone(),
+                    raft_node.clone(),
+                );
                 
-                // For now, we'll note this needs to be implemented
-                info!("TODO: Implement learner join protocol");
+                let join_handle = tokio::spawn(async move {
+                    // Give the gRPC server time to start
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    
+                    match join_protocol.execute_join(raft_peers).await {
+                        Ok(_) => info!("Successfully joined cluster as voting member"),
+                        Err(e) => error!("Failed to join cluster: {}", e),
+                    }
+                });
                 
+                handles.push(join_handle);
                 raft_node
             };
             
@@ -192,8 +201,17 @@ impl GameServer {
             let grpc_token = cancellation_token.clone();
             let grpc_addr_clone = grpc_addr_str.clone();
             
+            let grpc_raft_node = raft_node.clone();
+            let grpc_server_id = server_id.to_string();
             handles.push(tokio::spawn(async move {
-                if let Err(e) = run_game_relay_server(&grpc_addr_clone, grpc_broker, grpc_player_connections, grpc_token).await {
+                if let Err(e) = run_game_relay_server(
+                    &grpc_addr_clone, 
+                    grpc_broker, 
+                    grpc_player_connections, 
+                    grpc_raft_node,
+                    grpc_server_id,
+                    grpc_token
+                ).await {
                     error!("Game relay gRPC server error: {}", e);
                 }
             }));
