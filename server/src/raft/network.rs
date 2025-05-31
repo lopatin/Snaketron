@@ -73,7 +73,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             message: Some(crate::game_broker::game_relay::raft_message::Message::AppendEntries(
                 RaftAppendEntries {
                     term: rpc.term,
-                    leader_id: rpc.leader_id,
+                    leader_id: rpc.leader_id.to_string(),
                     prev_log_index: rpc.prev_log_index,
                     prev_log_term: rpc.prev_log_term,
                     entries: bincode::serde::encode_to_vec(&rpc.entries, bincode::config::standard())?,
@@ -116,7 +116,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             message: Some(crate::game_broker::game_relay::raft_message::Message::InstallSnapshot(
                 RaftInstallSnapshot {
                     term: rpc.term,
-                    leader_id: rpc.leader_id,
+                    leader_id: rpc.leader_id.to_string(),
                     last_included_index: rpc.last_included_index,
                     last_included_term: rpc.last_included_term,
                     offset: rpc.offset,
@@ -145,7 +145,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             message: Some(crate::game_broker::game_relay::raft_message::Message::VoteRequest(
                 RaftVoteRequest {
                     term: rpc.term,
-                    candidate_id: rpc.candidate_id,
+                    candidate_id: rpc.candidate_id.to_string(),
                     last_log_index: rpc.last_log_index,
                     last_log_term: rpc.last_log_term,
                 }
