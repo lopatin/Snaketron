@@ -27,8 +27,6 @@ impl GameRelayService {
 #[tonic::async_trait]
 impl GameRelay for GameRelayService {
     type StreamGameMessagesStream = GameMessageStream;
-    type ReplicateGameStateStream = Pin<Box<dyn Stream<Item = Result<game_relay::ReplicationAck, Status>> + Send>>;
-
     async fn stream_game_messages(
         &self,
         request: Request<Streaming<GameMessage>>,
@@ -140,7 +138,7 @@ impl GameRelay for GameRelayService {
             }
         }
     }
-    
+
     async fn notify_match_found(
         &self,
         request: Request<NotifyMatchRequest>,
@@ -169,6 +167,8 @@ impl GameRelay for GameRelayService {
             notified_players,
         }))
     }
+
+    type ReplicateGameStateStream = Pin<Box<dyn Stream<Item = Result<game_relay::ReplicationAck, Status>> + Send>>;
     
     async fn replicate_game_state(
         &self,
