@@ -55,6 +55,21 @@ impl GameEngine {
         }
     }
 
+    pub fn new_from_state(game_id: u32, start_ms: i64, game_state: GameState) -> Self {
+        GameEngine {
+            game_id,
+            committed_state: game_state.clone(),
+            predicted_state: Some(game_state),
+            event_log: Vec::new(),
+            tick_duration_ms: 300,
+            committed_state_lag_ms: 500,
+            unconfirmed_local_inputs: VecDeque::new(),
+            local_player_id: None,
+            start_ms,
+            command_counter: 0,
+        }
+    }
+
     pub fn set_local_player_id(&mut self, player_id: u32) {
         self.local_player_id = Some(player_id);
     }

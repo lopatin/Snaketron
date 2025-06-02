@@ -331,12 +331,8 @@ async fn create_adaptive_match(
     let mut game_state = GameState::new(40, 40, game_type_enum, None);
     
     // Add players to the game state
-    for (idx, &user_id) in user_ids.iter().enumerate() {
-        let player = Player {
-            user_id: user_id as u32,
-            snake_id: idx as u32,
-        };
-        game_state.players.insert(user_id as u32, player);
+    for user_id in user_ids.iter() {
+        game_state.add_player(*user_id as u32)?;
     }
     
     // Save the game to Raft

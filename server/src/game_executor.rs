@@ -20,15 +20,19 @@ async fn run_game(
 ) {
     info!("run_game called for game {}", game_id);
     
-    // Create the game engine
-    let start_ms = chrono::Utc::now().timestamp_millis();
-    let rng_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    // Get the game state from Raft
+    let game_state = match raft.get_game_state(game_id).await {
+        Some(state) => state,
+        None => {
+            error!("Game {} not found in Raft state", game_id);
+            return;
+        }
+    };
     
-    let mut engine = GameEngine::new_with_seed(game_id, start_ms, rng_seed);
-    info!("Created game engine for game {}", game_id);
+    // Create the game engine from the existing game state
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state);
+    info!("Created game engine for game {} from existing state", game_id);
 
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

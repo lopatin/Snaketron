@@ -47,12 +47,12 @@ impl TestEnvironment {
     }
     
     /// Add a server to this test environment
-    pub async fn add_server(&mut self) -> Result<usize> {
+    pub async fn add_server(&mut self) -> Result<(usize, u64)> {
         self.add_server_with_grpc(false).await
     }
     
     /// Add a server to this test environment with optional gRPC
-    pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<usize> {
+    pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<(usize, u64)> {
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
         
         let server = start_test_server_with_grpc(
@@ -64,10 +64,11 @@ impl TestEnvironment {
         .context("Failed to start server")?;
         
         let index = self.servers.len();
+        let server_id = server.id();
         info!(
             "Started server {} with ID {} on {} (gRPC: {:?})", 
             index, 
-            server.id(), 
+            server_id, 
             server.ws_addr(),
             server.grpc_addr()
         );
@@ -88,7 +89,7 @@ impl TestEnvironment {
         }
         
         self.servers.push(server);
-        Ok(index)
+        Ok((index, server_id))
     }
     
     /// Add a server with custom JWT verifier

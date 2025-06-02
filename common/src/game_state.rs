@@ -31,7 +31,7 @@ pub enum GameEvent {
     FoodEaten { snake_id: u32, position: Position },
     Snapshot { game_state: GameState },
     CommandScheduled { command_message: GameCommandMessage },
-    PlayerJoined { user_id: u32, snake_id: u32 },
+    // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated { status: GameStatus },
 }
 
@@ -41,6 +41,17 @@ pub struct Arena {
     pub height: u16,
     pub snakes: Vec<Snake>,
     pub food: Vec<Position>,
+}
+
+impl Arena {
+    pub fn add_snake(&mut self, snake: Snake) -> Result<u32> {
+        if self.snakes.len() >= u32::MAX as usize {
+            return Err(anyhow::anyhow!("Arena is full, cannot add more snakes"));
+        }
+        let id = self.snakes.len() as u32;
+        self.snakes.push(snake);
+        Ok(id)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -235,6 +246,25 @@ impl GameState {
         }
     }
     
+    pub fn add_player(&mut self, user_id: u32) -> Result<Player> {
+        if self.players.contains_key(&user_id) {
+            return Err(anyhow::anyhow!("Player with user_id {} already exists", user_id));
+        }
+
+        let snake = Snake {
+            body: vec![Position { x: 0, y: 0 }; DEFAULT_SNAKE_LENGTH],
+            direction: Direction::Right,
+            is_alive: true,
+            food: 0,
+        };
+
+        let snake_id = self.arena.add_snake(snake)?;
+        let player = Player { user_id, snake_id };
+        self.players.insert(user_id, player.clone());
+        
+        Ok(player)
+    }
+    
     pub fn schedule_command(&mut self, command_message: &GameCommandMessage) {
         self.apply_event(GameEvent::CommandScheduled { command_message: command_message.clone() }, None);
     }
@@ -245,12 +275,12 @@ impl GameState {
     pub fn tick_forward(&mut self) -> Result<Vec<GameEvent>> {
 
         let mut out: Vec<GameEvent> = Vec::new();
-        
+
         // Emit snapshot on first tick
         if self.tick == 0 {
             out.push(GameEvent::Snapshot { game_state: self.clone() });
         }
-        
+       
         // Exec commands in the queue until the only ones left are for after this tick
         while let Some(command_message) = self.command_queue.pop(self.tick) {
             if let Ok(events) = self.exec_command(command_message.command) {
@@ -389,8 +419,6 @@ impl GameState {
             GameEvent::CommandScheduled { command_message } => {
                 self.command_queue.push(command_message);
             }
-            
-            GameEvent::PlayerJoined { .. } => {}
             
             GameEvent::StatusUpdated { status } => {
                 self.status = status;
