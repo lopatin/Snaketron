@@ -246,13 +246,94 @@ impl GameState {
         }
     }
     
+    fn calculate_starting_positions(&self, player_count: usize) -> Vec<(Position, Direction)> {
+        let mut positions = Vec::new();
+        let arena_width = self.arena.width as i16;
+        let arena_height = self.arena.height as i16;
+        
+        match player_count {
+            0 => {},
+            1 => {
+                // Single snake starts on the right, facing left
+                let x = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                let y = arena_height / 2;
+                positions.push((Position { x, y }, Direction::Left));
+            },
+            2 => {
+                // Two snakes start on opposite sides, facing each other
+                let y = arena_height / 2;
+                
+                // Right side, facing left
+                let x_right = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                positions.push((Position { x: x_right, y }, Direction::Left));
+                
+                // Left side, facing right
+                let x_left = DEFAULT_SNAKE_LENGTH as i16;
+                positions.push((Position { x: x_left, y }, Direction::Right));
+            },
+            _ => {
+                // More than 2 players: arranged in two columns facing each other
+                let left_count = (player_count + 1) / 2;
+                let right_count = player_count / 2;
+                
+                // Calculate vertical spacing
+                let vertical_margin = 2;
+                let usable_height = arena_height - 2 * vertical_margin;
+                
+                // Left column (facing right)
+                let x_left = DEFAULT_SNAKE_LENGTH as i16;
+                for i in 0..left_count {
+                    let y = if left_count == 1 {
+                        arena_height / 2
+                    } else {
+                        vertical_margin + (i as i16 * usable_height) / (left_count - 1) as i16
+                    };
+                    positions.push((Position { x: x_left, y }, Direction::Right));
+                }
+                
+                // Right column (facing left)
+                let x_right = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                for i in 0..right_count {
+                    let y = if right_count == 1 {
+                        arena_height / 2
+                    } else {
+                        vertical_margin + (i as i16 * usable_height) / (right_count - 1) as i16
+                    };
+                    positions.push((Position { x: x_right, y }, Direction::Left));
+                }
+            }
+        }
+        
+        positions
+    }
+
     pub fn add_player(&mut self, user_id: u32) -> Result<Player> {
         if self.players.contains_key(&user_id) {
             return Err(anyhow::anyhow!("Player with user_id {} already exists", user_id));
         }
 
+        // Only rearrange players on tick 0
+        if self.tick != 0 {
+            // Just add player at default position if not tick 0
+            let snake = Snake {
+                body: vec![
+                    Position { x: DEFAULT_SNAKE_LENGTH as i16, y: 0 }, 
+                    Position { x: 1, y: 0 }
+                ],
+                direction: Direction::Right,
+                is_alive: true,
+                food: 0,
+            };
+
+            let snake_id = self.arena.add_snake(snake)?;
+            let player = Player { user_id, snake_id };
+            self.players.insert(user_id, player.clone());
+            return Ok(player);
+        }
+
+        // Add new player first with temporary position
         let snake = Snake {
-            body: vec![Position { x: 0, y: 0 }; DEFAULT_SNAKE_LENGTH],
+            body: vec![Position { x: 0, y: 0 }, Position { x: 0, y: 0 }],
             direction: Direction::Right,
             is_alive: true,
             food: 0,
@@ -261,6 +342,41 @@ impl GameState {
         let snake_id = self.arena.add_snake(snake)?;
         let player = Player { user_id, snake_id };
         self.players.insert(user_id, player.clone());
+
+        // Calculate starting positions for all players
+        let player_count = self.players.len();
+        let starting_positions = self.calculate_starting_positions(player_count);
+
+        // Rearrange all snakes to their starting positions
+        for (idx, (player_id, player)) in self.players.iter().enumerate() {
+            if idx < starting_positions.len() {
+                let (head_pos, direction) = &starting_positions[idx];
+                let snake = &mut self.arena.snakes[player.snake_id as usize];
+                
+                // Build compressed snake body: just head and tail for a straight snake
+                let tail_pos = match direction {
+                    Direction::Left => Position { 
+                        x: head_pos.x + (DEFAULT_SNAKE_LENGTH - 1) as i16, 
+                        y: head_pos.y 
+                    },
+                    Direction::Right => Position { 
+                        x: head_pos.x - (DEFAULT_SNAKE_LENGTH - 1) as i16, 
+                        y: head_pos.y 
+                    },
+                    Direction::Up => Position { 
+                        x: head_pos.x, 
+                        y: head_pos.y + (DEFAULT_SNAKE_LENGTH - 1) as i16 
+                    },
+                    Direction::Down => Position { 
+                        x: head_pos.x, 
+                        y: head_pos.y - (DEFAULT_SNAKE_LENGTH - 1) as i16 
+                    },
+                };
+                
+                snake.body = vec![*head_pos, tail_pos];
+                snake.direction = *direction;
+            }
+        }
         
         Ok(player)
     }

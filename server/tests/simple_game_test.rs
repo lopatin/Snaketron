@@ -135,10 +135,10 @@ async fn test_simple_game() -> Result<()> {
                     match &event.event {
                         GameEvent::SnakeDied { snake_id } => {
                             if *snake_id == snake1_id {
-                                println!("Snake 1 died!");
+                                println!("Snake 1 died! event= {:?}", event);
                                 snake1_died = true;
                             } else if *snake_id == snake2_id {
-                                println!("Snake 2 died!");
+                                println!("Snake 2 died! event= {:?}", event);
                                 snake2_died = true;
                             }
                         }
@@ -158,10 +158,10 @@ async fn test_simple_game() -> Result<()> {
                     match &event.event {
                         GameEvent::SnakeDied { snake_id } => {
                             if *snake_id == snake1_id {
-                                println!("Snake 1 died!");
+                                println!("Snake 1 died! event= {:?}", event);
                                 snake1_died = true;
                             } else if *snake_id == snake2_id {
-                                println!("Snake 2 died!");
+                                println!("Snake 2 died! event= {:?}", event);
                                 snake2_died = true;
                             }
                         }
