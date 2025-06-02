@@ -38,7 +38,7 @@ async fn test_simple_game_creation() -> Result<()> {
     
     println!("Clients queued");
     
-    // Wait for any message - just see what happens
+    // Wait for game snapshots - clients should receive these when matched
     let msg1 = timeout(Duration::from_secs(10), async {
         client1.receive_message().await
     }).await??;
@@ -51,26 +51,32 @@ async fn test_simple_game_creation() -> Result<()> {
     
     println!("Client2 received: {:?}", msg2);
     
-    // If we got MatchFound, try joining after a longer delay
-    if let (WSMessage::MatchFound { game_id: id1 }, WSMessage::MatchFound { game_id: id2 }) = (&msg1, &msg2) {
-        assert_eq!(id1, id2);
-        let game_id = *id1;
-        
-        println!("Both clients got MatchFound for game {}", game_id);
-        
-        // Wait longer for game to be created
-        println!("Waiting 5 seconds for game creation...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        
-        println!("Attempting to join game {}", game_id);
-        client1.send_message(WSMessage::JoinGame(game_id)).await?;
-        
-        // See what happens
-        let response = timeout(Duration::from_secs(5), async {
-            client1.receive_message().await
-        }).await??;
-        
-        println!("After join attempt, received: {:?}", response);
+    // Verify both clients received game snapshots
+    match (&msg1, &msg2) {
+        (WSMessage::GameEvent(event1), WSMessage::GameEvent(event2)) => {
+            // Check that both events are snapshots for the same game
+            assert_eq!(event1.game_id, event2.game_id);
+            let game_id = event1.game_id;
+            
+            println!("Both clients received game snapshots for game {}", game_id);
+            
+            // Verify the events are snapshots
+            match (&event1.event, &event2.event) {
+                (GameEvent::Snapshot { game_state: state1 }, GameEvent::Snapshot { game_state: state2 }) => {
+                    println!("Game snapshot verified - game has {} players", state1.players.len());
+                    
+                    // Verify both users are in the game
+                    assert!(state1.players.contains_key(&(env.user_ids()[0] as u32)));
+                    assert!(state1.players.contains_key(&(env.user_ids()[1] as u32)));
+                    
+                    // States should be identical
+                    assert_eq!(state1.tick, state2.tick);
+                    assert_eq!(state1.players.len(), 2);
+                }
+                _ => panic!("Expected Snapshot events, got {:?} and {:?}", event1.event, event2.event),
+            }
+        }
+        _ => panic!("Expected GameEvent messages, got {:?} and {:?}", msg1, msg2),
     }
     
     env.shutdown().await?;

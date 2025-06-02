@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Context;
 use tonic::transport::Channel;
-use common::{GameState, GameType};
+use common::{GameState, GameType, Player};
 use crate::raft::{ClientRequest, ClientResponse, RaftNode};
 
 // --- Configuration Constants ---
@@ -325,10 +325,24 @@ async fn create_adaptive_match(
     // Commit to db
     tx.commit().await?;
     
+    // Create game state with players
+    let game_type_enum: GameType = serde_json::from_value(game_type.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize game type: {}", e))?;
+    let mut game_state = GameState::new(40, 40, game_type_enum, None);
+    
+    // Add players to the game state
+    for (idx, &user_id) in user_ids.iter().enumerate() {
+        let player = Player {
+            user_id: user_id as u32,
+            snake_id: idx as u32,
+        };
+        game_state.players.insert(user_id as u32, player);
+    }
+    
     // Save the game to Raft
     match raft.propose(ClientRequest::CreateGame {
         game_id: game_id as u32,
-        game_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None),
+        game_state,
     }).await.context("Failed to save game to raft")? {
         ClientResponse::Success => info!(game_id, "Game created and saved to Raft"),
         ClientResponse::Error(msg) => {

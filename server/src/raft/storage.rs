@@ -61,6 +61,10 @@ impl GameRaftStorage {
             event_tx,
         }
     }
+    
+    pub async fn get_state_machine(&self) -> GameStateMachine {
+        self.state_machine.read().await.clone()
+    }
 }
 
 #[async_trait]

@@ -34,7 +34,6 @@ pub enum WSMessage {
     // Matchmaking messages
     QueueForMatch { game_type: common::GameType },
     LeaveQueue,
-    MatchFound { game_id: u32 },
     // High availability messages
     ServerShutdown { 
         reason: String,
@@ -390,19 +389,8 @@ async fn handle_websocket_connection(
     tokio::pin!(shutdown_timeout);
     let mut shutdown_started = false;
     
-    let game_start_stream = BroadcastStream::new(raft.subscribe_state_events())
-        .filter_map(|event| async move {
-            match event {
-                Ok(StateChangeEvent::GameCreated { game_id: _ }) => {
-                    // For now, don't send game creation events to clients
-                    // They will receive events when they join a specific game
-                    None::<WSMessage>
-                }
-                _ => None
-            }
-        });
-
-    tokio::pin!(game_start_stream);
+    // Subscribe to Raft state changes to get notified when games are created
+    let mut state_change_rx = raft.subscribe_state_events();
     
     
     loop {
@@ -446,6 +434,36 @@ async fn handle_websocket_connection(
                 if let Err(e) = ws_stream.send(msg).await {
                     error!("Failed to send message to client: {}", e);
                     break;
+                }
+            }
+            
+            // Handle Raft state change events
+            Ok(event) = state_change_rx.recv() => {
+                if let StateChangeEvent::GameCreated { game_id } = event {
+                    // Check if this authenticated user is in the newly created game
+                    if let ConnectionState::Authenticated { user_token } = &state {
+                        // Get the game state from Raft
+                        if let Some(game_state) = raft.get_game_state(game_id).await {
+                            // Check if this user is a player in the game
+                            if game_state.players.contains_key(&(user_token.user_id as u32)) {
+                                info!("User {} matched to game {}, sending snapshot", user_token.user_id, game_id);
+                                
+                                // Send game snapshot to the player
+                                let snapshot_event = GameEventMessage {
+                                    game_id,
+                                    tick: game_state.tick,
+                                    user_id: Some(user_token.user_id as u32),
+                                    event: GameEvent::Snapshot { game_state },
+                                };
+                                
+                                let wrapped_event = WSMessage::GameEvent(snapshot_event);
+                                let snapshot_msg = Message::Text(serde_json::to_string(&wrapped_event)?.into());
+                                if let Err(e) = ws_stream.send(snapshot_msg).await {
+                                    error!("Failed to send game snapshot: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             
@@ -610,7 +628,7 @@ pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, Str
     let now = Utc::now();
     
     // Query to find all servers in the specified region
-    let servers = sqlx::query_as::<_, (i64, String)>(
+    let servers = sqlx::query_as::<_, (i32, String)>(
         r#"
         SELECT id, grpc_address FROM servers
         WHERE region = $1 AND last_heartbeat > $2 - INTERVAL '30 seconds'

@@ -85,14 +85,18 @@ impl GameServer {
        
         // Initialize Raft node
         info!("Initializing Raft consensus node");
-        let raft_peers: Vec<String> = discover_peers(&db_pool, &region).await
-            .context("Failed to discover Raft peers")?
+        let raft_peers_with_ids = discover_peers(&db_pool, &region).await
+            .context("Failed to discover Raft peers")?;
+        
+        // Check if we're the only server or if there are other peers
+        let other_peers: Vec<String> = raft_peers_with_ids
             .into_iter()
+            .filter(|(id, _)| *id != server_id)
             .map(|(_, addr)| addr)
             .collect();
         
         let mut join_as_learner = false;
-        let raft = if raft_peers.is_empty() {
+        let raft = if other_peers.is_empty() {
             info!("Starting as first node in cluster");
             Arc::new(
                 RaftNode::new(
@@ -102,7 +106,7 @@ impl GameServer {
             )
         } else {
             // Join existing cluster as learner
-            info!("Joining existing cluster as learner");
+            info!("Joining existing cluster as learner with {} other peers", other_peers.len());
             let raft_node = Arc::new(
                 RaftNode::new(
                     server_id,
@@ -141,7 +145,7 @@ impl GameServer {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             join_protocol
-                .execute_join(raft_peers)
+                .execute_join(other_peers)
                 .await
                 .context("Failed to execute learner join protocol")?;
         }

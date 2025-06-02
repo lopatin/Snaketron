@@ -82,7 +82,7 @@ impl TestEnvironment {
                 "#
             )
             .bind(grpc_addr)
-            .bind(server.id())
+            .bind(server.id() as i32)
             .execute(self.db_pool())
             .await?;
         }

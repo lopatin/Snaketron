@@ -102,6 +102,12 @@ impl RaftNode {
     pub fn subscribe_state_events(&self) -> broadcast::Receiver<StateChangeEvent> {
         self.state_change_tx.subscribe()
     }
+    
+    pub async fn get_game_state(&self, game_id: u32) -> Option<GameState> {
+        let storage = self.storage.clone();
+        let state_machine = storage.get_state_machine().await;
+        state_machine.game_states.get(&game_id).cloned()
+    }
 
     pub async fn propose(&self, request: ClientRequest) -> Result<ClientResponse> {
         let client_request = ClientWriteRequest::new(request);
