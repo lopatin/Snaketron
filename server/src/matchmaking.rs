@@ -4,7 +4,11 @@ use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::{error, info, trace, warn};
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
+use std::sync::Arc;
+use anyhow::Context;
 use tonic::transport::Channel;
+use common::GameState;
+use crate::raft::{ClientRequest, ClientResponse, RaftNode};
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
@@ -48,6 +52,7 @@ struct ServerLoad {
 /// Main matchmaking loop that runs on each server
 pub async fn run_matchmaking_loop(
     pool: PgPool,
+    raft: Arc<RaftNode>,
     server_id: uuid::Uuid,
     cancellation_token: CancellationToken,
 ) {
@@ -89,7 +94,7 @@ pub async fn run_matchmaking_loop(
         });
         
         for game_type in &game_types {
-            match create_adaptive_match(&pool, game_type.clone(), server_id).await {
+            match create_adaptive_match(&pool, raft.clone(), game_type.clone(), server_id).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
@@ -101,7 +106,7 @@ pub async fn run_matchmaking_loop(
                 Ok(None) => {
                     trace!(game_type = ?game_type, "No suitable match found");
                 }
-                Err(e) if is_serialization_error(&e) => {
+                Err(e) if is_serialization_error(&e.into()) => {
                     trace!(game_type = ?game_type, "Serialization conflict, will retry next tick");
                 }
                 Err(e) => {
@@ -132,9 +137,10 @@ async fn update_heartbeat(pool: &PgPool, server_id: uuid::Uuid) -> Result<(), sq
 /// Create an adaptive match using expanding skill ranges
 async fn create_adaptive_match(
     pool: &PgPool,
+    raft: Arc<RaftNode>,
     game_type: serde_json::Value,
     server_id: uuid::Uuid,
-) -> Result<Option<(i32, Vec<i32>)>, sqlx::Error> {
+) -> anyhow::Result<Option<(i32, Vec<i32>)>> {
     let mut tx = pool.begin().await?;
     tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
 
@@ -301,7 +307,7 @@ async fn create_adaptive_match(
 
     if updated != request_ids.len() as u64 {
         tx.rollback().await?;
-        return Err(sqlx::Error::RowNotFound);
+        return Err(sqlx::Error::RowNotFound.into());
     }
 
     // Increment server game count
@@ -316,7 +322,24 @@ async fn create_adaptive_match(
     .execute(&mut *tx)
     .await?;
 
+    // Commit to db
     tx.commit().await?;
+    
+    // Save the game to Raft
+    match raft.propose(ClientRequest::CreateGame {
+        game_id: game_id as u32,
+        game_state: GameState::new(10, 10, None),
+    }).await.context("Failed to save game to raft")? {
+        Ok(ClientResponse::Success) => info!(game_id, "Game created and saved to Raft"),
+        Ok(ClientResponse::Error(msg)) => {
+            warn!(game_id, error = %msg, "Game creation failed in Raft");
+            return Err(anyhow::anyhow!("Raft error: {}", msg));
+        }
+        Err(e) => {
+            error!(game_id, error = %e, "Failed to save game creation to Raft");
+            return Err(e.into());
+        }
+    }
 
     // Log match details
     let avg_mmr = matched_players.iter()

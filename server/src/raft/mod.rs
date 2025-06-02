@@ -3,7 +3,7 @@ pub mod network;
 pub mod state_machine;
 pub mod types;
 
-use async_raft::{Config, Raft, RaftMetrics, raft::ClientWriteRequest, raft::ClientWriteResponse, raft::MembershipConfig, NodeId};
+use async_raft::{Config, Raft, RaftMetrics, raft::ClientWriteRequest, raft::ClientWriteResponse, raft::MembershipConfig, NodeId, ClientWriteError};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
@@ -12,15 +12,18 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, debug};
 
 use crate::game_manager::GameManager;
-use crate::replica_manager::ReplicaManager;
+use crate::replica_manager::{GameReplica, ReplicaManager};
 use tokio::sync::RwLock as TokioRwLock;
-
+use common::GameState;
 pub use storage::GameRaftStorage;
 pub use network::GameRaftNetwork;
 pub use state_machine::{GameStateMachine, StateMachineRequest, StateMachineResponse};
 pub use types::{RaftNodeId, ClientRequest, ClientResponse, StateChangeEvent};
+use crate::game_broker::game_relay;
 
 pub type GameRaft = Raft<ClientRequest, ClientResponse, GameRaftNetwork, GameRaftStorage>;
+
+const CLUSTER_NAME: String = "snaketron".to_string();
 
 /// Track learner progress
 #[derive(Clone, Debug)]
@@ -32,57 +35,38 @@ pub struct LearnerProgress {
 }
 
 pub struct RaftNode {
-    pub id: RaftNodeId,
+    pub id: NodeId,
     pub raft: Arc<GameRaft>,
     pub storage: Arc<GameRaftStorage>,
     pub network: Arc<GameRaftNetwork>,
     pub metrics: Arc<RwLock<RaftMetrics>>,
     /// Track learner nodes and their progress
     learners: Arc<RwLock<HashMap<NodeId, LearnerProgress>>>,
-    /// Broadcast channel for state change events
     state_change_tx: broadcast::Sender<StateChangeEvent>,
 }
 
 impl RaftNode {
-    pub async fn new(
-        id: String,
-        game_manager: Arc<TokioRwLock<GameManager>>,
-        replica_manager: Arc<ReplicaManager>,
-        initial_members: Vec<RaftNodeId>,
-    ) -> Result<Self> {
-        let node_id = RaftNodeId(id.clone());
+    pub async fn new(node_id: NodeId, initial_members: Vec<NodeId>) -> Result<Self> {
+        // Event sender
+        let (state_change_tx, _) = broadcast::channel(1024);
         
-        // Parse string ID to u64 for Raft
-        let raft_id = id.parse::<u64>().unwrap_or_else(|_| {
-            // Use hash of string as fallback
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            id.hash(&mut hasher);
-            hasher.finish()
-        });
+        // Create the storage layer
+        let storage = Arc::new(GameRaftStorage::new(node_id, state_change_tx.clone()));
         
-        // Create storage
-        let storage = Arc::new(GameRaftStorage::new(
-            node_id.clone(),
-            game_manager.clone(),
-            replica_manager.clone(),
-        ));
-        
-        // Create network layer
-        let network = Arc::new(GameRaftNetwork::new(node_id.clone()));
+        // Create the network layer
+        let network = Arc::new(GameRaftNetwork::new(node_id));
         
         // Configure Raft
-        let config = Arc::new(Config::build(id.clone())
+        let config = Arc::new(Config::build(CLUSTER_NAME)
             .election_timeout_min(150)
             .election_timeout_max(300)
             .heartbeat_interval(50)
             .max_payload_entries(500)
             .validate()?);
         
-        // Create Raft instance
+        // Create the Raft instance
         let raft = Arc::new(Raft::new(
-            raft_id,
+            node_id,
             config,
             network.clone(),
             storage.clone(),
@@ -91,18 +75,12 @@ impl RaftNode {
         // Initialize if this is the first node
         if initial_members.len() == 1 && initial_members[0] == node_id {
             let members: HashSet<u64> = initial_members.iter()
-                .map(|n| n.0.parse::<u64>().unwrap_or(0))
+                .map(|n| n.parse::<u64>().unwrap_or(0))
                 .collect();
             raft.initialize(members).await?;
         }
         
         let metrics = Arc::new(RwLock::new(raft.metrics().borrow().clone()));
-        
-        // Create broadcast channel for state changes
-        let (state_change_tx, _) = broadcast::channel(1024);
-        
-        // Connect the event sender to the storage/state machine
-        storage.set_event_sender(state_change_tx.clone()).await;
         
         Ok(Self {
             id: node_id,
@@ -124,15 +102,30 @@ impl RaftNode {
         let metrics = self.raft.metrics();
         metrics.borrow().current_leader
     }
-    
+
+    pub async fn subscribe_state_events(&self) -> broadcast::Receiver<StateChangeEvent> {
+        self.state_change_tx.subscribe()
+    }
+
     pub async fn propose(&self, request: ClientRequest) -> Result<ClientResponse> {
         let client_request = ClientWriteRequest::new(request);
         match self.raft.client_write(client_request).await {
             Ok(response) => Ok(response.data),
+            Err(ClientWriteError::ForwardToLeader(data, leader)) => {
+                if let Some(leader_id) = leader {
+                    info!("Forwarding request to leader {}: {:?}", leader_id, data);
+                    let mut leader_node = self.network.get_client(leader_id).await
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("No connection to leader {}", leader_id))?;
+                    Ok(ClientResponse::from(leader_node.raft_propose(data).await?))
+                } else {
+                    Err(anyhow::anyhow!("No leader available to forward request"))
+                }
+            },
             Err(e) => Err(anyhow::anyhow!("Failed to propose to Raft: {}", e)),
         }
     }
-    
+   
     /// Add a new node as a learner (non-voting member)
     pub async fn add_learner(&self, node_id: String, addr: String) -> Result<()> {
         let raft_id = node_id.parse::<u64>().unwrap_or_else(|_| {
@@ -218,14 +211,9 @@ impl RaftNode {
         }
     }
     
-    // Deprecated: Use add_learner for safer cluster expansion
-    pub async fn add_node(&self, node_id: RaftNodeId, addr: String) -> Result<()> {
-        self.add_learner(node_id.0, addr).await
-    }
-    
     /// Subscribe to state change events
     pub async fn subscribe_state_changes(&self) -> broadcast::Receiver<StateChangeEvent> {
-        self.state_change_tx.subscribe()
+        self.storage
     }
     
     /// Emit a state change event (called by the state machine)
@@ -238,6 +226,7 @@ impl RaftNode {
     pub fn get_state_change_sender(&self) -> broadcast::Sender<StateChangeEvent> {
         self.state_change_tx.clone()
     }
+
     
     pub async fn remove_node(&self, node_id: RaftNodeId) -> Result<()> {
         let raft_id = node_id.0.parse::<u64>().unwrap_or(0);
@@ -250,5 +239,9 @@ impl RaftNode {
         self.raft.change_membership(members).await?;
         self.network.remove_peer(raft_id).await;
         Ok(())
+    }
+    
+    pub fn get_game_state(&self, game_id: u32) -> Option<&GameState> {
+        self.storage
     }
 }

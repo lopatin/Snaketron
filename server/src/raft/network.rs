@@ -1,10 +1,7 @@
-use async_raft::{
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    },
-    RaftNetwork,
-};
+use async_raft::{raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+    InstallSnapshotResponse, VoteRequest, VoteResponse,
+}, NodeId, RaftNetwork};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,12 +19,12 @@ use crate::game_broker::game_relay::{
 use super::types::{ClientRequest, RaftNodeId};
 
 pub struct GameRaftNetwork {
-    node_id: RaftNodeId,
+    node_id: NodeId,
     connections: Arc<RwLock<HashMap<u64, GameRelayClient<Channel>>>>,
 }
 
 impl GameRaftNetwork {
-    pub fn new(node_id: RaftNodeId) -> Self {
+    pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -53,7 +50,7 @@ impl GameRaftNetwork {
         debug!("Removed Raft peer {}", node_id);
     }
     
-    async fn get_client(&self, target: u64) -> Option<GameRelayClient<Channel>> {
+    pub(crate) async fn get_client(&self, target: u64) -> Option<GameRelayClient<Channel>> {
         let connections = self.connections.read().await;
         connections.get(&target).cloned()
     }

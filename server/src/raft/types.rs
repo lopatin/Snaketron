@@ -1,72 +1,40 @@
 use serde::{Deserialize, Serialize};
-use async_raft::{AppData, AppDataResponse};
-use common::GameState;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum GameDiscoveryStatus {
-    Discovered,      // Found in DB, pending Raft submission
-    Submitted,       // Submitted to Raft
-    Assigned,        // Raft assigned to a server
-    Started,         // Game actually started
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct RaftNodeId(pub String);
-
-impl From<String> for RaftNodeId {
-    fn from(s: String) -> Self {
-        RaftNodeId(s)
-    }
-}
+use async_raft::{AppData, AppDataResponse, NodeId};
+use tonic::IntoRequest;
+use common::{GameCommandMessage, GameEventMessage, GameState};
+use crate::game_broker::game_relay::RaftProposeRequest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientRequest {
-    // Game state updates
-    UpdateGameState {
-        game_id: u32,
-        state: GameState,
-        tick: u32,
-    },
-    
-    // Authority transfers
-    TransferAuthority {
-        game_id: u32,
-        from_server: String,
-        to_server: String,
-        reason: String,
-    },
-    
-    // Game lifecycle
     CreateGame {
         game_id: u32,
-        initial_state: GameState,
-        authority_server: String,
-        players: Vec<u32>,
-        discovery_source: String,
-        discovered_at: i64,
+        game_state: GameState,
     },
     
-    DeleteGame {
+    StartGame {
         game_id: u32,
-        reason: String,
+        server_id: u64,
     },
     
-    // Service registry
+    ProcessGameEvent(GameEventMessage),
+
     RegisterServer {
-        server_id: String,
-        host: String,
-        port: u16,
+        server_id: u64,
+        hostname: String,
         grpc_port: u16,
-        max_capacity: u32,
-    },
-    
-    UpdateServerHeartbeat {
-        server_id: String,
     },
     
     RemoveServer {
-        server_id: String,
+        server_id: u64,
     },
+}
+
+impl IntoRequest<RaftProposeRequest> for ClientRequest {
+    fn into_request(self) -> Result<tonic::Request<RaftProposeRequest>, tonic::Status> {
+        let client_request = bincode::serde::encode_to_vec(&self, bincode::config::standard())
+            .map_err(|e| tonic::Status::internal(format!("Serialization error: {}", e)))?;
+        Ok(tonic::Request::new(RaftProposeRequest { client_request }))
+    }
 }
 
 // Implement the AppData trait for ClientRequest
@@ -75,8 +43,7 @@ impl AppData for ClientRequest {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientResponse {
     Success,
-    GameStateUpdated { version: u64 },
-    AuthorityTransferred { new_authority: String },
+    GameJoined { game_id: u32, user_id: u32, snake_id: u32 },
     GameCreated { game_id: u32 },
     GameDeleted,
     ServerRegistered,
@@ -85,33 +52,28 @@ pub enum ClientResponse {
     Error(String),
 }
 
+impl From<Vec<u8>> for ClientResponse {
+    fn from(bytes: Vec<u8>) -> Self {
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap().0
+    }
+}
+
 // Implement the AppDataResponse trait for ClientResponse
 impl AppDataResponse for ClientResponse {}
 
 // State change events emitted by the state machine
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StateChangeEvent {
-    GameAssigned {
+    GameCreated {
         game_id: u32,
-        authority: String,
-        players: Vec<u32>,
     },
-    GameStateUpdated {
-        game_id: u32,
-        version: u64,
-    },
-    AuthorityTransferred {
-        game_id: u32,
-        from: String,
-        to: String,
-    },
-    GameDeleted {
-        game_id: u32,
+    GameEvent {
+        event: GameEventMessage,
     },
     ServerRegistered {
-        server_id: String,
+        server_id: u64,
     },
     ServerRemoved {
-        server_id: String,
+        server_id: u64,
     },
 }

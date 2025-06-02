@@ -1,12 +1,12 @@
 use std::time::Duration;
-use common::{GameCommandMessage, GameEventMessage, GameEngine, GameState, server_process_incoming_command, GameCommand, GameEvent};
+use common::{GameCommandMessage, GameEventMessage, GameEngine, GameState, GameCommand, GameEvent};
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use std::sync::Arc;
 use crate::game_broker::GameMessageBroker;
 use crate::replica_manager::{ReplicaManager, ReplicationCommand};
 use tracing::{debug, info, warn, error};
-
+use crate::raft::{ClientRequest, RaftNode};
 
 pub struct GameManager {
     broker: Arc<dyn GameMessageBroker>,
@@ -31,18 +31,18 @@ impl GameManager {
     pub async fn start_game(&mut self, id: u32) -> Result<()> {
         info!("GameManager: start_game called for game {}", id);
         
-        // Check if game channels already exist (game is actually running)
-        // We need to try subscribing to see if channels exist
-        match self.broker.subscribe_events(id).await {
-            Ok(_) => {
-                info!("GameManager: Game {} already has channels, skipping start", id);
-                return Ok(()); // Game already running
-            }
-            Err(_) => {
-                info!("GameManager: Game {} channels don't exist, starting game", id);
-                // Continue with starting the game
-            }
-        }
+        // // Check if game channels already exist (game is actually running)
+        // // We need to try subscribing to see if channels exist
+        // match self.broker.subscribe_events(id).await {
+        //     Ok(_) => {
+        //         info!("GameManager: Game {} already has channels, skipping start", id);
+        //         return Ok(()); // Game already running
+        //     }
+        //     Err(_) => {
+        //         info!("GameManager: Game {} channels don't exist, starting game", id);
+        //         // Continue with starting the game
+        //     }
+        // }
         
         // Create the game engine
         let start_ms = chrono::Utc::now().timestamp_millis();
@@ -81,6 +81,7 @@ impl GameManager {
     
     async fn run_game_loop(
         game_id: u32,
+        raft: &RaftNode,
         mut engine: GameEngine,
         mut cmd_rx: broadcast::Receiver<GameCommandMessage>,
         event_broker: Arc<dyn GameMessageBroker>,
@@ -88,91 +89,16 @@ impl GameManager {
         replica_manager: Option<Arc<ReplicaManager>>,
         server_id: String,
     ) {
-        let mut game_version: u64 = 0;
-        let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
-        let mut snapshot_broadcast_interval = tokio::time::interval(Duration::from_secs(5)); // Broadcast snapshot every 5 seconds
-        snapshot_broadcast_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
         info!("GameManager: run_game_loop called for game {}", game_id);
         
-        // Send initial snapshot immediately
-        let initial_snapshot = engine.get_committed_state().clone();
-        let initial_event = GameEventMessage {
-            game_id,
-            tick: initial_snapshot.tick,
-            user_id: None,
-            event: GameEvent::Snapshot { game_state: initial_snapshot },
-        };
-        info!("GameManager: Publishing initial snapshot for game {}", game_id);
-        if let Err(e) = event_broker.publish_event(game_id, initial_event).await {
-            warn!(game_id, error = %e, "Failed to send initial game snapshot");
-        } else {
-            info!(game_id, "Successfully sent initial game snapshot");
-        }
-        
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
         loop {
             tokio::select! {
-                // Handle snapshot requests
-                Some(response_tx) = snapshot_rx.recv() => {
-                    // Get current committed state
-                    let snapshot = engine.get_committed_state().clone();
-                    let _ = response_tx.send(snapshot);
-                }
-                
-                // Periodic snapshot broadcast for distributed servers
-                _ = snapshot_broadcast_interval.tick() => {
-                    // Only broadcast if we have the GameBroker (for distributed support)
-                    if let Some(game_broker) = event_broker.as_any().downcast_ref::<crate::game_broker::GameBroker>() {
-                        let snapshot = engine.get_committed_state().clone();
-                        let _ = game_broker.broadcast_snapshot(game_id, snapshot).await;
-                    }
-                }
-                
-                // Handle game tick
                 _ = interval.tick() => {
-                    let mut state_changed = false;
-                    
-                    // Process all pending commands
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        // Check if this is a snapshot request
-                        if matches!(cmd.command, GameCommand::RequestSnapshot) {
-                            info!(game_id, "Processing RequestSnapshot command");
-                            // Send snapshot event
-                            let snapshot = engine.get_committed_state().clone();
-                            let snapshot_event = GameEventMessage {
-                                game_id,
-                                tick: snapshot.tick,
-                                user_id: None,
-                                event: GameEvent::Snapshot { game_state: snapshot },
-                            };
-                            if let Err(e) = event_broker.publish_event(game_id, snapshot_event).await {
-                                error!(game_id, error = %e, "Failed to publish snapshot");
-                                break;
-                            } else {
-                                info!(game_id, "Published snapshot in response to RequestSnapshot");
-                            }
-                        } else {
-                            let events = server_process_incoming_command(&mut engine, cmd);
-                            if !events.is_empty() {
-                                state_changed = true;
-                            }
-                            for event in events {
-                                // Broadcast event through broker
-                                if event_broker.publish_event(game_id, event).await.is_err() {
-                                    // Error publishing event
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Run game tick
+                    // Run game ticks
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     match engine.run_until(now_ms) {
                         Ok(events) => {
-                            if !events.is_empty() {
-                                state_changed = true;
-                            }
                             for event in events {
                                 let event_msg = GameEventMessage {
                                     game_id,
@@ -180,9 +106,12 @@ impl GameManager {
                                     user_id: None,
                                     event,
                                 };
-                                if event_broker.publish_event(game_id, event_msg).await.is_err() {
-                                    // Error publishing event
-                                    break;
+                                
+                                if let Err(e) = raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await
+                                        .expect("Failed to propose game event") {
+                                    warn!(game_id, error = %e, "Failed to publish game event");
+                                } else {
+                                    debug!(game_id, "Published game event: {:?}", event_msg);
                                 }
                             }
                         }
@@ -190,39 +119,18 @@ impl GameManager {
                             eprintln!("Error running game tick: {:?}", e);
                         }
                     }
-                    
-                    // Send replication event if state changed
-                    if state_changed {
-                        if let Some(ref replica_manager) = replica_manager {
-                            game_version += 1;
-                            let state = engine.get_committed_state().clone();
-                            let tick = engine.current_tick();
-                            
-                            let replication_cmd = ReplicationCommand::UpdateGameState {
-                                game_id,
-                                state,
-                                version: game_version,
-                                tick,
-                                source_server: server_id.clone(),
-                            };
-                            
-                            if let Err(e) = replica_manager.get_replication_sender().send(replication_cmd).await {
-                                warn!("Failed to send replication command: {}", e);
-                            }
-                        }
-                    }
                 }
             }
         }
     }
 
-    pub async fn join_game(
-        &self,
-        game_id: u32,
-    ) -> Result<(mpsc::Sender<GameCommandMessage>, broadcast::Receiver<GameEventMessage>)> {
-        let handle = self.broker.join_game(game_id).await?;
-        Ok((handle.command_tx, handle.event_rx))
-    }
+    // pub async fn join_game(
+    //     &self,
+    //     game_id: u32,
+    // ) -> Result<(mpsc::Sender<GameCommandMessage>, broadcast::Receiver<GameEventMessage>)> {
+    //     let handle = self.broker.join_game(game_id).await?;
+    //     Ok((handle.command_tx, handle.event_rx))
+    // }
     
     pub async fn get_game_snapshot(&self, game_id: u32) -> Result<GameState> {
         // Use the unified game handle for snapshot requests

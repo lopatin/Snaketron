@@ -1,8 +1,9 @@
 use anyhow::Result;
-use common::GameState;
+use common::{GameEventMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use async_raft::NodeId;
 use tracing::{debug, error, info, warn};
 use tokio::sync::broadcast;
 
@@ -20,13 +21,9 @@ pub struct StateMachineSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerRegistration {
-    pub server_id: String,
-    pub host: String,
-    pub port: u16,
+    pub server_id: u64,
+    pub hostname: String,
     pub grpc_port: u16,
-    pub max_capacity: u32,
-    #[serde(skip, default = "std::time::Instant::now")]
-    pub last_heartbeat: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,159 +37,125 @@ pub enum StateMachineResponse {
 }
 
 pub struct GameStateMachine {
-    node_id: RaftNodeId,
-    game_manager: Arc<TokioRwLock<GameManager>>,
-    replica_manager: Arc<ReplicaManager>,
-    
-    // Application state
-    last_applied_index: Option<u64>,
-    server_registry: HashMap<String, ServerRegistration>,
-    
-    // Event emitter
-    event_tx: Option<broadcast::Sender<StateChangeEvent>>,
+    node_id: NodeId,
+    game_states: HashMap<u32, GameState>,
+    servers: HashMap<u64, ServerRegistration>,
+    event_tx: broadcast::Sender<StateChangeEvent>,
 }
 
 impl GameStateMachine {
-    pub fn new(
-        node_id: RaftNodeId,
-        game_manager: Arc<TokioRwLock<GameManager>>,
-        replica_manager: Arc<ReplicaManager>,
-    ) -> Self {
+    pub fn new(node_id: NodeId, event_tx: broadcast::Sender<StateChangeEvent>) -> Self {
         Self {
             node_id,
-            game_manager,
-            replica_manager,
-            last_applied_index: None,
-            server_registry: HashMap::new(),
-            event_tx: None,
+            game_states: HashMap::new(),
+            servers: HashMap::new(),
+            event_tx,
         }
     }
-    
-    /// Set the event sender for state change notifications
-    pub fn set_event_sender(&mut self, tx: broadcast::Sender<StateChangeEvent>) {
-        self.event_tx = Some(tx);
-    }
-    
-    /// Emit a state change event
-    fn emit_event(&self, event: StateChangeEvent) {
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.send(event);
-        }
-    }
-    
-    pub fn last_applied_log(&self) -> Option<u64> {
-        self.last_applied_index
-    }
-    
+
     pub async fn apply(&mut self, index: &u64, request: &ClientRequest) -> Result<ClientResponse> {
         debug!("Applying request at index {}: {:?}", index, request);
         
         let response = match request {
-            ClientRequest::UpdateGameState { game_id, state, tick } => {
-                self.apply_game_state_update(*game_id, state.clone(), *tick).await?
+            ClientRequest::CreateGame { game_id, game_state } => {
+                // Check if the game already exists
+                if self.game_states.contains_key(game_id) {
+                    warn!("Game {} already exists, ignoring create request", game_id);
+                    return Ok(ClientResponse::Error(format!("Game {} already exists", game_id)));
+                }
+                
+                // Insert the new game state
+                self.game_states.insert(*game_id, game_state.clone());
+                
+                // Emit event
+                self.emit_event(StateChangeEvent::GameCreated { game_id: *game_id });
+                
+                ClientResponse::Success
             }
             
-            ClientRequest::TransferAuthority { game_id, from_server, to_server, reason } => {
-                self.apply_authority_transfer(*game_id, from_server.clone(), to_server.clone(), reason.clone()).await?
+            ClientRequest::StartGame { game_id, server_id } => {
+                if let Some(game_state) = self.game_states.get_mut(game_id) {
+                    match *game_state.status {
+                        GameStatus::Stopped => {
+                            game_state.status = GameStatus::Started { server_id };
+                            ClientResponse::Success
+                        }
+                        other => {
+                            warn!("Attempted to start game {} which is not stopped (current status: {:?})", game_id, other);
+                            ClientResponse::Error(format!("Game {} is not stopped", game_id));
+                        }
+                    }
+                } else {
+                    warn!("Attempted to start unknown game {}", game_id);
+                    ClientResponse::Error(format!("Unknown game ID: {}", game_id))
+                }
             }
             
-            ClientRequest::CreateGame { game_id, initial_state, authority_server, players, discovery_source, discovered_at } => {
-                self.apply_create_game(*game_id, initial_state.clone(), authority_server.clone(), players.clone(), discovery_source.clone(), *discovered_at).await?
+            ClientRequest::ProcessGameEvent(event) => {
+                if let Some(game_state) = self.game_states.get_mut(*event.game_id) {
+                    // Process the game event
+                    game_state.apply_event(*event.event, None);
+                    
+                    // Emit event
+                    self.emit_event(StateChangeEvent::GameEvent { event: event.clone() });
+                    
+                    ClientResponse::Success
+                } else {
+                    warn!("Received game event for unknown game {}", event.game_id);
+                    ClientResponse::Error(format!("Unknown game ID: {}", event.game_id))
+                }
             }
             
-            ClientRequest::DeleteGame { game_id, reason } => {
-                self.apply_delete_game(*game_id, reason.clone()).await?
-            }
-            
-            ClientRequest::RegisterServer { server_id, host, port, grpc_port, max_capacity } => {
-                self.apply_register_server(
-                    server_id.clone(),
-                    host.clone(),
-                    *port,
-                    *grpc_port,
-                    *max_capacity
-                ).await?
-            }
-            
-            ClientRequest::UpdateServerHeartbeat { server_id } => {
-                self.apply_heartbeat(server_id.clone()).await?
+            ClientRequest::RegisterServer { server_id, hostname, grpc_port} => {
+                info!("Registering server {}: {}:{}", server_id, hostname, grpc_port);
+                
+                // Check if the server already exists
+                if self.servers.contains_key(server_id) {
+                    warn!("Server {} is already registered", server_id);
+                    return Ok(ClientResponse::Error(format!("Server {} already registered", server_id)));
+                }
+                
+                // Register the server
+                let registration = ServerRegistration {
+                    server_id: *server_id,
+                    hostname: hostname.clone(),
+                    grpc_port: *grpc_port,
+                };
+                
+                self.servers.insert(*server_id, registration);
+                
+                // Emit state change event
+                self.emit_event(StateChangeEvent::ServerRegistered {
+                    server_id: *server_id,
+                });
+                
+                ClientResponse::ServerRegistered
             }
             
             ClientRequest::RemoveServer { server_id } => {
-                self.apply_remove_server(server_id.clone()).await?
+                if self.servers.remove(server_id).is_some() {
+                    // Emit state change event
+                    match self.event_tx.send(StateChangeEvent::ServerRemoved { server_id: server_id.clone() }) {
+                        Ok(num_receivers) => {
+                            info!("Server {} removed, notified {} receivers", server_id, num_receivers);
+                            ClientResponse::ServerRemoved
+                        }
+                        Err(e) => {
+                            warn!("Failed to notify receivers about server {} removal: {}", server_id, e);
+                            ClientResponse::Error(format!("Failed to notify receivers: {}", e))
+                        }
+                    }
+                } else {
+                    warn!("Attempted to remove unknown server {}", server_id);
+                    ClientResponse::Error(format!("Unknown server ID: {}", server_id))
+                }
             }
         };
-        
-        // Update last applied index
-        self.last_applied_index = Some(*index);
         
         Ok(response)
     }
     
-    async fn apply_game_state_update(
-        &self,
-        game_id: u32,
-        state: GameState,
-        tick: u32,
-    ) -> Result<ClientResponse> {
-        // Send to replica manager
-        let command = ReplicationCommand::UpdateGameState {
-            game_id,
-            state: state.clone(),
-            version: tick as u64,
-            tick,
-            source_server: self.node_id.0.clone(),
-        };
-        
-        self.replica_manager
-            .handle_replication_command(command)
-            .await?;
-        
-        // If we're the authority, update game manager
-        if self.game_manager.read().await.is_authority_for(game_id).await {
-            // Game manager handles its own state updates during tick
-            debug!("Game state update applied for game {}", game_id);
-        }
-        
-        Ok(ClientResponse::GameStateUpdated { version: tick as u64 })
-    }
-    
-    async fn apply_authority_transfer(
-        &self,
-        game_id: u32,
-        from_server: String,
-        to_server: String,
-        reason: String,
-    ) -> Result<ClientResponse> {
-        info!(
-            "Applying authority transfer for game {} from {} to {} (reason: {})",
-            game_id, from_server, to_server, reason
-        );
-        
-        let command = ReplicationCommand::UpdateAuthority {
-            game_id,
-            new_authority: to_server.clone(),
-            version: 0, // Version will be set by replica manager
-            reason: reason.clone(),
-        };
-        
-        self.replica_manager
-            .handle_replication_command(command)
-            .await?;
-        
-        // Emit state change event
-        self.emit_event(StateChangeEvent::AuthorityTransferred {
-            game_id,
-            from: from_server.clone(),
-            to: to_server.clone(),
-        });
-        
-        // Note: The GameExecutorService will handle authority transfers
-        // when it receives the AuthorityTransferred event
-        
-        Ok(ClientResponse::AuthorityTransferred { new_authority: to_server })
-    }
-    
+
     async fn apply_create_game(
         &self,
         game_id: u32,
@@ -257,33 +220,31 @@ impl GameStateMachine {
         Ok(ClientResponse::GameDeleted)
     }
     
-    async fn apply_register_server(
-        &mut self,
-        server_id: String,
-        host: String,
-        port: u16,
-        grpc_port: u16,
-        max_capacity: u32,
-    ) -> Result<ClientResponse> {
-        info!("Registering server {}: {}:{}", server_id, host, port);
-        
-        self.server_registry.insert(server_id.clone(), ServerRegistration {
-            server_id: server_id.clone(),
-            host,
-            port,
-            grpc_port,
-            max_capacity,
-            last_heartbeat: std::time::Instant::now(),
-        });
-        
-        // Emit state change event
-        self.emit_event(StateChangeEvent::ServerRegistered {
-            server_id,
-        });
-        
-        Ok(ClientResponse::ServerRegistered)
-    }
-    
+    // async fn apply_register_server(
+    //     &mut self,
+    //     server_id: u64,
+    //     hostname: String,
+    //     grpc_port: u16,
+    // ) -> Result<ClientResponse> {
+    //     info!("Registering server {}: {}:{}", server_id, hostname, grpc_port);
+    //     
+    //     self.servers.insert(server_id.clone(), ServerRegistration {
+    //         server_id: server_id.clone(),
+    //         host,
+    //         port,
+    //         grpc_port,
+    //         max_capacity,
+    //         last_heartbeat: std::time::Instant::now(),
+    //     });
+    //     
+    //     // Emit state change event
+    //     self.emit_event(StateChangeEvent::ServerRegistered {
+    //         server_id,
+    //     });
+    //     
+    //     Ok(ClientResponse::ServerRegistered)
+    // }
+    // 
     async fn apply_heartbeat(&mut self, server_id: String) -> Result<ClientResponse> {
         if let Some(server) = self.server_registry.get_mut(&server_id) {
             server.last_heartbeat = std::time::Instant::now();

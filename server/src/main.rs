@@ -66,8 +66,7 @@ async fn main() -> Result<()> {
     let ws_port = env::var("SNAKETRON_WS_PORT").unwrap_or_else(|_| "8080".to_string());
     let ws_addr = format!("0.0.0.0:{}", ws_port);
     
-    let grpc_addr = env::var("SNAKETRON_GRPC_PORT").ok()
-        .map(|port| format!("0.0.0.0:{}", port));
+    let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
     // Create JWT verifier
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;

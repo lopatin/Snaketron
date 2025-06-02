@@ -112,43 +112,43 @@ impl GameDiscoveryService {
         Ok(())
     }
     
-    async fn submit_game_to_raft(&self, raft_node: &Arc<RaftNode>, game: WaitingGame) -> Result<()> {
-        debug!("Submitting game {} to Raft for consensus", game.id);
-        
-        // Select authority server based on assignment or load balancing
-        let authority = self.select_authority(&game).await?;
-        
-        // Create initial game state
-        let initial_state = GameState::new(40, 30, None);
-        
-        // Convert player IDs to u32
-        let players: Vec<u32> = game.player_ids.iter().map(|&id| id as u32).collect();
-        
-        // Create Raft command
-        let command = ClientRequest::CreateGame {
-            game_id: game.id as u32,
-            initial_state,
-            authority_server: authority,
-            players: players.clone(),
-            discovery_source: self.server_id.clone(),
-            discovered_at: Utc::now().timestamp(),
-        };
-        
-        // Submit to Raft
-        match raft_node.propose(command).await {
-            Ok(_) => {
-                info!("Successfully submitted game {} to Raft", game.id);
-                // Mark as discovered
-                self.discovered_games.write().await.insert(game.id as u32);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to propose game {} to Raft: {}", game.id, e);
-                Err(e)
-            }
-        }
-    }
-    
+    // async fn submit_game_to_raft(&self, raft_node: &Arc<RaftNode>, game: WaitingGame) -> Result<()> {
+    //     debug!("Submitting game {} to Raft for consensus", game.id);
+    //     
+    //     // Select authority server based on assignment or load balancing
+    //     let authority = self.select_authority(&game).await?;
+    //     
+    //     // Create initial game state
+    //     let initial_state = GameState::new(40, 30, None);
+    //     
+    //     // Convert player IDs to u32
+    //     let players: Vec<u32> = game.player_ids.iter().map(|&id| id as u32).collect();
+    //     
+    //     // Create Raft command
+    //     // let command = ClientRequest::CreateGame {
+    //     //     game_id: game.id as u32,
+    //     //     initial_state,
+    //     //     authority_server: authority,
+    //     //     players: players.clone(),
+    //     //     discovery_source: self.server_id.clone(),
+    //     //     discovered_at: Utc::now().timestamp(),
+    //     // };
+    //     // 
+    //     // Submit to Raft
+    //     match raft_node.propose(command).await {
+    //         Ok(_) => {
+    //             info!("Successfully submitted game {} to Raft", game.id);
+    //             // Mark as discovered
+    //             self.discovered_games.write().await.insert(game.id as u32);
+    //             Ok(())
+    //         }
+    //         Err(e) => {
+    //             error!("Failed to propose game {} to Raft: {}", game.id, e);
+    //             Err(e)
+    //         }
+    //     }
+    // }
+    // 
     async fn select_authority(&self, game: &WaitingGame) -> Result<String> {
         // If a server was already assigned in the database, use it
         if let Some(server_id) = &game.server_id {

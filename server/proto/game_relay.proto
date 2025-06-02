@@ -30,6 +30,18 @@ service GameRelay {
   // Learner management
   rpc RequestJoinAsLearner(JoinAsLearnerRequest) returns (JoinAsLearnerResponse);
   rpc RequestPromotion(PromotionRequest) returns (PromotionResponse);
+  
+  rpc RaftPropose(RaftProposeRequest) returns (RaftProposeResponse);
+}
+
+message RaftProposeRequest {
+  bytes client_request = 1; // Serialized ClientRequest
+}
+
+message RaftProposeResponse {
+  bytes client_response = 1; // Serialized ClientResponse
+  bool success = 2;
+  optional string error = 3; // Error message if not successful
 }
 
 message GameMessage {
@@ -40,6 +52,10 @@ message GameMessage {
     Unsubscribe unsubscribe = 4;
     GameSnapshot snapshot = 5;
   }
+}
+
+message GameCommandMessage {
+  bytes command_data = 4; // Bincode-serialized common::GameCommandMessage
 }
 
 message GameCommand {

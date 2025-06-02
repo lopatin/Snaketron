@@ -1,198 +1,141 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::collections::HashSet;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
 use sqlx::PgPool;
-
+use common::GameEvent::StatusUpdated;
+use common::{GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus};
 use crate::{
     game_manager::GameManager,
     player_connections::PlayerConnectionManager,
     raft::{RaftNode, StateChangeEvent},
 };
+use crate::game_broker::GameMessageBroker;
+use crate::raft::ClientRequest;
+use crate::replica_manager::ReplicaManager;
 
-/// Service that monitors Raft state changes and executes game operations
-pub struct GameExecutorService {
-    server_id: String,
-    raft_node: Arc<RaftNode>,
-    games_manager: Arc<RwLock<GameManager>>,
-    player_connections: Arc<PlayerConnectionManager>,
-    db_pool: PgPool,
-    /// Track games we've already started to avoid duplicates
-    started_games: Arc<RwLock<HashSet<u32>>>,
-}
 
-impl GameExecutorService {
-    pub fn new(
-        server_id: String,
-        raft_node: Arc<RaftNode>,
-        games_manager: Arc<RwLock<GameManager>>,
-        player_connections: Arc<PlayerConnectionManager>,
-        db_pool: PgPool,
-    ) -> Self {
-        Self {
-            server_id,
-            raft_node,
-            games_manager,
-            player_connections,
-            db_pool,
-            started_games: Arc::new(RwLock::new(HashSet::new())),
-        }
-    }
+/// Create a game engine and run the game loop for a specific game.
+async fn run_game(
+    server_id: u64,
+    game_id: u32,
+    raft: Arc<RaftNode>,
+    cancellation_token: CancellationToken,
+) {
+    info!("run_game called for game {}", game_id);
     
-    /// Run the executor service
-    pub async fn run(&self, cancellation_token: CancellationToken) -> Result<()> {
-        info!("Starting game executor service for server {}", self.server_id);
-        
-        let mut state_rx = self.raft_node.subscribe_state_changes().await;
-        
-        loop {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    info!("Game executor service shutting down");
-                    break;
-                }
-                
-                Ok(event) = state_rx.recv() => {
-                    if let Err(e) = self.handle_state_change(event).await {
-                        error!("Error handling state change: {}", e);
+    // Create the game engine
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let rng_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    
+    let mut engine = GameEngine::new_with_seed(game_id, start_ms, rng_seed);
+    info!("Created game engine for game {}", game_id);
+
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            
+            _ = cancellation_token.cancelled() => {
+                info!("Game loop for game {} shutting down", game_id);
+                break;
+            }
+            
+            _ = interval.tick() => {
+                // Run game ticks
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                match engine.run_until(now_ms) {
+                    Ok(events) => {
+                        for event in events {
+                            let event_msg = GameEventMessage {
+                                game_id,
+                                tick: engine.current_tick(),
+                                user_id: None,
+                                event,
+                            };
+                            
+                            if let Err(e) = raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await
+                                    .expect("Failed to propose game event") {
+                                warn!(game_id, error = %e, "Failed to publish game event");
+                            } else {
+                                debug!(game_id, "Published game event: {:?}", event_msg);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error running game tick: {:?}", e);
                     }
                 }
             }
         }
-        
-        Ok(())
-    }
-    
-    async fn handle_state_change(&self, event: StateChangeEvent) -> Result<()> {
-        match event {
-            StateChangeEvent::GameAssigned { game_id, authority, players } => {
-                if authority == self.server_id {
-                    // This server has been assigned the game
-                    self.start_game_locally(game_id, players).await?;
-                }
-                
-                // Update database status for all servers
-                self.update_game_status(game_id, "active").await?;
-            }
-            
-            StateChangeEvent::AuthorityTransferred { game_id, from, to } => {
-                if from == self.server_id && to != self.server_id {
-                    // We're transferring authority away
-                    info!("Transferring authority for game {} to {}", game_id, to);
-                    // The GameManager will handle stopping the game
-                } else if to == self.server_id {
-                    // We're receiving authority
-                    info!("Receiving authority for game {} from {}", game_id, from);
-                    // TODO: Implement game takeover logic
-                }
-            }
-            
-            StateChangeEvent::GameDeleted { game_id } => {
-                // Clean up any local resources
-                self.started_games.write().await.remove(&game_id);
-            }
-            
-            _ => {
-                // Other events we don't need to handle here
-            }
-        }
-        
-        Ok(())
-    }
-    
-    async fn start_game_locally(&self, game_id: u32, players: Vec<u32>) -> Result<()> {
-        // Check if we've already started this game
-        {
-            let mut started = self.started_games.write().await;
-            if started.contains(&game_id) {
-                debug!("Game {} already started, skipping", game_id);
-                return Ok(());
-            }
-            started.insert(game_id);
-        }
-        
-        info!("Starting game {} locally with {} players", game_id, players.len());
-        
-        // Start the game through the GameManager
-        match self.games_manager.write().await.start_game(game_id).await {
-            Ok(_) => {
-                info!("Successfully started game {}", game_id);
-                
-                // Notify players that the game has started
-                self.notify_players(game_id, &players).await?;
-            }
-            Err(e) => {
-                error!("Failed to start game {}: {}", game_id, e);
-                // Remove from started set so it can be retried
-                self.started_games.write().await.remove(&game_id);
-                return Err(e.into());
-            }
-        }
-        
-        Ok(())
-    }
-    
-    async fn notify_players(&self, game_id: u32, players: &[u32]) -> Result<()> {
-        // Convert u32 player IDs to i32 for compatibility
-        let player_ids: Vec<i32> = players.iter().map(|&id| id as i32).collect();
-        
-        // Notify players about the match
-        self.player_connections
-            .notify_match_found(&player_ids, game_id)
-            .await;
-        
-        // Get which players are connected locally for logging
-        let local_players = self.player_connections
-            .get_connected_players(&player_ids)
-            .await;
-        
-        if !local_players.is_empty() {
-            info!(
-                "Notified {} local players about game {} starting", 
-                local_players.len(), 
-                game_id
-            );
-        }
-        
-        // Remote players will be notified by their respective servers
-        // when they see the GameAssigned event
-        
-        Ok(())
-    }
-    
-    async fn update_game_status(&self, game_id: u32, status: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE games SET status = $1, updated_at = NOW() WHERE id = $2"
-        )
-        .bind(status)
-        .bind(game_id as i32)
-        .execute(&self.db_pool)
-        .await
-        .context("Failed to update game status")?;
-        
-        debug!("Updated game {} status to '{}'", game_id, status);
-        Ok(())
     }
 }
 
+
 /// Run the game executor service
 pub async fn run_game_executor(
-    server_id: String,
-    raft_node: Arc<RaftNode>,
-    games_manager: Arc<RwLock<GameManager>>,
-    player_connections: Arc<PlayerConnectionManager>,
-    db_pool: PgPool,
+    server_id: u64,
+    raft: Arc<RaftNode>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
-    let executor = GameExecutorService::new(
-        server_id,
-        raft_node,
-        games_manager,
-        player_connections,
-        db_pool,
-    );
-    
-    executor.run(cancellation_token).await
+    info!("Starting game executor for server {}", server_id);
+
+    let mut state_rx = raft.subscribe_state_events().await;
+
+    let try_start_game = |game_id: u32| {
+        tokio::spawn(async move {
+            match raft.propose(ClientRequest::StartGame { game_id, server_id }).await {
+                Ok(response) => {
+                    // Run the game loop here.
+                },
+                Err(e) => error!("Failed to start game {} on server {}: {}", game_id, server_id, e),
+            }
+        });
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            
+            _ = cancellation_token.cancelled() => {
+                info!("Game executor service shutting down");
+                break;
+            }
+            
+            Ok(event) = state_rx.recv() => {
+                match event {
+                    StateChangeEvent::GameCreated { game_id } => {
+                        try_start_game(game_id);
+                    }
+                    
+                    StateChangeEvent::GameEvent { event } => {
+                        match event.event {
+                            StatusUpdated { status: GameStatus::Stopped } => {
+                                try_start_game(event.game_id);
+                            }
+                            
+                            _ => {
+                                // Handle other game events
+                                debug!("Received game event: {:?}", event);
+                            }
+                        }
+                    }
+                    
+                    _ => {
+                        // Handle other state changes
+                        debug!("Received state change event: {:?}", event);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

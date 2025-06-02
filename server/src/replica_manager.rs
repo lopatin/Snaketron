@@ -12,11 +12,8 @@ use tracing::{debug, error, info, warn};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameReplica {
     pub game_id: u32,
+    pub server_id: u32,
     pub state: GameState,
-    pub version: u64,
-    pub authority_server: String,
-    #[serde(skip, default = "Instant::now")]
-    pub last_update: Instant,
     pub tick: u32,
 }
 

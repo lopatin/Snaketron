@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage};
 use crate::game_manager::GameManager;
+use crate::raft::RaftNode;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum WSMessage {
@@ -503,11 +504,10 @@ async fn process_ws_message(
 
 pub async fn run_websocket_server(
     addr: &str,
-    games_manager: Arc<RwLock<GameManager>>,
+    raft: Arc<RaftNode>,
     db_pool: PgPool,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -791,73 +791,55 @@ async fn handle_websocket_connection(
 }
 
 
-pub async fn register_server(pool: &PgPool, _region: &str) -> Result<Uuid> {
+pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) -> Result<u64> {
     info!("Registering server instance");
-    
-    let server_id = Uuid::new_v4();
-    let address = "127.0.0.1:8080"; // In production, this would be the actual server address
 
     // Insert a new record and return the generated ID
-    sqlx::query(
+    let id: u64 = sqlx::query_scalar(
         r#"
-        INSERT INTO servers (id, address, last_heartbeat, current_game_count, max_game_capacity)
-        VALUES ($1, $2, NOW(), 0, 100)
+        INSERT INTO servers (grpc_address, last_heartbeat, region, created_at)
+        VALUES ($1, NULL, $3, $4)
+        RETURNING id
         "#
     )
-        .bind(server_id)
-        .bind(address)
+        .bind(grpc_address)
+        .bind(region)
+        .bind(Utc::now())
         .execute(pool)
         .await
         .context("Failed to register server in database")?;
 
-    info!(?server_id, address, "Server registered successfully");
-    Ok(server_id)
+    info!(?id, "Server registered with ID: {}", id);
+    Ok(id)
 }
 
-pub async fn run_heartbeat_loop(
-    pool: PgPool,
-    server_id: Uuid,
-    cancellation_token: CancellationToken
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-    info!(?server_id, "Starting heartbeat loop");
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                info!(?server_id, "Heartbeat shutdown received");
-                break;
-            }
-
-            _ = interval.tick() => {
-                let now = Utc::now();
-
-                match sqlx::query(
-                    r#"
-                    UPDATE servers
-                    SET last_heartbeat = $1
-                    WHERE id = $2
-                    "#
-                )
-                    .bind::<DateTime<Utc>>(now)
-                    .bind(server_id)
-                    .execute(&pool)
-                    .await
-                {
-                    Ok(result) => {
-                        if result.rows_affected() == 1 {
-                            trace!(?server_id, timestamp = %now, "Heartbeat sent successfully.");
-                        } else {
-                            warn!(?server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
-                        }
-                    }
-                    Err(e) => {
-                        error!(?server_id, error = %e, "Failed to send heartbeat");
-                    }
-                }
-            }
-        }
+pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, String)>> {
+    info!("Discovering peers in region: {}", region);
+    
+    let now = Utc::now();
+    
+    // Query to find all servers in the specified region
+    let servers = sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT id, grpc_address FROM servers
+        WHERE region = $1 AND last_heartbeat > $2 - INTERVAL '30 seconds'
+        "#
+    )
+    .bind(region)
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch server records")?;
+    
+    if servers.is_empty() {
+        warn!("No servers found in region: {}", region);
+        return Ok(vec![]);
     }
+    
+    info!("Found {} servers in region {}: {:?}", servers.len(), region, servers);
+    Ok(servers.into_iter()
+        .map(|(id, address)| (id as u64, address))
+        .collect())
 }
+
 

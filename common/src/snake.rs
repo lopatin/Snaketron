@@ -24,6 +24,12 @@ impl Position {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Player {
+    pub user_id: u32,
+    pub snake_id: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Snake {
     /// `body` is a compressed representation of the snake.
     /// It contains the head, turns, and tail positions.

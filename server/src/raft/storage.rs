@@ -1,8 +1,4 @@
-use async_raft::{
-    storage::{CurrentSnapshotData, HardState, InitialState},
-    raft::{Entry, EntryPayload, MembershipConfig},
-    RaftStorage,
-};
+use async_raft::{storage::{CurrentSnapshotData, HardState, InitialState}, raft::{Entry, EntryPayload, MembershipConfig}, RaftStorage, NodeId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -125,7 +121,7 @@ impl AsyncSeek for InMemorySnapshotReader {
 
 #[derive(Clone)]
 pub struct GameRaftStorage {
-    node_id: RaftNodeId,
+    node_id: NodeId,
     
     // Raft persistent state
     current_term: Arc<RwLock<u64>>,
@@ -144,35 +140,17 @@ pub struct GameRaftStorage {
 }
 
 impl GameRaftStorage {
-    pub fn new(
-        node_id: RaftNodeId,
-        game_manager: Arc<TokioRwLock<GameManager>>,
-        replica_manager: Arc<ReplicaManager>,
-    ) -> Self {
-        let state_machine = Arc::new(RwLock::new(GameStateMachine::new(
-            node_id.clone(),
-            game_manager,
-            replica_manager,
-        )));
-        
-        // Parse node_id to u64 for Raft
-        let raft_node_id = node_id.0.parse::<u64>().unwrap_or(0);
-        
+    pub fn new(node_id: NodeId, event_tx: broadcast::Sender<StateChangeEvent>) -> Self {
         Self {
             node_id,
             current_term: Arc::new(RwLock::new(0)),
             voted_for: Arc::new(RwLock::new(None)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
             snapshots: Arc::new(RwLock::new(BTreeMap::new())),
-            max_snapshots: 3, // Keep last 3 snapshots
-            state_machine,
-            membership: Arc::new(RwLock::new(MembershipConfig::new_initial(raft_node_id))),
+            max_snapshots: 3,
+            state_machine: Arc::new(RwLock::new(GameStateMachine::new(node_id.clone(), event_tx))),
+            membership: Arc::new(RwLock::new(MembershipConfig::new_initial(node_id))),
         }
-    }
-    
-    /// Set the event sender for state change notifications
-    pub async fn set_event_sender(&self, tx: broadcast::Sender<StateChangeEvent>) {
-        self.state_machine.write().await.set_event_sender(tx);
     }
     
     /// Clean up old snapshots, keeping only the most recent ones

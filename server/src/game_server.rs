@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::Duration;
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, trace};
 
 use crate::{
-    ws_server::{register_server, run_heartbeat_loop, run_websocket_server, JwtVerifier},
+    ws_server::{register_server, run_websocket_server, JwtVerifier},
     game_manager::GameManager,
     game_broker::{GameMessageBroker, GameBroker},
     matchmaking::run_matchmaking_loop,
@@ -20,10 +22,10 @@ use crate::{
     service_manager::ServiceManager,
     replica_manager::ReplicaManager,
     authority_transfer::AuthorityTransferManager,
-    raft::{RaftNode, RaftNodeId},
+    raft::{RaftNode},
     learner_join::LearnerJoinProtocol,
 };
-
+use crate::ws_server::discover_peers;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -32,19 +34,17 @@ pub struct GameServerConfig {
     /// WebSocket server address (e.g., "127.0.0.1:8080")
     pub ws_addr: String,
     /// gRPC server address for game relay (e.g., "127.0.0.1:50051")
-    pub grpc_addr: Option<String>,
+    pub grpc_addr: String,
     /// Region identifier for the server
     pub region: String,
     /// JWT verifier for authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
-    /// Initial Raft cluster members (empty for first node)
-    pub raft_peers: Vec<String>,
 }
 
 /// A complete game server instance with all components
 pub struct GameServer {
     /// Unique server ID in the database
-    pub server_id: Uuid,
+    pub server_id: u64,
     /// WebSocket server address
     pub ws_addr: String,
     /// gRPC server address (if enabled)
@@ -55,14 +55,6 @@ pub struct GameServer {
     cancellation_token: CancellationToken,
     /// Handles for all spawned tasks
     handles: Vec<JoinHandle<()>>,
-    /// Service manager for cluster topology
-    service_manager: Option<Arc<ServiceManager>>,
-    /// Replica manager for game state replication
-    replica_manager: Option<Arc<ReplicaManager>>,
-    /// Authority transfer manager
-    authority_transfer: Option<Arc<AuthorityTransferManager>>,
-    /// Player connection manager
-    player_connections: Arc<PlayerConnectionManager>,
     /// Raft consensus node
     raft_node: Option<Arc<RaftNode>>,
 }
@@ -76,243 +68,128 @@ impl GameServer {
             grpc_addr,
             region,
             jwt_verifier,
-            raft_peers,
         } = config;
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
-        let server_id = register_server(&db_pool, &region).await
+        let server_id: u64 = register_server(&db_pool, &region).await
             .context("Failed to register server")?;
         info!("Server registered with ID: {}", server_id);
-
+        
         // Create cancellation token for graceful shutdown
         let cancellation_token = CancellationToken::new();
         let mut handles = Vec::new();
 
-        // Start heartbeat loop
-        let heartbeat_pool = db_pool.clone();
-        let heartbeat_server_id = server_id.clone();
-        let heartbeat_token = cancellation_token.clone();
+        // Start the heartbeat loop
         handles.push(tokio::spawn(async move {
-            let _ = run_heartbeat_loop(heartbeat_pool, heartbeat_server_id, heartbeat_token).await;
+            let _ = run_heartbeat_loop(
+                db_pool.clone(), 
+                server_id.clone(), 
+                cancellation_token.clone()
+            ).await;
         }));
-
-        // Create game message broker
-        info!("Creating game broker");
-        let broker: Arc<dyn GameMessageBroker> = Arc::new(GameBroker::new(
-            db_pool.clone(),
-            server_id.to_string(),
-        ));
-
-        // Create player connection manager
-        let player_connections = Arc::new(PlayerConnectionManager::new());
-
-        // Create service manager for cluster topology
-        let service_manager = Arc::new(ServiceManager::new(
-            server_id.to_string(),
-            db_pool.clone(),
-            cancellation_token.clone(),
-        ));
-
-        // Create replica manager for game state replication
-        let replica_manager = Arc::new(ReplicaManager::new(
-            server_id.to_string(),
-            db_pool.clone(),
-            cancellation_token.clone(),
-        ));
-
-        // Create games manager with replica manager
-        let games_manager = Arc::new(RwLock::new(
-            GameManager::new(broker.clone(), server_id.to_string())
-                .with_replica_manager(replica_manager.clone())
-        ));
-
-        // Create authority transfer manager
-        let authority_transfer = Arc::new(AuthorityTransferManager::new(
-            server_id.to_string(),
-            db_pool.clone(),
-            service_manager.clone(),
-            replica_manager.clone(),
-            games_manager.clone(),
-        ));
-        
+       
         // Initialize Raft node
-        let raft_node = if let Some(ref grpc_addr_str) = grpc_addr {
-            info!("Initializing Raft consensus node");
-            
-            let raft_node = if raft_peers.is_empty() {
-                // This is the first node - initialize as leader
-                info!("Starting as first node in cluster");
-                let initial_members = vec![RaftNodeId(server_id.to_string())];
-                Arc::new(
-                    RaftNode::new(
-                        server_id.to_string(),
-                        games_manager.clone(),
-                        replica_manager.clone(),
-                        initial_members,
-                    ).await.context("Failed to create Raft node")?
-                )
-            } else {
-                // Join existing cluster as learner
-                info!("Joining existing cluster as learner");
-                let raft_node = Arc::new(
-                    RaftNode::new(
-                        server_id.to_string(),
-                        games_manager.clone(),
-                        replica_manager.clone(),
-                        vec![], // Start with empty membership, will be added as learner
-                    ).await.context("Failed to create Raft node")?
-                );
-                
-                // Execute join protocol in background
-                let join_protocol = LearnerJoinProtocol::new(
-                    server_id.to_string(),
-                    grpc_addr_str.clone(),
-                    raft_node.clone(),
-                );
-                
-                let join_handle = tokio::spawn(async move {
-                    // Give the gRPC server time to start
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    
-                    match join_protocol.execute_join(raft_peers).await {
-                        Ok(_) => info!("Successfully joined cluster as voting member"),
-                        Err(e) => error!("Failed to join cluster: {}", e),
-                    }
-                });
-                
-                handles.push(join_handle);
-                raft_node
-            };
-            
-            // async-raft manages its own internal timers, no tick needed
-            
-            Some(raft_node)
+        info!("Initializing Raft consensus node");
+        let raft_peers: Vec<String> = discover_peers(&db_pool, &region).await
+            .context("Failed to discover Raft peers")?
+            .map(|(_, addr)| addr);
+        
+        let mut join_as_learner = false;
+        let raft = if raft_peers.is_empty() {
+            info!("Starting as first node in cluster");
+            Arc::new(
+                RaftNode::new(
+                    server_id,
+                    vec![server_id],
+                ).await.context("Failed to create Raft node")?
+            )
         } else {
-            warn!("Raft not initialized: gRPC address not configured");
-            None
+            // Join existing cluster as learner
+            info!("Joining existing cluster as learner");
+            let raft_node = Arc::new(
+                RaftNode::new(
+                    server_id,
+                    vec![], // Start with empty membership, will be added as learner
+                ).await.context("Failed to create Raft node")?
+            );
+            join_as_learner = true;
+            raft_node
         };
 
-        // Start gRPC server if configured
-        if let Some(grpc_addr_str) = &grpc_addr {
-            info!("Starting gRPC server on {}", grpc_addr_str);
+        // Start gRPC server
+        info!("Starting gRPC server on {}", grpc_addr);
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = run_game_relay_server(
+                &grpc_addr.clone(),
+                raft.clone(),
+                server_id,
+                cancellation_token.clone()
+            ).await {
+                error!("Game relay gRPC server error: {}", e);
+            }
+        }));
+        
+        if join_as_learner {
+            // Execute join protocol in the background
+            let join_protocol = LearnerJoinProtocol::new(
+                server_id.to_string(),
+                grpc_addr,
+                raft.clone(),
+            );
             
-            let grpc_broker = broker.clone();
-            let grpc_player_connections = player_connections.clone();
-            let grpc_token = cancellation_token.clone();
-            let grpc_addr_clone = grpc_addr_str.clone();
-            
-            let grpc_raft_node = raft_node.clone();
-            let grpc_server_id = server_id.to_string();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = run_game_relay_server(
-                    &grpc_addr_clone, 
-                    grpc_broker, 
-                    grpc_player_connections, 
-                    grpc_raft_node,
-                    grpc_server_id,
-                    grpc_token
-                ).await {
-                    error!("Game relay gRPC server error: {}", e);
-                }
-            }));
+            // Give the gRPC server time to start
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            join_protocol
+                .execute_join(raft_peers)
+                .await
+                .context("Failed to execute learner join protocol")?;
         }
 
         // Start WebSocket server
-        let ws_games_manager = games_manager.clone();
         let ws_pool = db_pool.clone();
         let ws_token = cancellation_token.clone();
         let ws_addr_clone = ws_addr.clone();
-        let ws_player_connections = player_connections.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
-                ws_games_manager,
+                raft.clone(),
                 ws_pool,
                 ws_token,
                 ws_jwt_verifier,
-                ws_player_connections,
             ).await;
         }));
 
-        // Start matchmaking service
+        // Start the matchmaking service
         info!("Starting matchmaking service");
-        let matchmaking_pool = db_pool.clone();
-        let matchmaking_server_id = server_id.clone();
-        let matchmaking_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             run_matchmaking_loop(
-                matchmaking_pool,
-                matchmaking_server_id,
-                matchmaking_token,
+                db_pool.clone(),
+                raft.clone(),
+                server_id.clone(),
+                cancellation_token.clone(),
             ).await;
         }));
 
-        // Start game discovery service with Raft
-        info!("Starting game discovery service");
-        let discovery_pool = db_pool.clone();
-        let discovery_server_id = server_id.to_string();
-        let discovery_raft_node = raft_node.clone();
-        let discovery_token = cancellation_token.clone();
+        // Start game the execution loop
+        info!("Starting game executor service");
         handles.push(tokio::spawn(async move {
-            if let Err(e) = run_game_discovery_with_raft(
-                discovery_pool,
-                discovery_server_id,
-                discovery_raft_node,
-                discovery_token,
+            if let Err(e) = run_game_executor(
+                server_id,
+                raft.clone(),
+                cancellation_token.clone(),
             ).await {
-                error!("Game discovery service error: {}", e);
+                error!("Game executor service error: {}", e);
             }
         }));
-        
-        // Start game executor service if Raft is enabled
-        if let Some(raft_node_ref) = &raft_node {
-            info!("Starting game executor service");
-            let executor_server_id = server_id.to_string();
-            let executor_raft_node = raft_node_ref.clone();
-            let executor_games_manager = games_manager.clone();
-            let executor_player_connections = player_connections.clone();
-            let executor_db_pool = db_pool.clone();
-            let executor_token = cancellation_token.clone();
-            
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = run_game_executor(
-                    executor_server_id,
-                    executor_raft_node,
-                    executor_games_manager,
-                    executor_player_connections,
-                    executor_db_pool,
-                    executor_token,
-                ).await {
-                    error!("Game executor service error: {}", e);
-                }
-            }));
-        }
 
         // Start cleanup service
         let cleanup_pool = db_pool.clone();
         let cleanup_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_cleanup_service(cleanup_pool, cleanup_token).await;
-        }));
-
-        // Start service manager
-        info!("Starting service manager for cluster topology");
-        let service_manager_clone = service_manager.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = service_manager_clone.start().await {
-                error!("Service manager error: {}", e);
-            }
-        }));
-
-        // Start replica manager
-        info!("Starting replica manager for game state replication");
-        let replica_manager_clone = replica_manager.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = replica_manager_clone.start().await {
-                error!("Replica manager error: {}", e);
-            }
         }));
 
         // Wait a moment for all services to start
@@ -327,16 +204,12 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
-            service_manager: Some(service_manager),
-            replica_manager: Some(replica_manager),
-            authority_transfer: Some(authority_transfer),
-            player_connections,
             raft_node,
         })
     }
 
     /// Get the server's unique ID
-    pub fn id(&self) -> Uuid {
+    pub fn id(&self) -> u64 {
         self.server_id
     }
 
@@ -357,32 +230,6 @@ impl GameServer {
 
     /// Shutdown the server gracefully
     pub async fn shutdown(mut self) -> Result<()> {
-        // Perform graceful shutdown steps
-        if let Err(e) = self.perform_graceful_shutdown().await {
-            error!("Error during graceful shutdown: {}", e);
-        }
-        
-        // Signal all services to stop
-        self.cancellation_token.cancel();
-
-        // Wait for all services to complete
-        for handle in self.handles {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                handle
-            ).await {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => error!("Service panicked during shutdown: {:?}", e),
-                Err(_) => error!("Service shutdown timed out"),
-            }
-        }
-
-        info!("Game server {} shut down successfully", self.server_id);
-        Ok(())
-    }
-
-    /// Perform graceful shutdown with game migration
-    async fn perform_graceful_shutdown(&self) -> Result<()> {
         info!("Starting graceful shutdown of game server {}", self.server_id);
         
         // Step 1: Stop accepting new games
@@ -432,8 +279,11 @@ impl GameServer {
 
         // Step 5: Wait for all services to complete
         for handle in &self.handles {
-            // Note: We can't consume the handles here since we don't own self
-            // In a real implementation, we'd need to refactor this
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => error!("Service panicked during shutdown: {:?}", e),
+                Err(_) => error!("Service shutdown timed out"),
+            }
         }
 
         // Update server status to offline
@@ -475,12 +325,7 @@ pub async fn start_test_server_with_grpc(
     let ws_addr = format!("127.0.0.1:{}", ws_port);
 
     // Enable gRPC if requested
-    let grpc_addr = if enable_grpc {
-        let grpc_port = get_available_port();
-        Some(format!("127.0.0.1:{}", grpc_port))
-    } else {
-        None
-    };
+    let grpc_addr = format!("127.0.0.1:{}", get_available_port());
 
     let config = GameServerConfig {
         db_pool,
@@ -488,7 +333,6 @@ pub async fn start_test_server_with_grpc(
         grpc_addr,
         region: "test-region".to_string(),
         jwt_verifier,
-        raft_peers: vec![], // Single node for tests
     };
 
     GameServer::start(config).await
@@ -501,4 +345,52 @@ pub fn get_available_port() -> u16 {
     drop(listener);
     std::thread::sleep(std::time::Duration::from_millis(10));
     port
+}
+
+/// Run a loop to update last_heartbeat in the database
+pub async fn run_heartbeat_loop(
+    pool: PgPool,
+    server_id: u64,
+    cancellation_token: CancellationToken
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    info!(?server_id, "Starting heartbeat loop");
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                info!(?server_id, "Heartbeat shutdown received");
+                break;
+            }
+
+            _ = interval.tick() => {
+                let now = Utc::now();
+
+                match sqlx::query(
+                    r#"
+                    UPDATE servers
+                    SET last_heartbeat = $1
+                    WHERE id = $2
+                    "#
+                )
+                    .bind::<DateTime<Utc>>(now)
+                    .bind(server_id)
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(result) => {
+                        if result.rows_affected() == 1 {
+                            trace!(?server_id, timestamp = %now, "Heartbeat sent successfully.");
+                        } else {
+                            warn!(?server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
+                        }
+                    }
+                    Err(e) => {
+                        error!(?server_id, error = %e, "Failed to send heartbeat");
+                    }
+                }
+            }
+        }
+    }
 }

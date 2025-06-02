@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::{BinaryHeap, VecDeque};
-use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType};
+use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
 
 pub struct GameEngine {
     game_id: u32,
@@ -9,7 +9,6 @@ pub struct GameEngine {
 
     event_log: Vec<GameEventMessage>,
 
-    pending_commands: BinaryHeap<GameCommandMessage>,
     tick_duration_ms: u32,
     committed_state_lag_ms: u32,
 
@@ -28,7 +27,6 @@ impl GameEngine {
             committed_state: GameState::new(10, 10, None),
             predicted_state: Some(GameState::new(10, 10, None)),
             event_log: Vec::new(),
-            pending_commands: BinaryHeap::new(),
             tick_duration_ms: 300,
             committed_state_lag_ms: 500,
             unconfirmed_local_inputs: VecDeque::new(),
@@ -48,7 +46,6 @@ impl GameEngine {
             committed_state: GameState::new_with_type(10, 10, game_type.clone(), Some(rng_seed)),
             predicted_state: Some(GameState::new_with_type(10, 10, game_type, None)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
-            pending_commands: BinaryHeap::new(),
             tick_duration_ms: 300,
             committed_state_lag_ms: 500,
             unconfirmed_local_inputs: VecDeque::new(),
@@ -72,88 +69,48 @@ impl GameEngine {
         let mut out: Vec<GameEvent> = Vec::new();
 
         while self.committed_state.current_tick() < lagged_target_tick {
-            while let Some(cmd) = self.pending_commands.peek() {
-                if cmd.tick > self.committed_state.current_tick() {
-                    break;
-                }
-
-                let popped_cmd_msg = self.pending_commands.pop().context("Failed to pop command")?;
-
-                if popped_cmd_msg.tick < self.committed_state.current_tick() {
-                    // Ignore commands that are already in the past
-                    continue;
-                }
-
-                for event in self.committed_state.exec_command(popped_cmd_msg.command)? {
-                    out.push(event);
-                }
-            }
-
-            for event in self.committed_state.exec_command(GameCommand::Tick)? {
+            for event in self.committed_state.tick_forward()? {
                 out.push(event);
             }
         }
 
         if let Some(predicted_state) = &mut self.predicted_state {
             *predicted_state = self.committed_state.clone();
-            let mut remaining_commands = self.pending_commands.clone();
             while predicted_state.current_tick() < predicted_target_tick {
-                while let Some(cmd) = remaining_commands.peek() {
-                    if cmd.tick > predicted_state.current_tick() {
-                        break;
-                    }
-
-                    let popped_cmd_msg = remaining_commands.pop()
-                        .context("Failed to pop remaining command")?;
-
-                    if popped_cmd_msg.tick < predicted_state.current_tick() {
-                        // Ignore commands that are already in the past
-                        continue;
-                    }
-
-                    predicted_state.exec_command(popped_cmd_msg.command)?;
-                }
-
-                predicted_state.exec_command(GameCommand::Tick)?;
+                predicted_state.tick_forward()?;
             }
         }
 
         Ok(out)
     }
 
-    pub fn server_process_incoming_command(
+    pub fn process_command(
         &mut self,
-        command: GameCommand,
-        user_id: u32,
-        client_command_tick: u32,
+        command_message: GameCommandMessage,
     ) -> Result<GameCommandMessage> {
 
-        let server_scheduled_tick = client_command_tick
-            .max(self.committed_state.current_tick() + 1) // At least the next committed tick
-            .max(self.committed_state.current_tick() + 2); // Give some buffer
+        let server_scheduled_tick = command_message.command_id_client.tick
+            .min(self.committed_state.current_tick());
 
         let received_order = self.command_counter;
-        self.command_counter += 1; // Increment for next command
+        self.command_counter += 1;
+        
+        let command_id_server = CommandId { 
+            tick: server_scheduled_tick, 
+            user_id: command_message.command_id_client.user_id,
+            sequence_number: received_order
+        };
 
         let cmd = GameCommandMessage {
-            tick: server_scheduled_tick,
-            received_order,
-            user_id,
-            command: command.clone(),
+            command_id_client: command_message.command_id_client,
+            command_id_server: Some(command_id_server),
+            command: command_message.command,
         };
-        self.pending_commands.push(cmd.clone());
-
-        // Create and return the event that informs clients about this pending command.
-        let pending_event_notification = GameEventMessage {
-            game_id: self.game_id,
-            // The 'tick' of this notification event itself could be the current server committed_tick,
-            // indicating when the server became aware and scheduled it.
-            tick: self.committed_state.current_tick(),
-            user_id: None, // System event about a user's action
-            event: GameEvent::CommandPendingOnServer {
-                command_message: cmd.clone(),
-            },
-        };
+        
+        self.committed_state.schedule_command(&cmd);
+        if let Some(predicted_state) = &mut self.predicted_state {
+            predicted_state.schedule_command(&cmd);
+        }
 
         Ok(cmd)
     }
@@ -185,20 +142,20 @@ impl GameEngine {
 }
 
 // Standalone function for server-side command processing
-pub fn server_process_incoming_command(
-    engine: &mut GameEngine,
-    command_msg: GameCommandMessage,
-) -> Vec<GameEventMessage> {
-    // Add the command to the engine's pending commands
-    engine.pending_commands.push(command_msg.clone());
-    
-    // Return event indicating command is pending on server
-    vec![GameEventMessage {
-        game_id: engine.game_id,
-        tick: engine.committed_state.current_tick(),
-        user_id: None,
-        event: GameEvent::CommandPendingOnServer { 
-            command_message: command_msg 
-        },
-    }]
-}
+// pub fn server_process_incoming_command(
+//     engine: &mut GameEngine,
+//     command_msg: GameCommandMessage,
+// ) -> Vec<GameEventMessage> {
+//     // Add the command to the engine's pending commands
+//     engine.pending_commands.push(command_msg.clone());
+//     
+//     // Return event indicating command is pending on server
+//     vec![GameEventMessage {
+//         game_id: engine.game_id,
+//         tick: engine.committed_state.current_tick(),
+//         user_id: None,
+//         event: GameEvent::CommandPendingOnServer { 
+//             command_message: command_msg 
+//         },
+//     }]
+// }

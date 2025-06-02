@@ -108,7 +108,7 @@ impl LearnerJoinProtocol {
     /// Execute the full join protocol
     pub async fn execute_join(&self, peers: Vec<String>) -> Result<()> {
         info!("Executing learner join protocol for node {}", self.node_id);
-        
+
         // Phase 1: Discover leader
         let discovery = LeaderDiscovery::new(peers);
         let (leader_addr, _) = discovery.find_leader().await

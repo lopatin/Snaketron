@@ -9,7 +9,7 @@ let game = wasm.Game.new(60, 40);
 
 function GameCanvas() {
   return (
-    <canvas width="900" height="600" />
+    <canvas width="900" height="500" />
   );
 }
 

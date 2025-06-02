@@ -368,10 +368,8 @@ impl GameRelay for GameRelayService {
 
 pub async fn run_game_relay_server(
     addr: &str,
-    broker: Arc<dyn GameMessageBroker>,
-    player_connections: Arc<PlayerConnectionManager>,
-    raft_node: Option<Arc<RaftNode>>,
-    server_id: String,
+    raft: Arc<RaftNode>,
+    server_id: u64,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     #[cfg(feature = "skip-proto")]
@@ -384,8 +382,6 @@ pub async fn run_game_relay_server(
     #[cfg(not(feature = "skip-proto"))]
     {
         let service = GameRelayService::new(
-            broker, 
-            player_connections,
             raft_node,
             server_id,
             addr.to_string(),
