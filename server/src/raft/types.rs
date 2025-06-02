@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use async_raft::{AppData, AppDataResponse, NodeId};
 use tonic::IntoRequest;
 use common::{GameCommandMessage, GameEventMessage, GameState};
-use crate::game_broker::game_relay::RaftProposeRequest;
+use crate::game_relay::RaftProposeRequest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientRequest {

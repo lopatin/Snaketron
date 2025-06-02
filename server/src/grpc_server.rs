@@ -6,17 +6,15 @@ use tracing::{error, info, warn};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use crate::game_broker::{GameMessageBroker, game_relay};
+use crate::game_relay;
 use game_relay::game_relay_server::{GameRelay, GameRelayServer};
-use game_relay::{GameMessage, GetSnapshotRequest, GetSnapshotResponse, NotifyMatchRequest, NotifyMatchResponse};
-use crate::player_connections::PlayerConnectionManager;
+use game_relay::{GameMessage};
+use crate::game_relay::{RaftProposeRequest, RaftProposeResponse};
 use crate::raft::RaftNode;
 
 type GameMessageStream = Pin<Box<dyn Stream<Item = Result<GameMessage, Status>> + Send>>;
 
 pub struct GameRelayService {
-    broker: Arc<dyn GameMessageBroker>,
-    player_connections: Arc<PlayerConnectionManager>,
     raft_node: Option<Arc<RaftNode>>,
     server_id: String,
     grpc_addr: String,
@@ -24,15 +22,11 @@ pub struct GameRelayService {
 
 impl GameRelayService {
     pub fn new(
-        broker: Arc<dyn GameMessageBroker>, 
-        player_connections: Arc<PlayerConnectionManager>,
         raft_node: Option<Arc<RaftNode>>,
         server_id: String,
         grpc_addr: String,
     ) -> Self {
         Self { 
-            broker, 
-            player_connections,
             raft_node,
             server_id,
             grpc_addr,
@@ -221,20 +215,6 @@ impl GameRelay for GameRelayService {
         Ok(Response::new(Box::pin(output_stream) as Self::ReplicateGameStateStream))
     }
     
-    async fn transfer_authority(
-        &self,
-        request: Request<game_relay::AuthorityTransferRequest>,
-    ) -> Result<Response<game_relay::AuthorityTransferResponse>, Status> {
-        let _req = request.into_inner();
-        
-        // For now, always accept authority transfers
-        // In a full implementation, this would coordinate with GameManager
-        Ok(Response::new(game_relay::AuthorityTransferResponse {
-            accepted: true,
-            error: None,
-        }))
-    }
-    
     async fn notify_shutdown(
         &self,
         request: Request<game_relay::ShutdownNotification>,
@@ -356,6 +336,39 @@ impl GameRelay for GameRelayService {
                     warn!("Failed to promote learner: {}", e);
                     Ok(Response::new(game_relay::PromotionResponse {
                         promoted: false,
+                        reason: e.to_string(),
+                    }))
+                }
+            }
+        } else {
+            Err(Status::unavailable("Raft not initialized"))
+        }
+    }
+
+    async fn raft_propose(&self, request: Request<RaftProposeRequest>) -> std::result::Result<Response<RaftProposeResponse>, Status> {
+        if let Some(raft_node) = &self.raft_node {
+            let req = request.into_inner();
+            
+            // Only leader can propose
+            if !raft_node.is_leader().await {
+                return Ok(Response::new(RaftProposeResponse {
+                    client_response: 
+                }));
+            }
+            
+            // Propose the command to Raft
+            match raft_node.propose(req.command).await {
+                Ok(_) => {
+                    info!("Proposed command to Raft: {:?}", req.command);
+                    Ok(Response::new(RaftProposeResponse {
+                        success: true,
+                        reason: String::new(),
+                    }))
+                }
+                Err(e) => {
+                    error!("Failed to propose command: {}", e);
+                    Ok(Response::new(RaftProposeResponse {
+                        success: false,
                         reason: e.to_string(),
                     }))
                 }

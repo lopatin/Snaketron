@@ -11,15 +11,12 @@ use std::time::Instant;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, debug};
 
-use crate::game_manager::GameManager;
-use crate::replica_manager::{GameReplica, ReplicaManager};
 use tokio::sync::RwLock as TokioRwLock;
 use common::GameState;
 pub use storage::GameRaftStorage;
 pub use network::GameRaftNetwork;
 pub use state_machine::{GameStateMachine, StateMachineRequest, StateMachineResponse};
-pub use types::{RaftNodeId, ClientRequest, ClientResponse, StateChangeEvent};
-use crate::game_broker::game_relay;
+pub use types::{ClientRequest, ClientResponse, StateChangeEvent};
 
 pub type GameRaft = Raft<ClientRequest, ClientResponse, GameRaftNetwork, GameRaftStorage>;
 
@@ -74,9 +71,7 @@ impl RaftNode {
         
         // Initialize if this is the first node
         if initial_members.len() == 1 && initial_members[0] == node_id {
-            let members: HashSet<u64> = initial_members.iter()
-                .map(|n| n.parse::<u64>().unwrap_or(0))
-                .collect();
+            let members: HashSet<u64> = initial_members.into_iter().collect();
             raft.initialize(members).await?;
         }
         
@@ -103,7 +98,7 @@ impl RaftNode {
         metrics.borrow().current_leader
     }
 
-    pub async fn subscribe_state_events(&self) -> broadcast::Receiver<StateChangeEvent> {
+    pub fn subscribe_state_events(&self) -> broadcast::Receiver<StateChangeEvent> {
         self.state_change_tx.subscribe()
     }
 
@@ -211,11 +206,6 @@ impl RaftNode {
         }
     }
     
-    /// Subscribe to state change events
-    pub async fn subscribe_state_changes(&self) -> broadcast::Receiver<StateChangeEvent> {
-        self.storage
-    }
-    
     /// Emit a state change event (called by the state machine)
     pub fn emit_state_change(&self, event: StateChangeEvent) {
         // Ignore send errors (no receivers)
@@ -228,20 +218,15 @@ impl RaftNode {
     }
 
     
-    pub async fn remove_node(&self, node_id: RaftNodeId) -> Result<()> {
-        let raft_id = node_id.0.parse::<u64>().unwrap_or(0);
+    pub async fn remove_node(&self, node_id: NodeId) -> Result<()> {
         
         // Get current membership and remove node
         let metrics = self.raft.metrics();
         let mut members = metrics.borrow().membership_config.members.clone();
-        members.remove(&raft_id);
+        members.remove(&node_id);
         
         self.raft.change_membership(members).await?;
-        self.network.remove_peer(raft_id).await;
+        self.network.remove_peer(node_id).await;
         Ok(())
-    }
-    
-    pub fn get_game_state(&self, game_id: u32) -> Option<&GameState> {
-        self.storage
     }
 }

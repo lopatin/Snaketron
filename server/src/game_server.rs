@@ -11,17 +11,9 @@ use tracing::{info, error, warn, trace};
 
 use crate::{
     ws_server::{register_server, run_websocket_server, JwtVerifier},
-    game_manager::GameManager,
-    game_broker::{GameMessageBroker, GameBroker},
-    matchmaking::run_matchmaking_loop,
-    game_cleanup::run_cleanup_service,
-    game_discovery::{run_game_discovery_loop, run_game_discovery_with_raft},
     game_executor::run_game_executor,
-    player_connections::PlayerConnectionManager,
     grpc_server::run_game_relay_server,
-    service_manager::ServiceManager,
-    replica_manager::ReplicaManager,
-    authority_transfer::AuthorityTransferManager,
+    matchmaking::run_matchmaking_loop,
     raft::{RaftNode},
     learner_join::LearnerJoinProtocol,
 };
@@ -48,7 +40,7 @@ pub struct GameServer {
     /// WebSocket server address
     pub ws_addr: String,
     /// gRPC server address (if enabled)
-    pub grpc_addr: Option<String>,
+    pub grpc_addr: String,
     /// Database pool
     db_pool: PgPool,
     /// Cancellation token for graceful shutdown
@@ -56,7 +48,7 @@ pub struct GameServer {
     /// Handles for all spawned tasks
     handles: Vec<JoinHandle<()>>,
     /// Raft consensus node
-    raft_node: Option<Arc<RaftNode>>,
+    raft: Option<Arc<RaftNode>>,
 }
 
 impl GameServer {
@@ -185,18 +177,11 @@ impl GameServer {
             }
         }));
 
-        // Start cleanup service
-        let cleanup_pool = db_pool.clone();
-        let cleanup_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_cleanup_service(cleanup_pool, cleanup_token).await;
-        }));
-
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         info!("Game server {} started successfully", server_id);
-
+        
         Ok(Self {
             server_id,
             ws_addr,
@@ -204,7 +189,7 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
-            raft_node,
+            raft,
         })
     }
 
@@ -220,7 +205,7 @@ impl GameServer {
 
     /// Get the gRPC server address (if enabled)
     pub fn grpc_addr(&self) -> Option<&str> {
-        self.grpc_addr.as_deref()
+        self.grpc_addr.is_empty().then_some(&self.grpc_addr)
     }
 
     /// Get a reference to the database pool
@@ -239,41 +224,8 @@ impl GameServer {
             .execute(&self.db_pool)
             .await
             .context("Failed to update server status")?;
-
-        // Step 2: Notify all WebSocket clients
-        info!("Broadcasting shutdown notice to all WebSocket clients");
-        if let (Some(service_manager), Some(authority_transfer)) = (&self.service_manager, &self.authority_transfer) {
-            // Get list of games we're hosting
-            let hosted_games = sqlx::query_as::<_, (i32,)>(
-                r#"
-                SELECT id 
-                FROM games 
-                WHERE host_server_id = $1 
-                AND status = 'active'
-                "#
-            )
-            .bind(&self.server_id.to_string())
-            .fetch_all(&self.db_pool)
-            .await
-            .context("Failed to query hosted games")?;
-            
-            let game_ids: Vec<u32> = hosted_games.into_iter().map(|r| r.0 as u32).collect();
-            
-            // Broadcast shutdown notification to all servers
-            service_manager.broadcast_shutdown(30000, game_ids.clone()).await?;
-            
-            // Send shutdown notices to connected clients
-            self.player_connections.broadcast_shutdown_notice(30).await;
-            
-            // Step 3: Transfer games to other servers
-            info!("Transferring {} games to other servers", game_ids.len());
-            authority_transfer.transfer_all_games().await?;
-            
-            // Wait for transfers to complete
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        }
         
-        // Step 4: Signal all services to stop
+        // Signal all services to stop
         info!("Stopping all services");
         self.cancellation_token.cancel();
 

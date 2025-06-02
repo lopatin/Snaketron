@@ -4,11 +4,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tonic::{Request, Status};
 use tracing::{debug, error, info, warn};
-
-use crate::game_broker::game_relay::{
-    game_relay_client::GameRelayClient,
-    Empty, JoinAsLearnerRequest, PromotionRequest, RaftStatusResponse,
-};
+use crate::game_relay::{Empty, JoinAsLearnerRequest, PromotionRequest};
+use crate::game_relay::game_relay_client::GameRelayClient;
 use crate::raft::RaftNode;
 
 /// Represents the leader status of a node

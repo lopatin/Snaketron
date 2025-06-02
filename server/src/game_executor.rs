@@ -9,13 +9,9 @@ use sqlx::PgPool;
 use common::GameEvent::StatusUpdated;
 use common::{GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus};
 use crate::{
-    game_manager::GameManager,
-    player_connections::PlayerConnectionManager,
     raft::{RaftNode, StateChangeEvent},
 };
-use crate::game_broker::GameMessageBroker;
 use crate::raft::ClientRequest;
-use crate::replica_manager::ReplicaManager;
 
 
 /// Create a game engine and run the game loop for a specific game.
@@ -94,6 +90,7 @@ pub async fn run_game_executor(
             match raft.propose(ClientRequest::StartGame { game_id, server_id }).await {
                 Ok(response) => {
                     // Run the game loop here.
+                    run_game(server_id, game_id, raft.clone(), cancellation_token.clone()).await;
                 },
                 Err(e) => error!("Failed to start game {} on server {}: {}", game_id, server_id, e),
             }

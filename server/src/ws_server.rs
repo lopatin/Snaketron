@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use tracing::{debug, error, info, instrument, trace, warn};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_stream::wrappers::BroadcastStream;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use chrono::{DateTime, Utc};
@@ -13,15 +14,15 @@ use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
+
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage};
-use crate::game_manager::GameManager;
-use crate::raft::RaftNode;
+use crate::raft::{RaftNode, StateChangeEvent};
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
     Token(String),
     JoinGame(u32),
@@ -121,90 +122,6 @@ async fn remove_from_matchmaking_queue(
     Ok(())
 }
 
-async fn poll_for_match(pool: PgPool, user_id: i32, ws_tx: mpsc::Sender<Message>) {
-    info!("Starting match polling for user {}", user_id);
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    let timeout = tokio::time::sleep(Duration::from_secs(30)); // Stop polling after 30 seconds
-    tokio::pin!(timeout);
-    
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Check if user has been matched
-                match check_for_match(&pool, user_id).await {
-                    Ok(Some(game_id)) => {
-                        info!("User {} matched to game {}", user_id, game_id);
-                        // Send MatchFound message
-                        let msg = WSMessage::MatchFound { game_id: game_id as u32 };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            let _ = ws_tx.send(Message::Text(json.into())).await;
-                        }
-                        break;
-                    }
-                    Ok(None) => {
-                        // No match yet, continue polling
-                        trace!("No match yet for user {}", user_id);
-                    }
-                    Err(e) => {
-                        error!("Error checking for match: {}", e);
-                        break;
-                    }
-                }
-            }
-            _ = &mut timeout => {
-                info!("Match polling timeout for user {}", user_id);
-                break;
-            }
-        }
-    }
-    info!("Stopped polling for user {}", user_id);
-}
-
-async fn check_for_match(pool: &PgPool, user_id: i32) -> Result<Option<i32>> {
-    let game_id: Option<i32> = sqlx::query_scalar(
-        r#"
-        SELECT game_id
-        FROM game_requests
-        WHERE user_id = $1 AND game_id IS NOT NULL
-        ORDER BY request_time DESC
-        LIMIT 1
-        "#
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-    
-    Ok(game_id)
-}
-
-async fn get_current_server_id(pool: &PgPool) -> Result<Uuid> {
-    // In a real implementation, this would be stored when the server starts
-    // For now, get the first server or create one
-    let server_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM servers ORDER BY created_at DESC LIMIT 1"
-    )
-    .fetch_optional(pool)
-    .await?;
-    
-    match server_id {
-        Some(id) => Ok(id),
-        None => {
-            // Create a default server for testing
-            let id = Uuid::new_v4();
-            sqlx::query(
-                r#"
-                INSERT INTO servers (id, address, last_heartbeat, current_game_count, max_game_capacity)
-                VALUES ($1, $2, NOW(), 0, 100)
-                "#
-            )
-            .bind(id)
-            .bind("127.0.0.1:8080")
-            .execute(pool)
-            .await?;
-            Ok(id)
-        }
-    }
-}
 
 // Connection state machine
 enum ConnectionState {
@@ -252,8 +169,6 @@ async fn process_ws_message(
     state: ConnectionState,
     ws_message: WSMessage,
     jwt_verifier: &Arc<dyn JwtVerifier>,
-    player_connections: &Arc<crate::player_connections::PlayerConnectionManager>,
-    games_manager: &Arc<RwLock<GameManager>>,
     db_pool: &PgPool,
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
@@ -279,7 +194,6 @@ async fn process_ws_message(
                         Ok(user_token) => {
                             info!("Token verified successfully, user_id: {}", user_token.user_id);
                             // Register the player connection
-                            player_connections.register(user_token.user_id, ws_tx.clone()).await;
                             Ok(ConnectionState::Authenticated { user_token })
                         }
                         Err(e) => {
@@ -302,96 +216,6 @@ async fn process_ws_message(
         }
         ConnectionState::Authenticated { user_token } => {
             match ws_message {
-                WSMessage::JoinGame(game_id) => {
-                    info!("Joining game ID: {}", game_id);
-                    
-                    // Retry join_game a few times in case the game is still being initialized
-                    let mut join_result = None;
-                    for attempt in 0..5 {
-                        if attempt > 0 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                        
-                        let games_mgr = games_manager.read().await;
-                        match games_mgr.join_game(game_id).await {
-                            Ok((command_tx, event_rx)) => {
-                                join_result = Some((command_tx, event_rx));
-                                break;
-                            }
-                            Err(e) if attempt < 4 => {
-                                info!("Join game attempt {} failed ({}), retrying...", attempt + 1, e);
-                                drop(games_mgr); // Release the lock before sleeping
-                            }
-                            Err(e) => {
-                                error!("Failed to join game after {} attempts: {}", attempt + 1, e);
-                                break;
-                            }
-                        }
-                    }
-                    
-                    match join_result {
-                        Some((command_tx, event_rx)) => {
-                            info!("Successfully joined game {}", game_id);
-                            let games_mgr = games_manager.read().await;
-                            
-                            // Try to get initial game state
-                            match games_mgr.get_game_snapshot(game_id).await {
-                                Ok(snapshot) => {
-                                    // Send initial state to client
-                                    let event = GameEventMessage {
-                                        game_id,
-                                        tick: snapshot.tick,
-                                        user_id: None,
-                                        event: GameEvent::Snapshot { game_state: snapshot },
-                                    };
-                                    let msg = WSMessage::GameEvent(event);
-                                    let json_msg = serde_json::to_string(&msg)?;
-                                    ws_stream.send(Message::Text(json_msg.into())).await?;
-                                    
-                                    info!("WS: Transitioning to InGame state for game {} (local)", game_id);
-                                    debug!("WS: Event receiver channel created for game {}", game_id);
-                                    Ok(ConnectionState::InGame {
-                                        user_token,
-                                        game_id,
-                                        command_tx,
-                                        event_rx,
-                                    })
-                                }
-                                Err(e) => {
-                                    // For remote games, request a snapshot
-                                    info!("Could not get local snapshot ({}), requesting snapshot for remote game {}", e, game_id);
-                                    
-                                    // Send RequestSnapshot command
-                                    let snapshot_request = GameCommandMessage {
-                                        tick: 0,
-                                        received_order: 0,
-                                        user_id: user_token.user_id as u32,
-                                        command: GameCommand::RequestSnapshot,
-                                    };
-                                    
-                                    if let Err(e) = command_tx.send(snapshot_request).await {
-                                        error!("Failed to request snapshot: {}", e);
-                                    } else {
-                                        info!("Sent RequestSnapshot command for game {}", game_id);
-                                    }
-                                    
-                                    info!("WS: Transitioning to InGame state for game {} after join", game_id);
-                                    debug!("WS: Event receiver channel created for remote game {}", game_id);
-                                    Ok(ConnectionState::InGame {
-                                        user_token,
-                                        game_id,
-                                        command_tx,
-                                        event_rx,
-                                    })
-                                }
-                            }
-                        }
-                        None => {
-                            error!("Failed to join game {}", game_id);
-                            Ok(ConnectionState::Authenticated { user_token })
-                        }
-                    }
-                }
                 WSMessage::QueueForMatch { game_type } => {
                     info!("User {} queuing for match type: {:?}", user_token.user_id, game_type);
                     
@@ -467,9 +291,6 @@ async fn process_ws_message(
             match ws_message {
                 WSMessage::GameCommand(cmd) => {
                     let game_command = GameCommandMessage {
-                        tick: 0,
-                        received_order: 0,
-                        user_id: user_token.user_id as u32,
                         command: cmd,
                     };
                     
@@ -501,27 +322,17 @@ async fn process_ws_message(
 }
 
 
-
 pub async fn run_websocket_server(
-    addr: &str,
     raft: Arc<RaftNode>,
     db_pool: PgPool,
-    cancellation_token: CancellationToken,
+    addr: &str,
+    listener: TcpListener,
     jwt_verifier: Arc<dyn JwtVerifier>,
+    cancellation_token: CancellationToken,
 ) -> Result<()> {
+
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
-    run_websocket_server_with_listener(listener, games_manager, db_pool, cancellation_token, jwt_verifier, player_connections).await
-}
-
-pub async fn run_websocket_server_with_listener(
-    listener: TcpListener,
-    games_manager: Arc<RwLock<GameManager>>,
-    db_pool: PgPool,
-    cancellation_token: CancellationToken,
-    jwt_verifier: Arc<dyn JwtVerifier>,
-    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
-) -> Result<()> {
 
     let mut connection_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
 
@@ -539,11 +350,9 @@ pub async fn run_websocket_server_with_listener(
                     Ok((stream, peer_addr)) => {
                         info!("Accepted connection from: {}", peer_addr);
                         let connection_token = cancellation_token.child_token();
-                        let games_manager_clone = games_manager.clone();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let player_connections_clone = player_connections.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(games_manager_clone, db_pool_clone, stream, connection_token, jwt_verifier_clone, player_connections_clone));
+                        let handle = tokio::spawn(handle_websocket_connection(&raft, db_pool_clone, stream, jwt_verifier_clone, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -579,12 +388,11 @@ pub async fn run_websocket_server_with_listener(
 
 
 async fn handle_websocket_connection(
-    games_manager: Arc<RwLock<GameManager>>,
+    raft: &RaftNode,
     db_pool: PgPool,
     stream: TcpStream,
-    cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    player_connections: Arc<crate::player_connections::PlayerConnectionManager>
+    cancellation_token: CancellationToken,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
@@ -594,7 +402,7 @@ async fn handle_websocket_connection(
         .expect("Failed to accept WebSocket connection");
 
     // Create a channel for sending messages to the WebSocket
-    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(32);
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
     
     // Start in unauthenticated state
     let mut state = ConnectionState::Unauthenticated;
@@ -603,7 +411,22 @@ async fn handle_websocket_connection(
     let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
     tokio::pin!(shutdown_timeout);
     let mut shutdown_started = false;
+    
+    let game_start_stream = BroadcastStream::new(raft.subscribe_state_events())
+        .filter_map(|event| {
+            match event {
+                Ok(StateChangeEvent::GameCreated { game_id }) => {
+                    Some(WSMessage::GameEvent(GameEventMessage {
+                        game_id,
+                        event: GameEvent::Snapshot { game_state: None }, // Placeholder for actual game state
+                    }))
+                }
+                _ => None
+            }});
 
+    tokio::pin!(game_start_stream);
+    
+    
     loop {
         let state_name = match &state {
             ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
@@ -682,8 +505,6 @@ async fn handle_websocket_connection(
                             state,
                             ws_message,
                             &jwt_verifier,
-                            &player_connections,
-                            &games_manager,
                             &db_pool,
                             &ws_tx,
                             &mut ws_stream,
@@ -770,15 +591,6 @@ async fn handle_websocket_connection(
 
     // Clean up connection
     let _ = ws_stream.close(None).await;
-    
-    // Unregister the player connection if authenticated
-    match &state {
-        ConnectionState::Authenticated { user_token } | ConnectionState::InGame { user_token, .. } => {
-            player_connections.unregister(user_token.user_id).await;
-            info!("Unregistered player connection for user {}", user_token.user_id);
-        }
-        _ => {}
-    }
     
     // Drop any active game channels
     if let Some((command_tx, event_rx)) = state.take_game_channels() {

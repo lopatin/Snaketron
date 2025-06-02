@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Context;
 use tonic::transport::Channel;
-use common::GameState;
+use common::{GameState, GameType};
 use crate::raft::{ClientRequest, ClientResponse, RaftNode};
 
 // --- Configuration Constants ---
@@ -106,7 +106,7 @@ pub async fn run_matchmaking_loop(
                 Ok(None) => {
                     trace!(game_type = ?game_type, "No suitable match found");
                 }
-                Err(e) if is_serialization_error(&e.into()) => {
+                Err(e) if is_serialization_error(&e) => {
                     trace!(game_type = ?game_type, "Serialization conflict, will retry next tick");
                 }
                 Err(e) => {
@@ -328,16 +328,16 @@ async fn create_adaptive_match(
     // Save the game to Raft
     match raft.propose(ClientRequest::CreateGame {
         game_id: game_id as u32,
-        game_state: GameState::new(10, 10, None),
+        game_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None),
     }).await.context("Failed to save game to raft")? {
-        Ok(ClientResponse::Success) => info!(game_id, "Game created and saved to Raft"),
-        Ok(ClientResponse::Error(msg)) => {
+        ClientResponse::Success => info!(game_id, "Game created and saved to Raft"),
+        ClientResponse::Error(msg) => {
             warn!(game_id, error = %msg, "Game creation failed in Raft");
             return Err(anyhow::anyhow!("Raft error: {}", msg));
         }
-        Err(e) => {
-            error!(game_id, error = %e, "Failed to save game creation to Raft");
-            return Err(e.into());
+        _ => {
+            warn!(game_id, "Unexpected response from Raft when creating game");
+            return Err(anyhow::anyhow!("Unexpected Raft response"));
         }
     }
 
@@ -359,18 +359,6 @@ async fn create_adaptive_match(
         mmr_range = max_mmr_diff,
         "Match created"
     );
-    
-    // Get player-server mapping and notify remote servers
-    match get_player_servers(pool, &user_ids).await {
-        Ok(players_by_server) => {
-            if let Err(e) = notify_remote_servers(pool, game_id, server_id, players_by_server).await {
-                error!(game_id, error = %e, "Failed to notify remote servers about match");
-            }
-        }
-        Err(e) => {
-            error!(game_id, error = %e, "Failed to get player server mapping");
-        }
-    }
 
     Ok(Some((game_id, user_ids)))
 }
@@ -408,134 +396,4 @@ fn is_serialization_error(error: &sqlx::Error) -> bool {
         }
         _ => false,
     }
-}
-
-/// Optional: Clean up stale game requests
-pub async fn cleanup_stale_requests(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM game_requests
-        WHERE request_time < NOW() - INTERVAL '1 hour'
-          AND game_id IS NULL
-        "#
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected())
-}
-
-/// Optional: Rebalance games across servers
-pub async fn rebalance_server_loads(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // This could be implemented to move games from overloaded servers
-    // to less loaded ones, but would require careful state synchronization
-    Ok(())
-}
-
-/// Query which server each player is connected to
-async fn get_player_servers(pool: &PgPool, user_ids: &[i32]) -> Result<HashMap<uuid::Uuid, Vec<i32>>, sqlx::Error> {
-    #[derive(sqlx::FromRow)]
-    struct PlayerServer {
-        user_id: i32,
-        server_id: uuid::Uuid,
-    }
-    
-    // For now, we'll assume players connect to random available servers
-    // In a real implementation, you'd track this in a session table
-    let servers: Vec<uuid::Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT id FROM servers
-        WHERE last_heartbeat > NOW() - INTERVAL '30 seconds'
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-    
-    if servers.is_empty() {
-        return Ok(HashMap::new());
-    }
-    
-    // Distribute players across servers for testing
-    let mut players_by_server: HashMap<uuid::Uuid, Vec<i32>> = HashMap::new();
-    for (idx, &user_id) in user_ids.iter().enumerate() {
-        let server_idx = idx % servers.len();
-        let server_id = servers[server_idx];
-        players_by_server.entry(server_id).or_insert_with(Vec::new).push(user_id);
-    }
-    
-    Ok(players_by_server)
-}
-
-/// Notify players on remote servers about a match
-async fn notify_remote_servers(
-    pool: &PgPool,
-    game_id: i32,
-    game_server_id: uuid::Uuid,
-    players_by_server: HashMap<uuid::Uuid, Vec<i32>>,
-) -> Result<(), sqlx::Error> {
-    use crate::game_broker::game_relay::{
-        game_relay_client::GameRelayClient,
-        NotifyMatchRequest,
-    };
-    
-    for (server_id, player_ids) in players_by_server {
-        if server_id == game_server_id {
-            // Skip local server - it will be handled by game discovery
-            continue;
-        }
-        
-        // Get server gRPC address
-        let grpc_addr: Option<String> = sqlx::query_scalar(
-            r#"
-            SELECT grpc_address FROM servers
-            WHERE id = $1 AND grpc_address IS NOT NULL
-            "#
-        )
-        .bind(server_id)
-        .fetch_optional(pool)
-        .await?;
-        
-        if let Some(addr) = grpc_addr {
-            // Connect to remote server and notify
-            match GameRelayClient::connect(format!("http://{}", addr)).await {
-                Ok(mut client) => {
-                    let request = tonic::Request::new(NotifyMatchRequest {
-                        player_ids,
-                        game_id: game_id as u32,
-                        game_host_server_id: game_server_id.to_string(),
-                    });
-                    
-                    match client.notify_match_found(request).await {
-                        Ok(response) => {
-                            let resp = response.into_inner();
-                            info!(
-                                server_id = %server_id,
-                                game_id,
-                                notified_count = resp.notified_players.len(),
-                                "Successfully notified remote server"
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                server_id = %server_id,
-                                game_id,
-                                error = %e,
-                                "Failed to notify remote server"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        server_id = %server_id,
-                        addr,
-                        error = %e,
-                        "Failed to connect to remote server"
-                    );
-                }
-            }
-        }
-    }
-    
-    Ok(())
 }

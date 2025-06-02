@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use crate::{Direction, Player, Position, Snake};
@@ -187,11 +187,12 @@ impl PartialOrd for GameCommandMessage {
 
 
 impl GameState {
-    pub fn new(width: u16, height: u16, rng_seed: Option<u64>) -> Self {
-        Self::new_with_type(width, height, GameType::TeamMatch { per_team: 1 }, rng_seed)
-    }
-    
-    pub fn new_with_type(width: u16, height: u16, game_type: GameType, rng_seed: Option<u64>) -> Self {
+    pub fn new(
+        width: u16, 
+        height: u16, 
+        game_type: GameType, 
+        rng_seed: Option<u64>
+    ) -> Self {
         GameState {
             tick: 0,
             status: GameStatus::Stopped,
@@ -238,7 +239,7 @@ impl GameState {
         self.apply_event(GameEvent::CommandScheduled { command_message: command_message.clone() }, None);
     }
     
-    pub fn join(&mut self, user_id: u32) {
+    pub fn join(&mut self, _user_id: u32) {
     }
     
     pub fn tick_forward(&mut self) -> Result<Vec<GameEvent>> {
@@ -390,6 +391,10 @@ impl GameState {
             }
             
             GameEvent::PlayerJoined { .. } => {}
+            
+            GameEvent::StatusUpdated { status } => {
+                self.status = status;
+            }
         }
 
     }

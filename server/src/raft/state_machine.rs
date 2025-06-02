@@ -41,6 +41,7 @@ pub struct GameStateMachine {
     game_states: HashMap<u32, GameState>,
     servers: HashMap<u64, ServerRegistration>,
     event_tx: broadcast::Sender<StateChangeEvent>,
+    last_applied_index: Option<u64>,
 }
 
 impl GameStateMachine {
@@ -55,6 +56,8 @@ impl GameStateMachine {
 
     pub async fn apply(&mut self, index: &u64, request: &ClientRequest) -> Result<ClientResponse> {
         debug!("Applying request at index {}: {:?}", index, request);
+        
+        self.last_applied_index = Some(*index);
         
         let response = match request {
             ClientRequest::CreateGame { game_id, game_state } => {
@@ -155,71 +158,11 @@ impl GameStateMachine {
         Ok(response)
     }
     
+    pub(crate) fn last_applied_log(&self) -> Option<u64> {
+        self.last_applied_index
+    }
 
-    async fn apply_create_game(
-        &self,
-        game_id: u32,
-        initial_state: GameState,
-        authority_server: String,
-        players: Vec<u32>,
-        discovery_source: String,
-        discovered_at: i64,
-    ) -> Result<ClientResponse> {
-        info!("Creating game {} with authority on {} (discovered by {} at {})", 
-              game_id, authority_server, discovery_source, discovered_at);
-        
-        // Create replica
-        let replica = GameReplica {
-            game_id,
-            state: initial_state.clone(),
-            version: 0,
-            authority_server: authority_server.clone(),
-            last_update: std::time::Instant::now(),
-            tick: 0,
-        };
-        
-        self.replica_manager.add_replica(replica).await?;
-        
-        // Emit state change event
-        self.emit_event(StateChangeEvent::GameAssigned {
-            game_id,
-            authority: authority_server.clone(),
-            players: players.clone(),
-        });
-        
-        // Note: The GameExecutorService will handle starting the game
-        // when it receives the GameAssigned event
-        
-        Ok(ClientResponse::GameCreated { game_id })
-    }
-    
-    async fn apply_delete_game(
-        &self,
-        game_id: u32,
-        reason: String,
-    ) -> Result<ClientResponse> {
-        info!("Deleting game {} (reason: {})", game_id, reason);
-        
-        // Remove replica
-        let command = ReplicationCommand::DeleteGame {
-            game_id,
-            version: u64::MAX,
-            reason,
-        };
-        
-        self.replica_manager
-            .handle_replication_command(command)
-            .await?;
-        
-        // Emit state change event
-        self.emit_event(StateChangeEvent::GameDeleted { game_id });
-        
-        // Note: The GameExecutorService will handle stopping the game
-        // when it receives the GameDeleted event
-        
-        Ok(ClientResponse::GameDeleted)
-    }
-    
+   
     // async fn apply_register_server(
     //     &mut self,
     //     server_id: u64,

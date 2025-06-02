@@ -184,10 +184,10 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
             .last()
             .map(|e| (e.index, e.term))
             .unwrap_or((0, 0));
-        
+
         let last_applied_log = self.state_machine.read().await.last_applied_log()
             .unwrap_or(0);
-        
+
         let membership = self.membership.read().await.clone();
         
         debug!(
@@ -322,7 +322,7 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
 
     async fn create_snapshot(&self) -> Result<(String, Box<Self::Snapshot>)> {
         let snapshot_data = self.do_log_compaction().await?;
-        let id = format!("{}-{}-{}", self.node_id.0, snapshot_data.term, snapshot_data.index);
+        let id = format!("{}-{}-{}", self.node_id, snapshot_data.term, snapshot_data.index);
         Ok((id, snapshot_data.snapshot))
     }
 

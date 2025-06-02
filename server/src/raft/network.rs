@@ -8,15 +8,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use tracing::{debug, error, warn};
+use crate::game_relay::game_relay_client::GameRelayClient;
+use crate::game_relay::RaftInstallSnapshot;
+use super::types::{ClientRequest};
+// game_relay_client::GameRelayClient,
 
-use crate::game_broker::game_relay::{
-    game_relay_client::GameRelayClient,
-    RaftMessage as ProtoRaftMessage,
-    RaftAppendEntries, RaftAppendEntriesResponse,
-    RaftVoteRequest, RaftVoteResponse,
-    RaftInstallSnapshot, RaftInstallSnapshotResponse,
-};
-use super::types::{ClientRequest, RaftNodeId};
 
 pub struct GameRaftNetwork {
     node_id: NodeId,
@@ -110,7 +106,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             .ok_or_else(|| anyhow::anyhow!("No connection to node {}", target))?;
         
         let request = ProtoRaftMessage {
-            message: Some(crate::game_broker::game_relay::raft_message::Message::InstallSnapshot(
+            message: Some(crate::game_relay::raft_message::Message::InstallSnapshot(
                 RaftInstallSnapshot {
                     term: rpc.term,
                     leader_id: rpc.leader_id.to_string(),
