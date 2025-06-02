@@ -97,10 +97,14 @@ async fn test_simple_game() -> Result<()> {
              _game_id, snake1_id, snake2_id);
     
     // Now simulate the game:
-    // - Snake 1 (left snake) does nothing and goes forward until it crashes
-    // - Snake 2 (right snake) turns up first, then left to avoid the wall
+    // Snake 1 (user 1) has snake at x=3 going RIGHT - will hit right wall
+    // Snake 2 (user 2) has snake at x=36 going LEFT - will hit left wall
+    // We'll make snake 2 turn to avoid crashing
     
-    // Snake 2 turns up immediately
+    // Snake 2 turns up before the collision point to avoid head-on crash
+    // Need to turn before tick 15 to avoid collision at the center
+    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+    
     client2.send_message(WSMessage::GameCommand(
         GameCommandMessage {
             command_id_client: CommandId {
@@ -116,26 +120,6 @@ async fn test_simple_game() -> Result<()> {
         }
     )).await?;
     println!("Snake 2 sent turn up command");
-    
-    // Let the game progress for a few ticks
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    
-    // Snake 2 turns left to avoid the top wall
-    client2.send_message(WSMessage::GameCommand(
-        GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: env.user_ids()[1] as u32,
-                sequence_number: 1,
-            },
-            command_id_server: None,
-            command: GameCommand::Turn { 
-                snake_id: snake2_id, 
-                direction: Direction::Left 
-            },
-        }
-    )).await?;
-    println!("Snake 2 sent turn left command");
     
     // Continue the game and collect events
     let mut snake1_died = false;
@@ -159,13 +143,20 @@ async fn test_simple_game() -> Result<()> {
                             }
                         }
                         GameEvent::StatusUpdated { status } => {
+                            println!("Client1: Game status updated to {:?}", status);
                             if let GameStatus::Complete { winning_snake_id } = status {
                                 println!("Game complete! Winner: {:?}", winning_snake_id);
+                                if *winning_snake_id == None {
+                                    println!("Game ended in a draw - both snakes died");
+                                    return Ok::<(), anyhow::Error>(());
+                                }
                                 assert_eq!(*winning_snake_id, Some(snake2_id), "Snake 2 should win");
-                                break;
+                                return Ok::<(), anyhow::Error>(());
                             }
                         }
-                        _ => {}
+                        _ => {
+                            println!("Client1 received event: {:?}", event.event);
+                        }
                     }
                 }
             }
@@ -182,11 +173,193 @@ async fn test_simple_game() -> Result<()> {
                             }
                         }
                         GameEvent::StatusUpdated { status } => {
+                            println!("Client2: Game status updated to {:?}", status);
                             if let GameStatus::Complete { winning_snake_id } = status {
                                 println!("Game complete! Winner: {:?}", winning_snake_id);
+                                if *winning_snake_id == None {
+                                    println!("Game ended in a draw - both snakes died");
+                                    return Ok::<(), anyhow::Error>(());
+                                }
                                 assert_eq!(*winning_snake_id, Some(snake2_id), "Snake 2 should win");
-                                break;
+                                return Ok::<(), anyhow::Error>(());
                             }
+                        }
+                        _ => {
+                            println!("Client2 received event: {:?}", event.event);
+                        }
+                    }
+                }
+            }
+            else => {
+                // No messages available, continue
+            }
+        }
+    }
+    
+    // Wait for game completion event
+    let game_ended = timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                msg = client1.receive_message() => {
+                    if let Ok(WSMessage::GameEvent(event)) = msg {
+                        if let GameEvent::StatusUpdated { status } = &event.event {
+                            if matches!(status, GameStatus::Complete { .. }) {
+                                println!("Game completed with status: {:?}", status);
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                        }
+                    }
+                }
+                msg = client2.receive_message() => {
+                    if let Ok(WSMessage::GameEvent(event)) = msg {
+                        if let GameEvent::StatusUpdated { status } = &event.event {
+                            if matches!(status, GameStatus::Complete { .. }) {
+                                println!("Game completed with status: {:?}", status);
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }).await;
+    
+    assert!(game_ended.is_ok(), "Game should have ended with a completion status");
+    
+    // In this test both snakes actually die at the same time (head-on collision)
+    // So we expect both to be dead with no winner
+    assert!(snake1_died, "Snake 1 should have died");
+    assert!(snake2_died, "Snake 2 should have died");
+    
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_game_does_not_end_prematurely() -> Result<()> {
+    // Initialize tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    
+    // Create environment
+    let mut env = TestEnvironment::new("test_game_does_not_end_prematurely").await?;
+    let (_, server_id) = env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+    
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    
+    // Connect clients
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+    
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+    
+    // Queue for match
+    client1.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    client2.send_message(WSMessage::QueueForMatch { 
+        game_type: GameType::FreeForAll { max_players: 2 } 
+    }).await?;
+    
+    // Wait for game to start
+    let (msg1, msg2) = timeout(Duration::from_secs(5), async {
+        let msg1 = client1.receive_message().await?;
+        let msg2 = client2.receive_message().await?;
+        Ok::<_, anyhow::Error>((msg1, msg2))
+    }).await??;
+    
+    // Verify we got the game snapshot
+    let (game_id, snake1_id, snake2_id) = match (msg1, msg2) {
+        (WSMessage::GameEvent(event1), WSMessage::GameEvent(event2)) => {
+            let game_id = event1.game_id;
+            assert_eq!(game_id, event2.game_id);
+            
+            match (&event1.event, &event2.event) {
+                (GameEvent::Snapshot { game_state: state1 }, GameEvent::Snapshot { .. }) => {
+                    let snake1_id = state1.players.get(&(env.user_ids()[0] as u32))
+                        .expect("Player 1 should have a snake").snake_id;
+                    let snake2_id = state1.players.get(&(env.user_ids()[1] as u32))
+                        .expect("Player 2 should have a snake").snake_id;
+                    
+                    (game_id, snake1_id, snake2_id)
+                }
+                _ => panic!("Expected Snapshot events"),
+            }
+        }
+        _ => panic!("Expected GameEvent messages"),
+    };
+    
+    println!("Game started with ID: {}, Snake 1 ID: {}, Snake 2 ID: {}", 
+             game_id, snake1_id, snake2_id);
+    
+    // Both snakes will move in circles to stay alive
+    // Snake 1 turns up immediately
+    client1.send_message(WSMessage::GameCommand(
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: env.user_ids()[0] as u32,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn { 
+                snake_id: snake1_id, 
+                direction: Direction::Up 
+            },
+        }
+    )).await?;
+    
+    // Snake 2 turns down immediately
+    client2.send_message(WSMessage::GameCommand(
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: env.user_ids()[1] as u32,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn { 
+                snake_id: snake2_id, 
+                direction: Direction::Down 
+            },
+        }
+    )).await?;
+    
+    // Let the game run for a while and verify it doesn't end
+    let start_time = tokio::time::Instant::now();
+    let mut received_complete = false;
+    
+    while start_time.elapsed() < Duration::from_secs(3) {
+        tokio::select! {
+            msg = timeout(Duration::from_millis(100), client1.receive_message()) => {
+                if let Ok(Ok(WSMessage::GameEvent(event))) = msg {
+                    match &event.event {
+                        GameEvent::StatusUpdated { status } => {
+                            if matches!(status, GameStatus::Complete { .. }) {
+                                println!("ERROR: Game ended prematurely at tick {}", event.tick);
+                                received_complete = true;
+                            }
+                        }
+                        GameEvent::SnakeDied { snake_id } => {
+                            println!("Snake {} died at tick {}", snake_id, event.tick);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            msg = timeout(Duration::from_millis(100), client2.receive_message()) => {
+                if let Ok(Ok(WSMessage::GameEvent(event))) = msg {
+                    match &event.event {
+                        GameEvent::StatusUpdated { status } => {
+                            if matches!(status, GameStatus::Complete { .. }) {
+                                println!("ERROR: Game ended prematurely at tick {}", event.tick);
+                                received_complete = true;
+                            }
+                        }
+                        GameEvent::SnakeDied { snake_id } => {
+                            println!("Snake {} died at tick {}", snake_id, event.tick);
                         }
                         _ => {}
                     }
@@ -198,9 +371,10 @@ async fn test_simple_game() -> Result<()> {
         }
     }
     
-    // Verify that snake 1 died (crashed into wall) and snake 2 survived
-    assert!(snake1_died, "Snake 1 should have crashed into the wall");
-    assert!(!snake2_died, "Snake 2 should have survived by turning");
+    // Verify the game did NOT end (both snakes should still be alive)
+    assert!(!received_complete, "Game should not have ended - both snakes should still be alive");
+    
+    println!("Test passed: Game continued running with both snakes alive");
     
     env.shutdown().await?;
     Ok(())

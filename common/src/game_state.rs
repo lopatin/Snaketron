@@ -408,7 +408,7 @@ impl GameState {
             let head = snake.head()?;
             if snake.is_alive {
                 // If not within bounds
-                if !head.x >= 0 && head.x < width && head.y >= 0 && head.y < height {
+                if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
                     crashed_snake_ids.push(snake_id);
                     continue 'main_snake_loop;
                 }
@@ -457,6 +457,24 @@ impl GameState {
                     self.apply_event(GameEvent::FoodSpawned { position }, Some(&mut out));
                 }
             }
+        }
+
+        // Check if game should end (only one or no snakes alive)
+        let alive_snakes: Vec<u32> = self.arena.snakes
+            .iter()
+            .enumerate()
+            .filter(|(_, snake)| snake.is_alive)
+            .map(|(idx, _)| idx as u32)
+            .collect();
+        
+        if alive_snakes.len() <= 1 && matches!(self.status, GameStatus::Started { .. }) {
+            let winning_snake_id = alive_snakes.first().copied();
+            self.apply_event(
+                GameEvent::StatusUpdated { 
+                    status: GameStatus::Complete { winning_snake_id } 
+                },
+                Some(&mut out)
+            );
         }
 
         // Increment tick
