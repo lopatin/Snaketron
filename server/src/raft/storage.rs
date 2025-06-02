@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::io;
+use std::io::Cursor;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::sync::{RwLock, broadcast};
@@ -11,242 +12,140 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tracing::{debug, error, info};
 use anyhow::{Context, Result};
 
-use crate::game_manager::GameManager;
 use tokio::sync::RwLock as TokioRwLock;
-use crate::replica_manager::{ReplicaManager, ReplicationCommand};
-use super::types::{ClientRequest, ClientResponse, RaftNodeId, StateChangeEvent};
-use super::state_machine::{GameStateMachine, StateMachineSnapshot};
+use super::types::{ClientRequest, ClientResponse, StateChangeEvent};
+use super::state_machine::{GameStateMachine};
 
-/// In-memory snapshot that avoids serialization overhead
-#[derive(Clone, Debug)]
-pub struct InMemorySnapshot {
+const ERR_INCONSISTENT_LOG: &str = "a query was received which was expecting data to be in place which does not exist in the log";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateMachineSnapshot {
+    /// The last index covered by this snapshot.
     pub index: u64,
+    /// The term of the last index covered by this snapshot.
     pub term: u64,
+    /// The last membership config included in this snapshot.
     pub membership: MembershipConfig,
-    pub state: StateMachineSnapshot,
+    /// The data of the state machine at the time of this snapshot.
+    pub data: Vec<u8>,
 }
 
-/// A reader for in-memory snapshots that implements AsyncRead/AsyncWrite/AsyncSeek
-pub struct InMemorySnapshotReader {
-    snapshot: Arc<InMemorySnapshot>,
-    serialized: Vec<u8>,
-    position: usize,
-}
-
-impl InMemorySnapshotReader {
-    pub fn new(snapshot: Arc<InMemorySnapshot>) -> io::Result<Self> {
-        // For compatibility with async-raft, we still need to serialize for transport
-        // but we avoid doing this during normal operations
-        let serialized = bincode::serde::encode_to_vec(
-            &snapshot.state,
-            bincode::config::standard()
-        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
-        Ok(Self {
-            snapshot,
-            serialized,
-            position: 0,
-        })
-    }
-}
-
-impl AsyncRead for InMemorySnapshotReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let remaining = self.serialized.len() - self.position;
-        let to_read = remaining.min(buf.remaining());
-        
-        if to_read > 0 {
-            buf.put_slice(&self.serialized[self.position..self.position + to_read]);
-            self.position += to_read;
-        }
-        
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for InMemorySnapshotReader {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-        _buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Snapshots are read-only"
-        )))
-    }
-    
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemorySnapshotReader {
-    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
-        let new_pos = match position {
-            io::SeekFrom::Start(pos) => pos as usize,
-            io::SeekFrom::End(offset) => {
-                let len = self.serialized.len() as i64;
-                (len + offset) as usize
-            }
-            io::SeekFrom::Current(offset) => {
-                let current = self.position as i64;
-                (current + offset) as usize
-            }
-        };
-        
-        if new_pos > self.serialized.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Seek position out of bounds"
-            ));
-        }
-        
-        self.position = new_pos;
-        Ok(())
-    }
-    
-    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
-        Poll::Ready(Ok(self.position as u64))
-    }
-}
-
-#[derive(Clone)]
 pub struct GameRaftStorage {
+    /// The node ID of this Raft node.
     node_id: NodeId,
     
-    // Raft persistent state
-    current_term: Arc<RwLock<u64>>,
-    voted_for: Arc<RwLock<Option<u64>>>,
-    log: Arc<RwLock<BTreeMap<u64, Entry<ClientRequest>>>>,
+    /// Raft persistent state
+    log: RwLock<BTreeMap<u64, Entry<ClientRequest>>>,
+
+    /// The current hard state.
+    hard_state: RwLock<Option<HardState>>,
     
-    // In-memory snapshots - store multiple for history
-    snapshots: Arc<RwLock<BTreeMap<u64, Arc<InMemorySnapshot>>>>,
-    max_snapshots: usize,
-    
-    // Application state machine
-    state_machine: Arc<RwLock<GameStateMachine>>,
-    
-    // Membership
-    membership: Arc<RwLock<MembershipConfig>>,
+    /// Application state machine
+    state_machine: RwLock<GameStateMachine>,
+
+    /// The current snapshot.
+    current_snapshot: RwLock<Option<StateMachineSnapshot>>,
+
+    /// Channel for broadcasting state change events
+    event_tx: broadcast::Sender<StateChangeEvent>,
 }
 
 impl GameRaftStorage {
     pub fn new(node_id: NodeId, event_tx: broadcast::Sender<StateChangeEvent>) -> Self {
         Self {
             node_id,
-            current_term: Arc::new(RwLock::new(0)),
-            voted_for: Arc::new(RwLock::new(None)),
-            log: Arc::new(RwLock::new(BTreeMap::new())),
-            snapshots: Arc::new(RwLock::new(BTreeMap::new())),
-            max_snapshots: 3,
-            state_machine: Arc::new(RwLock::new(GameStateMachine::new(node_id.clone(), event_tx))),
-            membership: Arc::new(RwLock::new(MembershipConfig::new_initial(node_id))),
-        }
-    }
-    
-    /// Clean up old snapshots, keeping only the most recent ones
-    async fn cleanup_old_snapshots(&self) {
-        let mut snapshots = self.snapshots.write().await;
-        while snapshots.len() > self.max_snapshots {
-            if let Some((&oldest_index, _)) = snapshots.iter().next() {
-                snapshots.remove(&oldest_index);
-                debug!("Removed old snapshot at index {}", oldest_index);
-            }
+            log: RwLock::new(BTreeMap::new()),
+            hard_state: RwLock::new(None),
+            state_machine: RwLock::new(GameStateMachine::new(node_id.clone())),
+            current_snapshot: RwLock::new(None),
+            event_tx,
         }
     }
 }
 
 #[async_trait]
 impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
-    type Snapshot = InMemorySnapshotReader;
+    type Snapshot = Cursor<Vec<u8>>;
     type ShutdownError = std::io::Error;
 
     async fn get_membership_config(&self) -> Result<MembershipConfig> {
-        Ok(self.membership.read().await.clone())
-    }
-
-    async fn get_initial_state(&self) -> Result<InitialState> {
-        let term = *self.current_term.read().await;
-        let voted_for = self.voted_for.read().await.clone();
         let log = self.log.read().await;
-        
-        let (last_log_index, last_log_term) = log
-            .values()
-            .last()
-            .map(|e| (e.index, e.term))
-            .unwrap_or((0, 0));
-
-        let last_applied_log = self.state_machine.read().await.last_applied_log()
-            .unwrap_or(0);
-
-        let membership = self.membership.read().await.clone();
-        
-        debug!(
-            "Getting initial state: term={}, last_log=({}, {}), last_applied={}",
-            term, last_log_index, last_log_term, last_applied_log
-        );
-        
-        Ok(InitialState {
-            last_log_index,
-            last_log_term,
-            last_applied_log,
-            hard_state: HardState {
-                current_term: term,
-                voted_for,
-            },
-            membership,
+        let cfg_opt = log.values().rev().find_map(|entry| match &entry.payload {
+            EntryPayload::ConfigChange(cfg) => Some(cfg.membership.clone()),
+            EntryPayload::SnapshotPointer(snap) => Some(snap.membership.clone()),
+            _ => None,
+        });
+        Ok(match cfg_opt {
+            Some(cfg) => cfg,
+            None => MembershipConfig::new_initial(self.node_id),
         })
     }
 
+    async fn get_initial_state(&self) -> Result<InitialState> {
+        let membership = self.get_membership_config().await?;
+        let mut hs = self.hard_state.write().await;
+        let log = self.log.read().await;
+        let sm = self.state_machine.read().await;
+        match &mut *hs {
+            Some(inner) => {
+                let (last_log_index, last_log_term) = match log.values().rev().next() {
+                    Some(log) => (log.index, log.term),
+                    None => (0, 0),
+                };
+                let last_applied_log = sm.last_applied_log();
+                Ok(InitialState {
+                    last_log_index,
+                    last_log_term,
+                    last_applied_log,
+                    hard_state: inner.clone(),
+                    membership,
+                })
+            }
+            None => {
+                let new = InitialState::new_initial(self.node_id);
+                *hs = Some(new.hard_state.clone());
+                Ok(new)
+            }
+        }
+    }
+
     async fn save_hard_state(&self, hs: &HardState) -> Result<()> {
-        *self.current_term.write().await = hs.current_term;
-        *self.voted_for.write().await = hs.voted_for.clone();
-        debug!("Saved hard state: term={}, voted_for={:?}", hs.current_term, hs.voted_for);
+        *self.hard_state.write().await = Some(hs.clone());
         Ok(())
     }
 
     async fn get_log_entries(&self, start: u64, stop: u64) -> Result<Vec<Entry<ClientRequest>>> {
+        // Invalid request, return empty vec.
+        if start > stop {
+            error!("invalid request, start > stop");
+            return Ok(vec![]);
+        }
         let log = self.log.read().await;
-        let entries: Vec<_> = log
-            .range(start..stop)
-            .map(|(_, entry)| entry.clone())
-            .collect();
-        
-        debug!("Getting log entries from {} to {}: {} entries", start, stop, entries.len());
-        Ok(entries)
+        Ok(log.range(start..stop).map(|(_, val)| val.clone()).collect())
     }
 
     async fn delete_logs_from(&self, start: u64, stop: Option<u64>) -> Result<()> {
-        let mut log = self.log.write().await;
-        
-        let stop = stop.unwrap_or(u64::MAX);
-        let keys_to_remove: Vec<_> = log
-            .range(start..stop)
-            .map(|(k, _)| *k)
-            .collect();
-        
-        let num_removed = keys_to_remove.len();
-        for key in keys_to_remove {
-            log.remove(&key);
+        if stop.as_ref().map(|stop| &start > stop).unwrap_or(false) {
+            tracing::error!("invalid request, start > stop");
+            return Ok(());
         }
-        
-        debug!("Deleted {} log entries from index {}", num_removed, start);
+        let mut log = self.log.write().await;
+
+        // If a stop point was specified, delete from start until the given stop point.
+        if let Some(stop) = stop.as_ref() {
+            for key in start..*stop {
+                log.remove(&key);
+            }
+            return Ok(());
+        }
+        // Else, just split off the remainder.
+        log.split_off(&start);
         Ok(())
     }
 
     async fn append_entry_to_log(&self, entry: &Entry<ClientRequest>) -> Result<()> {
         let mut log = self.log.write().await;
         log.insert(entry.index, entry.clone());
-        debug!("Appended entry at index {}: {:?}", entry.index, entry.payload);
         Ok(())
     }
 
@@ -255,7 +154,6 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         for entry in entries {
             log.insert(entry.index, entry.clone());
         }
-        debug!("Replicated {} entries to log", entries.len());
         Ok(())
     }
 
@@ -265,58 +163,100 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         data: &ClientRequest,
     ) -> Result<ClientResponse> {
         let mut sm = self.state_machine.write().await;
-        let response = sm.apply(index, data).await
-            .context("Failed to apply entry")?;
+        let mut events_out: Vec<StateChangeEvent> = Vec::new();
+        let (rsp, events) = sm
+            .apply(index, data, Some(&mut events_out)).await
+            .context("Failed to apply entry to state machine")?;
         
-        debug!("Applied entry at index {} to state machine", index);
-        Ok(response)
+        // Emit state change events
+        for event in events {
+            self.event_tx.send(event)
+                .map_err(|_| anyhow::anyhow!("Failed to send state change event"))?;
+        }
+        
+        Ok(rsp)
     }
 
     async fn replicate_to_state_machine(&self, entries: &[(&u64, &ClientRequest)]) -> Result<()> {
         let mut sm = self.state_machine.write().await;
+        let mut events_out: Vec<StateChangeEvent> = Vec::new();
+        
         for (index, data) in entries {
-            sm.apply(index, data).await
-                .context("Failed to apply entry")?;
+            sm.apply(index, data, Some(&mut events_out)).await
+                .context("Failed to replicate entry to state machine")?;
         }
-        debug!("Replicated {} entries to state machine", entries.len());
+        
+        // Emit state change events
+        for event in events_out {
+            self.event_tx.send(event)
+                .map_err(|_| anyhow::anyhow!("Failed to send state change event"))?;
+        }
+        
         Ok(())
     }
 
     async fn do_log_compaction(&self) -> Result<CurrentSnapshotData<Self::Snapshot>> {
-        let sm = self.state_machine.read().await;
-        let state_snapshot = sm.take_direct_snapshot().await
-            .context("Failed to create snapshot")?;
-        
-        let membership = self.membership.read().await.clone();
-        let term = *self.current_term.read().await;
-        
-        let last_log = self.log.read().await
-            .values()
-            .last()
-            .map(|e| (e.index, e.term))
-            .unwrap_or((0, 0));
-        
-        let snapshot = Arc::new(InMemorySnapshot {
-            index: last_log.0,
-            term: last_log.1,
-            membership: membership.clone(),
-            state: state_snapshot,
-        });
-        
-        // Store in memory and clean up old snapshots
-        self.snapshots.write().await.insert(snapshot.index, snapshot.clone());
-        self.cleanup_old_snapshots().await;
-        
-        info!("Created in-memory snapshot at index {}", last_log.0);
-        
-        let reader = InMemorySnapshotReader::new(snapshot.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to create snapshot reader: {}", e))?;
-        
+
+        let (data, last_applied_log);
+        {
+            // Serialize the data of the state machine with bincode
+            let sm = self.state_machine.read().await;
+            let sm_bytes: Vec<u8> = bincode::serde::encode_to_vec(&sm, bincode::config::standard())
+                .context("Failed to serialize state machine")?;
+            data = bincode::serde::encode_to_vec(&sm, bincode::config::standard())
+                .context("Failed to serialize state machine snapshot")?;
+            last_applied_log = sm.last_applied_log;
+        } // Release state machine read lock.
+
+        let membership_config;
+        {
+            // Go backwards through the log to find the most recent membership config <= the `through` index.
+            let log = self.log.read().await;
+            membership_config = log
+                .values()
+                .rev()
+                .skip_while(|entry| entry.index > last_applied_log)
+                .find_map(|entry| match &entry.payload {
+                    EntryPayload::ConfigChange(cfg) => Some(cfg.membership.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| MembershipConfig::new_initial(self.node_id));
+        } // Release log read lock.
+
+        let snapshot_bytes: Vec<u8>;
+        let term;
+        {
+            let mut log = self.log.write().await;
+            let mut current_snapshot = self.current_snapshot.write().await;
+            term = log
+                .get(&last_applied_log)
+                .map(|entry| entry.term)
+                .ok_or_else(|| anyhow::anyhow!(ERR_INCONSISTENT_LOG))?;
+            *log = log.split_off(&last_applied_log);
+            log.insert(
+                last_applied_log,
+                Entry::new_snapshot_pointer(last_applied_log, term, "".into(), membership_config.clone()),
+            );
+
+            let snapshot = StateMachineSnapshot {
+                index: last_applied_log,
+                term,
+                membership: membership_config.clone(),
+                data,
+            };
+            snapshot_bytes = bincode::serde::encode_to_vec(
+                &snapshot,
+                bincode::config::standard()
+            ).context("Failed to serialize snapshot")?;
+
+            *current_snapshot = Some(snapshot);
+        } // Release log & snapshot write locks.
+
         Ok(CurrentSnapshotData {
-            term: snapshot.term,
-            index: snapshot.index,
-            membership: snapshot.membership.clone(),
-            snapshot: Box::new(reader),
+            term,
+            index: last_applied_log,
+            membership: membership_config.clone(),
+            snapshot: Box::new(Cursor::new(snapshot_bytes))
         })
     }
 
@@ -331,7 +271,7 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         index: u64,
         term: u64,
         delete_through: Option<u64>,
-        _id: String,
+        id: String,
         snapshot: Box<Self::Snapshot>,
     ) -> Result<()> {
         // Read the serialized snapshot data
@@ -339,56 +279,63 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         let mut snapshot = snapshot;
         tokio::io::AsyncReadExt::read_to_end(&mut *snapshot, &mut data).await
             .context("Failed to read snapshot")?;
-        
+
         // Deserialize the state machine snapshot
-        let (state_snapshot, _): (StateMachineSnapshot, _) = 
+        let (new_snapshot, _): (StateMachineSnapshot, _) =
             bincode::serde::decode_from_slice(&data, bincode::config::standard())
             .context("Failed to deserialize snapshot")?;
-        
-        // Get current membership to preserve it
-        let membership = self.membership.read().await.clone();
-        
-        let snapshot = Arc::new(InMemorySnapshot {
-            index,
-            term,
-            membership,
-            state: state_snapshot,
-        });
-        
-        // Restore state machine from snapshot
-        let mut sm = self.state_machine.write().await;
-        sm.restore_from_snapshot(&snapshot.state).await
-            .context("Failed to restore snapshot")?;
-        
-        // Store in memory
-        self.snapshots.write().await.insert(snapshot.index, snapshot);
-        self.cleanup_old_snapshots().await;
-        
-        // Delete old log entries
-        if let Some(through) = delete_through {
-            self.delete_logs_from(0, Some(through + 1)).await?;
+
+        // Update log.
+        {
+            // Go backwards through the log to find the most recent membership config <= the `through` index.
+            let mut log = self.log.write().await;
+            let membership_config = log
+                .values()
+                .rev()
+                .skip_while(|entry| entry.index > index)
+                .find_map(|entry| match &entry.payload {
+                    EntryPayload::ConfigChange(cfg) => Some(cfg.membership.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| MembershipConfig::new_initial(self.node_id));
+
+            match &delete_through {
+                Some(through) => {
+                    *log = log.split_off(&(through + 1));
+                }
+                None => log.clear(),
+            }
+            log.insert(index, Entry::new_snapshot_pointer(index, term, id, membership_config));
         }
-        
-        info!("Finalized snapshot installation at index {}", index);
+
+        // Update the state machine.
+        {
+            let new_sm: GameStateMachine = bincode::serde::decode_from_slice(
+                &new_snapshot.data, 
+                bincode::config::standard()
+            ).context("Failed to deserialize state machine from snapshot")?.0;
+            let mut sm = self.state_machine.write().await;
+            *sm = new_sm;
+        }
+
+        // Update the current snapshot.
+        let mut current_snapshot = self.current_snapshot.write().await;
+        *current_snapshot = Some(new_snapshot);
         Ok(())
     }
 
     async fn get_current_snapshot(&self) -> Result<Option<CurrentSnapshotData<Self::Snapshot>>> {
-        let snapshots = self.snapshots.read().await;
-        
-        // Get the most recent snapshot
-        if let Some((&_, snapshot)) = snapshots.iter().last() {
-            let reader = InMemorySnapshotReader::new(snapshot.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to create snapshot reader: {}", e))?;
-            
-            Ok(Some(CurrentSnapshotData {
-                term: snapshot.term,
-                index: snapshot.index,
-                membership: snapshot.membership.clone(),
-                snapshot: Box::new(reader),
-            }))
-        } else {
-            Ok(None)
+        match &*self.current_snapshot.read().await {
+            Some(snapshot) => {
+                let bytes = bincode::serde::encode_to_vec(snapshot, bincode::config::standard())?;
+                Ok(Some(CurrentSnapshotData {
+                    index: snapshot.index,
+                    term: snapshot.term,
+                    membership: snapshot.membership.clone(),
+                    snapshot: Box::new(Cursor::new(bytes)),
+                }))
+            }
+            None => Ok(None),
         }
     }
 }
