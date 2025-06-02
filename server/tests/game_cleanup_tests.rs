@@ -208,7 +208,11 @@ async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(10), async {
         loop {
             match client.receive_message().await? {
-                WSMessage::MatchFound { game_id } => return Ok(game_id),
+                WSMessage::GameEvent(event) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        return Ok(event.game_id);
+                    }
+                }
                 _ => continue,
             }
         }

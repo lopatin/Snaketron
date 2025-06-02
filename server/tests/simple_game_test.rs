@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::Result;
 use server::ws_server::WSMessage;
-use ::common::{GameEvent, GameType, GameCommand, Direction, GameStatus};
+use ::common::{GameEvent, GameType, GameCommand, GameCommandMessage, Direction, GameStatus, CommandId};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
@@ -102,9 +102,17 @@ async fn test_simple_game() -> Result<()> {
     
     // Snake 2 turns up immediately
     client2.send_message(WSMessage::GameCommand(
-        GameCommand::Turn { 
-            snake_id: snake2_id, 
-            direction: Direction::Up 
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: env.user_ids()[1] as u32,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn { 
+                snake_id: snake2_id, 
+                direction: Direction::Up 
+            },
         }
     )).await?;
     println!("Snake 2 sent turn up command");
@@ -114,9 +122,17 @@ async fn test_simple_game() -> Result<()> {
     
     // Snake 2 turns left to avoid the top wall
     client2.send_message(WSMessage::GameCommand(
-        GameCommand::Turn { 
-            snake_id: snake2_id, 
-            direction: Direction::Left 
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: env.user_ids()[1] as u32,
+                sequence_number: 1,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn { 
+                snake_id: snake2_id, 
+                direction: Direction::Left 
+            },
         }
     )).await?;
     println!("Snake 2 sent turn left command");

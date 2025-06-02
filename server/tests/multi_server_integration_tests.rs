@@ -321,21 +321,22 @@ async fn wait_for_game_start(client: &mut TestClient) -> Result<u32> {
             message_count += 1;
             println!("Waiting for message #{}", message_count);
             match client.receive_message().await {
-                Ok(WSMessage::MatchFound { game_id }) => {
-                    match_found = true;
-                    // Only join if we haven't already joined this game
-                    if joined_game_id != Some(game_id) {
-                        println!("Received MatchFound for game {}, joining...", game_id);
-                        // Join the game explicitly (needed for cross-server games)
-                        client.join_game(game_id).await?;
-                        joined_game_id = Some(game_id);
-                        println!("Sent JoinGame message for game {}", game_id);
-                        // Don't wait here - continue processing messages
-                    } else {
-                        println!("Received duplicate MatchFound for game {}, ignoring", game_id);
-                    }
-                }
                 Ok(WSMessage::GameEvent(event)) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        let game_id = event.game_id;
+                        match_found = true;
+                        // Only join if we haven't already joined this game
+                        if joined_game_id != Some(game_id) {
+                            println!("Received game snapshot for game {}, joining...", game_id);
+                            // Join the game explicitly (needed for cross-server games)
+                            client.join_game(game_id).await?;
+                            joined_game_id = Some(game_id);
+                            println!("Sent JoinGame message for game {}", game_id);
+                            // Don't wait here - continue processing messages
+                        } else {
+                            println!("Received duplicate game snapshot for game {}, ignoring", game_id);
+                        }
+                    }
                     received_any_event = true;
                     println!("Received GameEvent: {:?}", event.event);
                     if matches!(event.event, GameEvent::Snapshot { .. }) {

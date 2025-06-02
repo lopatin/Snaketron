@@ -25,6 +25,14 @@ pub enum ClientRequest {
     RemoveServer {
         server_id: u64,
     },
+    
+    /// Submit a game command from a user
+    SubmitGameCommand {
+        game_id: u32,
+        user_id: u32,
+        command: GameCommandMessage,
+        current_tick: u64, // Server's view of current game tick
+    },
 }
 
 // IntoRequest implementation removed - not needed
@@ -67,5 +75,11 @@ pub enum StateChangeEvent {
     },
     ServerRemoved {
         server_id: u64,
+    },
+    GameCommandSubmitted {
+        game_id: u32,
+        user_id: u32,
+        command: GameCommandMessage,
+        tick_submitted: u64,
     },
 }

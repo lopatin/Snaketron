@@ -12,7 +12,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, debug};
 
 use tokio::sync::RwLock as TokioRwLock;
-use common::GameState;
+use common::{GameCommandMessage, GameState};
 pub use storage::GameRaftStorage;
 pub use network::GameRaftNetwork;
 pub use state_machine::{GameStateMachine, StateMachineRequest, StateMachineResponse};
@@ -259,5 +259,19 @@ impl RaftNode {
         self.raft.change_membership(members).await?;
         self.network.remove_peer(node_id).await;
         Ok(())
+    }
+    
+    /// Get commands for a game submitted after a given tick
+    pub async fn get_commands_for_game(&self, game_id: u32, since_tick: u64) -> Vec<(GameCommandMessage, u64)> {
+        let storage = self.storage.clone();
+        let state_machine = storage.get_state_machine().await;
+        state_machine.get_commands_for_game(game_id, since_tick)
+    }
+    
+    /// Get the current tick for a game
+    pub async fn get_game_tick(&self, game_id: u32) -> Option<u32> {
+        let storage = self.storage.clone();
+        let state_machine = storage.get_state_machine().await;
+        state_machine.get_game_tick(game_id)
     }
 }

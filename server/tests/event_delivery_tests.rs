@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::Result;
 use server::ws_server::WSMessage;
-use ::common::{GameEvent, GameEventMessage, GameType, GameCommand, Direction};
+use ::common::{GameEvent, GameEventMessage, GameType, GameCommand, GameCommandMessage, Direction, CommandId};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
@@ -40,21 +40,25 @@ async fn test_game_events_delivered() -> Result<()> {
     let game_id = timeout(Duration::from_secs(5), async {
         loop {
             match client1.receive_message().await? {
-                WSMessage::MatchFound { game_id } => {
-                    return Ok::<_, anyhow::Error>(game_id);
+                WSMessage::GameEvent(event) => {
+                    if let GameEvent::Snapshot { .. } = event.event {
+                        return Ok::<_, anyhow::Error>(event.game_id);
+                    }
                 }
                 _ => continue,
             }
         }
     }).await??;
     
-    // Wait for client2 to also get match found
+    // Wait for client2 to also get game snapshot
     timeout(Duration::from_secs(5), async {
         loop {
             match client2.receive_message().await? {
-                WSMessage::MatchFound { game_id: id } => {
-                    assert_eq!(id, game_id);
-                    return Ok::<_, anyhow::Error>(());
+                WSMessage::GameEvent(event) => {
+                    if let GameEvent::Snapshot { .. } = event.event {
+                        assert_eq!(event.game_id, game_id);
+                        return Ok::<_, anyhow::Error>(());
+                    }
                 }
                 _ => continue,
             }
@@ -93,9 +97,17 @@ async fn test_game_events_delivered() -> Result<()> {
     assert_eq!(snapshot1.game_id, game_id);
     
     // Send a command from client1
-    client1.send_message(WSMessage::GameCommand(GameCommand::Turn { 
-        snake_id: env.user_ids()[0] as u32, 
-        direction: Direction::Up 
+    client1.send_message(WSMessage::GameCommand(GameCommandMessage {
+        command_id_client: CommandId {
+            tick: 0,
+            user_id: env.user_ids()[0] as u32,
+            sequence_number: 0,
+        },
+        command_id_server: None,
+        command: GameCommand::Turn { 
+            snake_id: env.user_ids()[0] as u32, 
+            direction: Direction::Up 
+        },
     })).await?;
     
     // Both clients should receive game events
@@ -157,8 +169,11 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Wait for match found
     let game_id = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::MatchFound { game_id } = client.receive_message().await? {
-                return Ok::<_, anyhow::Error>(game_id);
+            if let WSMessage::GameEvent(event) = client.receive_message().await? {
+                if let GameEvent::Snapshot { .. } = event.event {
+                    let game_id = event.game_id;
+                    return Ok::<_, anyhow::Error>(game_id);
+                }
             }
         }
     }).await??;
@@ -178,9 +193,17 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     }).await??;
     
     // Send a command
-    client.send_message(WSMessage::GameCommand(GameCommand::Turn { 
-        snake_id: env.user_ids()[0] as u32, 
-        direction: Direction::Up 
+    client.send_message(WSMessage::GameCommand(GameCommandMessage {
+        command_id_client: CommandId {
+            tick: 0,
+            user_id: env.user_ids()[0] as u32,
+            sequence_number: 0,
+        },
+        command_id_server: None,
+        command: GameCommand::Turn { 
+            snake_id: env.user_ids()[0] as u32, 
+            direction: Direction::Up 
+        },
     })).await?;
     
     // Should receive event
@@ -214,9 +237,17 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     }).await??;
     
     // Send another command
-    client.send_message(WSMessage::GameCommand(GameCommand::Turn { 
-        snake_id: env.user_ids()[0] as u32, 
-        direction: Direction::Down 
+    client.send_message(WSMessage::GameCommand(GameCommandMessage {
+        command_id_client: CommandId {
+            tick: 0,
+            user_id: env.user_ids()[0] as u32,
+            sequence_number: 1,
+        },
+        command_id_server: None,
+        command: GameCommand::Turn { 
+            snake_id: env.user_ids()[0] as u32, 
+            direction: Direction::Down 
+        },
     })).await?;
     
     // Should still receive events

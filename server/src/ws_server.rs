@@ -25,7 +25,7 @@ use crate::raft::{RaftNode, StateChangeEvent};
 pub enum WSMessage {
     Token(String),
     JoinGame(u32),
-    GameCommand(GameCommand),
+    GameCommand(GameCommandMessage),
     GameEvent(GameEventMessage),
     Chat(String),
     Shutdown,
@@ -364,6 +364,7 @@ async fn handle_websocket_connection(
                             &db_pool,
                             &ws_tx,
                             &mut ws_stream,
+                            &raft,
                         ).await;
                         
                         match process_result {
@@ -414,6 +415,7 @@ async fn process_ws_message(
     db_pool: &PgPool,
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
+    raft: &Arc<RaftNode>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -500,25 +502,30 @@ async fn process_ws_message(
         }
         ConnectionState::InGame { user_token, game_id } => {
             match ws_message {
-                // WSMessage::GameCommand(cmd) => {
-                //     let game_command = GameCommandMessage {
-                //         command_id_client: common::CommandId {
-                //             tick: 0, // This should be filled by the client
-                //             user_id: user_token.user_id as u32,
-                //             sequence_number: 0,
-                //         },
-                //         command_id_server: None,
-                //         command: cmd,
-                //     };
-                // 
-                //     if let Err(e) = command_tx.send(game_command).await {
-                //         error!("Failed to send command: {}", e);
-                //         // Game might have ended, transition back to authenticated
-                //         Ok(ConnectionState::Authenticated { user_token })
-                //     } else {
-                //         Ok(ConnectionState::InGame { user_token, game_id, command_tx, event_rx })
-                //     }
-                // }
+                WSMessage::GameCommand(command_message) => {
+                    // Get current game tick from Raft
+                    let current_tick = raft.get_game_tick(game_id).await.unwrap_or(0);
+                    
+                    // Submit command to Raft
+                    let request = crate::raft::ClientRequest::SubmitGameCommand {
+                        game_id,
+                        user_id: user_token.user_id as u32,
+                        command: command_message,
+                        current_tick: current_tick as u64,
+                    };
+                    
+                    match raft.propose(request).await {
+                        Ok(_) => {
+                            debug!("Successfully submitted game command to Raft");
+                            Ok(ConnectionState::InGame { user_token, game_id })
+                        }
+                        Err(e) => {
+                            error!("Failed to submit command to Raft: {}", e);
+                            // Keep the connection in game state, don't disconnect
+                            Ok(ConnectionState::InGame { user_token, game_id })
+                        }
+                    }
+                }
                 WSMessage::Ping => {
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());

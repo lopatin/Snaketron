@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common::{GameEventMessage, GameState, GameStatus};
+use common::{GameCommandMessage, GameEventMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,6 +34,9 @@ pub struct GameStateMachine {
     pub game_states: HashMap<u32, GameState>,
     pub servers: HashMap<u64, ServerRegistration>,
     pub last_applied_log: u64,
+    /// Latest command per user per game
+    /// Key: (game_id, user_id), Value: (command, tick_submitted)
+    pub user_commands: HashMap<(u32, u32), (GameCommandMessage, u64)>,
 }
 
 impl GameStateMachine {
@@ -43,6 +46,7 @@ impl GameStateMachine {
             game_states: HashMap::new(),
             servers: HashMap::new(),
             last_applied_log: 0,
+            user_commands: HashMap::new(),
         }
     }
 
@@ -151,10 +155,49 @@ impl GameStateMachine {
                     ClientResponse::Error(format!("Unknown server ID: {}", server_id))
                 }
             }
+            
+            ClientRequest::SubmitGameCommand { game_id, user_id, command, current_tick } => {
+                // Verify the game exists
+                if !self.game_states.contains_key(game_id) {
+                    warn!("Attempted to submit command for unknown game {}", game_id);
+                    return Ok((ClientResponse::Error(format!("Unknown game ID: {}", game_id)), vec![]));
+                }
+                
+                // Store the command with the current tick
+                let key = (*game_id, *user_id);
+                self.user_commands.insert(key, (command.clone(), *current_tick));
+                
+                // Emit state change event
+                if let Some(ref mut events) = out {
+                    events.push(StateChangeEvent::GameCommandSubmitted {
+                        game_id: *game_id,
+                        user_id: *user_id,
+                        command: command.clone(),
+                        tick_submitted: *current_tick,
+                    });
+                }
+                
+                debug!("User {} submitted command for game {} at tick {}", user_id, game_id, current_tick);
+                ClientResponse::Success
+            }
         };
 
         let events = out.map(|v| v.clone()).unwrap_or_default();
         Ok((response, events))
+    }
+    
+    /// Get all commands for a specific game submitted after a given tick
+    pub fn get_commands_for_game(&self, game_id: u32, since_tick: u64) -> Vec<(GameCommandMessage, u64)> {
+        self.user_commands
+            .iter()
+            .filter(|((gid, _), (_, tick))| *gid == game_id && *tick > since_tick)
+            .map(|((_, _), (cmd, tick))| (cmd.clone(), *tick))
+            .collect()
+    }
+    
+    /// Get the current tick for a game
+    pub fn get_game_tick(&self, game_id: u32) -> Option<u32> {
+        self.game_states.get(&game_id).map(|state| state.current_tick())
     }
 
 }

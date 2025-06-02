@@ -353,12 +353,7 @@ async fn test_rejoin_active_game() -> Result<()> {
 async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(30), async {
         loop {
-            // First we should get MatchFound, then GameEvent::Snapshot
             match client.receive_message().await? {
-                WSMessage::MatchFound { game_id: _ } => {
-                    // Just continue to wait for the snapshot
-                    continue;
-                }
                 WSMessage::GameEvent(event) => {
                     if matches!(event.event, GameEvent::Snapshot { .. }) {
                         return Ok(event.game_id);

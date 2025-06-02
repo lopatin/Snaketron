@@ -314,21 +314,7 @@ impl GameState {
 
         // Only rearrange players on tick 0
         if self.tick != 0 {
-            // Just add player at default position if not tick 0
-            let snake = Snake {
-                body: vec![
-                    Position { x: DEFAULT_SNAKE_LENGTH as i16, y: 0 }, 
-                    Position { x: 1, y: 0 }
-                ],
-                direction: Direction::Right,
-                is_alive: true,
-                food: 0,
-            };
-
-            let snake_id = self.arena.add_snake(snake)?;
-            let player = Player { user_id, snake_id };
-            self.players.insert(user_id, player.clone());
-            return Ok(player);
+            return Err(anyhow::anyhow!("Cannot add player after the game has started"));
         }
 
         // Add new player first with temporary position
@@ -494,7 +480,6 @@ impl GameState {
         Ok(out)
     }
 
-    // Must be idempotent so that Raft can reapply events if needed.
     pub fn apply_event(&mut self, event: GameEvent, out: Option<&mut Vec<GameEvent>>) {
         if let Some(out) = out {
             out.push(event.clone());
