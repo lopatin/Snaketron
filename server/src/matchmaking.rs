@@ -44,7 +44,7 @@ struct MatchmakingPlayer {
 
 #[derive(sqlx::FromRow, Debug)]
 struct ServerLoad {
-    id: uuid::Uuid,
+    id: i32,
     current_game_count: i32,
     max_game_capacity: i32,
 }
@@ -53,7 +53,7 @@ struct ServerLoad {
 pub async fn run_matchmaking_loop(
     pool: PgPool,
     raft: Arc<RaftNode>,
-    server_id: uuid::Uuid,
+    server_id: u64,
     cancellation_token: CancellationToken,
 ) {
     info!(?server_id, "Starting adaptive matchmaking loop");
@@ -118,7 +118,7 @@ pub async fn run_matchmaking_loop(
 }
 
 /// Update server heartbeat
-async fn update_heartbeat(pool: &PgPool, server_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+async fn update_heartbeat(pool: &PgPool, server_id: u64) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -128,7 +128,7 @@ async fn update_heartbeat(pool: &PgPool, server_id: uuid::Uuid) -> Result<(), sq
         "#
     )
     .bind(now)
-    .bind(server_id)
+    .bind(server_id as i32)
     .execute(pool)
     .await?;
     Ok(())
@@ -139,7 +139,7 @@ async fn create_adaptive_match(
     pool: &PgPool,
     raft: Arc<RaftNode>,
     game_type: serde_json::Value,
-    server_id: uuid::Uuid,
+    server_id: u64,
 ) -> anyhow::Result<Option<(i32, Vec<i32>)>> {
     let mut tx = pool.begin().await?;
     tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
@@ -168,7 +168,7 @@ async fn create_adaptive_match(
         .position(|&threshold| wait_seconds < threshold)
         .unwrap_or(WAIT_THRESHOLDS.len() - 1);
 
-    let (min_mmr_diff, max_mmr_diff) = MMR_RANGES.get(tier).copied().unwrap_or((0, 1000));
+    let (_min_mmr_diff, max_mmr_diff) = MMR_RANGES.get(tier).copied().unwrap_or((0, 1000));
     let base_min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
     
     // For game types with max_players, never require more than max_players
@@ -271,7 +271,7 @@ async fn create_adaptive_match(
         RETURNING id
         "#
     )
-    .bind(server_id)
+    .bind(server_id as i32)
     .bind(&game_type)
     .fetch_one(&mut *tx)
     .await?;
@@ -318,7 +318,7 @@ async fn create_adaptive_match(
         WHERE id = $1
         "#
     )
-    .bind(server_id)
+    .bind(server_id as i32)
     .execute(&mut *tx)
     .await?;
 
@@ -366,7 +366,7 @@ async fn create_adaptive_match(
 /// Select the least loaded healthy server
 async fn select_least_loaded_server(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<uuid::Uuid, sqlx::Error> {
+) -> Result<i32, sqlx::Error> {
     let server: ServerLoad = sqlx::query_as(
         r#"
         SELECT id, current_game_count, max_game_capacity
@@ -388,12 +388,16 @@ async fn select_least_loaded_server(
 }
 
 /// Check if an error is a serialization failure
-fn is_serialization_error(error: &sqlx::Error) -> bool {
-    match error {
-        sqlx::Error::Database(db_err) => {
-            // PostgreSQL serialization failure error code is 40001
-            db_err.code().map(|c| c == "40001").unwrap_or(false)
+fn is_serialization_error(error: &anyhow::Error) -> bool {
+    if let Some(sqlx_err) = error.downcast_ref::<sqlx::Error>() {
+        match sqlx_err {
+            sqlx::Error::Database(db_err) => {
+                // PostgreSQL serialization failure error code is 40001
+                db_err.code().map(|c| c == "40001").unwrap_or(false)
+            }
+            _ => false,
         }
-        _ => false,
+    } else {
+        false
     }
 }

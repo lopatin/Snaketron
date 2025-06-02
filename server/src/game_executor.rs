@@ -1,11 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
-use std::collections::HashSet;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
-use sqlx::PgPool;
 use common::GameEvent::StatusUpdated;
 use common::{GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus};
 use crate::{
@@ -57,11 +54,13 @@ async fn run_game(
                                 event,
                             };
                             
-                            if let Err(e) = raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await
-                                    .expect("Failed to propose game event") {
-                                warn!(game_id, error = %e, "Failed to publish game event");
-                            } else {
-                                debug!(game_id, "Published game event: {:?}", event_msg);
+                            match raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await {
+                                Ok(_) => {
+                                    debug!(game_id, "Published game event: {:?}", event_msg);
+                                }
+                                Err(e) => {
+                                    warn!(game_id, error = %e, "Failed to publish game event");
+                                }
                             }
                         }
                     }
@@ -83,12 +82,16 @@ pub async fn run_game_executor(
 ) -> Result<()> {
     info!("Starting game executor for server {}", server_id);
 
-    let mut state_rx = raft.subscribe_state_events().await;
+    let mut state_rx = raft.subscribe_state_events();
 
-    let try_start_game = |game_id: u32| {
+    let raft_clone = raft.clone();
+    let cancellation_token_clone = cancellation_token.clone();
+    let try_start_game = move |game_id: u32| {
+        let raft = raft_clone.clone();
+        let cancellation_token = cancellation_token_clone.clone();
         tokio::spawn(async move {
             match raft.propose(ClientRequest::StartGame { game_id, server_id }).await {
-                Ok(response) => {
+                Ok(_response) => {
                     // Run the game loop here.
                     run_game(server_id, game_id, raft.clone(), cancellation_token.clone()).await;
                 },

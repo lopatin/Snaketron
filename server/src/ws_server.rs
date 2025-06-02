@@ -1,11 +1,10 @@
 use std::pin::Pin;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::wrappers::BroadcastStream;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
-use chrono::{DateTime, Utc};
-use uuid::Uuid;
+use chrono::Utc;
 use std::time::Duration;
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream, StreamExt};
@@ -73,9 +72,13 @@ async fn add_to_matchmaking_queue(
     user_id: i32,
     game_type: common::GameType,
 ) -> Result<()> {
-    // First, get the current server ID (we need to know which server the user is connected to)
-    // For now, we'll use a placeholder. In a real implementation, this would be passed down.
-    let server_id = get_current_server_id(pool).await?;
+    // Get the first available server from the database
+    let server_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM servers WHERE status = 'active' LIMIT 1"
+    )
+    .fetch_one(pool)
+    .await
+    .context("No active servers available")?;
     
     // Remove any existing queue entry for this user
     sqlx::query(
@@ -224,13 +227,8 @@ async fn process_ws_message(
                         error!("Failed to add user to matchmaking queue: {}", e);
                     }
                     
-                    // Start polling for match
-                    let poll_pool = db_pool.clone();
-                    let poll_user_id = user_token.user_id;
-                    let poll_tx = ws_tx.clone();
-                    tokio::spawn(async move {
-                        poll_for_match(poll_pool, poll_user_id, poll_tx).await;
-                    });
+                    // Polling for match is now handled by the matchmaking service
+                    // No need to poll here
                     
                     Ok(ConnectionState::Authenticated { user_token })
                 }
@@ -251,35 +249,9 @@ async fn process_ws_message(
                     Ok(ConnectionState::Authenticated { user_token })
                 }
                 WSMessage::GameEvent(event_msg) => {
-                    // Handle game events - specifically initial snapshot from matchmaking
-                    if let GameEvent::Snapshot { ref game_state } = event_msg.event {
-                        info!("Received game snapshot for game {} - auto-joining", event_msg.game_id);
-                        
-                        // Join the game to get the channels
-                        let games_mgr = games_manager.read().await;
-                        match games_mgr.join_game(event_msg.game_id).await {
-                            Ok((command_tx, event_rx)) => {
-                                // Forward the snapshot to the client
-                                let snapshot_msg = Message::Text(serde_json::to_string(&event_msg)?.into());
-                                ws_stream.send(snapshot_msg).await?;
-                                
-                                info!("WS: Auto-joined game {} after matchmaking", event_msg.game_id);
-                                Ok(ConnectionState::InGame {
-                                    user_token,
-                                    game_id: event_msg.game_id,
-                                    command_tx,
-                                    event_rx,
-                                })
-                            }
-                            Err(e) => {
-                                error!("Failed to auto-join game {}: {}", event_msg.game_id, e);
-                                Ok(ConnectionState::Authenticated { user_token })
-                            }
-                        }
-                    } else {
-                        warn!("Unexpected game event while authenticated: {:?}", event_msg);
-                        Ok(ConnectionState::Authenticated { user_token })
-                    }
+                    // Forward game events to the client
+                    warn!("Received game event in authenticated state: {:?}", event_msg);
+                    Ok(ConnectionState::Authenticated { user_token })
                 }
                 _ => {
                     warn!("Unexpected message in authenticated state: {:?}", ws_message);
@@ -291,6 +263,12 @@ async fn process_ws_message(
             match ws_message {
                 WSMessage::GameCommand(cmd) => {
                     let game_command = GameCommandMessage {
+                        command_id_client: common::CommandId {
+                            tick: 0, // This should be filled by the client
+                            user_id: user_token.user_id as u32,
+                            sequence_number: 0,
+                        },
+                        command_id_server: None,
                         command: cmd,
                     };
                     
@@ -323,12 +301,11 @@ async fn process_ws_message(
 
 
 pub async fn run_websocket_server(
+    addr: &str,
     raft: Arc<RaftNode>,
     db_pool: PgPool,
-    addr: &str,
-    listener: TcpListener,
-    jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
+    jwt_verifier: Arc<dyn JwtVerifier>,
 ) -> Result<()> {
 
     let listener = TcpListener::bind(addr).await?;
@@ -352,7 +329,8 @@ pub async fn run_websocket_server(
                         let connection_token = cancellation_token.child_token();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(&raft, db_pool_clone, stream, jwt_verifier_clone, connection_token));
+                        let raft_clone = raft.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(raft_clone, db_pool_clone, stream, jwt_verifier_clone, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -388,7 +366,7 @@ pub async fn run_websocket_server(
 
 
 async fn handle_websocket_connection(
-    raft: &RaftNode,
+    raft: Arc<RaftNode>,
     db_pool: PgPool,
     stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -413,16 +391,16 @@ async fn handle_websocket_connection(
     let mut shutdown_started = false;
     
     let game_start_stream = BroadcastStream::new(raft.subscribe_state_events())
-        .filter_map(|event| {
+        .filter_map(|event| async move {
             match event {
-                Ok(StateChangeEvent::GameCreated { game_id }) => {
-                    Some(WSMessage::GameEvent(GameEventMessage {
-                        game_id,
-                        event: GameEvent::Snapshot { game_state: None }, // Placeholder for actual game state
-                    }))
+                Ok(StateChangeEvent::GameCreated { game_id: _ }) => {
+                    // For now, don't send game creation events to clients
+                    // They will receive events when they join a specific game
+                    None::<WSMessage>
                 }
                 _ => None
-            }});
+            }
+        });
 
     tokio::pin!(game_start_stream);
     
@@ -607,22 +585,23 @@ pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) ->
     info!("Registering server instance");
 
     // Insert a new record and return the generated ID
-    let id: u64 = sqlx::query_scalar(
+    let id: i32 = sqlx::query_scalar(
         r#"
         INSERT INTO servers (grpc_address, last_heartbeat, region, created_at)
-        VALUES ($1, NULL, $3, $4)
+        VALUES ($1, NULL, $2, $3)
         RETURNING id
         "#
     )
         .bind(grpc_address)
         .bind(region)
         .bind(Utc::now())
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .context("Failed to register server in database")?;
 
-    info!(?id, "Server registered with ID: {}", id);
-    Ok(id)
+    let id_u64 = id as u64;
+    info!(id = id_u64, "Server registered with ID: {}", id_u64);
+    Ok(id_u64)
 }
 
 pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, String)>> {

@@ -17,10 +17,11 @@ pub use storage::GameRaftStorage;
 pub use network::GameRaftNetwork;
 pub use state_machine::{GameStateMachine, StateMachineRequest, StateMachineResponse};
 pub use types::{ClientRequest, ClientResponse, StateChangeEvent};
+use crate::game_relay;
 
 pub type GameRaft = Raft<ClientRequest, ClientResponse, GameRaftNetwork, GameRaftStorage>;
 
-const CLUSTER_NAME: String = "snaketron".to_string();
+const CLUSTER_NAME: &str = "snaketron";
 
 /// Track learner progress
 #[derive(Clone, Debug)]
@@ -54,7 +55,7 @@ impl RaftNode {
         let network = Arc::new(GameRaftNetwork::new(node_id));
         
         // Configure Raft
-        let config = Arc::new(Config::build(CLUSTER_NAME)
+        let config = Arc::new(Config::build(CLUSTER_NAME.to_string())
             .election_timeout_min(150)
             .election_timeout_max(300)
             .heartbeat_interval(50)
@@ -109,10 +110,34 @@ impl RaftNode {
             Err(ClientWriteError::ForwardToLeader(data, leader)) => {
                 if let Some(leader_id) = leader {
                     info!("Forwarding request to leader {}: {:?}", leader_id, data);
-                    let mut leader_node = self.network.get_client(leader_id).await
-                        .as_ref()
+                    let mut leader_client = self.network.get_client(leader_id).await
                         .ok_or_else(|| anyhow::anyhow!("No connection to leader {}", leader_id))?;
-                    Ok(ClientResponse::from(leader_node.raft_propose(data).await?))
+                    
+                    // Serialize the client request
+                    let serialized_request = bincode::serde::encode_to_vec(&data, bincode::config::standard())
+                        .map_err(|e| anyhow::anyhow!("Failed to serialize request: {}", e))?;
+                    
+                    let request = crate::game_relay::RaftProposeRequest {
+                        client_request: serialized_request,
+                    };
+                    
+                    let response = leader_client.raft_propose(tonic::Request::new(request)).await
+                        .map_err(|e| anyhow::anyhow!("Failed to forward to leader: {}", e))?;
+                    let response = response.into_inner();
+                    
+                    if response.success {
+                        if let Some(client_response_bytes) = response.client_response {
+                            let (client_response, _): (ClientResponse, _) = bincode::serde::decode_from_slice(
+                                &client_response_bytes,
+                                bincode::config::standard()
+                            ).map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))?;
+                            Ok(client_response)
+                        } else {
+                            Err(anyhow::anyhow!("No response from leader"))
+                        }
+                    } else {
+                        Err(anyhow::anyhow!("Leader returned error: {:?}", response.error))
+                    }
                 } else {
                     Err(anyhow::anyhow!("No leader available to forward request"))
                 }

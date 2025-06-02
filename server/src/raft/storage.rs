@@ -92,7 +92,7 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
                     Some(log) => (log.index, log.term),
                     None => (0, 0),
                 };
-                let last_applied_log = sm.last_applied_log();
+                let last_applied_log = sm.last_applied_log;
                 Ok(InitialState {
                     last_log_index,
                     last_log_term,
@@ -201,9 +201,7 @@ impl RaftStorage<ClientRequest, ClientResponse> for GameRaftStorage {
         {
             // Serialize the data of the state machine with bincode
             let sm = self.state_machine.read().await;
-            let sm_bytes: Vec<u8> = bincode::serde::encode_to_vec(&sm, bincode::config::standard())
-                .context("Failed to serialize state machine")?;
-            data = bincode::serde::encode_to_vec(&sm, bincode::config::standard())
+            data = bincode::serde::encode_to_vec(&*sm, bincode::config::standard())
                 .context("Failed to serialize state machine snapshot")?;
             last_applied_log = sm.last_applied_log;
         } // Release state machine read lock.

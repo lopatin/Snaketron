@@ -7,11 +7,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use crate::game_relay::game_relay_client::GameRelayClient;
-use crate::game_relay::RaftInstallSnapshot;
+use crate::game_relay::{
+    RaftMessage as ProtoRaftMessage,
+    RaftAppendEntries,
+    RaftVoteRequest,
+    RaftInstallSnapshot,
+};
 use super::types::{ClientRequest};
-// game_relay_client::GameRelayClient,
 
 
 pub struct GameRaftNetwork {
@@ -63,7 +67,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             .ok_or_else(|| anyhow::anyhow!("No connection to node {}", target))?;
         
         let request = ProtoRaftMessage {
-            message: Some(crate::game_broker::game_relay::raft_message::Message::AppendEntries(
+            message: Some(crate::game_relay::raft_message::Message::AppendEntries(
                 RaftAppendEntries {
                     term: rpc.term,
                     leader_id: rpc.leader_id.to_string(),
@@ -78,7 +82,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
         let mut client = client.clone();
         let response = client.raft_rpc(tonic::Request::new(request)).await?;
         
-        if let Some(crate::game_broker::game_relay::raft_message::Message::AppendResponse(resp)) = 
+        if let Some(crate::game_relay::raft_message::Message::AppendResponse(resp)) = 
             response.into_inner().message {
             Ok(AppendEntriesResponse {
                 term: resp.term,
@@ -122,7 +126,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
         let mut client = client.clone();
         let response = client.raft_rpc(tonic::Request::new(request)).await?;
         
-        if let Some(crate::game_broker::game_relay::raft_message::Message::SnapshotResponse(resp)) = 
+        if let Some(crate::game_relay::raft_message::Message::SnapshotResponse(resp)) = 
             response.into_inner().message {
             Ok(InstallSnapshotResponse { term: resp.term })
         } else {
@@ -135,7 +139,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
             .ok_or_else(|| anyhow::anyhow!("No connection to node {}", target))?;
         
         let request = ProtoRaftMessage {
-            message: Some(crate::game_broker::game_relay::raft_message::Message::VoteRequest(
+            message: Some(crate::game_relay::raft_message::Message::VoteRequest(
                 RaftVoteRequest {
                     term: rpc.term,
                     candidate_id: rpc.candidate_id.to_string(),
@@ -148,7 +152,7 @@ impl RaftNetwork<ClientRequest> for GameRaftNetwork {
         let mut client = client.clone();
         let response = client.raft_rpc(tonic::Request::new(request)).await?;
         
-        if let Some(crate::game_broker::game_relay::raft_message::Message::VoteResponse(resp)) = 
+        if let Some(crate::game_relay::raft_message::Message::VoteResponse(resp)) = 
             response.into_inner().message {
             Ok(VoteResponse {
                 term: resp.term,

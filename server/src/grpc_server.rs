@@ -46,9 +46,7 @@ impl GameRelay for GameRelayService {
         info!(client_address = ?client_addr, "New game relay connection");
 
         let (response_tx, response_rx) = mpsc::channel(32);
-        let broker = self.broker.clone();
-        let response_tx_clone = response_tx.clone();
-
+        
         // Handle incoming messages from remote server
         tokio::spawn(async move {
             while let Some(result) = client_stream.next().await {
@@ -57,54 +55,13 @@ impl GameRelay for GameRelayService {
                         use game_relay::game_message::Message;
                         
                         match game_message.message {
-                            Some(Message::Command(cmd)) => {
-                                // Deserialize and forward command to local game
-                                if let Ok((command, _)) = bincode::serde::decode_from_slice::<common::GameCommand, bincode::config::Configuration>(&cmd.command_data, bincode::config::standard()) {
-                                    let cmd_msg = common::GameCommandMessage {
-                                        tick: cmd.tick,
-                                        received_order: 0, // Will be assigned by game engine
-                                        user_id: cmd.user_id as u32,
-                                        command,
-                                    };
-                                    
-                                    if let Err(e) = broker.publish_command(cmd.game_id, cmd_msg).await {
-                                        error!("Failed to forward command: {:?}", e);
-                                    }
-                                }
+                            Some(Message::Command(_cmd)) => {
+                                // TODO: Handle command forwarding when broker is available
+                                warn!("Command forwarding not yet implemented");
                             }
-                            Some(Message::Subscribe(sub)) => {
-                                // Remote server wants to subscribe to a game
-                                if sub.events {
-                                    info!("Remote server subscribing to events for game {}", sub.game_id);
-                                    
-                                    // Subscribe to local game events and forward them
-                                    if let Ok(mut event_rx) = broker.subscribe_events(sub.game_id).await {
-                                        let tx = response_tx_clone.clone();
-                                        let game_id = sub.game_id;
-                                        
-                                        tokio::spawn(async move {
-                                            while let Ok(event_msg) = event_rx.recv().await {
-                                                // Serialize just the event, not the whole message
-                                                if let Ok(event_data) = bincode::serde::encode_to_vec(&event_msg.event, bincode::config::standard()) {
-                                                    let grpc_event = game_relay::GameEvent {
-                                                        game_id,
-                                                        tick: event_msg.tick,
-                                                        user_id: event_msg.user_id.map(|id| id as i32),
-                                                        event_data,
-                                                    };
-                                                    
-                                                    let message = game_relay::GameMessage {
-                                                        message: Some(game_relay::game_message::Message::Event(grpc_event)),
-                                                    };
-                                                    
-                                                    if tx.send(Ok(message)).await.is_err() {
-                                                        break; // Client disconnected
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
+                            Some(Message::Subscribe(_sub)) => {
+                                // TODO: Handle subscription when broker is available
+                                warn!("Subscription handling not yet implemented");
                             }
                             Some(Message::Unsubscribe(unsub)) => {
                                 // Remote server unsubscribing from game
@@ -124,95 +81,6 @@ impl GameRelay for GameRelayService {
 
         let output_stream = ReceiverStream::new(response_rx);
         Ok(Response::new(Box::pin(output_stream) as Self::StreamGameMessagesStream))
-    }
-
-    async fn get_game_snapshot(
-        &self,
-        request: Request<GetSnapshotRequest>,
-    ) -> Result<Response<GetSnapshotResponse>, Status> {
-        let game_id = request.into_inner().game_id;
-        
-        // Check if game is local
-        match self.broker.is_game_local(game_id).await {
-            Ok(true) => {
-                // For now, we don't have direct access to GamesManager here
-                // In a real implementation, we'd need to coordinate with GamesManager
-                // to get snapshots. For testing, return unimplemented.
-                Err(Status::unimplemented("Snapshot retrieval not yet implemented"))
-            }
-            Ok(false) => {
-                Err(Status::not_found(format!("Game {} not found on this server", game_id)))
-            }
-            Err(e) => {
-                Err(Status::internal(format!("Error checking game location: {}", e)))
-            }
-        }
-    }
-
-    async fn notify_match_found(
-        &self,
-        request: Request<NotifyMatchRequest>,
-    ) -> Result<Response<NotifyMatchResponse>, Status> {
-        let req = request.into_inner();
-        info!(
-            game_id = req.game_id,
-            game_host = %req.game_host_server_id,
-            player_ids = ?req.player_ids,
-            "Received cross-server match notification"
-        );
-        
-        // Notify local players that are in the list
-        let notified_players = self.player_connections
-            .notify_remote_match_found(&req.player_ids, req.game_id, &req.game_host_server_id)
-            .await;
-        
-        info!(
-            game_id = req.game_id,
-            notified_count = notified_players.len(),
-            "Notified local players about cross-server match"
-        );
-        
-        Ok(Response::new(NotifyMatchResponse {
-            success: !notified_players.is_empty(),
-            notified_players,
-        }))
-    }
-
-    type ReplicateGameStateStream = Pin<Box<dyn Stream<Item = Result<game_relay::ReplicationAck, Status>> + Send>>;
-    
-    async fn replicate_game_state(
-        &self,
-        request: Request<Streaming<game_relay::ReplicationEvent>>,
-    ) -> Result<Response<Self::ReplicateGameStateStream>, Status> {
-        let mut _stream = request.into_inner();
-        let (tx, rx) = mpsc::channel(32);
-        
-        // For now, just acknowledge all replication events
-        // In a full implementation, this would coordinate with ReplicaManager
-        tokio::spawn(async move {
-            while let Some(result) = _stream.next().await {
-                match result {
-                    Ok(event) => {
-                        let ack = game_relay::ReplicationAck {
-                            game_id: event.game_id,
-                            version: event.version,
-                            success: true,
-                            error: None,
-                        };
-                        if tx.send(Ok(ack)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error receiving replication event: {:?}", e);
-                        break;
-                    }
-                }
-            }
-        });
-        
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(output_stream) as Self::ReplicateGameStateStream))
     }
     
     async fn notify_shutdown(
@@ -352,24 +220,35 @@ impl GameRelay for GameRelayService {
             // Only leader can propose
             if !raft_node.is_leader().await {
                 return Ok(Response::new(RaftProposeResponse {
-                    client_response: 
+                    success: false,
+                    client_response: None,
+                    error: Some("Not the leader".to_string()),
                 }));
             }
             
+            // Deserialize the client request
+            let (client_request, _): (crate::raft::ClientRequest, _) = bincode::serde::decode_from_slice(
+                &req.client_request,
+                bincode::config::standard()
+            ).map_err(|e| Status::invalid_argument(format!("Failed to deserialize request: {}", e)))?;
+            
             // Propose the command to Raft
-            match raft_node.propose(req.command).await {
-                Ok(_) => {
-                    info!("Proposed command to Raft: {:?}", req.command);
+            match raft_node.propose(client_request).await {
+                Ok(response) => {
+                    info!("Proposed command to Raft");
                     Ok(Response::new(RaftProposeResponse {
                         success: true,
-                        reason: String::new(),
+                        client_response: Some(bincode::serde::encode_to_vec(&response, bincode::config::standard())
+                            .map_err(|e| Status::internal(format!("Failed to serialize response: {}", e)))?),
+                        error: None,
                     }))
                 }
                 Err(e) => {
                     error!("Failed to propose command: {}", e);
                     Ok(Response::new(RaftProposeResponse {
                         success: false,
-                        reason: e.to_string(),
+                        client_response: None,
+                        error: Some(e.to_string()),
                     }))
                 }
             }
@@ -382,7 +261,7 @@ impl GameRelay for GameRelayService {
 pub async fn run_game_relay_server(
     addr: &str,
     raft: Arc<RaftNode>,
-    server_id: u64,
+    server_id: String,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     #[cfg(feature = "skip-proto")]
@@ -395,7 +274,7 @@ pub async fn run_game_relay_server(
     #[cfg(not(feature = "skip-proto"))]
     {
         let service = GameRelayService::new(
-            raft_node,
+            Some(raft),
             server_id,
             addr.to_string(),
         );

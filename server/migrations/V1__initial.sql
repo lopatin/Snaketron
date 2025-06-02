@@ -3,7 +3,10 @@ CREATE TABLE servers (
     grpc_address VARCHAR(255) NOT NULL,
     last_heartbeat TIMESTAMP,
     region VARCHAR(50) NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    current_game_count INT NOT NULL DEFAULT 0,
+    max_game_capacity INT NOT NULL DEFAULT 100
 );
 
 CREATE TABLE users (
@@ -16,7 +19,7 @@ CREATE TABLE users (
 
 CREATE TABLE games (
     id SERIAL PRIMARY KEY,
-    server_id UUID,
+    server_id INT,
     game_type JSONB NOT NULL,
     game_state JSONB,
     status VARCHAR(20) NOT NULL DEFAULT 'waiting',
@@ -32,7 +35,7 @@ CREATE INDEX idx_games_status_last_activity ON games(status, last_activity);
 
 CREATE TABLE game_requests (
     id SERIAL PRIMARY KEY,
-    server_id UUID NOT NULL,
+    server_id INT NOT NULL,
     user_id INT NOT NULL UNIQUE,
     game_type JSONB NOT NULL,
     game_id INT DEFAULT NULL,

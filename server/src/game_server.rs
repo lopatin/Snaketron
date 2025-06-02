@@ -64,7 +64,7 @@ impl GameServer {
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
-        let server_id: u64 = register_server(&db_pool, &region).await
+        let server_id: u64 = register_server(&db_pool, &grpc_addr, &region).await
             .context("Failed to register server")?;
         info!("Server registered with ID: {}", server_id);
         
@@ -73,11 +73,13 @@ impl GameServer {
         let mut handles = Vec::new();
 
         // Start the heartbeat loop
+        let heartbeat_pool = db_pool.clone();
+        let heartbeat_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_heartbeat_loop(
-                db_pool.clone(), 
-                server_id.clone(), 
-                cancellation_token.clone()
+                heartbeat_pool, 
+                server_id, 
+                heartbeat_token
             ).await;
         }));
        
@@ -85,7 +87,9 @@ impl GameServer {
         info!("Initializing Raft consensus node");
         let raft_peers: Vec<String> = discover_peers(&db_pool, &region).await
             .context("Failed to discover Raft peers")?
-            .map(|(_, addr)| addr);
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect();
         
         let mut join_as_learner = false;
         let raft = if raft_peers.is_empty() {
@@ -111,12 +115,15 @@ impl GameServer {
 
         // Start gRPC server
         info!("Starting gRPC server on {}", grpc_addr);
+        let grpc_addr_clone = grpc_addr.clone();
+        let grpc_raft = raft.clone();
+        let grpc_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = run_game_relay_server(
-                &grpc_addr.clone(),
-                raft.clone(),
-                server_id,
-                cancellation_token.clone()
+                &grpc_addr_clone,
+                grpc_raft,
+                server_id.to_string(),
+                grpc_token
             ).await {
                 error!("Game relay gRPC server error: {}", e);
             }
@@ -126,7 +133,7 @@ impl GameServer {
             // Execute join protocol in the background
             let join_protocol = LearnerJoinProtocol::new(
                 server_id.to_string(),
-                grpc_addr,
+                grpc_addr.clone(),
                 raft.clone(),
             );
             
@@ -144,10 +151,11 @@ impl GameServer {
         let ws_token = cancellation_token.clone();
         let ws_addr_clone = ws_addr.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
+        let ws_raft = raft.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
-                raft.clone(),
+                ws_raft,
                 ws_pool,
                 ws_token,
                 ws_jwt_verifier,
@@ -156,22 +164,27 @@ impl GameServer {
 
         // Start the matchmaking service
         info!("Starting matchmaking service");
+        let match_pool = db_pool.clone();
+        let match_raft = raft.clone();
+        let match_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             run_matchmaking_loop(
-                db_pool.clone(),
-                raft.clone(),
-                server_id.clone(),
-                cancellation_token.clone(),
+                match_pool,
+                match_raft,
+                server_id,
+                match_token,
             ).await;
         }));
 
         // Start game the execution loop
         info!("Starting game executor service");
+        let exec_raft = raft.clone();
+        let exec_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = run_game_executor(
                 server_id,
-                raft.clone(),
-                cancellation_token.clone(),
+                exec_raft,
+                exec_token,
             ).await {
                 error!("Game executor service error: {}", e);
             }
@@ -189,7 +202,7 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
-            raft,
+            raft: Some(raft),
         })
     }
 
@@ -205,7 +218,11 @@ impl GameServer {
 
     /// Get the gRPC server address (if enabled)
     pub fn grpc_addr(&self) -> Option<&str> {
-        self.grpc_addr.is_empty().then_some(&self.grpc_addr)
+        if self.grpc_addr.is_empty() {
+            None
+        } else {
+            Some(&self.grpc_addr)
+        }
     }
 
     /// Get a reference to the database pool
@@ -219,8 +236,8 @@ impl GameServer {
         
         // Step 1: Stop accepting new games
         info!("Updating server status to 'draining'");
-        sqlx::query("UPDATE servers SET status = 'draining' WHERE server_id = $1")
-            .bind(self.server_id)
+        sqlx::query("UPDATE servers SET status = 'draining' WHERE id = $1")
+            .bind(self.server_id as i32)
             .execute(&self.db_pool)
             .await
             .context("Failed to update server status")?;
@@ -230,7 +247,7 @@ impl GameServer {
         self.cancellation_token.cancel();
 
         // Step 5: Wait for all services to complete
-        for handle in &self.handles {
+        while let Some(handle) = self.handles.pop() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {},
                 Ok(Err(e)) => error!("Service panicked during shutdown: {:?}", e),
@@ -239,8 +256,8 @@ impl GameServer {
         }
 
         // Update server status to offline
-        sqlx::query("UPDATE servers SET status = 'offline' WHERE server_id = $1")
-            .bind(self.server_id)
+        sqlx::query("UPDATE servers SET status = 'offline' WHERE id = $1")
+            .bind(self.server_id as i32)
             .execute(&self.db_pool)
             .await
             .context("Failed to update server status to offline")?;
@@ -263,7 +280,7 @@ pub async fn start_test_server(
 pub async fn start_test_server_with_grpc(
     db_url: &str,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    enable_grpc: bool,
+    _enable_grpc: bool,
 ) -> Result<GameServer> {
     // Create database pool
     let db_pool = PgPoolOptions::new()
@@ -327,7 +344,7 @@ pub async fn run_heartbeat_loop(
                     "#
                 )
                     .bind::<DateTime<Utc>>(now)
-                    .bind(server_id)
+                    .bind(server_id as i32)
                     .execute(&pool)
                     .await
                 {

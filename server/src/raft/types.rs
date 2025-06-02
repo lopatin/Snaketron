@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use async_raft::{AppData, AppDataResponse, NodeId};
-use tonic::IntoRequest;
 use common::{GameCommandMessage, GameEventMessage, GameState};
-use crate::game_relay::RaftProposeRequest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientRequest {
@@ -29,13 +27,7 @@ pub enum ClientRequest {
     },
 }
 
-impl IntoRequest<RaftProposeRequest> for ClientRequest {
-    fn into_request(self) -> Result<tonic::Request<RaftProposeRequest>, tonic::Status> {
-        let client_request = bincode::serde::encode_to_vec(&self, bincode::config::standard())
-            .map_err(|e| tonic::Status::internal(format!("Serialization error: {}", e)))?;
-        Ok(tonic::Request::new(RaftProposeRequest { client_request }))
-    }
-}
+// IntoRequest implementation removed - not needed
 
 // Implement the AppData trait for ClientRequest
 impl AppData for ClientRequest {}
