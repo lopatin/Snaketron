@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Direction, Player, Position, Snake};
 use crate::util::PseudoRandom;
 
-const DEFAULT_SNAKE_LENGTH: usize = 3;
+const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum GameCommand {
