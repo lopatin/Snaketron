@@ -99,8 +99,8 @@ impl View for ReplayViewerState {
                 self.player.step_forward(1);
                 self.playback_accumulator -= SECONDS_PER_TICK;
                 
-                // Stop playing if we've reached the end
-                if self.player.current_tick >= self.player.max_tick() {
+                // Stop playing if the game is complete
+                if matches!(self.player.current_state.status, GameStatus::Complete { .. }) {
                     self.player.is_playing = false;
                     self.playback_accumulator = 0.0;
                     break;

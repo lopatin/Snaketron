@@ -28,6 +28,10 @@ impl ReplayPlayer {
         
         // Process ticks one by one to maintain game logic
         while self.current_tick < target_tick {
+            // Check if the game is already complete
+            if matches!(self.current_state.status, GameStatus::Complete { .. }) {
+                break;
+            }
             // First, apply all events that should happen before or at this tick
             // This includes CommandScheduled events that enqueue commands
             while self.current_event_index < self.replay.events.len() {
@@ -73,7 +77,12 @@ impl ReplayPlayer {
     
     /// Toggle play/pause
     pub fn toggle_play(&mut self) {
-        self.is_playing = !self.is_playing;
+        // Don't allow playing if the game is complete
+        if matches!(self.current_state.status, GameStatus::Complete { .. }) {
+            self.is_playing = false;
+        } else {
+            self.is_playing = !self.is_playing;
+        }
     }
     
     /// Get the maximum tick available in the replay
