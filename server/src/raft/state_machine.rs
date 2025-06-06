@@ -1,7 +1,7 @@
 use anyhow::Result;
-use common::{GameCommandMessage, GameEventMessage, GameState, GameStatus};
+use common::{GameCommandMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use async_raft::NodeId;
 use async_raft::raft::MembershipConfig;

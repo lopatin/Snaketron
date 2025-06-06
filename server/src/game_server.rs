@@ -2,11 +2,9 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use uuid::Uuid;
 use tracing::{info, error, warn, trace};
 
 use crate::{
@@ -16,8 +14,10 @@ use crate::{
     matchmaking::run_matchmaking_loop,
     raft::{RaftNode},
     learner_join::LearnerJoinProtocol,
+    replay::ReplayListener,
 };
 use crate::ws_server::discover_peers;
+use std::path::PathBuf;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -31,6 +31,8 @@ pub struct GameServerConfig {
     pub region: String,
     /// JWT verifier for authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
+    /// Optional directory for saving game replays
+    pub replay_dir: Option<PathBuf>,
 }
 
 /// A complete game server instance with all components
@@ -49,6 +51,8 @@ pub struct GameServer {
     handles: Vec<JoinHandle<()>>,
     /// Raft consensus node
     raft: Option<Arc<RaftNode>>,
+    /// Optional replay listener
+    replay_listener: Option<Arc<ReplayListener>>,
 }
 
 impl GameServer {
@@ -60,6 +64,7 @@ impl GameServer {
             grpc_addr,
             region,
             jwt_verifier,
+            replay_dir,
         } = config;
 
         // Register server in database
@@ -194,6 +199,22 @@ impl GameServer {
             }
         }));
 
+        // Start replay listener if configured
+        let replay_listener = if let Some(replay_dir) = replay_dir {
+            info!("Starting replay listener, saving to {:?}", replay_dir);
+            let listener = Arc::new(ReplayListener::new(replay_dir));
+            let replay_raft = raft.clone();
+            let replay_listener_clone = listener.clone();
+            handles.push(tokio::spawn(async move {
+                let rx = replay_raft.subscribe_state_events();
+                replay_listener_clone.subscribe_to_raft(rx).await;
+            }));
+            Some(listener)
+        } else {
+            info!("Replay recording disabled (no replay directory configured)");
+            None
+        };
+
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -207,6 +228,7 @@ impl GameServer {
             cancellation_token,
             handles,
             raft: Some(raft),
+            replay_listener,
         })
     }
 
@@ -232,6 +254,11 @@ impl GameServer {
     /// Get a reference to the database pool
     pub fn db_pool(&self) -> &PgPool {
         &self.db_pool
+    }
+
+    /// Get a reference to the replay listener
+    pub fn replay_listener(&self) -> Option<&Arc<ReplayListener>> {
+        self.replay_listener.as_ref()
     }
 
     /// Shutdown the server gracefully
@@ -300,12 +327,16 @@ pub async fn start_test_server_with_grpc(
     // Enable gRPC if requested
     let grpc_addr = format!("127.0.0.1:{}", get_available_port());
 
+    // Create a temporary directory for replay files in tests
+    let replay_dir = Some(std::env::temp_dir().join(format!("snaketron_test_replays_{}", uuid::Uuid::new_v4())));
+    
     let config = GameServerConfig {
         db_pool,
         ws_addr,
         grpc_addr,
         region: "test-region".to_string(),
         jwt_verifier,
+        replay_dir,
     };
 
     GameServer::start(config).await

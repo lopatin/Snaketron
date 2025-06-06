@@ -71,6 +71,13 @@ async fn main() -> Result<()> {
     // Create JWT verifier
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;
 
+    // Get optional replay directory
+    let replay_dir = env::var("SNAKETRON_REPLAY_DIR").ok().map(|dir| {
+        let path = std::path::PathBuf::from(dir);
+        info!("Replay recording enabled, saving to: {:?}", path);
+        path
+    });
+
     // Raft peers are now discovered automatically from the database
 
     // Create server configuration
@@ -80,6 +87,7 @@ async fn main() -> Result<()> {
         grpc_addr,
         region,
         jwt_verifier,
+        replay_dir,
     };
 
     // Start the game server

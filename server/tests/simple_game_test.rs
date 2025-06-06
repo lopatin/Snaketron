@@ -231,6 +231,25 @@ async fn test_simple_game() -> Result<()> {
     assert!(snake1_died, "Snake 1 should have died");
     assert!(snake2_died, "Snake 2 should have died");
     
+    // Output the replay file location
+    if let Some(server) = env.server(0) {
+        if let Some(replay_listener) = server.replay_listener() {
+            // Wait a bit for the replay to be saved
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            match replay_listener.get_replay_path(_game_id).await {
+                Ok(replay_path) => {
+                    println!("\n=== REPLAY FILE SAVED ===");
+                    println!("Game replay saved to: {}", replay_path.display());
+                    println!("========================\n");
+                }
+                Err(e) => {
+                    println!("Warning: Could not get replay path: {}", e);
+                }
+            }
+        }
+    }
+    
     env.shutdown().await?;
     Ok(())
 }

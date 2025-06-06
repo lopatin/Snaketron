@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
-use common::GameEvent::StatusUpdated;
-use common::{GameEngine, GameEvent, GameEventMessage, GameStatus};
+use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, CommandId};
 use crate::{
     raft::{RaftNode, StateChangeEvent},
 };
@@ -70,16 +69,14 @@ async fn run_game(
                         
                         // Update the command with server-side tick information
                         let mut server_command = command;
-                        server_command.command_id_server = Some(common::CommandId {
+                        server_command.command_id_server = Some(CommandId {
                             tick: execution_tick,
                             user_id: server_command.command_id_client.user_id,
                             sequence_number: server_command.command_id_client.sequence_number,
                         });
                         
                         // Emit CommandScheduled event
-                        let event = GameEvent::CommandScheduled { 
-                            command_message: server_command 
-                        };
+                        let event = GameEvent::CommandScheduled { command_message: server_command };
                         let event_msg = GameEventMessage {
                             game_id,
                             tick: engine.current_tick(),
@@ -173,7 +170,7 @@ pub async fn run_game_executor(
                     
                     StateChangeEvent::GameEvent { event } => {
                         match event.event {
-                            StatusUpdated { status: GameStatus::Stopped } => {
+                            GameEvent::StatusUpdated { status: GameStatus::Stopped } => {
                                 try_start_game(event.game_id);
                             }
                             

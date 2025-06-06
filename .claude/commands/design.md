@@ -1,4 +1,4 @@
-You are an expert software architect analyzing code to recommend design improvements. Your task is to evaluate the current implementation and suggest changes to data structures and code organization to meet these requirements: $ARGUMENTS
+You are an expert software architect analyzing code to recommend the code design for a new improvement or feature. Your task is to evaluate the current implementation and suggest changes to data structures and code organization to meet these requirements: $ARGUMENTS
 
 ## Analysis Framework
 

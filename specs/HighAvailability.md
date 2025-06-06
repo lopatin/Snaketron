@@ -27,7 +27,4 @@ Rust channels are used for intra-server message passing, and Raft is used for in
 1. Servers A and B are running in the same region.
 2. A is sent a SIGTERM signal to begin graceful shutdown.
 3. Each connected WebSocket is sent a shutdown message. It will reconnect to another server to drain A.
-4. Fails over each game in its GameManager:
-    - Queries Raft for the least loaded server (B).
-    - Sets the game state `host` field to B.
-    - B realizes that it is now the host for the game and starts running the game loop.
+4. Each server is always trying to start each game. But a game can't be started while it's running on an active server. If the active server crashes, then one of the other servers will succeed in claiming the game as started, which will give it the go ahead to start the game loop.
