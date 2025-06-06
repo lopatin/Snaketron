@@ -1,7 +1,9 @@
 use super::View;
 use crate::app::AppCommand;
 use crate::replay::{ReplayData, player::ReplayPlayer};
-use crate::render::snake::SnakeRenderer;
+use crate::render::arena::ArenaRenderer;
+use crate::render::standard_renderer::StandardRenderer;
+use crate::render::types::{RenderConfig, CharDimensions};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
@@ -165,57 +167,18 @@ impl ReplayViewerState {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         
-        // Calculate cell size based on available space
-        let _cell_width = inner.width as f64 / arena.width as f64;
-        let _cell_height = inner.height as f64 / arena.height as f64;
+        // Create renderer with 2x1 characters per point
+        let char_dims = CharDimensions::new(2, 1);
+        let renderer = StandardRenderer::new(char_dims);
+        let arena_renderer = ArenaRenderer::new(renderer);
+        let config = RenderConfig { chars_per_point: char_dims };
         
-        // Use a simple character-based rendering for now
-        let mut grid = vec![vec![' '; arena.width as usize]; arena.height as usize];
-        
-        // Render food
-        for food in &arena.food {
-            if food.x >= 0 && food.x < arena.width as i16 && 
-               food.y >= 0 && food.y < arena.height as i16 {
-                grid[food.y as usize][food.x as usize] = '●';
-            }
-        }
-        
-        // Render snakes
-        for (snake_id, snake) in arena.snakes.iter().enumerate() {
-            let snake_id = snake_id as u32;
-            if snake.is_alive {
-                let positions = SnakeRenderer::expand_snake_body(snake);
-                let snake_char = match snake_id % 4 {
-                    0 => '█',
-                    1 => '▓',
-                    2 => '▒',
-                    _ => '░',
-                };
-                
-                for pos in positions {
-                    if pos.x >= 0 && pos.x < arena.width as i16 && 
-                       pos.y >= 0 && pos.y < arena.height as i16 {
-                        grid[pos.y as usize][pos.x as usize] = snake_char;
-                    }
-                }
-                
-                // Mark the head with a different character
-                if let Ok(head) = snake.head() {
-                    if head.x >= 0 && head.x < arena.width as i16 && 
-                       head.y >= 0 && head.y < arena.height as i16 {
-                        grid[head.y as usize][head.x as usize] = match snake.direction {
-                            common::Direction::Up => '▲',
-                            common::Direction::Down => '▼',
-                            common::Direction::Left => '◄',
-                            common::Direction::Right => '►',
-                        };
-                    }
-                }
-            }
-        }
+        // Render the arena to a character grid
+        let char_grid = arena_renderer.render(arena, &config);
         
         // Convert grid to lines
-        let lines: Vec<Line> = grid.into_iter()
+        let lines: Vec<Line> = char_grid.into_lines()
+            .into_iter()
             .map(|row| {
                 let text: String = row.into_iter().collect();
                 Line::from(text)
