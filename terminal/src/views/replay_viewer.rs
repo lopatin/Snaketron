@@ -76,7 +76,7 @@ impl View for ReplayViewerState {
                 None
             }
             KeyCode::PageDown => {
-                let visible_height = 10; // Approximate visible lines in event log
+                let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
                 let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
                 self.event_log_scroll = (self.event_log_scroll + 5).min(max_scroll);
                 let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
@@ -114,31 +114,31 @@ impl View for ReplayViewerState {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(3),  // Header
-                Constraint::Min(10),    // Game area
+                Constraint::Min(20),    // Game arena at top
+                Constraint::Length(12), // Event log (taller)
+                Constraint::Length(3),  // Header (tick counter)
                 Constraint::Length(4),  // Status
-                Constraint::Length(3),  // Controls
-                Constraint::Min(5),     // Event log at bottom
+                Constraint::Length(3),  // Controls help at bottom
             ])
             .split(frame.area());
         
+        // Game arena at top
+        self.render_arena(frame, chunks[0]);
+        
+        // Event log
+        self.render_event_log(frame, chunks[1]);
+        
         // Header with game info
         let header = self.render_header();
-        frame.render_widget(header, chunks[0]);
-        
-        // Game arena
-        self.render_arena(frame, chunks[1]);
+        frame.render_widget(header, chunks[2]);
         
         // Status info
         let status = self.render_status();
-        frame.render_widget(status, chunks[2]);
+        frame.render_widget(status, chunks[3]);
         
-        // Controls help
+        // Controls help at bottom
         let controls = self.render_controls();
-        frame.render_widget(controls, chunks[3]);
-        
-        // Event log at bottom
-        self.render_event_log(frame, chunks[4]);
+        frame.render_widget(controls, chunks[4]);
     }
 }
 
@@ -176,19 +176,67 @@ impl ReplayViewerState {
         // Render the arena to a character grid
         let char_grid = arena_renderer.render(arena, &config);
         
-        // Convert grid to styled lines
-        let lines: Vec<Line> = char_grid.into_styled_lines()
-            .into_iter()
-            .map(|(chars, styles)| {
-                let spans: Vec<Span> = chars.into_iter()
-                    .zip(styles.into_iter())
-                    .map(|(ch, style)| Span::styled(ch.to_string(), style))
-                    .collect();
-                Line::from(spans)
-            })
-            .collect();
+        // Calculate arena dimensions including borders
+        let arena_width = (arena.width as usize * char_dims.horizontal) + 2; // +2 for left and right borders
+        let arena_height = (arena.height as usize * char_dims.vertical) + 2; // +2 for top and bottom borders
         
-        let game_view = Paragraph::new(lines);
+        // Calculate centering offsets
+        let x_offset = inner.width.saturating_sub(arena_width as u16) / 2;
+        let y_offset = inner.height.saturating_sub(arena_height as u16) / 2;
+        
+        // Create lines with borders and proper positioning
+        let mut final_lines: Vec<Line> = Vec::new();
+        
+        // Add vertical spacing for centering
+        for _ in 0..y_offset {
+            final_lines.push(Line::from(""));
+        }
+        
+        // Top border
+        let mut top_border = " ".repeat(x_offset as usize);
+        top_border.push('┌');
+        for _ in 0..(arena.width as usize * char_dims.horizontal) {
+            top_border.push('─');
+        }
+        top_border.push('┐');
+        final_lines.push(Line::from(vec![
+            Span::styled(top_border, Style::default().fg(Color::DarkGray))
+        ]));
+        
+        // Convert grid to styled lines with side borders
+        let grid_lines = char_grid.into_styled_lines();
+        for (chars, styles) in grid_lines {
+            let mut line_spans = Vec::new();
+            
+            // Left padding and border
+            if x_offset > 0 {
+                line_spans.push(Span::raw(" ".repeat(x_offset as usize)));
+            }
+            line_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            
+            // Arena content
+            for (ch, style) in chars.into_iter().zip(styles.into_iter()) {
+                line_spans.push(Span::styled(ch.to_string(), style));
+            }
+            
+            // Right border
+            line_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            
+            final_lines.push(Line::from(line_spans));
+        }
+        
+        // Bottom border
+        let mut bottom_border = " ".repeat(x_offset as usize);
+        bottom_border.push('└');
+        for _ in 0..(arena.width as usize * char_dims.horizontal) {
+            bottom_border.push('─');
+        }
+        bottom_border.push('┘');
+        final_lines.push(Line::from(vec![
+            Span::styled(bottom_border, Style::default().fg(Color::DarkGray))
+        ]));
+        
+        let game_view = Paragraph::new(final_lines);
         
         frame.render_widget(game_view, inner);
     }
