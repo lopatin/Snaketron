@@ -23,6 +23,8 @@ fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
     
+    // Removed debug code
+    
     // Get replay directory from args or use centralized default
     let replay_dir = std::env::args()
         .nth(1)

@@ -5,18 +5,22 @@ use crate::render::snake::SnakeRenderer;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Margin},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::time::{Duration, Instant};
+use std::cell::{RefCell, Cell};
 use common::{GameStatus};
 
 pub struct ReplayViewerState {
     player: ReplayPlayer,
     last_update: Instant,
     playback_accumulator: f32,
+    event_log_scroll: u16,
+    event_log_total_lines: Cell<u16>,
+    event_log_scrollbar_state: RefCell<ScrollbarState>,
 }
 
 impl ReplayViewerState {
@@ -25,6 +29,9 @@ impl ReplayViewerState {
             player: ReplayPlayer::new(replay_data),
             last_update: Instant::now(),
             playback_accumulator: 0.0,
+            event_log_scroll: 0,
+            event_log_total_lines: Cell::new(0),
+            event_log_scrollbar_state: RefCell::new(ScrollbarState::default()),
         }
     }
 }
@@ -60,6 +67,20 @@ impl View for ReplayViewerState {
             KeyCode::Char('q') | KeyCode::Esc => {
                 Some(AppCommand::BackToSelector)
             }
+            KeyCode::PageUp => {
+                self.event_log_scroll = self.event_log_scroll.saturating_sub(5);
+                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                None
+            }
+            KeyCode::PageDown => {
+                let visible_height = 10; // Approximate visible lines in event log
+                let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
+                self.event_log_scroll = (self.event_log_scroll + 5).min(max_scroll);
+                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                None
+            }
             _ => None,
         }
     }
@@ -92,9 +113,10 @@ impl View for ReplayViewerState {
             .margin(1)
             .constraints([
                 Constraint::Length(3),  // Header
-                Constraint::Min(0),     // Game area
+                Constraint::Min(10),    // Game area
                 Constraint::Length(4),  // Status
                 Constraint::Length(3),  // Controls
+                Constraint::Min(5),     // Event log at bottom
             ])
             .split(frame.area());
         
@@ -112,6 +134,9 @@ impl View for ReplayViewerState {
         // Controls help
         let controls = self.render_controls();
         frame.render_widget(controls, chunks[3]);
+        
+        // Event log at bottom
+        self.render_event_log(frame, chunks[4]);
     }
 }
 
@@ -250,11 +275,93 @@ impl ReplayViewerState {
     }
     
     fn render_controls(&self) -> Paragraph {
-        let help_text = "Space: Play/Pause | h/l: ±1 tick | j/k: ±10 ticks | q: Back to menu";
+        let help_text = "Space: Play/Pause | h/l: ±1 tick | j/k: ±10 ticks | PageUp/Down: Scroll event log | q: Back to menu";
         
         Paragraph::new(help_text)
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL))
+    }
+    
+    fn render_event_log(&self, frame: &mut Frame, area: Rect) {
+        // Get all events up to current tick
+        let current_tick = self.player.current_tick;
+        let events_to_show: Vec<&crate::replay::TimestampedEvent> = self.player.replay.events
+            .iter()
+            .filter(|e| e.tick <= current_tick)
+            .collect();
+        
+        // Create text lines for each event showing raw JSON
+        let mut lines = Vec::new();
+        
+        for event in events_to_show.iter().rev() {
+            // Add tick header
+            lines.push(Line::from(vec![
+                Span::styled(format!("=== Tick {} ===", event.tick), 
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            ]));
+            
+            // Serialize event to JSON
+            if let Ok(json) = serde_json::to_string_pretty(&event.event) {
+                // Split JSON into lines and wrap long lines
+                for json_line in json.lines() {
+                    // Simple line wrapping at 60 chars for the event log area
+                    let max_width = area.width.saturating_sub(4) as usize; // Account for borders and padding
+                    
+                    if json_line.len() <= max_width {
+                        lines.push(Line::from(json_line.to_string()));
+                    } else {
+                        // Wrap long lines
+                        let mut remaining = json_line;
+                        while !remaining.is_empty() {
+                            let chunk_len = remaining.len().min(max_width);
+                            let chunk = &remaining[..chunk_len];
+                            lines.push(Line::from(chunk.to_string()));
+                            remaining = &remaining[chunk_len..];
+                        }
+                    }
+                }
+            } else {
+                lines.push(Line::from(format!("Failed to serialize event")));
+            }
+            
+            // Add empty line between events
+            lines.push(Line::from(""));
+        }
+        
+        // Update total lines count
+        let total_lines = lines.len();
+        self.event_log_total_lines.set(total_lines as u16);
+        
+        // Update scrollbar state with content length
+        let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+        *scrollbar_state = scrollbar_state
+            .content_length(total_lines)
+            .position(self.event_log_scroll as usize);
+        
+        // Create scrollable paragraph with user-controlled scroll position
+        let event_log = Paragraph::new(lines)
+            .block(Block::default()
+                .title(format!("Raw Event Log ({} events) - PageUp/PageDown to scroll", events_to_show.len()))
+                .borders(Borders::ALL))
+            .style(Style::default().fg(Color::White))
+            .scroll((self.event_log_scroll, 0));
+        
+        frame.render_widget(event_log, area);
+        
+        // Create and render scrollbar
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+        
+        // Render the scrollbar inside the block borders
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut *scrollbar_state,
+        );
     }
 }
