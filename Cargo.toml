@@ -3,5 +3,6 @@ members = [
     "macros",
     "common",
     "server",
-    "client"
+    "client",
+    "terminal"
 ]

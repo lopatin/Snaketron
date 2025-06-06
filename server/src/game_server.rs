@@ -327,8 +327,11 @@ pub async fn start_test_server_with_grpc(
     // Enable gRPC if requested
     let grpc_addr = format!("127.0.0.1:{}", get_available_port());
 
-    // Create a temporary directory for replay files in tests
-    let replay_dir = Some(std::env::temp_dir().join(format!("snaketron_test_replays_{}", uuid::Uuid::new_v4())));
+    // Use centralized replay directory for tests
+    let test_name = format!("test_{}", uuid::Uuid::new_v4());
+    let replay_path = crate::replay::directory::get_test_replay_directory(&test_name);
+    std::fs::create_dir_all(&replay_path).ok();
+    let replay_dir = Some(replay_path);
     
     let config = GameServerConfig {
         db_pool,

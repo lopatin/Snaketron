@@ -71,12 +71,24 @@ async fn main() -> Result<()> {
     // Create JWT verifier
     let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;
 
-    // Get optional replay directory
-    let replay_dir = env::var("SNAKETRON_REPLAY_DIR").ok().map(|dir| {
-        let path = std::path::PathBuf::from(dir);
-        info!("Replay recording enabled, saving to: {:?}", path);
-        path
-    });
+    // Set up replay directory - use environment variable or default to centralized location
+    let replay_dir = if let Ok(custom_dir) = env::var("SNAKETRON_REPLAY_DIR") {
+        let path = std::path::PathBuf::from(custom_dir);
+        info!("Using custom replay directory: {:?}", path);
+        Some(path)
+    } else {
+        // Use centralized replay directory
+        match server::replay::directory::ensure_replay_directory() {
+            Ok(path) => {
+                info!("Replay recording enabled, saving to: {:?}", path);
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create replay directory: {}. Replay recording disabled.", e);
+                None
+            }
+        }
+    };
 
     // Raft peers are now discovered automatically from the database
 

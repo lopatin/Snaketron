@@ -10,6 +10,7 @@ use common::{GameState, GameEventMessage, GameStatus};
 
 mod recorder;
 mod listener;
+pub mod directory;
 
 pub use recorder::GameReplayRecorder;
 pub use listener::ReplayListener;
