@@ -1,4 +1,5 @@
 use common::Direction;
+use ratatui::style::{Color, Style};
 use super::traits::GameObjectRenderer;
 use super::types::{CharPattern, CharDimensions};
 
@@ -23,50 +24,19 @@ impl GameObjectRenderer for StandardRenderer {
         is_head: bool,
         player_id: u32,
     ) -> CharPattern {
-        let chars = if self.char_dims.horizontal == 2 && self.char_dims.vertical == 1 {
-            // 2x1 rendering - use brightness to distinguish head from body
-            if is_head {
-                // Bright white for head
-                vec![vec!['█', '█']]
-            } else {
-                // Different shades for different players
-                let body_char = match player_id % 4 {
-                    0 => '▓',  // Slightly darker than head
-                    1 => '▒',  // Medium shade
-                    2 => '░',  // Light shade
-                    _ => '▒',  // Default to medium
-                };
-                vec![vec![body_char, body_char]]
-            }
-        } else if self.char_dims.horizontal == 1 && self.char_dims.vertical == 1 {
-            // 1x1 rendering (classic mode)
-            let char = if is_head {
-                // Bright white for head
-                '█'
-            } else {
-                // Different shades for different players
-                match player_id % 4 {
-                    0 => '▓',
-                    1 => '▒',
-                    2 => '░',
-                    _ => '▒',
-                }
-            };
-            vec![vec![char]]
-        } else {
-            // Fallback for other dimensions
-            let fill_char = if is_head { '█' } else {
-                match player_id % 4 {
-                    0 => '▓',
-                    1 => '▒',
-                    2 => '░',
-                    _ => '▒',
-                }
-            };
-            vec![vec![fill_char; self.char_dims.horizontal]; self.char_dims.vertical]
+        // Use solid blocks for all snakes, vary only the color
+        let chars = vec![vec!['█'; self.char_dims.horizontal]; self.char_dims.vertical];
+        
+        // Select base color for the player
+        let color = match player_id % 4 {
+            0 => if is_head { Color::White } else { Color::Gray },          // White → Gray
+            1 => if is_head { Color::LightGreen } else { Color::Green },    // Light Green → Green
+            2 => if is_head { Color::LightBlue } else { Color::Blue },      // Light Blue → Blue
+            _ => if is_head { Color::LightYellow } else { Color::Yellow },  // Light Yellow → Yellow
         };
         
-        CharPattern::new(chars)
+        let style = Style::default().fg(color);
+        CharPattern::new_with_style(chars, style)
     }
     
     fn render_food(&self) -> CharPattern {
@@ -90,7 +60,9 @@ impl GameObjectRenderer for StandardRenderer {
             pattern
         };
         
-        CharPattern::new(chars)
+        // Food is always red
+        let style = Style::default().fg(Color::Red);
+        CharPattern::new_with_style(chars, style)
     }
     
     fn render_empty(&self) -> CharPattern {

@@ -176,17 +176,19 @@ impl ReplayViewerState {
         // Render the arena to a character grid
         let char_grid = arena_renderer.render(arena, &config);
         
-        // Convert grid to lines
-        let lines: Vec<Line> = char_grid.into_lines()
+        // Convert grid to styled lines
+        let lines: Vec<Line> = char_grid.into_styled_lines()
             .into_iter()
-            .map(|row| {
-                let text: String = row.into_iter().collect();
-                Line::from(text)
+            .map(|(chars, styles)| {
+                let spans: Vec<Span> = chars.into_iter()
+                    .zip(styles.into_iter())
+                    .map(|(ch, style)| Span::styled(ch.to_string(), style))
+                    .collect();
+                Line::from(spans)
             })
             .collect();
         
-        let game_view = Paragraph::new(lines)
-            .style(Style::default().fg(Color::White));
+        let game_view = Paragraph::new(lines);
         
         frame.render_widget(game_view, inner);
     }

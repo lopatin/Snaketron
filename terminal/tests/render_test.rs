@@ -44,8 +44,8 @@ fn test_2x1_rendering() {
     assert_eq!(lines[5][11], '█');
 
     // Verify snake body is rendered (at position 4,5 -> chars 8,9 at row 5)
-    assert_eq!(lines[5][8], '▓');
-    assert_eq!(lines[5][9], '▓');
+    assert_eq!(lines[5][8], '█');
+    assert_eq!(lines[5][9], '█');
 
     // Verify food is rendered (at position 7,7 -> chars 14,15 at row 7)
     assert_eq!(lines[7][14], '●');
@@ -90,7 +90,7 @@ fn test_1x1_rendering() {
     assert_eq!(lines[2][2], '█');
 
     // Verify snake body
-    assert_eq!(lines[2][1], '▓');
+    assert_eq!(lines[2][1], '█');
 
     // Verify food
     assert_eq!(lines[3][3], '●');
