@@ -2320,7 +2320,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "snaketron"
+name = "snaketron-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",

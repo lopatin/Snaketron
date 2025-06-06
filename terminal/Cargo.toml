@@ -1,7 +1,15 @@
 [package]
-name = "snaketron"
+name = "snaketron-terminal"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snaketron-terminal"
+path = "src/main.rs"
 
 [dependencies]
 common = { path = "../common" }
@@ -14,7 +22,3 @@ serde_json = "1.0"
 flate2 = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[[bin]]
-name = "snaketron"
-path = "src/main.rs"

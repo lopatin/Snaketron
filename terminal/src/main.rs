@@ -29,6 +29,15 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/snaketron_replays"));
     
+    println!("Looking for replays in: {:?}", replay_dir);
+    
+    // Check if directory exists
+    if !replay_dir.exists() {
+        eprintln!("Replay directory does not exist: {:?}", replay_dir);
+        eprintln!("Creating directory...");
+        std::fs::create_dir_all(&replay_dir)?;
+    }
+    
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();

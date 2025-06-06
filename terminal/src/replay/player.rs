@@ -1,5 +1,4 @@
 use super::*;
-use common::{GameEvent};
 
 pub struct ReplayPlayer {
     pub replay: ReplayData,
@@ -29,29 +28,27 @@ impl ReplayPlayer {
         
         // Process ticks one by one to maintain game logic
         while self.current_tick < target_tick {
-            self.current_tick += 1;
-            self.current_state.tick = self.current_tick;
-            
-            // Step all alive snakes forward
-            for snake in self.current_state.arena.snakes.iter_mut() {
-                if snake.is_alive {
-                    snake.step_forward();
-                }
-            }
-            
-            // Apply events at this tick
+            // First, apply all events that should happen before or at this tick
+            // This includes CommandScheduled events that enqueue commands
             while self.current_event_index < self.replay.events.len() {
                 let event = self.replay.events[self.current_event_index].clone();
-                if event.tick == self.current_tick {
-                    self.apply_event(&event.event);
-                    self.current_event_index += 1;
-                } else if event.tick > self.current_tick {
-                    break;
-                } else {
-                    // Skip past events (shouldn't happen in normal playback)
-                    self.current_event_index += 1;
+                if event.tick > self.current_tick {
+                    break; // This event is for a future tick
                 }
+                
+                // Apply the event (this may enqueue commands or update state)
+                self.apply_event(&event.event);
+                self.current_event_index += 1;
             }
+            
+            // Now tick the game forward - this processes queued commands and advances the simulation
+            // This is the same method the actual game engine uses
+            if let Err(e) = self.current_state.tick_forward() {
+                eprintln!("Error during tick_forward: {:?}", e);
+            }
+            
+            // The tick counter is incremented by tick_forward, so we sync our tracking
+            self.current_tick = self.current_state.tick;
         }
     }
     
@@ -86,41 +83,21 @@ impl ReplayPlayer {
             .unwrap_or(0)
     }
     
+    /// Get the current tick
+    pub fn current_tick(&self) -> u32 {
+        self.current_tick
+    }
+    
+    /// Get the current game state
+    pub fn current_state(&self) -> &GameState {
+        &self.current_state
+    }
+    
     fn apply_event(&mut self, event_msg: &GameEventMessage) {
         let event = &event_msg.event;
         
-        match event {
-            GameEvent::SnakeTurned { snake_id, direction } => {
-                if let Some(snake) = self.current_state.arena.snakes.get_mut(*snake_id as usize) {
-                    snake.direction = *direction;
-                }
-            }
-            GameEvent::SnakeDied { snake_id } => {
-                if let Some(snake) = self.current_state.arena.snakes.get_mut(*snake_id as usize) {
-                    snake.is_alive = false;
-                }
-            }
-            GameEvent::FoodEaten { snake_id, position } => {
-                if let Some(snake) = self.current_state.arena.snakes.get_mut(*snake_id as usize) {
-                    snake.food += 1;
-                }
-                // Remove food from arena
-                self.current_state.arena.food.retain(|&pos| pos != *position);
-            }
-            GameEvent::FoodSpawned { position } => {
-                self.current_state.arena.food.push(*position);
-            }
-            GameEvent::CommandScheduled { command_message } => {
-                // Add command to the queue
-                self.current_state.command_queue.push(command_message.clone());
-            }
-            GameEvent::StatusUpdated { status } => {
-                self.current_state.status = status.clone();
-            }
-            GameEvent::Snapshot { game_state } => {
-                // Snapshot events update the entire state
-                self.current_state = game_state.clone();
-            }
-        }
+        // Use the GameState's apply_event method for consistency
+        // This ensures we handle events exactly as the game engine does
+        self.current_state.apply_event(event.clone(), None);
     }
 }
