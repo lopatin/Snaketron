@@ -12,82 +12,55 @@ impl SnakeRenderer {
         let mut positions = Vec::new();
         
         // Process each segment between consecutive body points
-        for window in snake.body.windows(2) {
+        for (i, window) in snake.body.windows(2).enumerate() {
             let start = &window[0];
             let end = &window[1];
+            
+            // For the first segment, always include the start point
+            // For subsequent segments, skip the start point (it's already added as the end of previous segment)
+            let skip_start = i > 0;
             
             // Generate all positions between start and end
             if start.x == end.x {
                 // Vertical segment
-                let _min_y = start.y.min(end.y);
-                let _max_y = start.y.max(end.y);
-                
-                if positions.is_empty() || positions.last() != Some(start) {
-                    // Add all points from start to end
-                    if start.y <= end.y {
-                        for y in start.y..=end.y {
-                            positions.push(Position { x: start.x, y });
-                        }
-                    } else {
-                        for y in (end.y..=start.y).rev() {
-                            positions.push(Position { x: start.x, y });
-                        }
+                if start.y < end.y {
+                    // Going down
+                    let begin = if skip_start { start.y + 1 } else { start.y };
+                    for y in begin..=end.y {
+                        positions.push(Position { x: start.x, y });
                     }
                 } else {
-                    // Skip the first point as it's already in positions
-                    if start.y <= end.y {
-                        for y in (start.y + 1)..=end.y {
-                            positions.push(Position { x: start.x, y });
-                        }
-                    } else {
-                        for y in (end.y..start.y).rev() {
-                            positions.push(Position { x: start.x, y });
-                        }
+                    // Going up
+                    let begin = if skip_start { start.y - 1 } else { start.y };
+                    for y in (end.y..=begin).rev() {
+                        positions.push(Position { x: start.x, y });
                     }
                 }
             } else if start.y == end.y {
                 // Horizontal segment
-                if positions.is_empty() || positions.last() != Some(start) {
-                    // Add all points from start to end
-                    if start.x <= end.x {
-                        for x in start.x..=end.x {
-                            positions.push(Position { x, y: start.y });
-                        }
-                    } else {
-                        for x in (end.x..=start.x).rev() {
-                            positions.push(Position { x, y: start.y });
-                        }
+                if start.x < end.x {
+                    // Going right
+                    let begin = if skip_start { start.x + 1 } else { start.x };
+                    for x in begin..=end.x {
+                        positions.push(Position { x, y: start.y });
                     }
                 } else {
-                    // Skip the first point as it's already in positions
-                    if start.x <= end.x {
-                        for x in (start.x + 1)..=end.x {
-                            positions.push(Position { x, y: start.y });
-                        }
-                    } else {
-                        for x in (end.x..start.x).rev() {
-                            positions.push(Position { x, y: start.y });
-                        }
+                    // Going left
+                    let begin = if skip_start { start.x - 1 } else { start.x };
+                    for x in (end.x..=begin).rev() {
+                        positions.push(Position { x, y: start.y });
                     }
                 }
             } else {
-                // This shouldn't happen with valid snake data
-                // Just add the end point
-                if positions.is_empty() || positions.last() != Some(start) {
+                // This shouldn't happen with valid snake data (diagonal segment)
+                // Just add both points
+                if !skip_start {
                     positions.push(*start);
                 }
                 positions.push(*end);
             }
         }
         
-        // Remove any duplicates that might have been created
-        let mut deduped = Vec::new();
-        for pos in positions {
-            if deduped.is_empty() || deduped.last() != Some(&pos) {
-                deduped.push(pos);
-            }
-        }
-        
-        deduped
+        positions
     }
 }
