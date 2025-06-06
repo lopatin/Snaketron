@@ -261,12 +261,6 @@ impl RaftNode {
         Ok(())
     }
     
-    /// Get commands for a game submitted after a given tick
-    pub async fn get_commands_for_game(&self, game_id: u32, since_tick: u64) -> Vec<(GameCommandMessage, u64)> {
-        let storage = self.storage.clone();
-        let state_machine = storage.get_state_machine().await;
-        state_machine.get_commands_for_game(game_id, since_tick)
-    }
     
     /// Get the current tick for a game
     pub async fn get_game_tick(&self, game_id: u32) -> Option<u32> {

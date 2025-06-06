@@ -105,7 +105,7 @@ impl GameEngine {
     ) -> Result<GameCommandMessage> {
 
         let server_scheduled_tick = command_message.command_id_client.tick
-            .min(self.committed_state.current_tick());
+            .max(self.committed_state.current_tick());
 
         let received_order = self.command_counter;
         self.command_counter += 1;

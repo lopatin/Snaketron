@@ -2,13 +2,8 @@ use anyhow::Result;
 use common::{GameCommandMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use async_raft::NodeId;
-use async_raft::raft::MembershipConfig;
-use tracing::{debug, error, info, warn};
-use tokio::sync::broadcast;
-
-use tokio::sync::RwLock as TokioRwLock;
+use tracing::{debug, info, warn};
 use super::types::{ClientRequest, ClientResponse, StateChangeEvent};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,14 +181,6 @@ impl GameStateMachine {
         Ok((response, events))
     }
     
-    /// Get all commands for a specific game submitted after a given tick
-    pub fn get_commands_for_game(&self, game_id: u32, since_tick: u64) -> Vec<(GameCommandMessage, u64)> {
-        self.user_commands
-            .iter()
-            .filter(|((gid, _), (_, tick))| *gid == game_id && *tick > since_tick)
-            .map(|((_, _), (cmd, tick))| (cmd.clone(), *tick))
-            .collect()
-    }
     
     /// Get the current tick for a game
     pub fn get_game_tick(&self, game_id: u32) -> Option<u32> {

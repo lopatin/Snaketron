@@ -103,7 +103,7 @@ async fn test_simple_game() -> Result<()> {
     
     // Snake 2 turns up before the collision point to avoid head-on crash
     // Need to turn before tick 15 to avoid collision at the center
-    // tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
     
     client2.send_message(WSMessage::GameCommand(
         GameCommandMessage {
@@ -119,7 +119,22 @@ async fn test_simple_game() -> Result<()> {
             },
         }
     )).await?;
-    println!("Snake 2 sent turn up command");
+    
+    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+     
+    client2.send_message(WSMessage::GameCommand( GameCommandMessage {
+             command_id_client: CommandId {
+                 tick: 0,
+                 user_id: env.user_ids()[1] as u32,
+                 sequence_number: 0,
+             },
+             command_id_server: None,
+             command: GameCommand::Turn { 
+                 snake_id: snake2_id, 
+                 direction: Direction::Left 
+             },
+         }
+     )).await?;
     
     // Continue the game and collect events
     let mut snake1_died = false;
@@ -226,10 +241,8 @@ async fn test_simple_game() -> Result<()> {
     
     assert!(game_ended.is_ok(), "Game should have ended with a completion status");
     
-    // In this test both snakes actually die at the same time (head-on collision)
-    // So we expect both to be dead with no winner
     assert!(snake1_died, "Snake 1 should have died");
-    assert!(snake2_died, "Snake 2 should have died");
+    assert!(!snake2_died, "Snake 2 should not have died");
     
     // Output the replay file location
     if let Some(server) = env.server(0) {
