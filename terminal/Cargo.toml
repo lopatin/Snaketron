@@ -8,7 +8,7 @@ name = "terminal"
 path = "src/lib.rs"
 
 [[bin]]
-name = "snaketron-terminal"
+name = "snaketron"
 path = "src/main.rs"
 
 [dependencies]

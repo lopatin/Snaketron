@@ -58,12 +58,12 @@ impl View for ReplayViewerState {
             }
             KeyCode::Char('j') => {
                 self.player.is_playing = false;
-                self.player.step_backward(10);
+                self.player.step_forward(10);
                 None
             }
             KeyCode::Char('k') => {
                 self.player.is_playing = false;
-                self.player.step_forward(10);
+                self.player.step_backward(10);
                 None
             }
             KeyCode::Char('q') | KeyCode::Esc => {

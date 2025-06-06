@@ -103,7 +103,7 @@ async fn test_simple_game() -> Result<()> {
     
     // Snake 2 turns up before the collision point to avoid head-on crash
     // Need to turn before tick 15 to avoid collision at the center
-    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+    // tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
     
     client2.send_message(WSMessage::GameCommand(
         GameCommandMessage {
