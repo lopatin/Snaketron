@@ -30,6 +30,15 @@ fn main() {
                 is_alive: true,
                 food: 0,
             },
+            Snake {
+                body: vec![
+                    Position { x: 8, y: 8 },   // head
+                    Position { x: 8, y: 6 },   // tail
+                ],
+                direction: Direction::Down,
+                is_alive: true,
+                food: 0,
+            },
         ],
         food: vec![
             Position { x: 10, y: 5 },

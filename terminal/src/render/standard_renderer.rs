@@ -19,51 +19,50 @@ impl GameObjectRenderer for StandardRenderer {
     
     fn render_snake_segment(
         &self,
-        direction: Option<Direction>,
+        _direction: Option<Direction>,
         is_head: bool,
         player_id: u32,
     ) -> CharPattern {
         let chars = if self.char_dims.horizontal == 2 && self.char_dims.vertical == 1 {
-            // 2x1 rendering
+            // 2x1 rendering - use brightness to distinguish head from body
             if is_head {
-                match direction {
-                    Some(Direction::Up) => vec![vec!['▲', '▲']],
-                    Some(Direction::Down) => vec![vec!['▼', '▼']],
-                    Some(Direction::Left) => vec![vec!['◄', '◄']],
-                    Some(Direction::Right) => vec![vec!['►', '►']],
-                    None => vec![vec!['█', '█']],
-                }
+                // Bright white for head
+                vec![vec!['█', '█']]
             } else {
+                // Different shades for different players
                 let body_char = match player_id % 4 {
-                    0 => '█',
-                    1 => '▓',
-                    2 => '▒',
-                    _ => '░',
+                    0 => '▓',  // Slightly darker than head
+                    1 => '▒',  // Medium shade
+                    2 => '░',  // Light shade
+                    _ => '▒',  // Default to medium
                 };
                 vec![vec![body_char, body_char]]
             }
         } else if self.char_dims.horizontal == 1 && self.char_dims.vertical == 1 {
             // 1x1 rendering (classic mode)
-            if is_head {
-                match direction {
-                    Some(Direction::Up) => vec![vec!['▲']],
-                    Some(Direction::Down) => vec![vec!['▼']],
-                    Some(Direction::Left) => vec![vec!['◄']],
-                    Some(Direction::Right) => vec![vec!['►']],
-                    None => vec![vec!['█']],
-                }
+            let char = if is_head {
+                // Bright white for head
+                '█'
             } else {
-                let body_char = match player_id % 4 {
-                    0 => '█',
-                    1 => '▓',
-                    2 => '▒',
-                    _ => '░',
-                };
-                vec![vec![body_char]]
-            }
+                // Different shades for different players
+                match player_id % 4 {
+                    0 => '▓',
+                    1 => '▒',
+                    2 => '░',
+                    _ => '▒',
+                }
+            };
+            vec![vec![char]]
         } else {
-            // Fallback for other dimensions - fill with solid blocks
-            let fill_char = if is_head { '▮' } else { '█' };
+            // Fallback for other dimensions
+            let fill_char = if is_head { '█' } else {
+                match player_id % 4 {
+                    0 => '▓',
+                    1 => '▒',
+                    2 => '░',
+                    _ => '▒',
+                }
+            };
             vec![vec![fill_char; self.char_dims.horizontal]; self.char_dims.vertical]
         };
         
