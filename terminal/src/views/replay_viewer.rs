@@ -4,7 +4,7 @@ use crate::replay::{ReplayData, player::ReplayPlayer};
 use crate::render::arena::ArenaRenderer;
 use crate::render::standard_renderer::StandardRenderer;
 use crate::render::types::{RenderConfig, CharDimensions};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Margin},
@@ -57,13 +57,47 @@ impl View for ReplayViewerState {
                 None
             }
             KeyCode::Char('j') => {
-                self.player.is_playing = false;
-                self.player.step_forward(10);
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+J: Scroll event log down
+                    let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
+                    let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
+                    self.event_log_scroll = (self.event_log_scroll + 1).min(max_scroll);
+                    let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                    *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                } else {
+                    // Regular j: Step forward 10 ticks
+                    self.player.is_playing = false;
+                    self.player.step_forward(10);
+                }
                 None
             }
             KeyCode::Char('k') => {
-                self.player.is_playing = false;
-                self.player.step_backward(10);
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+K: Scroll event log up
+                    self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
+                    let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                    *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                } else {
+                    // Regular k: Step backward 10 ticks
+                    self.player.is_playing = false;
+                    self.player.step_backward(10);
+                }
+                None
+            }
+            KeyCode::Char('J') => {
+                // Uppercase J (Shift+J): Scroll event log down
+                let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
+                let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
+                self.event_log_scroll = (self.event_log_scroll + 1).min(max_scroll);
+                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                None
+            }
+            KeyCode::Char('K') => {
+                // Uppercase K (Shift+K): Scroll event log up
+                self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
+                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
                 None
             }
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -288,9 +322,12 @@ impl ReplayViewerState {
     }
     
     fn render_controls(&self) -> Paragraph {
-        let help_text = "Space: Play/Pause | h/l: ±1 tick | j/k: ±10 ticks | PageUp/Down: Scroll event log | q: Back to menu";
+        let lines = vec![
+            Line::from("Space: Play/Pause | h/l: ±1 tick | j/k: ±10 ticks | q: Back to menu"),
+            Line::from("Shift+J/K: Scroll event log | PageUp/Down: Scroll event log (5 lines)"),
+        ];
         
-        Paragraph::new(help_text)
+        Paragraph::new(lines)
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL))
@@ -355,7 +392,7 @@ impl ReplayViewerState {
         // Create scrollable paragraph with user-controlled scroll position
         let event_log = Paragraph::new(lines)
             .block(Block::default()
-                .title(format!("Raw Event Log ({} events) - PageUp/PageDown to scroll", events_to_show.len()))
+                .title(format!("Raw Event Log ({} events)", events_to_show.len()))
                 .borders(Borders::ALL))
             .style(Style::default().fg(Color::White))
             .scroll((self.event_log_scroll, 0));
