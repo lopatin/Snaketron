@@ -16,6 +16,27 @@ use std::time::{Duration, Instant};
 use std::cell::{RefCell, Cell};
 use common::{GameStatus};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LayoutMode {
+    SingleColumn,  // Tall/narrow screens
+    TwoColumn,     // Wide screens
+}
+
+impl LayoutMode {
+    fn from_dimensions(width: u16, height: u16) -> Self {
+        // Aspect ratio and minimum width thresholds
+        let aspect_ratio = width as f32 / height as f32;
+        const MIN_WIDTH_FOR_TWO_COLUMN: u16 = 100;  // Reduced from 120
+        const ASPECT_RATIO_THRESHOLD: f32 = 1.8;    // Increased from 1.5 for better layout
+        
+        if width >= MIN_WIDTH_FOR_TWO_COLUMN && aspect_ratio >= ASPECT_RATIO_THRESHOLD {
+            LayoutMode::TwoColumn
+        } else {
+            LayoutMode::SingleColumn
+        }
+    }
+}
+
 pub struct ReplayViewerState {
     player: ReplayPlayer,
     last_update: Instant,
@@ -48,73 +69,55 @@ impl View for ReplayViewerState {
             }
             KeyCode::Char('h') => {
                 self.player.is_playing = false;
-                self.player.step_backward(1);
+                self.player.step_backward(5);
                 None
             }
             KeyCode::Char('l') => {
                 self.player.is_playing = false;
-                self.player.step_forward(1);
+                self.player.step_forward(5);
                 None
             }
             KeyCode::Char('j') => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+J: Scroll event log down
-                    let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
-                    let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
-                    self.event_log_scroll = (self.event_log_scroll + 1).min(max_scroll);
-                    let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                    *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                    self.scroll_event_log_down(1);
                 } else {
-                    // Regular j: Step forward 10 ticks
+                    // Regular j: Step forward 1 tick
                     self.player.is_playing = false;
-                    self.player.step_forward(10);
+                    self.player.step_forward(1);
                 }
                 None
             }
             KeyCode::Char('k') => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     // Shift+K: Scroll event log up
-                    self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
-                    let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                    *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                    self.scroll_event_log_up(1);
                 } else {
-                    // Regular k: Step backward 10 ticks
+                    // Regular k: Step backward 1 tick
                     self.player.is_playing = false;
-                    self.player.step_backward(10);
+                    self.player.step_backward(1);
                 }
                 None
             }
             KeyCode::Char('J') => {
                 // Uppercase J (Shift+J): Scroll event log down
-                let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
-                let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
-                self.event_log_scroll = (self.event_log_scroll + 1).min(max_scroll);
-                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                self.scroll_event_log_down(1);
                 None
             }
             KeyCode::Char('K') => {
                 // Uppercase K (Shift+K): Scroll event log up
-                self.event_log_scroll = self.event_log_scroll.saturating_sub(1);
-                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                self.scroll_event_log_up(1);
                 None
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 Some(AppCommand::BackToSelector)
             }
             KeyCode::PageUp => {
-                self.event_log_scroll = self.event_log_scroll.saturating_sub(5);
-                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                self.scroll_event_log_up(5);
                 None
             }
             KeyCode::PageDown => {
-                let visible_height = 10; // Approximate visible lines in taller event log (12 - 2 for borders)
-                let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
-                self.event_log_scroll = (self.event_log_scroll + 5).min(max_scroll);
-                let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-                *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+                self.scroll_event_log_down(5);
                 None
             }
             _ => None,
@@ -144,6 +147,32 @@ impl View for ReplayViewerState {
     }
     
     fn render(&self, frame: &mut Frame) {
+        let layout_mode = LayoutMode::from_dimensions(frame.area().width, frame.area().height);
+        
+        match layout_mode {
+            LayoutMode::SingleColumn => self.render_single_column(frame),
+            LayoutMode::TwoColumn => self.render_two_column(frame),
+        }
+    }
+}
+
+impl ReplayViewerState {
+    fn scroll_event_log_up(&mut self, lines: u16) {
+        self.event_log_scroll = self.event_log_scroll.saturating_sub(lines);
+        let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+        *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+    }
+    
+    fn scroll_event_log_down(&mut self, lines: u16) {
+        // We'll calculate visible height later when we know the actual rendered area
+        let visible_height = 10; // Default estimate, will be improved
+        let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
+        self.event_log_scroll = (self.event_log_scroll + lines).min(max_scroll);
+        let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
+        *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+    }
+    
+    fn render_single_column(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -152,7 +181,7 @@ impl View for ReplayViewerState {
                 Constraint::Length(12), // Event log (taller)
                 Constraint::Length(3),  // Header (tick counter)
                 Constraint::Length(4),  // Status
-                Constraint::Length(3),  // Controls help at bottom
+                Constraint::Length(4),  // Controls help at bottom (increased for 2 lines)
             ])
             .split(frame.area());
         
@@ -174,9 +203,65 @@ impl View for ReplayViewerState {
         let controls = self.render_controls();
         frame.render_widget(controls, chunks[4]);
     }
-}
-
-impl ReplayViewerState {
+    
+    fn render_two_column(&self, frame: &mut Frame) {
+        // Split into left (arena) and right (everything else) columns
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .margin(1)
+            .constraints([
+                Constraint::Percentage(40),  // Arena column
+                Constraint::Percentage(60),  // Info column
+            ])
+            .split(frame.area());
+        
+        // Render arena in left column
+        self.render_arena(frame, main_chunks[0]);
+        
+        // Calculate dynamic constraints for right column
+        let available_height = main_chunks[1].height;
+        let constraints = self.calculate_info_column_constraints(available_height);
+        
+        // Split right column for other components
+        let info_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(main_chunks[1]);
+        
+        // Render components in right column
+        self.render_event_log(frame, info_chunks[0]);
+        frame.render_widget(self.render_header(), info_chunks[1]);
+        frame.render_widget(self.render_status(), info_chunks[2]);
+        frame.render_widget(self.render_controls(), info_chunks[3]);
+    }
+    
+    fn calculate_info_column_constraints(&self, available_height: u16) -> Vec<Constraint> {
+        const HEADER_HEIGHT: u16 = 3;
+        const STATUS_HEIGHT: u16 = 4;
+        const CONTROLS_HEIGHT: u16 = 4;  // Increased for 2 lines
+        const MIN_EVENT_LOG_HEIGHT: u16 = 10;
+        
+        let fixed_height = HEADER_HEIGHT + STATUS_HEIGHT + CONTROLS_HEIGHT;
+        
+        if available_height > fixed_height + MIN_EVENT_LOG_HEIGHT {
+            // Enough space - event log takes remaining space
+            vec![
+                Constraint::Min(MIN_EVENT_LOG_HEIGHT),  // Event log expands
+                Constraint::Length(HEADER_HEIGHT),      // Header
+                Constraint::Length(STATUS_HEIGHT),      // Status
+                Constraint::Length(CONTROLS_HEIGHT),    // Controls
+            ]
+        } else {
+            // Limited space - use percentages
+            vec![
+                Constraint::Percentage(58),  // Event log gets majority (slightly reduced)
+                Constraint::Percentage(12),  // Header
+                Constraint::Percentage(16),  // Status
+                Constraint::Percentage(14),  // Controls (increased)
+            ]
+        }
+    }
+    
     fn render_header(&self) -> Paragraph {
         let title = format!(
             "Tick: {} / {} | Speed: {}x | {}",
@@ -323,7 +408,7 @@ impl ReplayViewerState {
     
     fn render_controls(&self) -> Paragraph {
         let lines = vec![
-            Line::from("Space: Play/Pause | h/l: ±1 tick | j/k: ±10 ticks | q: Back to menu"),
+            Line::from("Space: Play/Pause | j/k: ±1 tick | h/l: ±5 ticks | q: Back to menu"),
             Line::from("Shift+J/K: Scroll event log | PageUp/Down: Scroll event log (5 lines)"),
         ];
         
