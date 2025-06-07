@@ -41,9 +41,11 @@ pub struct ReplayViewerState {
     player: ReplayPlayer,
     last_update: Instant,
     playback_accumulator: f32,
-    event_log_scroll: u16,
+    event_log_scroll: Cell<u16>,
     event_log_total_lines: Cell<u16>,
+    event_log_visible_height: Cell<u16>,
     event_log_scrollbar_state: RefCell<ScrollbarState>,
+    event_log_sticky_bottom: Cell<bool>,
 }
 
 impl ReplayViewerState {
@@ -52,9 +54,11 @@ impl ReplayViewerState {
             player: ReplayPlayer::new(replay_data),
             last_update: Instant::now(),
             playback_accumulator: 0.0,
-            event_log_scroll: 0,
+            event_log_scroll: Cell::new(0),
             event_log_total_lines: Cell::new(0),
+            event_log_visible_height: Cell::new(10), // Default estimate
             event_log_scrollbar_state: RefCell::new(ScrollbarState::default()),
+            event_log_sticky_bottom: Cell::new(true),  // Start with sticky scrolling enabled
         }
     }
 }
@@ -157,19 +161,49 @@ impl View for ReplayViewerState {
 }
 
 impl ReplayViewerState {
-    fn scroll_event_log_up(&mut self, lines: u16) {
-        self.event_log_scroll = self.event_log_scroll.saturating_sub(lines);
+    fn scroll_event_log_up(&self, lines: u16) {
+        let current_scroll = self.event_log_scroll.get();
+        let new_scroll = current_scroll.saturating_sub(lines);
+        self.event_log_scroll.set(new_scroll);
+        
+        let visible_height = self.event_log_visible_height.get();
+        let total_lines = self.event_log_total_lines.get();
+        
         let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-        *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+        *scrollbar_state = scrollbar_state
+            .content_length(total_lines as usize)
+            .viewport_content_length(visible_height as usize)
+            .position(new_scroll as usize);
+        
+        // Disable sticky scrolling when user manually scrolls up
+        self.event_log_sticky_bottom.set(false);
     }
     
-    fn scroll_event_log_down(&mut self, lines: u16) {
-        // We'll calculate visible height later when we know the actual rendered area
-        let visible_height = 10; // Default estimate, will be improved
-        let max_scroll = self.event_log_total_lines.get().saturating_sub(visible_height);
-        self.event_log_scroll = (self.event_log_scroll + lines).min(max_scroll);
+    fn scroll_event_log_down(&self, lines: u16) {
+        let visible_height = self.event_log_visible_height.get();
+        let total_lines = self.event_log_total_lines.get();
+        
+        // Calculate max scroll position
+        let max_scroll = if total_lines > visible_height {
+            total_lines - visible_height
+        } else {
+            0
+        };
+        
+        let current_scroll = self.event_log_scroll.get();
+        let new_scroll = (current_scroll + lines).min(max_scroll);
+        self.event_log_scroll.set(new_scroll);
+        
+        // Check if we're at the bottom after scrolling
+        if new_scroll >= max_scroll {
+            self.event_log_sticky_bottom.set(true);
+        }
+        
         let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
-        *scrollbar_state = scrollbar_state.position(self.event_log_scroll as usize);
+        *scrollbar_state = scrollbar_state
+            .content_length(total_lines as usize)
+            .viewport_content_length(visible_height as usize)
+            .position(new_scroll as usize);
     }
     
     fn render_single_column(&self, frame: &mut Frame) {
@@ -429,7 +463,8 @@ impl ReplayViewerState {
         // Create text lines for each event showing raw JSON
         let mut lines = Vec::new();
         
-        for event in events_to_show.iter().rev() {
+        // Show events in ascending order (oldest first)
+        for event in events_to_show.iter() {
             // Add tick header
             lines.push(Line::from(vec![
                 Span::styled(format!("=== Tick {} ===", event.tick), 
@@ -468,19 +503,47 @@ impl ReplayViewerState {
         let total_lines = lines.len();
         self.event_log_total_lines.set(total_lines as u16);
         
-        // Update scrollbar state with content length
+        // Calculate visible height (area height minus borders)
+        let visible_height = area.height.saturating_sub(2) as usize;
+        self.event_log_visible_height.set(visible_height as u16);
+        
+        // Calculate the scroll position needed to show the bottom
+        let scroll_position = if total_lines > visible_height {
+            // Content is taller than visible area - calculate scroll to show bottom
+            (total_lines - visible_height) as u16
+        } else {
+            // Content fits entirely - no scrolling needed
+            0
+        };
+        
+        // Apply sticky scrolling if enabled
+        if self.event_log_sticky_bottom.get() {
+            self.event_log_scroll.set(scroll_position);
+        } else {
+            // Ensure current scroll position is within valid bounds
+            let current_scroll = self.event_log_scroll.get();
+            if current_scroll > scroll_position {
+                self.event_log_scroll.set(scroll_position);
+            }
+        }
+        
+        // Update scrollbar state with content length and viewport
         let mut scrollbar_state = self.event_log_scrollbar_state.borrow_mut();
         *scrollbar_state = scrollbar_state
             .content_length(total_lines)
-            .position(self.event_log_scroll as usize);
+            .viewport_content_length(visible_height)
+            .position(self.event_log_scroll.get() as usize);
         
         // Create scrollable paragraph with user-controlled scroll position
         let event_log = Paragraph::new(lines)
             .block(Block::default()
-                .title(format!("Raw Event Log ({} events)", events_to_show.len()))
+                .title(format!("Raw Event Log ({} events){}",
+                    events_to_show.len(),
+                    if self.event_log_sticky_bottom.get() { " [Auto-scroll]" } else { "" }
+                ))
                 .borders(Borders::ALL))
             .style(Style::default().fg(Color::White))
-            .scroll((self.event_log_scroll, 0));
+            .scroll((self.event_log_scroll.get(), 0));
         
         frame.render_widget(event_log, area);
         
