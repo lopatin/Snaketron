@@ -63,4 +63,10 @@
     text-decoration: underline;
     text-underline-offset: 6px;
   }
+  
+  /* Navigation link hover effects */
+  nav a:hover {
+    text-decoration: underline;
+    text-underline-offset: 6px;
+  }
 }

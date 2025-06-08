@@ -9,8 +9,25 @@ import ReactDOM from 'react-dom/client';
 
 function Header() {
   return (
-    <header className="bg-white border-t-3 border-b-3 border-white py-5 pb-[18px] flex justify-center items-center relative site-header">
-      <img src="/SnaketronLogo.png" alt="Snaketron" className="h-6 w-auto opacity-80" />
+    <header className="bg-white border-t-3 border-b-3 border-white py-5 pb-[18px] site-header">
+      <div className="max-w-6xl mx-auto px-5 flex justify-between items-center">
+        <div className="flex items-center gap-12">
+          <img src="/SnaketronLogo.png" alt="Snaketron" className="h-6 w-auto opacity-80" />
+          <nav className="flex gap-6">
+            <a href="#" className="text-black-70 font-black italic uppercase tracking-1 opacity-100 underline underline-offset-6">Play</a>
+            <a href="#" className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity">Leaderboards</a>
+            <a href="#" className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity">Spectate</a>
+          </nav>
+        </div>
+        <div>
+          <select className="text-black-70 font-bold italic uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
+            <option>US East</option>
+            <option>US West</option>
+            <option>Europe</option>
+            <option>Asia</option>
+          </select>
+        </div>
+      </div>
     </header>
   );
 }
