@@ -1,0 +1,47 @@
+# Development Dockerfile with hot reloading
+FROM rust:latest
+
+# Install cargo-watch for auto-reloading
+RUN cargo install cargo-watch
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Copy only Cargo files first to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY server/Cargo.toml ./server/
+COPY common/Cargo.toml ./common/
+COPY macros/Cargo.toml ./macros/
+COPY client/Cargo.toml ./client/
+COPY terminal/Cargo.toml ./terminal/
+
+# Create dummy source files to build dependencies
+RUN mkdir -p server/src common/src macros/src client/src terminal/src && \
+    echo "fn main() {}" > server/src/main.rs && \
+    echo "fn main() {}" > server/src/lib.rs && \
+    echo "fn main() {}" > common/src/lib.rs && \
+    echo "fn main() {}" > macros/src/lib.rs && \
+    echo "fn main() {}" > client/src/lib.rs && \
+    echo "fn main() {}" > terminal/src/main.rs && \
+    echo "fn main() {}" > terminal/src/lib.rs
+
+# Build dependencies only
+RUN cargo build --release --bin server
+
+# Remove dummy source files
+RUN rm -rf server/src common/src macros/src client/src terminal/src
+
+# The actual source will be mounted as volumes
+
+# Expose ports
+EXPOSE 8080 50051
+
+# Use cargo-watch to auto-reload on changes
+CMD ["cargo", "watch", "-x", "run --bin server", "-w", "server", "-w", "common", "-w", "macros"]

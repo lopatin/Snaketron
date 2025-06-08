@@ -62,7 +62,13 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 
 ### Docker Commands
 ```bash
-# Start the entire stack (database + server)
+# Development mode with hot reloading (recommended for development)
+./dev.sh
+
+# Or manually with docker-compose
+docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+# Production-like mode (full rebuild each time)
 docker-compose up --build
 
 # Run in detached mode

@@ -13,9 +13,10 @@ A competitive online multiplayer Snake game built with Rust (backend + WebAssemb
 
 ### Using Docker (Recommended)
 
+#### For Development (with hot reloading):
 ```bash
-# Start database and server
-docker-compose up --build
+# Start database and server with auto-reload on code changes
+./dev.sh
 
 # In another terminal, build and start the client
 cd client
@@ -23,6 +24,12 @@ wasm-pack build --target web --out-dir pkg
 cd web
 npm install
 npm start
+```
+
+#### For Production-like environment:
+```bash
+# Start database and server (rebuilds on each change)
+docker-compose up --build
 ```
 
 The game will be available at:

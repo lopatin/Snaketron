@@ -1,0 +1,31 @@
+# Development override for faster local development
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  server:
+    # Use a different build strategy for development
+    build:
+      context: .
+      dockerfile: server/Dockerfile.dev
+    volumes:
+      # Mount source code for hot reloading
+      - ./server:/usr/src/app/server:delegated
+      - ./common:/usr/src/app/common:delegated
+      - ./macros:/usr/src/app/macros:delegated
+      - ./Cargo.toml:/usr/src/app/Cargo.toml:delegated
+      - ./Cargo.lock:/usr/src/app/Cargo.lock:delegated
+      # Named volume for target directory to avoid rebuilding dependencies
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-target:/usr/src/app/target
+    environment:
+      # Enable cargo-watch for auto-reload
+      CARGO_WATCH: "true"
+      # Faster builds in development
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 1
+
+volumes:
+  cargo-cache:
+  cargo-target:
