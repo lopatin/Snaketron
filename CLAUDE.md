@@ -139,3 +139,4 @@ cargo test --all
 
 ### Testing Guidelines
 - Server integration tests should not access the DB directly, they should emulate what the main method would do on servers, which do their own maintenance rather than needing it to be in a test harness.
+```

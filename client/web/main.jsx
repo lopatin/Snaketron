@@ -43,18 +43,52 @@ function App() {
     <div className="min-h-screen flex flex-col">
       <Header />
 
-    <div className="flex flex-col gap-30 items-center mt-10">
-        <div className="relative inline-block border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden -skew-x-[10deg] cursor-pointer button-outer">
-            <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
-                <button className="relative w-[280px] py-18 px-0 bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button">
-                    <span className="inline-block skew-x-[10deg]">SINGLE PLAYER</span>
-                </button>
+    <div className="flex justify-center items-center mt-10">
+        <div className="flex gap-4">
+            {/* Column 1: Quick Match */}
+            <div className="-skew-x-[10deg]">
+                <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
+                    <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
+                        <button className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                            <span className="skew-x-[10deg]">QUICK MATCH</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            {/* Column 2: Competitive & Single Player */}
+            <div className="-skew-x-[10deg] flex flex-col gap-[10px]">
+                <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
+                    <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
+                        <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                            <span className="skew-x-[10deg]">COMPETITIVE</span>
+                        </button>
+                    </div>
+                </div>
+                <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
+                    <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
+                        <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                            <span className="skew-x-[10deg]">SINGLE PLAYER</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            {/* Column 3: Custom Game */}
+            <div className="-skew-x-[10deg] flex items-start h-[110px]">
+                <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
+                    <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
+                        <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                            <span className="skew-x-[10deg]">CUSTOM GAME</span>
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
-        <main className="flex-1 flex justify-center items-center text-center p-5">
-            <GameCanvas />
-        </main>
+    <main className="flex-1 flex justify-center items-center text-center p-5">
+        <GameCanvas />
+    </main>
     </div>
   );
 }
