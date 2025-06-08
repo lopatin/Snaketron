@@ -59,10 +59,49 @@ pub struct GameProperties {
     pub available_food_target: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct CustomGameSettings {
+    pub arena_width: u16,
+    pub arena_height: u16,
+    pub tick_duration_ms: u16,
+    pub food_spawn_rate: f32,  // food per minute
+    pub max_players: u8,
+    pub game_mode: GameMode,
+    pub is_private: bool,
+    pub allow_spectators: bool,
+    pub snake_start_length: u8,
+    pub tactical_mode: bool,  // vs classic mode
+}
+
+impl Default for CustomGameSettings {
+    fn default() -> Self {
+        CustomGameSettings {
+            arena_width: 40,
+            arena_height: 40,
+            tick_duration_ms: 300,
+            food_spawn_rate: 3.0,
+            max_players: 4,
+            game_mode: GameMode::FreeForAll { max_players: 4 },
+            is_private: true,
+            allow_spectators: true,
+            snake_start_length: 4,
+            tactical_mode: false,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum GameMode {
+    SinglePlayer,
+    Duel,  // 1v1
+    FreeForAll { max_players: u8 },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum GameType {
     TeamMatch { per_team: u8 },
     FreeForAll { max_players: u8 },
+    Custom { settings: CustomGameSettings },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -143,6 +182,9 @@ pub struct GameState {
     // Players by user_id
     pub players: HashMap<u32, Player>,
     pub rng: Option<PseudoRandom>,
+    // Custom game fields
+    pub game_code: Option<String>,
+    pub host_user_id: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -219,7 +261,9 @@ impl GameState {
             },
             command_queue: CommandQueue::new(),
             players: HashMap::new(),
-            rng: rng_seed.map(PseudoRandom::new)
+            rng: rng_seed.map(PseudoRandom::new),
+            game_code: None,
+            host_user_id: None,
         }
     }
 

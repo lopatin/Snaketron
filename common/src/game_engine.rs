@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::VecDeque;
 use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
+use wasm_bindgen::prelude::*;
 
 pub struct GameEngine {
     game_id: u32,
