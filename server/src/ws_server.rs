@@ -34,6 +34,19 @@ pub enum WSMessage {
     // Matchmaking messages
     QueueForMatch { game_type: common::GameType },
     LeaveQueue,
+    // Custom game messages
+    CreateCustomGame { settings: common::CustomGameSettings },
+    JoinCustomGame { game_code: String },
+    UpdateCustomGameSettings { settings: common::CustomGameSettings },
+    StartCustomGame,
+    SpectateGame { game_id: u32, game_code: Option<String> },
+    // Custom game responses
+    CustomGameCreated { game_id: u32, game_code: String },
+    CustomGameJoined { game_id: u32 },
+    CustomGameSettingsUpdated { settings: common::CustomGameSettings },
+    CustomGameStarting,
+    SpectatorJoined,
+    AccessDenied { reason: String },
     // High availability messages
     ServerShutdown { 
         reason: String,
@@ -494,6 +507,60 @@ async fn process_ws_message(
                     warn!("Received game event in authenticated state: {:?}", event_msg);
                     Ok(ConnectionState::Authenticated { user_token })
                 }
+                WSMessage::CreateCustomGame { settings } => {
+                    info!("User {} creating custom game", user_token.user_id);
+                    
+                    match create_custom_game(db_pool, raft, user_token.user_id, settings).await {
+                        Ok((game_id, game_code)) => {
+                            // Send success response
+                            let response = WSMessage::CustomGameCreated { game_id, game_code };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            
+                            // Transition to in-game state
+                            Ok(ConnectionState::InGame { 
+                                user_token,
+                                game_id,
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to create custom game: {}", e);
+                            let response = WSMessage::AccessDenied { 
+                                reason: format!("Failed to create game: {}", e) 
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::Authenticated { user_token })
+                        }
+                    }
+                }
+                WSMessage::JoinCustomGame { game_code } => {
+                    info!("User {} joining custom game with code: {}", user_token.user_id, game_code);
+                    
+                    match join_custom_game(db_pool, raft, user_token.user_id, &game_code).await {
+                        Ok(game_id) => {
+                            // Send success response
+                            let response = WSMessage::CustomGameJoined { game_id };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            
+                            // Transition to in-game state
+                            Ok(ConnectionState::InGame { 
+                                user_token,
+                                game_id,
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to join custom game: {}", e);
+                            let response = WSMessage::AccessDenied { 
+                                reason: format!("Failed to join game: {}", e) 
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::Authenticated { user_token })
+                        }
+                    }
+                }
                 _ => {
                     warn!("Unexpected message in authenticated state: {:?}", ws_message);
                     Ok(ConnectionState::Authenticated { user_token })
@@ -531,6 +598,43 @@ async fn process_ws_message(
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
                     ws_stream.send(pong_msg).await?;
                     Ok(ConnectionState::InGame { user_token, game_id })
+                }
+                WSMessage::StartCustomGame => {
+                    info!("User {} starting custom game {}", user_token.user_id, game_id);
+                    
+                    // Check if user is the host
+                    let is_host = check_game_host(db_pool, game_id, user_token.user_id).await?;
+                    if !is_host {
+                        let response = WSMessage::AccessDenied { 
+                            reason: "Only the host can start the game".to_string() 
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_stream.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::InGame { user_token, game_id });
+                    }
+                    
+                    // Start the game via Raft
+                    let request = crate::raft::ClientRequest::StartGame { 
+                        game_id,
+                        server_id: raft.id,
+                    };
+                    match raft.propose(request).await {
+                        Ok(_) => {
+                            let response = WSMessage::CustomGameStarting;
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::InGame { user_token, game_id })
+                        }
+                        Err(e) => {
+                            error!("Failed to start game: {}", e);
+                            let response = WSMessage::AccessDenied { 
+                                reason: format!("Failed to start game: {}", e) 
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::InGame { user_token, game_id })
+                        }
+                    }
                 }
                 _ => {
                     warn!("Unexpected message in game state: {:?}", ws_message);
@@ -597,6 +701,168 @@ pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, Str
     Ok(servers.into_iter()
         .map(|(id, address)| (id as u64, address))
         .collect())
+}
+
+// Helper function to generate unique game codes
+fn generate_game_code() -> String {
+    use rand::{Rng, thread_rng};
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = thread_rng();
+    
+    (0..8)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+async fn create_custom_game(
+    pool: &PgPool,
+    raft: &Arc<RaftNode>,
+    user_id: i32,
+    settings: common::CustomGameSettings,
+) -> Result<(u32, String)> {
+    let game_code = generate_game_code();
+    
+    // Get current server ID from Raft node ID
+    let server_id = raft.id as i32;
+    
+    // Create lobby entry
+    let lobby_id: i32 = sqlx::query_scalar(
+        r#"
+        INSERT INTO custom_game_lobbies (game_code, host_user_id, settings, created_at, expires_at, state)
+        VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '1 hour', 'waiting')
+        RETURNING id
+        "#
+    )
+    .bind(&game_code)
+    .bind(user_id)
+    .bind(serde_json::to_value(&settings)?)
+    .fetch_one(pool)
+    .await?;
+    
+    // Create game entry
+    let game_id: i32 = sqlx::query_scalar(
+        r#"
+        INSERT INTO games (server_id, game_type, status, game_mode, is_private, game_code)
+        VALUES ($1, $2, 'waiting', 'custom', $3, $4)
+        RETURNING id
+        "#
+    )
+    .bind(server_id)
+    .bind(serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?)
+    .bind(settings.is_private)
+    .bind(&game_code)
+    .fetch_one(pool)
+    .await?;
+    
+    // Update lobby with game_id
+    sqlx::query("UPDATE custom_game_lobbies SET game_id = $1 WHERE id = $2")
+        .bind(game_id)
+        .bind(lobby_id)
+        .execute(pool)
+        .await?;
+    
+    // Create game state
+    let mut game_state = common::GameState::new(
+        settings.arena_width,
+        settings.arena_height,
+        common::GameType::Custom { settings },
+        Some(rand::random::<u64>()),
+    );
+    game_state.game_code = Some(game_code.clone());
+    game_state.host_user_id = Some(user_id as u32);
+    
+    // Add the host as the first player
+    game_state.add_player(user_id as u32)?;
+    
+    // Submit to Raft
+    let request = crate::raft::ClientRequest::CreateGame {
+        game_id: game_id as u32,
+        game_state,
+    };
+    
+    raft.propose(request).await?;
+    
+    Ok((game_id as u32, game_code))
+}
+
+async fn join_custom_game(
+    pool: &PgPool,
+    raft: &Arc<RaftNode>,
+    user_id: i32,
+    game_code: &str,
+) -> Result<u32> {
+    // Find the game by code
+    let (game_id, is_private): (i32, bool) = sqlx::query_as(
+        "SELECT id, is_private FROM games WHERE game_code = $1 AND status = 'waiting'"
+    )
+    .bind(game_code)
+    .fetch_one(pool)
+    .await
+    .context("Game not found or already started")?;
+    
+    // Check if game is full
+    let player_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM game_players WHERE game_id = $1"
+    )
+    .bind(game_id)
+    .fetch_one(pool)
+    .await?;
+    
+    // Get max players from game settings
+    let max_players: i32 = sqlx::query_scalar(
+        r#"
+        SELECT (game_type->'settings'->>'max_players')::int
+        FROM games
+        WHERE id = $1
+        "#
+    )
+    .bind(game_id)
+    .fetch_one(pool)
+    .await?;
+    
+    if player_count >= max_players as i64 {
+        return Err(anyhow::anyhow!("Game is full"));
+    }
+    
+    // For now, we need to handle player joining differently since GameState
+    // only allows adding players on tick 0. We'll need to implement a proper
+    // lobby system or modify the game engine to support late joins.
+    
+    // Add player to the game_players table
+    sqlx::query(
+        "INSERT INTO game_players (game_id, user_id, team_id) VALUES ($1, $2, 0)"
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    
+    // TODO: Implement proper player joining through Raft when game hasn't started yet
+    warn!("Player joining for custom games needs proper implementation");
+    
+    Ok(game_id as u32)
+}
+
+async fn check_game_host(
+    pool: &PgPool,
+    game_id: u32,
+    user_id: i32,
+) -> Result<bool> {
+    let host_user_id: Option<i32> = sqlx::query_scalar(
+        r#"
+        SELECT host_user_id
+        FROM custom_game_lobbies
+        WHERE game_id = $1
+        "#
+    )
+    .bind(game_id as i32)
+    .fetch_optional(pool)
+    .await?;
+    
+    Ok(host_user_id == Some(user_id))
 }
 
 

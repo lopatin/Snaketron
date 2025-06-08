@@ -6,6 +6,7 @@ export const useGameWebSocket = () => {
   const [gameState, setGameState] = useState(null);
   const [currentGameId, setCurrentGameId] = useState(null);
   const [customGameCode, setCustomGameCode] = useState(null);
+  const [isHost, setIsHost] = useState(false);
 
   // Handle game-specific messages
   useEffect(() => {
@@ -23,6 +24,7 @@ export const useGameWebSocket = () => {
       onMessage('CustomGameCreated', (message) => {
         setCurrentGameId(message.data.game_id);
         setCustomGameCode(message.data.game_code);
+        setIsHost(true); // Creator is always the host
       })
     );
 
@@ -95,6 +97,7 @@ export const useGameWebSocket = () => {
     gameState,
     currentGameId,
     customGameCode,
+    isHost,
     createCustomGame,
     joinCustomGame,
     updateCustomGameSettings,

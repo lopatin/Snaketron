@@ -1,7 +1,9 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom';
 import './index.css';
 import CustomGameCreator from './components/CustomGameCreator.jsx';
+import GameLobby from './components/GameLobby.jsx';
+import JoinGameModal from './components/JoinGameModal.jsx';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext.jsx';
 
 function Header() {
@@ -37,6 +39,7 @@ function GameCanvas() {
 
 function Home() {
   const navigate = useNavigate();
+  const [showJoinModal, setShowJoinModal] = useState(false);
   
   return (
     <>
@@ -86,9 +89,26 @@ function Home() {
           </div>
         </div>
       </div>
+      
+      {/* Join Game Button */}
+      <div className="flex justify-center mt-6">
+        <button
+          onClick={() => setShowJoinModal(true)}
+          className="px-6 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
+        >
+          Or Join Existing Game
+        </button>
+      </div>
+      
       <main className="flex-1 flex justify-center items-center text-center p-5">
         <GameCanvas />
       </main>
+      
+      {/* Join Game Modal */}
+      <JoinGameModal 
+        isOpen={showJoinModal} 
+        onClose={() => setShowJoinModal(false)} 
+      />
     </>
   );
 }
@@ -108,7 +128,7 @@ function AppContent() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/custom" element={<CustomGameCreator />} />
-        <Route path="/game/:gameCode" element={<div className="flex-1 flex justify-center items-center">Game Lobby - Coming Soon</div>} />
+        <Route path="/game/:gameCode" element={<GameLobby />} />
         <Route path="/play/:gameId" element={<div className="flex-1 flex justify-center items-center">Game View - Coming Soon</div>} />
       </Routes>
     </div>
