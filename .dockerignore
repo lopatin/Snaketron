@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Client build artifacts
+client/pkg/
+client/web/node_modules/
+client/web/dist/
+
+# Old code
+_old/
+
+# Local files
+.env
+*.log
+replays/
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+*_test.rs
+tests/
+
+# TLA+ files
+*.tla
+*.cfg
+tla2tools.jar
+
+# Database
+docker-compose.yml
+.dockerignore
+Dockerfile

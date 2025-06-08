@@ -1,0 +1,32 @@
+# Production override for AWS Fargate deployment
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+
+version: '3.8'
+
+services:
+  # In production, we don't run the database in the same task
+  # Database should be AWS RDS or a separately managed service
+  db:
+    deploy:
+      replicas: 0  # Don't deploy database in production
+
+  server:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/snaketron-server:${IMAGE_TAG}
+    environment:
+      # Override with production database settings
+      SNAKETRON_DB_HOST: ${PROD_DB_HOST}
+      SNAKETRON_DB_PORT: ${PROD_DB_PORT}
+      SNAKETRON_DB_USER: ${PROD_DB_USER}
+      SNAKETRON_DB_PASS: ${PROD_DB_PASS}
+      SNAKETRON_DB_NAME: ${PROD_DB_NAME}
+      # Production region
+      SNAKETRON_REGION: ${AWS_REGION}
+      # Production logging
+      RUST_LOG: info
+    volumes: []  # No local volumes in Fargate
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/snaketron-server
+        awslogs-region: ${AWS_REGION}
+        awslogs-stream-prefix: ecs

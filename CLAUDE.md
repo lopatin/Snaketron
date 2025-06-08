@@ -34,9 +34,17 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 - **Shared Game Logic**: Common crate compiled to both native (server) and WASM (client) enables consistent game behavior and client-side prediction.
 - **Decoupling**: The server which is running the game loop is not necessarily the same server that is running the WebSocket server that the game client connects to.
 - **Database Schema**: Well-structured tables for servers, users, games, and matchmaking with proper indexes for performance.
+- **Containerization**: Docker support for both local development and production deployment on AWS Fargate.
 
 ### Development Workflow
 
+#### Using Docker (Recommended)
+1. Start the entire stack: `docker-compose up --build`
+2. The server will automatically run migrations and start accepting connections
+3. Build the client WASM package and start the webpack dev server
+4. The client connects via WebSocket to the server at ws://localhost:8080
+
+#### Manual Setup
 1. Start the PostgreSQL database first
 2. Run database migrations (automatic on server start via Refinery)
 3. Start the server which will register itself and begin accepting connections
@@ -52,13 +60,22 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 
 ## Commands
 
-### Database
+### Docker Commands
 ```bash
-# Start PostgreSQL database
-docker-compose up -d
+# Start the entire stack (database + server)
+docker-compose up --build
 
-# Stop database
+# Run in detached mode
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f server
+
+# Stop all services
 docker-compose down
+
+# Start only the database
+docker-compose up -d db
 ```
 
 ### Server Development

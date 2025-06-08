@@ -3,7 +3,7 @@ version: '3.8'
 services:
   db:
     image: postgres:13.3
-    container_name: snaketron-postgres-test
+    container_name: snaketron-postgres
     platform: linux/arm64
     environment:
       POSTGRES_USER: snaketron
@@ -11,4 +11,48 @@ services:
       POSTGRES_DB: snaketron
     ports:
       - "5432:5432"
-    restart: no
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U snaketron"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - snaketron-network
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: snaketron-server
+    platform: linux/arm64
+    environment:
+      # Database configuration
+      SNAKETRON_DB_HOST: db
+      SNAKETRON_DB_PORT: 5432
+      SNAKETRON_DB_USER: snaketron
+      SNAKETRON_DB_PASS: snaketron
+      SNAKETRON_DB_NAME: snaketron
+      # Server configuration
+      SNAKETRON_WS_PORT: 8080
+      SNAKETRON_GRPC_PORT: 50051
+      SNAKETRON_REGION: local
+      # Logging
+      RUST_LOG: info,server=debug
+      # Replay directory (using volume)
+      SNAKETRON_REPLAY_DIR: /var/lib/snaketron/replays
+    ports:
+      - "8080:8080"   # WebSocket port
+      - "50051:50051" # gRPC port
+    volumes:
+      - ./replays:/var/lib/snaketron/replays
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - snaketron-network
+
+networks:
+  snaketron-network:
+    driver: bridge
