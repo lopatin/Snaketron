@@ -56,15 +56,19 @@ function App() {
                 </div>
             </div>
             
-            {/* Column 2: Competitive & Single Player */}
-            <div className="-skew-x-[10deg] flex flex-col gap-[10px]">
+            {/* Column 2: Competitive */}
+            <div className="-skew-x-[10deg]">
                 <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
                     <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
-                        <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                        <button className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
                             <span className="skew-x-[10deg]">COMPETITIVE</span>
                         </button>
                     </div>
                 </div>
+            </div>
+            
+            {/* Column 3: Single Player & Custom Game */}
+            <div className="-skew-x-[10deg] flex flex-col gap-[10px]">
                 <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
                     <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
                         <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
@@ -72,10 +76,6 @@ function App() {
                         </button>
                     </div>
                 </div>
-            </div>
-            
-            {/* Column 3: Custom Game */}
-            <div className="-skew-x-[10deg] flex items-start h-[110px]">
                 <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
                     <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
                         <button className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
