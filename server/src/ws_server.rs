@@ -561,6 +561,33 @@ async fn process_ws_message(
                         }
                     }
                 }
+                WSMessage::SpectateGame { game_id, game_code } => {
+                    info!("User {} attempting to spectate game {}", user_token.user_id, game_id);
+                    
+                    match spectate_game(db_pool, user_token.user_id, game_id, game_code.as_deref()).await {
+                        Ok(actual_game_id) => {
+                            // Send success response
+                            let response = WSMessage::SpectatorJoined;
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            
+                            // Transition to in-game state as spectator
+                            Ok(ConnectionState::InGame { 
+                                user_token,
+                                game_id: actual_game_id,
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to spectate game: {}", e);
+                            let response = WSMessage::AccessDenied { 
+                                reason: format!("Failed to spectate game: {}", e) 
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::Authenticated { user_token })
+                        }
+                    }
+                }
                 _ => {
                     warn!("Unexpected message in authenticated state: {:?}", ws_message);
                     Ok(ConnectionState::Authenticated { user_token })
@@ -863,6 +890,84 @@ async fn check_game_host(
     .await?;
     
     Ok(host_user_id == Some(user_id))
+}
+
+async fn spectate_game(
+    pool: &PgPool,
+    user_id: i32,
+    game_id: u32,
+    game_code: Option<&str>,
+) -> Result<u32> {
+    // If game_code is provided, look up game by code
+    let actual_game_id = if let Some(code) = game_code {
+        let result: Option<(i32, bool)> = sqlx::query_as(
+            r#"
+            SELECT g.id, g.is_private
+            FROM games g
+            WHERE g.game_code = $1
+            "#
+        )
+        .bind(code)
+        .fetch_optional(pool)
+        .await?;
+        
+        if let Some((id, is_private)) = result {
+            // Check if spectators are allowed for private games
+            if is_private {
+                let allow_spectators: Option<bool> = sqlx::query_scalar(
+                    r#"
+                    SELECT allow_spectators
+                    FROM custom_game_lobbies
+                    WHERE game_id = $1
+                    "#
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                
+                if !allow_spectators.unwrap_or(false) {
+                    return Err(anyhow::anyhow!("Spectators are not allowed for this game"));
+                }
+            }
+            id as u32
+        } else {
+            return Err(anyhow::anyhow!("Invalid game code"));
+        }
+    } else {
+        // Direct game_id access - check if game exists and is public
+        let is_private: Option<bool> = sqlx::query_scalar(
+            r#"
+            SELECT is_private
+            FROM games
+            WHERE id = $1
+            "#
+        )
+        .bind(game_id as i32)
+        .fetch_optional(pool)
+        .await?;
+        
+        match is_private {
+            Some(false) => game_id, // Public game, allow spectating
+            Some(true) => return Err(anyhow::anyhow!("Cannot spectate private game without code")),
+            None => return Err(anyhow::anyhow!("Game not found")),
+        }
+    };
+    
+    // Add spectator to the game_spectators table
+    sqlx::query(
+        r#"
+        INSERT INTO game_spectators (game_id, user_id, joined_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (game_id, user_id) DO NOTHING
+        "#
+    )
+    .bind(actual_game_id as i32)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    
+    info!("User {} joined as spectator for game {}", user_id, actual_game_id);
+    Ok(actual_game_id)
 }
 
 

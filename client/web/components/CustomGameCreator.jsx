@@ -41,8 +41,8 @@ function CustomGameCreator() {
       arena_height: settings.arenaHeight,
       tick_duration_ms: gameSpeedToMs[settings.gameSpeed],
       food_spawn_rate: settings.foodSpawnRate,
-      max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'singlePlayer' ? 1 : settings.maxPlayers,
-      game_mode: settings.gameMode === 'singlePlayer' ? 'SinglePlayer' : 
+      max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
+      game_mode: settings.gameMode === 'solo' ? 'Solo' : 
                  settings.gameMode === 'duel' ? 'Duel' : 
                  { FreeForAll: { max_players: settings.maxPlayers } },
       is_private: settings.isPrivate,
@@ -72,12 +72,12 @@ function CustomGameCreator() {
             <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Mode</label>
             <div className="grid grid-cols-3 gap-2">
               <button
-                onClick={() => handleSettingChange('gameMode', 'singlePlayer')}
+                onClick={() => handleSettingChange('gameMode', 'solo')}
                 className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  settings.gameMode === 'singlePlayer' ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
+                  settings.gameMode === 'solo' ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
                 }`}
               >
-                Single Player
+                Solo
               </button>
               <button
                 onClick={() => handleSettingChange('gameMode', 'duel')}

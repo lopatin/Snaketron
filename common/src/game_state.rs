@@ -92,7 +92,7 @@ impl Default for CustomGameSettings {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum GameMode {
-    SinglePlayer,
+    Solo,  // Practice mode - just one player
     Duel,  // 1v1
     FreeForAll { max_players: u8 },
 }
@@ -246,6 +246,19 @@ impl GameState {
         game_type: GameType, 
         rng_seed: Option<u64>
     ) -> Self {
+        // Calculate food target based on custom settings or defaults
+        let available_food_target = match &game_type {
+            GameType::Custom { settings } => {
+                // Convert food per minute to approximate target count
+                // Assuming 300ms ticks (3.33 ticks/sec), we get ~200 ticks/min
+                // So food_target = food_spawn_rate * arena_size / 200
+                let arena_size = (settings.arena_width * settings.arena_height) as f32;
+                let base_target = (settings.food_spawn_rate * arena_size / 1600.0).max(1.0);
+                base_target.round() as usize
+            },
+            _ => 5, // Default for non-custom games
+        };
+        
         GameState {
             tick: 0,
             status: GameStatus::Stopped,
@@ -257,7 +270,7 @@ impl GameState {
             },
             game_type,
             properties: GameProperties {
-                available_food_target: 5,
+                available_food_target,
             },
             command_queue: CommandQueue::new(),
             players: HashMap::new(),
@@ -295,11 +308,17 @@ impl GameState {
         let arena_width = self.arena.width as i16;
         let arena_height = self.arena.height as i16;
         
+        // Get snake length from custom settings or use default
+        let snake_length = match &self.game_type {
+            GameType::Custom { settings } => settings.snake_start_length as i16,
+            _ => DEFAULT_SNAKE_LENGTH as i16,
+        };
+        
         match player_count {
             0 => {},
             1 => {
                 // Single snake starts on the right, facing left
-                let x = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                let x = arena_width - snake_length - 1;
                 let y = arena_height / 2;
                 positions.push((Position { x, y }, Direction::Left));
             },
@@ -308,11 +327,11 @@ impl GameState {
                 let y = arena_height / 2;
                 
                 // Right side, facing left
-                let x_right = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                let x_right = arena_width - snake_length - 1;
                 positions.push((Position { x: x_right, y }, Direction::Left));
                 
                 // Left side, facing right
-                let x_left = DEFAULT_SNAKE_LENGTH as i16;
+                let x_left = snake_length;
                 positions.push((Position { x: x_left, y }, Direction::Right));
             },
             _ => {
@@ -325,7 +344,7 @@ impl GameState {
                 let usable_height = arena_height - 2 * vertical_margin;
                 
                 // Left column (facing right)
-                let x_left = DEFAULT_SNAKE_LENGTH as i16;
+                let x_left = snake_length;
                 for i in 0..left_count {
                     let y = if left_count == 1 {
                         arena_height / 2
@@ -336,7 +355,7 @@ impl GameState {
                 }
                 
                 // Right column (facing left)
-                let x_right = arena_width - DEFAULT_SNAKE_LENGTH as i16 - 1;
+                let x_right = arena_width - snake_length - 1;
                 for i in 0..right_count {
                     let y = if right_count == 1 {
                         arena_height / 2
@@ -377,6 +396,12 @@ impl GameState {
         let player_count = self.players.len();
         let starting_positions = self.calculate_starting_positions(player_count);
 
+        // Get snake length from custom settings or use default
+        let snake_length = match &self.game_type {
+            GameType::Custom { settings } => settings.snake_start_length as usize,
+            _ => DEFAULT_SNAKE_LENGTH,
+        };
+        
         // Rearrange all snakes to their starting positions
         for (idx, (player_id, player)) in self.players.iter().enumerate() {
             if idx < starting_positions.len() {
@@ -386,20 +411,20 @@ impl GameState {
                 // Build compressed snake body: just head and tail for a straight snake
                 let tail_pos = match direction {
                     Direction::Left => Position { 
-                        x: head_pos.x + (DEFAULT_SNAKE_LENGTH - 1) as i16, 
+                        x: head_pos.x + (snake_length - 1) as i16, 
                         y: head_pos.y 
                     },
                     Direction::Right => Position { 
-                        x: head_pos.x - (DEFAULT_SNAKE_LENGTH - 1) as i16, 
+                        x: head_pos.x - (snake_length - 1) as i16, 
                         y: head_pos.y 
                     },
                     Direction::Up => Position { 
                         x: head_pos.x, 
-                        y: head_pos.y + (DEFAULT_SNAKE_LENGTH - 1) as i16 
+                        y: head_pos.y + (snake_length - 1) as i16 
                     },
                     Direction::Down => Position { 
                         x: head_pos.x, 
-                        y: head_pos.y - (DEFAULT_SNAKE_LENGTH - 1) as i16 
+                        y: head_pos.y - (snake_length - 1) as i16 
                     },
                 };
                 
@@ -531,8 +556,23 @@ impl GameState {
         let mut out: Vec<GameEvent> = Vec::new();
         match command {
             GameCommand::Turn { snake_id, direction } => {
-                let snake = self.get_snake_mut(snake_id)?;
+                // Check if tactical mode is enabled before borrowing snake mutably
+                let is_tactical = match &self.game_type {
+                    GameType::Custom { settings } => settings.tactical_mode,
+                    _ => false,
+                };
+                
+                // Get current snake state
+                let snake = self.arena.snakes.get(snake_id as usize)
+                    .context("Snake not found")?;
+                
                 if snake.is_alive && snake.direction != direction {
+                    // In tactical mode, prevent 180-degree turns
+                    if is_tactical && snake.direction.is_opposite(&direction) {
+                        // Ignore the command - cannot turn 180 degrees in tactical mode
+                        return Ok(out);
+                    }
+                    
                     self.apply_event(GameEvent::SnakeTurned { snake_id, direction }, Some(&mut out));
                 }
             }

@@ -42,12 +42,22 @@ impl GameEngine {
     }
     
     pub fn new_with_seed_and_type(game_id: u32, start_ms: i64, rng_seed: u64, game_type: GameType) -> Self {
+        // Extract dimensions and tick duration from custom settings if available
+        let (width, height, tick_duration_ms) = match &game_type {
+            GameType::Custom { settings } => (
+                settings.arena_width,
+                settings.arena_height,
+                settings.tick_duration_ms as u32,
+            ),
+            _ => (40, 40, 300), // Default dimensions for non-custom games
+        };
+        
         GameEngine {
             game_id,
-            committed_state: GameState::new(10, 10, game_type.clone(), Some(rng_seed)),
-            predicted_state: Some(GameState::new(10, 10, game_type, None)), // Client prediction doesn't need RNG
+            committed_state: GameState::new(width, height, game_type.clone(), Some(rng_seed)),
+            predicted_state: Some(GameState::new(width, height, game_type, None)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
-            tick_duration_ms: 300,
+            tick_duration_ms,
             committed_state_lag_ms: 500,
             unconfirmed_local_inputs: VecDeque::new(),
             local_player_id: None,
@@ -57,12 +67,18 @@ impl GameEngine {
     }
 
     pub fn new_from_state(game_id: u32, start_ms: i64, game_state: GameState) -> Self {
+        // Extract tick duration from custom settings if available
+        let tick_duration_ms = match &game_state.game_type {
+            GameType::Custom { settings } => settings.tick_duration_ms as u32,
+            _ => 300, // Default for non-custom games
+        };
+        
         GameEngine {
             game_id,
             committed_state: game_state.clone(),
             predicted_state: Some(game_state),
             event_log: Vec::new(),
-            tick_duration_ms: 300,
+            tick_duration_ms,
             committed_state_lag_ms: 500,
             unconfirmed_local_inputs: VecDeque::new(),
             local_player_id: None,

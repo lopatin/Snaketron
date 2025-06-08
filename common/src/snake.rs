@@ -9,6 +9,19 @@ pub enum Direction {
     Right,
 }
 
+impl Direction {
+    /// Returns true if the two directions are opposite (180 degrees apart)
+    pub fn is_opposite(&self, other: &Direction) -> bool {
+        matches!(
+            (self, other),
+            (Direction::Up, Direction::Down) |
+            (Direction::Down, Direction::Up) |
+            (Direction::Left, Direction::Right) |
+            (Direction::Right, Direction::Left)
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Position {
     pub x: i16,
