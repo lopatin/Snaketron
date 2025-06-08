@@ -5,7 +5,15 @@ import * as wasm from "wasm-snaketron";
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 
-let game = wasm.Game.new(60, 40);
+// let game = wasm.Game.new(60, 40);
+
+function Header() {
+  return (
+    <header className="site-header">
+      <img src="/SnaketronLogo.png" alt="Snaketron" className="logo" />
+    </header>
+  );
+}
 
 function GameCanvas() {
   return (
@@ -13,15 +21,26 @@ function GameCanvas() {
   );
 }
 
+function App() {
+  return (
+    <div className="app">
+      <Header />
+      <main className="game-container">
+        <GameCanvas />
+      </main>
+    </div>
+  );
+}
+
 console.log('hi from main.jsx');
 
 // mount
-const container = document.getElementById('gameCanvas');
+const container = document.getElementById('root');
 const root = ReactDOM.createRoot(container);
 
 root.render(
     <React.StrictMode>
-      <GameCanvas />
+      <App />
     </React.StrictMode>
 );
 
