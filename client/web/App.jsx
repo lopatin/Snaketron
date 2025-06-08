@@ -49,7 +49,9 @@ function Home() {
           <div className="-skew-x-[10deg]">
             <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
               <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
-                <button className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
+                <button 
+                  data-testid="quick-play-button"
+                  className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center">
                   <span className="skew-x-[10deg]">QUICK MATCH</span>
                 </button>
               </div>
@@ -79,6 +81,7 @@ function Home() {
             <div className="border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden cursor-pointer button-outer">
               <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
                 <button 
+                  data-testid="custom-game-button"
                   onClick={() => navigate('/custom')}
                   className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button flex items-center justify-center"
                 >
@@ -93,6 +96,7 @@ function Home() {
       {/* Join Game Button */}
       <div className="flex justify-center mt-6">
         <button
+          data-testid="join-game-button"
           onClick={() => setShowJoinModal(true)}
           className="px-6 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
         >

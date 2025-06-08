@@ -33,6 +33,10 @@ export const WebSocketProvider = ({ children }) => {
           clearTimeout(reconnectTimeout.current);
           reconnectTimeout.current = null;
         }
+        // Expose for testing
+        if (typeof window !== 'undefined') {
+          window.__wsInstance = ws.current;
+        }
       };
 
       ws.current.onclose = () => {
@@ -118,6 +122,13 @@ export const WebSocketProvider = ({ children }) => {
     sendMessage,
     onMessage,
   };
+
+  // Expose context for testing
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.__wsContext = value;
+    }
+  }, [value]);
 
   return (
     <WebSocketContext.Provider value={value}>

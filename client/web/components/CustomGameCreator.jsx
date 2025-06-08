@@ -70,7 +70,17 @@ function CustomGameCreator() {
           {/* Game Mode */}
           <div>
             <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Mode</label>
-            <div className="grid grid-cols-3 gap-2">
+            <select
+              data-testid="game-mode-select"
+              value={settings.gameMode}
+              onChange={(e) => handleSettingChange('gameMode', e.target.value)}
+              className="w-full px-3 py-2 border border-black-70 rounded font-bold uppercase tracking-1 bg-white"
+            >
+              <option value="solo">Solo</option>
+              <option value="duel">Duel</option>
+              <option value="freeForAll">Free For All</option>
+            </select>
+            <div className="grid grid-cols-3 gap-2 mt-2">
               <button
                 onClick={() => handleSettingChange('gameMode', 'solo')}
                 className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
@@ -99,38 +109,33 @@ function CustomGameCreator() {
           </div>
 
           {/* Arena Size */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-bold uppercase tracking-1 mb-2">Arena Width</label>
-              <input
-                type="number"
-                min="20"
-                max="100"
-                value={settings.arenaWidth}
-                onChange={(e) => handleSettingChange('arenaWidth', parseInt(e.target.value))}
-                className="w-full px-3 py-2 border border-black-70 rounded font-mono"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-bold uppercase tracking-1 mb-2">Arena Height</label>
-              <input
-                type="number"
-                min="20"
-                max="100"
-                value={settings.arenaHeight}
-                onChange={(e) => handleSettingChange('arenaHeight', parseInt(e.target.value))}
-                className="w-full px-3 py-2 border border-black-70 rounded font-mono"
-              />
-            </div>
+          <div>
+            <label className="block text-sm font-bold uppercase tracking-1 mb-2">
+              Arena Size: <span data-testid="arena-size-value">{settings.arenaWidth}x{settings.arenaHeight}</span>
+            </label>
+            <input
+              data-testid="arena-size-slider"
+              type="range"
+              min="20"
+              max="60"
+              value={settings.arenaWidth}
+              onChange={(e) => {
+                const size = parseInt(e.target.value);
+                handleSettingChange('arenaWidth', size);
+                handleSettingChange('arenaHeight', size);
+              }}
+              className="w-full"
+            />
           </div>
 
           {/* Max Players (if not duel or single player) */}
           {settings.gameMode === 'freeForAll' && (
             <div>
               <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-                Max Players: {settings.maxPlayers}
+                Max Players: <span data-testid="max-players-value">{settings.maxPlayers}</span>
               </label>
               <input
+                data-testid="max-players-slider"
                 type="range"
                 min="2"
                 max="8"
@@ -143,7 +148,20 @@ function CustomGameCreator() {
 
           {/* Game Speed */}
           <div>
-            <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Speed</label>
+            <label className="block text-sm font-bold uppercase tracking-1 mb-2">
+              Game Speed: <span data-testid="game-speed-value">{settings.gameSpeed}</span>
+            </label>
+            <select
+              data-testid="game-speed-select"
+              value={settings.gameSpeed}
+              onChange={(e) => handleSettingChange('gameSpeed', e.target.value)}
+              className="w-full px-3 py-2 border border-black-70 rounded font-bold uppercase tracking-1 bg-white mb-2"
+            >
+              <option value="slow">Slow</option>
+              <option value="normal">Normal</option>
+              <option value="fast">Fast</option>
+              <option value="extreme">Extreme</option>
+            </select>
             <div className="grid grid-cols-4 gap-2">
               {Object.keys(gameSpeedToMs).map(speed => (
                 <button
@@ -227,12 +245,14 @@ function CustomGameCreator() {
           {/* Action Buttons */}
           <div className="flex gap-4 mt-8">
             <button
+              data-testid="back-button"
               onClick={() => navigate('/')}
               className="flex-1 px-6 py-3 border border-black-70 rounded font-black italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
             >
               Cancel
             </button>
             <button
+              data-testid="create-game-button"
               onClick={handleCreateGame}
               className="flex-1 px-6 py-3 border-2 border-black-70 rounded font-black italic uppercase tracking-1 bg-black-70 text-white hover:bg-black transition-colors"
             >

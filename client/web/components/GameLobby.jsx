@@ -70,10 +70,11 @@ function GameLobby() {
         <div className="lg:col-span-2 bg-white rounded-lg border-2 border-black-70 p-6">
           <h2 className="text-2xl font-black italic uppercase tracking-1 mb-6">Players</h2>
           
-          <div className="space-y-3">
+          <div className="space-y-3" data-testid="players-list">
             {players.map((player, index) => (
               <div 
                 key={player.id}
+                data-testid="player-item"
                 className="flex items-center justify-between p-4 border border-black-70 rounded"
               >
                 <div className="flex items-center gap-3">
@@ -83,7 +84,7 @@ function GameLobby() {
                   <div>
                     <span className="font-bold">{player.name}</span>
                     {player.isHost && (
-                      <span className="ml-2 text-sm font-bold italic uppercase tracking-1 opacity-70">
+                      <span data-testid="host-badge" className="ml-2 text-sm font-bold italic uppercase tracking-1 opacity-70">
                         (Host)
                       </span>
                     )}
@@ -113,6 +114,7 @@ function GameLobby() {
           <div className="mt-6 flex gap-3">
             {isHost ? (
               <button
+                data-testid="start-game-button"
                 onClick={handleStartGame}
                 disabled={!isConnected || isStarting || players.length < 2}
                 className="flex-1 px-6 py-3 border-2 border-black-70 rounded font-black italic uppercase tracking-1 bg-black-70 text-white hover:bg-black transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -129,6 +131,7 @@ function GameLobby() {
             )}
             
             <button
+              data-testid="leave-game-button"
               onClick={handleLeaveGame}
               className="px-6 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
             >
@@ -143,10 +146,11 @@ function GameLobby() {
           <div className="bg-white rounded-lg border-2 border-black-70 p-6">
             <h3 className="text-lg font-black italic uppercase tracking-1 mb-3">Game Code</h3>
             <div className="flex items-center gap-2">
-              <div className="flex-1 p-3 bg-gray-100 rounded font-mono text-xl text-center font-bold">
+              <div data-testid="game-code" className="flex-1 p-3 bg-gray-100 rounded font-mono text-xl text-center font-bold">
                 {gameCode}
               </div>
               <button
+                data-testid="copy-code-button"
                 onClick={handleCopyCode}
                 className="px-4 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
               >
@@ -158,24 +162,24 @@ function GameLobby() {
 
           {/* Game Settings */}
           {gameSettings && (
-            <div className="bg-white rounded-lg border-2 border-black-70 p-6">
+            <div data-testid="game-settings" className="bg-white rounded-lg border-2 border-black-70 p-6">
               <h3 className="text-lg font-black italic uppercase tracking-1 mb-3">Settings</h3>
               <dl className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Mode</dt>
-                  <dd className="font-mono">{gameSettings.gameMode}</dd>
+                  <dd data-testid="game-mode-value" className="font-mono">{gameSettings.gameMode}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Max Players</dt>
-                  <dd className="font-mono">{gameSettings.maxPlayers}</dd>
+                  <dd data-testid="max-players-value" className="font-mono">{gameSettings.maxPlayers}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Arena</dt>
-                  <dd className="font-mono">{gameSettings.arenaSize}</dd>
+                  <dd data-testid="arena-size-value" className="font-mono">{gameSettings.arenaSize}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Speed</dt>
-                  <dd className="font-mono">{gameSettings.gameSpeed}</dd>
+                  <dd data-testid="game-speed-value" className="font-mono">{gameSettings.gameSpeed}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Food Rate</dt>
