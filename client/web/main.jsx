@@ -25,9 +25,19 @@ function App() {
   return (
     <div className="app">
       <Header />
-      <main className="game-container">
-        <GameCanvas />
-      </main>
+
+    <div class="button-container">
+        <div class="button-outer">
+            <div class="button-wrapper">
+                <button class="skewed-button">
+                    <span>SINGLE PLAYER</span>
+                </button>
+            </div>
+        </div>
+    </div>
+        <main className="game-container">
+            <GameCanvas />
+        </main>
     </div>
   );
 }

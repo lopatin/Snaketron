@@ -3,6 +3,10 @@ body {
     margin: 0;
     padding: 0;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+    /* Subtle dot pattern background */
+    background-image: radial-gradient(circle, rgba(0, 0, 0, 0.3) 1px, transparent 1px);
+    background-size: 15px 15px;
+    background-position: 0 0;
 }
 
 .app {
@@ -14,30 +18,24 @@ body {
 /* Header styles with custom double border */
 .site-header {
     background-color: #ffffff;
-    border-top: 1px solid #000000;
-    margin-top: 2px;
-    padding: 20px;
+    border-top: 3px solid white;
+    padding: 20px 0 18px;
     display: flex;
     justify-content: center;
     align-items: center;
     position: relative;
-    /* Add bottom border using pseudo-elements for precise control */
-    border-bottom: 1px solid #000000;
-}
-
-.site-header::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: -5px; /* 3px gap + 2px to account for the border width */
-    height: 2px;
-    background-color: #000000;
+    /* White borders with box-shadow to create the lines */
+    border-bottom: 3px solid white;
+    box-shadow: 
+        inset 0 .5px 0 0 rgba(0, 0, 0, 0.8),     /* Top border line */
+        inset 0 -.5px 0 0 rgba(0, 0, 0, 0.8),    /* Upper line of lower double border */
+        0 1.5px 0 0 rgba(0, 0, 0, 0.8);           /* Lower line of lower double border (2px thick) */
 }
 
 .logo {
     height: 24px;
     width: auto;
+    opacity: 0.8;
 }
 
 /* Game container */
@@ -47,7 +45,7 @@ body {
     justify-content: center;
     align-items: center;
     text-align: center;
-    background-color: #ffffff;
+    /*background-color: #ffffff;*/
     padding: 20px;
 }
 
@@ -57,3 +55,94 @@ canvas {
     height: auto;
     border: 1px solid #f0f0f0;
 }
+
+
+.button-container {
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+    align-items: center;
+    margin-top: 40px;
+}
+
+/* Wrapper for proper border-radius with skew */
+.button-outer {
+    position: relative;
+    display: inline-block;
+    border: 1px solid rgba(0, 0, 0, 0.7);
+    border-right-width: 2px;
+    border-bottom-width: 2px;
+    border-radius: 8px;
+    overflow: hidden; /* This ensures border-radius clips content */
+    transform: skewX(-10deg);
+    cursor: pointer;
+    /*transition: border-right-width 0.15s ease, border-bottom-width 0.15s ease;*/
+}
+
+/* Inner wrapper for spacing */
+.button-wrapper {
+    background: #ffffff;
+    padding: 3px; /* Gap between borders */
+    margin: 0;
+    /*transition: background 0.15s ease; !* Match button transition speed *!*/
+    cursor: pointer;
+}
+
+/* Main skewed button style */
+.skewed-button {
+    position: relative;
+    width: 280px; /* Fixed width for consistency */
+    padding: 18px 0;
+    background: #ffffff;
+    color: rgba(0, 0, 0, 0.7); /* Black with 0.7 opacity */
+    font-size: 18px;
+    font-weight: 900;
+    font-style: italic;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    cursor: pointer;
+    text-align: center;
+    border: 1px solid rgba(0, 0, 0, 0.7);
+    border-radius: 5px;
+    transform: none;
+    /*transition: all 0.15s ease; !* Fast transition for all properties *!*/
+    /* Make text appear even bolder */
+    text-shadow: 0.5px 0.5px 0 rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.3);
+    -webkit-text-stroke: 0.4px rgba(0, 0, 0, 0.7);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Text inside button - unskew it */
+.skewed-button span {
+    display: inline-block;
+    transform: skewX(10deg);
+}
+
+/* Hover effect */
+.button-outer:hover {
+    border-right-width: 3px;
+    border-bottom-width: 3px;
+}
+
+.button-outer:hover .skewed-button {
+    /*background: rgba(0, 0, 0, 0.9); !* Almost black *!*/
+    /*color: #ffffff; !* White text *!*/
+    /*border-color: #ffffff; !* White border *!*/
+    /*text-shadow: none; !* Remove text shadow for cleaner look *!*/
+    /*-webkit-text-stroke: 0; !* Remove text stroke *!*/
+
+    /* underline on hover */
+}
+
+.button-outer:hover .skewed-button span {
+    text-decoration: underline;
+    text-underline-offset: 6px;
+}
+
+/* Active state */
+/*.button-outer:active .skewed-button {*/
+/*    background: #eee;*/
+/*    color: #ffffff;*/
+/*    border-color: #ffffff;*/
+/*}*/
