@@ -1,148 +1,66 @@
-/* Base styles */
-body {
-    margin: 0;
-    padding: 0;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+@import "tailwindcss";
+
+/* Custom theme configuration for Tailwind v4 */
+@theme {
+  --color-black-70: rgba(0, 0, 0, 0.7);
+  --color-black-80: rgba(0, 0, 0, 0.8);
+  
+  --opacity-70: 0.7;
+  --opacity-80: 0.8;
+  
+  --spacing-18: 18px;
+  --spacing-30: 30px;
+  
+  --font-size-18: 18px;
+  
+  --letter-spacing-1: 1px;
+  
+  --border-width-3: 3px;
+  
+  --text-underline-offset-6: 6px;
+}
+
+/* Custom styles for effects that can't be achieved with Tailwind utilities */
+
+/* Base body styles with dot pattern background */
+@layer base {
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
     /* Subtle dot pattern background */
     background-image: radial-gradient(circle, rgba(0, 0, 0, 0.3) 1px, transparent 1px);
     background-size: 15px 15px;
     background-position: 0 0;
+  }
 }
 
-.app {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-}
-
-/* Header styles with custom double border */
-.site-header {
-    background-color: #ffffff;
-    border-top: 3px solid white;
-    padding: 20px 0 18px;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    position: relative;
+/* Custom styles for complex effects */
+@layer components {
+  /* Header double border effect using box-shadow */
+  .site-header {
     /* White borders with box-shadow to create the lines */
-    border-bottom: 3px solid white;
     box-shadow: 
-        inset 0 .5px 0 0 rgba(0, 0, 0, 0.8),     /* Top border line */
-        inset 0 -.5px 0 0 rgba(0, 0, 0, 0.8),    /* Upper line of lower double border */
-        0 1.5px 0 0 rgba(0, 0, 0, 0.8);           /* Lower line of lower double border (2px thick) */
-}
+      inset 0 .5px 0 0 rgba(0, 0, 0, 0.8),     /* Top border line */
+      inset 0 -.5px 0 0 rgba(0, 0, 0, 0.8),    /* Upper line of lower double border */
+      0 1.5px 0 0 rgba(0, 0, 0, 0.8);          /* Lower line of lower double border (2px thick) */
+  }
 
-.logo {
-    height: 24px;
-    width: auto;
-    opacity: 0.8;
-}
-
-/* Game container */
-.game-container {
-    flex: 1;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    text-align: center;
-    /*background-color: #ffffff;*/
-    padding: 20px;
-}
-
-canvas {
-    display: block;
-    max-width: 100%;
-    height: auto;
-    border: 1px solid #f0f0f0;
-}
-
-
-.button-container {
-    display: flex;
-    flex-direction: column;
-    gap: 30px;
-    align-items: center;
-    margin-top: 40px;
-}
-
-/* Wrapper for proper border-radius with skew */
-.button-outer {
-    position: relative;
-    display: inline-block;
-    border: 1px solid rgba(0, 0, 0, 0.7);
-    border-right-width: 2px;
-    border-bottom-width: 2px;
-    border-radius: 8px;
-    overflow: hidden; /* This ensures border-radius clips content */
-    transform: skewX(-10deg);
-    cursor: pointer;
-    /*transition: border-right-width 0.15s ease, border-bottom-width 0.15s ease;*/
-}
-
-/* Inner wrapper for spacing */
-.button-wrapper {
-    background: #ffffff;
-    padding: 3px; /* Gap between borders */
-    margin: 0;
-    /*transition: background 0.15s ease; !* Match button transition speed *!*/
-    cursor: pointer;
-}
-
-/* Main skewed button style */
-.skewed-button {
-    position: relative;
-    width: 280px; /* Fixed width for consistency */
-    padding: 18px 0;
-    background: #ffffff;
-    color: rgba(0, 0, 0, 0.7); /* Black with 0.7 opacity */
-    font-size: 18px;
-    font-weight: 900;
-    font-style: italic;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    cursor: pointer;
-    text-align: center;
-    border: 1px solid rgba(0, 0, 0, 0.7);
-    border-radius: 5px;
-    transform: none;
-    /*transition: all 0.15s ease; !* Fast transition for all properties *!*/
+  /* Skewed button text effects */
+  .skewed-button {
     /* Make text appear even bolder */
-    text-shadow: 0.5px 0.5px 0 rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.3);
-    -webkit-text-stroke: 0.4px rgba(0, 0, 0, 0.7);
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
+    /*text-shadow: 0.5px 0.5px 0 rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.3);*/
+    /*-webkit-text-stroke: 0.4px rgba(0, 0, 0, 0.7);*/
+    /*-webkit-font-smoothing: antialiased;*/
+    /*-moz-osx-font-smoothing: grayscale;*/
+  }
 
-/* Text inside button - unskew it */
-.skewed-button span {
-    display: inline-block;
-    transform: skewX(10deg);
-}
-
-/* Hover effect */
-.button-outer:hover {
+  /* Hover state for button outer */
+  .button-outer:hover {
     border-right-width: 3px;
     border-bottom-width: 3px;
-}
+  }
 
-.button-outer:hover .skewed-button {
-    /*background: rgba(0, 0, 0, 0.9); !* Almost black *!*/
-    /*color: #ffffff; !* White text *!*/
-    /*border-color: #ffffff; !* White border *!*/
-    /*text-shadow: none; !* Remove text shadow for cleaner look *!*/
-    /*-webkit-text-stroke: 0; !* Remove text stroke *!*/
-
-    /* underline on hover */
-}
-
-.button-outer:hover .skewed-button span {
+  .button-outer:hover .skewed-button span {
     text-decoration: underline;
     text-underline-offset: 6px;
+  }
 }
-
-/* Active state */
-/*.button-outer:active .skewed-button {*/
-/*    background: #eee;*/
-/*    color: #ffffff;*/
-/*    border-color: #ffffff;*/
-/*}*/

@@ -9,33 +9,33 @@ import ReactDOM from 'react-dom/client';
 
 function Header() {
   return (
-    <header className="site-header">
-      <img src="/SnaketronLogo.png" alt="Snaketron" className="logo" />
+    <header className="bg-white border-t-3 border-b-3 border-white py-5 pb-[18px] flex justify-center items-center relative site-header">
+      <img src="/SnaketronLogo.png" alt="Snaketron" className="h-6 w-auto opacity-80" />
     </header>
   );
 }
 
 function GameCanvas() {
   return (
-    <canvas width="900" height="500" />
+    <canvas width="900" height="500" className="block max-w-full h-auto border border-gray-100" />
   );
 }
 
 function App() {
   return (
-    <div className="app">
+    <div className="min-h-screen flex flex-col">
       <Header />
 
-    <div class="button-container">
-        <div class="button-outer">
-            <div class="button-wrapper">
-                <button class="skewed-button">
-                    <span>SINGLE PLAYER</span>
+    <div className="flex flex-col gap-30 items-center mt-10">
+        <div className="relative inline-block border border-black-70 border-r-2 border-b-2 rounded-lg overflow-hidden -skew-x-[10deg] cursor-pointer button-outer">
+            <div className="bg-white p-[3px] m-0 cursor-pointer button-wrapper">
+                <button className="relative w-[280px] py-18 px-0 bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center border border-black-70 rounded-[5px] skewed-button">
+                    <span className="inline-block skew-x-[10deg]">SINGLE PLAYER</span>
                 </button>
             </div>
         </div>
     </div>
-        <main className="game-container">
+        <main className="flex-1 flex justify-center items-center text-center p-5">
             <GameCanvas />
         </main>
     </div>

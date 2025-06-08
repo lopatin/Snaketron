@@ -20,8 +20,9 @@ module.exports = {
       {
         test: /\.css$/i, // Regex to match .css files
         use: [
-          'style-loader', // 2. Injects styles into DOM (adds <style> tags)
-          'css-loader'    // 1. Translates CSS into CommonJS modules
+          'style-loader', // 3. Injects styles into DOM (adds <style> tags)
+          'css-loader',   // 2. Translates CSS into CommonJS modules
+          'postcss-loader' // 1. Process CSS with PostCSS (Tailwind)
         ],
       },
     ],
