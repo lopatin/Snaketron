@@ -5,7 +5,12 @@ import * as wasm from "wasm-snaketron";
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 
-// let game = wasm.Game.new(60, 40);
+// Initialize game client after WASM is loaded
+let game = null;
+wasm.default().then(() => {
+  game = new wasm.GameClient(1, BigInt(Date.now()));
+  console.log('GameClient initialized');
+});
 
 function Header() {
   return (
