@@ -40,7 +40,7 @@ function JoinGameModal({ isOpen, onClose }) {
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-      <div className="bg-white rounded-lg border-2 border-black-70 p-6 max-w-md w-full">
+      <div className="panel p-6 max-w-md w-full">
         <h2 className="text-2xl font-black italic uppercase tracking-1 mb-4">Join Game</h2>
         
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -67,14 +67,14 @@ function JoinGameModal({ isOpen, onClose }) {
             <button
               type="button"
               onClick={onClose}
-              className="flex-1 px-4 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
+              className="flex-1 btn-secondary"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={isJoining || !gameCode.trim()}
-              className="flex-1 px-4 py-3 border-2 border-black-70 rounded font-black italic uppercase tracking-1 bg-black-70 text-white hover:bg-black transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex-1 btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isJoining ? 'Joining...' : 'Join'}
             </button>

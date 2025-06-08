@@ -62,11 +62,11 @@ function CustomGameCreator() {
   };
 
   return (
-    <div className="flex-1 flex justify-center items-center p-5">
-      <div className="max-w-2xl w-full bg-white rounded-lg border-2 border-black-70 p-8">
-        <h1 className="text-3xl font-black italic uppercase tracking-1 mb-8 text-center">CREATE CUSTOM GAME</h1>
-        
-        <div className="space-y-6">
+    <div className="flex-1 p-8">
+      <div className="max-w-xl mx-auto">
+        <h1 className="panel-heading mb-6">CREATE CUSTOM GAME</h1>
+        <div className="panel p-6">
+          <div className="space-y-4">
           {/* Game Mode */}
           <div>
             <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Mode</label>
@@ -74,7 +74,7 @@ function CustomGameCreator() {
               data-testid="game-mode-select"
               value={settings.gameMode}
               onChange={(e) => handleSettingChange('gameMode', e.target.value)}
-              className="w-full px-3 py-2 border border-black-70 rounded font-bold uppercase tracking-1 bg-white"
+              className="w-full px-2 py-1.5 text-sm border border-black-70 rounded font-bold uppercase tracking-1 bg-white"
             >
               <option value="solo">Solo</option>
               <option value="duel">Duel</option>
@@ -83,25 +83,19 @@ function CustomGameCreator() {
             <div className="grid grid-cols-3 gap-2 mt-2">
               <button
                 onClick={() => handleSettingChange('gameMode', 'solo')}
-                className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  settings.gameMode === 'solo' ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                }`}
+                className={`btn-toggle ${settings.gameMode === 'solo' ? 'active' : ''}`}
               >
                 Solo
               </button>
               <button
                 onClick={() => handleSettingChange('gameMode', 'duel')}
-                className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  settings.gameMode === 'duel' ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                }`}
+                className={`btn-toggle ${settings.gameMode === 'duel' ? 'active' : ''}`}
               >
                 Duel
               </button>
               <button
                 onClick={() => handleSettingChange('gameMode', 'freeForAll')}
-                className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  settings.gameMode === 'freeForAll' ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                }`}
+                className={`btn-toggle ${settings.gameMode === 'freeForAll' ? 'active' : ''}`}
               >
                 Free For All
               </button>
@@ -155,7 +149,7 @@ function CustomGameCreator() {
               data-testid="game-speed-select"
               value={settings.gameSpeed}
               onChange={(e) => handleSettingChange('gameSpeed', e.target.value)}
-              className="w-full px-3 py-2 border border-black-70 rounded font-bold uppercase tracking-1 bg-white mb-2"
+              className="w-full px-2 py-1.5 text-sm border border-black-70 rounded font-bold uppercase tracking-1 bg-white mb-2"
             >
               <option value="slow">Slow</option>
               <option value="normal">Normal</option>
@@ -167,9 +161,7 @@ function CustomGameCreator() {
                 <button
                   key={speed}
                   onClick={() => handleSettingChange('gameSpeed', speed)}
-                  className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                    settings.gameSpeed === speed ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                  }`}
+                  className={`btn-toggle ${settings.gameSpeed === speed ? 'active' : ''}`}
                 >
                   {speed}
                 </button>
@@ -199,17 +191,13 @@ function CustomGameCreator() {
             <div className="grid grid-cols-2 gap-2">
               <button
                 onClick={() => handleSettingChange('tacticalMode', false)}
-                className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  !settings.tacticalMode ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                }`}
+                className={`btn-toggle ${!settings.tacticalMode ? 'active' : ''}`}
               >
                 Classic
               </button>
               <button
                 onClick={() => handleSettingChange('tacticalMode', true)}
-                className={`px-4 py-2 border border-black-70 rounded font-bold italic uppercase tracking-1 transition-all ${
-                  settings.tacticalMode ? 'bg-black-70 text-white' : 'bg-white text-black-70 hover:bg-gray-100'
-                }`}
+                className={`btn-toggle ${settings.tacticalMode ? 'active' : ''}`}
               >
                 Tactical
               </button>
@@ -223,9 +211,9 @@ function CustomGameCreator() {
                 type="checkbox"
                 checked={settings.isPrivate}
                 onChange={(e) => handleSettingChange('isPrivate', e.target.checked)}
-                className="w-5 h-5 border-2 border-black-70"
+                className="w-4 h-4 border border-black-70"
               />
-              <span className="font-bold uppercase tracking-1">Private Game</span>
+              <span className="text-sm font-bold uppercase tracking-1">Private Game</span>
             </label>
             
             <label className="flex items-center gap-3 cursor-pointer">
@@ -234,9 +222,9 @@ function CustomGameCreator() {
                 checked={settings.allowSpectators}
                 onChange={(e) => handleSettingChange('allowSpectators', e.target.checked)}
                 disabled={!settings.isPrivate}
-                className="w-5 h-5 border-2 border-black-70 disabled:opacity-50"
+                className="w-4 h-4 border border-black-70 disabled:opacity-50"
               />
-              <span className={`font-bold uppercase tracking-1 ${!settings.isPrivate ? 'opacity-50' : ''}`}>
+              <span className={`text-sm font-bold uppercase tracking-1 ${!settings.isPrivate ? 'opacity-50' : ''}`}>
                 Allow Spectators
               </span>
             </label>
@@ -247,17 +235,18 @@ function CustomGameCreator() {
             <button
               data-testid="back-button"
               onClick={() => navigate('/')}
-              className="flex-1 px-6 py-3 border border-black-70 rounded font-black italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
+              className="flex-1 btn-secondary"
             >
               Cancel
             </button>
             <button
               data-testid="create-game-button"
               onClick={handleCreateGame}
-              className="flex-1 px-6 py-3 border-2 border-black-70 rounded font-black italic uppercase tracking-1 bg-black-70 text-white hover:bg-black transition-colors"
+              className="flex-1 btn-primary"
             >
               Create Game
             </button>
+          </div>
           </div>
         </div>
       </div>

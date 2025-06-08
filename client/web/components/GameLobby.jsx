@@ -67,7 +67,7 @@ function GameLobby() {
     <div className="flex-1 flex justify-center items-center p-5">
       <div className="max-w-4xl w-full grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left Column: Players */}
-        <div className="lg:col-span-2 bg-white rounded-lg border-2 border-black-70 p-6">
+        <div className="lg:col-span-2 panel p-6">
           <h2 className="text-2xl font-black italic uppercase tracking-1 mb-6">Players</h2>
           
           <div className="space-y-3" data-testid="players-list">
@@ -117,7 +117,7 @@ function GameLobby() {
                 data-testid="start-game-button"
                 onClick={handleStartGame}
                 disabled={!isConnected || isStarting || players.length < 2}
-                className="flex-1 px-6 py-3 border-2 border-black-70 rounded font-black italic uppercase tracking-1 bg-black-70 text-white hover:bg-black transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex-1 btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isStarting ? 'Starting...' : 'Start Game'}
               </button>
@@ -133,7 +133,7 @@ function GameLobby() {
             <button
               data-testid="leave-game-button"
               onClick={handleLeaveGame}
-              className="px-6 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
+              className="btn-secondary"
             >
               Leave
             </button>
@@ -143,7 +143,7 @@ function GameLobby() {
         {/* Right Column: Game Info */}
         <div className="space-y-6">
           {/* Game Code */}
-          <div className="bg-white rounded-lg border-2 border-black-70 p-6">
+          <div className="panel p-6">
             <h3 className="text-lg font-black italic uppercase tracking-1 mb-3">Game Code</h3>
             <div className="flex items-center gap-2">
               <div data-testid="game-code" className="flex-1 p-3 bg-gray-100 rounded font-mono text-xl text-center font-bold">
@@ -152,7 +152,7 @@ function GameLobby() {
               <button
                 data-testid="copy-code-button"
                 onClick={handleCopyCode}
-                className="px-4 py-3 border border-black-70 rounded font-bold italic uppercase tracking-1 bg-white text-black-70 hover:bg-gray-100 transition-colors"
+                className="btn-secondary"
               >
                 {copied ? '✓' : 'Copy'}
               </button>
@@ -162,7 +162,7 @@ function GameLobby() {
 
           {/* Game Settings */}
           {gameSettings && (
-            <div data-testid="game-settings" className="bg-white rounded-lg border-2 border-black-70 p-6">
+            <div data-testid="game-settings" className="panel p-6">
               <h3 className="text-lg font-black italic uppercase tracking-1 mb-3">Settings</h3>
               <dl className="space-y-2 text-sm">
                 <div className="flex justify-between">

@@ -1,6 +1,7 @@
 .idea
 target
 client/web/node_modules
+node_modules
 client/web/dist
 .env
 states

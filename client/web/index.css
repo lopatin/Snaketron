@@ -35,6 +35,10 @@
 
 /* Custom styles for complex effects */
 @layer components {
+  /* Letter spacing utility */
+  .tracking-1 {
+    letter-spacing: var(--letter-spacing-1);
+  }
   /* Header double border effect using box-shadow */
   .site-header {
     /* White borders with box-shadow to create the lines */
@@ -53,13 +57,15 @@
     /*-moz-osx-font-smoothing: grayscale;*/
   }
 
-  /* Hover state for button outer */
-  .button-outer:hover {
-    border-right-width: 3px;
-    border-bottom-width: 3px;
+  /* Main menu buttons with double-line border */
+  .main-menu-button {
+    border: 3px solid white;
+    box-shadow: 
+      inset 0 0 0 0.5px rgba(0, 0, 0, 0.7),  /* Inner black shadow */
+      .5px .5px 0 1.5px rgba(0, 0, 0, 0.7);   /* Same as panel */
   }
-
-  .button-outer:hover .skewed-button span {
+  
+  .main-menu-button:hover span {
     text-decoration: underline;
     text-underline-offset: 6px;
   }
@@ -68,5 +74,54 @@
   nav a:hover {
     text-decoration: underline;
     text-underline-offset: 6px;
+  }
+
+  /* Reusable panel with double-line border */
+  .panel {
+    @apply bg-white rounded-lg;
+    border: 3px solid white;
+    box-shadow: 
+      inset 0 0 0 0.5px rgba(0, 0, 0, 0.7),  /* Inner black shadow */
+      .5px .5px 0 1.5px rgba(0, 0, 0, 0.7);
+  }
+
+  /* Panel heading with white background */
+  .panel-heading {
+    @apply text-3xl font-black italic uppercase bg-white px-4 py-2 inline-block;
+    letter-spacing: var(--letter-spacing-1);
+  }
+
+  /* Primary CTA button with double border and italics */
+  .btn-primary {
+    @apply px-4 py-2 text-sm rounded font-black italic uppercase bg-black-70 text-white hover:bg-black transition-all cursor-pointer;
+    letter-spacing: var(--letter-spacing-1);
+    border: 2px solid white;
+    box-shadow: 
+      inset 0 0 0 0.5px rgba(0, 0, 0, 0.7),  /* Inner black shadow */
+      0 0 0 1px rgba(0, 0, 0, 0.7);   /* Same as panel */
+  }
+  
+  .btn-primary:hover {
+    @apply bg-black;
+  }
+
+  /* Secondary button - no italics, single border */
+  .btn-secondary {
+    @apply px-4 py-2 text-sm border-2 border-black-70 rounded font-black uppercase bg-white text-black-70 hover:bg-gray-100 transition-colors cursor-pointer;
+    letter-spacing: var(--letter-spacing-1);
+  }
+
+  /* Toggle button for selections */
+  .btn-toggle {
+    @apply px-3 py-1.5 text-xs border border-black-70 rounded font-bold uppercase transition-all cursor-pointer;
+    letter-spacing: var(--letter-spacing-1);
+  }
+
+  .btn-toggle.active {
+    @apply bg-black-70 text-white;
+  }
+
+  .btn-toggle:not(.active) {
+    @apply bg-white text-black-70 hover:bg-gray-100;
   }
 }
