@@ -25,7 +25,6 @@ services:
       context: .
       dockerfile: server/Dockerfile
     container_name: snaketron-server
-    platform: linux/arm64
     environment:
       # Database configuration
       SNAKETRON_DB_HOST: db

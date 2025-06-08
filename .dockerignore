@@ -10,12 +10,12 @@
 
 # Build artifacts
 target/
-Cargo.lock
 
 # Client build artifacts
 client/pkg/
 client/web/node_modules/
 client/web/dist/
+client/web/package-lock.json
 
 # Old code
 _old/

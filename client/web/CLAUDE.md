@@ -33,3 +33,5 @@ npm run build
 ```
 npm run start
 ```
+
+The client will be available at http://localhost:3000 and will connect to the WebSocket server at ws://localhost:8080.

@@ -117,9 +117,8 @@ function AppContent() {
   const { connect } = useWebSocket();
   
   useEffect(() => {
-    // Connect to WebSocket server
-    // TODO: Update with actual server URL
-    connect('ws://localhost:3000/ws');
+    // Connect to WebSocket server running in Docker container
+    connect('ws://localhost:8080/ws');
   }, [connect]);
 
   return (

@@ -26,9 +26,10 @@ npm start
 ```
 
 The game will be available at:
-- Frontend: http://localhost:3000
-- WebSocket Server: ws://localhost:8080
-- Database: localhost:5432
+- Frontend: http://localhost:3000 (webpack dev server)
+- WebSocket Server: ws://localhost:8080 (Docker container)
+- gRPC Server: localhost:50051 (Docker container)
+- Database: localhost:5432 (Docker container)
 
 ### Manual Setup
 

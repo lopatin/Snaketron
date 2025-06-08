@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.75-slim as builder
+FROM rust:latest as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,16 +12,19 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/app
 
 # Copy workspace files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY macros ./macros
 COPY common ./common
 COPY server ./server
+COPY client ./client
+COPY terminal ./terminal
 
 # Build the server
 RUN cargo build --release --bin server
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM ubuntu:22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
