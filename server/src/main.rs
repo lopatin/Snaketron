@@ -5,7 +5,7 @@ use sqlx::postgres::PgPoolOptions;
 use refinery::config::{Config, ConfigDbType};
 use std::sync::Arc;
 use server::game_server::{GameServer, GameServerConfig};
-use server::ws_server::DefaultJwtVerifier;
+use server::ws_server::{DefaultJwtVerifier, TestJwtVerifier};
 
 mod migrations {
     use refinery::embed_migrations;
@@ -68,8 +68,14 @@ async fn main() -> Result<()> {
     
     let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
-    // Create JWT verifier
-    let jwt_verifier = Arc::new(DefaultJwtVerifier) as Arc<dyn server::ws_server::JwtVerifier>;
+    // Create JWT verifier - use test mode if SNAKETRON_TEST_MODE is set
+    let jwt_verifier: Arc<dyn server::ws_server::JwtVerifier> = 
+        if env::var("SNAKETRON_TEST_MODE").unwrap_or_default() == "true" {
+            info!("Running in TEST MODE - JWT verification disabled");
+            Arc::new(TestJwtVerifier::new(db_pool.clone()))
+        } else {
+            Arc::new(DefaultJwtVerifier)
+        };
 
     // Set up replay directory - use environment variable or default to centralized location
     let replay_dir = if let Ok(custom_dir) = env::var("SNAKETRON_REPLAY_DIR") {

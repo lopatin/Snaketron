@@ -40,6 +40,8 @@ services:
       RUST_LOG: info,server=debug
       # Replay directory (using volume)
       SNAKETRON_REPLAY_DIR: /var/lib/snaketron/replays
+      # Test mode - accept any token
+      SNAKETRON_TEST_MODE: "true"
     ports:
       - "8080:8080"   # WebSocket port
       - "50051:50051" # gRPC port

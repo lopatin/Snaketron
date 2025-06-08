@@ -79,6 +79,60 @@ impl JwtVerifier for DefaultJwtVerifier {
     }
 }
 
+// Test implementation that accepts any token and creates users as needed
+pub struct TestJwtVerifier {
+    db_pool: PgPool,
+}
+
+impl TestJwtVerifier {
+    pub fn new(db_pool: PgPool) -> Self {
+        Self { db_pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl JwtVerifier for TestJwtVerifier {
+    async fn verify(&self, token: &str) -> Result<UserToken> {
+        // In test mode, accept any token and create user if needed
+        // Extract username from token or use default
+        let username = if token.starts_with("test-token-") {
+            format!("test_user_{}", token.strip_prefix("test-token-").unwrap_or("default"))
+        } else {
+            "test_user_default".to_string()
+        };
+        
+        // Try to find existing user first
+        let existing_user: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE username = $1"
+        )
+        .bind(&username)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        
+        let user_id = match existing_user {
+            Some(id) => id,
+            None => {
+                // Create new test user
+                let new_id: i32 = sqlx::query_scalar(
+                    r#"
+                    INSERT INTO users (username, password_hash, mmr)
+                    VALUES ($1, 'test_password_hash', 1000)
+                    RETURNING id
+                    "#
+                )
+                .bind(&username)
+                .fetch_one(&self.db_pool)
+                .await?;
+                
+                info!("Created test user {} with ID {}", username, new_id);
+                new_id
+            }
+        };
+        
+        Ok(UserToken { user_id })
+    }
+}
+
 async fn add_to_matchmaking_queue(
     pool: &PgPool,
     user_id: i32,

@@ -21,32 +21,45 @@ class WebSocketMonitor {
         constructor(...args) {
           super(...args);
           
+          const url = args[0];
           const connection = {
-            url: args[0],
+            url: url,
             openedAt: null,
             closedAt: null,
             messages: { sent: [], received: [] }
           };
           
-          window.__wsMonitor.connections.push(connection);
+          // Only monitor game server WebSocket connections
+          const isGameServer = url.includes(':8080');
+          if (isGameServer) {
+            window.__wsMonitor.connections.push(connection);
+          }
 
           // Monitor connection state
           this.addEventListener('open', () => {
-            window.__wsMonitor.state = 'connected';
-            connection.openedAt = Date.now();
+            if (isGameServer) {
+              window.__wsMonitor.state = 'connected';
+              connection.openedAt = Date.now();
+            }
           });
 
           this.addEventListener('close', () => {
-            window.__wsMonitor.state = 'disconnected';
-            connection.closedAt = Date.now();
+            if (isGameServer) {
+              window.__wsMonitor.state = 'disconnected';
+              connection.closedAt = Date.now();
+            }
           });
 
           this.addEventListener('error', () => {
-            window.__wsMonitor.state = 'error';
+            if (isGameServer) {
+              window.__wsMonitor.state = 'error';
+            }
           });
 
           // Monitor received messages
           this.addEventListener('message', (event) => {
+            if (!isGameServer) return;
+            
             const message = {
               type: 'received',
               data: event.data,
@@ -56,7 +69,9 @@ class WebSocketMonitor {
             try {
               const parsed = JSON.parse(event.data);
               message.parsed = parsed;
-              message.messageType = parsed.type || parsed.Type || 'unknown';
+              // Extract message type from enum-style format
+              const messageType = Object.keys(parsed)[0];
+              message.messageType = messageType || 'unknown';
             } catch (e) {
               message.messageType = 'raw';
             }
@@ -68,22 +83,26 @@ class WebSocketMonitor {
           // Override send method
           const originalSend = this.send.bind(this);
           this.send = function(data) {
-            const message = {
-              type: 'sent',
-              data: data,
-              timestamp: Date.now()
-            };
-            
-            try {
-              const parsed = JSON.parse(data);
-              message.parsed = parsed;
-              message.messageType = parsed.type || parsed.Type || 'unknown';
-            } catch (e) {
-              message.messageType = 'raw';
+            if (isGameServer) {
+              const message = {
+                type: 'sent',
+                data: data,
+                timestamp: Date.now()
+              };
+              
+              try {
+                const parsed = JSON.parse(data);
+                message.parsed = parsed;
+                // Extract message type from enum-style format
+                const messageType = Object.keys(parsed)[0];
+                message.messageType = messageType || 'unknown';
+              } catch (e) {
+                message.messageType = 'raw';
+              }
+              
+              window.__wsMonitor.sent.push(message);
+              connection.messages.sent.push(message);
             }
-            
-            window.__wsMonitor.sent.push(message);
-            connection.messages.sent.push(message);
             
             return originalSend(data);
           };

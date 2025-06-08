@@ -14,6 +14,19 @@ test.describe('Custom Game Creation', () => {
     // Wait for WebSocket connection
     await wsMonitor.waitForConnection();
     
+    // Send mock authentication token with unique identifier
+    const testId = Date.now();
+    await page.evaluate((testId) => {
+      if (window.__wsContext && window.__wsContext.isConnected) {
+        window.__wsContext.sendMessage({
+          Token: `test-token-${testId}`
+        });
+      }
+    }, testId);
+    
+    // Wait a bit for authentication to process
+    await page.waitForTimeout(500);
+    
     // Initialize page objects
     const homePage = new HomePage(page);
     const customGamePage = new CustomGamePage(page);
@@ -39,8 +52,7 @@ test.describe('Custom Game Creation', () => {
     console.log('Create game message:', createMessage.parsed);
     
     expect(createMessage.parsed).toMatchObject({
-      type: 'CreateCustomGame',
-      data: {
+      CreateCustomGame: {
         settings: expect.objectContaining({
           arena_width: expect.any(Number),
           arena_height: expect.any(Number),
@@ -55,13 +67,14 @@ test.describe('Custom Game Creation', () => {
     console.log('Server response:', responseMessage.parsed);
     
     expect(responseMessage.parsed).toMatchObject({
-      type: 'CustomGameCreated',
-      game_id: expect.any(String),
-      game_code: expect.stringMatching(/^[A-Z0-9]{8}$/)
+      CustomGameCreated: {
+        game_id: expect.any(Number),
+        game_code: expect.stringMatching(/^[A-Z0-9]{8}$/)
+      }
     });
 
     // Step 6: Verify navigation to game lobby
-    const gameCode = responseMessage.parsed.game_code;
+    const gameCode = responseMessage.parsed.CustomGameCreated.game_code;
     await expect(page).toHaveURL(`/game/${gameCode}`);
     
     // Step 7: Verify game lobby displays correctly

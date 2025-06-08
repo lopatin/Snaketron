@@ -59,9 +59,13 @@ export const WebSocketProvider = ({ children }) => {
           console.log('WebSocket message received:', message);
           setLastMessage(message);
           
+          // Extract message type from enum-style format
+          const messageType = Object.keys(message)[0];
+          const messageData = message[messageType];
+          
           // Call registered handlers for this message type
-          const handlers = messageHandlers.current.get(message.type) || [];
-          handlers.forEach(handler => handler(message));
+          const handlers = messageHandlers.current.get(messageType) || [];
+          handlers.forEach(handler => handler({ type: messageType, data: messageData }));
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
         }

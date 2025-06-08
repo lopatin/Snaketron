@@ -52,43 +52,35 @@ export const useGameWebSocket = () => {
   // Game actions
   const createCustomGame = (settings) => {
     sendMessage({
-      type: 'CreateCustomGame',
-      data: { settings }
+      CreateCustomGame: { settings }
     });
   };
 
   const joinCustomGame = (gameCode) => {
     sendMessage({
-      type: 'JoinCustomGame',
-      data: { game_code: gameCode }
+      JoinCustomGame: { game_code: gameCode }
     });
   };
 
   const updateCustomGameSettings = (settings) => {
     sendMessage({
-      type: 'UpdateCustomGameSettings',
-      data: { settings }
+      UpdateCustomGameSettings: { settings }
     });
   };
 
   const startCustomGame = () => {
-    sendMessage({
-      type: 'StartCustomGame',
-      data: {}
-    });
+    sendMessage('StartCustomGame');
   };
 
   const spectateGame = (gameId, gameCode = null) => {
     sendMessage({
-      type: 'SpectateGame',
-      data: { game_id: gameId, game_code: gameCode }
+      SpectateGame: { game_id: gameId, game_code: gameCode }
     });
   };
 
   const sendGameCommand = (command) => {
     sendMessage({
-      type: 'GameCommand',
-      data: command
+      GameCommand: command
     });
   };
 
