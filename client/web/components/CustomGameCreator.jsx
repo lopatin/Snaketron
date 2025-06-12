@@ -234,7 +234,7 @@ function CustomGameCreator() {
             <button
               data-testid="create-game-button"
               onClick={handleCreateGame}
-              className="flex-1 btn-primary"
+              className="flex-1 btn-primary-straight"
             >
               Create Game
             </button>

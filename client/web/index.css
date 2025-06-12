@@ -121,6 +121,20 @@
     @apply bg-black-70 text-white;
   }
 
+  /* Primary button without italics (for non-skewed buttons) */
+  .btn-primary-straight {
+    @apply px-4 py-2 text-sm rounded font-black uppercase bg-black-70 text-white hover:bg-black transition-all cursor-pointer;
+    letter-spacing: var(--letter-spacing-1);
+    border: 2px solid white;
+    box-shadow: 
+      inset 0 0 0 0.5px rgba(0, 0, 0, 0.7),  /* Inner black shadow */
+      0 0 0 1px rgba(0, 0, 0, 0.7);   /* Same as panel */
+  }
+  
+  .btn-primary-straight:hover {
+    @apply bg-black;
+  }
+
   .btn-toggle:not(.active) {
     @apply bg-white text-black-70 hover:bg-gray-100;
   }

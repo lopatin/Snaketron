@@ -117,7 +117,7 @@ function GameLobby() {
                 data-testid="start-game-button"
                 onClick={handleStartGame}
                 disabled={!isConnected || isStarting || players.length < 2}
-                className="flex-1 btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex-1 btn-primary-straight disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isStarting ? 'Starting...' : 'Start Game'}
               </button>

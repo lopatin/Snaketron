@@ -32,7 +32,7 @@ function Header() {
             </nav>
           </div>
           <div>
-            <select className="text-black-70 font-bold italic uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
+            <select className="text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
               <option>US East</option>
               <option>US West</option>
               <option>Europe</option>

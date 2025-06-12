@@ -74,7 +74,7 @@ function JoinGameModal({ isOpen, onClose }) {
             <button
               type="submit"
               disabled={isJoining || !gameCode.trim()}
-              className="flex-1 btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex-1 btn-primary-straight disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isJoining ? 'Joining...' : 'Join'}
             </button>
