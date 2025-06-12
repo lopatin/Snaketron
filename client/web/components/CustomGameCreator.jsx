@@ -10,10 +10,10 @@ function CustomGameCreator() {
     arenaWidth: 40,
     arenaHeight: 40,
     maxPlayers: 4,
-    foodSpawnRate: 3.0,
+    foodSpawnRate: 'medium',
     gameSpeed: 'normal',
     tacticalMode: false,
-    isPrivate: true,
+    allowJoin: true,
     allowSpectators: true,
     snakeStartLength: 3,
   });
@@ -40,12 +40,12 @@ function CustomGameCreator() {
       arena_width: settings.arenaWidth,
       arena_height: settings.arenaHeight,
       tick_duration_ms: gameSpeedToMs[settings.gameSpeed],
-      food_spawn_rate: settings.foodSpawnRate,
+      food_spawn_rate: foodSpawnRates[settings.foodSpawnRate],
       max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
       game_mode: settings.gameMode === 'solo' ? 'Solo' : 
                  settings.gameMode === 'duel' ? 'Duel' : 
                  { FreeForAll: { max_players: settings.maxPlayers } },
-      is_private: settings.isPrivate,
+      is_private: !settings.allowJoin,
       allow_spectators: settings.allowSpectators,
       snake_start_length: settings.snakeStartLength,
       tactical_mode: settings.tacticalMode,
@@ -61,26 +61,23 @@ function CustomGameCreator() {
     extreme: 100,
   };
 
+  const foodSpawnRates = {
+    low: 1.5,
+    medium: 3.0,
+    high: 5.0,
+    extreme: 8.0,
+  };
+
   return (
     <div className="flex-1 p-8">
       <div className="max-w-xl mx-auto">
         <h1 className="panel-heading mb-6">CREATE CUSTOM GAME</h1>
         <div className="panel p-6">
-          <div className="space-y-4">
+          <div className="space-y-6">
           {/* Game Mode */}
           <div>
             <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Mode</label>
-            <select
-              data-testid="game-mode-select"
-              value={settings.gameMode}
-              onChange={(e) => handleSettingChange('gameMode', e.target.value)}
-              className="w-full px-2 py-1.5 text-sm border border-black-70 rounded font-bold uppercase tracking-1 bg-white"
-            >
-              <option value="solo">Solo</option>
-              <option value="duel">Duel</option>
-              <option value="freeForAll">Free For All</option>
-            </select>
-            <div className="grid grid-cols-3 gap-2 mt-2">
+            <div className="grid grid-cols-3 gap-2">
               <button
                 onClick={() => handleSettingChange('gameMode', 'solo')}
                 className={`btn-toggle ${settings.gameMode === 'solo' ? 'active' : ''}`}
@@ -102,25 +99,6 @@ function CustomGameCreator() {
             </div>
           </div>
 
-          {/* Arena Size */}
-          <div>
-            <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-              Arena Size: <span data-testid="arena-size-value">{settings.arenaWidth}x{settings.arenaHeight}</span>
-            </label>
-            <input
-              data-testid="arena-size-slider"
-              type="range"
-              min="20"
-              max="60"
-              value={settings.arenaWidth}
-              onChange={(e) => {
-                const size = parseInt(e.target.value);
-                handleSettingChange('arenaWidth', size);
-                handleSettingChange('arenaHeight', size);
-              }}
-              className="w-full"
-            />
-          </div>
 
           {/* Max Players (if not duel or single player) */}
           {settings.gameMode === 'freeForAll' && (
@@ -142,47 +120,64 @@ function CustomGameCreator() {
 
           {/* Game Speed */}
           <div>
-            <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-              Game Speed: <span data-testid="game-speed-value">{settings.gameSpeed}</span>
-            </label>
-            <select
-              data-testid="game-speed-select"
-              value={settings.gameSpeed}
-              onChange={(e) => handleSettingChange('gameSpeed', e.target.value)}
-              className="w-full px-2 py-1.5 text-sm border border-black-70 rounded font-bold uppercase tracking-1 bg-white mb-2"
-            >
-              <option value="slow">Slow</option>
-              <option value="normal">Normal</option>
-              <option value="fast">Fast</option>
-              <option value="extreme">Extreme</option>
-            </select>
+            <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Speed</label>
             <div className="grid grid-cols-4 gap-2">
-              {Object.keys(gameSpeedToMs).map(speed => (
-                <button
-                  key={speed}
-                  onClick={() => handleSettingChange('gameSpeed', speed)}
-                  className={`btn-toggle ${settings.gameSpeed === speed ? 'active' : ''}`}
-                >
-                  {speed}
-                </button>
-              ))}
+              <button
+                onClick={() => handleSettingChange('gameSpeed', 'slow')}
+                className={`btn-toggle ${settings.gameSpeed === 'slow' ? 'active' : ''}`}
+              >
+                Slow
+              </button>
+              <button
+                onClick={() => handleSettingChange('gameSpeed', 'normal')}
+                className={`btn-toggle ${settings.gameSpeed === 'normal' ? 'active' : ''}`}
+              >
+                Normal
+              </button>
+              <button
+                onClick={() => handleSettingChange('gameSpeed', 'fast')}
+                className={`btn-toggle ${settings.gameSpeed === 'fast' ? 'active' : ''}`}
+              >
+                Fast
+              </button>
+              <button
+                onClick={() => handleSettingChange('gameSpeed', 'extreme')}
+                className={`btn-toggle ${settings.gameSpeed === 'extreme' ? 'active' : ''}`}
+              >
+                Extreme
+              </button>
             </div>
           </div>
 
           {/* Food Spawn Rate */}
           <div>
-            <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-              Food Per Minute: {settings.foodSpawnRate.toFixed(1)}
-            </label>
-            <input
-              type="range"
-              min="0.5"
-              max="10"
-              step="0.5"
-              value={settings.foodSpawnRate}
-              onChange={(e) => handleSettingChange('foodSpawnRate', parseFloat(e.target.value))}
-              className="w-full"
-            />
+            <label className="block text-sm font-bold uppercase tracking-1 mb-2">Food Spawn Rate</label>
+            <div className="grid grid-cols-4 gap-2">
+              <button
+                onClick={() => handleSettingChange('foodSpawnRate', 'low')}
+                className={`btn-toggle ${settings.foodSpawnRate === 'low' ? 'active' : ''}`}
+              >
+                Low
+              </button>
+              <button
+                onClick={() => handleSettingChange('foodSpawnRate', 'medium')}
+                className={`btn-toggle ${settings.foodSpawnRate === 'medium' ? 'active' : ''}`}
+              >
+                Medium
+              </button>
+              <button
+                onClick={() => handleSettingChange('foodSpawnRate', 'high')}
+                className={`btn-toggle ${settings.foodSpawnRate === 'high' ? 'active' : ''}`}
+              >
+                High
+              </button>
+              <button
+                onClick={() => handleSettingChange('foodSpawnRate', 'extreme')}
+                className={`btn-toggle ${settings.foodSpawnRate === 'extreme' ? 'active' : ''}`}
+              >
+                Extreme
+              </button>
+            </div>
           </div>
 
           {/* Game Style */}
@@ -209,11 +204,11 @@ function CustomGameCreator() {
             <label className="flex items-center gap-3 cursor-pointer">
               <input
                 type="checkbox"
-                checked={settings.isPrivate}
-                onChange={(e) => handleSettingChange('isPrivate', e.target.checked)}
+                checked={settings.allowJoin}
+                onChange={(e) => handleSettingChange('allowJoin', e.target.checked)}
                 className="w-4 h-4 border border-black-70"
               />
-              <span className="text-sm font-bold uppercase tracking-1">Private Game</span>
+              <span className="text-sm font-bold uppercase tracking-1">Allow anyone to Join</span>
             </label>
             
             <label className="flex items-center gap-3 cursor-pointer">
@@ -221,12 +216,9 @@ function CustomGameCreator() {
                 type="checkbox"
                 checked={settings.allowSpectators}
                 onChange={(e) => handleSettingChange('allowSpectators', e.target.checked)}
-                disabled={!settings.isPrivate}
-                className="w-4 h-4 border border-black-70 disabled:opacity-50"
+                className="w-4 h-4 border border-black-70"
               />
-              <span className={`text-sm font-bold uppercase tracking-1 ${!settings.isPrivate ? 'opacity-50' : ''}`}>
-                Allow Spectators
-              </span>
+              <span className="text-sm font-bold uppercase tracking-1">Allow anyone to Spectate</span>
             </label>
           </div>
 
