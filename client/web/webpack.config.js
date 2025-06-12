@@ -6,6 +6,7 @@ module.exports = {
   output: {
     path: path.resolve(__dirname, "dist"),
     filename: "bootstrap.js",
+    publicPath: '/',
   },
   module: {
     rules: [
@@ -33,5 +34,12 @@ module.exports = {
   ],
   experiments: {
     asyncWebAssembly: true,
+  },
+  devServer: {
+    historyApiFallback: true,
+    static: {
+      directory: path.join(__dirname, 'dist'),
+    },
+    port: 3000,
   },
 };
