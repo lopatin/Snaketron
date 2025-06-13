@@ -35,6 +35,7 @@ services:
       # Server configuration
       SNAKETRON_WS_PORT: 8080
       SNAKETRON_GRPC_PORT: 50051
+      SNAKETRON_API_PORT: 3001
       SNAKETRON_REGION: local
       # Logging
       RUST_LOG: info,server=debug
@@ -42,9 +43,12 @@ services:
       SNAKETRON_REPLAY_DIR: /var/lib/snaketron/replays
       # Test mode - accept any token
       SNAKETRON_TEST_MODE: "true"
+      # JWT secret (use a secure secret in production)
+      SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
     ports:
       - "8080:8080"   # WebSocket port
       - "50051:50051" # gRPC port
+      - "3001:3001"   # API port
     volumes:
       - ./replays:/var/lib/snaketron/replays
     depends_on:

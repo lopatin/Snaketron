@@ -23,6 +23,10 @@ services:
       SNAKETRON_REGION: ${AWS_REGION}
       # Production logging
       RUST_LOG: info
+      # Disable test mode in production
+      SNAKETRON_TEST_MODE: "false"
+      # Production JWT secret should be set from environment
+      SNAKETRON_JWT_SECRET: ${PROD_JWT_SECRET}
     volumes: []  # No local volumes in Fargate
     logging:
       driver: awslogs

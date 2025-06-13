@@ -5,7 +5,8 @@ use sqlx::postgres::PgPoolOptions;
 use refinery::config::{Config, ConfigDbType};
 use std::sync::Arc;
 use server::game_server::{GameServer, GameServerConfig};
-use server::ws_server::{DefaultJwtVerifier, TestJwtVerifier};
+use server::ws_server::TestJwtVerifier;
+use server::api::{jwt::{JwtManager, ProductionJwtVerifier}, run_api_server};
 
 mod migrations {
     use refinery::embed_migrations;
@@ -68,13 +69,21 @@ async fn main() -> Result<()> {
     
     let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
+    // Get JWT secret from environment or use a default for development
+    let jwt_secret = env::var("SNAKETRON_JWT_SECRET")
+        .unwrap_or_else(|_| {
+            tracing::warn!("SNAKETRON_JWT_SECRET not set, using default secret (NOT FOR PRODUCTION!)");
+            "your-secret-key-change-this-in-production".to_string()
+        });
+
     // Create JWT verifier - use test mode if SNAKETRON_TEST_MODE is set
     let jwt_verifier: Arc<dyn server::ws_server::JwtVerifier> = 
         if env::var("SNAKETRON_TEST_MODE").unwrap_or_default() == "true" {
             info!("Running in TEST MODE - JWT verification disabled");
             Arc::new(TestJwtVerifier::new(db_pool.clone()))
         } else {
-            Arc::new(DefaultJwtVerifier)
+            let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
+            Arc::new(ProductionJwtVerifier::new(jwt_manager))
         };
 
     // Set up replay directory - use environment variable or default to centralized location
@@ -108,6 +117,9 @@ async fn main() -> Result<()> {
         replay_dir,
     };
 
+    // Clone db_pool for API server
+    let api_db_pool = config.db_pool.clone();
+
     // Start the game server
     let game_server = GameServer::start(config).await?;
     info!("Server {} started successfully", game_server.id());
@@ -116,11 +128,24 @@ async fn main() -> Result<()> {
         info!("gRPC server listening on: {}", grpc_addr);
     }
 
+    // Start the API server
+    let api_port = env::var("SNAKETRON_API_PORT").unwrap_or_else(|_| "3001".to_string());
+    let api_addr = format!("0.0.0.0:{}", api_port);
+    
+    let api_handle = tokio::spawn(async move {
+        if let Err(e) = run_api_server(&api_addr, api_db_pool, &jwt_secret).await {
+            tracing::error!("API server error: {}", e);
+        }
+    });
+
     // Wait for shutdown signal
     info!("Server started. Waiting for shutdown signal (Ctrl+C)...");
     tokio::signal::ctrl_c().await?;
 
     info!("Received shutdown signal. Shutting down gracefully...");
+    
+    // Shutdown both servers
+    api_handle.abort();
     game_server.shutdown().await?;
     
     info!("Server shut down successfully");

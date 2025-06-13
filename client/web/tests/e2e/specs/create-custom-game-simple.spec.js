@@ -1,31 +1,31 @@
 const { test, expect } = require('@playwright/test');
 const { HomePage, CustomGamePage, GameLobbyPage } = require('../fixtures/page-objects/index.js');
 const { WebSocketMonitor } = require('../fixtures/helpers/websocket-monitor.js');
+const { AuthHelper } = require('../fixtures/helpers/auth-helper.js');
 
 test.describe('Custom Game Creation', () => {
   test('user can create and join a solo custom game', async ({ page }) => {
+    // Setup authentication helper
+    const authHelper = new AuthHelper(page);
+    
+    // Authenticate user first
+    const authData = await authHelper.authenticateUser();
+    console.log('Authenticated as:', authData.user.username);
+    
     // Setup WebSocket monitoring
     const wsMonitor = new WebSocketMonitor(page);
     await wsMonitor.setup();
 
-    // Navigate to the app
+    // Navigate to the app (this will reload with auth token in localStorage)
     await page.goto('http://localhost:3000');
     
     // Wait for WebSocket connection
     await wsMonitor.waitForConnection();
     
-    // Send mock authentication token with unique identifier
-    const testId = Date.now();
-    await page.evaluate((testId) => {
-      if (window.__wsContext && window.__wsContext.isConnected) {
-        window.__wsContext.sendMessage({
-          Token: `test-token-${testId}`
-        });
-      }
-    }, testId);
-    
-    // Wait a bit for authentication to process
-    await page.waitForTimeout(500);
+    // The app should automatically send the JWT token from localStorage
+    // Wait for the token message to be sent
+    const tokenMessage = await wsMonitor.waitForMessage('Token', 'sent', 5000);
+    console.log('Token sent to server');
     
     // Initialize page objects
     const homePage = new HomePage(page);

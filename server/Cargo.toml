@@ -45,6 +45,12 @@ bincode = { version = "2.0", features = ["serde"] }
 async-raft = "0.6"
 flate2 = "1.0"
 rand = "0.8"
+# HTTP API dependencies
+axum = { version = "0.7", features = ["tokio"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+# Password hashing
+bcrypt = "0.15"
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", features = ["prost"] }
@@ -53,3 +59,4 @@ prost-build = "0.13.5"
 [dev-dependencies]
 jsonwebtoken = "9.3"
 rand = "0.8"
+reqwest = { version = "0.11", features = ["json"] }

@@ -84,6 +84,18 @@ export const useGameWebSocket = () => {
     });
   };
 
+  // Create a quick match or competitive game
+  const createGame = (gameType) => {
+    // TODO: Implement actual game creation message
+    console.log('Creating game:', gameType);
+    // For now, we'll use custom game as a placeholder
+    createCustomGame({
+      max_players: gameType === 'duel' ? 2 : 8,
+      game_speed: 'normal',
+      map_size: 'medium'
+    });
+  };
+
   return {
     isConnected,
     gameState,
@@ -91,6 +103,7 @@ export const useGameWebSocket = () => {
     customGameCode,
     isHost,
     createCustomGame,
+    createGame,
     joinCustomGame,
     updateCustomGameSettings,
     startCustomGame,

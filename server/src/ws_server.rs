@@ -63,21 +63,20 @@ pub struct UserToken {
     pub user_id: i32,
 }
 
+// Player metadata to store additional user information
+#[derive(Debug, Clone)]
+pub struct PlayerMetadata {
+    pub user_id: i32,
+    pub username: String,
+    pub token: String,
+}
+
 // JWT verification trait for dependency injection
 #[async_trait::async_trait]
 pub trait JwtVerifier: Send + Sync {
     async fn verify(&self, token: &str) -> Result<UserToken>;
 }
 
-// Default implementation that always fails
-pub struct DefaultJwtVerifier;
-
-#[async_trait::async_trait]
-impl JwtVerifier for DefaultJwtVerifier {
-    async fn verify(&self, _token: &str) -> Result<UserToken> {
-        Err(anyhow::anyhow!("JWT verification not implemented"))
-    }
-}
 
 // Test implementation that accepts any token and creates users as needed
 pub struct TestJwtVerifier {
@@ -199,12 +198,12 @@ enum ConnectionState {
     
     // Authenticated but not in a game
     Authenticated { 
-        user_token: UserToken 
+        metadata: PlayerMetadata,
     },
     
     // Authenticated and connected to a game
     InGame {
-        user_token: UserToken,
+        metadata: PlayerMetadata,
         game_id: u32,
         // command_tx: mpsc::Sender<GameCommandMessage>,
         // event_rx: broadcast::Receiver<GameEventMessage>,
@@ -360,12 +359,12 @@ async fn handle_websocket_connection(
             Some(Ok(event)) = state_event_stream.next() => {
                 match event {
                     StateChangeEvent::GameCreated { game_id } => {
-                        if let ConnectionState::Authenticated { user_token } = &state {
+                        if let ConnectionState::Authenticated { metadata } = &state {
                             // Get the game state from Raft
                             if let Some(game_state) = raft.get_game_state(game_id).await {
-                                if game_state.players.contains_key(&(user_token.user_id as u32)) {
+                                if game_state.players.contains_key(&(metadata.user_id as u32)) {
                                     state = ConnectionState::InGame {
-                                        user_token: user_token.clone(),
+                                        metadata: metadata.clone(),
                                         game_id,
                                         // command_tx: game_state.command_tx.clone(),
                                         // event_rx: game_state.event_rx.clone(),
@@ -376,7 +375,7 @@ async fn handle_websocket_connection(
                     }
                     
                     StateChangeEvent::GameEvent { event } => {
-                        if let ConnectionState::InGame { user_token, game_id, .. } = &state {
+                        if let ConnectionState::InGame { metadata, game_id, .. } = &state {
                             if event.game_id == *game_id {
                                 // Forward game events to the client
                                 let event_msg = WSMessage::GameEvent(event);
@@ -504,8 +503,30 @@ async fn process_ws_message(
                     match jwt_verifier.verify(&jwt_token).await {
                         Ok(user_token) => {
                             info!("Token verified successfully, user_id: {}", user_token.user_id);
-                            // Register the player connection
-                            Ok(ConnectionState::Authenticated { user_token })
+                            
+                            // Fetch username from database
+                            let username: String = match sqlx::query_scalar(
+                                "SELECT username FROM users WHERE id = $1"
+                            )
+                            .bind(user_token.user_id)
+                            .fetch_optional(db_pool)
+                            .await? {
+                                Some(name) => name,
+                                None => {
+                                    error!("User {} not found in database", user_token.user_id);
+                                    return Err(anyhow::anyhow!("User not found"));
+                                }
+                            };
+                            
+                            // Create player metadata
+                            let metadata = PlayerMetadata {
+                                user_id: user_token.user_id,
+                                username,
+                                token: jwt_token.clone(),
+                            };
+                            
+                            info!("User authenticated: {} (id: {})", metadata.username, metadata.user_id);
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                         Err(e) => {
                             error!("Failed to verify token: {}", e);
@@ -525,46 +546,46 @@ async fn process_ws_message(
                 }
             }
         }
-        ConnectionState::Authenticated { user_token } => {
+        ConnectionState::Authenticated { metadata } => {
             match ws_message {
                 WSMessage::QueueForMatch { game_type } => {
-                    info!("User {} queuing for match type: {:?}", user_token.user_id, game_type);
+                    info!("User {} ({}) queuing for match type: {:?}", metadata.username, metadata.user_id, game_type);
 
                     // Add to matchmaking queue
-                    if let Err(e) = add_to_matchmaking_queue(db_pool, user_token.user_id, game_type).await {
+                    if let Err(e) = add_to_matchmaking_queue(db_pool, metadata.user_id, game_type).await {
                         error!("Failed to add user to matchmaking queue: {}", e);
                     }
 
                     // Polling for match is now handled by the matchmaking service
                     // No need to poll here
 
-                    Ok(ConnectionState::Authenticated { user_token })
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::LeaveQueue => {
-                    info!("User {} leaving matchmaking queue", user_token.user_id);
+                    info!("User {} ({}) leaving matchmaking queue", metadata.username, metadata.user_id);
 
                     // Remove from matchmaking queue
-                    if let Err(e) = remove_from_matchmaking_queue(db_pool, user_token.user_id).await {
+                    if let Err(e) = remove_from_matchmaking_queue(db_pool, metadata.user_id).await {
                         error!("Failed to remove user from matchmaking queue: {}", e);
                     }
 
-                    Ok(ConnectionState::Authenticated { user_token })
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::Ping => {
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
                     ws_stream.send(pong_msg).await?;
-                    Ok(ConnectionState::Authenticated { user_token })
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::GameEvent(event_msg) => {
                     // Forward game events to the client
                     warn!("Received game event in authenticated state: {:?}", event_msg);
-                    Ok(ConnectionState::Authenticated { user_token })
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::CreateCustomGame { settings } => {
-                    info!("User {} creating custom game", user_token.user_id);
+                    info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
                     
-                    match create_custom_game(db_pool, raft, user_token.user_id, settings).await {
+                    match create_custom_game(db_pool, raft, metadata.user_id, settings).await {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
@@ -573,7 +594,7 @@ async fn process_ws_message(
                             
                             // Transition to in-game state
                             Ok(ConnectionState::InGame { 
-                                user_token,
+                                metadata,
                                 game_id,
                             })
                         }
@@ -584,14 +605,14 @@ async fn process_ws_message(
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated { user_token })
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
                 }
                 WSMessage::JoinCustomGame { game_code } => {
-                    info!("User {} joining custom game with code: {}", user_token.user_id, game_code);
+                    info!("User {} ({}) joining custom game with code: {}", metadata.username, metadata.user_id, game_code);
                     
-                    match join_custom_game(db_pool, raft, user_token.user_id, &game_code).await {
+                    match join_custom_game(db_pool, raft, metadata.user_id, &game_code).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::CustomGameJoined { game_id };
@@ -600,7 +621,7 @@ async fn process_ws_message(
                             
                             // Transition to in-game state
                             Ok(ConnectionState::InGame { 
-                                user_token,
+                                metadata,
                                 game_id,
                             })
                         }
@@ -611,14 +632,14 @@ async fn process_ws_message(
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated { user_token })
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
                 }
                 WSMessage::SpectateGame { game_id, game_code } => {
-                    info!("User {} attempting to spectate game {}", user_token.user_id, game_id);
+                    info!("User {} ({}) attempting to spectate game {}", metadata.username, metadata.user_id, game_id);
                     
-                    match spectate_game(db_pool, user_token.user_id, game_id, game_code.as_deref()).await {
+                    match spectate_game(db_pool, metadata.user_id, game_id, game_code.as_deref()).await {
                         Ok(actual_game_id) => {
                             // Send success response
                             let response = WSMessage::SpectatorJoined;
@@ -627,7 +648,7 @@ async fn process_ws_message(
                             
                             // Transition to in-game state as spectator
                             Ok(ConnectionState::InGame { 
-                                user_token,
+                                metadata,
                                 game_id: actual_game_id,
                             })
                         }
@@ -638,17 +659,17 @@ async fn process_ws_message(
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated { user_token })
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
                 }
                 _ => {
                     warn!("Unexpected message in authenticated state: {:?}", ws_message);
-                    Ok(ConnectionState::Authenticated { user_token })
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
             }
         }
-        ConnectionState::InGame { user_token, game_id } => {
+        ConnectionState::InGame { metadata, game_id } => {
             match ws_message {
                 WSMessage::GameCommand(command_message) => {
                     // Get current game tick from Raft
@@ -657,7 +678,7 @@ async fn process_ws_message(
                     // Submit command to Raft
                     let request = crate::raft::ClientRequest::SubmitGameCommand {
                         game_id,
-                        user_id: user_token.user_id as u32,
+                        user_id: metadata.user_id as u32,
                         command: command_message,
                         current_tick: current_tick as u64,
                     };
@@ -665,12 +686,12 @@ async fn process_ws_message(
                     match raft.propose(request).await {
                         Ok(_) => {
                             debug!("Successfully submitted game command to Raft");
-                            Ok(ConnectionState::InGame { user_token, game_id })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
                             error!("Failed to submit command to Raft: {}", e);
                             // Keep the connection in game state, don't disconnect
-                            Ok(ConnectionState::InGame { user_token, game_id })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                     }
                 }
@@ -678,20 +699,20 @@ async fn process_ws_message(
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
                     ws_stream.send(pong_msg).await?;
-                    Ok(ConnectionState::InGame { user_token, game_id })
+                    Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::StartCustomGame => {
-                    info!("User {} starting custom game {}", user_token.user_id, game_id);
+                    info!("User {} ({}) starting custom game {}", metadata.username, metadata.user_id, game_id);
                     
                     // Check if user is the host
-                    let is_host = check_game_host(db_pool, game_id, user_token.user_id).await?;
+                    let is_host = check_game_host(db_pool, game_id, metadata.user_id).await?;
                     if !is_host {
                         let response = WSMessage::AccessDenied { 
                             reason: "Only the host can start the game".to_string() 
                         };
                         let json_msg = serde_json::to_string(&response)?;
                         ws_stream.send(Message::Text(json_msg.into())).await?;
-                        return Ok(ConnectionState::InGame { user_token, game_id });
+                        return Ok(ConnectionState::InGame { metadata, game_id });
                     }
                     
                     // Start the game via Raft
@@ -704,7 +725,7 @@ async fn process_ws_message(
                             let response = WSMessage::CustomGameStarting;
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InGame { user_token, game_id })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
                             error!("Failed to start game: {}", e);
@@ -713,13 +734,13 @@ async fn process_ws_message(
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InGame { user_token, game_id })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                     }
                 }
                 _ => {
                     warn!("Unexpected message in game state: {:?}", ws_message);
-                    Ok(ConnectionState::InGame { user_token, game_id })
+                    Ok(ConnectionState::InGame { metadata, game_id })
                 }
             }
         }
