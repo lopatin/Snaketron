@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, useNavigate, Link } from 'react-router-dom';
+import { BrowserRouter, Route, useNavigate, Link } from 'react-router-dom';
 import './index.css';
 import CustomGameCreator from './components/CustomGameCreator.jsx';
 import GameLobby from './components/GameLobby.jsx';
@@ -7,6 +7,7 @@ import JoinGameModal from './components/JoinGameModal.jsx';
 import AuthPage from './components/AuthPage.jsx';
 import ProtectedRoute from './components/ProtectedRoute.jsx';
 import GameModeSelector from './components/GameModeSelector.jsx';
+import AnimatedRoutes from './components/AnimatedRoutes.jsx';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext.jsx';
 import { AuthProvider, useAuth } from './contexts/AuthContext.jsx';
 
@@ -156,7 +157,7 @@ function AppContent() {
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
-      <Routes>
+      <AnimatedRoutes>
         <Route path="/" element={<Home />} />
         <Route path="/auth" element={<AuthPage />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
@@ -175,7 +176,7 @@ function AppContent() {
             <div className="flex-1 flex justify-center items-center">Game View - Coming Soon</div>
           </ProtectedRoute>
         } />
-      </Routes>
+      </AnimatedRoutes>
     </div>
   );
 }
