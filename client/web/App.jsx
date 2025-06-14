@@ -74,13 +74,23 @@ function Header() {
                   </svg>
                 </button>
                 {showUserDropdown && (
-                  <div className="absolute right-0 mt-2 w-32 bg-white border border-gray-200 rounded shadow-lg z-50">
+                  <div className="absolute right-0 mt-1 bg-white rounded-lg main-menu-button z-50" style={{ minWidth: '120px' }}>
+                    <button 
+                      onClick={() => {
+                        // TODO: Navigate to profile
+                        setShowUserDropdown(false);
+                      }}
+                      className="block w-full text-left px-4 py-2 text-sm text-black-70 hover:underline transition-all cursor-pointer"
+                      style={{ boxShadow: 'inset 0 -0.5px 0 0 rgba(0, 0, 0, 0.1)' }}
+                    >
+                      Profile
+                    </button>
                     <button 
                       onClick={() => {
                         logout();
                         setShowUserDropdown(false);
                       }}
-                      className="block w-full text-left px-4 py-2 text-sm text-black-70 hover:bg-gray-50 transition-colors"
+                      className="block w-full text-left px-4 py-2 text-sm text-black-70 hover:underline transition-all cursor-pointer"
                     >
                       Logout
                     </button>
