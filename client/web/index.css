@@ -107,7 +107,7 @@
 
   /* Secondary button - no italics, single border */
   .btn-secondary {
-    @apply px-4 py-2 text-sm border-2 border-black-70 rounded font-black uppercase bg-white text-black-70 hover:bg-gray-100 transition-colors cursor-pointer;
+    @apply px-4 py-2 text-sm border-1 border-black-80 rounded font-bold uppercase bg-white text-black-80 hover:bg-gray-100 transition-colors cursor-pointer;
     letter-spacing: var(--letter-spacing-1);
   }
 

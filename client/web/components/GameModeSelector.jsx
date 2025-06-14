@@ -23,8 +23,8 @@ const GAME_MODES = {
   'solo': {
     title: 'SOLO',
     modes: [
-      { id: 'practice', name: 'PRACTICE', description: 'Improve your skills' },
-      { id: 'challenge', name: 'CHALLENGE', description: 'Complete objectives' }
+      { id: 'solo-classic', name: 'CLASSIC', description: 'Classic single-player Snake' },
+      { id: 'solo-tactical', name: 'TACTICAL', description: 'Enhanced movement' }
     ]
   }
 };
@@ -151,16 +151,19 @@ function GameModeSelector() {
         <div className="panel p-6">
           {/* Username Input Section */}
           {!user && (
-            <div className="mb-2 pb-8 border-gray-200">
+            <div className="mt-1 border-gray-200">
               <input
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="Choose a username"
+                placeholder="Username"
                 className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
                 disabled={isAuthenticating}
               />
               <div className="auth-message ml-2 h-8 mb-1 mt-1 flex items-center">
+                {!username && (
+                    <p className="text-sm text-gray-700">Choose a username</p>
+                )}
                 {username && username.length >= 3 && checkingUsername && (
                   <p className="text-sm text-gray-700">Checking username...</p>
                 )}
@@ -183,6 +186,14 @@ function GameModeSelector() {
                 className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
                 disabled={isAuthenticating}
               />
+              <div className="auth-message ml-2 h-8 mb-1 mt-1 flex items-center">
+                {isAuthenticating && (
+                  <p className="text-sm text-gray-700">Logging in...</p>
+                )}
+                {authError && (
+                  <p className="text-red-600 text-sm">{authError}</p>
+                )}
+              </div>
             </div>
           )}
 
@@ -207,23 +218,15 @@ function GameModeSelector() {
                 </button>
               ))}
             </div>
-            {!user && !username && (
-              <p className="text-sm text-gray-600 text-center mt-4">
-                Enter a username to continue
-              </p>
-            )}
-            {isAuthenticating && (
-              <p className="text-sm text-gray-600 text-center mt-4">
-                Starting game...
-              </p>
-            )}
-            {authError && (
-              <p className="text-red-600 text-sm text-center mt-4">{authError}</p>
-            )}
+            {/*{!user && !username && (*/}
+            {/*  <p className="text-sm text-gray-600 text-center mt-4">*/}
+            {/*    Enter a username to continue*/}
+            {/*  </p>*/}
+            {/*)}*/}
           </div>
 
           {/* Back Button */}
-          <div className="mt-8 pt-6 border-t-2 border-gray-200">
+          <div className="mt-6 pt-6 border-t-2 border-gray-200">
             <button
               onClick={() => navigate('/')}
               className="btn-secondary w-full md:w-auto"

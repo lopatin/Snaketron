@@ -5,3 +5,4 @@ node_modules
 client/web/dist
 .env
 states
+.DS_Store
