@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { BrowserRouter, Route, useNavigate, Link } from 'react-router-dom';
 import './index.css';
 import CustomGameCreator from './components/CustomGameCreator.jsx';
@@ -12,8 +12,24 @@ import { AuthProvider, useAuth } from './contexts/AuthContext.jsx';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);
+  const [showUserDropdown, setShowUserDropdown] = useState(false);
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const dropdownRef = useRef(null);
+  
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setShowUserDropdown(false);
+      }
+    }
+    
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
   
   return (
     <>
@@ -40,21 +56,36 @@ function Header() {
             </nav>
           </div>
           <div className="flex items-center gap-4">
-            <select className="text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
+            <select className="text-sm text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
               <option>US East</option>
               <option>US West</option>
               <option>Europe</option>
               <option>Asia</option>
             </select>
             {user && (
-              <div className="flex items-center gap-3">
-                <span className="text-black-70 font-bold uppercase">{user.username}</span>
+              <div className="relative" ref={dropdownRef}>
                 <button 
-                  onClick={logout}
-                  className="text-black-70 font-bold uppercase tracking-1 hover:opacity-70 transition-opacity"
+                  onClick={() => setShowUserDropdown(!showUserDropdown)}
+                  className="flex items-center gap-1 text-sm text-black-70 font-bold uppercase cursor-pointer hover:opacity-70 transition-opacity"
                 >
-                  Logout
+                  {user.username}
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
                 </button>
+                {showUserDropdown && (
+                  <div className="absolute right-0 mt-2 w-32 bg-white border border-gray-200 rounded shadow-lg z-50">
+                    <button 
+                      onClick={() => {
+                        logout();
+                        setShowUserDropdown(false);
+                      }}
+                      className="block w-full text-left px-4 py-2 text-sm text-black-70 hover:bg-gray-50 transition-colors"
+                    >
+                      Logout
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

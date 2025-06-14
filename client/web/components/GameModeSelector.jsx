@@ -151,44 +151,38 @@ function GameModeSelector() {
         <div className="panel p-6">
           {/* Username Input Section */}
           {!user && (
-            <div className="mb-8 pb-8 border-b-2 border-gray-200">
-              <div className="space-y-3">
-                <div>
-                  <input
-                    type="text"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    placeholder="Choose a username"
-                    className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
-                    disabled={isAuthenticating}
-                  />
-                  <div className="min-h-[1.5rem] mt-3 mb-3">
-                    {username && username.length >= 3 && checkingUsername && (
-                      <p className="text-sm text-gray-700">Checking username...</p>
-                    )}
-                    {username && username.length >= 3 && !checkingUsername && usernameStatus === 'available' && (
-                      <p className="text-sm text-gray-700">
-                        User "{username}" will be created. Create a new password below.
-                      </p>
-                    )}
-                    {username && username.length >= 3 && !checkingUsername && usernameStatus === 'exists' && (
-                      <p className="text-sm text-gray-700">
-                        Enter password for "{username}"
-                      </p>
-                    )}
-                  </div>
-                </div>
-                {username && (
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder={usernameStatus === 'exists' && requiresPassword ? "Password (required)" : "Password (optional)"}
-                    className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
-                    disabled={isAuthenticating}
-                  />
+            <div className="mb-2 pb-8 border-gray-200">
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Choose a username"
+                className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
+                disabled={isAuthenticating}
+              />
+              <div className="auth-message ml-2 h-8 mb-1 mt-1 flex items-center">
+                {username && username.length >= 3 && checkingUsername && (
+                  <p className="text-sm text-gray-700">Checking username...</p>
+                )}
+                {username && username.length >= 3 && !checkingUsername && usernameStatus === 'available' && (
+                  <p className="text-sm text-gray-700">
+                    {username} is available. Create a new password below.
+                  </p>
+                )}
+                {username && username.length >= 3 && !checkingUsername && usernameStatus === 'exists' && (
+                  <p className="text-sm text-gray-700">
+                    Enter password for "{username}"
+                  </p>
                 )}
               </div>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Password"
+                className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
+                disabled={isAuthenticating}
+              />
             </div>
           )}
 
