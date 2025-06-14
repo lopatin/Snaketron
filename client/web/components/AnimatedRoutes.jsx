@@ -18,14 +18,14 @@ function AnimatedRoutes({ children }) {
         setTimeout(() => {
           setIsAnimating(false);
         }, 10);
-      }, 150);
+      }, 100);
 
       return () => clearTimeout(timer);
     }
   }, [location, displayLocation]);
 
   return (
-    <div className={`flex-1 transition-opacity duration-150 ease-in-out ${
+    <div className={`flex-1 transition-opacity duration-100 ease-in-out ${
       isAnimating ? 'opacity-0' : 'opacity-100'
     }`}>
       <Routes location={displayLocation}>

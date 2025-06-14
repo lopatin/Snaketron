@@ -4,7 +4,6 @@ import './index.css';
 import CustomGameCreator from './components/CustomGameCreator.jsx';
 import GameLobby from './components/GameLobby.jsx';
 import JoinGameModal from './components/JoinGameModal.jsx';
-import AuthPage from './components/AuthPage.jsx';
 import ProtectedRoute from './components/ProtectedRoute.jsx';
 import GameModeSelector from './components/GameModeSelector.jsx';
 import AnimatedRoutes from './components/AnimatedRoutes.jsx';
@@ -47,7 +46,7 @@ function Header() {
               <option>Europe</option>
               <option>Asia</option>
             </select>
-            {user ? (
+            {user && (
               <div className="flex items-center gap-3">
                 <span className="text-black-70 font-bold uppercase">{user.username}</span>
                 <button 
@@ -57,13 +56,6 @@ function Header() {
                   Logout
                 </button>
               </div>
-            ) : (
-              <button 
-                onClick={() => navigate('/auth')}
-                className="text-black-70 font-bold uppercase tracking-1 border border-black-70 rounded px-3 py-1 hover:bg-gray-50 transition-colors"
-              >
-                Login
-              </button>
             )}
           </div>
         </div>
@@ -159,13 +151,8 @@ function AppContent() {
       <Header />
       <AnimatedRoutes>
         <Route path="/" element={<Home />} />
-        <Route path="/auth" element={<AuthPage />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
-        <Route path="/custom" element={
-          <ProtectedRoute>
-            <CustomGameCreator />
-          </ProtectedRoute>
-        } />
+        <Route path="/custom" element={<CustomGameCreator />} />
         <Route path="/game/:gameCode" element={
           <ProtectedRoute>
             <GameLobby />

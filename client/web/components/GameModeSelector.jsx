@@ -2,10 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext.jsx';
 import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
-import { useDebounce } from '../hooks/useDebounce.js';
 import { api } from '../services/api.js';
-import { CheckIcon, XIcon } from './Icons.jsx';
-import Spinner from './Spinner.jsx';
+import { useDebouncedValue } from '../hooks/useDebouncedValue.js';
 
 const GAME_MODES = {
   'quick-play': {
@@ -39,29 +37,15 @@ function GameModeSelector() {
   
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [requiresPassword, setRequiresPassword] = useState(false);
-  const [checkingUsername, setCheckingUsername] = useState(false);
-  const [usernameStatus, setUsernameStatus] = useState(null); // 'available', 'taken', 'exists'
   const [authError, setAuthError] = useState(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [checkingUsername, setCheckingUsername] = useState(false);
+  const [usernameStatus, setUsernameStatus] = useState(null); // 'available' | 'exists' | null
+  const [requiresPassword, setRequiresPassword] = useState(false);
+  
+  const debouncedUsername = useDebouncedValue(username, 500);
 
   const gameModeConfig = GAME_MODES[category];
-
-  // Load saved username on mount
-  useEffect(() => {
-    const savedUsername = localStorage.getItem('savedUsername');
-    if (savedUsername) {
-      setUsername(savedUsername);
-      checkUsernameStatus(savedUsername);
-    }
-    
-    // If already logged in, mark as authenticated
-    if (user) {
-      setUsername(user.username);
-      setIsAuthenticated(true);
-    }
-  }, [user]);
 
   // Redirect if invalid category
   useEffect(() => {
@@ -70,89 +54,47 @@ function GameModeSelector() {
     }
   }, [category, gameModeConfig, navigate]);
 
-  // Check username status with debounce
-  const checkUsernameStatus = useDebounce(async (username) => {
-    if (!username || username.length < 3) {
+  // Load saved username on mount
+  useEffect(() => {
+    const savedUsername = localStorage.getItem('savedUsername');
+    if (savedUsername) {
+      setUsername(savedUsername);
+    }
+  }, []);
+
+  // Check username availability when it changes
+  useEffect(() => {
+    if (debouncedUsername && debouncedUsername.length >= 3) {
+      setCheckingUsername(true);
+      setUsernameStatus(null);
+      
+      console.log('Checking username:', debouncedUsername);
+      
+      api.checkUsername(debouncedUsername)
+        .then(data => {
+          console.log('Username check response:', data);
+          setUsernameStatus(data.available ? 'available' : 'exists');
+          setRequiresPassword(data.requiresPassword || false);
+        })
+        .catch(err => {
+          console.error('Error checking username:', err);
+          // On error, assume username is available (for development)
+          setUsernameStatus('available');
+          setRequiresPassword(false);
+        })
+        .finally(() => {
+          setCheckingUsername(false);
+        });
+    } else {
       setUsernameStatus(null);
       setRequiresPassword(false);
-      setIsAuthenticated(false);
-      return;
     }
-
-    // If already logged in with this username, don't check
-    if (user && user.username === username) {
-      setUsernameStatus('authenticated');
-      setIsAuthenticated(true);
-      return;
-    }
-
-    setCheckingUsername(true);
-    setAuthError(null);
-    
-    try {
-      const response = await api.checkUsername(username);
-      if (response.available) {
-        setUsernameStatus('available');
-        setRequiresPassword(false);
-        setIsAuthenticated(false);
-      } else {
-        setUsernameStatus('exists');
-        setRequiresPassword(response.requiresPassword || false);
-        setIsAuthenticated(false);
-      }
-    } catch (error) {
-      console.error('Username check failed:', error);
-      setUsernameStatus(null);
-    } finally {
-      setCheckingUsername(false);
-    }
-  }, 500);
-
-  const handleUsernameChange = (value) => {
-    setUsername(value);
-    setPassword('');
-    setAuthError(null);
-    setIsAuthenticated(false);
-    checkUsernameStatus(value);
-  };
-
-  const handleAuthenticate = async () => {
-    if (!username || username.length < 3) {
-      setAuthError('Username must be at least 3 characters');
-      return;
-    }
-
-    setIsAuthenticating(true);
-    setAuthError(null);
-
-    try {
-      if (usernameStatus === 'available') {
-        // Register as guest (no password)
-        await register(username, password || null);
-      } else if (usernameStatus === 'exists') {
-        if (requiresPassword && !password) {
-          setAuthError('Password is required for this username');
-          setIsAuthenticating(false);
-          return;
-        }
-        // Login with password
-        await login(username, password);
-      }
-
-      // Save username for next time
-      localStorage.setItem('savedUsername', username);
-      setIsAuthenticated(true);
-    } catch (error) {
-      setAuthError(error.message || 'Authentication failed');
-    } finally {
-      setIsAuthenticating(false);
-    }
-  };
+  }, [debouncedUsername]);
 
   const handleGameModeClick = async (modeId) => {
-    if (!isAuthenticated) {
-      await handleAuthenticate();
-      if (!isAuthenticated) return;
+    if (!username || username.length < 3) {
+      setAuthError('Please enter a username (at least 3 characters)');
+      return;
     }
 
     if (!isConnected) {
@@ -160,15 +102,44 @@ function GameModeSelector() {
       return;
     }
 
-    // Create the game
-    createGame(modeId);
-    
-    // Navigate to custom game creator for now
-    // TODO: Navigate to actual game when implemented
-    navigate('/custom');
-  };
+    setIsAuthenticating(true);
+    setAuthError(null);
 
-  const canPlayGame = isAuthenticated || (username.length >= 3 && !checkingUsername);
+    try {
+      // First, authenticate the user if not already authenticated
+      if (!user) {
+        // Check if username exists
+        const checkData = await api.checkUsername(username);
+        
+        if (!checkData.available && checkData.requiresPassword && !password) {
+          setAuthError('This username requires a password');
+          setIsAuthenticating(false);
+          return;
+        }
+
+        // Login or register
+        if (!checkData.available) {
+          await login(username, password);
+        } else {
+          await register(username, password || null);
+        }
+        
+        // Save username for next time
+        localStorage.setItem('savedUsername', username);
+      }
+
+      // Now create the game
+      createGame(modeId);
+      
+      // Navigate to game lobby or appropriate page
+      // TODO: Navigate to actual game when implemented
+      navigate('/custom');
+    } catch (error) {
+      setAuthError(error.message || 'Failed to start game');
+    } finally {
+      setIsAuthenticating(false);
+    }
+  };
 
   if (!gameModeConfig) return null;
 
@@ -178,94 +149,59 @@ function GameModeSelector() {
         <h1 className="panel-heading mb-6">{gameModeConfig.title}</h1>
         
         <div className="panel p-6">
-          {/* Authentication Section */}
-          <div className="mb-8 pb-8 border-b-2 border-gray-200">
-            <div className="space-y-4">
-              {/* Username Field */}
-              <div>
-                <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-                  Username
-                </label>
-                <div className="relative">
+          {/* Username Input Section */}
+          {!user && (
+            <div className="mb-8 pb-8 border-b-2 border-gray-200">
+              <div className="space-y-3">
+                <div>
                   <input
                     type="text"
                     value={username}
-                    onChange={(e) => handleUsernameChange(e.target.value)}
-                    className="w-full px-4 py-2 text-sm border-2 border-black-70 rounded"
-                    placeholder="Enter username"
-                    disabled={isAuthenticated}
+                    onChange={(e) => setUsername(e.target.value)}
+                    placeholder="Choose a username"
+                    className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
+                    disabled={isAuthenticating}
                   />
-                  {username && !isAuthenticated && (
-                    <div className="absolute right-3 top-2.5">
-                      {checkingUsername ? (
-                        <Spinner className="w-4 h-4" />
-                      ) : usernameStatus === 'available' ? (
-                        <CheckIcon className="w-4 h-4 text-green-600" />
-                      ) : usernameStatus === 'exists' ? (
-                        <XIcon className="w-4 h-4 text-yellow-600" />
-                      ) : null}
-                    </div>
-                  )}
-                  {isAuthenticated && (
-                    <div className="absolute right-3 top-2.5">
-                      <CheckIcon className="w-4 h-4 text-green-600" />
-                    </div>
-                  )}
+                  <div className="min-h-[1.5rem] mt-3 mb-3">
+                    {username && username.length >= 3 && checkingUsername && (
+                      <p className="text-sm text-gray-700">Checking username...</p>
+                    )}
+                    {username && username.length >= 3 && !checkingUsername && usernameStatus === 'available' && (
+                      <p className="text-sm text-gray-700">
+                        User "{username}" will be created. Create a new password below.
+                      </p>
+                    )}
+                    {username && username.length >= 3 && !checkingUsername && usernameStatus === 'exists' && (
+                      <p className="text-sm text-gray-700">
+                        Enter password for "{username}"
+                      </p>
+                    )}
+                  </div>
                 </div>
-                {username && usernameStatus === 'available' && !isAuthenticated && (
-                  <p className="text-xs text-green-600 mt-1">
-                    Username available - will be created as guest
-                  </p>
-                )}
-                {username && usernameStatus === 'exists' && !isAuthenticated && (
-                  <p className="text-xs text-yellow-600 mt-1">
-                    {requiresPassword ? 'Username exists - password required' : 'Username exists - no password required'}
-                  </p>
-                )}
-              </div>
-
-              {/* Password Field (only if required) */}
-              {requiresPassword && !isAuthenticated && (
-                <div>
-                  <label className="block text-sm font-bold uppercase tracking-1 mb-2">
-                    Password
-                  </label>
+                {username && (
                   <input
                     type="password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && handleAuthenticate()}
-                    className="w-full px-4 py-2 text-sm border-2 border-black-70 rounded"
-                    placeholder="Enter password"
+                    placeholder={usernameStatus === 'exists' && requiresPassword ? "Password (required)" : "Password (optional)"}
+                    className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
+                    disabled={isAuthenticating}
                   />
-                </div>
-              )}
-
-              {/* Error Message */}
-              {authError && (
-                <p className="text-red-600 text-sm">{authError}</p>
-              )}
-
-              {/* Auth Status */}
-              {isAuthenticated && (
-                <p className="text-green-600 text-sm">
-                  ✓ Authenticated as {username}
-                </p>
-              )}
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Game Modes */}
           <div className="space-y-4">
-            <h2 className="text-lg font-bold uppercase tracking-1">Select Game Mode</h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {gameModeConfig.modes.map((mode) => (
                 <button
                   key={mode.id}
                   onClick={() => handleGameModeClick(mode.id)}
-                  disabled={!canPlayGame || isAuthenticating}
+                  disabled={isAuthenticating || (!user && (!username || username.length < 3))}
                   className={`p-6 text-left border-2 rounded-lg transition-all ${
-                    canPlayGame && !isAuthenticating
+                    user || (username && username.length >= 3)
                       ? 'border-black-70 hover:bg-gray-50 cursor-pointer'
                       : 'border-gray-300 bg-gray-50 cursor-not-allowed opacity-50'
                   }`}
@@ -277,10 +213,18 @@ function GameModeSelector() {
                 </button>
               ))}
             </div>
-            {!canPlayGame && (
+            {!user && !username && (
               <p className="text-sm text-gray-600 text-center mt-4">
-                Please enter a valid username to continue
+                Enter a username to continue
               </p>
+            )}
+            {isAuthenticating && (
+              <p className="text-sm text-gray-600 text-center mt-4">
+                Starting game...
+              </p>
+            )}
+            {authError && (
+              <p className="text-red-600 text-sm text-center mt-4">{authError}</p>
             )}
           </div>
 

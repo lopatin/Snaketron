@@ -19,8 +19,8 @@ const ProtectedRoute = ({ children }) => {
   }
   
   if (!user) {
-    // Save intended destination and redirect to auth
-    return <Navigate to="/auth" state={{ from: location }} replace />;
+    // Redirect to home page where they can choose a game mode and authenticate
+    return <Navigate to="/" state={{ from: location }} replace />;
   }
   
   return children;

@@ -1,10 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
+import { useAuth } from '../contexts/AuthContext.jsx';
+import { api } from '../services/api.js';
 
 function CustomGameCreator() {
   const navigate = useNavigate();
   const { createCustomGame, customGameCode, isConnected } = useGameWebSocket();
+  const { user, login, register } = useAuth();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [authError, setAuthError] = useState(null);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
+  // Load saved username on mount
+  useEffect(() => {
+    const savedUsername = localStorage.getItem('savedUsername');
+    if (savedUsername) {
+      setUsername(savedUsername);
+    }
+  }, []);
+
   const [settings, setSettings] = useState({
     gameMode: 'freeForAll',
     arenaWidth: 40,
@@ -30,28 +45,64 @@ function CustomGameCreator() {
   };
 
   const handleCreateGame = async () => {
-    if (!isConnected) {
-      console.error('Not connected to server');
+    if (!username || username.length < 3) {
+      setAuthError('Please enter a username (at least 3 characters)');
       return;
     }
 
-    // Convert UI settings to server format
-    const serverSettings = {
-      arena_width: settings.arenaWidth,
-      arena_height: settings.arenaHeight,
-      tick_duration_ms: gameSpeedToMs[settings.gameSpeed],
-      food_spawn_rate: foodSpawnRates[settings.foodSpawnRate],
-      max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
-      game_mode: settings.gameMode === 'solo' ? 'Solo' : 
-                 settings.gameMode === 'duel' ? 'Duel' : 
-                 { FreeForAll: { max_players: settings.maxPlayers } },
-      is_private: !settings.allowJoin,
-      allow_spectators: settings.allowSpectators,
-      snake_start_length: settings.snakeStartLength,
-      tactical_mode: settings.tacticalMode,
-    };
+    if (!isConnected) {
+      setAuthError('Not connected to server');
+      return;
+    }
 
-    createCustomGame(serverSettings);
+    setIsAuthenticating(true);
+    setAuthError(null);
+
+    try {
+      // First, authenticate the user if not already authenticated
+      if (!user) {
+        // Check if username exists
+        const checkData = await api.checkUsername(username);
+        
+        if (!checkData.available && checkData.requiresPassword && !password) {
+          setAuthError('This username requires a password');
+          setIsAuthenticating(false);
+          return;
+        }
+
+        // Login or register
+        if (!checkData.available) {
+          await login(username, password);
+        } else {
+          await register(username, password || null);
+        }
+        
+        // Save username for next time
+        localStorage.setItem('savedUsername', username);
+      }
+
+      // Convert UI settings to server format
+      const serverSettings = {
+        arena_width: settings.arenaWidth,
+        arena_height: settings.arenaHeight,
+        tick_duration_ms: gameSpeedToMs[settings.gameSpeed],
+        food_spawn_rate: foodSpawnRates[settings.foodSpawnRate],
+        max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
+        game_mode: settings.gameMode === 'solo' ? 'Solo' : 
+                   settings.gameMode === 'duel' ? 'Duel' : 
+                   { FreeForAll: { max_players: settings.maxPlayers } },
+        is_private: !settings.allowJoin,
+        allow_spectators: settings.allowSpectators,
+        snake_start_length: settings.snakeStartLength,
+        tactical_mode: settings.tacticalMode,
+      };
+
+      createCustomGame(serverSettings);
+    } catch (error) {
+      setAuthError(error.message || 'Failed to create game');
+    } finally {
+      setIsAuthenticating(false);
+    }
   };
 
   const gameSpeedToMs = {
@@ -74,6 +125,34 @@ function CustomGameCreator() {
         <h1 className="panel-heading mb-6">CREATE CUSTOM GAME</h1>
         <div className="panel p-6">
           <div className="space-y-6">
+          {/* Username/Authentication Section */}
+          {!user && (
+            <div>
+              <label className="block text-sm font-bold uppercase tracking-1 mb-2">Username</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Enter username"
+                className="w-full px-4 py-3 text-base border-2 border-black-70 rounded mb-3"
+                disabled={isAuthenticating}
+              />
+              {username && (
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Password (optional for new users)"
+                  className="w-full px-4 py-3 text-base border-2 border-black-70 rounded"
+                  disabled={isAuthenticating}
+                />
+              )}
+              {authError && (
+                <p className="text-red-600 text-sm mt-2">{authError}</p>
+              )}
+            </div>
+          )}
+          
           {/* Game Mode */}
           <div>
             <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Mode</label>
@@ -235,8 +314,9 @@ function CustomGameCreator() {
               data-testid="create-game-button"
               onClick={handleCreateGame}
               className="flex-1 btn-primary-straight"
+              disabled={isAuthenticating || (!user && (!username || username.length < 3))}
             >
-              Create Game
+              {isAuthenticating ? 'Creating...' : 'Create Game'}
             </button>
           </div>
           </div>
