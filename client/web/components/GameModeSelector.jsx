@@ -10,7 +10,7 @@ const GAME_MODES = {
     title: 'QUICK MATCH',
     modes: [
       { id: 'duel', name: 'DUEL', description: '1v1 battle' },
-      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Multiple players' }
+      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Up to 8 player brawl' }
     ]
   },
   'competitive': {
@@ -126,14 +126,22 @@ function GameModeSelector() {
         
         // Save username for next time
         localStorage.setItem('savedUsername', username);
+        
+        // Wait a bit for the JWT token to be sent to WebSocket
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
 
       // Now create the game
+      console.log('Creating game with modeId:', modeId);
       createGame(modeId);
       
-      // Navigate to game lobby or appropriate page
-      // TODO: Navigate to actual game when implemented
-      navigate('/custom');
+      // For solo games, navigation will be handled by the SoloGameCreated message
+      // For multiplayer games, navigate to custom lobby for now
+      if (!modeId.startsWith('solo-')) {
+        navigate('/custom');
+      } else {
+        console.log('Waiting for SoloGameCreated message...');
+      }
     } catch (error) {
       setAuthError(error.message || 'Failed to start game');
     } finally {

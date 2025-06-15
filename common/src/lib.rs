@@ -2,12 +2,14 @@ mod snake;
 mod arena;
 mod game_state;
 mod game_engine;
+mod ai;
 
 pub mod util;
 
 pub use snake::*;
 pub use game_state::*;
 pub use game_engine::*;
+pub use ai::*;
 pub use util::PseudoRandom;
 
 

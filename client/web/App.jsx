@@ -3,6 +3,7 @@ import { BrowserRouter, Route, useNavigate, Link } from 'react-router-dom';
 import './index.css';
 import CustomGameCreator from './components/CustomGameCreator.jsx';
 import GameLobby from './components/GameLobby.jsx';
+import GameArena from './components/GameArena.jsx';
 import JoinGameModal from './components/JoinGameModal.jsx';
 import ProtectedRoute from './components/ProtectedRoute.jsx';
 import GameModeSelector from './components/GameModeSelector.jsx';
@@ -201,7 +202,7 @@ function AppContent() {
         } />
         <Route path="/play/:gameId" element={
           <ProtectedRoute>
-            <div className="flex-1 flex justify-center items-center">Game View - Coming Soon</div>
+            <GameArena />
           </ProtectedRoute>
         } />
       </AnimatedRoutes>

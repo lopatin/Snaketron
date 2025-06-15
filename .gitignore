@@ -6,3 +6,4 @@ client/web/dist
 .env
 states
 .DS_Store
+replays/

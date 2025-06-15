@@ -7,6 +7,7 @@ class HomePage {
       customGameButton: '[data-testid="custom-game-button"], button:has-text("Custom Game")',
       joinGameButton: '[data-testid="join-game-button"], button:has-text("Join Existing Game")',
       quickPlayButton: '[data-testid="quick-play-button"], button:has-text("Quick Play")',
+      soloButton: '[data-testid="solo-button"], button:has-text("SOLO")',
       logo: 'img[alt="SnakeTron Logo"]',
       title: 'h1'
     };
@@ -15,6 +16,10 @@ class HomePage {
   async navigate() {
     await this.page.goto('/');
     await this.waitForLoad();
+  }
+
+  async goto() {
+    await this.navigate();
   }
 
   async waitForLoad() {
@@ -35,6 +40,12 @@ class HomePage {
 
   async clickQuickPlay() {
     await this.page.click(this.selectors.quickPlayButton);
+  }
+
+  async clickSolo() {
+    await this.page.click(this.selectors.soloButton);
+    // Wait for navigation to game mode selector
+    await this.page.waitForURL('**/game-modes/solo');
   }
 
   async isCustomGameButtonVisible() {

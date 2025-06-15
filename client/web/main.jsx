@@ -10,6 +10,8 @@ import App from './App.jsx';
 let game = null;
 wasm.default().then(() => {
   game = new wasm.GameClient(1, BigInt(Date.now()));
+  // Expose wasm to window for components to use
+  window.wasm = wasm;
   console.log('GameClient initialized');
 });
 

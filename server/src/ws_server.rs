@@ -40,6 +40,8 @@ pub enum WSMessage {
     UpdateCustomGameSettings { settings: common::CustomGameSettings },
     StartCustomGame,
     SpectateGame { game_id: u32, game_code: Option<String> },
+    // Solo game messages
+    CreateSoloGame { mode: common::SoloMode },
     // Custom game responses
     CustomGameCreated { game_id: u32, game_code: String },
     CustomGameJoined { game_id: u32 },
@@ -47,6 +49,8 @@ pub enum WSMessage {
     CustomGameStarting,
     SpectatorJoined,
     AccessDenied { reason: String },
+    // Solo game responses
+    SoloGameCreated { game_id: u32 },
     // High availability messages
     ServerShutdown { 
         reason: String,
@@ -663,6 +667,33 @@ async fn process_ws_message(
                         }
                     }
                 }
+                WSMessage::CreateSoloGame { mode } => {
+                    info!("User {} ({}) creating solo game with mode: {:?}", metadata.username, metadata.user_id, mode);
+                    
+                    match create_solo_game(db_pool, raft, metadata.user_id, mode).await {
+                        Ok(game_id) => {
+                            // Send success response
+                            let response = WSMessage::SoloGameCreated { game_id };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            
+                            // Transition to in-game state
+                            Ok(ConnectionState::InGame { 
+                                metadata,
+                                game_id,
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to create solo game: {}", e);
+                            let response = WSMessage::AccessDenied { 
+                                reason: format!("Failed to create solo game: {}", e) 
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::Authenticated { metadata })
+                        }
+                    }
+                }
                 _ => {
                     warn!("Unexpected message in authenticated state: {:?}", ws_message);
                     Ok(ConnectionState::Authenticated { metadata })
@@ -888,6 +919,71 @@ async fn create_custom_game(
     raft.propose(request).await?;
     
     Ok((game_id as u32, game_code))
+}
+
+async fn create_solo_game(
+    pool: &PgPool,
+    raft: &Arc<RaftNode>,
+    user_id: i32,
+    mode: common::SoloMode,
+) -> Result<u32> {
+    // Get current server ID from Raft node ID
+    let server_id = raft.id as i32;
+    
+    // Create game settings based on solo mode
+    let settings = common::CustomGameSettings {
+        arena_width: 40,
+        arena_height: 40,
+        tick_duration_ms: 300,
+        food_spawn_rate: 3.0,
+        max_players: 1,  // Solo game
+        game_mode: common::GameMode::Solo,
+        is_private: true,
+        allow_spectators: false,
+        snake_start_length: 4,
+        tactical_mode: mode == common::SoloMode::Tactical,
+    };
+    
+    // Create game entry
+    let game_id: i32 = sqlx::query_scalar(
+        r#"
+        INSERT INTO games (server_id, game_type, status, game_mode, is_private)
+        VALUES ($1, $2, 'waiting', 'solo', true)
+        RETURNING id
+        "#
+    )
+    .bind(server_id)
+    .bind(serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?)
+    .fetch_one(pool)
+    .await?;
+    
+    // Create game state with one player
+    let mut game_state = common::GameState::new(
+        settings.arena_width,
+        settings.arena_height,
+        common::GameType::Custom { settings: settings.clone() },
+        Some(rand::random::<u64>()),
+    );
+    
+    // Add the player (only one player for solo mode)
+    game_state.add_player(user_id as u32)?;
+    
+    // Submit to Raft
+    let request = crate::raft::ClientRequest::CreateGame {
+        game_id: game_id as u32,
+        game_state,
+    };
+    
+    raft.propose(request).await?;
+    
+    // Start the game immediately (no waiting in solo mode)
+    let start_request = crate::raft::ClientRequest::StartGame { 
+        game_id: game_id as u32,
+        server_id: raft.id,
+    };
+    raft.propose(start_request).await?;
+    
+    Ok(game_id as u32)
 }
 
 async fn join_custom_game(

@@ -101,7 +101,7 @@ async fn run_game(
                                 game_id,
                                 tick: engine.current_tick(),
                                 user_id: None,
-                                event,
+                                event: event.clone(),
                             };
                             
                             match raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await {
@@ -110,6 +110,39 @@ async fn run_game(
                                 }
                                 Err(e) => {
                                     warn!(game_id, error = %e, "Failed to publish game event");
+                                }
+                            }
+                        }
+                        
+                        // Check for solo game end
+                        if let Some(game_state) = raft.get_game_state(game_id).await {
+                            if game_state.game_type.is_solo() && game_state.players.len() == 1 {
+                                // Get the single player
+                                if let Some((user_id, player)) = game_state.players.iter().next() {
+                                    if let Some(snake) = game_state.arena.snakes.get(player.snake_id as usize) {
+                                        if !snake.is_alive {
+                                            // Calculate score: snake length - starting length
+                                            let score = snake.body.len().saturating_sub(2) as u32;  // 2 positions for starting snake
+                                            let duration = game_state.tick;
+                                            
+                                            // Send solo game ended event
+                                            let event = GameEvent::SoloGameEnded { score, duration };
+                                            let event_msg = GameEventMessage {
+                                                game_id,
+                                                tick: engine.current_tick(),
+                                                user_id: Some(*user_id),
+                                                event,
+                                            };
+                                            
+                                            if let Err(e) = raft.propose(ClientRequest::ProcessGameEvent(event_msg)).await {
+                                                warn!("Failed to publish solo game ended event: {}", e);
+                                            }
+                                            
+                                            // Exit the game loop for solo games
+                                            info!("Solo game {} ended. Score: {}, Duration: {} ticks", game_id, score, duration);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

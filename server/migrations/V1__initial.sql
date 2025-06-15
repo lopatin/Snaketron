@@ -31,7 +31,7 @@ CREATE TABLE games (
     game_code VARCHAR(8),
     FOREIGN KEY (server_id) REFERENCES servers(id),
     CONSTRAINT games_status_check CHECK (status IN ('waiting', 'active', 'finished', 'abandoned')),
-    CONSTRAINT games_mode_check CHECK (game_mode IN ('matchmaking', 'custom'))
+    CONSTRAINT games_mode_check CHECK (game_mode IN ('matchmaking', 'custom', 'solo'))
 );
 
 CREATE INDEX idx_games_server_id ON games(server_id);

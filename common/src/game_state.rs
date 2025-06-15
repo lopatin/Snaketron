@@ -33,6 +33,7 @@ pub enum GameEvent {
     CommandScheduled { command_message: GameCommandMessage },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated { status: GameStatus },
+    SoloGameEnded { score: u32, duration: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -97,6 +98,12 @@ pub enum GameMode {
     FreeForAll { max_players: u8 },
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum SoloMode {
+    Classic,   // Classic snake movement
+    Tactical,  // Enhanced movement (no 180-degree turns)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum GameType {
     TeamMatch { per_team: u8 },
@@ -114,6 +121,13 @@ pub enum GameStatus {
 impl GameType {
     pub fn is_duel(&self) -> bool {
         self == &GameType::TeamMatch { per_team: 1 }
+    }
+    
+    pub fn is_solo(&self) -> bool {
+        match self {
+            GameType::Custom { settings } => settings.game_mode == GameMode::Solo,
+            _ => false,
+        }
     }
 }
 
@@ -625,6 +639,10 @@ impl GameState {
             
             GameEvent::StatusUpdated { status } => {
                 self.status = status;
+            }
+            
+            GameEvent::SoloGameEnded { .. } => {
+                // This event is informational only, no state change needed
             }
         }
 
