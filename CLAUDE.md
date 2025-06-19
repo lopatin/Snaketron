@@ -155,10 +155,21 @@ cargo build --all
 
 # Run all tests
 cargo test --all
+
+# Run clippy (linter) on all packages
+cargo clippy --all-targets --all-features
+
+# Format all Rust code
+cargo fmt --all
+
+# Check formatting without changing files
+cargo fmt --all -- --check
 ```
 
 ### Development Best Practices
 - Make sure that `cargo test` passes before committing any changes
+- Run `cargo clippy --all-targets --all-features` to catch common issues
+- Use `cargo fmt --all` to maintain consistent code formatting
 
 ### Testing Guidelines
 - Server integration tests should not access the DB directly, they should emulate what the main method would do on servers, which do their own maintenance rather than needing it to be in a test harness.
