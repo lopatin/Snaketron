@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Routes, useLocation } from 'react-router-dom';
+import { AnimatedRoutesProps } from '../types';
 
-function AnimatedRoutes({ children }) {
+function AnimatedRoutes({ children }: AnimatedRoutesProps) {
   const location = useLocation();
   const [displayLocation, setDisplayLocation] = useState(location);
   const [isAnimating, setIsAnimating] = useState(false);

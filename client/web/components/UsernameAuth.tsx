@@ -1,11 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useAuth } from '../contexts/AuthContext.jsx';
-import { useDebounce } from '../hooks/useDebounce.js';
-import { api } from '../services/api.js';
-import { CheckIcon, XIcon } from './Icons.jsx';
-import Spinner from './Spinner.jsx';
+import { useAuth } from '../contexts/AuthContext';
+import { useDebounce } from '../hooks/useDebounce';
+import { api } from '../services/api';
+import { CheckIcon, XIcon } from './Icons';
+import Spinner from './Spinner';
+import { UsernameAuthProps, UsernameStatus } from '../types';
 
-function UsernameAuth({ onAuthenticated, className = '' }) {
+interface ExtendedUsernameAuthProps extends UsernameAuthProps {
+  className?: string;
+}
+
+function UsernameAuth({ onAuthenticated, className = '' }: ExtendedUsernameAuthProps) {
   const { user, login, register } = useAuth();
   
   const [username, setUsername] = useState('');
@@ -13,12 +18,12 @@ function UsernameAuth({ onAuthenticated, className = '' }) {
   const [showPasswordField, setShowPasswordField] = useState(false);
   const [requiresPassword, setRequiresPassword] = useState(false);
   const [checkingUsername, setCheckingUsername] = useState(false);
-  const [usernameStatus, setUsernameStatus] = useState(null); // 'available', 'taken', 'exists'
-  const [authError, setAuthError] = useState(null);
+  const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [hasAttemptedAuth, setHasAttemptedAuth] = useState(false);
-  const passwordInputRef = useRef(null);
+  const passwordInputRef = useRef<HTMLInputElement>(null);
 
   // Load saved username on mount
   useEffect(() => {
@@ -85,7 +90,7 @@ function UsernameAuth({ onAuthenticated, className = '' }) {
             onAuthenticated({ username });
           }
         } catch (error) {
-          setAuthError(error.message || 'Authentication failed');
+          setAuthError((error as Error).message || 'Authentication failed');
           // Don't reset hasAttemptedAuth here to prevent retry loop
         } finally {
           setIsAuthenticating(false);
@@ -95,7 +100,7 @@ function UsernameAuth({ onAuthenticated, className = '' }) {
   }, [username, password, usernameStatus, requiresPassword, checkingUsername, isAuthenticated, isAuthenticating, hasAttemptedAuth, authError, register, login, onAuthenticated]);
 
   // Check username status with debounce
-  const checkUsernameStatus = useDebounce(async (username) => {
+  const checkUsernameStatus = useDebounce(async (username: string) => {
     if (!username || username.length < 3) {
       setUsernameStatus(null);
       setRequiresPassword(false);
@@ -141,7 +146,7 @@ function UsernameAuth({ onAuthenticated, className = '' }) {
     }
   }, 500);
 
-  const handleUsernameChange = (value) => {
+  const handleUsernameChange = (value: string) => {
     setUsername(value);
     setPassword('');
     setAuthError(null);
@@ -150,7 +155,7 @@ function UsernameAuth({ onAuthenticated, className = '' }) {
     checkUsernameStatus(value);
   };
 
-  const handlePasswordChange = (value) => {
+  const handlePasswordChange = (value: string) => {
     setPassword(value);
     setAuthError(null);
     setHasAttemptedAuth(false);

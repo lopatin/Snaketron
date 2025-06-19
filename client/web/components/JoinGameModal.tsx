@@ -1,15 +1,16 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { JoinGameModalProps, FormEventHandler } from '../types';
 
-function JoinGameModal({ isOpen, onClose }) {
+function JoinGameModal({ isOpen, onClose }: JoinGameModalProps) {
   const navigate = useNavigate();
   const { joinCustomGame, isConnected } = useGameWebSocket();
   const [gameCode, setGameCode] = useState('');
   const [error, setError] = useState('');
   const [isJoining, setIsJoining] = useState(false);
 
-  const handleSubmit = async (e) => {
+  const handleSubmit: FormEventHandler = async (e) => {
     e.preventDefault();
     
     if (!gameCode.trim()) {

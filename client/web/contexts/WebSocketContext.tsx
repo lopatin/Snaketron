@@ -57,7 +57,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         // Expose for testing
         if (typeof window !== 'undefined') {
-          window.__wsInstance = ws.current;
+          window.__wsInstance = ws.current || undefined;
         }
         // Call the onConnect callback if provided
         if (onConnectCallback.current) {

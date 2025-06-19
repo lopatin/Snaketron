@@ -1,23 +1,25 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
-import { useAuth } from '../contexts/AuthContext.jsx';
+import { useAuth } from '../contexts/AuthContext';
+import { GameState, CanvasRef } from '../types';
+import * as wasm from 'wasm-snaketron';
 
 export default function GameArena() {
   const { gameId } = useParams();
   const navigate = useNavigate();
-  const canvasRef = useRef(null);
-  const gameClientRef = useRef(null);
-  const animationRef = useRef(null);
-  const gameLoopRef = useRef(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const gameClientRef = useRef<any>(null);
+  const animationRef = useRef<number | null>(null);
+  const gameLoopRef = useRef<number | null>(null);
   const lastUpdateRef = useRef(Date.now());
-  const pendingDirectionRef = useRef(null);
+  const pendingDirectionRef = useRef<string | null>(null);
   
-  const { gameState, sendCommand, connected, updateGameState } = useGameWebSocket();
+  const { gameState, sendCommand, connected } = useGameWebSocket();
   const { user } = useAuth();
   const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
-  const [localGameState, setLocalGameState] = useState(null);
+  const [localGameState, setLocalGameState] = useState<GameState | null>(null);
   
   // Initialize local game state from WebSocket game state
   useEffect(() => {
@@ -45,7 +47,7 @@ export default function GameArena() {
         'Right': 'Left'
       };
       
-      if (opposites[currentDirection] !== newDirection) {
+      if (opposites[currentDirection as keyof typeof opposites] !== newDirection) {
         newGameState.arena.snakes[0].direction = newDirection;
         console.log('Direction changed to:', newDirection);
       }
@@ -118,7 +120,7 @@ export default function GameArena() {
     }
     
     // Handle keyboard input
-    const handleKeyPress = (e) => {
+    const handleKeyPress = (e: KeyboardEvent) => {
       if (gameOver) return;
       
       let direction = null;
@@ -137,7 +139,7 @@ export default function GameArena() {
         // Also send to server if connected
         if (connected) {
           sendCommand({
-            ChangeDirection: { direction }
+            Turn: { direction: direction as 'Up' | 'Down' | 'Left' | 'Right' }
           });
         }
       }
@@ -160,9 +162,7 @@ export default function GameArena() {
     
     const render = () => {
       try {
-        // Convert gameState to JSON string as expected by WASM
-        const gameStateJson = JSON.stringify(currentState);
-        window.wasm.render_game(gameStateJson, canvasRef.current);
+        wasm.render_game(currentState, canvasRef.current!);
       } catch (error) {
         console.error('Error rendering game:', error);
       }

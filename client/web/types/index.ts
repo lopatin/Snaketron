@@ -170,6 +170,63 @@ export interface JoinGameModalProps {
   onClose: () => void;
 }
 
+export interface AuthModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+export interface AnimatedRoutesProps {
+  children: React.ReactNode;
+}
+
+export interface UsernameAuthProps {
+  onAuthenticated: (user: { username: string }) => void;
+}
+
+// Event Handler Types
+export type FormEventHandler = React.FormEventHandler<HTMLFormElement>;
+export type ChangeEventHandler = React.ChangeEventHandler<HTMLInputElement>;
+export type KeyboardEventHandler = React.KeyboardEventHandler<HTMLDivElement>;
+
+// Ref Types
+export type InputRef = React.RefObject<HTMLInputElement>;
+export type CanvasRef = React.RefObject<HTMLCanvasElement>;
+
+// State Types
+export type UsernameStatus = 'authenticated' | 'available' | 'exists' | null;
+export type GameModeId = 'quick' | 'competitive' | 'solo-classic' | 'solo-tactical' | 'custom' | 'duel' | 'freeforall';
+
+// Index Signature Types
+export interface SpeedMap {
+  slow: number;
+  normal: number;
+  fast: number;
+  extreme: number;
+}
+
+export interface FoodSpawnMap {
+  low: number;
+  medium: number;
+  high: number;
+  extreme: number;
+}
+
+// Game Lobby Types
+export interface LobbyPlayer {
+  id: number;
+  name: string;
+  isHost: boolean;
+  isReady: boolean;
+}
+
+export interface LobbySettings {
+  gameMode: string;
+  maxPlayers: number;
+  mapSize: string;
+  gameSpeed: string;
+  powerUps: boolean;
+}
+
 // Game Settings for UI
 export interface UIGameSettings {
   gameMode: 'solo' | 'duel' | 'freeForAll';

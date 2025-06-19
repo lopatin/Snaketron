@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { useAuth } from '../contexts/AuthContext.jsx';
-import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
-import { api } from '../services/api.js';
-import { useDebouncedValue } from '../hooks/useDebouncedValue.js';
+import { useAuth } from '../contexts/AuthContext';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { api } from '../services/api';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { UsernameStatus, GameModeId } from '../types';
 
 const GAME_MODES = {
   'quick-play': {
@@ -37,15 +38,15 @@ function GameModeSelector() {
   
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [authError, setAuthError] = useState(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [checkingUsername, setCheckingUsername] = useState(false);
-  const [usernameStatus, setUsernameStatus] = useState(null); // 'available' | 'exists' | null
+  const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>(null);
   const [requiresPassword, setRequiresPassword] = useState(false);
   
   const debouncedUsername = useDebouncedValue(username, 500);
 
-  const gameModeConfig = GAME_MODES[category];
+  const gameModeConfig = category ? GAME_MODES[category as keyof typeof GAME_MODES] : undefined;
 
   // Redirect if invalid category
   useEffect(() => {
@@ -91,7 +92,7 @@ function GameModeSelector() {
     }
   }, [debouncedUsername]);
 
-  const handleGameModeClick = async (modeId) => {
+  const handleGameModeClick = async (modeId: string) => {
     if (!username || username.length < 3) {
       setAuthError('Please enter a username (at least 3 characters)');
       return;
@@ -143,7 +144,7 @@ function GameModeSelector() {
         console.log('Waiting for SoloGameCreated message...');
       }
     } catch (error) {
-      setAuthError(error.message || 'Failed to start game');
+      setAuthError((error as Error).message || 'Failed to start game');
     } finally {
       setIsAuthenticating(false);
     }
@@ -208,7 +209,7 @@ function GameModeSelector() {
           {/* Game Modes */}
           <div className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {gameModeConfig.modes.map((mode) => (
+              {gameModeConfig.modes.map((mode: { id: string; name: string; description: string }) => (
                 <button
                   key={mode.id}
                   onClick={() => handleGameModeClick(mode.id)}

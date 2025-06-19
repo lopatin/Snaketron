@@ -1,9 +1,10 @@
 import React from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
-import { useAuth } from '../contexts/AuthContext.jsx';
-import Spinner from './Spinner.jsx';
+import { useAuth } from '../contexts/AuthContext';
+import Spinner from './Spinner';
+import { ProtectedRouteProps } from '../types';
 
-const ProtectedRoute = ({ children }) => {
+const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
   const { user, loading } = useAuth();
   const location = useLocation();
   

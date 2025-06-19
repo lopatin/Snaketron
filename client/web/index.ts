@@ -3,9 +3,13 @@ import * as wasm from "wasm-snaketron";
 
 console.log('hi from index.js');
 
-let game = wasm.Game.new(60, 40);
+// Game instantiation would go here if Game class existed
+// let game = new wasm.Game();
 
 console.log('got game');
 
 
-wasm.render(game, window.document.getElementById("gameCanvas"));
+const canvas = window.document.getElementById("gameCanvas") as HTMLCanvasElement;
+if (canvas) {
+  // wasm.render(game, canvas);
+}

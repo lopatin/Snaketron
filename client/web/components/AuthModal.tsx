@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { AuthModalProps, FormEventHandler } from '../types';
 
-const AuthModal = ({ isOpen, onClose }) => {
+const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
   const [mode, setMode] = useState('login'); // 'login' or 'register'
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -11,7 +12,7 @@ const AuthModal = ({ isOpen, onClose }) => {
   
   const { login, register } = useAuth();
 
-  const handleSubmit = async (e) => {
+  const handleSubmit: FormEventHandler = async (e) => {
     e.preventDefault();
     setError('');
 
@@ -35,19 +36,17 @@ const AuthModal = ({ isOpen, onClose }) => {
     setLoading(true);
 
     try {
-      const result = mode === 'login' 
-        ? await login(username, password)
-        : await register(username, password);
-
-      if (result.success) {
-        onClose();
-        // Reset form
-        setUsername('');
-        setPassword('');
-        setConfirmPassword('');
+      if (mode === 'login') {
+        await login(username, password);
       } else {
-        setError(result.error);
+        await register(username, password);
       }
+      
+      onClose();
+      // Reset form
+      setUsername('');
+      setPassword('');
+      setConfirmPassword('');
     } finally {
       setLoading(false);
     }

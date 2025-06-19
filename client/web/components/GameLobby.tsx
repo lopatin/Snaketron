@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { LobbyPlayer, LobbySettings } from '../types';
 
 function GameLobby() {
   const { gameCode } = useParams();
@@ -13,8 +14,8 @@ function GameLobby() {
     isHost 
   } = useGameWebSocket();
   
-  const [players, setPlayers] = useState([]);
-  const [gameSettings, setGameSettings] = useState(null);
+  const [players, setPlayers] = useState<LobbyPlayer[]>([]);
+  const [gameSettings, setGameSettings] = useState<LobbySettings | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -29,10 +30,9 @@ function GameLobby() {
     setGameSettings({
       gameMode: 'FreeForAll',
       maxPlayers: 4,
-      arenaSize: '40x40',
+      mapSize: '40x40',
       gameSpeed: 'Normal',
-      foodSpawnRate: '3.0/min',
-      tacticalMode: false,
+      powerUps: false,
     });
   }, [gameCode]);
 
@@ -53,7 +53,9 @@ function GameLobby() {
   };
 
   const handleCopyCode = () => {
-    navigator.clipboard.writeText(gameCode);
+    if (gameCode) {
+      navigator.clipboard.writeText(gameCode);
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -175,19 +177,15 @@ function GameLobby() {
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Arena</dt>
-                  <dd data-testid="arena-size-value" className="font-mono">{gameSettings.arenaSize}</dd>
+                  <dd data-testid="arena-size-value" className="font-mono">{gameSettings.mapSize}</dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="font-bold uppercase opacity-70">Speed</dt>
                   <dd data-testid="game-speed-value" className="font-mono">{gameSettings.gameSpeed}</dd>
                 </div>
                 <div className="flex justify-between">
-                  <dt className="font-bold uppercase opacity-70">Food Rate</dt>
-                  <dd className="font-mono">{gameSettings.foodSpawnRate}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="font-bold uppercase opacity-70">Style</dt>
-                  <dd className="font-mono">{gameSettings.tacticalMode ? 'Tactical' : 'Classic'}</dd>
+                  <dt className="font-bold uppercase opacity-70">Power-ups</dt>
+                  <dd className="font-mono">{gameSettings.powerUps ? 'Enabled' : 'Disabled'}</dd>
                 </div>
               </dl>
             </div>

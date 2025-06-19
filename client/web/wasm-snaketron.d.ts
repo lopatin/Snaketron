@@ -32,7 +32,13 @@ declare module 'wasm-snaketron' {
     get_state(): GameState;
   }
 
+  export class Game {
+    constructor();
+    // Add any methods that Game class has
+  }
+
   export function render(game: GameClient, canvas: HTMLCanvasElement): void;
+  export function render_game(gameState: GameState, canvas: HTMLCanvasElement): void;
 
   const init: () => Promise<void>;
   export default init;

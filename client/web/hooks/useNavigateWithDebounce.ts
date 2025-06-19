@@ -1,12 +1,12 @@
 import { useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, NavigateOptions } from 'react-router-dom';
 
 export function useNavigateWithDebounce(delay = 300) {
   const navigate = useNavigate();
-  const timeoutRef = useRef(null);
-  const lastNavigationRef = useRef(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastNavigationRef = useRef<string | null>(null);
 
-  const navigateDebounced = useCallback((to, options) => {
+  const navigateDebounced = useCallback((to: string, options?: NavigateOptions) => {
     // If trying to navigate to the same path, ignore
     if (lastNavigationRef.current === to) {
       return;

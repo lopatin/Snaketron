@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useGameWebSocket } from '../hooks/useGameWebSocket.js';
-import { useAuth } from '../contexts/AuthContext.jsx';
-import { api } from '../services/api.js';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { useAuth } from '../contexts/AuthContext';
+import { api } from '../services/api';
+import { UIGameSettings, SpeedMap, FoodSpawnMap, GameMode } from '../types';
 
 function CustomGameCreator() {
   const navigate = useNavigate();
@@ -10,7 +11,7 @@ function CustomGameCreator() {
   const { user, login, register } = useAuth();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [authError, setAuthError] = useState(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   // Load saved username on mount
   useEffect(() => {
@@ -20,7 +21,7 @@ function CustomGameCreator() {
     }
   }, []);
 
-  const [settings, setSettings] = useState({
+  const [settings, setSettings] = useState<UIGameSettings>({
     gameMode: 'freeForAll',
     arenaWidth: 40,
     arenaHeight: 40,
@@ -40,7 +41,7 @@ function CustomGameCreator() {
     }
   }, [customGameCode, navigate]);
 
-  const handleSettingChange = (key, value) => {
+  const handleSettingChange = <K extends keyof UIGameSettings>(key: K, value: UIGameSettings[K]) => {
     setSettings(prev => ({ ...prev, [key]: value }));
   };
 
@@ -85,12 +86,12 @@ function CustomGameCreator() {
       const serverSettings = {
         arena_width: settings.arenaWidth,
         arena_height: settings.arenaHeight,
-        tick_duration_ms: gameSpeedToMs[settings.gameSpeed],
-        food_spawn_rate: foodSpawnRates[settings.foodSpawnRate],
+        tick_duration_ms: gameSpeedToMs[settings.gameSpeed as keyof typeof gameSpeedToMs],
+        food_spawn_rate: foodSpawnRates[settings.foodSpawnRate as keyof typeof foodSpawnRates],
         max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
-        game_mode: settings.gameMode === 'solo' ? 'Solo' : 
-                   settings.gameMode === 'duel' ? 'Duel' : 
-                   { FreeForAll: { max_players: settings.maxPlayers } },
+        game_mode: settings.gameMode === 'solo' ? 'Solo' as GameMode : 
+                   settings.gameMode === 'duel' ? 'Duel' as GameMode : 
+                   { FreeForAll: { max_players: settings.maxPlayers } } as GameMode,
         is_private: !settings.allowJoin,
         allow_spectators: settings.allowSpectators,
         snake_start_length: settings.snakeStartLength,
@@ -99,7 +100,7 @@ function CustomGameCreator() {
 
       createCustomGame(serverSettings);
     } catch (error) {
-      setAuthError(error.message || 'Failed to create game');
+      setAuthError((error as Error).message || 'Failed to create game');
     } finally {
       setIsAuthenticating(false);
     }
