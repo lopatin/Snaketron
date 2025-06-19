@@ -1,4 +1,13 @@
+import { User, LoginResponse, CheckUsernameResponse } from '../types';
+
+interface RequestOptions extends RequestInit {
+  headers?: Record<string, string>;
+}
+
 class API {
+  private baseURL: string;
+  private token: string | null;
+
   constructor() {
     // In webpack, process.env needs to be defined in the webpack config
     // For now, we'll use a simple fallback
@@ -6,7 +15,7 @@ class API {
     this.token = localStorage.getItem('token');
   }
 
-  setAuthToken(token) {
+  setAuthToken(token: string | null): void {
     this.token = token;
     if (token) {
       localStorage.setItem('token', token);
@@ -15,9 +24,9 @@ class API {
     }
   }
 
-  async request(endpoint, options = {}) {
+  async request<T = any>(endpoint: string, options: RequestOptions = {}): Promise<T> {
     const url = `${this.baseURL}${endpoint}`;
-    const config = {
+    const config: RequestOptions = {
       ...options,
       headers: {
         'Content-Type': 'application/json',
@@ -25,7 +34,7 @@ class API {
       },
     };
 
-    if (this.token) {
+    if (this.token && config.headers) {
       config.headers.Authorization = `Bearer ${this.token}`;
     }
 
@@ -42,11 +51,11 @@ class API {
       };
     }
 
-    return data;
+    return data as T;
   }
 
-  async login(username, password) {
-    const data = await this.request('/api/auth/login', {
+  async login(username: string, password: string): Promise<LoginResponse> {
+    const data = await this.request<LoginResponse>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -54,8 +63,8 @@ class API {
     return data;
   }
 
-  async register(username, password) {
-    const data = await this.request('/api/auth/register', {
+  async register(username: string, password: string): Promise<LoginResponse> {
+    const data = await this.request<LoginResponse>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -63,9 +72,9 @@ class API {
     return data;
   }
 
-  async checkUsername(username) {
+  async checkUsername(username: string): Promise<CheckUsernameResponse> {
     try {
-      const response = await this.request('/api/auth/check-username', {
+      const response = await this.request<CheckUsernameResponse>('/api/auth/check-username', {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
@@ -79,15 +88,15 @@ class API {
     } catch (error) {
       // Return a safe default on error
       return {
-        available: null,
+        available: false,
         requiresPassword: false,
         errors: []
       };
     }
   }
 
-  async getCurrentUser() {
-    return this.request('/api/auth/me');
+  async getCurrentUser(): Promise<User> {
+    return this.request<User>('/api/auth/me');
   }
 }
 

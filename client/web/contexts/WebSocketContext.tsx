@@ -1,8 +1,25 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import { WebSocketContextType } from '../types';
 
-const WebSocketContext = createContext(null);
+interface WebSocketProviderProps {
+  children: React.ReactNode;
+}
 
-export const useWebSocket = () => {
+interface MessageHandler {
+  (message: { type: string; data: any }): void;
+}
+
+// Extend window interface for testing
+declare global {
+  interface Window {
+    __wsInstance?: WebSocket;
+    __wsContext?: WebSocketContextType;
+  }
+}
+
+const WebSocketContext = createContext<WebSocketContextType | null>(null);
+
+export const useWebSocket = (): WebSocketContextType => {
   const context = useContext(WebSocketContext);
   if (!context) {
     throw new Error('useWebSocket must be used within WebSocketProvider');
@@ -10,15 +27,14 @@ export const useWebSocket = () => {
   return context;
 };
 
-export const WebSocketProvider = ({ children }) => {
+export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState(null);
-  const ws = useRef(null);
-  const messageHandlers = useRef(new Map());
-  const reconnectTimeout = useRef(null);
-  const onConnectCallback = useRef(null);
+  const ws = useRef<WebSocket | null>(null);
+  const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
+  const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const onConnectCallback = useRef<(() => void) | null>(null);
 
-  const connect = useCallback((url, onConnect) => {
+  const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
       console.log('WebSocket already connected');
       return;
@@ -59,15 +75,14 @@ export const WebSocketProvider = ({ children }) => {
         }, 2000);
       };
 
-      ws.current.onerror = (error) => {
+      ws.current.onerror = (error: Event) => {
         console.error('WebSocket error:', error);
       };
 
-      ws.current.onmessage = (event) => {
+      ws.current.onmessage = (event: MessageEvent) => {
         try {
           const message = JSON.parse(event.data);
           console.log('WebSocket message received:', message);
-          setLastMessage(message);
           
           // Extract message type from enum-style format
           const messageType = Object.keys(message)[0];
@@ -75,7 +90,7 @@ export const WebSocketProvider = ({ children }) => {
           
           // Call registered handlers for this message type
           const handlers = messageHandlers.current.get(messageType) || [];
-          handlers.forEach(handler => handler({ type: messageType, data: messageData }));
+          handlers.forEach((handler: MessageHandler) => handler({ type: messageType, data: messageData }));
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
         }
@@ -96,7 +111,7 @@ export const WebSocketProvider = ({ children }) => {
     }
   }, []);
 
-  const sendMessage = useCallback((message) => {
+  const sendMessage = useCallback((message: any) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify(message));
       console.log('WebSocket message sent:', message);
@@ -105,11 +120,11 @@ export const WebSocketProvider = ({ children }) => {
     }
   }, []);
 
-  const onMessage = useCallback((messageType, handler) => {
+  const onMessage = useCallback((messageType: string, handler: MessageHandler) => {
     if (!messageHandlers.current.has(messageType)) {
       messageHandlers.current.set(messageType, []);
     }
-    messageHandlers.current.get(messageType).push(handler);
+    messageHandlers.current.get(messageType)!.push(handler);
 
     // Return cleanup function
     return () => {
@@ -128,13 +143,11 @@ export const WebSocketProvider = ({ children }) => {
     };
   }, [disconnect]);
 
-  const value = {
+  const value: WebSocketContextType = {
     isConnected,
-    lastMessage,
-    connect,
-    disconnect,
     sendMessage,
     onMessage,
+    connect,
   };
 
   // Expose context for testing

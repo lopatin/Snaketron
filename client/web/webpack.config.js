@@ -2,16 +2,19 @@ const CopyWebpackPlugin = require("copy-webpack-plugin");
 const path = require('path');
 
 module.exports = {
-  entry: "./bootstrap.js",
+  entry: "./bootstrap.ts",
   output: {
     path: path.resolve(__dirname, "dist"),
     filename: "bootstrap.js",
     publicPath: '/',
   },
+  resolve: {
+    extensions: ['.ts', '.tsx', '.js', '.jsx'],
+  },
   module: {
     rules: [
       {
-        test: /\.(js|jsx)$/, // Target both .js and .jsx files
+        test: /\.(ts|tsx|js|jsx)$/, // Target TypeScript and JavaScript files
         exclude: /node_modules/, // IMPORTANT: Don't run babel on node_modules
         use: {
           loader: 'babel-loader'

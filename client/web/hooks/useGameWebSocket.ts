@@ -1,22 +1,41 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useWebSocket } from '../contexts/WebSocketContext.jsx';
+import { useWebSocket } from '../contexts/WebSocketContext';
+import { GameState, GameType, GameCommand, Command, CustomGameSettings } from '../types';
 
-export const useGameWebSocket = () => {
+interface UseGameWebSocketReturn {
+  isConnected: boolean;
+  gameState: GameState | null;
+  currentGameId: string | null;
+  customGameCode: string | null;
+  isHost: boolean;
+  createCustomGame: (settings: Partial<CustomGameSettings>) => void;
+  createGame: (gameType: string) => void;
+  createSoloGame: (mode: 'Classic' | 'Tactical') => void;
+  joinCustomGame: (gameCode: string) => void;
+  updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
+  startCustomGame: () => void;
+  spectateGame: (gameId: string, gameCode?: string | null) => void;
+  sendGameCommand: (command: GameCommand) => void;
+  sendCommand: (command: Command) => void;
+  connected: boolean;
+}
+
+export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const { isConnected, sendMessage, onMessage } = useWebSocket();
   const navigate = useNavigate();
-  const [gameState, setGameState] = useState(null);
-  const [currentGameId, setCurrentGameId] = useState(null);
-  const [customGameCode, setCustomGameCode] = useState(null);
+  const [gameState, setGameState] = useState<GameState | null>(null);
+  const [currentGameId, setCurrentGameId] = useState<string | null>(null);
+  const [customGameCode, setCustomGameCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
 
   // Handle game-specific messages
   useEffect(() => {
-    const unsubscribers = [];
+    const unsubscribers: (() => void)[] = [];
 
     // Game events (including game state updates)
     unsubscribers.push(
-      onMessage('GameEvent', (message) => {
+      onMessage('GameEvent', (message: any) => {
         console.log('Received GameEvent message:', message);
         
         // The message structure might be different - let's handle it safely
@@ -42,12 +61,10 @@ export const useGameWebSocket = () => {
           setGameState(event.Snapshot.game_state);
         } else if (event.SoloGameEnded) {
           // Solo game ended
-          setGameState(prev => ({
+          setGameState(prev => prev ? {
             ...prev,
-            game_ended: true,
-            final_score: event.SoloGameEnded.score,
-            duration: event.SoloGameEnded.duration
-          }));
+            status: { Ended: {} }
+          } : prev);
         } else if (event.StatusUpdated) {
           // Update game status
           console.log('StatusUpdated event:', event.StatusUpdated);
@@ -93,7 +110,7 @@ export const useGameWebSocket = () => {
 
     // Custom game created
     unsubscribers.push(
-      onMessage('CustomGameCreated', (message) => {
+      onMessage('CustomGameCreated', (message: any) => {
         setCurrentGameId(message.data.game_id);
         setCustomGameCode(message.data.game_code);
         setIsHost(true); // Creator is always the host
@@ -102,20 +119,20 @@ export const useGameWebSocket = () => {
 
     // Custom game joined
     unsubscribers.push(
-      onMessage('CustomGameJoined', (message) => {
+      onMessage('CustomGameJoined', (message: any) => {
         setCurrentGameId(message.data.game_id);
       })
     );
 
     // Solo game created
     unsubscribers.push(
-      onMessage('SoloGameCreated', (message) => {
+      onMessage('SoloGameCreated', (message: any) => {
         console.log('Received SoloGameCreated message:', message);
         setCurrentGameId(message.data.game_id);
         
         // Initialize a basic game state since server doesn't send initial snapshot
         // This is a workaround - ideally server should send GameEvent::Snapshot
-        const initialGameState = {
+        const initialGameState: GameState = {
           tick: 0,
           status: { Started: { server_id: 1 } },
           arena: {
@@ -127,21 +144,21 @@ export const useGameWebSocket = () => {
                   { x: 20, y: 20 },  // head
                   { x: 16, y: 20 }   // tail (snake length 4)
                 ],
-                direction: "Right",
+                direction: "Right" as const,
                 is_alive: true,
                 food: 0
               }
             ],
             food: []
           },
-          game_type: { Custom: { settings: { game_mode: 'Solo' } } },
+          game_type: { Custom: { settings: { game_mode: 'Solo' } } } as GameType,
           properties: { available_food_target: 3 },
           players: {
             // Assume the authenticated user is player 0 with snake 0
             // This will be overridden when we get the actual game state
             0: { user_id: 0, snake_id: 0 }
           },
-          game_id: message.data.game_id
+          game_id: String(message.data.game_id)
         };
         
         console.log('Setting initial game state:', initialGameState);
@@ -154,7 +171,7 @@ export const useGameWebSocket = () => {
 
     // Access denied
     unsubscribers.push(
-      onMessage('AccessDenied', (message) => {
+      onMessage('AccessDenied', (message: any) => {
         console.error('Access denied:', message.data.reason);
         // TODO: Show error to user
       })
@@ -167,19 +184,19 @@ export const useGameWebSocket = () => {
   }, [onMessage]);
 
   // Game actions
-  const createCustomGame = (settings) => {
+  const createCustomGame = (settings: Partial<CustomGameSettings>) => {
     sendMessage({
       CreateCustomGame: { settings }
     });
   };
 
-  const joinCustomGame = (gameCode) => {
+  const joinCustomGame = (gameCode: string) => {
     sendMessage({
       JoinCustomGame: { game_code: gameCode }
     });
   };
 
-  const updateCustomGameSettings = (settings) => {
+  const updateCustomGameSettings = (settings: Partial<CustomGameSettings>) => {
     sendMessage({
       UpdateCustomGameSettings: { settings }
     });
@@ -189,20 +206,20 @@ export const useGameWebSocket = () => {
     sendMessage('StartCustomGame');
   };
 
-  const spectateGame = (gameId, gameCode = null) => {
+  const spectateGame = (gameId: string, gameCode?: string | null) => {
     sendMessage({
-      SpectateGame: { game_id: gameId, game_code: gameCode }
+      SpectateGame: { game_id: gameId, game_code: gameCode || null }
     });
   };
 
-  const sendGameCommand = (command) => {
+  const sendGameCommand = (command: GameCommand) => {
     console.log('Sending game command (sendGameCommand):', command);
     sendMessage({
       GameCommand: command
     });
   };
   
-  const sendCommand = (command) => {
+  const sendCommand = (command: Command) => {
     console.log('Sending game command (sendCommand):', command);
     console.log('Current game ID:', currentGameId);
     console.log('Connected:', isConnected);
@@ -221,7 +238,7 @@ export const useGameWebSocket = () => {
     });
   };
 
-  const createSoloGame = (mode) => {
+  const createSoloGame = (mode: 'Classic' | 'Tactical') => {
     console.log('Sending CreateSoloGame message with mode:', mode);
     sendMessage({
       CreateSoloGame: { mode }
@@ -229,7 +246,7 @@ export const useGameWebSocket = () => {
   };
 
   // Create a quick match or competitive game
-  const createGame = (gameType) => {
+  const createGame = (gameType: string) => {
     console.log('Creating game:', gameType);
     
     // Handle solo games separately
@@ -243,8 +260,9 @@ export const useGameWebSocket = () => {
     // For multiplayer games, use custom game as a placeholder for now
     createCustomGame({
       max_players: gameType === 'duel' ? 2 : 8,
-      game_speed: 'normal',
-      map_size: 'medium'
+      tick_duration_ms: 100, // Normal speed
+      arena_width: 40,      // Medium map size
+      arena_height: 40
     });
   };
 

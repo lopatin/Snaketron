@@ -1,10 +1,11 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../services/api.js';
+import { api } from '../services/api';
+import { AuthContextType, User } from '../types';
 
-const AuthContext = createContext(null);
+const AuthContext = createContext<AuthContextType | null>(null);
 
-export const useAuth = () => {
+export const useAuth = (): AuthContextType => {
   const context = useContext(AuthContext);
   if (!context) {
     throw new Error('useAuth must be used within AuthProvider');
@@ -12,12 +13,13 @@ export const useAuth = () => {
   return context;
 };
 
-const API_BASE_URL = 'http://localhost:3001';
+interface AuthProviderProps {
+  children: React.ReactNode;
+}
 
-export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
   const navigate = useNavigate();
 
   // Check if user is logged in on mount
@@ -30,7 +32,7 @@ export const AuthProvider = ({ children }) => {
     }
   }, []);
 
-  const fetchCurrentUser = async (token) => {
+  const fetchCurrentUser = async (token: string) => {
     try {
       api.setAuthToken(token);
       const userInfo = await api.getCurrentUser();
@@ -44,29 +46,21 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
-  const login = useCallback(async (username, password) => {
-    setError(null);
+  const login = useCallback(async (username: string, password: string) => {
     try {
       const data = await api.login(username, password);
       setUser(data.user);
-      return { success: true };
     } catch (err) {
-      const errorMessage = err.message || 'Login failed';
-      setError(errorMessage);
       throw err;
     }
   }, []);
 
-  const register = useCallback(async (username, password) => {
-    setError(null);
+  const register = useCallback(async (username: string, password: string | null) => {
     try {
       // Support guest registration (no password)
       const data = await api.register(username, password || '');
       setUser(data.user);
-      return { success: true };
     } catch (err) {
-      const errorMessage = err.message || 'Registration failed';
-      setError(errorMessage);
       throw err;
     }
   }, []);
@@ -77,14 +71,13 @@ export const AuthProvider = ({ children }) => {
     navigate('/');
   }, [navigate]);
 
-  const getToken = useCallback(() => {
+  const getToken = useCallback((): string | null => {
     return localStorage.getItem('token');
   }, []);
 
-  const value = {
+  const value: AuthContextType = {
     user,
     loading,
-    error,
     login,
     register,
     logout,

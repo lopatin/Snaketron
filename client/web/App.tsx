@@ -1,15 +1,15 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { BrowserRouter, Route, useNavigate, Link } from 'react-router-dom';
 import './index.css';
-import CustomGameCreator from './components/CustomGameCreator.jsx';
-import GameLobby from './components/GameLobby.jsx';
-import GameArena from './components/GameArena.jsx';
-import JoinGameModal from './components/JoinGameModal.jsx';
-import ProtectedRoute from './components/ProtectedRoute.jsx';
-import GameModeSelector from './components/GameModeSelector.jsx';
-import AnimatedRoutes from './components/AnimatedRoutes.jsx';
-import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext.jsx';
-import { AuthProvider, useAuth } from './contexts/AuthContext.jsx';
+import CustomGameCreator from './components/CustomGameCreator';
+import GameLobby from './components/GameLobby';
+import GameArena from './components/GameArena';
+import JoinGameModal from './components/JoinGameModal';
+import ProtectedRoute from './components/ProtectedRoute';
+import GameModeSelector from './components/GameModeSelector';
+import AnimatedRoutes from './components/AnimatedRoutes';
+import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);

@@ -23,7 +23,7 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 
 3. **Client** (`client/`)
    - WebAssembly module compiled from Rust
-   - React frontend consuming WASM functions
+   - React frontend with TypeScript consuming WASM functions
    - Canvas-based rendering system
 
 ### Key Architectural Decisions
@@ -138,7 +138,7 @@ async fn test_websocket_functionality() -> Result<()> {
 # Build WASM package (from client directory)
 cd client && wasm-pack build --target web --out-dir pkg
 
-# Install web dependencies (from client/web directory)
+# Install web dependencies including TypeScript (from client/web directory)
 cd client/web && npm install
 
 # Start development server with hot reload
@@ -146,6 +146,9 @@ cd client/web && npm start
 
 # Build production bundle
 cd client/web && npm run build
+
+# Type check TypeScript code
+cd client/web && npx tsc --noEmit
 ```
 
 ### Full Project Build
