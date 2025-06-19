@@ -16,11 +16,17 @@ export const WebSocketProvider = ({ children }) => {
   const ws = useRef(null);
   const messageHandlers = useRef(new Map());
   const reconnectTimeout = useRef(null);
+  const onConnectCallback = useRef(null);
 
-  const connect = useCallback((url) => {
+  const connect = useCallback((url, onConnect) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
       console.log('WebSocket already connected');
       return;
+    }
+
+    // Store the onConnect callback
+    if (onConnect) {
+      onConnectCallback.current = onConnect;
     }
 
     try {
@@ -37,6 +43,10 @@ export const WebSocketProvider = ({ children }) => {
         if (typeof window !== 'undefined') {
           window.__wsInstance = ws.current;
         }
+        // Call the onConnect callback if provided
+        if (onConnectCallback.current) {
+          onConnectCallback.current();
+        }
       };
 
       ws.current.onclose = () => {
@@ -45,7 +55,7 @@ export const WebSocketProvider = ({ children }) => {
         // Auto-reconnect after 2 seconds
         reconnectTimeout.current = setTimeout(() => {
           console.log('Attempting to reconnect...');
-          connect(url);
+          connect(url, onConnect);
         }, 2000);
       };
 

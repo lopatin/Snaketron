@@ -171,22 +171,35 @@ function Home() {
 
 function AppContent() {
   const { connect, sendMessage } = useWebSocket();
-  const { user, getToken } = useAuth();
+  const { user, getToken, loading } = useAuth();
+  const [wsConnected, setWsConnected] = useState(false);
   
   useEffect(() => {
     // Connect to WebSocket server running in Docker container
-    connect('ws://localhost:8080/ws');
-  }, [connect]);
-  
-  // Send JWT token when user logs in
-  useEffect(() => {
-    if (user) {
+    // Send authentication token when connection is established
+    connect('ws://localhost:8080/ws', () => {
+      console.log('WebSocket connected, checking for auth token...');
+      setWsConnected(true);
       const token = getToken();
       if (token) {
+        console.log('Sending authentication token on connection');
+        sendMessage({ Token: token });
+      } else {
+        console.log('No auth token found');
+      }
+    });
+  }, [connect, getToken, sendMessage]);
+  
+  // Also send token when user logs in after WebSocket is already connected
+  useEffect(() => {
+    if (wsConnected && user) {
+      const token = getToken();
+      if (token) {
+        console.log('User logged in, sending token to existing WebSocket connection');
         sendMessage({ Token: token });
       }
     }
-  }, [user, getToken, sendMessage]);
+  }, [wsConnected, user, getToken, sendMessage]);
 
   return (
     <div className="min-h-screen flex flex-col">
