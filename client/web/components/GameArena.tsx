@@ -162,7 +162,7 @@ export default function GameArena() {
     
     const render = () => {
       try {
-        wasm.render_game(currentState, canvasRef.current!);
+        wasm.render_game(JSON.stringify(currentState), canvasRef.current!);
       } catch (error) {
         console.error('Error rendering game:', error);
       }
