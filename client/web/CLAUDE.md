@@ -54,5 +54,38 @@ The client will be available at http://localhost:3000 and will connect to the We
 ### Type Checking
 To check TypeScript types without building:
 ```
-npx tsc --noEmit
+npm run type-check
+```
+
+## TypeScript Guidelines
+
+### Essential Information
+- **Strict Mode**: The project uses TypeScript strict mode. All variables, parameters, and return types should be explicitly typed.
+- **Type Definitions**: Custom types are centralized in `types/index.ts`. Import and use these types instead of creating duplicates.
+- **WASM Integration**: The `wasm-snaketron` module types are defined in `wasm-snaketron.d.ts`. Note that `render_game` expects a JSON string, not an object.
+- **React Components**: Use functional components with proper prop interfaces. Component props should be defined as interfaces in the types file.
+- **Event Handlers**: Use React's built-in event types (e.g., `React.FormEvent`, `React.ChangeEvent<HTMLInputElement>`).
+- **State Management**: When using `useState` with nullable values, use union types like `string | null` instead of just `null`.
+- **WebSocket Context**: The WebSocket context is fully typed. Use the `WebSocketContextType` interface when consuming it.
+
+### Common Patterns
+```typescript
+// Component with props
+interface MyComponentProps {
+  onClose: () => void;
+  isOpen: boolean;
+}
+
+const MyComponent: React.FC<MyComponentProps> = ({ onClose, isOpen }) => {
+  // ...
+};
+
+// Typed state
+const [error, setError] = useState<string | null>(null);
+
+// Event handlers
+const handleSubmit: React.FormEventHandler = (e) => {
+  e.preventDefault();
+  // ...
+};
 ```
