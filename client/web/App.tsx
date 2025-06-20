@@ -170,9 +170,10 @@ function Home() {
 }
 
 function AppContent() {
-  const { connect, sendMessage } = useWebSocket();
+  const { connect, sendMessage, isConnected } = useWebSocket();
   const { user, getToken, loading } = useAuth();
   const [wsConnected, setWsConnected] = useState(false);
+  const tokenSentRef = useRef<boolean>(false);
   
   useEffect(() => {
     // Connect to WebSocket server running in Docker container
@@ -181,9 +182,12 @@ function AppContent() {
       console.log('WebSocket connected, checking for auth token...');
       setWsConnected(true);
       const token = getToken();
-      if (token) {
+      if (token && !tokenSentRef.current) {
         console.log('Sending authentication token on connection');
         sendMessage({ Token: token });
+        tokenSentRef.current = true;
+      } else if (token) {
+        console.log('Token already sent for this connection');
       } else {
         console.log('No auth token found');
       }
@@ -192,14 +196,24 @@ function AppContent() {
   
   // Also send token when user logs in after WebSocket is already connected
   useEffect(() => {
-    if (wsConnected && user) {
+    if (wsConnected && user && !tokenSentRef.current) {
       const token = getToken();
       if (token) {
         console.log('User logged in, sending token to existing WebSocket connection');
         sendMessage({ Token: token });
+        tokenSentRef.current = true;
       }
     }
   }, [wsConnected, user, getToken, sendMessage]);
+
+  // Reset token sent flag when WebSocket disconnects
+  useEffect(() => {
+    if (!isConnected) {
+      tokenSentRef.current = false;
+      setWsConnected(false);
+      console.log('WebSocket disconnected, resetting token sent flag');
+    }
+  }, [isConnected]);
 
   return (
     <div className="min-h-screen flex flex-col">
