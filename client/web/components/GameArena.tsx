@@ -185,8 +185,6 @@ export default function GameArena() {
   
   // Render game state
   useEffect(() => {
-    console.log('Render effect - gameState:', !!gameState, 'canvas:', !!canvasRef.current, 'wasm:', !!window.wasm);
-    
     if (!gameState || !canvasRef.current || !window.wasm) {
       if (!window.wasm) console.log('Waiting for WASM to load...');
       if (!gameState) console.log('Waiting for game state...');

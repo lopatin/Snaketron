@@ -72,7 +72,6 @@ export const useGameEngine = ({
       // Update game state
       const stateJson = engineRef.current.getGameStateJson();
       const newState = JSON.parse(stateJson);
-      console.log('Game state updated - tick:', newState.tick, 'status:', newState.status);
       setGameState(newState);
       
       // Stop the loop if game is ended
