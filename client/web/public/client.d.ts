@@ -16,6 +16,10 @@ export class GameClient {
    */
   constructor(game_id: number, start_ms: bigint);
   /**
+   * Creates a new game client instance from an existing game state
+   */
+  static newFromState(game_id: number, start_ms: bigint, state_json: string): GameClient;
+  /**
    * Set the local player ID
    */
   setLocalPlayerId(player_id: number): void;
@@ -25,9 +29,18 @@ export class GameClient {
    */
   runUntil(ts_ms: bigint): string;
   /**
-   * Process a turn command for a snake
+   * Process a turn command for a snake with client-side prediction
+   * Returns the command message that should be sent to the server
    */
-  processTurn(snake_id: number, direction: string): void;
+  processTurn(snake_id: number, direction: string): string;
+  /**
+   * Process a server event for reconciliation
+   */
+  processServerEvent(event_json: string): void;
+  /**
+   * Initialize game state from a snapshot
+   */
+  initializeFromSnapshot(state_json: string): void;
   /**
    * Get the current game state as JSON
    */
@@ -57,9 +70,12 @@ export interface InitOutput {
   readonly render_game: (a: number, b: number, c: any, d: number) => [number, number];
   readonly __wbg_gameclient_free: (a: number, b: number) => void;
   readonly gameclient_new: (a: number, b: bigint) => number;
+  readonly gameclient_newFromState: (a: number, b: bigint, c: number, d: number) => [number, number, number];
   readonly gameclient_setLocalPlayerId: (a: number, b: number) => void;
   readonly gameclient_runUntil: (a: number, b: bigint) => [number, number, number, number];
-  readonly gameclient_processTurn: (a: number, b: number, c: number, d: number) => [number, number];
+  readonly gameclient_processTurn: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+  readonly gameclient_processServerEvent: (a: number, b: number, c: number) => [number, number];
+  readonly gameclient_initializeFromSnapshot: (a: number, b: number, c: number) => [number, number];
   readonly gameclient_getGameStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getCommittedStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getEventLogJson: (a: number) => [number, number, number, number];

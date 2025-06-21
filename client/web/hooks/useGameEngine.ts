@@ -2,6 +2,12 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
 
+declare global {
+  interface Window {
+    wasm: any;
+  }
+}
+
 interface UseGameEngineProps {
   gameId: string;
   playerId?: number;
@@ -34,17 +40,24 @@ export const useGameEngine = ({
   useEffect(() => {
     const initEngine = async () => {
       try {
+        // Wait for WASM to be initialized
+        if (!window.wasm) {
+          console.log('Waiting for WASM to initialize...');
+          setTimeout(initEngine, 100);
+          return;
+        }
+
         const startMs = BigInt(Date.now());
         
         let engine: GameClient;
         if (initialState) {
-          engine = GameClient.newFromState(
+          engine = window.wasm.GameClient.newFromState(
             parseInt(gameId),
             startMs,
             JSON.stringify(initialState)
           );
         } else {
-          engine = new GameClient(parseInt(gameId), startMs);
+          engine = new window.wasm.GameClient(parseInt(gameId), startMs);
         }
         
         if (playerId !== undefined) {
