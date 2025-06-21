@@ -4,6 +4,7 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useAuth } from '../contexts/AuthContext';
 import { GameState, CanvasRef } from '../types';
 import * as wasm from 'wasm-snaketron';
+import Scoreboard from './Scoreboard';
 
 export default function GameArena() {
   const { gameId } = useParams();
@@ -14,12 +15,17 @@ export default function GameArena() {
   const gameLoopRef = useRef<number | null>(null);
   const lastUpdateRef = useRef(Date.now());
   const pendingDirectionRef = useRef<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   
   const { gameState, sendCommand, connected } = useGameWebSocket();
   const { user } = useAuth();
   const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
   const [localGameState, setLocalGameState] = useState<GameState | null>(null);
+  const [cellSize, setCellSize] = useState(15);
+  const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
+  const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
+  const [isArenaVisible, setIsArenaVisible] = useState(false);
   
   // Initialize local game state from WebSocket game state
   useEffect(() => {
@@ -27,6 +33,65 @@ export default function GameArena() {
       setLocalGameState(JSON.parse(JSON.stringify(gameState)));
     }
   }, [gameState, localGameState]);
+
+  // Trigger fade-in animation when component mounts and hide background dots
+  useEffect(() => {
+    // Hide background dots
+    document.body.classList.add('hide-background-dots');
+    
+    const timer = setTimeout(() => {
+      setIsArenaVisible(true);
+    }, 300); // Delay to ensure smooth transition after fade-out
+
+    return () => {
+      clearTimeout(timer);
+      // Restore background dots when leaving game view
+      document.body.classList.remove('hide-background-dots');
+    };
+  }, []);
+
+  // Calculate optimal cell size and canvas dimensions
+  useEffect(() => {
+    const calculateSizes = () => {
+      const currentState = localGameState || gameState;
+      if (!currentState || !currentState.arena) return;
+      
+      const gridWidth = currentState.arena.width || 40;
+      const gridHeight = currentState.arena.height || 40;
+      
+      const vh = window.innerHeight;
+      const vw = window.innerWidth;
+      
+      // Account for scoreboard (~140px), bottom padding (40px), 
+      // container padding (2*16px), and panel border+shadow (~10px)
+      const availableHeight = vh - 220 - 32 - 10;
+      const availableWidth = vw - 100 - 32 - 10;
+      
+      // Start with max cell size and reduce until it fits
+      let optimalCellSize = 15;
+      let canvasWidth = gridWidth * optimalCellSize;
+      let canvasHeight = gridHeight * optimalCellSize;
+      
+      // Reduce cell size by 1px until canvas fits in available space
+      while ((canvasWidth > availableWidth || canvasHeight > availableHeight) && optimalCellSize > 5) {
+        optimalCellSize--;
+        canvasWidth = gridWidth * optimalCellSize;
+        canvasHeight = gridHeight * optimalCellSize;
+      }
+      
+      setCellSize(optimalCellSize);
+      setCanvasSize({ width: canvasWidth, height: canvasHeight });
+      setPanelSize({ 
+        width: canvasWidth + 10, // Add space for borders
+        height: canvasHeight + 10 
+      });
+    };
+
+    calculateSizes();
+    window.addEventListener('resize', calculateSizes);
+    
+    return () => window.removeEventListener('resize', calculateSizes);
+  }, [localGameState, gameState]);
 
   // Client-side game loop
   const updateLocalGameState = useCallback(() => {
@@ -162,7 +227,7 @@ export default function GameArena() {
     
     const render = () => {
       try {
-        wasm.render_game(JSON.stringify(currentState), canvasRef.current!);
+        wasm.render_game(JSON.stringify(currentState), canvasRef.current!, cellSize);
       } catch (error) {
         console.error('Error rendering game:', error);
       }
@@ -176,7 +241,7 @@ export default function GameArena() {
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [localGameState, gameState]);
+  }, [localGameState, gameState, cellSize]);
   
   // Handle game events from server (if connected)
   useEffect(() => {
@@ -189,48 +254,57 @@ export default function GameArena() {
     }
   }, [gameState, connected, localGameState]);
   
-  // Show connecting message only if we don't have any game state yet
+  // Don't show any loading message - just render empty until game state is ready
   if (!gameState && !localGameState) {
-    return (
-      <div className="flex-1 flex items-center justify-center bg-gray-900">
-        <div className="text-white text-xl">
-          {connected ? "Loading game..." : "Starting offline game..."}
-        </div>
-      </div>
-    );
+    return null;
   }
   
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900">
-      <div className="text-white mb-4">
-        <span className="text-2xl font-bold">Score: {score}</span>
+    <div className="fixed inset-0 flex flex-col overflow-hidden">
+      {/* Scoreboard */}
+      <Scoreboard gameState={localGameState || gameState} score={score} isVisible={isArenaVisible} />
+      
+      {/* Game Arena */}
+      <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '140px', paddingBottom: '40px' }}>
+        <div 
+          className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
+            isArenaVisible ? 'opacity-100' : 'opacity-0'
+          }`}
+          ref={containerRef}
+          style={{
+            width: `${panelSize.width}px`,
+            height: `${panelSize.height}px`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          <canvas 
+            ref={canvasRef}
+            width={canvasSize.width}
+            height={canvasSize.height}
+            className="bg-white block"
+            style={{ 
+              border: 'none'
+            }}
+          />
+        </div>
       </div>
       
-      <canvas 
-        ref={canvasRef}
-        width={800} 
-        height={800}
-        className="border-2 border-gray-600 bg-gray-800"
-      />
-      
       {gameOver && (
-        <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-          <div className="bg-white p-8 rounded-lg text-center">
-            <h2 className="text-3xl font-bold mb-4">Game Over!</h2>
-            <p className="text-xl mb-6">Final Score: {score}</p>
+        <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="panel bg-white p-8 text-center">
+            <h2 className="text-3xl font-black italic uppercase tracking-1 mb-4 text-black-70">Game Over!</h2>
+            <p className="text-xl mb-6 text-black-70 font-bold">Final Score: {score}</p>
             <button
               onClick={() => navigate('/')}
-              className="px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+              className="btn-primary"
             >
               Play Again
             </button>
           </div>
         </div>
       )}
-      
-      <div className="text-white mt-4 text-sm">
-        Use arrow keys to control your snake
-      </div>
     </div>
   );
 }

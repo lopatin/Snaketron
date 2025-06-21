@@ -12,6 +12,10 @@ function AnimatedRoutes({ children }: AnimatedRoutesProps) {
       // Start fade out
       setIsAnimating(true);
       
+      // Check if we're navigating to a game screen
+      const isGameRoute = location.pathname.startsWith('/play/');
+      const fadeOutDuration = isGameRoute ? 300 : 100;
+      
       // After fade out, update location and fade in
       const timer = setTimeout(() => {
         setDisplayLocation(location);
@@ -19,14 +23,18 @@ function AnimatedRoutes({ children }: AnimatedRoutesProps) {
         setTimeout(() => {
           setIsAnimating(false);
         }, 10);
-      }, 100);
+      }, fadeOutDuration);
 
       return () => clearTimeout(timer);
     }
   }, [location, displayLocation]);
 
+  // Use longer transition for game routes
+  const isGameRoute = displayLocation.pathname.startsWith('/play/');
+  const transitionDuration = isGameRoute ? 'duration-300' : 'duration-100';
+
   return (
-    <div className={`flex-1 transition-opacity duration-100 ease-in-out ${
+    <div className={`flex-1 transition-opacity ${transitionDuration} ease-in-out ${
       isAnimating ? 'opacity-0' : 'opacity-100'
     }`}>
       <Routes location={displayLocation}>

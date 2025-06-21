@@ -26,10 +26,29 @@
 @layer base {
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
-    /* Subtle dot pattern background */
+    position: relative;
+  }
+  
+  /* Dot pattern on pseudo-element for transition effect */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
     background-image: radial-gradient(circle, rgba(0, 0, 0, 0.3) 1px, transparent 1px);
     background-size: 15px 15px;
     background-position: 0 0;
+    pointer-events: none;
+    z-index: -1;
+    opacity: 1;
+    transition: opacity 0.2s ease-out;
+  }
+  
+  /* Hide background dots when in game view with fade transition */
+  body.hide-background-dots::before {
+    opacity: 0;
   }
 }
 

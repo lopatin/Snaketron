@@ -10,6 +10,7 @@ import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { UIProvider, useUI } from './contexts/UIContext';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -17,6 +18,7 @@ function Header() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const { isHeaderVisible } = useUI();
   
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -34,7 +36,9 @@ function Header() {
   
   return (
     <>
-      <header className="bg-white border-t-3 border-b-3 border-white py-5 pb-[18px] site-header">
+      <header className={`bg-white border-t-3 border-b-3 border-white py-5 pb-[18px] site-header transition-all duration-300 ${
+        isHeaderVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+      }`}>
         <div className="max-w-6xl mx-auto px-5 flex justify-between items-center">
           <div className="flex items-center gap-12">
             <Link to="/">
@@ -114,7 +118,9 @@ function Header() {
 
 function GameCanvas() {
   return (
-    <canvas width="900" height="500" className="block max-w-full h-auto border border-gray-100" />
+    <div className="panel p-8 bg-white">
+      <canvas width="900" height="500" className="block max-w-full h-auto bg-white" style={{ border: 'none' }} />
+    </div>
   );
 }
 
@@ -241,9 +247,11 @@ function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <WebSocketProvider>
-          <AppContent />
-        </WebSocketProvider>
+        <UIProvider>
+          <WebSocketProvider>
+            <AppContent />
+          </WebSocketProvider>
+        </UIProvider>
       </AuthProvider>
     </BrowserRouter>
   );
