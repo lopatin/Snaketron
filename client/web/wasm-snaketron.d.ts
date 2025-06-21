@@ -27,9 +27,18 @@ declare module 'wasm-snaketron' {
   }
 
   export class GameClient {
-    constructor(userId: number, timestamp: bigint);
-    step(): void;
-    get_state(): GameState;
+    constructor(gameId: number, startMs: bigint);
+    static newFromState(gameId: number, startMs: bigint, stateJson: string): GameClient;
+    setLocalPlayerId(playerId: number): void;
+    runUntil(timestampMs: bigint): string;
+    processTurn(snakeId: number, direction: string): string;
+    processServerEvent(eventJson: string): void;
+    initializeFromSnapshot(stateJson: string): void;
+    getGameStateJson(): string;
+    getCommittedStateJson(): string;
+    getEventLogJson(): string;
+    getCurrentTick(): number;
+    getGameId(): number;
   }
 
   export class Game {

@@ -1,7 +1,7 @@
 mod render;
 
 use wasm_bindgen::prelude::*;
-use common::{GameEngine, GameCommand, Direction};
+use common::{GameEngine, GameCommand, Direction, GameEvent, GameState};
 use serde_json;
 
 /// The main client-side game interface exposed to JavaScript.
@@ -23,6 +23,20 @@ impl GameClient {
             engine: GameEngine::new(game_id, start_ms),
         }
     }
+    
+    /// Creates a new game client instance from an existing game state
+    #[wasm_bindgen(js_name = newFromState)]
+    pub fn new_from_state(game_id: u32, start_ms: i64, state_json: &str) -> Result<GameClient, JsValue> {
+        // Set panic hook for better error messages in browser console
+        console_error_panic_hook::set_once();
+        
+        let game_state: GameState = serde_json::from_str(state_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        Ok(GameClient {
+            engine: GameEngine::new_from_state(game_id, start_ms, game_state),
+        })
+    }
 
     /// Set the local player ID
     #[wasm_bindgen(js_name = setLocalPlayerId)]
@@ -41,9 +55,10 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Process a turn command for a snake
+    /// Process a turn command for a snake with client-side prediction
+    /// Returns the command message that should be sent to the server
     #[wasm_bindgen(js_name = processTurn)]
-    pub fn process_turn(&mut self, snake_id: u32, direction: &str) -> Result<(), JsValue> {
+    pub fn process_turn(&mut self, snake_id: u32, direction: &str) -> Result<String, JsValue> {
         let dir = match direction {
             "Up" => Direction::Up,
             "Down" => Direction::Down,
@@ -54,9 +69,35 @@ impl GameClient {
 
         let command = GameCommand::Turn { snake_id, direction: dir };
         
-        // For client-side, we'd typically add this to pending commands
-        // The actual implementation would depend on your networking setup
-        Ok(())
+        // Process with client-side prediction
+        let command_message = self.engine.process_local_command(command)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        // Return the command message as JSON to be sent to server
+        serde_json::to_string(&command_message)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+    
+    /// Process a server event for reconciliation
+    #[wasm_bindgen(js_name = processServerEvent)]
+    pub fn process_server_event(&mut self, event_json: &str) -> Result<(), JsValue> {
+        let event: GameEvent = serde_json::from_str(event_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        self.engine.process_server_event(&event)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+    
+    /// Initialize game state from a snapshot
+    #[wasm_bindgen(js_name = initializeFromSnapshot)]
+    pub fn initialize_from_snapshot(&mut self, state_json: &str) -> Result<(), JsValue> {
+        let game_state: GameState = serde_json::from_str(state_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        // Process as a snapshot event
+        let event = GameEvent::Snapshot { game_state };
+        self.engine.process_server_event(&event)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Get the current game state as JSON

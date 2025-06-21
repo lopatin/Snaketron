@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { GameState, CanvasRef } from '../types';
 import * as wasm from 'wasm-snaketron';
@@ -10,29 +11,50 @@ export default function GameArena() {
   const { gameId } = useParams();
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const gameClientRef = useRef<any>(null);
-  const animationRef = useRef<number | null>(null);
-  const gameLoopRef = useRef<number | null>(null);
-  const lastUpdateRef = useRef(Date.now());
-  const pendingDirectionRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
-  const { gameState, sendCommand, connected } = useGameWebSocket();
+  const { gameState: serverGameState, sendCommand: sendServerCommand, connected, sendGameCommand } = useGameWebSocket();
   const { user } = useAuth();
+  
+  // Use game engine for client-side prediction
+  const {
+    gameEngine,
+    gameState,
+    isRunning,
+    sendCommand,
+    processServerEvent,
+    startEngine,
+    stopEngine
+  } = useGameEngine({
+    gameId: gameId || '0',
+    playerId: user?.id,
+    initialState: serverGameState || undefined,
+    onCommandReady: (commandMessage) => {
+      // Send command to server
+      sendGameCommand(commandMessage);
+    }
+  });
+  
   const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
-  const [localGameState, setLocalGameState] = useState<GameState | null>(null);
   const [cellSize, setCellSize] = useState(15);
   const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   
-  // Initialize local game state from WebSocket game state
+  // Start game engine when server state is available
   useEffect(() => {
-    if (gameState && !localGameState) {
-      setLocalGameState(JSON.parse(JSON.stringify(gameState)));
+    if (serverGameState && !isRunning) {
+      startEngine();
     }
-  }, [gameState, localGameState]);
+  }, [serverGameState, isRunning, startEngine]);
+  
+  // Stop engine on unmount
+  useEffect(() => {
+    return () => {
+      stopEngine();
+    };
+  }, [stopEngine]);
 
   // Trigger fade-in animation when component mounts and hide background dots
   useEffect(() => {
@@ -53,11 +75,10 @@ export default function GameArena() {
   // Calculate optimal cell size and canvas dimensions
   useEffect(() => {
     const calculateSizes = () => {
-      const currentState = localGameState || gameState;
-      if (!currentState || !currentState.arena) return;
+      if (!gameState || !gameState.arena) return;
       
-      const gridWidth = currentState.arena.width || 40;
-      const gridHeight = currentState.arena.height || 40;
+      const gridWidth = gameState.arena.width || 40;
+      const gridHeight = gameState.arena.height || 40;
       
       const vh = window.innerHeight;
       const vw = window.innerWidth;
@@ -92,92 +113,26 @@ export default function GameArena() {
     window.addEventListener('resize', calculateSizes);
     
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [localGameState, gameState]);
+  }, [gameState]);
 
-  // Client-side game loop
-  const updateLocalGameState = useCallback(() => {
-    if (!localGameState || gameOver) return;
-
-    const newGameState = JSON.parse(JSON.stringify(localGameState));
-    
-    // Apply pending direction change
-    if (pendingDirectionRef.current && newGameState.arena.snakes[0]) {
-      const currentDirection = newGameState.arena.snakes[0].direction;
-      const newDirection = pendingDirectionRef.current;
-      
-      // Prevent reverse direction
-      const opposites = {
-        'Up': 'Down',
-        'Down': 'Up', 
-        'Left': 'Right',
-        'Right': 'Left'
-      };
-      
-      if (opposites[currentDirection as keyof typeof opposites] !== newDirection) {
-        newGameState.arena.snakes[0].direction = newDirection;
-        console.log('Direction changed to:', newDirection);
-      }
-      
-      pendingDirectionRef.current = null;
-    }
-
-    // Move snake
-    if (newGameState.arena.snakes[0] && newGameState.arena.snakes[0].is_alive) {
-      const snake = newGameState.arena.snakes[0];
-      const head = snake.body[0];
-      const direction = snake.direction;
-      
-      let newHead = { ...head };
-      
-      switch(direction) {
-        case 'Up': newHead.y = head.y - 1; break;
-        case 'Down': newHead.y = head.y + 1; break;
-        case 'Left': newHead.x = head.x - 1; break;
-        case 'Right': newHead.x = head.x + 1; break;
-      }
-      
-      // Check wall collision
-      if (newHead.x < 0 || newHead.x >= newGameState.arena.width || 
-          newHead.y < 0 || newHead.y >= newGameState.arena.height) {
-        snake.is_alive = false;
-        setGameOver(true);
-        console.log('Game over: wall collision');
-        return;
-      }
-      
-      // Update snake body (simplified - just move head and tail)
-      snake.body = [newHead, ...snake.body.slice(0, -1)];
-      
-      // Update score based on snake length
-      const newScore = Math.max(0, snake.body.length - 2);
-      setScore(newScore);
-    }
-    
-    newGameState.tick += 1;
-    setLocalGameState(newGameState);
-  }, [localGameState, gameOver]);
-
-  // Start game loop
+  // Update score when game state changes
   useEffect(() => {
-    if (!localGameState || gameOver) return;
-    
-    const gameLoop = () => {
-      const now = Date.now();
-      if (now - lastUpdateRef.current > 200) { // Update every 200ms
-        updateLocalGameState();
-        lastUpdateRef.current = now;
+    if (gameState && user?.id) {
+      const player = gameState.players?.[user.id];
+      if (player) {
+        const snake = gameState.arena.snakes.find(s => s.body.length > 0);
+        if (snake) {
+          const newScore = Math.max(0, snake.body.length - 2);
+          setScore(newScore);
+          
+          // Check if snake is dead
+          if (!snake.is_alive && !gameOver) {
+            setGameOver(true);
+          }
+        }
       }
-      gameLoopRef.current = requestAnimationFrame(gameLoop);
-    };
-    
-    gameLoopRef.current = requestAnimationFrame(gameLoop);
-    
-    return () => {
-      if (gameLoopRef.current) {
-        cancelAnimationFrame(gameLoopRef.current);
-      }
-    };
-  }, [localGameState, gameOver, updateLocalGameState]);
+    }
+  }, [gameState, user?.id, gameOver]);
 
   useEffect(() => {
     if (!window.wasm) {
@@ -199,15 +154,12 @@ export default function GameArena() {
       
       if (direction) {
         e.preventDefault();
-        console.log('Setting pending direction:', direction);
-        pendingDirectionRef.current = direction;
+        console.log('Sending turn command:', direction);
         
-        // Also send to server if connected
-        if (connected) {
-          sendCommand({
-            Turn: { direction: direction as 'Up' | 'Down' | 'Left' | 'Right' }
-          });
-        }
+        // Send command through game engine (handles both local prediction and server)
+        sendCommand({
+          Turn: { direction: direction as 'Up' | 'Down' | 'Left' | 'Right' }
+        });
       }
     };
     
@@ -217,53 +169,51 @@ export default function GameArena() {
   
   // Render game state
   useEffect(() => {
-    const currentState = localGameState || gameState;
-    console.log('Render effect - currentState:', !!currentState, 'canvas:', !!canvasRef.current, 'wasm:', !!window.wasm);
+    console.log('Render effect - gameState:', !!gameState, 'canvas:', !!canvasRef.current, 'wasm:', !!window.wasm);
     
-    if (!currentState || !canvasRef.current || !window.wasm) {
+    if (!gameState || !canvasRef.current || !window.wasm) {
       if (!window.wasm) console.log('Waiting for WASM to load...');
-      if (!currentState) console.log('Waiting for game state...');
+      if (!gameState) console.log('Waiting for game state...');
       return;
     }
     
+    let animationId: number;
     const render = () => {
       try {
-        wasm.render_game(JSON.stringify(currentState), canvasRef.current!, cellSize);
+        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize);
       } catch (error) {
         console.error('Error rendering game:', error);
       }
-      animationRef.current = requestAnimationFrame(render);
+      animationId = requestAnimationFrame(render);
     };
     
     render();
     
     return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
+      if (animationId) {
+        cancelAnimationFrame(animationId);
       }
     };
-  }, [localGameState, gameState, cellSize]);
+  }, [gameState, cellSize]);
   
-  // Handle game events from server (if connected)
+  // Process server events through game engine
   useEffect(() => {
-    if (!gameState) return;
+    if (!serverGameState) return;
     
-    // If we get updates from server, sync with local state
-    if (connected && gameState && !localGameState) {
-      console.log('Syncing server game state to local state');
-      setLocalGameState(JSON.parse(JSON.stringify(gameState)));
-    }
-  }, [gameState, connected, localGameState]);
+    // The game engine will handle server state updates internally
+    // through the WebSocket hook integration
+    console.log('Server game state updated');
+  }, [serverGameState]);
   
   // Don't show any loading message - just render empty until game state is ready
-  if (!gameState && !localGameState) {
+  if (!gameState) {
     return null;
   }
   
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
       {/* Scoreboard */}
-      <Scoreboard gameState={localGameState || gameState} score={score} isVisible={isArenaVisible} />
+      <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} />
       
       {/* Game Arena */}
       <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '140px', paddingBottom: '40px' }}>
