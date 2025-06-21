@@ -13,7 +13,7 @@ export default function GameArena() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
-  const { gameState: serverGameState, sendCommand: sendServerCommand, connected, sendGameCommand } = useGameWebSocket();
+  const { gameState: serverGameState, sendCommand: sendServerCommand, connected, sendGameCommand, lastGameEvent } = useGameWebSocket();
   const { user } = useAuth();
   
   // Use game engine for client-side prediction
@@ -135,11 +135,18 @@ export default function GameArena() {
           // Check if snake is dead
           if (!snake.is_alive && !gameOver) {
             setGameOver(true);
+            stopEngine(); // Stop the engine when game ends
           }
         }
       }
     }
-  }, [gameState, user?.id, gameOver]);
+    
+    // Also check if game status is Ended
+    if (gameState && 'Ended' in gameState.status && !gameOver) {
+      setGameOver(true);
+      stopEngine(); // Stop the engine when game ends
+    }
+  }, [gameState, user?.id, gameOver, stopEngine]);
 
   useEffect(() => {
     if (!window.wasm) {
@@ -149,7 +156,9 @@ export default function GameArena() {
     
     // Handle keyboard input
     const handleKeyPress = (e: KeyboardEvent) => {
-      if (gameOver) return;
+      if (gameOver || !gameState || 'Ended' in gameState.status) {
+        return;
+      }
       
       let direction = null;
       switch(e.key) {
@@ -172,7 +181,7 @@ export default function GameArena() {
     
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [sendCommand, gameOver, connected]);
+  }, [sendCommand, gameOver, connected, gameState]);
   
   // Render game state
   useEffect(() => {
@@ -205,12 +214,11 @@ export default function GameArena() {
   
   // Process server events through game engine
   useEffect(() => {
-    if (!serverGameState) return;
-    
-    // The game engine will handle server state updates internally
-    // through the WebSocket hook integration
-    console.log('Server game state updated');
-  }, [serverGameState]);
+    if (lastGameEvent && processServerEvent) {
+      console.log('Processing server event in GameArena:', lastGameEvent);
+      processServerEvent(lastGameEvent);
+    }
+  }, [lastGameEvent, processServerEvent]);
   
   // Don't show any loading message - just render empty until game state is ready
   if (!gameState) {

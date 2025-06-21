@@ -9,6 +9,7 @@ interface UseGameWebSocketReturn {
   currentGameId: string | null;
   customGameCode: string | null;
   isHost: boolean;
+  lastGameEvent: any | null;
   createCustomGame: (settings: Partial<CustomGameSettings>) => void;
   createGame: (gameType: string) => void;
   createSoloGame: (mode: 'Classic' | 'Tactical') => void;
@@ -28,6 +29,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [customGameCode, setCustomGameCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
+  const [lastGameEvent, setLastGameEvent] = useState<any | null>(null);
 
   // Handle game-specific messages
   useEffect(() => {
@@ -54,6 +56,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
         
+        // Store the event for the game engine to process
+        setLastGameEvent(event);
+        
         // Handle different event types
         if (event.Snapshot) {
           // Full game state snapshot
@@ -61,6 +66,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           setGameState(event.Snapshot.game_state);
         } else if (event.SoloGameEnded) {
           // Solo game ended
+          console.log('Received SoloGameEnded event');
           setGameState(prev => prev ? {
             ...prev,
             status: { Ended: {} }
@@ -128,6 +134,13 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     unsubscribers.push(
       onMessage('SoloGameCreated', (message: any) => {
         console.log('Received SoloGameCreated message:', message);
+        
+        // Check if current game is already ended - don't reinitialize
+        if (gameState && 'Ended' in gameState.status) {
+          console.log('Current game is ended, not reinitializing for new game');
+          return;
+        }
+        
         setCurrentGameId(message.data.game_id);
         
         // Initialize a basic game state since server doesn't send initial snapshot
@@ -181,7 +194,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     return () => {
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [onMessage]);
+  }, [onMessage, navigate, gameState]);
 
   // Game actions
   const createCustomGame = (settings: Partial<CustomGameSettings>) => {
@@ -272,6 +285,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     currentGameId,
     customGameCode,
     isHost,
+    lastGameEvent,
     createCustomGame,
     createGame,
     createSoloGame,

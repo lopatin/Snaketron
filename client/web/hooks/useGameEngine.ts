@@ -75,6 +75,14 @@ export const useGameEngine = ({
       console.log('Game state updated - tick:', newState.tick, 'status:', newState.status);
       setGameState(newState);
       
+      // Stop the loop if game is ended
+      if ('Ended' in newState.status) {
+        console.log('Game ended, stopping game loop');
+        isRunningRef.current = false;
+        setIsRunning(false);
+        return;
+      }
+      
       // Continue loop if still running
       if (isRunningRef.current) {
         animationFrameRef.current = requestAnimationFrame(runGameLoop);
@@ -178,21 +186,19 @@ export const useGameEngine = ({
 
   // Send command with client-side prediction
   const sendCommand = useCallback((command: Command) => {
-    if (!engineRef.current || !playerId) return;
+    if (!engineRef.current || playerId === undefined) {
+      console.error('Cannot send command - engine:', !!engineRef.current, 'playerId:', playerId);
+      return;
+    }
 
     try {
-      // Get the snake ID for the player
-      const player = gameState?.players?.[playerId];
-      if (!player) {
-        console.error('Player not found in game state');
-        return;
-      }
-
-      const snakeId = player.snake_id;
+      // For solo games, the player ID is typically the user's ID from auth
+      // The snake ID is usually 0 for the first/only snake
+      const snakeId = 0; // In solo games, there's typically only one snake with ID 0
       
       // Process command based on type
       let commandMessageJson: string;
-      if (typeof command === 'object' && 'Turn' in command) {
+       if (typeof command === 'object' && 'Turn' in command) {
         commandMessageJson = engineRef.current.processTurn(snakeId, command.Turn.direction);
       } else if (command === 'Respawn') {
         console.error('Respawn command not implemented yet');
@@ -208,13 +214,31 @@ export const useGameEngine = ({
     } catch (error) {
       console.error('Failed to process command:', error);
     }
-  }, [gameState, playerId, onCommandReady]);
+  }, [playerId, onCommandReady]);
 
   // Process server event for reconciliation
   const processServerEvent = useCallback((event: any) => {
     if (!engineRef.current) return;
 
     try {
+      // Handle SoloGameEnded event specially
+      if (event.SoloGameEnded) {
+        console.log('Processing SoloGameEnded event');
+        // Update the local game state to mark it as ended
+        setGameState(prev => prev ? {
+          ...prev,
+          status: { Ended: {} }
+        } : prev);
+        // Stop the game loop
+        isRunningRef.current = false;
+        setIsRunning(false);
+        if (animationFrameRef.current !== null) {
+          cancelAnimationFrame(animationFrameRef.current);
+          animationFrameRef.current = null;
+        }
+        return;
+      }
+      
       // Convert the event if it contains a Snapshot with game state
       let convertedEvent = event;
       if (event.Snapshot && event.Snapshot.game_state) {
