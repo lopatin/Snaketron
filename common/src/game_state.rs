@@ -550,7 +550,15 @@ impl GameState {
             .map(|(idx, _)| idx as u32)
             .collect();
         
-        if alive_snakes.len() <= 1 && matches!(self.status, GameStatus::Started { .. }) {
+        // For solo games, only end when no snakes are alive
+        // For multiplayer games, end when 1 or fewer snakes are alive
+        let should_end = if self.game_type.is_solo() {
+            alive_snakes.is_empty()
+        } else {
+            alive_snakes.len() <= 1
+        };
+        
+        if should_end && matches!(self.status, GameStatus::Started { .. }) {
             let winning_snake_id = alive_snakes.first().copied();
             self.apply_event(
                 GameEvent::StatusUpdated { 

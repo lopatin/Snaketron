@@ -18,7 +18,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
-use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage};
+use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
 use crate::raft::{RaftNode, StateChangeEvent};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -382,12 +382,37 @@ async fn handle_websocket_connection(
                         if let ConnectionState::InGame { metadata, game_id, .. } = &state {
                             if event.game_id == *game_id {
                                 // Forward game events to the client
-                                let event_msg = WSMessage::GameEvent(event);
+                                let event_msg = WSMessage::GameEvent(event.clone());
                                 let json_msg = serde_json::to_string(&event_msg)?;
                                 let ws_msg = Message::Text(Utf8Bytes::from(json_msg));
                                 if let Err(e) = ws_stream.send(ws_msg).await {
                                     error!("Failed to send game event message: {}", e);
                                     break;
+                                }
+                                
+                                // Check if the game has ended
+                                match &event.event {
+                                    GameEvent::SoloGameEnded { .. } => {
+                                        info!("Solo game {} has ended, transitioning back to Authenticated state", game_id);
+                                        // Transition back to Authenticated state
+                                        state = ConnectionState::Authenticated { 
+                                            metadata: metadata.clone() 
+                                        };
+                                    }
+                                    GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
+                                        // For multiplayer games, transition immediately on Complete
+                                        // For solo games, we'll transition on SoloGameEnded instead
+                                        // We can check if this is a solo game by looking at the game state
+                                        if let Some(game_state) = raft.get_game_state(*game_id).await {
+                                            if !game_state.game_type.is_solo() {
+                                                info!("Multiplayer game {} has ended, transitioning back to Authenticated state", game_id);
+                                                state = ConnectionState::Authenticated { 
+                                                    metadata: metadata.clone() 
+                                                };
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

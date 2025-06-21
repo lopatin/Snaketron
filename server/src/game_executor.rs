@@ -121,9 +121,13 @@ async fn run_game(
                                 if let Some((user_id, player)) = game_state.players.iter().next() {
                                     if let Some(snake) = game_state.arena.snakes.get(player.snake_id as usize) {
                                         if !snake.is_alive {
-                                            // Calculate score: snake length - starting length
-                                            let score = snake.body.len().saturating_sub(2) as u32;  // 2 positions for starting snake
-                                            let duration = game_state.tick;
+                                            // Calculate score: actual snake length - starting length
+                                            let starting_length = match &game_state.game_type {
+                                                common::GameType::Custom { settings } => settings.snake_start_length as usize,
+                                                _ => 4,  // Default starting length
+                                            };
+                                            let score = snake.length().saturating_sub(starting_length) as u32;
+                                            let duration = engine.current_tick();
                                             
                                             // Send solo game ended event
                                             let event = GameEvent::SoloGameEnded { score, duration };

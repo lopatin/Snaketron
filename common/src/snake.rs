@@ -122,5 +122,20 @@ impl Snake {
     pub fn iter_body(&self) -> impl Iterator<Item=(&Position, &Position)> {
         self.body.iter().zip(self.body.iter().skip(1))
     }
+    
+    /// Calculate the actual length of the snake (number of grid cells it occupies)
+    pub fn length(&self) -> usize {
+        if self.body.len() < 2 {
+            return self.body.len();
+        }
+        
+        let mut length = 0;
+        for (p1, p2) in self.iter_body() {
+            // Calculate Manhattan distance between consecutive points
+            let distance = ((p2.x - p1.x).abs() + (p2.y - p1.y).abs()) as usize;
+            length += distance;
+        }
+        length + 1 // Add 1 for the head
+    }
 }
 
