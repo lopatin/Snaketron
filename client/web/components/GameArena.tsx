@@ -80,10 +80,11 @@ export default function GameArena() {
       }
       
       setCellSize(optimalCellSize);
-      setCanvasSize({ width: canvasWidth, height: canvasHeight });
+      // Add 2px to canvas size to account for 1px padding on each side
+      setCanvasSize({ width: canvasWidth + 2, height: canvasHeight + 2 });
       setPanelSize({ 
-        width: canvasWidth + 10, // Add space for borders
-        height: canvasHeight + 10 
+        width: canvasWidth + 12, // Add space for borders and padding
+        height: canvasHeight + 12 
       });
     };
 

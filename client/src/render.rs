@@ -26,21 +26,32 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     // Use a fixed dot radius of 1px to match the background dots
     let dot_radius = 1.0;
 
-    // Calculate total canvas size
-    let canvas_width = width as f64 * cell_size;
-    let canvas_height = height as f64 * cell_size;
+    // Get actual canvas dimensions
+    let canvas_width = canvas.width() as f64;
+    let canvas_height = canvas.height() as f64;
 
-    // Clear canvas with white background
+    // Clear entire canvas with white background (including padding area)
     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
     ctx.fill_rect(0.0, 0.0, canvas_width, canvas_height);
+
+    // Add 1px padding offset for all drawing operations
+    let padding = 1.0;
+    
+    // Save the current state and translate for padding
+    ctx.save();
+    ctx.translate(padding, padding)?;
+    
+    // Fill the game area with white again to ensure clean background
+    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+    ctx.fill_rect(0.0, 0.0, canvas_width - 2.0 * padding, canvas_height - 2.0 * padding);
 
     // Draw dots at grid intersections (like the background pattern)
     ctx.set_fill_style(&JsValue::from_str("rgba(0, 0, 0, 0.3)")); // Same as background dots
     
     // Only draw dots at 15px intervals to match background, regardless of cell size
     let dot_spacing = 15.0;
-    let dots_x = (canvas_width / dot_spacing).ceil() as u32;
-    let dots_y = (canvas_height / dot_spacing).ceil() as u32;
+    let dots_x = ((canvas_width - 2.0 * padding) / dot_spacing).ceil() as u32;
+    let dots_y = ((canvas_height - 2.0 * padding) / dot_spacing).ceil() as u32;
     
     // Start from 1 and end at dots_x/y - 1 to skip outer edge dots
     for x in 1..dots_x {
@@ -48,8 +59,8 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             let dot_x = x as f64 * dot_spacing;
             let dot_y = y as f64 * dot_spacing;
             
-            // Skip dots that are on or outside the canvas edges
-            if dot_x >= canvas_width || dot_y >= canvas_height {
+            // Skip dots that are on or outside the canvas edges (accounting for padding)
+            if dot_x >= canvas_width - 2.0 * padding || dot_y >= canvas_height - 2.0 * padding {
                 continue;
             }
             
@@ -130,7 +141,43 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                         continue;
                     }
                     
-                    // First pass: Draw borders (1px larger)
+                    // First pass: Fill with white rectangles to cover grid dots
+                    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                    
+                    // Fill white rectangles for body segments (expanded by 1px)
+                    for window in body.windows(2) {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
+                            let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
+                            let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
+                            let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+
+                            if x1 == x2 {
+                                // Vertical segment - draw rectangle
+                                let x = x1 * cell_size;
+                                let min_y = y1.min(y2) * cell_size;
+                                let max_y = y1.max(y2) * cell_size;
+                                ctx.fill_rect(x - 1.0, min_y - 1.0, cell_size + 2.0, (max_y - min_y) + cell_size + 2.0);
+                            } else if y1 == y2 {
+                                // Horizontal segment - draw rectangle
+                                let y = y1 * cell_size;
+                                let min_x = x1.min(x2) * cell_size;
+                                let max_x = x1.max(x2) * cell_size;
+                                ctx.fill_rect(min_x - 1.0, y - 1.0, (max_x - min_x) + cell_size + 2.0, cell_size + 2.0);
+                            }
+                        }
+                    }
+
+                    // Fill white rectangles for all body points (expanded by 1px)
+                    for point in body.iter() {
+                        if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
+                            let rect_x = x as f64 * cell_size - 1.0;
+                            let rect_y = y as f64 * cell_size - 1.0;
+                            ctx.fill_rect(rect_x, rect_y, cell_size + 2.0, cell_size + 2.0);
+                        }
+                    }
+
+                    // Second pass: Draw borders (1px larger)
                     ctx.set_stroke_style(&JsValue::from_str(border_color));
                     
                     // Draw border for body segments
@@ -184,7 +231,7 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                         }
                     }
 
-                    // Second pass: Draw the actual snake
+                    // Third pass: Draw the actual snake
                     ctx.set_stroke_style(&JsValue::from_str(color));
                     ctx.set_fill_style(&JsValue::from_str(color));
 
@@ -285,6 +332,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         ctx.fill_text(&format!("Tick: {}", tick), 10.0, 
             canvas_height + 20.0)?;
     }
+
+    // Restore the canvas state (remove padding translation)
+    ctx.restore();
 
     Ok(())
 }
