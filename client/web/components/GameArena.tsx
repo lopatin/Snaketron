@@ -42,10 +42,17 @@ export default function GameArena() {
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   
-  // Start game engine when server state is available
+  // Start game engine when server state is available and game is not ended
   useEffect(() => {
+    console.log('GameArena - serverGameState:', !!serverGameState, 'isRunning:', isRunning);
     if (serverGameState && !isRunning) {
-      startEngine();
+      console.log('GameArena - Starting engine with server state, status:', serverGameState.status);
+      // Only start if the game is not ended
+      if (!('Ended' in serverGameState.status)) {
+        startEngine();
+      } else {
+        console.log('GameArena - Game is ended, not starting engine');
+      }
     }
   }, [serverGameState, isRunning, startEngine]);
   

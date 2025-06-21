@@ -25,6 +25,24 @@ interface UseGameEngineReturn {
   stopEngine: () => void;
 }
 
+// Convert TypeScript GameStatus to Rust GameStatus format
+const convertGameStatus = (status: any): any => {
+  if (status.Ended) {
+    return { Complete: { winning_snake_id: null } };
+  } else if (status.Waiting) {
+    return 'Stopped';
+  }
+  return status;
+};
+
+// Convert game state from TypeScript format to Rust format
+const convertGameState = (state: GameState): any => {
+  return {
+    ...state,
+    status: convertGameStatus(state.status)
+  };
+};
+
 export const useGameEngine = ({
   gameId,
   playerId,
@@ -33,8 +51,40 @@ export const useGameEngine = ({
 }: UseGameEngineProps): UseGameEngineReturn => {
   const engineRef = useRef<GameClient | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const isRunningRef = useRef(false);
   const [gameState, setGameState] = useState<GameState | null>(initialState || null);
   const [isRunning, setIsRunning] = useState(false);
+
+  // Game loop - no dependencies to avoid recreation
+  const runGameLoop = useCallback(() => {
+    // Check if we should continue running
+    if (!engineRef.current || !isRunningRef.current) {
+      console.log('Game loop skipped - engine:', !!engineRef.current, 'isRunning:', isRunningRef.current);
+      return;
+    }
+
+    try {
+      const now = BigInt(Date.now());
+      
+      // Run engine until current time
+      engineRef.current.runUntil(now);
+      
+      // Update game state
+      const stateJson = engineRef.current.getGameStateJson();
+      const newState = JSON.parse(stateJson);
+      console.log('Game state updated - tick:', newState.tick, 'status:', newState.status);
+      setGameState(newState);
+      
+      // Continue loop if still running
+      if (isRunningRef.current) {
+        animationFrameRef.current = requestAnimationFrame(runGameLoop);
+      }
+    } catch (error) {
+      console.error('Game loop error:', error);
+      isRunningRef.current = false;
+      setIsRunning(false);
+    }
+  }, []); // No dependencies - uses refs instead
 
   // Initialize game engine
   useEffect(() => {
@@ -47,16 +97,30 @@ export const useGameEngine = ({
           return;
         }
 
-        const startMs = BigInt(Date.now());
-        
         let engine: GameClient;
         if (initialState) {
+          console.log('Creating engine from initial state - tick:', initialState.tick, 'status:', initialState.status);
+          const convertedState = convertGameState(initialState);
+          
+          // Calculate start time based on current tick and tick duration
+          const tickDuration = 
+            (typeof initialState.game_type === 'object' && 'Custom' in initialState.game_type) 
+              ? initialState.game_type.Custom.settings.tick_duration_ms 
+              : 300;
+          const currentMs = Date.now();
+          const gameElapsedMs = initialState.tick * tickDuration;
+          const startMs = BigInt(currentMs - gameElapsedMs);
+          
+          console.log('Calculated start time - currentMs:', currentMs, 'gameElapsedMs:', gameElapsedMs, 'startMs:', startMs);
+          
           engine = window.wasm.GameClient.newFromState(
             parseInt(gameId),
             startMs,
-            JSON.stringify(initialState)
+            JSON.stringify(convertedState)
           );
         } else {
+          console.log('Creating new engine without initial state');
+          const startMs = BigInt(Date.now());
           engine = new window.wasm.GameClient(parseInt(gameId), startMs);
         }
         
@@ -65,6 +129,13 @@ export const useGameEngine = ({
         }
         
         engineRef.current = engine;
+        console.log('Game engine initialized successfully');
+        
+        // If we're already supposed to be running, start the game loop
+        if (isRunningRef.current) {
+          console.log('Engine initialized while running - starting game loop');
+          runGameLoop();
+        }
       } catch (error) {
         console.error('Failed to initialize game engine:', error);
       }
@@ -77,38 +148,27 @@ export const useGameEngine = ({
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [gameId, playerId, initialState]);
-
-  // Game loop
-  const runGameLoop = useCallback(() => {
-    if (!engineRef.current || !isRunning) return;
-
-    try {
-      const now = BigInt(Date.now());
-      
-      // Run engine until current time
-      const eventsJson = engineRef.current.runUntil(now);
-      const events = JSON.parse(eventsJson);
-      
-      // Update game state
-      const stateJson = engineRef.current.getGameStateJson();
-      const newState = JSON.parse(stateJson);
-      setGameState(newState);
-      
-      // Continue loop
-      animationFrameRef.current = requestAnimationFrame(runGameLoop);
-    } catch (error) {
-      console.error('Game loop error:', error);
-      setIsRunning(false);
-    }
-  }, [isRunning]);
+  }, [gameId, playerId, initialState, runGameLoop]);
 
   // Start/stop engine
   const startEngine = useCallback(() => {
-    setIsRunning(true);
-  }, []);
+    console.log('Starting game engine - engine exists:', !!engineRef.current);
+    if (!isRunningRef.current) {
+      isRunningRef.current = true;
+      setIsRunning(true);
+      // Start the game loop immediately if engine exists
+      if (engineRef.current) {
+        console.log('Engine exists, starting game loop immediately');
+        runGameLoop();
+      } else {
+        console.log('Engine not ready yet, will start loop when initialized');
+      }
+    }
+  }, [runGameLoop]);
 
   const stopEngine = useCallback(() => {
+    console.log('Stopping game engine');
+    isRunningRef.current = false;
     setIsRunning(false);
     if (animationFrameRef.current !== null) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -116,21 +176,13 @@ export const useGameEngine = ({
     }
   }, []);
 
-  // Start game loop when running changes
-  useEffect(() => {
-    if (isRunning) {
-      runGameLoop();
-    }
-  }, [isRunning, runGameLoop]);
-
   // Send command with client-side prediction
   const sendCommand = useCallback((command: Command) => {
     if (!engineRef.current || !playerId) return;
 
     try {
       // Get the snake ID for the player
-      const currentState = gameState;
-      const player = currentState?.players?.[playerId];
+      const player = gameState?.players?.[playerId];
       if (!player) {
         console.error('Player not found in game state');
         return;
@@ -163,7 +215,17 @@ export const useGameEngine = ({
     if (!engineRef.current) return;
 
     try {
-      engineRef.current.processServerEvent(JSON.stringify(event));
+      // Convert the event if it contains a Snapshot with game state
+      let convertedEvent = event;
+      if (event.Snapshot && event.Snapshot.game_state) {
+        convertedEvent = {
+          ...event,
+          Snapshot: {
+            game_state: convertGameState(event.Snapshot.game_state)
+          }
+        };
+      }
+      engineRef.current.processServerEvent(JSON.stringify(convertedEvent));
     } catch (error) {
       console.error('Failed to process server event:', error);
     }
