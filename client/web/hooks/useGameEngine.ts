@@ -275,7 +275,8 @@ export const useGameEngine = ({
           }
         };
       }
-      engineRef.current.processServerEvent(JSON.stringify(convertedEvent));
+      const currentTs = BigInt(Date.now());
+      engineRef.current.processServerEvent(JSON.stringify(convertedEvent), currentTs);
     } catch (error) {
       console.error('Failed to process server event:', error);
     }

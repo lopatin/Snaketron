@@ -1,13 +1,5 @@
 use anyhow::Result;
-use std::collections::VecDeque;
 use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
-use wasm_bindgen::prelude::*;
-
-#[derive(Debug, Clone)]
-struct UnconfirmedCommand {
-    command_message: GameCommandMessage,
-    local_sequence: u32,
-}
 
 pub struct GameEngine {
     game_id: u32,
@@ -19,9 +11,7 @@ pub struct GameEngine {
     tick_duration_ms: u32,
     committed_state_lag_ms: u32,
 
-    unconfirmed_local_commands: VecDeque<UnconfirmedCommand>,
     local_player_id: Option<u32>,
-    local_sequence_counter: u32,
 
     start_ms: i64,
     command_counter: u32,
@@ -37,9 +27,7 @@ impl GameEngine {
             event_log: Vec::new(),
             tick_duration_ms: 300,
             committed_state_lag_ms: 500,
-            unconfirmed_local_commands: VecDeque::new(),
             local_player_id: None,
-            local_sequence_counter: 0,
             start_ms,
             command_counter: 0,
         }
@@ -67,9 +55,7 @@ impl GameEngine {
             event_log: Vec::new(),
             tick_duration_ms,
             committed_state_lag_ms: 500,
-            unconfirmed_local_commands: VecDeque::new(),
             local_player_id: None,
-            local_sequence_counter: 0,
             start_ms,
             command_counter: 0,
         }
@@ -89,9 +75,7 @@ impl GameEngine {
             event_log: Vec::new(),
             tick_duration_ms,
             committed_state_lag_ms: 500,
-            unconfirmed_local_commands: VecDeque::new(),
             local_player_id: None,
-            local_sequence_counter: 0,
             start_ms,
             command_counter: 0,
         }
@@ -99,12 +83,6 @@ impl GameEngine {
 
     pub fn set_local_player_id(&mut self, player_id: u32) {
         self.local_player_id = Some(player_id);
-    }
-    
-    /// Get the last unconfirmed command that should be sent to server
-    pub fn get_last_unconfirmed_command(&self) -> Option<&GameCommandMessage> {
-        self.unconfirmed_local_commands.back()
-            .map(|cmd| &cmd.command_message)
     }
     
     /// Process a local command with client-side prediction
@@ -122,18 +100,11 @@ impl GameEngine {
             command_id_client: CommandId {
                 tick: predicted_tick,
                 user_id: player_id,
-                sequence_number: self.local_sequence_counter,
+                sequence_number: 0, // Sequence number no longer needed
             },
             command_id_server: None,
             command,
         };
-        
-        // Add to unconfirmed commands
-        self.unconfirmed_local_commands.push_back(UnconfirmedCommand {
-            command_message: command_message.clone(),
-            local_sequence: self.local_sequence_counter,
-        });
-        self.local_sequence_counter += 1;
         
         // Apply to predicted state immediately
         if let Some(predicted_state) = &mut self.predicted_state {
@@ -145,34 +116,27 @@ impl GameEngine {
 
 
     /// Process a server event and reconcile with local predictions
-    pub fn process_server_event(&mut self, event: &GameEvent) -> Result<()> {
+    pub fn process_server_event(&mut self, event: &GameEvent, current_ts: i64) -> Result<()> {
         // Apply event to committed state
         self.committed_state.apply_event(event.clone(), None);
         
         // Handle specific events that require reconciliation
         match event {
             GameEvent::CommandScheduled { command_message } => {
-                // Remove matching unconfirmed command if this is our command
-                if let Some(player_id) = self.local_player_id {
-                    if command_message.command_id_client.user_id == player_id {
-                        self.unconfirmed_local_commands.retain(|unconfirmed| {
-                            unconfirmed.command_message.command_id_client.sequence_number 
-                                != command_message.command_id_client.sequence_number
-                        });
-                    }
+                if let Some(predicted_state) = &mut self.predicted_state {
+                    predicted_state.apply_event(event.clone(), None);
+                    self.rebuild_predicted_state(current_ts)?;
                 }
-                
-                // Rebuild predicted state
-                self.rebuild_predicted_state()?;
             }
             GameEvent::Snapshot { game_state } => {
-                // Full state sync - clear unconfirmed commands and reset
+                // Full state sync - reset both states
                 self.committed_state = game_state.clone();
-                self.unconfirmed_local_commands.clear();
                 self.predicted_state = Some(game_state.clone());
+                // Rebuild to advance predicted state to current time
+                self.rebuild_predicted_state(current_ts)?;
             }
             _ => {
-                // Other events just need to be applied to predicted state too
+                // Other events need to be applied to predicted state too
                 if let Some(predicted_state) = &mut self.predicted_state {
                     predicted_state.apply_event(event.clone(), None);
                 }
@@ -182,15 +146,17 @@ impl GameEngine {
         Ok(())
     }
     
-    /// Rebuild predicted state from committed state + unconfirmed commands
-    fn rebuild_predicted_state(&mut self) -> Result<()> {
+    /// Rebuild predicted state from committed state and advance to current time
+    fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
         // Clone committed state as base
         self.predicted_state = Some(self.committed_state.clone());
         
+        // Advance predicted state to current time
+        let predicted_target_tick = ((current_ts - self.start_ms) / self.tick_duration_ms as i64) as u32;
+        
         if let Some(predicted_state) = &mut self.predicted_state {
-            // Re-apply all unconfirmed commands
-            for unconfirmed in &self.unconfirmed_local_commands {
-                predicted_state.schedule_command(&unconfirmed.command_message);
+            while predicted_state.current_tick() < predicted_target_tick {
+                predicted_state.tick_forward()?;
             }
         }
         
