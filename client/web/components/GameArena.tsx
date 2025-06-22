@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
+import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, CanvasRef } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
@@ -13,8 +14,16 @@ export default function GameArena() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
-  const { gameState: serverGameState, sendCommand: sendServerCommand, connected, sendGameCommand, lastGameEvent } = useGameWebSocket();
+  const {
+    gameState: serverGameState,
+    sendCommand: sendServerCommand,
+    connected,
+    sendGameCommand,
+    lastGameEvent
+  } = useGameWebSocket();
+
   const { user } = useAuth();
+  const { latencyMs } = useWebSocket();
   
   // Use game engine for client-side prediction
   const {
@@ -32,7 +41,8 @@ export default function GameArena() {
     onCommandReady: (commandMessage) => {
       // Send command to server
       sendGameCommand(commandMessage);
-    }
+    },
+    latencyMs
   });
   
   const [score, setScore] = useState(0);

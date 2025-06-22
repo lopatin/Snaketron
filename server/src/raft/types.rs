@@ -31,7 +31,6 @@ pub enum ClientRequest {
         game_id: u32,
         user_id: u32,
         command: GameCommandMessage,
-        current_tick: u64, // Server's view of current game tick
     },
 }
 
@@ -80,6 +79,5 @@ pub enum StateChangeEvent {
         game_id: u32,
         user_id: u32,
         command: GameCommandMessage,
-        tick_submitted: u64,
     },
 }

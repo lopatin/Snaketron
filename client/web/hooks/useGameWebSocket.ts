@@ -107,6 +107,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         } else if (event.SnakeTurned || event.SnakeDied) {
           // These need full state updates from server
           console.log('Snake event (need full state):', event);
+        } else if (event.CommandScheduled) {
+          // CommandScheduled events need to be passed to the game engine
+          console.log('CommandScheduled event:', event.CommandScheduled);
         } else {
           // Other events
           console.log('Unhandled game event:', event);

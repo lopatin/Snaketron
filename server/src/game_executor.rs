@@ -54,10 +54,9 @@ async fn run_game(
                     StateChangeEvent::GameCommandSubmitted { 
                         game_id: cmd_game_id, 
                         user_id, 
-                        command, 
-                        tick_submitted 
+                        command
                     } if cmd_game_id == game_id => {
-                        debug!("Processing command for game {} from user {} submitted at tick {}", game_id, user_id, tick_submitted);
+                        debug!("Processing command for game {} from user {}", game_id, user_id);
                         
                         // Process the command through the game engine
                         match engine.process_command(command) {
@@ -215,9 +214,9 @@ pub async fn run_game_executor(
                         }
                     }
                     
-                    StateChangeEvent::GameCommandSubmitted { game_id, user_id, command, tick_submitted } => {
+                    StateChangeEvent::GameCommandSubmitted { game_id, user_id, command } => {
                         // The game executor will poll for these commands in the game loop
-                        debug!("Command submitted for game {} by user {} at tick {}", game_id, user_id, tick_submitted);
+                        debug!("Command submitted for game {} by user {}", game_id, user_id);
                     }
                     
                     _ => {

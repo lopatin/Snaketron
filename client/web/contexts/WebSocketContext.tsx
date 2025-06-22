@@ -29,10 +29,13 @@ export const useWebSocket = (): WebSocketContextType => {
 
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number>(0);
   const ws = useRef<WebSocket | null>(null);
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
   const onConnectCallback = useRef<(() => void) | null>(null);
+  const pingTimeout = useRef<NodeJS.Timeout | null>(null);
+  const pingSentTime = useRef<number | null>(null);
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
@@ -59,6 +62,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (typeof window !== 'undefined') {
           window.__wsInstance = ws.current || undefined;
         }
+        
+        // Start latency measurement
+        const measureLatency = () => {
+          if (ws.current?.readyState === WebSocket.OPEN) {
+            pingSentTime.current = Date.now();
+            ws.current.send(JSON.stringify('Ping'));
+            // Measure latency every 5 seconds
+            pingTimeout.current = setTimeout(measureLatency, 5000);
+          }
+        };
+        measureLatency();
+        
         // Call the onConnect callback if provided
         if (onConnectCallback.current) {
           onConnectCallback.current();
@@ -68,6 +83,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       ws.current.onclose = () => {
         console.log('WebSocket disconnected');
         setIsConnected(false);
+        // Clear ping timeout
+        if (pingTimeout.current) {
+          clearTimeout(pingTimeout.current);
+          pingTimeout.current = null;
+        }
         // Auto-reconnect after 2 seconds
         reconnectTimeout.current = setTimeout(() => {
           console.log('Attempting to reconnect...');
@@ -83,14 +103,22 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         try {
           const message = JSON.parse(event.data);
           console.log('WebSocket message received:', message);
-          
-          // Extract message type from enum-style format
-          const messageType = Object.keys(message)[0];
-          const messageData = message[messageType];
-          
-          // Call registered handlers for this message type
-          const handlers = messageHandlers.current.get(messageType) || [];
-          handlers.forEach((handler: MessageHandler) => handler({ type: messageType, data: messageData }));
+
+          // Handle Pong response for latency measurement
+          if (message === 'Pong' && pingSentTime.current !== null) {
+            const latency = Math.round((Date.now() - pingSentTime.current) / 2);
+            setLatencyMs(latency);
+            console.log('WebSocket latency:', latency, 'ms');
+            pingSentTime.current = null;
+          } else {
+            // Extract message type from enum-style format
+            const messageType = Object.keys(message)[0];
+            const messageData = message[messageType];
+
+            // Call registered handlers for this message type
+            const handlers = messageHandlers.current.get(messageType) || [];
+            handlers.forEach((handler: MessageHandler) => handler({type: messageType, data: messageData}));
+          }
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
         }
@@ -104,6 +132,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (reconnectTimeout.current) {
       clearTimeout(reconnectTimeout.current);
       reconnectTimeout.current = null;
+    }
+    if (pingTimeout.current) {
+      clearTimeout(pingTimeout.current);
+      pingTimeout.current = null;
     }
     if (ws.current) {
       ws.current.close();
@@ -148,6 +180,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     sendMessage,
     onMessage,
     connect,
+    latencyMs,
   };
 
   // Expose context for testing

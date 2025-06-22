@@ -2,17 +2,12 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
 
-declare global {
-  interface Window {
-    wasm: any;
-  }
-}
-
 interface UseGameEngineProps {
   gameId: string;
   playerId?: number;
   initialState?: GameState;
   onCommandReady?: (commandMessage: any) => void;
+  latencyMs?: number;
 }
 
 interface UseGameEngineReturn {
@@ -47,13 +42,22 @@ export const useGameEngine = ({
   gameId,
   playerId,
   initialState,
-  onCommandReady
+  onCommandReady,
+  latencyMs = 0
 }: UseGameEngineProps): UseGameEngineReturn => {
   const engineRef = useRef<GameClient | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const [gameState, setGameState] = useState<GameState | null>(initialState || null);
   const [isRunning, setIsRunning] = useState(false);
+  const initialStateRef = useRef<GameState | undefined>(initialState);
+  const engineGameIdRef = useRef<string | null>(null);
+  const latencyMsRef = useRef(latencyMs);
+
+  // Update latency ref when it changes
+  useEffect(() => {
+    latencyMsRef.current = latencyMs;
+  }, [latencyMs]);
 
   // Game loop - no dependencies to avoid recreation
   const runGameLoop = useCallback(() => {
@@ -93,10 +97,25 @@ export const useGameEngine = ({
     }
   }, []); // No dependencies - uses refs instead
 
+  // Update initial state ref when it changes
+  useEffect(() => {
+    if (initialState && !initialStateRef.current) {
+      initialStateRef.current = initialState;
+    }
+  }, [initialState]);
+
   // Initialize game engine
   useEffect(() => {
+    console.log('useGameEngine effect running - gameId:', gameId, 'playerId:', playerId);
+    
     const initEngine = async () => {
       try {
+        // Check if engine already exists for this game
+        if (engineRef.current && engineGameIdRef.current === gameId) {
+          console.log('Engine already initialized for game:', gameId);
+          return;
+        }
+
         // Wait for WASM to be initialized
         if (!window.wasm) {
           console.log('Waiting for WASM to initialize...');
@@ -104,39 +123,43 @@ export const useGameEngine = ({
           return;
         }
 
-        let engine: GameClient;
-        if (initialState) {
-          console.log('Creating engine from initial state - tick:', initialState.tick, 'status:', initialState.status);
-          const convertedState = convertGameState(initialState);
-          
-          // Calculate start time based on current tick and tick duration
-          const tickDuration = 
-            (typeof initialState.game_type === 'object' && 'Custom' in initialState.game_type) 
-              ? initialState.game_type.Custom.settings.tick_duration_ms 
-              : 300;
-          const currentMs = Date.now();
-          const gameElapsedMs = initialState.tick * tickDuration;
-          const startMs = BigInt(currentMs - gameElapsedMs);
-          
-          console.log('Calculated start time - currentMs:', currentMs, 'gameElapsedMs:', gameElapsedMs, 'startMs:', startMs);
-          
-          engine = window.wasm.GameClient.newFromState(
-            parseInt(gameId),
-            startMs,
-            JSON.stringify(convertedState)
-          );
-        } else {
-          console.log('Creating new engine without initial state');
-          const startMs = BigInt(Date.now());
-          engine = new window.wasm.GameClient(parseInt(gameId), startMs);
+        // Wait for initial state if we don't have it yet
+        if (!initialStateRef.current) {
+          console.log('Waiting for initial state...');
+          setTimeout(initEngine, 100);
+          return;
         }
+
+        let engine: GameClient;
+        const state = initialStateRef.current;
+        console.log('Creating engine from initial state - tick:', state.tick, 'status:', state.status);
+        const convertedState = convertGameState(state);
+        
+        // Calculate start time based on current tick and tick duration, compensating for latency
+        const tickDuration = 
+          (typeof state.game_type === 'object' && 'Custom' in state.game_type) 
+            ? state.game_type.Custom.settings.tick_duration_ms 
+            : 300;
+        const currentMs = Date.now();
+        const gameElapsedMs = state.tick * tickDuration;
+        // Subtract latency to compensate for network delay
+        const startMs = BigInt(currentMs - gameElapsedMs - latencyMsRef.current);
+        
+        console.log('Calculated start time - currentMs:', currentMs, 'gameElapsedMs:', gameElapsedMs, 'latencyMs:', latencyMsRef.current, 'startMs:', startMs);
+        
+        engine = window.wasm.GameClient.newFromState(
+          parseInt(gameId),
+          startMs,
+          JSON.stringify(convertedState)
+        );
         
         if (playerId !== undefined) {
           engine.setLocalPlayerId(playerId);
         }
         
         engineRef.current = engine;
-        console.log('Game engine initialized successfully');
+        engineGameIdRef.current = gameId;
+        console.log('Game engine initialized successfully for game:', gameId);
         
         // If we're already supposed to be running, start the game loop
         if (isRunningRef.current) {
@@ -151,11 +174,14 @@ export const useGameEngine = ({
     initEngine();
 
     return () => {
+      console.log('useGameEngine cleanup - gameId:', gameId);
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
       }
+      // Don't clear the engine here - let the next effect run decide if it needs to reinitialize
     };
-  }, [gameId, playerId, initialState, runGameLoop]);
+  }, [gameId, playerId, runGameLoop]);
 
   // Start/stop engine
   const startEngine = useCallback(() => {
@@ -209,6 +235,7 @@ export const useGameEngine = ({
 
       // Parse and send to server
       const commandMessage = JSON.parse(commandMessageJson);
+      console.log('Command message from engine:', commandMessage);
       onCommandReady?.(commandMessage);
     } catch (error) {
       console.error('Failed to process command:', error);

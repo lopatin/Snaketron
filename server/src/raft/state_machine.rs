@@ -30,8 +30,8 @@ pub struct GameStateMachine {
     pub servers: HashMap<u64, ServerRegistration>,
     pub last_applied_log: u64,
     /// Latest command per user per game
-    /// Key: (game_id, user_id), Value: (command, tick_submitted)
-    pub user_commands: HashMap<(u32, u32), (GameCommandMessage, u64)>,
+    /// Key: (game_id, user_id), Value: command
+    pub user_commands: HashMap<(u32, u32), GameCommandMessage>,
 }
 
 impl GameStateMachine {
@@ -151,16 +151,16 @@ impl GameStateMachine {
                 }
             }
             
-            ClientRequest::SubmitGameCommand { game_id, user_id, command, current_tick } => {
+            ClientRequest::SubmitGameCommand { game_id, user_id, command } => {
                 // Verify the game exists
                 if !self.game_states.contains_key(game_id) {
                     warn!("Attempted to submit command for unknown game {}", game_id);
                     return Ok((ClientResponse::Error(format!("Unknown game ID: {}", game_id)), vec![]));
                 }
                 
-                // Store the command with the current tick
+                // Store the command
                 let key = (*game_id, *user_id);
-                self.user_commands.insert(key, (command.clone(), *current_tick));
+                self.user_commands.insert(key, command.clone());
                 
                 // Emit state change event
                 if let Some(ref mut events) = out {
@@ -168,11 +168,10 @@ impl GameStateMachine {
                         game_id: *game_id,
                         user_id: *user_id,
                         command: command.clone(),
-                        tick_submitted: *current_tick,
                     });
                 }
                 
-                debug!("User {} submitted command for game {} at tick {}", user_id, game_id, current_tick);
+                debug!("User {} submitted command for game {}", user_id, game_id);
                 ClientResponse::Success
             }
         };

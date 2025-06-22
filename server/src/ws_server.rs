@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tokio::time::Sleep;
+use tokio::time::{Sleep, sleep};
 use tokio_stream::StreamExt;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -728,15 +728,11 @@ async fn process_ws_message(
         ConnectionState::InGame { metadata, game_id } => {
             match ws_message {
                 WSMessage::GameCommand(command_message) => {
-                    // Get current game tick from Raft
-                    let current_tick = raft.get_game_tick(game_id).await.unwrap_or(0);
-                    
                     // Submit command to Raft
                     let request = crate::raft::ClientRequest::SubmitGameCommand {
                         game_id,
                         user_id: metadata.user_id as u32,
                         command: command_message,
-                        current_tick: current_tick as u64,
                     };
                     
                     match raft.propose(request).await {
