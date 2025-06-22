@@ -71,8 +71,68 @@ export const useGameEngine = ({
       const now = BigInt(Date.now());
       
       // Run engine until current time
+      const lastTick = engineRef.current.getCurrentTick()
+
       engineRef.current.runUntil(now);
-      
+
+      const currentTick = engineRef.current.getCurrentTick();
+
+      if (currentTick !== lastTick) {
+        // Get both committed and predicted states
+        const committedStateJson = engineRef.current.getCommittedStateJson();
+        const predictedStateJson = engineRef.current.getGameStateJson();
+        const eventLogJson = engineRef.current.getEventLogJson();
+        
+        // Parse the states
+        const committedState = JSON.parse(committedStateJson);
+        const predictedState = JSON.parse(predictedStateJson);
+        const eventLog = JSON.parse(eventLogJson);
+        
+        // Extract snake positions (deep clone)
+        const committedSnakes = JSON.parse(JSON.stringify(
+          committedState.arena.snakes.map((snake: any, idx: number) => ({
+            index: idx,
+            is_alive: snake.is_alive,
+            direction: snake.direction,
+            body: snake.body.slice(0, 5), // First 5 positions for brevity
+            length: snake.body.length
+          }))
+        ));
+        
+        const predictedSnakes = JSON.parse(JSON.stringify(
+          predictedState.arena.snakes.map((snake: any, idx: number) => ({
+            index: idx,
+            is_alive: snake.is_alive,
+            direction: snake.direction,
+            body: snake.body.slice(0, 5), // First 5 positions for brevity
+            length: snake.body.length
+          }))
+        ));
+        
+        // Extract pending commands from event log
+        const pendingCommands = JSON.parse(JSON.stringify(
+          eventLog
+            .filter((event: any) => event.event.CommandScheduled)
+            .map((event: any) => ({
+              tick: event.tick,
+              user_id: event.user_id,
+              command: event.event.CommandScheduled.command_message.command
+            }))
+        ));
+        
+        // Log the detailed state
+        console.log(
+          `${new Date().toISOString()} Game State Update\n` +
+          `Tick: ${lastTick} → ${currentTick}\n` +
+          `\n--- COMMITTED STATE (tick ${committedState.tick}) ---\n` +
+          `Snakes: ${JSON.stringify(committedSnakes, null, 2)}\n` +
+          `\n--- PREDICTED STATE (tick ${predictedState.tick}) ---\n` +
+          `Snakes: ${JSON.stringify(predictedSnakes, null, 2)}\n` +
+          `\n--- PENDING COMMANDS ---\n` +
+          `${pendingCommands.length > 0 ? JSON.stringify(pendingCommands, null, 2) : 'None'}\n`
+        );
+      }
+
       // Update game state
       const stateJson = engineRef.current.getGameStateJson();
       const newState = JSON.parse(stateJson);

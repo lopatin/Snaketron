@@ -17,8 +17,7 @@ export default function GameArena() {
   const {
     gameState: serverGameState,
     sendCommand: sendServerCommand,
-    connected,
-    sendGameCommand,
+    connected, sendGameCommand,
     lastGameEvent
   } = useGameWebSocket();
 
