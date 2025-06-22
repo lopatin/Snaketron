@@ -207,6 +207,8 @@ pub struct GameState {
     // Custom game fields
     pub game_code: Option<String>,
     pub host_user_id: Option<u32>,
+    // Game start timestamp in milliseconds
+    pub start_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -266,7 +268,8 @@ impl GameState {
         width: u16, 
         height: u16, 
         game_type: GameType, 
-        rng_seed: Option<u64>
+        rng_seed: Option<u64>,
+        start_ms: i64
     ) -> Self {
         // Calculate food target based on custom settings or defaults
         let available_food_target = match &game_type {
@@ -299,6 +302,7 @@ impl GameState {
             rng: rng_seed.map(PseudoRandom::new),
             game_code: None,
             host_user_id: None,
+            start_ms,
         }
     }
 

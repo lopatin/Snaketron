@@ -938,11 +938,13 @@ async fn create_custom_game(
         .await?;
     
     // Create game state
+    let start_ms = chrono::Utc::now().timestamp_millis();
     let mut game_state = common::GameState::new(
         settings.arena_width,
         settings.arena_height,
         common::GameType::Custom { settings },
         Some(rand::random::<u64>()),
+        start_ms,
     );
     game_state.game_code = Some(game_code.clone());
     game_state.host_user_id = Some(user_id as u32);
@@ -998,11 +1000,13 @@ async fn create_solo_game(
     .await?;
     
     // Create game state with one player
+    let start_ms = chrono::Utc::now().timestamp_millis();
     let mut game_state = common::GameState::new(
         settings.arena_width,
         settings.arena_height,
         common::GameType::Custom { settings: settings.clone() },
         Some(rand::random::<u64>()),
+        start_ms,
     );
     
     // Add the player (only one player for solo mode)

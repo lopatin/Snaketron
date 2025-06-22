@@ -54,6 +54,7 @@ export interface GameState {
   game_ended?: boolean;
   final_score?: number;
   duration?: number;
+  start_ms: number;
 }
 
 export type GameStatus = 

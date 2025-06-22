@@ -22,8 +22,8 @@ impl GameEngine {
     pub fn new(game_id: u32, start_ms: i64) -> Self {
         GameEngine {
             game_id,
-            committed_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None),
-            predicted_state: Some(GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None)),
+            committed_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms),
+            predicted_state: Some(GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms)),
             event_log: Vec::new(),
             tick_duration_ms: 300,
             committed_state_lag_ms: 500,
@@ -50,8 +50,8 @@ impl GameEngine {
         
         GameEngine {
             game_id,
-            committed_state: GameState::new(width, height, game_type.clone(), Some(rng_seed)),
-            predicted_state: Some(GameState::new(width, height, game_type, None)), // Client prediction doesn't need RNG
+            committed_state: GameState::new(width, height, game_type.clone(), Some(rng_seed), start_ms),
+            predicted_state: Some(GameState::new(width, height, game_type, None, start_ms)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
             tick_duration_ms,
             committed_state_lag_ms: 500,
@@ -68,6 +68,13 @@ impl GameEngine {
             _ => 300, // Default for non-custom games
         };
         
+        // Use start_ms from game_state if available, otherwise use the provided start_ms
+        let actual_start_ms = if game_state.start_ms != 0 {
+            game_state.start_ms
+        } else {
+            start_ms
+        };
+        
         GameEngine {
             game_id,
             committed_state: game_state.clone(),
@@ -76,7 +83,7 @@ impl GameEngine {
             tick_duration_ms,
             committed_state_lag_ms: 500,
             local_player_id: None,
-            start_ms,
+            start_ms: actual_start_ms,
             command_counter: 0,
         }
     }

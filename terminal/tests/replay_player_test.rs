@@ -7,7 +7,8 @@ use std::time::SystemTime;
 #[test]
 fn test_replay_player_with_tick_forward() -> Result<()> {
     // Create initial game state
-    let mut initial_state = GameState::new(20, 20, common::GameType::FreeForAll { max_players: 2 }, Some(12345));
+    let start_ms = 1700000000000; // Fixed timestamp for testing
+    let mut initial_state = GameState::new(20, 20, common::GameType::FreeForAll { max_players: 2 }, Some(12345), start_ms);
     initial_state.add_player(1)?;
     initial_state.add_player(2)?;
     initial_state.status = GameStatus::Started { server_id: 1 };

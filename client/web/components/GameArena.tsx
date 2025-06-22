@@ -144,7 +144,7 @@ export default function GameArena() {
           // Check if snake is dead
           if (!snake.is_alive && !gameOver) {
             setGameOver(true);
-            stopEngine(); // Stop the engine when game ends
+            // stopEngine(); // Stop the engine when game ends
           }
         }
       }
@@ -153,7 +153,7 @@ export default function GameArena() {
     // Also check if game status is Ended
     if (gameState && 'Ended' in gameState.status && !gameOver) {
       setGameOver(true);
-      stopEngine(); // Stop the engine when game ends
+      // stopEngine(); // Stop the engine when game ends
     }
   }, [gameState, user?.id, gameOver, stopEngine]);
 

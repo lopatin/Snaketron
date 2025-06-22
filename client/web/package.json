@@ -8,7 +8,9 @@
   },
   "scripts": {
     "build": "webpack --config webpack.config.js",
-    "start": "webpack-dev-server --port 3000",
+    "kill-port": "lsof -ti:3000 | xargs kill -9 2>/dev/null || true",
+    "start": "npm run kill-port && webpack-dev-server --port 3000",
+    "stop": "npm run kill-port",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",

@@ -326,7 +326,8 @@ async fn create_adaptive_match(
     // Create game state with players
     let game_type_enum: GameType = serde_json::from_value(game_type.clone())
         .map_err(|e| anyhow::anyhow!("Failed to deserialize game type: {}", e))?;
-    let mut game_state = GameState::new(40, 40, game_type_enum, None);
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let mut game_state = GameState::new(40, 40, game_type_enum, None, start_ms);
     
     // Add players to the game state
     for user_id in user_ids.iter() {

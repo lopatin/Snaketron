@@ -195,20 +195,13 @@ export const useGameEngine = ({
 
         let engine: GameClient;
         const state = initialStateRef.current;
-        console.log('Creating engine from initial state - tick:', state.tick, 'status:', state.status);
+        console.log('Creating engine from initial state - tick:', state.tick, 'status:', state.status, 'start_ms:', state.start_ms);
         const convertedState = convertGameState(state);
         
-        // Calculate start time based on current tick and tick duration, compensating for latency
-        const tickDuration = 
-          (typeof state.game_type === 'object' && 'Custom' in state.game_type) 
-            ? state.game_type.Custom.settings.tick_duration_ms 
-            : 300;
-        const currentMs = Date.now();
-        const gameElapsedMs = state.tick * tickDuration;
-        // Subtract latency to compensate for network delay
-        const startMs = BigInt(currentMs - gameElapsedMs - latencyMsRef.current);
+        // Use start_ms from the game state directly
+        const startMs = BigInt(state.start_ms);
         
-        console.log('Calculated start time - currentMs:', currentMs, 'gameElapsedMs:', gameElapsedMs, 'latencyMs:', latencyMsRef.current, 'startMs:', startMs);
+        console.log('Using start time from game state - startMs:', startMs);
         
         engine = window.wasm.GameClient.newFromState(
           parseInt(gameId),

@@ -30,7 +30,8 @@ async fn test_replay_with_tick_forward() -> Result<()> {
     }).await?;
     
     // Create a simple game
-    let mut game_state = GameState::new(20, 20, GameType::FreeForAll { max_players: 2 }, Some(12345));
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let mut game_state = GameState::new(20, 20, GameType::FreeForAll { max_players: 2 }, Some(12345), start_ms);
     game_state.add_player(1)?;
     game_state.add_player(2)?;
     game_state.status = GameStatus::Started { server_id: server.id() };

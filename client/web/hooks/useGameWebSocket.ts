@@ -169,7 +169,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
             // This will be overridden when we get the actual game state
             0: { user_id: 0, snake_id: 0 }
           },
-          game_id: String(message.data.game_id)
+          game_id: String(message.data.game_id),
+          start_ms: Date.now()  // Initialize with current time as a temporary workaround
         };
         
         console.log('Setting initial game state:', initialGameState);
