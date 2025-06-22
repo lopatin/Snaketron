@@ -1,7 +1,7 @@
 mod render;
 
 use wasm_bindgen::prelude::*;
-use common::{GameEngine, GameCommand, Direction, GameEvent, GameState};
+use common::{GameEngine, GameCommand, Direction, GameEvent, GameEventMessage, GameState};
 use serde_json;
 
 /// The main client-side game interface exposed to JavaScript.
@@ -80,11 +80,11 @@ impl GameClient {
     
     /// Process a server event for reconciliation
     #[wasm_bindgen(js_name = processServerEvent)]
-    pub fn process_server_event(&mut self, event_json: &str, current_ts: i64) -> Result<(), JsValue> {
-        let event: GameEvent = serde_json::from_str(event_json)
+    pub fn process_server_event(&mut self, event_message_json: &str, current_ts: i64) -> Result<(), JsValue> {
+        let event_message: GameEventMessage = serde_json::from_str(event_message_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        self.engine.process_server_event(&event, current_ts)
+        self.engine.process_server_event(&event_message, current_ts)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
     
@@ -94,9 +94,15 @@ impl GameClient {
         let game_state: GameState = serde_json::from_str(state_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        // Process as a snapshot event
-        let event = GameEvent::Snapshot { game_state };
-        self.engine.process_server_event(&event, current_ts)
+        // Create a GameEventMessage with the snapshot event
+        let event_message = GameEventMessage {
+            game_id: self.engine.game_id(),
+            tick: game_state.current_tick(),
+            user_id: None,
+            event: GameEvent::Snapshot { game_state },
+        };
+        
+        self.engine.process_server_event(&event_message, current_ts)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

@@ -36,11 +36,11 @@ export class GameClient {
   /**
    * Process a server event for reconciliation
    */
-  processServerEvent(event_json: string): void;
+  processServerEvent(event_message_json: string, current_ts: bigint): void;
   /**
    * Initialize game state from a snapshot
    */
-  initializeFromSnapshot(state_json: string): void;
+  initializeFromSnapshot(state_json: string, current_ts: bigint): void;
   /**
    * Get the current game state as JSON
    */
@@ -74,8 +74,8 @@ export interface InitOutput {
   readonly gameclient_setLocalPlayerId: (a: number, b: number) => void;
   readonly gameclient_runUntil: (a: number, b: bigint) => [number, number, number, number];
   readonly gameclient_processTurn: (a: number, b: number, c: number, d: number) => [number, number, number, number];
-  readonly gameclient_processServerEvent: (a: number, b: number, c: number) => [number, number];
-  readonly gameclient_initializeFromSnapshot: (a: number, b: number, c: number) => [number, number];
+  readonly gameclient_processServerEvent: (a: number, b: number, c: number, d: bigint) => [number, number];
+  readonly gameclient_initializeFromSnapshot: (a: number, b: number, c: number, d: bigint) => [number, number];
   readonly gameclient_getGameStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getCommittedStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getEventLogJson: (a: number) => [number, number, number, number];

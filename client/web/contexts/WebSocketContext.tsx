@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { WebSocketContextType } from '../types';
+import { clockSync } from '../utils/clockSync';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -36,6 +37,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const onConnectCallback = useRef<(() => void) | null>(null);
   const pingTimeout = useRef<NodeJS.Timeout | null>(null);
   const pingSentTime = useRef<number | null>(null);
+  const syncRequestTimes = useRef<Map<number, number>>(new Map());
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
@@ -63,16 +65,30 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           window.__wsInstance = ws.current || undefined;
         }
         
-        // Start latency measurement
+        // Set up clock sync callback
+        clockSync.setOnSyncRequest((clientTime) => {
+          if (ws.current?.readyState === WebSocket.OPEN) {
+            syncRequestTimes.current.set(clientTime, clientTime);
+            ws.current.send(JSON.stringify({
+              ClockSyncRequest: { client_time: clientTime }
+            }));
+          }
+        });
+        
+        // Start clock synchronization
+        clockSync.start();
+        
+        // Keep legacy latency measurement for backward compatibility
         const measureLatency = () => {
           if (ws.current?.readyState === WebSocket.OPEN) {
             pingSentTime.current = Date.now();
             ws.current.send(JSON.stringify('Ping'));
-            // Measure latency every 5 seconds
-            pingTimeout.current = setTimeout(measureLatency, 5000);
+            // Measure latency every 10 seconds (less frequent since we have clock sync)
+            pingTimeout.current = setTimeout(measureLatency, 10000);
           }
         };
-        measureLatency();
+        // Delay initial ping to avoid conflict with clock sync
+        setTimeout(measureLatency, 1000);
         
         // Call the onConnect callback if provided
         if (onConnectCallback.current) {
@@ -88,6 +104,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           clearTimeout(pingTimeout.current);
           pingTimeout.current = null;
         }
+        // Reset clock sync
+        clockSync.reset();
         // Auto-reconnect after 2 seconds
         reconnectTimeout.current = setTimeout(() => {
           console.log('Attempting to reconnect...');
@@ -110,6 +128,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
             setLatencyMs(latency);
             console.log('WebSocket latency:', latency, 'ms');
             pingSentTime.current = null;
+          } else if (message.ClockSyncResponse) {
+            // Handle clock sync response
+            const { client_time, server_time } = message.ClockSyncResponse;
+            const t1 = syncRequestTimes.current.get(client_time);
+            if (t1) {
+              syncRequestTimes.current.delete(client_time);
+              const t3 = Date.now();
+              clockSync.processSyncResponse(t1, server_time, t3);
+              // Update latency with clock sync RTT as well
+              const rtt = t3 - t1;
+              setLatencyMs(Math.round(rtt / 2));
+            }
           } else {
             // Extract message type from enum-style format
             const messageType = Object.keys(message)[0];

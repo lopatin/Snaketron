@@ -8,8 +8,8 @@ export const gameclient_newFromState: (a: number, b: bigint, c: number, d: numbe
 export const gameclient_setLocalPlayerId: (a: number, b: number) => void;
 export const gameclient_runUntil: (a: number, b: bigint) => [number, number, number, number];
 export const gameclient_processTurn: (a: number, b: number, c: number, d: number) => [number, number, number, number];
-export const gameclient_processServerEvent: (a: number, b: number, c: number) => [number, number];
-export const gameclient_initializeFromSnapshot: (a: number, b: number, c: number) => [number, number];
+export const gameclient_processServerEvent: (a: number, b: number, c: number, d: bigint) => [number, number];
+export const gameclient_initializeFromSnapshot: (a: number, b: number, c: number, d: bigint) => [number, number];
 export const gameclient_getGameStateJson: (a: number) => [number, number, number, number];
 export const gameclient_getCommittedStateJson: (a: number) => [number, number, number, number];
 export const gameclient_getEventLogJson: (a: number) => [number, number, number, number];

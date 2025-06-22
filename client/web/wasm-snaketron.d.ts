@@ -32,7 +32,7 @@ declare module 'wasm-snaketron' {
     setLocalPlayerId(playerId: number): void;
     runUntil(timestampMs: bigint): string;
     processTurn(snakeId: number, direction: string): string;
-    processServerEvent(eventJson: string, currentTs: bigint): void;
+    processServerEvent(eventMessageJson: string, currentTs: bigint): void;
     initializeFromSnapshot(stateJson: string, currentTs: bigint): void;
     getGameStateJson(): string;
     getCommittedStateJson(): string;

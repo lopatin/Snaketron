@@ -116,18 +116,19 @@ impl GameEngine {
 
 
     /// Process a server event and reconcile with local predictions
-    pub fn process_server_event(&mut self, event: &GameEvent, current_ts: i64) -> Result<()> {
-        // Apply event to committed state
-        self.committed_state.apply_event(event.clone(), None);
+    pub fn process_server_event(&mut self, event_message: &GameEventMessage, current_ts: i64) -> Result<()> {
+        // For CommandScheduled events, we can skip them as they're already handled locally
+        if matches!(event_message.event, GameEvent::CommandScheduled { .. }) {
+            return Ok(());
+        }
         
-        // Handle specific events that require reconciliation
-        match event {
-            GameEvent::CommandScheduled { command_message } => {
-                if let Some(predicted_state) = &mut self.predicted_state {
-                    predicted_state.apply_event(event.clone(), None);
-                    self.rebuild_predicted_state(current_ts)?;
-                }
-            }
+        // Step the committed state forward to the event tick before applying the event
+        // This ensures events are applied at the correct tick (similar to ReplayViewer)
+        while self.committed_state.current_tick() < event_message.tick {
+            self.committed_state.tick_forward()?;
+        }
+        
+        match &event_message.event {
             GameEvent::Snapshot { game_state } => {
                 // Full state sync - reset both states
                 self.committed_state = game_state.clone();
@@ -136,10 +137,11 @@ impl GameEngine {
                 self.rebuild_predicted_state(current_ts)?;
             }
             _ => {
-                // Other events need to be applied to predicted state too
-                if let Some(predicted_state) = &mut self.predicted_state {
-                    predicted_state.apply_event(event.clone(), None);
-                }
+                // Apply event to committed state
+                self.committed_state.apply_event(event_message.event.clone(), None);
+                
+                // Rebuild predicted state from committed state
+                self.rebuild_predicted_state(current_ts)?;
             }
         }
         

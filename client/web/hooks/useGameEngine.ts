@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
+import { getClockDrift } from '../utils/clockSync';
 
 interface UseGameEngineProps {
   gameId: string;
@@ -68,7 +69,9 @@ export const useGameEngine = ({
     }
 
     try {
-      const now = BigInt(Date.now());
+      // Apply clock drift compensation to get server-synchronized time
+      const clockDrift = getClockDrift();
+      const now = BigInt(Date.now() - Math.round(clockDrift));
       
       // Run engine until current time
       const lastTick = engineRef.current.getCurrentTick()
@@ -303,11 +306,27 @@ export const useGameEngine = ({
   }, [playerId, onCommandReady]);
 
   // Process server event for reconciliation
-  const processServerEvent = useCallback((event: any) => {
+  const processServerEvent = useCallback((eventMessage: any) => {
     if (!engineRef.current) return;
 
     try {
+      // Check if it's just an event or a full event message
+      let fullEventMessage = eventMessage;
+      
+      // If we only received the event, we need to wrap it in a GameEventMessage
+      // This handles backward compatibility
+      if (!eventMessage.game_id && !eventMessage.tick && !eventMessage.event) {
+        console.warn('Received bare event, wrapping in GameEventMessage structure');
+        fullEventMessage = {
+          game_id: parseInt(gameId || '0'),
+          tick: 0, // The server should provide the tick
+          user_id: null,
+          event: eventMessage
+        };
+      }
+      
       // Handle SoloGameEnded event specially
+      const event = fullEventMessage.event || fullEventMessage;
       if (event.SoloGameEnded) {
         console.log('Processing SoloGameEnded event');
         // Update the local game state to mark it as ended
@@ -326,21 +345,26 @@ export const useGameEngine = ({
       }
       
       // Convert the event if it contains a Snapshot with game state
-      let convertedEvent = event;
       if (event.Snapshot && event.Snapshot.game_state) {
-        convertedEvent = {
-          ...event,
-          Snapshot: {
-            game_state: convertGameState(event.Snapshot.game_state)
+        fullEventMessage = {
+          ...fullEventMessage,
+          event: {
+            ...event,
+            Snapshot: {
+              game_state: convertGameState(event.Snapshot.game_state)
+            }
           }
         };
       }
-      const currentTs = BigInt(Date.now());
-      engineRef.current.processServerEvent(JSON.stringify(convertedEvent), currentTs);
+      
+      // Apply clock drift compensation when processing server events
+      const clockDrift = getClockDrift();
+      const currentTs = BigInt(Date.now() - Math.round(clockDrift));
+      engineRef.current.processServerEvent(JSON.stringify(fullEventMessage), currentTs);
     } catch (error) {
       console.error('Failed to process server event:', error);
     }
-  }, []);
+  }, [gameId]);
 
   return {
     gameEngine: engineRef.current,

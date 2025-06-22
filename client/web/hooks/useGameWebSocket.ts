@@ -40,24 +40,19 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('GameEvent', (message: any) => {
         console.log('Received GameEvent message:', message);
         
-        // The message structure might be different - let's handle it safely
-        const eventData = message.GameEvent || message.data || message;
+        // The message contains the full GameEventMessage from the server
+        const eventMessage = message.GameEvent || message.data || message;
         
-        if (!eventData) {
+        if (!eventMessage) {
           console.error('Invalid GameEvent message structure:', message);
           return;
         }
         
-        // Check if event property exists
-        const event = eventData.event || eventData;
+        // Store the full event message (including tick) for the game engine to process
+        setLastGameEvent(eventMessage);
         
-        if (!event) {
-          console.error('No event data found in GameEvent:', eventData);
-          return;
-        }
-        
-        // Store the event for the game engine to process
-        setLastGameEvent(event);
+        // Also extract just the event for local state updates
+        const event = eventMessage.event || eventMessage;
         
         // Handle different event types
         if (event.Snapshot) {

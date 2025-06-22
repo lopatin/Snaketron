@@ -31,6 +31,9 @@ pub enum WSMessage {
     Shutdown,
     Ping,
     Pong,
+    // Clock synchronization messages
+    ClockSyncRequest { client_time: i64 },
+    ClockSyncResponse { client_time: i64, server_time: i64 },
     // Matchmaking messages
     QueueForMatch { game_type: common::GameType },
     LeaveQueue,
@@ -606,6 +609,14 @@ async fn process_ws_message(
                     ws_stream.send(pong_msg).await?;
                     Ok(ConnectionState::Authenticated { metadata })
                 }
+                WSMessage::ClockSyncRequest { client_time } => {
+                    // Respond with server time for clock synchronization
+                    let server_time = chrono::Utc::now().timestamp_millis();
+                    let response = WSMessage::ClockSyncResponse { client_time, server_time };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_stream.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated { metadata })
+                }
                 WSMessage::GameEvent(event_msg) => {
                     // Forward game events to the client
                     warn!("Received game event in authenticated state: {:?}", event_msg);
@@ -751,6 +762,14 @@ async fn process_ws_message(
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
                     ws_stream.send(pong_msg).await?;
+                    Ok(ConnectionState::InGame { metadata, game_id })
+                }
+                WSMessage::ClockSyncRequest { client_time } => {
+                    // Respond with server time for clock synchronization
+                    let server_time = chrono::Utc::now().timestamp_millis();
+                    let response = WSMessage::ClockSyncResponse { client_time, server_time };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_stream.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::StartCustomGame => {

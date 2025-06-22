@@ -147,6 +147,14 @@ impl CommandQueue {
         }
     }
     
+    pub fn has_commands_for_tick(&self, tick: u32) -> bool {
+        if let Some(command_message) = self.queue.peek() {
+            command_message.tick() <= tick
+        } else {
+            false
+        }
+    }
+    
     pub fn push(&mut self, command_message: GameCommandMessage) {
         if self.active_ids.insert(command_message.id().clone()) {
             self.queue.push(command_message.clone());
@@ -452,6 +460,10 @@ impl GameState {
     
     pub fn schedule_command(&mut self, command_message: &GameCommandMessage) {
         self.apply_event(GameEvent::CommandScheduled { command_message: command_message.clone() }, None);
+    }
+    
+    pub fn has_scheduled_commands(&self, tick: u32) -> bool {
+        self.command_queue.has_commands_for_tick(tick)
     }
     
     pub fn join(&mut self, _user_id: u32) {

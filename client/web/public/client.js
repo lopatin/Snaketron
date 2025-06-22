@@ -238,12 +238,13 @@ export class GameClient {
     }
     /**
      * Process a server event for reconciliation
-     * @param {string} event_json
+     * @param {string} event_message_json
+     * @param {bigint} current_ts
      */
-    processServerEvent(event_json) {
-        const ptr0 = passStringToWasm0(event_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    processServerEvent(event_message_json, current_ts) {
+        const ptr0 = passStringToWasm0(event_message_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.gameclient_processServerEvent(this.__wbg_ptr, ptr0, len0);
+        const ret = wasm.gameclient_processServerEvent(this.__wbg_ptr, ptr0, len0, current_ts);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -251,11 +252,12 @@ export class GameClient {
     /**
      * Initialize game state from a snapshot
      * @param {string} state_json
+     * @param {bigint} current_ts
      */
-    initializeFromSnapshot(state_json) {
+    initializeFromSnapshot(state_json, current_ts) {
         const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.gameclient_initializeFromSnapshot(this.__wbg_ptr, ptr0, len0);
+        const ret = wasm.gameclient_initializeFromSnapshot(this.__wbg_ptr, ptr0, len0, current_ts);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
