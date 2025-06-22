@@ -32,8 +32,8 @@ module.exports = defineConfig({
     /* Force headless mode */
     headless: false,
     
-    /* Set viewport */
-    viewport: { width: 1280, height: 720 },
+    /* Set viewport - full screen vertically */
+    viewport: { width: 1280, height: 1080 },
   },
 
   /* Configure projects for major browsers */

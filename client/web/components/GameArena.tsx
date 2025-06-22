@@ -200,6 +200,11 @@ export default function GameArena() {
       return;
     }
     
+    // Expose game state for testing
+    if (process.env.NODE_ENV !== 'production') {
+      (window as any).__gameArenaState = gameState;
+    }
+    
     let animationId: number;
     const render = () => {
       try {
