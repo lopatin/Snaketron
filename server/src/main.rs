@@ -22,8 +22,17 @@ async fn main() -> Result<()> {
     // Load .env file if exists
     dotenv::dotenv().ok();
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with environment filter and log compatibility
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    
+    // Set up tracing subscriber with log compatibility
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+    
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // Database setup
     let db_host = env::var("SNAKETRON_DB_HOST")

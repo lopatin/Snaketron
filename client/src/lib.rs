@@ -19,6 +19,9 @@ impl GameClient {
         // Set panic hook for better error messages in browser console
         console_error_panic_hook::set_once();
         
+        // Initialize logging for WASM - this will send log messages to browser console
+        wasm_logger::init(wasm_logger::Config::default());
+        
         GameClient {
             engine: GameEngine::new(game_id, start_ms),
         }
@@ -29,6 +32,9 @@ impl GameClient {
     pub fn new_from_state(game_id: u32, start_ms: i64, state_json: &str) -> Result<GameClient, JsValue> {
         // Set panic hook for better error messages in browser console
         console_error_panic_hook::set_once();
+        
+        // Initialize logging for WASM - this will send log messages to browser console
+        wasm_logger::init(wasm_logger::Config::default());
         
         let game_state: GameState = serde_json::from_str(state_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;

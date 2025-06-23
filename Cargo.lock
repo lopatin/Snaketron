@@ -363,6 +363,7 @@ dependencies = [
  "console_error_panic_hook",
  "serde_json",
  "wasm-bindgen",
+ "wasm-logger",
  "web-sys",
 ]
 
@@ -371,6 +372,7 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "log",
  "macros",
  "quote",
  "serde",
@@ -3733,6 +3735,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a05d73b933a847d6cccdda8f838a22ff101ad9bf93e33684f39c1f5f0eece3d"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-logger"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "074649a66bb306c8f2068c9016395fa65d8e08d2affcbf95acf3c24c3ab19718"
+dependencies = [
+ "log",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
