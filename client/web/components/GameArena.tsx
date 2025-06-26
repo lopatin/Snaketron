@@ -165,6 +165,11 @@ export default function GameArena() {
     
     // Handle keyboard input
     const handleKeyPress = (e: KeyboardEvent) => {
+      // Ignore repeat events
+      if (e.repeat) {
+        return;
+      }
+      
       if (gameOver || !gameState || 'Ended' in gameState.status) {
         return;
       }
@@ -179,12 +184,14 @@ export default function GameArena() {
       
       if (direction) {
         e.preventDefault();
-        console.log('Sending turn command:', direction);
+        console.log('Keydown event - sending turn command:', direction, 'repeat:', e.repeat, 'timestamp:', Date.now());
         
         // Send command through game engine (handles both local prediction and server)
         sendCommand({
           Turn: { direction: direction as 'Up' | 'Down' | 'Left' | 'Right' }
         });
+        
+        console.log('sendCommand call completed at:', Date.now());
       }
     };
     

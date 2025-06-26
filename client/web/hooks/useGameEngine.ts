@@ -79,13 +79,15 @@ export const useGameEngine = ({
       engineRef.current.rebuildPredictedState(now);
 
       const currentTick = engineRef.current.getCurrentTick();
+      console.log(currentTick);
 
       if (currentTick !== lastTick) {
         // Get both committed and predicted states
         const committedStateJson = engineRef.current.getCommittedStateJson();
         const predictedStateJson = engineRef.current.getGameStateJson();
         const eventLogJson = engineRef.current.getEventLogJson();
-        
+
+
         // Parse the states
         const committedState = JSON.parse(committedStateJson);
         const predictedState = JSON.parse(predictedStateJson);
@@ -268,6 +270,8 @@ export const useGameEngine = ({
 
   // Send command with client-side prediction
   const sendCommand = useCallback((command: Command) => {
+    console.log('sendCommand called with:', command, 'timestamp:', Date.now());
+    
     if (!engineRef.current || playerId === undefined) {
       console.error('Cannot send command - engine:', !!engineRef.current, 'playerId:', playerId);
       return;
@@ -281,7 +285,9 @@ export const useGameEngine = ({
       // Process command based on type
       let commandMessageJson: string;
        if (typeof command === 'object' && 'Turn' in command) {
+        console.log('Processing turn command:', command.Turn.direction, 'at', Date.now());
         commandMessageJson = engineRef.current.processTurn(snakeId, command.Turn.direction);
+        console.log('processTurn returned at', Date.now());
       } else if (command === 'Respawn') {
         console.error('Respawn command not implemented yet');
         return;
@@ -292,8 +298,9 @@ export const useGameEngine = ({
 
       // Parse and send to server
       const commandMessage = JSON.parse(commandMessageJson);
-      console.log('Command message from engine:', commandMessage);
+      console.log('Command message from engine:', commandMessage, 'at', Date.now());
       onCommandReady?.(commandMessage);
+      console.log('Command sent to server at', Date.now());
     } catch (error) {
       console.error('Failed to process command:', error);
     }
