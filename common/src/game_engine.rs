@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
+use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId, CommandQueue};
 
 pub struct GameEngine {
     game_id: u32,
@@ -113,7 +113,7 @@ impl GameEngine {
             command,
         };
         
-        // Apply to predicted state immediately
+        // Add to predicted state command queue
         if let Some(predicted_state) = &mut self.predicted_state {
             predicted_state.schedule_command(&command_message);
         }
@@ -137,18 +137,11 @@ impl GameEngine {
         
         match &event_message.event {
             GameEvent::Snapshot { game_state } => {
-                // Full state sync - reset both states
                 self.committed_state = game_state.clone();
-                self.predicted_state = Some(game_state.clone());
-                // Rebuild to advance predicted state to current time
-                self.rebuild_predicted_state(current_ts)?;
             }
             _ => {
                 // Apply event to committed state
                 self.committed_state.apply_event(event_message.event.clone(), None);
-                
-                // Rebuild predicted state from committed state
-                self.rebuild_predicted_state(current_ts)?;
             }
         }
         
@@ -157,16 +150,31 @@ impl GameEngine {
     
     /// Rebuild predicted state from committed state and advance to current time
     pub fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
-        // Clone committed state as base
-        self.predicted_state = Some(self.committed_state.clone());
-        
-        // Advance predicted state to current time
+        // Calculate target tick
         let predicted_target_tick = ((current_ts - self.start_ms) / self.tick_duration_ms as i64) as u32;
         
-        if let Some(predicted_state) = &mut self.predicted_state {
-            while predicted_state.current_tick() < predicted_target_tick {
-                predicted_state.tick_forward()?;
+        // Check if we need to rebuild by comparing with existing predicted state
+        let needs_rebuild = self.predicted_state
+            .as_ref()
+            .map_or(false, |state| predicted_target_tick > state.current_tick());
+        
+        if needs_rebuild {
+            // Preserve the command queue from the old predicted state
+            let command_queue = self.predicted_state
+                .as_ref()
+                .map(|state| state.command_queue.clone())
+                .unwrap_or_else(|| CommandQueue::new());
+            
+            // Clone committed state and restore the command queue
+            let mut new_predicted_state = self.committed_state.clone();
+            new_predicted_state.command_queue = command_queue;
+            
+            // Advance to target tick
+            while new_predicted_state.current_tick() < predicted_target_tick {
+                new_predicted_state.tick_forward()?;
             }
+            
+            self.predicted_state = Some(new_predicted_state);
         }
         
         Ok(())
@@ -176,7 +184,7 @@ impl GameEngine {
     /// Can be called from a very fast interval loop or requestAnimationFrame.
     pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, GameEvent)>> {
         let predicted_target_tick = ((ts_ms - self.start_ms) / self.tick_duration_ms as i64) as u32;
-        let lag_ticks = (self.committed_state_lag_ms / self.tick_duration_ms) as u32;
+        let lag_ticks = self.committed_state_lag_ms / self.tick_duration_ms;
         let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
         let mut out: Vec<(u32, GameEvent)> = Vec::new();
 
