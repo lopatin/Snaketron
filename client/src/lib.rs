@@ -60,6 +60,12 @@ impl GameClient {
         serde_json::to_string(&events)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
+    
+    #[wasm_bindgen(js_name = rebuildPredictedState)]
+    pub fn rebuild_predicted_state(&mut self, ts_ms: i64) -> Result<(), JsValue> {
+        self.engine.rebuild_predicted_state(ts_ms)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
 
     /// Process a turn command for a snake with client-side prediction
     /// Returns the command message that should be sent to the server

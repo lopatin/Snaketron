@@ -156,7 +156,7 @@ impl GameEngine {
     }
     
     /// Rebuild predicted state from committed state and advance to current time
-    fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
+    pub fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
         // Clone committed state as base
         self.predicted_state = Some(self.committed_state.clone());
         

@@ -76,7 +76,7 @@ export const useGameEngine = ({
       // Run engine until current time
       const lastTick = engineRef.current.getCurrentTick()
 
-      engineRef.current.runUntil(now);
+      engineRef.current.rebuildPredictedState(now);
 
       const currentTick = engineRef.current.getCurrentTick();
 
@@ -127,9 +127,10 @@ export const useGameEngine = ({
         console.log(
           `${new Date().toISOString()} Game State Update\n` +
           `Tick: ${lastTick} → ${currentTick}\n` +
-          `\n--- COMMITTED STATE (tick ${committedState.tick}) ---\n` +
+          `Now: ${(Number(now))} (clock drift: ${clockDrift} ms)\n` +
+          `\n--- COMMITTED STATE (tick ${committedState.tick}, start_ms ${committedState.start_ms}) ---\n` +
           `Snakes: ${JSON.stringify(committedSnakes, null, 2)}\n` +
-          `\n--- PREDICTED STATE (tick ${predictedState.tick}) ---\n` +
+          `\n--- PREDICTED STATE (tick ${predictedState.tick}, start_ms ${predictedState.start_ms}) ---\n` +
           `Snakes: ${JSON.stringify(predictedSnakes, null, 2)}\n` +
           `\n--- PENDING COMMANDS ---\n` +
           `${pendingCommands.length > 0 ? JSON.stringify(pendingCommands, null, 2) : 'None'}\n`
