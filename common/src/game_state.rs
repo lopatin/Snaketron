@@ -157,33 +157,33 @@ impl CommandQueue {
     }
     
     pub fn push(&mut self, command_message: GameCommandMessage) {
-        debug!("CommandQueue::push: Command added to queue");
+        // debug!("CommandQueue::push: Command added to queue");
         eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
         self.queue.push(command_message.clone());
 
         // Delete the non-server-sent command from the queue.
         if command_message.command_id_server.is_some() {
-            debug!("CommandQueue::push: Tombstoning client command {:?}", command_message.command_id_client);
+            // debug!("CommandQueue::push: Tombstoning client command {:?}", command_message.command_id_client);
             eprintln!("COMMON DEBUG: Tombstoning client command {:?}", command_message.command_id_client);
             self.tombstone_ids.insert(command_message.command_id_client);
         }
     }
     
     pub fn pop(&mut self, max_tick: u32) -> Option<GameCommandMessage> {
-        debug!("CommandQueue::pop: Called with max_tick {}", max_tick);
+        // debug!("CommandQueue::pop: Called with max_tick {}", max_tick);
         eprintln!("COMMON DEBUG: CommandQueue::pop called with max_tick {}", max_tick);
         if let Some(command_message) = self.queue.peek() {
-            debug!("CommandQueue::pop: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
+            // debug!("CommandQueue::pop: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
             eprintln!("COMMON DEBUG: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
             if command_message.tick() > max_tick {
-                debug!("CommandQueue::pop: No commands ready for this tick");
+                // debug!("CommandQueue::pop: No commands ready for this tick");
                 eprintln!("COMMON DEBUG: No commands ready for this tick");
                 return None; // No commands for this tick
             }
         }
         
         if let Some(command_message) = self.queue.pop() {
-            debug!("CommandQueue::pop: Popped command: {:?}", command_message);
+            // debug!("CommandQueue::pop: Popped command: {:?}", command_message);
             eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             if command_message.command_id_server.is_none() && self.tombstone_ids.remove(&command_message.command_id_client) {
                 eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
@@ -191,12 +191,12 @@ impl CommandQueue {
                 // Continue popping the next command.
                 self.pop(max_tick)
             } else {
-                debug!("CommandQueue::pop: Returning command: {:?}", command_message);
+                // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
                 eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
                 Some(command_message)
             }
         } else {
-            debug!("CommandQueue::pop: Queue is empty");
+            // debug!("CommandQueue::pop: Queue is empty");
             eprintln!("COMMON DEBUG: CommandQueue::pop: Queue is empty");
             None
         }
@@ -495,24 +495,24 @@ impl GameState {
         }
        
         // Exec commands in the queue until the only ones left are for after this tick
-        debug!("tick_forward: Checking for commands at tick {}", self.tick);
+        // debug!("tick_forward: Checking for commands at tick {}", self.tick);
         eprintln!("COMMON DEBUG: tick_forward checking commands at tick {}", self.tick);
         while let Some(command_message) = self.command_queue.pop(self.tick) {
-            debug!("tick_forward: Popped command from queue: {:?}", command_message);
+            // debug!("tick_forward: Popped command from queue: {:?}", command_message);
             eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             match self.exec_command(command_message.command) {
                 Ok(events) => {
-                    debug!("tick_forward: exec_command returned {} events", events.len());
+                    // debug!("tick_forward: exec_command returned {} events", events.len());
                     eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
                     out.extend(events);
                 }
                 Err(e) => {
-                    debug!("tick_forward: exec_command failed with error: {:?}", e);
+                    // debug!("tick_forward: exec_command failed with error: {:?}", e);
                     eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
                 }
             }
         }
-        debug!("tick_forward: Finished processing commands for tick {}", self.tick);
+        // debug!("tick_forward: Finished processing commands for tick {}", self.tick);
 
         // Take a snapshot of the existing snakes to rollback dead ones after movement
         let old_snakes = self.arena.snakes.clone();

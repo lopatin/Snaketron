@@ -31,6 +31,7 @@ declare module 'wasm-snaketron' {
     static newFromState(gameId: number, startMs: bigint, stateJson: string): GameClient;
     setLocalPlayerId(playerId: number): void;
     runUntil(timestampMs: bigint): string;
+    rebuildPredictedState(timestampMs: bigint): void;
     processTurn(snakeId: number, direction: string): string;
     processServerEvent(eventMessageJson: string, currentTs: bigint): void;
     initializeFromSnapshot(stateJson: string, currentTs: bigint): void;
@@ -38,6 +39,8 @@ declare module 'wasm-snaketron' {
     getCommittedStateJson(): string;
     getEventLogJson(): string;
     getCurrentTick(): number;
+    getCommittedTick(): number;
+    getPredictedTick(): number;
     getGameId(): number;
   }
 

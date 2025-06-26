@@ -74,14 +74,14 @@ export const useGameEngine = ({
       const now = BigInt(Date.now() - Math.round(clockDrift));
       
       // Run engine until current time
-      const lastTick = engineRef.current.getCurrentTick()
-
+      const lastTick = engineRef.current.getPredictedTick()
       engineRef.current.rebuildPredictedState(now);
-
-      const currentTick = engineRef.current.getCurrentTick();
-      console.log(currentTick);
+      const currentTick = engineRef.current.getPredictedTick();
 
       if (currentTick !== lastTick) {
+        console.log("predicted tick changed", lastTick, "→", currentTick);
+        console.log(JSON.parse(engineRef.current.getGameStateJson()).arena.snakes[0]);
+
         // Get both committed and predicted states
         const committedStateJson = engineRef.current.getCommittedStateJson();
         const predictedStateJson = engineRef.current.getGameStateJson();
@@ -132,8 +132,10 @@ export const useGameEngine = ({
           `Now: ${(Number(now))} (clock drift: ${clockDrift} ms)\n` +
           `\n--- COMMITTED STATE (tick ${committedState.tick}, start_ms ${committedState.start_ms}) ---\n` +
           `Snakes: ${JSON.stringify(committedSnakes, null, 2)}\n` +
+          `Command queue: ${JSON.stringify(committedState.command_queue, null, 2)}\n` +
           `\n--- PREDICTED STATE (tick ${predictedState.tick}, start_ms ${predictedState.start_ms}) ---\n` +
           `Snakes: ${JSON.stringify(predictedSnakes, null, 2)}\n` +
+          `Command queue: ${JSON.stringify(predictedState.command_queue, null, 2)}\n` +
           `\n--- PENDING COMMANDS ---\n` +
           `${pendingCommands.length > 0 ? JSON.stringify(pendingCommands, null, 2) : 'None'}\n`
         );

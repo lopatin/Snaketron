@@ -215,6 +215,7 @@ export default function GameArena() {
     let animationId: number;
     const render = () => {
       try {
+        console.log('rendering game state:', JSON.stringify(gameState.arena.snakes[0].body));
         wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize);
       } catch (error) {
         console.error('Error rendering game:', error);

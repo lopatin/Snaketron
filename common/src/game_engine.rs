@@ -125,9 +125,9 @@ impl GameEngine {
     /// Process a server event and reconcile with local predictions
     pub fn process_server_event(&mut self, event_message: &GameEventMessage, current_ts: i64) -> Result<()> {
         // For CommandScheduled events, we can skip them as they're already handled locally
-        if matches!(event_message.event, GameEvent::CommandScheduled { .. }) {
-            return Ok(());
-        }
+        // if matches!(event_message.event, GameEvent::CommandScheduled { .. }) {
+        //     return Ok(());
+        // }
         
         // Step the committed state forward to the event tick before applying the event
         // This ensures events are applied at the correct tick (similar to ReplayViewer)
@@ -139,8 +139,17 @@ impl GameEngine {
             GameEvent::Snapshot { game_state } => {
                 self.committed_state = game_state.clone();
             }
-            _ => {
+            GameEvent::CommandScheduled { .. } => {
                 // Apply event to committed state
+                self.committed_state.apply_event(event_message.event.clone(), None);
+                
+                // Also schedule in predicted state if it exists
+                if let Some(predicted_state) = &mut self.predicted_state {
+                    predicted_state.apply_event(event_message.event.clone(), None);
+                }
+            }
+            _ => {
+                // Otherwise apply event just to the committed state
                 self.committed_state.apply_event(event_message.event.clone(), None);
             }
         }
@@ -160,14 +169,14 @@ impl GameEngine {
         
         if needs_rebuild {
             // Preserve the command queue from the old predicted state
-            let command_queue = self.predicted_state
-                .as_ref()
-                .map(|state| state.command_queue.clone())
-                .unwrap_or_else(|| CommandQueue::new());
+            // let command_queue = self.predicted_state
+            //     .as_ref()
+            //     .map(|state| state.command_queue.clone())
+            //     .unwrap_or_else(|| CommandQueue::new());
             
-            // Clone committed state and restore the command queue
+            // Clone committed state and restore command queue
             let mut new_predicted_state = self.committed_state.clone();
-            new_predicted_state.command_queue = command_queue;
+            // new_predicted_state.command_queue = command_queue;
             
             // Advance to target tick
             while new_predicted_state.current_tick() < predicted_target_tick {
@@ -258,6 +267,13 @@ impl GameEngine {
     
     pub fn current_tick(&self) -> u32 {
         self.committed_state.current_tick()
+    }
+    
+    pub fn get_predicted_tick(&self) -> u32 {
+        self.predicted_state
+            .as_ref()
+            .map(|state| state.current_tick())
+            .unwrap_or_else(|| self.committed_state.current_tick())
     }
 
 }

@@ -150,10 +150,23 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Get the current tick number
+    /// Get the current tick number (alias for getCommittedTick)
     #[wasm_bindgen(js_name = getCurrentTick)]
     pub fn get_current_tick(&self) -> u32 {
         self.engine.current_tick()
+    }
+
+    /// Get the committed tick number (server-authoritative state tick)
+    #[wasm_bindgen(js_name = getCommittedTick)]
+    pub fn get_committed_tick(&self) -> u32 {
+        self.engine.current_tick()
+    }
+
+    /// Get the predicted tick number (client-side predicted state tick)
+    #[wasm_bindgen(js_name = getPredictedTick)]
+    pub fn get_predicted_tick(&self) -> u32 {
+        // Access the predicted state tick from the engine
+        self.engine.get_predicted_tick()
     }
 
     /// Get the game ID
