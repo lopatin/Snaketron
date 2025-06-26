@@ -23,6 +23,13 @@ export interface WebSocketContextType {
   latencyMs: number;
 }
 
+// Latency Settings Types
+export interface LatencySettings {
+  enabled: boolean;
+  sendDelayMs: number;
+  receiveDelayMs: number;
+}
+
 // Game Types
 export interface Position {
   x: number;

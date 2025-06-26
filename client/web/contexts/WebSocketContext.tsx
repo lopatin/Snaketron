@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { WebSocketContextType } from '../types';
 import { clockSync } from '../utils/clockSync';
+import { useLatency } from './LatencyContext';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -38,6 +39,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const pingTimeout = useRef<NodeJS.Timeout | null>(null);
   const pingSentTime = useRef<number | null>(null);
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
+  const { settings: latencySettings } = useLatency();
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
@@ -118,9 +120,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       };
 
       ws.current.onmessage = (event: MessageEvent) => {
-        try {
-          const message = JSON.parse(event.data);
-          console.log('WebSocket message received:', message);
+        // Apply artificial receive delay if enabled
+        const processMessage = () => {
+          try {
+            const message = JSON.parse(event.data);
+            console.log('WebSocket message received:', message);
 
           // Handle Pong response for latency measurement
           if (message === 'Pong' && pingSentTime.current !== null) {
@@ -149,8 +153,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
             const handlers = messageHandlers.current.get(messageType) || [];
             handlers.forEach((handler: MessageHandler) => handler({type: messageType, data: messageData}));
           }
-        } catch (error) {
-          console.error('Failed to parse WebSocket message:', error);
+          } catch (error) {
+            console.error('Failed to parse WebSocket message:', error);
+          }
+        };
+
+        if (latencySettings.enabled && latencySettings.receiveDelayMs > 0) {
+          console.log(`Applying artificial receive delay: ${latencySettings.receiveDelayMs}ms`);
+          setTimeout(processMessage, latencySettings.receiveDelayMs);
+        } else {
+          processMessage();
         }
       };
     } catch (error) {
@@ -174,13 +186,22 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, []);
 
   const sendMessage = useCallback((message: any) => {
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify(message));
-      console.log('WebSocket message sent:', message);
+    const doSend = () => {
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify(message));
+        console.log('WebSocket message sent:', message);
+      } else {
+        console.error('WebSocket is not connected');
+      }
+    };
+
+    if (latencySettings.enabled && latencySettings.sendDelayMs > 0) {
+      console.log(`Applying artificial send delay: ${latencySettings.sendDelayMs}ms`);
+      setTimeout(doSend, latencySettings.sendDelayMs);
     } else {
-      console.error('WebSocket is not connected');
+      doSend();
     }
-  }, []);
+  }, [latencySettings]);
 
   const onMessage = useCallback((messageType: string, handler: MessageHandler) => {
     if (!messageHandlers.current.has(messageType)) {
