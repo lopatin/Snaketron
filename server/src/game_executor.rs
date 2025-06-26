@@ -95,10 +95,10 @@ async fn run_game(
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 match engine.run_until(now_ms) {
                     Ok(events) => {
-                        for event in events {
+                        for (tick, event) in events {
                             let event_msg = GameEventMessage {
                                 game_id,
-                                tick: engine.current_tick(),
+                                tick,
                                 user_id: None,
                                 event: event.clone(),
                             };

@@ -51,13 +51,24 @@ impl GameClient {
     }
 
     /// Run the game engine until the specified timestamp
-    /// Returns a JSON array of game events that occurred
+    /// Returns a JSON array of game events that occurred with their tick numbers
     #[wasm_bindgen(js_name = runUntil)]
     pub fn run_until(&mut self, ts_ms: i64) -> Result<String, JsValue> {
         let events = self.engine.run_until(ts_ms)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        serde_json::to_string(&events)
+        // Convert to a format that's easier to work with in JavaScript
+        let events_with_ticks: Vec<serde_json::Value> = events
+            .into_iter()
+            .map(|(tick, event)| {
+                serde_json::json!({
+                    "tick": tick,
+                    "event": event
+                })
+            })
+            .collect();
+        
+        serde_json::to_string(&events_with_ticks)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
     
