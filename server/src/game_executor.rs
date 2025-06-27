@@ -56,7 +56,8 @@ async fn run_game(
                         user_id, 
                         command
                     } if cmd_game_id == game_id => {
-                        debug!("Processing command for game {} from user {}", game_id, user_id);
+                        debug!("Processing command for game {} from user {}. Command: {:?}", 
+                            game_id, user_id, command);
                         
                         // Process the command through the game engine
                         match engine.process_command(command) {
@@ -70,9 +71,10 @@ async fn run_game(
                                     event,
                                 };
                                 
+                                debug!("Proposing command for game {}: {:?}", game_id, event_msg);
                                 match raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await {
-                                    Ok(_) => {
-                                        debug!(game_id, "Scheduled command for execution");
+                                    Ok(rsp) => {
+                                        debug!(game_id, "Scheduled command for execution {:?}", rsp);
                                     }
                                     Err(e) => {
                                         warn!(game_id, error = %e, "Failed to schedule command");

@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
@@ -80,7 +81,7 @@ impl Default for CustomGameSettings {
         CustomGameSettings {
             arena_width: 40,
             arena_height: 40,
-            tick_duration_ms: 300,
+            tick_duration_ms: 200,
             food_spawn_rate: 3.0,
             max_players: 4,
             game_mode: GameMode::FreeForAll { max_players: 4 },
@@ -134,7 +135,7 @@ impl GameType {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandQueue {
-    queue: BinaryHeap<GameCommandMessage>,
+    queue: BinaryHeap<Reverse<GameCommandMessage>>,
     active_ids: HashSet<CommandId>,
     tombstone_ids: HashSet<CommandId>,
 }
@@ -150,7 +151,7 @@ impl CommandQueue {
     
     pub fn has_commands_for_tick(&self, tick: u32) -> bool {
         if let Some(command_message) = self.queue.peek() {
-            command_message.tick() <= tick
+            command_message.0.tick() <= tick
         } else {
             false
         }
@@ -159,7 +160,7 @@ impl CommandQueue {
     pub fn push(&mut self, command_message: GameCommandMessage) {
         // debug!("CommandQueue::push: Command added to queue");
         eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
-        self.queue.push(command_message.clone());
+        self.queue.push(Reverse(command_message.clone()));
 
         // Delete the non-server-sent command from the queue.
         if command_message.command_id_server.is_some() {
@@ -172,7 +173,7 @@ impl CommandQueue {
     pub fn pop(&mut self, max_tick: u32) -> Option<GameCommandMessage> {
         // debug!("CommandQueue::pop: Called with max_tick {}", max_tick);
         eprintln!("COMMON DEBUG: CommandQueue::pop called with max_tick {}", max_tick);
-        if let Some(command_message) = self.queue.peek() {
+        if let Some(Reverse(command_message)) = self.queue.peek() {
             // debug!("CommandQueue::pop: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
             eprintln!("COMMON DEBUG: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
             if command_message.tick() > max_tick {
@@ -182,7 +183,7 @@ impl CommandQueue {
             }
         }
         
-        if let Some(command_message) = self.queue.pop() {
+        if let Some(Reverse(command_message)) = self.queue.pop() {
             // debug!("CommandQueue::pop: Popped command: {:?}", command_message);
             eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             if command_message.command_id_server.is_none() && self.tombstone_ids.remove(&command_message.command_id_client) {

@@ -200,6 +200,7 @@ impl GameEngine {
         while self.committed_state.current_tick() < lagged_target_tick {
             let current_tick = self.committed_state.current_tick();
             for event in self.committed_state.tick_forward()? {
+                eprintln!("game_engine: Emitting event at tick {}: {:?}", current_tick, event);
                 out.push((current_tick, event));
             }
         }
