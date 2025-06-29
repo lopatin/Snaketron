@@ -81,7 +81,7 @@ impl Default for CustomGameSettings {
         CustomGameSettings {
             arena_width: 40,
             arena_height: 40,
-            tick_duration_ms: 200,
+            tick_duration_ms: 150,
             food_spawn_rate: 3.0,
             max_players: 4,
             game_mode: GameMode::FreeForAll { max_players: 4 },
@@ -188,7 +188,7 @@ impl CommandQueue {
             eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             if command_message.command_id_server.is_none() && self.tombstone_ids.remove(&command_message.command_id_client) {
                 eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
-                // Ignore the command if it's a tombstone. 
+                // Ignore the command if it's a tombstone.
                 // Continue popping the next command.
                 self.pop(max_tick)
             } else {

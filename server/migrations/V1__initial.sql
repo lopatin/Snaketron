@@ -1,5 +1,8 @@
 CREATE TABLE servers (
     id SERIAL PRIMARY KEY,
+    ip_address VARCHAR(45),
+    grpc_port INT NOT NULL DEFAULT 50051,
+    raft_port INT NOT NULL DEFAULT 50052,
     grpc_address VARCHAR(255) NOT NULL,
     last_heartbeat TIMESTAMP,
     region VARCHAR(50) NOT NULL,

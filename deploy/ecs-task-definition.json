@@ -1,0 +1,125 @@
+{
+  "family": "snaketron-server",
+  "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/snaketron-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/snaketron-ecs-task-execution-role",
+  "networkMode": "awsvpc",
+  "containerDefinitions": [
+    {
+      "name": "snaketron-server",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/snaketron-server:${IMAGE_TAG}",
+      "cpu": 256,
+      "memory": 512,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 3001,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 50051,
+          "protocol": "tcp"
+        },
+        {
+          "containerPort": 50052,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "DATABASE_URL",
+          "value": "${DATABASE_URL}"
+        },
+        {
+          "name": "JWT_SECRET",
+          "value": "${JWT_SECRET}"
+        },
+        {
+          "name": "RUST_LOG",
+          "value": "info"
+        },
+        {
+          "name": "IS_FARGATE",
+          "value": "true"
+        },
+        {
+          "name": "BIND_ADDR",
+          "value": "0.0.0.0"
+        },
+        {
+          "name": "GRPC_PORT",
+          "value": "50051"
+        },
+        {
+          "name": "RAFT_PORT",
+          "value": "50052"
+        },
+        {
+          "name": "WS_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "RUST_MIN_STACK",
+          "value": "1048576"
+        },
+        {
+          "name": "SNAKETRON_WS_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "SNAKETRON_GRPC_PORT",
+          "value": "50051"
+        },
+        {
+          "name": "SNAKETRON_DB_HOST",
+          "value": "${DB_HOST}"
+        },
+        {
+          "name": "SNAKETRON_DB_PORT",
+          "value": "${DB_PORT}"
+        },
+        {
+          "name": "SNAKETRON_DB_USER",
+          "value": "${DB_USER}"
+        },
+        {
+          "name": "SNAKETRON_DB_PASS",
+          "value": "${DB_PASS}"
+        },
+        {
+          "name": "SNAKETRON_DB_NAME",
+          "value": "${DB_NAME}"
+        },
+        {
+          "name": "SNAKETRON_JWT_SECRET",
+          "value": "${JWT_SECRET}"
+        },
+        {
+          "name": "SNAKETRON_REGION",
+          "value": "${AWS_REGION}"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:3001/api/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/snaketron-server",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ],
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512"
+}

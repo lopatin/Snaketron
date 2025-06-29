@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
 use crate::raft::{RaftNode, StateChangeEvent};
+use crate::ip_discovery::discover_own_ip;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -827,14 +828,29 @@ async fn process_ws_message(
 pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) -> Result<u64> {
     info!("Registering server instance");
 
+    // Discover our own IP address
+    let ip_address = discover_own_ip().await
+        .context("Failed to discover own IP address")?;
+    
+    info!("Discovered server IP address: {}", ip_address);
+
+    // Extract port from grpc_address (format: "0.0.0.0:50051" or ":50051")
+    let grpc_port: i32 = grpc_address
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(50051);
+
     // Insert a new record and return the generated ID
     let id: i32 = sqlx::query_scalar(
         r#"
-        INSERT INTO servers (grpc_address, last_heartbeat, region, created_at)
-        VALUES ($1, NULL, $2, $3)
+        INSERT INTO servers (ip_address, grpc_port, grpc_address, last_heartbeat, region, created_at)
+        VALUES ($1, $2, $3, NULL, $4, $5)
         RETURNING id
         "#
     )
+        .bind(&ip_address)
+        .bind(grpc_port)
         .bind(grpc_address)
         .bind(region)
         .bind(Utc::now())
@@ -843,7 +859,7 @@ pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) ->
         .context("Failed to register server in database")?;
 
     let id_u64 = id as u64;
-    info!(id = id_u64, "Server registered with ID: {}", id_u64);
+    info!(id = id_u64, ip = %ip_address, "Server registered with ID: {} at IP: {}", id_u64, ip_address);
     Ok(id_u64)
 }
 
@@ -852,11 +868,12 @@ pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, Str
     
     let now = Utc::now();
     
-    // Query to find all servers in the specified region
-    let servers = sqlx::query_as::<_, (i32, String)>(
+    // Query to find all servers in the specified region with IP addresses
+    let servers = sqlx::query_as::<_, (i32, Option<String>, i32)>(
         r#"
-        SELECT id, grpc_address FROM servers
+        SELECT id, ip_address, grpc_port FROM servers
         WHERE region = $1 AND last_heartbeat > $2 - INTERVAL '30 seconds'
+        AND ip_address IS NOT NULL
         "#
     )
     .bind(region)
@@ -870,10 +887,18 @@ pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, Str
         return Ok(vec![]);
     }
     
-    info!("Found {} servers in region {}: {:?}", servers.len(), region, servers);
-    Ok(servers.into_iter()
-        .map(|(id, address)| (id as u64, address))
-        .collect())
+    // Build gRPC addresses from IP and port
+    let peer_addresses: Vec<(u64, String)> = servers.into_iter()
+        .filter_map(|(id, ip, port)| {
+            ip.map(|ip_addr| {
+                let address = format!("{}:{}", ip_addr, port);
+                (id as u64, address)
+            })
+        })
+        .collect();
+    
+    info!("Found {} servers in region {}: {:?}", peer_addresses.len(), region, peer_addresses);
+    Ok(peer_addresses)
 }
 
 // Helper function to generate unique game codes

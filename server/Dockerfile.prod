@@ -1,0 +1,87 @@
+# Build stage - optimized for production
+FROM rust:1.75-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Copy workspace files for dependency caching
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+
+# Create dummy files to cache dependencies
+RUN mkdir -p macros/src common/src server/src client/src terminal/src && \
+    echo "fn main() {}" > server/src/main.rs && \
+    touch macros/src/lib.rs common/src/lib.rs client/src/lib.rs terminal/src/main.rs
+
+# Copy dummy Cargo.toml files for workspace members
+COPY macros/Cargo.toml ./macros/
+COPY common/Cargo.toml ./common/
+COPY server/Cargo.toml ./server/
+COPY client/Cargo.toml ./client/
+COPY terminal/Cargo.toml ./terminal/
+
+# Build dependencies
+RUN cargo build --release --bin server && \
+    rm -rf macros/src common/src server/src client/src terminal/src
+
+# Copy actual source code
+COPY macros ./macros
+COPY common ./common
+COPY server ./server
+COPY client ./client
+COPY terminal ./terminal
+
+# Build the server with optimizations
+RUN cargo build --release --bin server
+
+# Runtime stage - minimal image for production
+FROM debian:bookworm-slim
+
+# Install runtime dependencies and curl for health checks
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash snaketron
+
+# Copy the binary from builder
+COPY --from=builder /usr/src/app/target/release/server /usr/local/bin/server
+
+# Create necessary directories
+RUN mkdir -p /var/lib/snaketron/replays && \
+    chown -R snaketron:snaketron /var/lib/snaketron
+
+# Switch to non-root user
+USER snaketron
+
+# Set working directory
+WORKDIR /home/snaketron
+
+# Expose ports
+EXPOSE 8080 50051 50052
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Set production environment variables
+ENV SNAKETRON_WS_PORT=8080
+ENV SNAKETRON_GRPC_PORT=50051
+ENV SNAKETRON_RAFT_PORT=50052
+ENV SNAKETRON_REPLAY_DIR=/var/lib/snaketron/replays
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
+# Run the server
+CMD ["server"]

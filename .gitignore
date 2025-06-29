@@ -1,9 +1,114 @@
+# IDE and editor files
 .idea
-target
-client/web/node_modules
-node_modules
-client/web/dist
+.vscode
+*.swp
+*.swo
+*~
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node.js dependencies and build outputs
+node_modules/
+client/web/node_modules/
+client/web/dist/
+client/web/build/
+client/pkg/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files with secrets
 .env
-states
-.DS_Store
+.env.local
+.env.*.local
+*.env
+
+# Game state and replays
+states/
 replays/
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+**/.terraform/*
+*.tfvars
+*.tfvars.json
+terraform.tfvars
+terraform.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.terraform.lock.hcl
+*.tfplan
+crash.log
+crash.*.log
+
+# AWS credentials and config
+.aws/
+aws-exports.js
+
+# Deployment secrets
+deploy/github-secrets.txt
+deploy/.env
+deploy/*.pem
+deploy/*.key
+
+# SSL certificates
+*.pem
+*.crt
+*.key
+*.p12
+
+# Database dumps
+*.sql
+*.dump
+
+# Log files
+*.log
+logs/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Local configuration overrides
+*.local.yml
+*.local.yaml
+*.local.json
+local-config/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+
+# Coverage reports
+coverage/
+*.lcov
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp

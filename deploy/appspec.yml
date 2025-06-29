@@ -1,0 +1,30 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: "<TASK_DEFINITION>"
+        LoadBalancerInfo:
+          ContainerName: "snaketron-server"
+          ContainerPort: 8080
+        PlatformVersion: "LATEST"
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            Subnets:
+              - "<SUBNET_1>"
+              - "<SUBNET_2>"
+              - "<SUBNET_3>"
+            SecurityGroups:
+              - "<SECURITY_GROUP>"
+            AssignPublicIp: "DISABLED"
+        CapacityProviderStrategy:
+          - CapacityProvider: "FARGATE_SPOT"
+            Base: 0
+            Weight: 100
+
+Hooks:
+  - BeforeInstall: "BeforeInstallHook"
+  - AfterInstall: "AfterInstallHook"
+  - AfterAllowTestTraffic: "AfterAllowTestTrafficHook"
+  - BeforeAllowTraffic: "BeforeAllowTrafficHook"
+  - AfterAllowTraffic: "AfterAllowTrafficHook"

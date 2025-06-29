@@ -25,7 +25,7 @@ impl GameEngine {
             committed_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms),
             predicted_state: Some(GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms)),
             event_log: Vec::new(),
-            tick_duration_ms: 300,
+            tick_duration_ms: 200,
             committed_state_lag_ms: 500,
             local_player_id: None,
             start_ms,

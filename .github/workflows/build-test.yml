@@ -1,0 +1,110 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, release]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: snaketron_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron_test
+          SNAKETRON_DB_HOST: localhost
+          SNAKETRON_DB_PORT: 5432
+          SNAKETRON_DB_USER: postgres
+          SNAKETRON_DB_PASS: postgres
+          SNAKETRON_DB_NAME: snaketron_test
+          SNAKETRON_JWT_SECRET: test_secret_key_for_testing
+          RUST_LOG: info
+        run: cargo test --all
+
+  build-wasm:
+    name: Build WASM Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM
+        run: |
+          cd client
+          wasm-pack build --target web --out-dir pkg
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/web/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd client/web
+          npm ci
+
+      - name: Type check
+        run: |
+          cd client/web
+          npm run type-check
+
+      - name: Build client
+        run: |
+          cd client/web
+          npm run build
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: wasm-client
+          path: |
+            client/pkg/
+            client/web/build/
