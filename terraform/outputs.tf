@@ -1,6 +1,6 @@
-output "alb_dns_name" {
-  description = "DNS name of the load balancer"
-  value       = module.load_balancing.alb_dns_name
+output "nlb_dns_name" {
+  description = "DNS name of the Network Load Balancer"
+  value       = module.nlb.nlb_dns_name
 }
 
 output "ecr_repository_url" {
@@ -24,27 +24,8 @@ output "rds_endpoint" {
   sensitive   = true
 }
 
-output "cloudfront_distribution_id" {
-  description = "CloudFront distribution ID"
-  value       = module.s3_cloudfront.distribution_id
-}
-
-output "cloudfront_domain_name" {
-  description = "CloudFront distribution domain name"
-  value       = module.s3_cloudfront.domain_name
-}
-
-output "s3_bucket_name" {
-  description = "S3 bucket name for web client"
-  value       = module.s3_cloudfront.bucket_name
-}
-
-output "codedeploy_app_name" {
-  description = "CodeDeploy application name"
-  value       = module.codedeploy.app_name
-}
-
-output "codedeploy_deployment_group_name" {
-  description = "CodeDeploy deployment group name"
-  value       = module.codedeploy.deployment_group_name
+output "database_url" {
+  description = "Complete database connection URL"
+  value       = module.rds.connection_string
+  sensitive   = true
 }

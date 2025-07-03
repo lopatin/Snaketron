@@ -37,6 +37,7 @@ services:
       SNAKETRON_GRPC_PORT: 50051
       SNAKETRON_API_PORT: 3001
       SNAKETRON_REGION: local
+      SNAKETRON_WEB_DIR: /app/web
       # Logging
       RUST_LOG: info,server=debug
       # Replay directory (using volume)

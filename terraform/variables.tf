@@ -59,31 +59,19 @@ variable "jwt_secret" {
 }
 
 variable "certificate_arn" {
-  description = "ACM certificate ARN for ALB HTTPS"
+  description = "ACM certificate ARN for NLB HTTPS"
   type        = string
   default     = ""
 }
 
-variable "client_domain_name" {
-  description = "Domain name for web client"
-  type        = string
-  default     = "play.snaketron.io"
-}
-
-variable "cloudfront_certificate_arn" {
-  description = "ACM certificate ARN for CloudFront (must be in us-east-1)"
+variable "server_domain_name" {
+  description = "Domain name for server (e.g., api.snaketron.io)"
   type        = string
   default     = ""
 }
 
-variable "deployment_notification_email" {
-  description = "Email address for deployment notifications"
+variable "route53_zone_id" {
+  description = "Route53 hosted zone ID"
   type        = string
   default     = ""
-}
-
-variable "enable_deployment_alarms" {
-  description = "Enable CloudWatch alarms for CodeDeploy"
-  type        = bool
-  default     = true
 }

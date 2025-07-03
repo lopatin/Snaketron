@@ -18,23 +18,19 @@ A competitive online multiplayer Snake game built with Rust (backend + WebAssemb
 # Start database and server with auto-reload on code changes
 ./dev.sh
 
-# In another terminal, build and start the client
-cd client
-wasm-pack build --target web --out-dir pkg
-cd web
-npm install
-npm start
+# The web client is automatically built and served by the Rust server
+# Access the game at http://localhost:3001
 ```
 
 #### For Production-like environment:
 ```bash
-# Start database and server (rebuilds on each change)
+# Start database and server (includes web client build)
 docker-compose up --build
 ```
 
 The game will be available at:
-- Frontend: http://localhost:3000 (webpack dev server)
-- WebSocket Server: ws://localhost:8080 (Docker container)
+- Full Application: http://localhost:3001 (API + static files)
+- WebSocket Server: ws://localhost:8080
 - gRPC Server: localhost:50051 (Docker container)
 - Database: localhost:5432 (Docker container)
 
@@ -45,19 +41,23 @@ The game will be available at:
    docker-compose up -d db
    ```
 
-2. Run the server:
-   ```bash
-   cargo run --bin server
-   ```
-
-3. Build and run the client:
+2. Build the web client:
    ```bash
    cd client
    wasm-pack build --target web --out-dir pkg
    cd web
    npm install
-   npm start
+   npm run build
    ```
+
+3. Run the server (which serves the web client):
+   ```bash
+   # Set the web directory to serve the built files
+   export SNAKETRON_WEB_DIR=client/web/dist
+   cargo run --bin server
+   ```
+
+The application will be available at http://localhost:3001
 
 ## Development
 
@@ -77,7 +77,7 @@ RUST_LOG=info cargo test -p server -- --nocapture
 - `server/` - Game server with WebSocket and gRPC support
 - `client/` - WebAssembly client module
 - `terminal/` - Terminal-based game viewer and replay player
-- `specs/` - TLA+ specifications for distributed systems design
+- `specs/` - Design documents and specifications
 
 ## Production Deployment
 

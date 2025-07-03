@@ -119,6 +119,10 @@ resource "aws_ecs_task_definition" "server" {
         protocol      = "tcp"
       },
       {
+        containerPort = 3001
+        protocol      = "tcp"
+      },
+      {
         containerPort = 50051
         protocol      = "tcp"
       },
@@ -160,6 +164,14 @@ resource "aws_ecs_task_definition" "server" {
       {
         name  = "WS_PORT"
         value = "8080"
+      },
+      {
+        name  = "API_PORT"
+        value = "3001"
+      },
+      {
+        name  = "WEB_DIR"
+        value = "/app/web"
       },
       {
         name  = "RUST_MIN_STACK"
@@ -219,9 +231,15 @@ resource "aws_ecs_service" "server" {
   }
 
   load_balancer {
-    target_group_arn = var.blue_target_group_arn
+    target_group_arn = var.websocket_target_group_arn
     container_name   = "${var.name_prefix}-server"
     container_port   = 8080
+  }
+  
+  load_balancer {
+    target_group_arn = var.api_target_group_arn
+    container_name   = "${var.name_prefix}-server"
+    container_port   = 3001
   }
 
   health_check_grace_period_seconds = 120

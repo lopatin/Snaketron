@@ -16,11 +16,14 @@ services:
       - ./macros:/usr/src/app/macros:delegated
       - ./client:/usr/src/app/client:delegated
       - ./terminal:/usr/src/app/terminal:delegated
+      - ./scripts:/usr/src/app/scripts:delegated
       - ./Cargo.toml:/usr/src/app/Cargo.toml:delegated
       - ./Cargo.lock:/usr/src/app/Cargo.lock:delegated
       # Named volume for target directory to avoid rebuilding dependencies
       - cargo-cache:/usr/local/cargo/registry
       - cargo-target:/usr/src/app/target
+      # Web build output
+      - web-build:/app/web
     environment:
       # Enable cargo-watch for auto-reload
       CARGO_WATCH: "true"
@@ -31,3 +34,4 @@ services:
 volumes:
   cargo-cache:
   cargo-target:
+  web-build:

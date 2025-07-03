@@ -23,8 +23,13 @@ variable "security_groups" {
   type        = list(string)
 }
 
-variable "blue_target_group_arn" {
-  description = "Blue target group ARN for load balancer"
+variable "websocket_target_group_arn" {
+  description = "Target group ARN for WebSocket traffic"
+  type        = string
+}
+
+variable "api_target_group_arn" {
+  description = "Target group ARN for API/static traffic"
   type        = string
 }
 

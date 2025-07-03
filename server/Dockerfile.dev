@@ -41,7 +41,16 @@ RUN rm -rf server/src common/src macros/src client/src terminal/src
 # The actual source will be mounted as volumes
 
 # Expose ports
-EXPOSE 8080 50051
+EXPOSE 8080 3001 50051 50052
 
-# Use cargo-watch to auto-reload on changes
-CMD ["cargo", "watch", "-x", "run --bin server", "-w", "server", "-w", "common", "-w", "macros"]
+# Install Node.js and wasm-pack for client build
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+# Copy development startup script
+COPY scripts/dev-start.sh /usr/local/bin/dev-start.sh
+RUN chmod +x /usr/local/bin/dev-start.sh
+
+# Use the development startup script
+CMD ["/usr/local/bin/dev-start.sh"]

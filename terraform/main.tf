@@ -53,16 +53,17 @@ module "rds" {
   db_storage_size   = var.db_storage_size
 }
 
-module "load_balancing" {
-  source = "./modules/load-balancing"
+module "nlb" {
+  source = "./modules/nlb"
   
   name_prefix     = local.name_prefix
   environment     = var.environment
   vpc_id          = module.networking.vpc_id
   subnet_ids      = module.networking.public_subnet_ids
-  security_groups = [module.networking.alb_security_group_id]
   
   certificate_arn = var.certificate_arn
+  domain_name     = var.server_domain_name
+  zone_id         = var.route53_zone_id
 }
 
 module "ecs" {
@@ -74,7 +75,8 @@ module "ecs" {
   subnet_ids      = module.networking.private_subnet_ids
   security_groups = [module.networking.ecs_security_group_id]
   
-  blue_target_group_arn = module.load_balancing.blue_target_group_arn
+  websocket_target_group_arn = module.nlb.websocket_target_group_arn
+  api_target_group_arn      = module.nlb.api_target_group_arn
   
   task_cpu    = var.task_cpu
   task_memory = var.task_memory
@@ -86,30 +88,6 @@ module "ecs" {
   jwt_secret   = var.jwt_secret
 }
 
-module "codedeploy" {
-  source = "./modules/codedeploy"
-  
-  name_prefix     = local.name_prefix
-  environment     = var.environment
-  
-  ecs_cluster_name = module.ecs.cluster_name
-  ecs_service_name = module.ecs.service_name
-  
-  alb_listener_arns = module.load_balancing.listener_arns
-  blue_target_group_name = module.load_balancing.blue_target_group_name
-  green_target_group_name = module.load_balancing.green_target_group_name
-  blue_target_group_arn_suffix = module.load_balancing.blue_target_group_arn_suffix
-  alb_arn_suffix = module.load_balancing.alb_arn_suffix
-  
-  notification_email = var.deployment_notification_email
-  enable_deployment_alarms = var.enable_deployment_alarms
-}
+# CodeDeploy module removed - using simple ECS deployments with NLB
 
-module "s3_cloudfront" {
-  source = "./modules/s3-cloudfront"
-  
-  name_prefix     = local.name_prefix
-  environment     = var.environment
-  domain_name     = var.client_domain_name
-  certificate_arn = var.cloudfront_certificate_arn
-}
+# S3/CloudFront module removed - static files served from Rust server

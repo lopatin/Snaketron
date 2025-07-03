@@ -7,7 +7,10 @@ use axum::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
 use tracing::info;
 
 use super::auth::{self, AuthState};
@@ -19,6 +22,7 @@ pub async fn run_api_server(
     addr: &str,
     db_pool: PgPool,
     jwt_secret: &str,
+    web_dir: Option<&str>,
 ) -> Result<()> {
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     
@@ -44,7 +48,7 @@ pub async fn run_api_server(
             auth_middleware,
         ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
@@ -58,6 +62,19 @@ pub async fn run_api_server(
         .merge(protected_routes)
         .layer(cors)
         .with_state(auth_state);
+
+    // Add static file serving if web_dir is provided
+    if let Some(dir) = web_dir {
+        let index_path = format!("{}/index.html", dir);
+        let serve_dir = ServeDir::new(dir)
+            .not_found_service(ServeFile::new(&index_path));
+        
+        app = Router::new()
+            .nest("/api", app)
+            .fallback_service(serve_dir);
+        
+        info!("Serving static files from: {}", dir);
+    }
 
     // Start server
     let listener = TcpListener::bind(addr).await?;

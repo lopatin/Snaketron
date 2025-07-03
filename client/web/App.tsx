@@ -205,9 +205,16 @@ function AppContent() {
   const tokenSentRef = useRef<boolean>(false);
   
   useEffect(() => {
-    // Connect to WebSocket server running in Docker container
+    // Connect to WebSocket server
+    // In production, use the same host as the page; in development, use localhost:8080
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = process.env.NODE_ENV === 'production' 
+      ? window.location.host 
+      : 'localhost:8080';
+    const wsUrl = `${wsProtocol}//${wsHost}/ws`;
+    
     // Send authentication token when connection is established
-    connect('ws://localhost:8080/ws', () => {
+    connect(wsUrl, () => {
       console.log('WebSocket connected, checking for auth token...');
       setWsConnected(true);
       const token = getToken();

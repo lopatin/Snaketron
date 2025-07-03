@@ -7,11 +7,9 @@ on:
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY_SERVER: snaketron-server
-  ECS_SERVICE: snaketron-game-service
-  ECS_CLUSTER: snaketron-cluster
-  ECS_TASK_DEFINITION: snaketron-server
-  S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
-  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+  ECS_SERVICE: snaketron-prod-game-service
+  ECS_CLUSTER: snaketron-prod-cluster
+  ECS_TASK_DEFINITION: snaketron-prod-server
 
 jobs:
   build-and-push-server:
@@ -47,7 +45,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./server/Dockerfile.prod
+          file: ./server/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -55,7 +53,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy-server:
-    name: Deploy Server to ECS via CodeDeploy
+    name: Deploy Server to ECS
     needs: build-and-push-server
     runs-on: ubuntu-latest
     steps:
@@ -83,7 +81,7 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
-          container-name: snaketron-server
+          container-name: snaketron-prod-server
           image: ${{ needs.build-and-push-server.outputs.image-tag }}
           environment-variables: |
             DATABASE_URL=${{ secrets.DATABASE_URL }}
@@ -94,8 +92,12 @@ jobs:
             GRPC_PORT=50051
             RAFT_PORT=50052
             WS_PORT=8080
+            API_PORT=3001
+            WEB_DIR=/app/web
             RUST_MIN_STACK=1048576
             SNAKETRON_WS_PORT=8080
+            SNAKETRON_API_PORT=3001
+            SNAKETRON_WEB_DIR=/app/web
             SNAKETRON_GRPC_PORT=50051
             SNAKETRON_DB_HOST=${{ secrets.DB_HOST }}
             SNAKETRON_DB_PORT=${{ secrets.DB_PORT }}
@@ -105,188 +107,18 @@ jobs:
             SNAKETRON_JWT_SECRET=${{ secrets.JWT_SECRET }}
             SNAKETRON_REGION=${{ env.AWS_REGION }}
 
-      - name: Register new task definition
-        id: register-task
-        run: |
-          TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://${{ steps.task-def.outputs.task-definition }} \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-          echo "task-definition-arn=$TASK_DEFINITION_ARN" >> $GITHUB_OUTPUT
-
-      - name: Create CodeDeploy deployment
-        id: deploy
-        run: |
-          # Get CodeDeploy application and deployment group names from environment or use defaults
-          CODEDEPLOY_APP="${{ secrets.CODEDEPLOY_APP_NAME }}"
-          CODEDEPLOY_GROUP="${{ secrets.CODEDEPLOY_DEPLOYMENT_GROUP }}"
-          
-          if [ -z "$CODEDEPLOY_APP" ]; then
-            CODEDEPLOY_APP="${{ env.ECS_CLUSTER }}-app"
-          fi
-          
-          if [ -z "$CODEDEPLOY_GROUP" ]; then
-            CODEDEPLOY_GROUP="${{ env.ECS_CLUSTER }}-ecs-dg"
-          fi
-          
-          # Create appspec content
-          APPSPEC_CONTENT=$(cat << EOF
-          {
-            "version": 0.0,
-            "Resources": [
-              {
-                "TargetService": {
-                  "Type": "AWS::ECS::Service",
-                  "Properties": {
-                    "TaskDefinition": "${{ steps.register-task.outputs.task-definition-arn }}",
-                    "LoadBalancerInfo": {
-                      "ContainerName": "snaketron-server",
-                      "ContainerPort": 8080
-                    }
-                  }
-                }
-              }
-            ]
-          }
-          EOF
-          )
-          
-          # Create deployment
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name "$CODEDEPLOY_APP" \
-            --deployment-group-name "$CODEDEPLOY_GROUP" \
-            --deployment-config-name "CodeDeployDefault.ECSLinear10PercentEvery1Minutes" \
-            --description "GitHub Actions deployment from commit ${{ github.sha }}" \
-            --revision "{
-              \"revisionType\": \"AppSpecContent\",
-              \"appSpecContent\": {
-                \"content\": $(echo "$APPSPEC_CONTENT" | jq -Rs .)
-              }
-            }" \
-            --query 'deploymentId' \
-            --output text)
-          
-          echo "deployment-id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
-          echo "Created CodeDeploy deployment: $DEPLOYMENT_ID"
-
-      - name: Wait for CodeDeploy deployment
-        run: |
-          DEPLOYMENT_ID="${{ steps.deploy.outputs.deployment-id }}"
-          echo "Monitoring deployment $DEPLOYMENT_ID..."
-          
-          # Wait for deployment to complete (with timeout)
-          TIMEOUT=1800  # 30 minutes
-          START_TIME=$(date +%s)
-          
-          while true; do
-            CURRENT_TIME=$(date +%s)
-            ELAPSED=$((CURRENT_TIME - START_TIME))
-            
-            if [ $ELAPSED -gt $TIMEOUT ]; then
-              echo "Deployment timed out after $TIMEOUT seconds"
-              exit 1
-            fi
-            
-            STATUS=$(aws deploy get-deployment \
-              --deployment-id "$DEPLOYMENT_ID" \
-              --query 'deploymentInfo.status' \
-              --output text)
-            
-            echo "Deployment status: $STATUS"
-            
-            case "$STATUS" in
-              "Succeeded")
-                echo "Deployment completed successfully!"
-                break
-                ;;
-              "Failed")
-                echo "Deployment failed!"
-                exit 1
-                ;;
-              "Stopped")
-                echo "Deployment was stopped!"
-                exit 1
-                ;;
-            esac
-            
-            sleep 30
-          done
-
-  build-and-deploy-client:
-    name: Build and Deploy Web Client
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Build WASM
-        run: |
-          cd client
-          wasm-pack build --target web --out-dir pkg
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: client/web/package-lock.json
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
 
-      - name: Install dependencies
-        run: |
-          cd client/web
-          npm ci
-
-      - name: Build React app
-        env:
-          REACT_APP_WS_URL: wss://api.snaketron.io
-          REACT_APP_API_URL: https://api.snaketron.io
-          NODE_ENV: production
-          GENERATE_SOURCEMAP: false
-          PUBLIC_URL: https://play.snaketron.io
-        run: |
-          cd client/web
-          npm run build
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy to S3
-        run: |
-          # Sync all files except index.html with cache headers
-          aws s3 sync client/web/build s3://${{ env.S3_BUCKET }} \
-            --delete \
-            --cache-control "public, max-age=31536000" \
-            --exclude "index.html" \
-            --exclude "*.json"
-          
-          # Upload index.html with no-cache headers
-          aws s3 cp client/web/build/index.html s3://${{ env.S3_BUCKET }}/ \
-            --cache-control "no-cache, no-store, must-revalidate" \
-            --content-type "text/html"
-          
-          # Upload manifest and other JSON files
-          aws s3 cp client/web/build/manifest.json s3://${{ env.S3_BUCKET }}/ \
-            --cache-control "no-cache" \
-            --content-type "application/json" || true
-
-      - name: Invalidate CloudFront
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
-            --paths "/*"
 
   notify:
     name: Notify Deployment Status
-    needs: [deploy-server, build-and-deploy-client]
+    needs: deploy-server
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -298,7 +130,6 @@ jobs:
           text: |
             Deployment to AWS ${{ job.status }}
             Server: ${{ needs.deploy-server.result }}
-            Client: ${{ needs.build-and-deploy-client.result }}
           webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

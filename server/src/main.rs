@@ -137,12 +137,29 @@ async fn main() -> Result<()> {
         info!("gRPC server listening on: {}", grpc_addr);
     }
 
-    // Start the API server
+    // Determine web directory
+    let web_dir = env::var("SNAKETRON_WEB_DIR").ok()
+        .or_else(|| {
+            // In production (Docker), serve from /app/web
+            if std::path::Path::new("/app/web").exists() {
+                Some("/app/web".to_string())
+            } else {
+                None
+            }
+        });
+    
+    if let Some(ref dir) = web_dir {
+        info!("Web static files will be served from: {}", dir);
+    } else {
+        info!("Web static files serving disabled (directory not found)");
+    }
+    
+    // Start the API server with static file serving
     let api_port = env::var("SNAKETRON_API_PORT").unwrap_or_else(|_| "3001".to_string());
     let api_addr = format!("0.0.0.0:{}", api_port);
     
     let api_handle = tokio::spawn(async move {
-        if let Err(e) = run_api_server(&api_addr, api_db_pool, &jwt_secret).await {
+        if let Err(e) = run_api_server(&api_addr, api_db_pool, &jwt_secret, web_dir.as_deref()).await {
             tracing::error!("API server error: {}", e);
         }
     });

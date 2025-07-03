@@ -46,9 +46,9 @@ async-raft = "0.6"
 flate2 = "1.0"
 rand = "0.8"
 # HTTP API dependencies
-axum = { version = "0.7", features = ["tokio"] }
+axum = { version = "0.7", features = ["tokio", "ws"] }
 tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 # Password hashing
 bcrypt = "0.15"
 # IP discovery dependencies

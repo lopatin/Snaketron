@@ -88,15 +88,12 @@ The GitHub Actions workflow will:
 - 3-9 auto-scaling Fargate Spot containers
 - Each container runs a game server with:
   - WebSocket endpoint (port 8080)
+  - API/Static file server (port 3001)
   - gRPC for inter-server communication (port 50051)
   - Raft consensus protocol (port 50052)
 - Direct IP communication between containers
 - SQL-based service discovery
-
-### Web Client (Serverless)
-- Static files hosted on S3
-- CloudFront CDN for global distribution
-- Automatic cache invalidation on deployment
+- Static web assets served directly from the Rust server
 
 ### Database
 - RDS PostgreSQL (db.t4g.micro)
@@ -107,32 +104,37 @@ The GitHub Actions workflow will:
   - Matchmaking
 
 ### Networking
+- Network Load Balancer (NLB) for TCP traffic
+  - Port 80/443: Routes to API/static file server
+  - Port 8080: Routes to WebSocket server
 - Containers discover their own IP via platform-specific methods
 - Register IP in database on startup
 - Query database to discover peer IPs
-- Direct container-to-container communication
+- Direct container-to-container communication for Raft/gRPC
 
 ## Deployment Scripts
 
-### `codedeploy-deploy.sh`
-Triggers deployments using AWS CodeDeploy for blue/green deployments:
+### Simple ECS Deployment
+The deployment process is simplified with direct ECS deployments:
+- No blue/green complexity - NLB handles connection draining
+- Rolling updates maintain service availability
+- New tasks start before old ones are stopped
+- Health checks ensure new containers are ready
+
+To deploy manually:
 ```bash
-# Deploy using current task definition
-./deploy/codedeploy-deploy.sh
-
-# Deploy specific task definition
-./deploy/codedeploy-deploy.sh --task-definition arn:aws:ecs:us-east-1:123456789012:task-definition/snaketron-server:42
-
-# Deploy with custom description
-./deploy/codedeploy-deploy.sh --description "Deploy version 2.0.1 with bug fixes"
+# Update the ECS service with a new task definition
+aws ecs update-service \
+  --cluster snaketron-prod-cluster \
+  --service snaketron-prod-game-service \
+  --task-definition snaketron-prod-server:latest
 ```
 
 Features:
-- Blue/green deployments with traffic shifting
-- Automatic rollback on failure
-- Health check validation at each stage
-- CloudWatch alarms monitoring
-- Maintains Raft cluster quorum throughout deployment
+- Simple rolling deployments
+- Automatic connection draining via NLB
+- Maintains Raft cluster quorum during updates
+- No additional infrastructure complexity
 
 ### `setup-aws.sh`
 Initial setup script for AWS resources:
@@ -142,19 +144,20 @@ Initial setup script for AWS resources:
 
 ## Cost Optimization
 
-The deployment is optimized for low cost (~$50-60/month):
+The deployment is optimized for low cost (~$40-50/month):
 - Fargate Spot pricing (70% discount)
 - Minimal container sizes (0.25 vCPU, 0.5GB RAM)
 - db.t4g.micro RDS instance
 - CloudWatch Logs with 1-day retention
-- Serverless web hosting
+- NLB is cheaper than ALB
+- No S3/CloudFront costs
 
 ## Monitoring
 
 - CloudWatch Logs: `/ecs/snaketron-server`
 - ECS task metrics in CloudWatch
-- ALB metrics and access logs
-- CloudFront distribution metrics
+- NLB metrics and flow logs
+- Target group health metrics
 
 ## Troubleshooting
 
@@ -173,41 +176,40 @@ The deployment is optimized for low cost (~$50-60/month):
 - Check DATABASE_URL format in task definition
 - Ensure database migrations have run
 
-### Web Client Not Updating
-- Check CloudFront invalidation completed
-- Verify S3 bucket policy allows CloudFront access
-- Clear browser cache
+### Web Client Not Loading
+- Check NLB target group health for port 3001
+- Verify API server is running on port 3001
+- Check browser console for connection errors
+- Ensure SNAKETRON_WEB_DIR is set to /app/web
 
-## CodeDeploy Blue/Green Deployment
+## Rolling Deployments
 
-The deployment uses AWS CodeDeploy for zero-downtime blue/green deployments:
+The deployment uses ECS rolling updates for zero-downtime deployments:
 
-1. **Traffic Shifting**: Gradually shifts traffic from blue to green environment (10% every minute)
-2. **Health Validation**: Validates health at each stage with automated rollback
-3. **Raft Awareness**: Maintains cluster quorum throughout deployment
-4. **CloudWatch Alarms**: Monitors response time and unhealthy hosts
+1. **Health Checks**: New containers must pass health checks before receiving traffic
+2. **Connection Draining**: NLB automatically drains connections from old containers
+3. **Gradual Rollout**: New tasks are started before old ones are stopped
+4. **Automatic Rollback**: ECS can automatically rollback if deployment fails
 
-### Deployment Stages
-1. **BeforeInstall**: Verifies Raft cluster has minimum healthy nodes
-2. **AfterInstall**: Confirms new containers registered successfully
-3. **AfterAllowTestTraffic**: Validates new deployment with test traffic
-4. **BeforeAllowTraffic**: Final health check before production traffic
-5. **AfterAllowTraffic**: Verifies deployment success after traffic shift
+### Deployment Process
+1. New task definition is registered with updated container image
+2. ECS starts new tasks with the new definition
+3. Health checks verify new containers are ready
+4. NLB gradually shifts traffic to new containers
+5. Old containers are drained and stopped
 
 ## Rollback
 
-CodeDeploy automatically handles rollback in case of:
-- Deployment failures
-- CloudWatch alarm triggers
-- Manual stop request
-
-To manually rollback:
+To manually rollback to a previous version:
 ```bash
-# Stop ongoing deployment (triggers automatic rollback)
-aws deploy stop-deployment --deployment-id <deployment-id> --auto-rollback-enabled
+# List recent task definitions
+aws ecs list-task-definitions --family-prefix snaketron-prod-server
 
-# Or redeploy previous version
-./deploy/codedeploy-deploy.sh --task-definition <previous-task-definition-arn>
+# Update service with previous task definition
+aws ecs update-service \
+  --cluster snaketron-prod-cluster \
+  --service snaketron-prod-game-service \
+  --task-definition snaketron-prod-server:previous-revision
 ```
 
 ## Local Development

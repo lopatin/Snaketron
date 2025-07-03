@@ -33,11 +33,19 @@ resource "aws_security_group" "ecs_tasks" {
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description     = "WebSocket from ALB"
+    description     = "WebSocket from NLB"
     from_port       = 8080
     to_port         = 8080
     protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    cidr_blocks     = ["0.0.0.0/0"]  # NLB doesn't have security groups
+  }
+  
+  ingress {
+    description     = "API/Static from NLB"
+    from_port       = 3001
+    to_port         = 3001
+    protocol        = "tcp"
+    cidr_blocks     = ["0.0.0.0/0"]  # NLB doesn't have security groups
   }
 
   ingress {

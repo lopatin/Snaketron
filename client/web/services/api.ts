@@ -9,9 +9,12 @@ class API {
   private token: string | null;
 
   constructor() {
-    // In webpack, process.env needs to be defined in the webpack config
-    // For now, we'll use a simple fallback
-    this.baseURL = 'http://localhost:3001';
+    // In production, use the same host as the page; in development, use localhost:3001
+    if (process.env.NODE_ENV === 'production') {
+      this.baseURL = window.location.origin;
+    } else {
+      this.baseURL = 'http://localhost:3001';
+    }
     this.token = localStorage.getItem('token');
   }
 
