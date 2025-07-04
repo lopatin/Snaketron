@@ -38,25 +38,34 @@ COPY Cargo.lock ./
 COPY macros ./macros
 COPY common ./common
 COPY client ./client
+# Copy server Cargo.toml to satisfy workspace requirements
+COPY server/Cargo.toml ./server/
+# Copy terminal Cargo.toml as well
+COPY terminal/Cargo.toml ./terminal/
 
 # Build WASM package
 RUN cd client && wasm-pack build --target web --out-dir pkg
 
 # Build stage for web client
-FROM node:20-alpine as web-builder
+FROM node:20 as web-builder
 
-# Create app directory
+# Create app directory structure to match the expected paths
 WORKDIR /app
 
-# Copy package files
-COPY client/web/package*.json ./
+# First copy the WASM package to the expected location
+COPY --from=wasm-builder /usr/src/app/client/pkg /client/pkg
+
+# Then copy package files
+COPY client/web/package.json client/web/package-lock.json ./
 
 # Install dependencies
 RUN npm ci
 
+# Create symlink for local wasm-snaketron package
+RUN cd node_modules && ln -s /client/pkg wasm-snaketron
+
 # Copy web source files
 COPY client/web ./
-COPY --from=wasm-builder /usr/src/app/client/pkg ../client/pkg
 
 # Build production bundle
 RUN npm run build

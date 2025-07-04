@@ -48,6 +48,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+# Install Python and build tools for native Node modules
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy development startup script
 COPY scripts/dev-start.sh /usr/local/bin/dev-start.sh
 RUN chmod +x /usr/local/bin/dev-start.sh

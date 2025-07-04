@@ -7,6 +7,7 @@ A competitive online multiplayer Snake game built with Rust (backend + WebAssemb
 - **Backend**: Rust server with WebSocket connections, gRPC for inter-server communication, and Raft consensus
 - **Frontend**: React + WebAssembly (compiled from Rust)
 - **Database**: PostgreSQL with automatic migrations
+- **Cache/Leader Election**: Redis for optional leader election and distributed coordination
 - **Infrastructure**: Docker containers, designed for AWS Fargate deployment
 
 ## Quick Start
@@ -33,12 +34,13 @@ The game will be available at:
 - WebSocket Server: ws://localhost:8080
 - gRPC Server: localhost:50051 (Docker container)
 - Database: localhost:5432 (Docker container)
+- Redis: localhost:6379 (Docker container)
 
 ### Manual Setup
 
-1. Start PostgreSQL:
+1. Start PostgreSQL and Redis:
    ```bash
-   docker-compose up -d db
+   docker-compose up -d db redis
    ```
 
 2. Build the web client:

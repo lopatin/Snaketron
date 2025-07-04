@@ -27,6 +27,7 @@ async fn test_replay_with_tick_forward() -> Result<()> {
         region: "test-region".to_string(),
         jwt_verifier,
         replay_dir: Some(server::replay::directory::get_test_replay_directory("replay_test")),
+        redis_url: None,
     }).await?;
     
     // Create a simple game

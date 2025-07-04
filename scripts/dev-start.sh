@@ -19,7 +19,15 @@ cd /usr/src/app/client/web
 if [ ! -d "node_modules" ]; then
     echo -e "${YELLOW}Installing npm dependencies...${NC}"
     npm install
+else
+    # Check if lightningcss is properly installed for this architecture
+    if ! npm ls lightningcss >/dev/null 2>&1; then
+        echo -e "${YELLOW}Reinstalling dependencies due to architecture mismatch...${NC}"
+        rm -rf node_modules package-lock.json
+        npm install
+    fi
 fi
+
 npm run build
 
 echo -e "${GREEN}Web client built successfully!${NC}"

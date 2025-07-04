@@ -15,6 +15,7 @@ use crate::{
     raft::{RaftNode},
     learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
+    leader_election::LeaderElection,
 };
 use crate::ws_server::discover_peers;
 use std::path::PathBuf;
@@ -33,6 +34,8 @@ pub struct GameServerConfig {
     pub jwt_verifier: Arc<dyn JwtVerifier>,
     /// Optional directory for saving game replays
     pub replay_dir: Option<PathBuf>,
+    /// Optional Redis URL for leader election (e.g., "redis://127.0.0.1:6379")
+    pub redis_url: Option<String>,
 }
 
 /// A complete game server instance with all components
@@ -65,6 +68,7 @@ impl GameServer {
             region,
             jwt_verifier,
             replay_dir,
+            redis_url,
         } = config;
 
         // Register server in database
@@ -215,6 +219,41 @@ impl GameServer {
             None
         };
 
+        // Start leader election if Redis URL is configured
+        if let Some(redis_url) = redis_url {
+            info!("Starting leader election service with Redis");
+            let election_token = cancellation_token.clone();
+            handles.push(tokio::spawn(async move {
+                // Example: Run a simple service that logs when it's the leader
+                let election = match LeaderElection::new(
+                    &redis_url,
+                    server_id,
+                    format!("snaketron:leader:{}", region),
+                    Duration::from_secs(2),
+                    election_token,
+                ).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!("Failed to create leader election: {}", e);
+                        return;
+                    }
+                };
+                
+                // Example service that runs only on the leader
+                let service = || Box::pin(async move {
+                    info!("This server is now the leader!");
+                    // User can replace this with their actual service logic
+                    Ok::<(), anyhow::Error>(())
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+                
+                if let Err(e) = election.run_election_loop(service).await {
+                    error!("Leader election error: {}", e);
+                }
+            }));
+        } else {
+            info!("Leader election disabled (no Redis URL configured)");
+        }
+
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -340,6 +379,7 @@ pub async fn start_test_server_with_grpc(
         region: "test-region".to_string(),
         jwt_verifier,
         replay_dir,
+        redis_url: None,
     };
 
     GameServer::start(config).await
