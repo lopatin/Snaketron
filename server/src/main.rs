@@ -116,6 +116,12 @@ async fn main() -> Result<()> {
 
     // Raft peers are now discovered automatically from the database
 
+    // Get Redis URL from environment (optional)
+    let redis_url = env::var("SNAKETRON_REDIS_URL").ok();
+    if redis_url.is_some() {
+        info!("Redis leader election enabled");
+    }
+
     // Create server configuration
     let config = GameServerConfig {
         db_pool,
@@ -124,6 +130,7 @@ async fn main() -> Result<()> {
         region,
         jwt_verifier,
         replay_dir,
+        redis_url,
     };
 
     // Clone db_pool for API server

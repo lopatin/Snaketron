@@ -1,6 +1,8 @@
 #!/bin/bash
 # Development script for fast local development
 
+export RUST_LOG=debug
+
 echo "Starting SnakeTron in development mode with hot reloading..."
 echo "Changes to Rust code will automatically restart the server."
 echo ""
