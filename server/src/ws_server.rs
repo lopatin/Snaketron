@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use tracing::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_stream::wrappers::BroadcastStream;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use chrono::Utc;
@@ -19,9 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
-use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
-use crate::raft::{RaftNode, StateChangeEvent};
+use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
+use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
 use crate::game_executor::{StreamEvent, publish_to_stream};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,7 +226,6 @@ enum ConnectionState {
 
 pub async fn run_websocket_server(
     addr: &str,
-    raft: Arc<RaftNode>,
     db_pool: PgPool,
     redis_url: String,
     cancellation_token: CancellationToken,
@@ -256,9 +253,8 @@ pub async fn run_websocket_server(
                         let connection_token = cancellation_token.child_token();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let raft_clone = raft.clone();
                         let redis_url_clone = redis_url.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(raft_clone, db_pool_clone, redis_url_clone, stream, jwt_verifier_clone, connection_token));
+                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, redis_url_clone, stream, jwt_verifier_clone, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -294,7 +290,6 @@ pub async fn run_websocket_server(
 
 
 async fn handle_websocket_connection(
-    raft: Arc<RaftNode>,
     db_pool: PgPool,
     redis_url: String,
     stream: TcpStream,
@@ -325,10 +320,8 @@ async fn handle_websocket_connection(
     tokio::pin!(shutdown_timeout);
     let mut shutdown_started = false;
     
-    // Subscribe to Raft state changes to get notified when games are created
-    
-    let mut state_event_stream = BroadcastStream::new(raft.subscribe_state_events());
-    tokio::pin!(state_event_stream);
+    // Will be used to track Redis stream subscription for game events
+    let mut game_event_handle: Option<JoinHandle<()>> = None;
     
     loop {
         let state_name = match &state {
@@ -374,52 +367,6 @@ async fn handle_websocket_connection(
                 }
             }
             
-            // Handle Raft state change events
-            Some(Ok(event)) = state_event_stream.next() => {
-                match event {
-                    StateChangeEvent::GameEvent { event } => {
-                        if let ConnectionState::InGame { metadata, game_id, .. } = &state {
-                            if event.game_id == *game_id {
-                                // Forward game events to the client
-                                let event_msg = WSMessage::GameEvent(event.clone());
-                                let json_msg = serde_json::to_string(&event_msg)?;
-                                let ws_msg = Message::Text(Utf8Bytes::from(json_msg));
-                                if let Err(e) = ws_stream.send(ws_msg).await {
-                                    error!("Failed to send game event message: {}", e);
-                                    break;
-                                }
-                                
-                                // Check if the game has ended
-                                match &event.event {
-                                    GameEvent::SoloGameEnded { .. } => {
-                                        info!("Solo game {} has ended, transitioning back to Authenticated state", game_id);
-                                        // Transition back to Authenticated state
-                                        state = ConnectionState::Authenticated { 
-                                            metadata: metadata.clone() 
-                                        };
-                                    }
-                                    GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
-                                        // For multiplayer games, transition immediately on Complete
-                                        // For solo games, we'll transition on SoloGameEnded instead
-                                        // We can check if this is a solo game by looking at the game state
-                                        if let Some(game_state) = raft.get_game_state(*game_id).await {
-                                            if !game_state.game_type.is_solo() {
-                                                info!("Multiplayer game {} has ended, transitioning back to Authenticated state", game_id);
-                                                state = ConnectionState::Authenticated { 
-                                                    metadata: metadata.clone() 
-                                                };
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    
-                    _ => {}
-                }
-            }
             
             // Handle incoming WebSocket messages
             message = ws_stream.next() => {
@@ -451,6 +398,9 @@ async fn handle_websocket_connection(
                         // Process message based on current state using the new helper function
                         debug!("WS: Processing message: {:?}", ws_message);
                         
+                        // Check current state before processing
+                        let was_in_game = matches!(&state, ConnectionState::InGame { .. });
+                        
                         let process_result = process_ws_message(
                             state,
                             ws_message,
@@ -458,13 +408,53 @@ async fn handle_websocket_connection(
                             &db_pool,
                             &ws_tx,
                             &mut ws_stream,
-                            &raft,
                             &mut redis_conn,
                         ).await;
                         
                         match process_result {
                             Ok(new_state) => {
+                                // Check if we're transitioning to InGame state
+                                let entering_game = matches!(&new_state, ConnectionState::InGame { .. }) 
+                                    && !was_in_game;
+                                let leaving_game = was_in_game 
+                                    && !matches!(&new_state, ConnectionState::InGame { .. });
+                                
                                 state = new_state;
+                                
+                                // Handle game state transitions
+                                if entering_game {
+                                    if let ConnectionState::InGame { game_id, .. } = &state {
+                                        // Start Redis stream subscription for game events
+                                        let partition_id = (game_id % 10) + 1;
+                                        let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+                                        let game_id_filter = *game_id;
+                                        let ws_tx_clone = ws_tx.clone();
+                                        let redis_url_clone = redis_url.clone();
+                                        
+                                        // Abort any existing subscription
+                                        if let Some(handle) = game_event_handle.take() {
+                                            handle.abort();
+                                        }
+                                        
+                                        // Start new subscription
+                                        game_event_handle = Some(tokio::spawn(async move {
+                                            if let Err(e) = subscribe_to_game_events(
+                                                redis_url_clone,
+                                                stream_key,
+                                                game_id_filter,
+                                                ws_tx_clone
+                                            ).await {
+                                                error!("Redis stream subscription error: {}", e);
+                                            }
+                                        }));
+                                    }
+                                } else if leaving_game {
+                                    // Stop Redis stream subscription
+                                    if let Some(handle) = game_event_handle.take() {
+                                        handle.abort();
+                                    }
+                                }
+                                
                                 let new_state_name = match &state {
                                     ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
                                     ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
@@ -496,6 +486,11 @@ async fn handle_websocket_connection(
         }
     }
 
+    // Clean up any active Redis stream subscription
+    if let Some(handle) = game_event_handle {
+        handle.abort();
+    }
+    
     // Clean up connection
     let _ = ws_stream.close(None).await;
     
@@ -510,7 +505,6 @@ async fn process_ws_message(
     db_pool: &PgPool,
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
-    raft: &Arc<RaftNode>,
     redis_conn: &mut ConnectionManager,
 ) -> Result<ConnectionState> {
     use tracing::debug;
@@ -787,12 +781,23 @@ async fn process_ws_message(
                         return Ok(ConnectionState::InGame { metadata, game_id });
                     }
                     
-                    // Start the game via Raft
-                    let request = crate::raft::ClientRequest::StartGame { 
+                    // Get server ID from database
+                    let server_id: i32 = sqlx::query_scalar(
+                        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
+                    )
+                    .fetch_one(db_pool)
+                    .await?;
+                    
+                    // Start the game by publishing StatusUpdated event to Redis
+                    let partition_id = (game_id % 10) + 1; // Partitions are 1-indexed
+                    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+                    
+                    let status_event = StreamEvent::StatusUpdated { 
                         game_id,
-                        server_id: raft.id,
+                        status: GameStatus::Started { server_id: server_id as u64 },
                     };
-                    match raft.propose(request).await {
+                    
+                    match publish_to_stream(redis_conn, &stream_key, &status_event).await {
                         Ok(_) => {
                             let response = WSMessage::CustomGameStarting;
                             let json_msg = serde_json::to_string(&response)?;
@@ -1203,6 +1208,82 @@ async fn spectate_game(
     
     info!("User {} joined as spectator for game {}", user_id, actual_game_id);
     Ok(actual_game_id)
+}
+
+/// Subscribe to Redis stream and forward game events to the WebSocket client
+async fn subscribe_to_game_events(
+    redis_url: String,
+    stream_key: String,
+    game_id: u32,
+    ws_tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    // Create a new Redis connection for this subscription
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client for subscription")?;
+    let mut redis_conn = ConnectionManager::new(client).await
+        .context("Failed to create Redis connection manager")?;
+    
+    // Track the last message ID we've read
+    let mut last_id = "$".to_string(); // Start from latest messages
+    
+    loop {
+        // Read from Redis stream
+        let options = StreamReadOptions::default()
+            .count(10)
+            .block(100); // 100ms timeout
+            
+        match redis_conn.xread_options(&[&stream_key], &[&last_id], &options).await {
+            Ok(reply) => {
+                let reply: StreamReadReply = reply;
+                for stream_data in reply.keys {
+                    for stream_id in stream_data.ids {
+                        last_id = stream_id.id.clone();
+                        
+                        // Parse the event from Redis stream
+                        if let Some(data) = stream_id.map.get("data") {
+                            if let redis::Value::BulkString(bytes) = data {
+                                match serde_json::from_slice::<StreamEvent>(bytes) {
+                                    Ok(StreamEvent::GameEvent(event_msg)) if event_msg.game_id == game_id => {
+                                        // Forward to WebSocket client
+                                        let ws_msg = WSMessage::GameEvent(event_msg.clone());
+                                        let json_msg = serde_json::to_string(&ws_msg)?;
+                                        let msg = Message::Text(Utf8Bytes::from(json_msg));
+                                        
+                                        // Send through the channel
+                                        if ws_tx.send(msg).await.is_err() {
+                                            // Channel closed, client disconnected
+                                            return Ok(());
+                                        }
+                                        
+                                        // Check if game ended
+                                        match &event_msg.event {
+                                            GameEvent::SoloGameEnded { .. } | 
+                                            GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
+                                                info!("Game {} ended, stopping event subscription", game_id);
+                                                return Ok(());
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        // Other event types or different game ID, ignore
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse stream event: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to read from Redis stream: {}", e);
+                // Sleep briefly before retrying
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 

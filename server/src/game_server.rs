@@ -166,12 +166,10 @@ impl GameServer {
         let ws_token = cancellation_token.clone();
         let ws_addr_clone = ws_addr.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
-        let ws_raft = raft.clone();
         let ws_redis_url = redis_url.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
-                ws_raft,
                 ws_pool,
                 ws_redis_url,
                 ws_token,
