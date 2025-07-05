@@ -1,43 +1,56 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
-use common::{GameEngine, GameEvent, GameEventMessage, GameStatus};
-use crate::{
-    raft::{RaftNode, StateChangeEvent},
-};
-use crate::raft::ClientRequest;
+use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMessage, GameState};
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
+use serde::{Serialize, Deserialize};
 
+/// Events that can be sent through Redis streams
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum StreamEvent {
+    GameCreated { 
+        game_id: u32, 
+        game_state: GameState 
+    },
+    GameCommandSubmitted { 
+        game_id: u32, 
+        user_id: u32, 
+        command: GameCommandMessage 
+    },
+    GameEvent(GameEventMessage),
+    StatusUpdated { 
+        game_id: u32, 
+        status: GameStatus 
+    },
+}
 
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
     server_id: u64,
     game_id: u32,
-    raft: Arc<RaftNode>,
+    mut game_state: GameState,
+    mut redis_conn: ConnectionManager,
+    stream_key: String,
     cancellation_token: CancellationToken,
 ) {
-    info!("run_game called for game {}", game_id);
+    info!("run_game called for game {} on stream {}", game_id, stream_key);
     
-    // Get the game state from Raft
-    let game_state = match raft.get_game_state(game_id).await {
-        Some(state) => state,
-        None => {
-            error!("Game {} not found in Raft state", game_id);
-            return;
-        }
-    };
-    
-    // Create the game engine from the existing game state
+    // Create the game engine from the provided game state
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state);
-    info!("Created game engine for game {} from existing state", game_id);
+    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state.clone());
+    info!("Created game engine for game {} from provided state", game_id);
 
-    // Subscribe to state change events
-    let mut state_rx = raft.subscribe_state_events();
+    // Consumer ID for this specific game instance (for future use with consumer groups)
+    let _consumer_id = format!("game-{}-server-{}", game_id, server_id);
 
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
+    // Track the last message ID we've read
+    let mut last_id = "0-0".to_string();
     
     loop {
         tokio::select! {
@@ -48,46 +61,73 @@ async fn run_game(
                 break;
             }
             
-            // Process state change events
-            Ok(event) = state_rx.recv() => {
-                match event {
-                    StateChangeEvent::GameCommandSubmitted { 
-                        game_id: cmd_game_id, 
-                        user_id, 
-                        command
-                    } if cmd_game_id == game_id => {
-                        debug!("Processing command for game {} from user {}. Command: {:?}", 
-                            game_id, user_id, command);
-                        
-                        // Process the command through the game engine
-                        match engine.process_command(command) {
-                            Ok(scheduled_command) => {
-                                // Emit CommandScheduled event with the server-scheduled command
-                                let event = GameEvent::CommandScheduled { command_message: scheduled_command };
-                                let event_msg = GameEventMessage {
-                                    game_id,
-                                    tick: engine.current_tick(),
-                                    user_id: None,
-                                    event,
-                                };
+            // Process commands from Redis stream (non-blocking read with short timeout)
+            stream_read = async {
+                let options = StreamReadOptions::default()
+                    .count(10)
+                    .block(10); // 10ms timeout
+                    
+                redis_conn.xread_options(&[&stream_key], &[&last_id], &options).await
+            } => {
+                match stream_read {
+                    Ok(reply) => {
+                        let reply: StreamReadReply = reply;
+                        for stream_data in reply.keys {
+                            for stream_id in stream_data.ids {
+                                last_id = stream_id.id.clone();
                                 
-                                debug!("Proposing command for game {}: {:?}", game_id, event_msg);
-                                match raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await {
-                                    Ok(rsp) => {
-                                        debug!(game_id, "Scheduled command for execution {:?}", rsp);
-                                    }
-                                    Err(e) => {
-                                        warn!(game_id, error = %e, "Failed to schedule command");
+                                // Parse the event from Redis stream
+                                if let Some(data) = stream_id.map.get("data") {
+                                    if let redis::Value::BulkString(bytes) = data {
+                                        match serde_json::from_slice::<StreamEvent>(bytes) {
+                                            Ok(StreamEvent::GameCommandSubmitted { 
+                                                game_id: cmd_game_id, 
+                                                user_id, 
+                                                command 
+                                            }) if cmd_game_id == game_id => {
+                                                debug!("Processing command for game {} from user {}. Command: {:?}", 
+                                                    game_id, user_id, command);
+                                                
+                                                // Process the command through the game engine
+                                                match engine.process_command(command) {
+                                                    Ok(scheduled_command) => {
+                                                        // Apply to tracked game state
+                                                        game_state.schedule_command(&scheduled_command);
+                                                        
+                                                        // Emit CommandScheduled event
+                                                        let event = GameEvent::CommandScheduled { command_message: scheduled_command };
+                                                        let event_msg = GameEventMessage {
+                                                            game_id,
+                                                            tick: engine.current_tick(),
+                                                            user_id: None,
+                                                            event,
+                                                        };
+                                                        
+                                                        // Publish to Redis stream
+                                                        let stream_event = StreamEvent::GameEvent(event_msg.clone());
+                                                        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
+                                                            warn!("Failed to publish command scheduled event: {}", e);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to process command for game {}: {:?}", game_id, e);
+                                                    }
+                                                }
+                                            }
+                                            Ok(_) => {
+                                                // Ignore events for other games or other event types
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to parse stream event: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to process command for game {}: {:?}", game_id, e);
-                            }
                         }
                     }
-                    _ => {
-                        // Ignore other state change events
+                    Err(e) => {
+                        debug!("Failed to read from Redis stream: {}", e);
                     }
                 }
             }
@@ -97,27 +137,28 @@ async fn run_game(
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 match engine.run_until(now_ms) {
                     Ok(events) => {
-                        for (tick, event) in events {
+                        for (tick, event) in &events {
                             let event_msg = GameEventMessage {
                                 game_id,
-                                tick,
+                                tick: *tick,
                                 user_id: None,
                                 event: event.clone(),
                             };
                             
-                            match raft.propose(ClientRequest::ProcessGameEvent(event_msg.clone())).await {
-                                Ok(_) => {
-                                    debug!(game_id, "Published game event: {:?}", event_msg);
-                                }
-                                Err(e) => {
-                                    warn!(game_id, error = %e, "Failed to publish game event");
-                                }
+                            // Publish to Redis stream
+                            let stream_event = StreamEvent::GameEvent(event_msg.clone());
+                            if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
+                                warn!("Failed to publish game event: {}", e);
                             }
                         }
                         
+                        // Apply events to tracked game state
+                        for (_, event) in &events {
+                            game_state.apply_event(event.clone(), None);
+                        }
+                        
                         // Check for solo game end
-                        if let Some(game_state) = raft.get_game_state(game_id).await {
-                            if game_state.game_type.is_solo() && game_state.players.len() == 1 {
+                        if game_state.game_type.is_solo() && game_state.players.len() == 1 {
                                 // Get the single player
                                 if let Some((user_id, player)) = game_state.players.iter().next() {
                                     if let Some(snake) = game_state.arena.snakes.get(player.snake_id as usize) {
@@ -139,7 +180,9 @@ async fn run_game(
                                                 event,
                                             };
                                             
-                                            if let Err(e) = raft.propose(ClientRequest::ProcessGameEvent(event_msg)).await {
+                                            // Publish to Redis stream
+                                            let stream_event = StreamEvent::GameEvent(event_msg.clone());
+                                            if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
                                                 warn!("Failed to publish solo game ended event: {}", e);
                                             }
                                             
@@ -150,7 +193,6 @@ async fn run_game(
                                     }
                                 }
                             }
-                        }
                     }
                     Err(e) => {
                         eprintln!("Error running game tick: {:?}", e);
@@ -161,21 +203,54 @@ async fn run_game(
     }
 }
 
+/// Helper function to publish events to Redis stream
+async fn publish_to_stream(
+    redis_conn: &mut ConnectionManager,
+    stream_key: &str,
+    event: &StreamEvent,
+) -> Result<()> {
+    let data = serde_json::to_vec(event)
+        .context("Failed to serialize stream event")?;
+    
+    let _: String = redis_conn.xadd(
+        stream_key,
+        "*", // Auto-generate ID
+        &[("data", data)],
+    ).await
+    .context("Failed to add event to Redis stream")?;
+    
+    Ok(())
+}
 
 /// Run the game executor service for a specific partition
 pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
-    raft: Arc<RaftNode>,
+    redis_url: String,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     info!("Starting game executor for server {} partition {}", server_id, partition_id);
 
-    let mut state_rx = raft.subscribe_state_events();
+    // Create Redis connection
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client")?;
+    let mut redis_conn = ConnectionManager::new(client).await
+        .context("Failed to create Redis connection manager")?;
+    
+    // Stream key for this partition
+    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+    
+    // Consumer group for this executor
+    let group_name = format!("executor-{}", server_id);
+    let consumer_name = format!("server-{}-partition-{}", server_id, partition_id);
+    
+    // Create consumer group if it doesn't exist
+    let _: Result<(), _> = redis_conn.xgroup_create_mkstream(&stream_key, &group_name, "$").await;
 
-    let raft_clone = raft.clone();
-    let cancellation_token_clone = cancellation_token.clone();
-    let try_start_game = move |game_id: u32| {
+    // Track active games
+    let mut active_games = std::collections::HashSet::new();
+    
+    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, active_games: &mut std::collections::HashSet<u32>| {
         // Only process games that belong to this partition
         // Partition 1 handles games where game_id % 10 == 0
         // Partition 2 handles games where game_id % 10 == 1
@@ -184,17 +259,21 @@ pub async fn run_game_executor(
             debug!("Game {} belongs to partition {}, not partition {}", game_id, (game_id % 10) + 1, partition_id);
             return;
         }
+        
+        if active_games.contains(&game_id) {
+            debug!("Game {} is already running", game_id);
+            return;
+        }
+        
         info!("Partition {} will start game {}", partition_id, game_id);
-        let raft = raft_clone.clone();
-        let cancellation_token = cancellation_token_clone.clone();
+        active_games.insert(game_id);
+        
         tokio::spawn(async move {
-            match raft.propose(ClientRequest::StartGame { game_id, server_id }).await {
-                Ok(_response) => {
-                    // Run the game loop here.
-                    run_game(server_id, game_id, raft.clone(), cancellation_token.clone()).await;
-                },
-                Err(e) => error!("Failed to start game {} on server {}: {}", game_id, server_id, e),
-            }
+            // Run the game loop
+            run_game(server_id, game_id, game_state, redis_conn, stream_key, cancellation_token).await;
+            // Remove from active games when done
+            // Note: In real implementation, you'd need a shared state for this
+            info!("Game {} has ended", game_id);
         });
     };
 
@@ -207,33 +286,79 @@ pub async fn run_game_executor(
                 break;
             }
             
-            Ok(event) = state_rx.recv() => {
-                match event {
-                    StateChangeEvent::GameCreated { game_id } => {
-                        try_start_game(game_id);
-                    }
+            // Read from Redis stream using consumer group
+            stream_read = async {
+                let options = StreamReadOptions::default()
+                    .group(&group_name, &consumer_name)
+                    .count(10)
+                    .block(100);
                     
-                    StateChangeEvent::GameEvent { event } => {
-                        match event.event {
-                            GameEvent::StatusUpdated { status: GameStatus::Stopped } => {
-                                try_start_game(event.game_id);
-                            }
-                            
-                            _ => {
-                                // Handle other game events
-                                debug!("Received game event: {:?}", event);
+                redis_conn.xread_options(&[&stream_key], &[">"], &options).await
+            } => {
+                match stream_read {
+                    Ok(reply) => {
+                        let reply: StreamReadReply = reply;
+                        for stream_data in reply.keys {
+                            for stream_id in stream_data.ids {
+                                let msg_id = stream_id.id.clone();
+                                
+                                // Parse the event from Redis stream
+                                if let Some(data) = stream_id.map.get("data") {
+                                    if let redis::Value::BulkString(bytes) = data {
+                                        match serde_json::from_slice::<StreamEvent>(bytes) {
+                                            Ok(event) => {
+                                                match event {
+                                                    StreamEvent::GameCreated { game_id, game_state } => {
+                                                        if game_id % 10 == partition_id - 1 {
+                                                            info!("Received GameCreated event for game {}", game_id);
+                                                            let redis_conn_clone = redis_conn.clone();
+                                                            let stream_key_clone = stream_key.clone();
+                                                            let cancellation_token_clone = cancellation_token.clone();
+                                                            try_start_game(game_id, game_state, redis_conn_clone, stream_key_clone, cancellation_token_clone, &mut active_games);
+                                                        }
+                                                    }
+                                                    StreamEvent::StatusUpdated { game_id, status } => {
+                                                        if game_id % 10 == partition_id - 1 {
+                                                            match status {
+                                                                GameStatus::Stopped => {
+                                                                    // Game stopped, it might need to be restarted
+                                                                    // In this implementation, we'd need to fetch game state
+                                                                    // from somewhere (e.g., Redis or database)
+                                                                    debug!("Game {} stopped, may need restart", game_id);
+                                                                }
+                                                                GameStatus::Complete { .. } => {
+                                                                    // Game completed, remove from active games
+                                                                    active_games.remove(&game_id);
+                                                                    info!("Game {} completed", game_id);
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        // Other events are handled by individual game loops
+                                                        debug!("Received event in partition executor: {:?}", event);
+                                                    }
+                                                }
+                                                
+                                                // Acknowledge the message
+                                                let _: Result<(), _> = redis_conn.xack(&stream_key, &group_name, &[&msg_id]).await;
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to parse stream event: {}", e);
+                                                // Still acknowledge to avoid reprocessing
+                                                let _: Result<(), _> = redis_conn.xack(&stream_key, &group_name, &[&msg_id]).await;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    
-                    StateChangeEvent::GameCommandSubmitted { game_id, user_id, command } => {
-                        // The game executor will poll for these commands in the game loop
-                        debug!("Command submitted for game {} by user {}", game_id, user_id);
-                    }
-                    
-                    _ => {
-                        // Handle other state changes
-                        debug!("Received state change event: {:?}", event);
+                    Err(e) => {
+                        debug!("Failed to read from Redis stream: {}", e);
+                        // Sleep briefly before retrying
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }

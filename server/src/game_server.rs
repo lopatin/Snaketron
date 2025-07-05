@@ -9,16 +9,18 @@ use tracing::{info, error, warn, trace, debug};
 
 use crate::{
     ws_server::{register_server, run_websocket_server, JwtVerifier},
-    game_executor::run_game_executor,
+    game_executor::{run_game_executor, StreamEvent},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
-    raft::{RaftNode},
+    raft::{RaftNode, StateChangeEvent},
     learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
     cluster_singleton::ClusterSingleton,
 };
 use crate::ws_server::discover_peers;
 use std::path::PathBuf;
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -189,13 +191,13 @@ impl GameServer {
             ).await;
         }));
 
+
         // Start game executors for each partition as cluster singletons
         // Each partition handles games where game_id % 10 == (partition_id - 1)
         // This provides automatic failover - if one server goes down, another will
         // automatically take over its partitions
         info!("Starting game executor services for 10 partitions");
         for partition_id in 1..=10 {
-            let exec_raft = raft.clone();
             let exec_token = cancellation_token.clone();
             let exec_redis_url = redis_url.clone();
             
@@ -218,14 +220,14 @@ impl GameServer {
                 
                 // Service that runs the game executor for this partition
                 let service = move |token: CancellationToken| {
-                    let raft_clone = exec_raft.clone();
+                    let redis_url_clone = exec_redis_url.clone();
                     Box::pin(async move {
                         info!("Game executor for partition {} is now active", partition_id);
                         
                         if let Err(e) = run_game_executor(
                             server_id,
                             partition_id,
-                            raft_clone,
+                            redis_url_clone,
                             token,
                         ).await {
                             error!("Game executor service error for partition {}: {}", partition_id, e);
