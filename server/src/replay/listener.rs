@@ -27,10 +27,6 @@ impl ReplayListener {
                         tracing::error!("Failed to record game event: {}", e);
                     }
                 }
-                StateChangeEvent::GameCreated { game_id } => {
-                    // Note: We'll get the initial state from the Snapshot event
-                    tracing::debug!("Game {} created, waiting for snapshot event", game_id);
-                }
                 _ => {}
             }
         }

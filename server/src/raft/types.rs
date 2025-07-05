@@ -1,14 +1,9 @@
 use serde::{Deserialize, Serialize};
-use async_raft::{AppData, AppDataResponse, NodeId};
-use common::{GameCommandMessage, GameEventMessage, GameState};
+use async_raft::{AppData, AppDataResponse};
+use common::{GameEventMessage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientRequest {
-    CreateGame {
-        game_id: u32,
-        game_state: GameState,
-    },
-    
     StartGame {
         game_id: u32,
         server_id: u64,
@@ -24,13 +19,6 @@ pub enum ClientRequest {
     
     RemoveServer {
         server_id: u64,
-    },
-    
-    /// Submit a game command from a user
-    SubmitGameCommand {
-        game_id: u32,
-        user_id: u32,
-        command: GameCommandMessage,
     },
 }
 
@@ -63,9 +51,6 @@ impl AppDataResponse for ClientResponse {}
 // State change events emitted by the state machine
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StateChangeEvent {
-    GameCreated {
-        game_id: u32,
-    },
     GameEvent {
         event: GameEventMessage,
     },
@@ -74,10 +59,5 @@ pub enum StateChangeEvent {
     },
     ServerRemoved {
         server_id: u64,
-    },
-    GameCommandSubmitted {
-        game_id: u32,
-        user_id: u32,
-        command: GameCommandMessage,
     },
 }

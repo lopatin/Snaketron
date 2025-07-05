@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common::{GameCommandMessage, GameState, GameStatus};
+use common::{GameState, GameStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use async_raft::NodeId;
@@ -29,9 +29,6 @@ pub struct GameStateMachine {
     pub game_states: HashMap<u32, GameState>,
     pub servers: HashMap<u64, ServerRegistration>,
     pub last_applied_log: u64,
-    /// Latest command per user per game
-    /// Key: (game_id, user_id), Value: command
-    pub user_commands: HashMap<(u32, u32), GameCommandMessage>,
 }
 
 impl GameStateMachine {
@@ -41,7 +38,6 @@ impl GameStateMachine {
             game_states: HashMap::new(),
             servers: HashMap::new(),
             last_applied_log: 0,
-            user_commands: HashMap::new(),
         }
     }
 
@@ -56,24 +52,6 @@ impl GameStateMachine {
         self.last_applied_log = *index;
 
         let response = match request {
-            ClientRequest::CreateGame { game_id, game_state } => {
-                // Check if the game already exists
-                if self.game_states.contains_key(game_id) {
-                    warn!("Game {} already exists, ignoring create request", game_id);
-                    return Ok((ClientResponse::Error(format!("Game {} already exists", game_id)), vec![]));
-                }
-
-                // Insert the new game state
-                self.game_states.insert(*game_id, game_state.clone());
-
-                // Emit event
-                if let Some(ref mut events) = out {
-                    events.push(StateChangeEvent::GameCreated { game_id: *game_id });
-                }
-
-                ClientResponse::Success
-            }
-
             ClientRequest::StartGame { game_id, server_id } => {
                 if let Some(game_state) = self.game_states.get_mut(game_id) {
                     match &game_state.status {
@@ -149,30 +127,6 @@ impl GameStateMachine {
                     warn!("Attempted to remove unknown server {}", server_id);
                     ClientResponse::Error(format!("Unknown server ID: {}", server_id))
                 }
-            }
-            
-            ClientRequest::SubmitGameCommand { game_id, user_id, command } => {
-                // Verify the game exists
-                if !self.game_states.contains_key(game_id) {
-                    warn!("Attempted to submit command for unknown game {}", game_id);
-                    return Ok((ClientResponse::Error(format!("Unknown game ID: {}", game_id)), vec![]));
-                }
-                
-                // Store the command
-                let key = (*game_id, *user_id);
-                self.user_commands.insert(key, command.clone());
-                
-                // Emit state change event
-                if let Some(ref mut events) = out {
-                    events.push(StateChangeEvent::GameCommandSubmitted {
-                        game_id: *game_id,
-                        user_id: *user_id,
-                        command: command.clone(),
-                    });
-                }
-                
-                debug!("User {} submitted command for game {}", user_id, game_id);
-                ClientResponse::Success
             }
         };
 

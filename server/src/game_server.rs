@@ -167,11 +167,13 @@ impl GameServer {
         let ws_addr_clone = ws_addr.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
         let ws_raft = raft.clone();
+        let ws_redis_url = redis_url.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
                 ws_raft,
                 ws_pool,
+                ws_redis_url,
                 ws_token,
                 ws_jwt_verifier,
             ).await;
@@ -180,15 +182,17 @@ impl GameServer {
         // Start the matchmaking service
         info!("Starting matchmaking service");
         let match_pool = db_pool.clone();
-        let match_raft = raft.clone();
+        let match_redis_url = redis_url.clone();
         let match_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
-            run_matchmaking_loop(
+            if let Err(e) = run_matchmaking_loop(
                 match_pool,
-                match_raft,
+                match_redis_url,
                 server_id,
                 match_token,
-            ).await;
+            ).await {
+                error!("Matchmaking loop error: {}", e);
+            }
         }));
 
 

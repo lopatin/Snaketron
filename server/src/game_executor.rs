@@ -204,7 +204,7 @@ async fn run_game(
 }
 
 /// Helper function to publish events to Redis stream
-async fn publish_to_stream(
+pub async fn publish_to_stream(
     redis_conn: &mut ConnectionManager,
     stream_key: &str,
     event: &StreamEvent,

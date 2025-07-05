@@ -18,8 +18,11 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 use common::{GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
 use crate::raft::{RaftNode, StateChangeEvent};
+use crate::game_executor::{StreamEvent, publish_to_stream};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -227,6 +230,7 @@ pub async fn run_websocket_server(
     addr: &str,
     raft: Arc<RaftNode>,
     db_pool: PgPool,
+    redis_url: String,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
 ) -> Result<()> {
@@ -253,7 +257,8 @@ pub async fn run_websocket_server(
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
                         let raft_clone = raft.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(raft_clone, db_pool_clone, stream, jwt_verifier_clone, connection_token));
+                        let redis_url_clone = redis_url.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(raft_clone, db_pool_clone, redis_url_clone, stream, jwt_verifier_clone, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -291,12 +296,19 @@ pub async fn run_websocket_server(
 async fn handle_websocket_connection(
     raft: Arc<RaftNode>,
     db_pool: PgPool,
+    redis_url: String,
     stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
+
+    // Create Redis connection for this WebSocket connection
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client")?;
+    let mut redis_conn = ConnectionManager::new(client).await
+        .context("Failed to create Redis connection manager")?;
 
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
@@ -365,22 +377,6 @@ async fn handle_websocket_connection(
             // Handle Raft state change events
             Some(Ok(event)) = state_event_stream.next() => {
                 match event {
-                    StateChangeEvent::GameCreated { game_id } => {
-                        if let ConnectionState::Authenticated { metadata } = &state {
-                            // Get the game state from Raft
-                            if let Some(game_state) = raft.get_game_state(game_id).await {
-                                if game_state.players.contains_key(&(metadata.user_id as u32)) {
-                                    state = ConnectionState::InGame {
-                                        metadata: metadata.clone(),
-                                        game_id,
-                                        // command_tx: game_state.command_tx.clone(),
-                                        // event_rx: game_state.event_rx.clone(),
-                                    };
-                                }
-                            }
-                        }
-                    }
-                    
                     StateChangeEvent::GameEvent { event } => {
                         if let ConnectionState::InGame { metadata, game_id, .. } = &state {
                             if event.game_id == *game_id {
@@ -463,6 +459,7 @@ async fn handle_websocket_connection(
                             &ws_tx,
                             &mut ws_stream,
                             &raft,
+                            &mut redis_conn,
                         ).await;
                         
                         match process_result {
@@ -514,6 +511,7 @@ async fn process_ws_message(
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
     raft: &Arc<RaftNode>,
+    redis_conn: &mut ConnectionManager,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -625,7 +623,7 @@ async fn process_ws_message(
                 WSMessage::CreateCustomGame { settings } => {
                     info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
                     
-                    match create_custom_game(db_pool, raft, metadata.user_id, settings).await {
+                    match create_custom_game(db_pool, redis_conn, metadata.user_id, settings).await {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
@@ -652,7 +650,7 @@ async fn process_ws_message(
                 WSMessage::JoinCustomGame { game_code } => {
                     info!("User {} ({}) joining custom game with code: {}", metadata.username, metadata.user_id, game_code);
                     
-                    match join_custom_game(db_pool, raft, metadata.user_id, &game_code).await {
+                    match join_custom_game(db_pool, metadata.user_id, &game_code).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::CustomGameJoined { game_id };
@@ -706,7 +704,7 @@ async fn process_ws_message(
                 WSMessage::CreateSoloGame { mode } => {
                     info!("User {} ({}) creating solo game with mode: {:?}", metadata.username, metadata.user_id, mode);
                     
-                    match create_solo_game(db_pool, raft, metadata.user_id, mode).await {
+                    match create_solo_game(db_pool, redis_conn, metadata.user_id, mode).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -739,20 +737,23 @@ async fn process_ws_message(
         ConnectionState::InGame { metadata, game_id } => {
             match ws_message {
                 WSMessage::GameCommand(command_message) => {
-                    // Submit command to Raft
-                    let request = crate::raft::ClientRequest::SubmitGameCommand {
+                    // Submit command directly to Redis stream
+                    let partition_id = (game_id % 10) + 1; // Partitions are 1-indexed
+                    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+                    
+                    let event = StreamEvent::GameCommandSubmitted {
                         game_id,
                         user_id: metadata.user_id as u32,
                         command: command_message,
                     };
                     
-                    match raft.propose(request).await {
+                    match publish_to_stream(redis_conn, &stream_key, &event).await {
                         Ok(_) => {
-                            debug!("Successfully submitted game command to Raft");
+                            debug!("Successfully submitted game command to Redis stream");
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
-                            error!("Failed to submit command to Raft: {}", e);
+                            error!("Failed to submit command to Redis stream: {}", e);
                             // Keep the connection in game state, don't disconnect
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
@@ -892,14 +893,18 @@ fn generate_game_code() -> String {
 
 async fn create_custom_game(
     pool: &PgPool,
-    raft: &Arc<RaftNode>,
+    redis_conn: &mut ConnectionManager,
     user_id: i32,
     settings: common::CustomGameSettings,
 ) -> Result<(u32, String)> {
     let game_code = generate_game_code();
     
-    // Get current server ID from Raft node ID
-    let server_id = raft.id as i32;
+    // Get current server ID from database
+    let server_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
+    )
+    .fetch_one(pool)
+    .await?;
     
     // Create lobby entry
     let lobby_id: i32 = sqlx::query_scalar(
@@ -952,25 +957,34 @@ async fn create_custom_game(
     // Add the host as the first player
     game_state.add_player(user_id as u32)?;
     
-    // Submit to Raft
-    let request = crate::raft::ClientRequest::CreateGame {
-        game_id: game_id as u32,
+    // Publish GameCreated event to Redis stream
+    let game_id_u32 = game_id as u32;
+    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+    
+    let event = StreamEvent::GameCreated {
+        game_id: game_id_u32,
         game_state,
     };
     
-    raft.propose(request).await?;
+    publish_to_stream(redis_conn, &stream_key, &event).await
+        .context("Failed to publish GameCreated event to Redis stream")?;
     
     Ok((game_id as u32, game_code))
 }
 
 async fn create_solo_game(
     pool: &PgPool,
-    raft: &Arc<RaftNode>,
+    redis_conn: &mut ConnectionManager,
     user_id: i32,
     mode: common::SoloMode,
 ) -> Result<u32> {
-    // Get current server ID from Raft node ID
-    let server_id = raft.id as i32;
+    // Get current server ID from database
+    let server_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
+    )
+    .fetch_one(pool)
+    .await?;
     
     // Create game settings based on solo mode
     let settings = common::CustomGameSettings {
@@ -1012,27 +1026,33 @@ async fn create_solo_game(
     // Add the player (only one player for solo mode)
     game_state.add_player(user_id as u32)?;
     
-    // Submit to Raft
-    let request = crate::raft::ClientRequest::CreateGame {
-        game_id: game_id as u32,
+    // Publish GameCreated event to Redis stream
+    let game_id_u32 = game_id as u32;
+    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+    
+    let event = StreamEvent::GameCreated {
+        game_id: game_id_u32,
         game_state,
     };
     
-    raft.propose(request).await?;
+    publish_to_stream(redis_conn, &stream_key, &event).await
+        .context("Failed to publish GameCreated event to Redis stream")?;
     
     // Start the game immediately (no waiting in solo mode)
-    let start_request = crate::raft::ClientRequest::StartGame { 
+    let status_event = StreamEvent::StatusUpdated { 
         game_id: game_id as u32,
-        server_id: raft.id,
+        status: GameStatus::Started { server_id: server_id as u64 },
     };
-    raft.propose(start_request).await?;
+    
+    publish_to_stream(redis_conn, &stream_key, &status_event).await
+        .context("Failed to publish StatusUpdated event to Redis stream")?;
     
     Ok(game_id as u32)
 }
 
 async fn join_custom_game(
     pool: &PgPool,
-    raft: &Arc<RaftNode>,
     user_id: i32,
     game_code: &str,
 ) -> Result<u32> {
@@ -1082,7 +1102,7 @@ async fn join_custom_game(
     .execute(pool)
     .await?;
     
-    // TODO: Implement proper player joining through Raft when game hasn't started yet
+    // TODO: Implement proper player joining through Redis events when game hasn't started yet
     warn!("Player joining for custom games needs proper implementation");
     
     Ok(game_id as u32)

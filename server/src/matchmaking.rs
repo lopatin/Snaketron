@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use std::sync::Arc;
 use anyhow::Context;
 use common::{GameState, GameType};
-use crate::raft::{ClientRequest, ClientResponse, RaftNode};
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use crate::game_executor::{StreamEvent, publish_to_stream};
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
@@ -50,11 +52,17 @@ struct ServerLoad {
 /// Main matchmaking loop that runs on each server
 pub async fn run_matchmaking_loop(
     pool: PgPool,
-    raft: Arc<RaftNode>,
+    redis_url: String,
     server_id: u64,
     cancellation_token: CancellationToken,
-) {
+) -> anyhow::Result<()> {
     info!(?server_id, "Starting adaptive matchmaking loop");
+
+    // Create Redis connection for publishing game events
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client")?;
+    let redis_conn = ConnectionManager::new(client).await
+        .context("Failed to create Redis connection manager")?;
 
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -92,7 +100,7 @@ pub async fn run_matchmaking_loop(
         });
         
         for game_type in &game_types {
-            match create_adaptive_match(&pool, raft.clone(), game_type.clone(), server_id).await {
+            match create_adaptive_match(&pool, redis_conn.clone(), game_type.clone(), server_id).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
@@ -113,6 +121,8 @@ pub async fn run_matchmaking_loop(
             }
         }
     }
+    
+    Ok(())
 }
 
 /// Update server heartbeat
@@ -135,7 +145,7 @@ async fn update_heartbeat(pool: &PgPool, server_id: u64) -> Result<(), sqlx::Err
 /// Create an adaptive match using expanding skill ranges
 async fn create_adaptive_match(
     pool: &PgPool,
-    raft: Arc<RaftNode>,
+    mut redis_conn: ConnectionManager,
     game_type: serde_json::Value,
     server_id: u64,
 ) -> anyhow::Result<Option<(i32, Vec<i32>)>> {
@@ -334,21 +344,20 @@ async fn create_adaptive_match(
         game_state.add_player(*user_id as u32)?;
     }
     
-    // Save the game to Raft
-    match raft.propose(ClientRequest::CreateGame {
-        game_id: game_id as u32,
+    // Publish GameCreated event to Redis stream
+    let game_id_u32 = game_id as u32;
+    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+    
+    let event = StreamEvent::GameCreated {
+        game_id: game_id_u32,
         game_state,
-    }).await.context("Failed to save game to raft")? {
-        ClientResponse::Success => info!(game_id, "Game created and saved to Raft"),
-        ClientResponse::Error(msg) => {
-            warn!(game_id, error = %msg, "Game creation failed in Raft");
-            return Err(anyhow::anyhow!("Raft error: {}", msg));
-        }
-        _ => {
-            warn!(game_id, "Unexpected response from Raft when creating game");
-            return Err(anyhow::anyhow!("Unexpected Raft response"));
-        }
-    }
+    };
+    
+    publish_to_stream(&mut redis_conn, &stream_key, &event).await
+        .context("Failed to publish GameCreated event to Redis stream")?;
+    
+    info!(game_id, partition_id, "Game created and published to Redis stream");
 
     // Log match details
     let avg_mmr = matched_players.iter()
