@@ -106,7 +106,7 @@ impl ClusterSingleton {
     /// - This instance loses leadership
     /// 
     /// The service should monitor this token and shut down gracefully when canceled.
-    pub async fn run_as_singleton(mut self, user_service: impl Fn(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
+    pub async fn run(mut self, user_service: impl Fn(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
         info!("Starting cluster singleton for server_id={}", self.server_id);
         
         let mut renew_interval = interval(Duration::from_millis(300));

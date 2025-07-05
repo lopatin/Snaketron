@@ -6,22 +6,28 @@ This document tracks what needs to be done to completely remove Raft from the Sn
 - ✅ Game executor now uses Redis streams instead of Raft
 - ✅ Game events are published to partition-specific Redis streams
 - ✅ Game executor reads commands from Redis streams
-- ❌ Integration tests are broken (e.g., test_simple_game) because game creation still goes through Raft
+- ✅ Matchmaking creates games directly in database and publishes to Redis (Step 1 completed)
+- ✅ WebSocket server publishes commands directly to Redis streams (Step 2 completed)
+- ✅ Removed CreateGame and SubmitGameCommand from Raft types
+- ✅ WebSocket connection uses shared Redis ConnectionManager
+- ✅ WebSocket connection subscribes to Redis streams instead of Raft state events
+- ❌ Integration tests are broken (e.g., test_simple_game) need updates
 
 ## Remaining Work
 
-### 1. Game Creation Flow
-**Current**: Games are created via Raft (CreateGame request)
-**Needed**: 
-- Create games directly in database/Redis
-- Publish GameCreated event to appropriate Redis stream partition
-- Update matchmaking service to bypass Raft
+### 1. ✅ Game Creation Flow (COMPLETED)
+**Previous**: Games were created via Raft (CreateGame request)
+**Implemented**: 
+- Matchmaking service creates games directly in database
+- Publishes GameCreated event to appropriate Redis stream partition
+- Removed CreateGame from Raft types
 
-### 2. Game Command Submission
-**Current**: Commands go through WebSocket → Raft → Game Executor
-**Needed**:
-- WebSocket server should publish commands directly to Redis streams
-- Remove `SubmitGameCommand` from Raft
+### 2. ✅ Game Command Submission (COMPLETED)
+**Previous**: Commands went through WebSocket → Raft → Game Executor
+**Implemented**:
+- WebSocket server publishes commands directly to Redis streams
+- Removed `SubmitGameCommand` from Raft types
+- Added subscribe_to_game_events function for Redis stream subscription
 
 ### 3. Game State Storage
 **Current**: Game states are stored in Raft's replicated state machine

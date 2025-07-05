@@ -210,7 +210,7 @@ impl GameServer {
                     &exec_redis_url,
                     server_id,
                     format!("snaketron:game-executor:partition-{}", partition_id),
-                    Duration::from_secs(2),
+                    Duration::from_secs(1),
                     exec_token.clone(),
                 ).await {
                     Ok(s) => s,
@@ -239,7 +239,7 @@ impl GameServer {
                     }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
                 };
                 
-                if let Err(e) = singleton.run_as_singleton(service).await {
+                if let Err(e) = singleton.run(service).await {
                     error!("Cluster singleton error for game executor partition {}: {}", partition_id, e);
                 }
             }));
@@ -302,7 +302,7 @@ impl GameServer {
                 Ok::<(), anyhow::Error>(())
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
             
-            if let Err(e) = cluster_singleton.run_as_singleton(service).await {
+            if let Err(e) = cluster_singleton.run(service).await {
                 error!("Cluster singleton error: {}", e);
             }
         }));
