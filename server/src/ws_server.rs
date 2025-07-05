@@ -232,6 +232,12 @@ pub async fn run_websocket_server(
     jwt_verifier: Arc<dyn JwtVerifier>,
 ) -> Result<()> {
 
+    // Create shared Redis connection manager
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client")?;
+    let redis_conn = ConnectionManager::new(client).await
+        .context("Failed to create Redis connection manager")?;
+
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
 
@@ -253,8 +259,8 @@ pub async fn run_websocket_server(
                         let connection_token = cancellation_token.child_token();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let redis_url_clone = redis_url.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, redis_url_clone, stream, jwt_verifier_clone, connection_token));
+                        let redis_conn_clone = redis_conn.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, redis_conn_clone, stream, jwt_verifier_clone, connection_token));
                         connection_handles.push(handle);
                     }
 
@@ -291,19 +297,13 @@ pub async fn run_websocket_server(
 
 async fn handle_websocket_connection(
     db_pool: PgPool,
-    redis_url: String,
+    redis_conn: ConnectionManager,
     stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
-
-    // Create Redis connection for this WebSocket connection
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client")?;
-    let mut redis_conn = ConnectionManager::new(client).await
-        .context("Failed to create Redis connection manager")?;
 
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
@@ -401,6 +401,9 @@ async fn handle_websocket_connection(
                         // Check current state before processing
                         let was_in_game = matches!(&state, ConnectionState::InGame { .. });
                         
+                        // Clone the connection manager for this call
+                        let mut redis_conn_clone = redis_conn.clone();
+                        
                         let process_result = process_ws_message(
                             state,
                             ws_message,
@@ -408,7 +411,7 @@ async fn handle_websocket_connection(
                             &db_pool,
                             &ws_tx,
                             &mut ws_stream,
-                            &mut redis_conn,
+                            &mut redis_conn_clone,
                         ).await;
                         
                         match process_result {
@@ -429,7 +432,7 @@ async fn handle_websocket_connection(
                                         let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
                                         let game_id_filter = *game_id;
                                         let ws_tx_clone = ws_tx.clone();
-                                        let redis_url_clone = redis_url.clone();
+                                        let redis_conn_for_subscription = redis_conn.clone();
                                         
                                         // Abort any existing subscription
                                         if let Some(handle) = game_event_handle.take() {
@@ -439,7 +442,7 @@ async fn handle_websocket_connection(
                                         // Start new subscription
                                         game_event_handle = Some(tokio::spawn(async move {
                                             if let Err(e) = subscribe_to_game_events(
-                                                redis_url_clone,
+                                                redis_conn_for_subscription,
                                                 stream_key,
                                                 game_id_filter,
                                                 ws_tx_clone
@@ -1212,16 +1215,13 @@ async fn spectate_game(
 
 /// Subscribe to Redis stream and forward game events to the WebSocket client
 async fn subscribe_to_game_events(
-    redis_url: String,
+    redis_conn: ConnectionManager,
     stream_key: String,
     game_id: u32,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
-    // Create a new Redis connection for this subscription
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client for subscription")?;
-    let mut redis_conn = ConnectionManager::new(client).await
-        .context("Failed to create Redis connection manager")?;
+    // Use the connection manager for this subscription
+    let mut redis_conn = redis_conn;
     
     // Track the last message ID we've read
     let mut last_id = "$".to_string(); // Start from latest messages
