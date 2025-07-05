@@ -116,11 +116,10 @@ async fn main() -> Result<()> {
 
     // Raft peers are now discovered automatically from the database
 
-    // Get Redis URL from environment (optional)
-    let redis_url = env::var("SNAKETRON_REDIS_URL").ok();
-    if redis_url.is_some() {
-        info!("Redis leader election enabled");
-    }
+    // Get Redis URL from environment (required)
+    let redis_url = env::var("SNAKETRON_REDIS_URL")
+        .context("SNAKETRON_REDIS_URL environment variable is required")?;
+    info!("Redis leader election enabled at {}", redis_url);
 
     // Create server configuration
     let config = GameServerConfig {

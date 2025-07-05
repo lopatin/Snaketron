@@ -162,19 +162,29 @@ async fn run_game(
 }
 
 
-/// Run the game executor service
+/// Run the game executor service for a specific partition
 pub async fn run_game_executor(
     server_id: u64,
+    partition_id: u32,
     raft: Arc<RaftNode>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
-    info!("Starting game executor for server {}", server_id);
+    info!("Starting game executor for server {} partition {}", server_id, partition_id);
 
     let mut state_rx = raft.subscribe_state_events();
 
     let raft_clone = raft.clone();
     let cancellation_token_clone = cancellation_token.clone();
     let try_start_game = move |game_id: u32| {
+        // Only process games that belong to this partition
+        // Partition 1 handles games where game_id % 10 == 0
+        // Partition 2 handles games where game_id % 10 == 1
+        // ... and so on
+        if game_id % 10 != partition_id - 1 {
+            debug!("Game {} belongs to partition {}, not partition {}", game_id, (game_id % 10) + 1, partition_id);
+            return;
+        }
+        info!("Partition {} will start game {}", partition_id, game_id);
         let raft = raft_clone.clone();
         let cancellation_token = cancellation_token_clone.clone();
         tokio::spawn(async move {

@@ -10,7 +10,22 @@ use tracing::{info, warn, error, debug};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
-pub struct LeaderElection {
+/// A cluster singleton ensures that only one instance of a service runs across the entire cluster
+/// It uses Redis-based leader election internally to manage exclusivity
+/// 
+/// This can be used for various patterns:
+/// - Global singleton services (e.g., a single matchmaking service for the entire region)
+/// - Partitioned singletons (e.g., one game executor per partition, with automatic failover)
+/// 
+/// The lease_key parameter determines the scope of the singleton - different keys create
+/// independent singletons that can coexist on the same cluster.
+/// 
+/// The cancellation_token passed to the constructor represents the server shutdown signal.
+/// When this token is cancelled, the cluster singleton will:
+/// 1. Stop trying to acquire/maintain leadership
+/// 2. Gracefully shut down any running service (via a child cancellation token)
+/// 3. Exit the run_as_singleton loop
+pub struct ClusterSingleton {
     redis_url: String,
     redis_client: Option<ConnectionManager>,
     server_id: u64,
@@ -20,7 +35,7 @@ pub struct LeaderElection {
     cancellation_token: CancellationToken,
 }
 
-impl LeaderElection {
+impl ClusterSingleton {
     pub async fn new(
         redis_url: &str,
         server_id: u64,
@@ -28,14 +43,14 @@ impl LeaderElection {
         lease_duration: Duration,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
-        // Try to establish initial connection but don't fail if Redis is down
+        // Try to establish an initial connection but don't fail if Redis is down
         let redis_client = match Self::create_connection(redis_url).await {
             Ok(client) => {
-                info!("Successfully connected to Redis for leader election");
+                info!("Successfully connected to Redis for cluster singleton");
                 Some(client)
             }
             Err(e) => {
-                warn!("Failed to connect to Redis initially: {}. Will retry during election loop.", e);
+                warn!("Failed to connect to Redis initially: {}. Will retry during leader election.", e);
                 None
             }
         };
@@ -83,8 +98,16 @@ impl LeaderElection {
         Ok(())
     }
 
-    pub async fn run_election_loop(mut self, user_service: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
-        info!("Starting leader election loop for server_id={}", self.server_id);
+    /// Runs the provided service as a cluster singleton
+    /// The service will only run on one node at a time across the cluster
+    /// 
+    /// The service function receives a CancellationToken that will be canceled when:
+    /// - The server is shutting down (parent token cancelled)
+    /// - This instance loses leadership
+    /// 
+    /// The service should monitor this token and shut down gracefully when canceled.
+    pub async fn run_as_singleton(mut self, user_service: impl Fn(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
+        info!("Starting cluster singleton for server_id={}", self.server_id);
         
         let mut renew_interval = interval(Duration::from_millis(300));
         renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -94,6 +117,7 @@ impl LeaderElection {
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         let mut service_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
+        let mut service_token: Option<CancellationToken> = None;
         let mut rng = StdRng::from_entropy();
         
         // Create the initial claim sleep
@@ -103,29 +127,35 @@ impl LeaderElection {
         loop {
             tokio::select! {
                 _ = self.cancellation_token.cancelled() => {
-                    info!("Leader election shutdown received");
+                    info!("Cluster singleton shutdown received");
                     self.is_leader.store(false, Ordering::Release);
-                    if let Some(handle) = service_handle.take() {
-                        handle.abort();
-                    }
+                    
+                    // Gracefully shut down the service if running
+                    self.stop_service(&mut service_token, &mut service_handle).await;
+                    
                     break;
                 }
                 _ = &mut claim_sleep => {
-                    debug!("Attempting to claim leadership for server_id={}", self.server_id);
+                    debug!("Attempting to become leader for server_id={}", self.server_id);
                     if !self.is_leader() {
                         match self.try_acquire_lease().await {
                             Ok(true) => {
-                                info!("Acquired leadership for server_id={}", self.server_id);
+                                info!("Became leader for server_id={}", self.server_id);
                                 self.is_leader.store(true, Ordering::Release);
                                 
                                 // Start the user service
                                 if service_handle.is_none() {
-                                    let service_future = user_service();
+                                    // Create a child cancellation token for this service instance
+                                    // This token will be automatically canceled if the parent (server shutdown) token is canceled
+                                    // It can also be manually canceled when we lose leadership
+                                    let token = self.cancellation_token.child_token();
+                                    service_token = Some(token.clone());
+                                    let service_future = user_service(token);
                                     service_handle = Some(tokio::spawn(service_future));
                                 }
                             }
                             Ok(false) => {
-                                debug!("Failed to acquire leadership - another server holds the lease");
+                                debug!("Failed to become leader - another server is already leader");
                             }
                             Err(e) => {
                                 warn!("Error trying to acquire lease: {}", e);
@@ -150,18 +180,14 @@ impl LeaderElection {
                                 self.is_leader.store(false, Ordering::Release);
                                 
                                 // Stop the user service
-                                if let Some(handle) = service_handle.take() {
-                                    handle.abort();
-                                }
+                                self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                             Err(e) => {
                                 error!("Error renewing lease: {}", e);
                                 self.is_leader.store(false, Ordering::Release);
                                 
                                 // Stop the user service on error
-                                if let Some(handle) = service_handle.take() {
-                                    handle.abort();
-                                }
+                                self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                         }
                     }
@@ -197,9 +223,7 @@ impl LeaderElection {
                                 warn!("Lost Redis connection while being leader. Stepping down.");
                                 self.is_leader.store(false, Ordering::Release);
                                 
-                                if let Some(handle) = service_handle.take() {
-                                    handle.abort();
-                                }
+                                self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                         }
                     }
@@ -273,7 +297,35 @@ impl LeaderElection {
         }
     }
 
+    /// Returns true if this instance is currently the leader (i.e., running as the singleton)
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::Acquire)
+    }
+    
+    /// Gracefully stops the running service
+    async fn stop_service(
+        &self,
+        service_token: &mut Option<CancellationToken>,
+        service_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    ) {
+        // First, send a cancellation signal to the service
+        if let Some(token) = service_token.take() {
+            debug!("Cancelling service token");
+            token.cancel();
+        }
+        
+        // Then wait for the service to finish gracefully
+        if let Some(handle) = service_handle.take() {
+            debug!("Waiting for service to shut down gracefully");
+            match tokio::time::timeout(Duration::from_secs(10), handle).await {
+                Ok(Ok(Ok(()))) => info!("Service shut down gracefully"),
+                Ok(Ok(Err(e))) => error!("Service returned error: {:?}", e),
+                Ok(Err(e)) => error!("Service task panicked: {:?}", e),
+                Err(_) => {
+                    warn!("Service shutdown timed out after 10 seconds");
+                    // The task will continue running but we won't wait for it
+                }
+            }
+        }
     }
 }

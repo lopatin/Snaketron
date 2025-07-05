@@ -7,7 +7,7 @@ pub mod learner_join;
 pub mod ws_server;
 pub mod replay;
 pub mod api;
-pub mod leader_election;
+pub mod cluster_singleton;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

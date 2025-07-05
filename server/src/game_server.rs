@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tracing::{info, error, warn, trace};
+use tracing::{info, error, warn, trace, debug};
 
 use crate::{
     ws_server::{register_server, run_websocket_server, JwtVerifier},
@@ -15,7 +15,7 @@ use crate::{
     raft::{RaftNode},
     learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
-    leader_election::LeaderElection,
+    cluster_singleton::ClusterSingleton,
 };
 use crate::ws_server::discover_peers;
 use std::path::PathBuf;
@@ -34,8 +34,8 @@ pub struct GameServerConfig {
     pub jwt_verifier: Arc<dyn JwtVerifier>,
     /// Optional directory for saving game replays
     pub replay_dir: Option<PathBuf>,
-    /// Optional Redis URL for leader election (e.g., "redis://127.0.0.1:6379")
-    pub redis_url: Option<String>,
+    /// Redis URL for cluster singleton coordination (e.g., "redis://127.0.0.1:6379")
+    pub redis_url: String,
 }
 
 /// A complete game server instance with all components
@@ -189,19 +189,57 @@ impl GameServer {
             ).await;
         }));
 
-        // Start game the execution loop
-        info!("Starting game executor service");
-        let exec_raft = raft.clone();
-        let exec_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = run_game_executor(
-                server_id,
-                exec_raft,
-                exec_token,
-            ).await {
-                error!("Game executor service error: {}", e);
-            }
-        }));
+        // Start game executors for each partition as cluster singletons
+        // Each partition handles games where game_id % 10 == (partition_id - 1)
+        // This provides automatic failover - if one server goes down, another will
+        // automatically take over its partitions
+        info!("Starting game executor services for 10 partitions");
+        for partition_id in 1..=10 {
+            let exec_raft = raft.clone();
+            let exec_token = cancellation_token.clone();
+            let exec_redis_url = redis_url.clone();
+            
+            handles.push(tokio::spawn(async move {
+                info!("Starting cluster singleton for game executor partition {}", partition_id);
+                
+                let singleton = match ClusterSingleton::new(
+                    &exec_redis_url,
+                    server_id,
+                    format!("snaketron:game-executor:partition-{}", partition_id),
+                    Duration::from_secs(2),
+                    exec_token.clone(),
+                ).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to create cluster singleton for partition {}: {}", partition_id, e);
+                        return;
+                    }
+                };
+                
+                // Service that runs the game executor for this partition
+                let service = move |token: CancellationToken| {
+                    let raft_clone = exec_raft.clone();
+                    Box::pin(async move {
+                        info!("Game executor for partition {} is now active", partition_id);
+                        
+                        if let Err(e) = run_game_executor(
+                            server_id,
+                            partition_id,
+                            raft_clone,
+                            token,
+                        ).await {
+                            error!("Game executor service error for partition {}: {}", partition_id, e);
+                        }
+                        
+                        Ok::<(), anyhow::Error>(())
+                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                };
+                
+                if let Err(e) = singleton.run_as_singleton(service).await {
+                    error!("Cluster singleton error for game executor partition {}: {}", partition_id, e);
+                }
+            }));
+        }
 
         // Start replay listener if configured
         let replay_listener = if let Some(replay_dir) = replay_dir {
@@ -219,41 +257,51 @@ impl GameServer {
             None
         };
 
-        // Optional Redis leader election
-        if let Some(redis_url) = redis_url {
-            info!("Starting leader election service with Redis");
-            let election_token = cancellation_token.clone();
-            let election_region = region.clone();
-            handles.push(tokio::spawn(async move {
-                // Example: Run a simple service that logs when it's the leader
-                let election = match LeaderElection::new(
-                    &redis_url,
-                    server_id,
-                    format!("snaketron:leader:{}", election_region),
-                    Duration::from_secs(2),
-                    election_token,
-                ).await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        error!("Failed to create leader election: {}", e);
-                        return;
-                    }
-                };
-                
-                // Example service that runs only on the leader
-                let service = || Box::pin(async move {
-                    info!("This server is now the leader!");
-                    // User can replace this with their actual service logic
-                    Ok::<(), anyhow::Error>(())
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-                
-                if let Err(e) = election.run_election_loop(service).await {
-                    error!("Leader election error: {}", e);
+        // Redis cluster singleton
+        info!("Starting cluster singleton service with Redis");
+        let lock_token = cancellation_token.clone();
+        let lock_region = region.clone();
+        handles.push(tokio::spawn(async move {
+            // Example: Run a simple service that logs when it holds the lock
+            let cluster_singleton = match ClusterSingleton::new(
+                &redis_url,
+                server_id,
+                format!("snaketron:singleton:{}", lock_region),
+                Duration::from_secs(2),
+                lock_token,
+            ).await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("Failed to create cluster singleton: {}", e);
+                    return;
                 }
-            }));
-        } else {
-            info!("Redis leader election not configured");
-        }
+            };
+            
+            // Example service that runs as a singleton across the cluster
+            let service = |token: CancellationToken| Box::pin(async move {
+                info!("This server is now running the singleton service!");
+                
+                // Example of how to use the cancellation token in your service
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            info!("Singleton service received cancellation signal");
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                            // Your actual service logic would go here
+                            debug!("Singleton service is running...");
+                        }
+                    }
+                }
+                
+                Ok::<(), anyhow::Error>(())
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+            
+            if let Err(e) = cluster_singleton.run_as_singleton(service).await {
+                error!("Cluster singleton error: {}", e);
+            }
+        }));
 
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -380,7 +428,7 @@ pub async fn start_test_server_with_grpc(
         region: "test-region".to_string(),
         jwt_verifier,
         replay_dir,
-        redis_url: None,
+        redis_url: "redis://127.0.0.1:6379".to_string(),
     };
 
     GameServer::start(config).await
