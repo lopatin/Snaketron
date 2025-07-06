@@ -203,23 +203,21 @@ pub async fn run_game_executor(
     // Create consumer group if it doesn't exist
     let _: Result<(), _> = redis_conn.xgroup_create_mkstream(&stream_key, &group_name, "$").await;
 
-    // Track active games and their event channels
-    let mut active_games = std::collections::HashSet::new();
+    // Track game channels
     let mut game_channels: HashMap<u32, mpsc::Sender<GameCommandMessage>> = HashMap::new();
     
-    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, active_games: &mut std::collections::HashSet<u32>, game_channels: &mut HashMap<u32, mpsc::Sender<GameCommandMessage>>| {
-        if game_id % PARTITION_COUNT != partition_id - 1 {
-            debug!("Game {} belongs to partition {}, not partition {}", game_id, (game_id % PARTITION_COUNT) + 1, partition_id);
+    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, game_channels: &mut HashMap<u32, mpsc::Sender<GameCommandMessage>>| {
+        if game_id % PARTITION_COUNT != partition_id {
+            debug!("Game {} belongs to partition {}, not partition {}", game_id, game_id % PARTITION_COUNT, partition_id);
             return;
         }
         
-        if active_games.contains(&game_id) {
+        if game_channels.contains_key(&game_id) {
             debug!("Game {} is already running", game_id);
             return;
         }
         
         info!("Partition {} will start game {}", partition_id, game_id);
-        active_games.insert(game_id);
         
         // Create a channel for this game
         let (tx, rx) = mpsc::channel(100);
@@ -266,39 +264,33 @@ pub async fn run_game_executor(
                                             Ok(event) => {
                                                 match event {
                                                     StreamEvent::GameCreated { game_id, game_state } => {
-                                                        if game_id % PARTITION_COUNT == partition_id - 1 {
-                                                            info!("Received GameCreated event for game {}", game_id);
-                                                            let redis_conn_clone = redis_conn.clone();
-                                                            let stream_key_clone = stream_key.clone();
-                                                            let cancellation_token_clone = cancellation_token.clone();
-                                                            try_start_game(
-                                                                game_id, 
-                                                                game_state, 
-                                                                redis_conn_clone, 
-                                                                stream_key_clone, 
-                                                                cancellation_token_clone, 
-                                                                &mut active_games, 
-                                                                &mut game_channels
-                                                            );
-                                                        }
+                                                        info!("Received GameCreated event for game {}", game_id);
+                                                        let redis_conn_clone = redis_conn.clone();
+                                                        let stream_key_clone = stream_key.clone();
+                                                        let cancellation_token_clone = cancellation_token.clone();
+                                                        try_start_game(
+                                                            game_id, 
+                                                            game_state, 
+                                                            redis_conn_clone, 
+                                                            stream_key_clone, 
+                                                            cancellation_token_clone, 
+                                                            &mut game_channels
+                                                        );
                                                     }
                                                     StreamEvent::StatusUpdated { game_id, status } => {
-                                                        if game_id % PARTITION_COUNT == partition_id - 1 {
-                                                            match status {
-                                                                GameStatus::Stopped => {
-                                                                    // Game stopped, it might need to be restarted
-                                                                    // In this implementation, we'd need to fetch game state
-                                                                    // from somewhere (e.g., Redis or database)
-                                                                    debug!("Game {} stopped, may need restart", game_id);
-                                                                }
-                                                                GameStatus::Complete { .. } => {
-                                                                    // Game completed, remove from active games and channel
-                                                                    active_games.remove(&game_id);
-                                                                    game_channels.remove(&game_id);
-                                                                    info!("Game {} completed", game_id);
-                                                                }
-                                                                _ => {}
+                                                        match status {
+                                                            GameStatus::Stopped => {
+                                                                // Game stopped, it might need to be restarted
+                                                                // In this implementation, we'd need to fetch game state
+                                                                // from somewhere (e.g., Redis or database)
+                                                                debug!("Game {} stopped, may need restart", game_id);
                                                             }
+                                                            GameStatus::Complete { .. } => {
+                                                                // Game completed, remove channel
+                                                                game_channels.remove(&game_id);
+                                                                info!("Game {} completed", game_id);
+                                                            }
+                                                            _ => {}
                                                         }
                                                     }
                                                     StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
@@ -308,7 +300,6 @@ pub async fn run_game_executor(
                                                                 warn!("Failed to send command to game {}: {}", game_id, e);
                                                                 // The game might have ended, remove from channels
                                                                 game_channels.remove(&game_id);
-                                                                active_games.remove(&game_id);
                                                             }
                                                         } else {
                                                             debug!("Received command for inactive game {}", game_id);

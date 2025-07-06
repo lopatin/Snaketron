@@ -20,7 +20,7 @@ use tungstenite::Utf8Bytes;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
 use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus};
-use crate::game_executor::{StreamEvent, publish_to_stream};
+use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -428,7 +428,7 @@ async fn handle_websocket_connection(
                                 if entering_game {
                                     if let ConnectionState::InGame { game_id, .. } = &state {
                                         // Start Redis stream subscription for game events
-                                        let partition_id = (game_id % 10) + 1;
+                                        let partition_id = game_id % PARTITION_COUNT;
                                         let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
                                         let game_id_filter = *game_id;
                                         let ws_tx_clone = ws_tx.clone();
@@ -735,7 +735,7 @@ async fn process_ws_message(
             match ws_message {
                 WSMessage::GameCommand(command_message) => {
                     // Submit command directly to Redis stream
-                    let partition_id = (game_id % 10) + 1; // Partitions are 1-indexed
+                    let partition_id = game_id % PARTITION_COUNT;
                     let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
                     
                     let event = StreamEvent::GameCommandSubmitted {
@@ -792,7 +792,7 @@ async fn process_ws_message(
                     .await?;
                     
                     // Start the game by publishing StatusUpdated event to Redis
-                    let partition_id = (game_id % 10) + 1; // Partitions are 1-indexed
+                    let partition_id = game_id % PARTITION_COUNT;
                     let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
                     
                     let status_event = StreamEvent::StatusUpdated { 
@@ -967,7 +967,7 @@ async fn create_custom_game(
     
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
-    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let partition_id = game_id_u32 % PARTITION_COUNT;
     let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {
@@ -1036,7 +1036,7 @@ async fn create_solo_game(
     
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
-    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let partition_id = game_id_u32 % PARTITION_COUNT;
     let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {

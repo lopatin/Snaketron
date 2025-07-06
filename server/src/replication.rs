@@ -130,26 +130,23 @@ impl PartitionReplica {
                 }
             }
             StreamEvent::StatusUpdated { game_id, status } => {
-                // Only process games that belong to this partition
-                if game_id % PARTITION_COUNT == self.partition_id - 1 {
-                    let mut states = self.game_states.write().await;
-                    if let Some(game_state) = states.get_mut(&game_id) {
-                        game_state.status = status.clone();
-                        debug!("Updated status for game {} to {:?}", game_id, status);
-                        
-                        // Remove completed games from memory after some time
-                        if matches!(status, GameStatus::Complete { .. }) {
-                            // In production, you might want to keep completed games for a while
-                            // or move them to a different storage
-                            info!("Game {} completed, removing from replication", game_id);
-                            states.remove(&game_id);
-                        }
+                let mut states = self.game_states.write().await;
+                if let Some(game_state) = states.get_mut(&game_id) {
+                    game_state.status = status.clone();
+                    debug!("Updated status for game {} to {:?}", game_id, status);
+                    
+                    // Remove completed games from memory after some time
+                    if matches!(status, GameStatus::Complete { .. }) {
+                        // In production, you might want to keep completed games for a while
+                        // or move them to a different storage
+                        info!("Game {} completed, removing from replication", game_id);
+                        states.remove(&game_id);
                     }
                 }
             }
             StreamEvent::GameCreated { .. } => {
                 // Only process games that belong to this partition
-                // if game_id % 10 == self.partition_id - 1 {
+                // if game_id % PARTITION_COUNT == self.partition_id {
                 //     info!("Replicating new game {} in partition {}", game_id, self.partition_id);
                 //     let mut states = self.game_states.write().await;
                 //     states.insert(game_id, game_state);
@@ -344,7 +341,7 @@ impl GameStateReader for ReplicationManager {
     async fn get_partition_games(&self, partition_id: u32) -> Vec<(u32, GameState)> {
         let states = self.game_states.read().await;
         states.iter()
-            .filter(|(game_id, _)| *game_id % 10 == partition_id - 1)
+            .filter(|(game_id, _)| *game_id % PARTITION_COUNT == partition_id)
             .map(|(id, state)| (*id, state.clone()))
             .collect()
     }

@@ -8,7 +8,7 @@ use anyhow::Context;
 use common::{GameState, GameType};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use crate::game_executor::{StreamEvent, publish_to_stream};
+use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
@@ -346,7 +346,7 @@ async fn create_adaptive_match(
     
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
-    let partition_id = (game_id_u32 % 10) + 1; // Partitions are 1-indexed
+    let partition_id = game_id_u32 % PARTITION_COUNT;
     let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {

@@ -22,6 +22,7 @@ use crate::ws_server::discover_peers;
 use std::path::PathBuf;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use crate::game_executor::PARTITION_COUNT;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -56,9 +57,9 @@ pub struct GameServer {
     /// Handles for all spawned tasks
     handles: Vec<JoinHandle<()>>,
     /// Raft consensus node
-    raft: Option<Arc<RaftNode>>,
+    // raft: Option<Arc<RaftNode>>,
     /// Optional replay listener
-    replay_listener: Option<Arc<ReplayListener>>,
+    // replay_listener: Option<Arc<ReplayListener>>,
     /// Replication manager for game state
     replication_manager: Option<Arc<ReplicationManager>>,
 }
@@ -91,84 +92,6 @@ impl GameServer {
             .context("Failed to create Redis client")?;
         let redis_conn = ConnectionManager::new(client).await
             .context("Failed to create Redis connection manager")?;
-
-        // Start the heartbeat loop
-        let heartbeat_pool = db_pool.clone();
-        let heartbeat_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_heartbeat_loop(
-                heartbeat_pool, 
-                server_id, 
-                heartbeat_token
-            ).await;
-        }));
-       
-        // Initialize Raft node
-        info!("Initializing Raft consensus node");
-        let raft_peers_with_ids = discover_peers(&db_pool, &region).await
-            .context("Failed to discover Raft peers")?;
-        
-        // Check if we're the only server or if there are other peers
-        let other_peers: Vec<String> = raft_peers_with_ids
-            .into_iter()
-            .filter(|(id, _)| *id != server_id)
-            .map(|(_, addr)| addr)
-            .collect();
-        
-        let mut join_as_learner = false;
-        let raft = if other_peers.is_empty() {
-            info!("Starting as first node in cluster");
-            Arc::new(
-                RaftNode::new(
-                    server_id,
-                    vec![server_id],
-                ).await.context("Failed to create Raft node")?
-            )
-        } else {
-            // Join existing cluster as learner
-            info!("Joining existing cluster as learner with {} other peers", other_peers.len());
-            let raft_node = Arc::new(
-                RaftNode::new(
-                    server_id,
-                    vec![], // Start with empty membership, will be added as learner
-                ).await.context("Failed to create Raft node")?
-            );
-            join_as_learner = true;
-            raft_node
-        };
-
-        // Start gRPC server
-        info!("Starting gRPC server on {}", grpc_addr);
-        let grpc_addr_clone = grpc_addr.clone();
-        let grpc_raft = raft.clone();
-        let grpc_token = cancellation_token.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = run_game_relay_server(
-                &grpc_addr_clone,
-                grpc_raft,
-                server_id.to_string(),
-                grpc_token
-            ).await {
-                error!("Game relay gRPC server error: {}", e);
-            }
-        }));
-        
-        if join_as_learner {
-            // Execute join protocol in the background
-            let join_protocol = LearnerJoinProtocol::new(
-                server_id.to_string(),
-                grpc_addr.clone(),
-                raft.clone(),
-            );
-            
-            // Give the gRPC server time to start
-            tokio::time::sleep(Duration::from_secs(2)).await;
-
-            join_protocol
-                .execute_join(other_peers)
-                .await
-                .context("Failed to execute learner join protocol")?;
-        }
 
         // Start WebSocket server
         let ws_pool = db_pool.clone();
@@ -227,11 +150,10 @@ impl GameServer {
         }
 
         // Start game executors for each partition as cluster singletons
-        // Each partition handles games where game_id % 10 == (partition_id - 1)
         // This provides automatic failover - if one server goes down, another will
         // automatically take over its partitions
         info!("Starting game executor services for 10 partitions");
-        for partition_id in 1..=10 {
+        for partition_id in 0..PARTITION_COUNT {
             let exec_token = cancellation_token.clone();
             let exec_redis_url = redis_url.clone();
             let exec_replication_manager = replication_manager.clone();
@@ -281,20 +203,20 @@ impl GameServer {
         }
 
         // Start replay listener if configured
-        let replay_listener = if let Some(replay_dir) = replay_dir {
-            info!("Starting replay listener, saving to {:?}", replay_dir);
-            let listener = Arc::new(ReplayListener::new(replay_dir));
-            let replay_raft = raft.clone();
-            let replay_listener_clone = listener.clone();
-            handles.push(tokio::spawn(async move {
-                let rx = replay_raft.subscribe_state_events();
-                replay_listener_clone.subscribe_to_raft(rx).await;
-            }));
-            Some(listener)
-        } else {
-            info!("Replay recording disabled (no replay directory configured)");
-            None
-        };
+        // let replay_listener = if let Some(replay_dir) = replay_dir {
+        //     info!("Starting replay listener, saving to {:?}", replay_dir);
+        //     let listener = Arc::new(ReplayListener::new(replay_dir));
+        //     let replay_raft = raft.clone();
+        //     let replay_listener_clone = listener.clone();
+        //     handles.push(tokio::spawn(async move {
+        //         let rx = replay_raft.subscribe_state_events();
+        //         replay_listener_clone.subscribe_to_raft(rx).await;
+        //     }));
+        //     Some(listener)
+        // } else {
+        //     info!("Replay recording disabled (no replay directory configured)");
+        //     None
+        // };
 
         // Redis cluster singleton
         info!("Starting cluster singleton service with Redis");
@@ -354,8 +276,8 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
-            raft: Some(raft),
-            replay_listener,
+            // raft: Some(raft),
+            // replay_listener,
             replication_manager: Some(replication_manager),
         })
     }
@@ -385,9 +307,9 @@ impl GameServer {
     }
 
     /// Get a reference to the replay listener
-    pub fn replay_listener(&self) -> Option<&Arc<ReplayListener>> {
-        self.replay_listener.as_ref()
-    }
+    // pub fn replay_listener(&self) -> Option<&Arc<ReplayListener>> {
+    //     self.replay_listener.as_ref()
+    // }
     
     /// Get the replication manager
     pub fn replication_manager(&self) -> Option<&Arc<ReplicationManager>> {
