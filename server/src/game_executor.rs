@@ -149,12 +149,8 @@ async fn run_game(
                             }
                         }
                         
-                        // Apply events to tracked game state
-                        for (_, event) in &events {
-                            game_state.apply_event(event.clone(), None);
-                        }
-                        
                         // Check for solo game end
+                        let game_state = engine.get_committed_state();
                         if game_state.game_type.is_solo() && game_state.players.len() == 1 {
                                 // Get the single player
                                 if let Some((user_id, player)) = game_state.players.iter().next() {
