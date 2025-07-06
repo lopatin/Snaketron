@@ -208,12 +208,8 @@ pub async fn run_game_executor(
     let mut game_channels: HashMap<u32, mpsc::Sender<GameCommandMessage>> = HashMap::new();
     
     let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, active_games: &mut std::collections::HashSet<u32>, game_channels: &mut HashMap<u32, mpsc::Sender<GameCommandMessage>>| {
-        // Only process games that belong to this partition
-        // Partition 1 handles games where game_id % 10 == 0
-        // Partition 2 handles games where game_id % 10 == 1
-        // ... and so on
-        if game_id % 10 != partition_id - 1 {
-            debug!("Game {} belongs to partition {}, not partition {}", game_id, (game_id % 10) + 1, partition_id);
+        if game_id % PARTITION_COUNT != partition_id - 1 {
+            debug!("Game {} belongs to partition {}, not partition {}", game_id, (game_id % PARTITION_COUNT) + 1, partition_id);
             return;
         }
         
@@ -270,7 +266,7 @@ pub async fn run_game_executor(
                                             Ok(event) => {
                                                 match event {
                                                     StreamEvent::GameCreated { game_id, game_state } => {
-                                                        if game_id % 10 == partition_id - 1 {
+                                                        if game_id % PARTITION_COUNT == partition_id - 1 {
                                                             info!("Received GameCreated event for game {}", game_id);
                                                             let redis_conn_clone = redis_conn.clone();
                                                             let stream_key_clone = stream_key.clone();
@@ -287,7 +283,7 @@ pub async fn run_game_executor(
                                                         }
                                                     }
                                                     StreamEvent::StatusUpdated { game_id, status } => {
-                                                        if game_id % 10 == partition_id - 1 {
+                                                        if game_id % PARTITION_COUNT == partition_id - 1 {
                                                             match status {
                                                                 GameStatus::Stopped => {
                                                                     // Game stopped, it might need to be restarted

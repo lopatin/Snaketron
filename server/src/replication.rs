@@ -7,7 +7,7 @@ use tracing::{info, error, warn, debug};
 use common::{GameState, GameEvent, GameEventMessage, GameStatus};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
-use crate::game_executor::StreamEvent;
+use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 
 /// In-memory game state storage
 pub type GameStateStore = Arc<RwLock<HashMap<u32, GameState>>>;
@@ -18,7 +18,6 @@ pub struct ReplicationStatus {
     pub partition_id: u32,
     pub is_ready: bool,
     pub last_processed_id: String,
-    pub games_replicated: usize,
 }
 
 /// PartitionReplica subscribes to Redis stream partitions and maintains game states
@@ -43,7 +42,6 @@ impl PartitionReplica {
             partition_id,
             is_ready: false,
             last_processed_id: "0-0".to_string(),
-            games_replicated: 0,
         }));
 
         Self {
@@ -117,6 +115,13 @@ impl PartitionReplica {
                 let game_id = event_msg.game_id;
                 let mut states = self.game_states.write().await;
                 if let Some(game_state) = states.get_mut(&game_id) {
+                    // Tick forward until we reach the event's tick
+                    if event_msg.tick > game_state.tick {
+                        if let Err(e) = game_state.tick_forward() {
+                            error!("Error during tick_forward: {:?}", e);
+                        }
+                    }
+                    
                     // Apply event to game state
                     game_state.apply_event(event_msg.event.clone(), None);
                     debug!("Applied event to game {} state: {:?}", game_id, event_msg.event);
@@ -126,7 +131,7 @@ impl PartitionReplica {
             }
             StreamEvent::StatusUpdated { game_id, status } => {
                 // Only process games that belong to this partition
-                if game_id % 10 == self.partition_id - 1 {
+                if game_id % PARTITION_COUNT == self.partition_id - 1 {
                     let mut states = self.game_states.write().await;
                     if let Some(game_state) = states.get_mut(&game_id) {
                         game_state.status = status.clone();
@@ -217,21 +222,17 @@ impl PartitionReplica {
                 }
             }
             
-            // Exit if we've reached our target or if there are no more messages
-            if reached_target || batch_empty {
-                break;
-            }
-            
             // Update status
-            {
-                let mut status = self.status.write().await;
-                status.last_processed_id = last_id.clone();
-                status.games_replicated = self.game_states.read().await.len();
-            }
+            self.status.write().await.last_processed_id = last_id.clone();
             
             if events_processed % 1000 == 0 {
                 info!("Partition {} catch-up progress: {} events processed", 
                     self.partition_id, events_processed);
+            }
+
+            // Exit if we've reached our target or if there are no more messages
+            if reached_target || batch_empty {
+                break;
             }
         }
 
@@ -297,11 +298,7 @@ impl PartitionReplica {
                                     }
                                     
                                     // Update status
-                                    {
-                                        let mut status = self.status.write().await;
-                                        status.last_processed_id = last_id.clone();
-                                        status.games_replicated = self.game_states.read().await.len();
-                                    }
+                                    self.status.write().await.last_processed_id = last_id.clone();
                                 }
                             }
                         }
