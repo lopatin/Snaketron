@@ -16,6 +16,7 @@ use crate::{
     learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
     cluster_singleton::ClusterSingleton,
+    replication::ReplicationManager,
 };
 use crate::ws_server::discover_peers;
 use std::path::PathBuf;
@@ -58,6 +59,8 @@ pub struct GameServer {
     raft: Option<Arc<RaftNode>>,
     /// Optional replay listener
     replay_listener: Option<Arc<ReplayListener>>,
+    /// Replication manager for game state
+    replication_manager: Option<Arc<ReplicationManager>>,
 }
 
 impl GameServer {
@@ -82,6 +85,12 @@ impl GameServer {
         // Create cancellation token for graceful shutdown
         let cancellation_token = CancellationToken::new();
         let mut handles = Vec::new();
+
+        // Redis connection manager
+        let client = redis::Client::open(redis_url.as_str())
+            .context("Failed to create Redis client")?;
+        let redis_conn = ConnectionManager::new(client).await
+            .context("Failed to create Redis connection manager")?;
 
         // Start the heartbeat loop
         let heartbeat_pool = db_pool.clone();
@@ -193,6 +202,29 @@ impl GameServer {
             }
         }));
 
+        // Start replication manager for all partitions BEFORE game executors
+        info!("Starting replication manager for game state replication");
+        let replication_partitions: Vec<u32> = (1..=10).collect();
+        let replication_manager = Arc::new(
+            ReplicationManager::new(
+                replication_partitions,
+                cancellation_token.clone(),
+                redis_conn.clone(),
+            ).await.context("Failed to create replication manager")?
+        );
+        
+        // Wait for replication to be ready
+        let replication_start = std::time::Instant::now();
+        loop {
+            if replication_manager.is_ready().await {
+                info!("Replication manager is ready after {:?}", replication_start.elapsed());
+                break;
+            }
+            if replication_start.elapsed() > Duration::from_secs(30) {
+                warn!("Replication manager taking longer than expected to catch up");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // Start game executors for each partition as cluster singletons
         // Each partition handles games where game_id % 10 == (partition_id - 1)
@@ -202,6 +234,7 @@ impl GameServer {
         for partition_id in 1..=10 {
             let exec_token = cancellation_token.clone();
             let exec_redis_url = redis_url.clone();
+            let exec_replication_manager = replication_manager.clone();
             
             handles.push(tokio::spawn(async move {
                 info!("Starting cluster singleton for game executor partition {}", partition_id);
@@ -223,6 +256,7 @@ impl GameServer {
                 // Service that runs the game executor for this partition
                 let service = move |token: CancellationToken| {
                     let redis_url_clone = exec_redis_url.clone();
+                    let replication_manager_clone = exec_replication_manager.clone();
                     Box::pin(async move {
                         info!("Game executor for partition {} is now active", partition_id);
                         
@@ -230,6 +264,7 @@ impl GameServer {
                             server_id,
                             partition_id,
                             redis_url_clone,
+                            replication_manager_clone,
                             token,
                         ).await {
                             error!("Game executor service error for partition {}: {}", partition_id, e);
@@ -321,6 +356,7 @@ impl GameServer {
             handles,
             raft: Some(raft),
             replay_listener,
+            replication_manager: Some(replication_manager),
         })
     }
 
@@ -351,6 +387,11 @@ impl GameServer {
     /// Get a reference to the replay listener
     pub fn replay_listener(&self) -> Option<&Arc<ReplayListener>> {
         self.replay_listener.as_ref()
+    }
+    
+    /// Get the replication manager
+    pub fn replication_manager(&self) -> Option<&Arc<ReplicationManager>> {
+        self.replication_manager.as_ref()
     }
 
     /// Shutdown the server gracefully

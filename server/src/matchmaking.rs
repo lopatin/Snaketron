@@ -381,30 +381,6 @@ async fn create_adaptive_match(
     Ok(Some((game_id, user_ids)))
 }
 
-/// Select the least loaded healthy server
-async fn select_least_loaded_server(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<i32, sqlx::Error> {
-    let server: ServerLoad = sqlx::query_as(
-        r#"
-        SELECT id, current_game_count, max_game_capacity
-        FROM servers
-        WHERE last_heartbeat > NOW() - INTERVAL '30 seconds'
-          AND current_game_count < max_game_capacity
-        ORDER BY 
-            CAST(current_game_count AS FLOAT) / NULLIF(max_game_capacity, 0) ASC,
-            RANDOM()
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-        "#
-    )
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| sqlx::Error::RowNotFound)?;
-
-    Ok(server.id)
-}
-
 /// Check if an error is a serialization failure
 fn is_serialization_error(error: &anyhow::Error) -> bool {
     if let Some(sqlx_err) = error.downcast_ref::<sqlx::Error>() {

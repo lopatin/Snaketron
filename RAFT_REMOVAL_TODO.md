@@ -29,12 +29,22 @@ This document tracks what needs to be done to completely remove Raft from the Sn
 - Removed `SubmitGameCommand` from Raft types
 - Added subscribe_to_game_events function for Redis stream subscription
 
-### 3. Game State Storage
-**Current**: Game states are stored in Raft's replicated state machine
-**Needed**:
-- Store game states in Redis or PostgreSQL
-- Game executor should persist state after each tick
-- Implement state recovery on executor restart
+### 3. ✅ Game State Replication (COMPLETED)
+**Previous**: Game states were stored in Raft's replicated state machine
+**Implemented**:
+- Created ReplicationWorker that subscribes to Redis stream partitions
+- ReplicationManager runs one worker instance per partition (1-10)
+- Maintains game states in Arc<RwLock<HashMap<GameId, GameState>>> in memory
+- Processes events from streams to update states:
+  - Uses Redis XREAD with blocking for real-time updates
+  - Applies each event to its corresponding game state
+  - Tracks last processed stream ID per partition
+- On startup:
+  - Reads all events from beginning (can be optimized with checkpoints)
+  - Replays events to rebuild current state
+  - Marks as "ready" once caught up to stream tail
+- Provides GameStateReader trait for read-only access to game states
+- Integrated into GameServer startup with automatic initialization
 
 ### 4. Game Event Distribution
 **Current**: Game events flow through Raft to WebSocket clients

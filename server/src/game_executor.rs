@@ -31,7 +31,7 @@ pub enum StreamEvent {
 async fn run_game(
     server_id: u64,
     game_id: u32,
-    mut game_state: GameState,
+    game_state: GameState,
     mut redis_conn: ConnectionManager,
     stream_key: String,
     cancellation_token: CancellationToken,
@@ -40,13 +40,13 @@ async fn run_game(
     
     // Create the game engine from the provided game state
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state.clone());
+    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state);
     info!("Created game engine for game {} from provided state", game_id);
 
     // Consumer ID for this specific game instance (for future use with consumer groups)
     let _consumer_id = format!("game-{}-server-{}", game_id, server_id);
 
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     
     // Track the last message ID we've read
@@ -61,11 +61,11 @@ async fn run_game(
                 break;
             }
             
-            // Process commands from Redis stream (non-blocking read with short timeout)
+            // Process commands from Redis stream
             stream_read = async {
                 let options = StreamReadOptions::default()
                     .count(10)
-                    .block(10); // 10ms timeout
+                    .block(100);
                     
                 redis_conn.xread_options(&[&stream_key], &[&last_id], &options).await
             } => {
@@ -91,9 +91,6 @@ async fn run_game(
                                                 // Process the command through the game engine
                                                 match engine.process_command(command) {
                                                     Ok(scheduled_command) => {
-                                                        // Apply to tracked game state
-                                                        game_state.schedule_command(&scheduled_command);
-                                                        
                                                         // Emit CommandScheduled event
                                                         let event = GameEvent::CommandScheduled { command_message: scheduled_command };
                                                         let event_msg = GameEventMessage {
@@ -104,7 +101,7 @@ async fn run_game(
                                                         };
                                                         
                                                         // Publish to Redis stream
-                                                        let stream_event = StreamEvent::GameEvent(event_msg.clone());
+                                                        let stream_event = StreamEvent::GameEvent(event_msg);
                                                         if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
                                                             warn!("Failed to publish command scheduled event: {}", e);
                                                         }
@@ -227,6 +224,7 @@ pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
     redis_url: String,
+    _replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     info!("Starting game executor for server {} partition {}", server_id, partition_id);
@@ -286,7 +284,7 @@ pub async fn run_game_executor(
                 break;
             }
             
-            // Read from Redis stream using consumer group
+            // Read from Redis stream using a consumer group
             stream_read = async {
                 let options = StreamReadOptions::default()
                     .group(&group_name, &consumer_name)
