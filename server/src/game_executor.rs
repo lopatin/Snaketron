@@ -7,6 +7,10 @@ use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMes
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc;
+use std::collections::HashMap;
+
+pub const PARTITION_COUNT: u32 = 10;
 
 /// Events that can be sent through Redis streams
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,11 +33,12 @@ pub enum StreamEvent {
 
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
-    server_id: u64,
+    _server_id: u64,
     game_id: u32,
     game_state: GameState,
     mut redis_conn: ConnectionManager,
     stream_key: String,
+    mut command_receiver: mpsc::Receiver<GameCommandMessage>,
     cancellation_token: CancellationToken,
 ) {
     info!("run_game called for game {} on stream {}", game_id, stream_key);
@@ -43,14 +48,8 @@ async fn run_game(
     let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state);
     info!("Created game engine for game {} from provided state", game_id);
 
-    // Consumer ID for this specific game instance (for future use with consumer groups)
-    let _consumer_id = format!("game-{}-server-{}", game_id, server_id);
-
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    
-    // Track the last message ID we've read
-    let mut last_id = "0-0".to_string();
     
     loop {
         tokio::select! {
@@ -61,70 +60,31 @@ async fn run_game(
                 break;
             }
             
-            // Process commands from Redis stream
-            stream_read = async {
-                let options = StreamReadOptions::default()
-                    .count(10)
-                    .block(100);
-                    
-                redis_conn.xread_options(&[&stream_key], &[&last_id], &options).await
-            } => {
-                match stream_read {
-                    Ok(reply) => {
-                        let reply: StreamReadReply = reply;
-                        for stream_data in reply.keys {
-                            for stream_id in stream_data.ids {
-                                last_id = stream_id.id.clone();
-                                
-                                // Parse the event from Redis stream
-                                if let Some(data) = stream_id.map.get("data") {
-                                    if let redis::Value::BulkString(bytes) = data {
-                                        match serde_json::from_slice::<StreamEvent>(bytes) {
-                                            Ok(StreamEvent::GameCommandSubmitted { 
-                                                game_id: cmd_game_id, 
-                                                user_id, 
-                                                command 
-                                            }) if cmd_game_id == game_id => {
-                                                debug!("Processing command for game {} from user {}. Command: {:?}", 
-                                                    game_id, user_id, command);
-                                                
-                                                // Process the command through the game engine
-                                                match engine.process_command(command) {
-                                                    Ok(scheduled_command) => {
-                                                        // Emit CommandScheduled event
-                                                        let event = GameEvent::CommandScheduled { command_message: scheduled_command };
-                                                        let event_msg = GameEventMessage {
-                                                            game_id,
-                                                            tick: engine.current_tick(),
-                                                            user_id: None,
-                                                            event,
-                                                        };
-                                                        
-                                                        // Publish to Redis stream
-                                                        let stream_event = StreamEvent::GameEvent(event_msg);
-                                                        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
-                                                            warn!("Failed to publish command scheduled event: {}", e);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to process command for game {}: {:?}", game_id, e);
-                                                    }
-                                                }
-                                            }
-                                            Ok(_) => {
-                                                // Ignore events for other games or other event types
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to parse stream event: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            // Process commands from the channel
+            Some(command) = command_receiver.recv() => {
+                debug!("Processing command for game {}. Command: {:?}", 
+                    game_id, command);
+                
+                // Process the command through the game engine
+                match engine.process_command(command) {
+                    Ok(scheduled_command) => {
+                        // Emit CommandScheduled event
+                        let event = GameEvent::CommandScheduled { command_message: scheduled_command };
+                        let event_msg = GameEventMessage {
+                            game_id,
+                            tick: engine.current_tick(),
+                            user_id: None,
+                            event,
+                        };
+                        
+                        // Publish to Redis stream
+                        let stream_event = StreamEvent::GameEvent(event_msg);
+                        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
+                            warn!("Failed to publish command scheduled event: {}", e);
                         }
                     }
                     Err(e) => {
-                        debug!("Failed to read from Redis stream: {}", e);
+                        warn!("Failed to process command for game {}: {:?}", game_id, e);
                     }
                 }
             }
@@ -150,6 +110,8 @@ async fn run_game(
                         }
                         
                         // Check for solo game end
+                        // TODO: Why is this here, and why does SoloGameEnded even exist?
+                        // Shouldn't the game engine emit the game end event?
                         let game_state = engine.get_committed_state();
                         if game_state.game_type.is_solo() && game_state.players.len() == 1 {
                                 // Get the single player
@@ -241,10 +203,11 @@ pub async fn run_game_executor(
     // Create consumer group if it doesn't exist
     let _: Result<(), _> = redis_conn.xgroup_create_mkstream(&stream_key, &group_name, "$").await;
 
-    // Track active games
+    // Track active games and their event channels
     let mut active_games = std::collections::HashSet::new();
+    let mut game_channels: HashMap<u32, mpsc::Sender<GameCommandMessage>> = HashMap::new();
     
-    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, active_games: &mut std::collections::HashSet<u32>| {
+    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, active_games: &mut std::collections::HashSet<u32>, game_channels: &mut HashMap<u32, mpsc::Sender<GameCommandMessage>>| {
         // Only process games that belong to this partition
         // Partition 1 handles games where game_id % 10 == 0
         // Partition 2 handles games where game_id % 10 == 1
@@ -262,9 +225,13 @@ pub async fn run_game_executor(
         info!("Partition {} will start game {}", partition_id, game_id);
         active_games.insert(game_id);
         
+        // Create a channel for this game
+        let (tx, rx) = mpsc::channel(100);
+        game_channels.insert(game_id, tx);
+        
         tokio::spawn(async move {
             // Run the game loop
-            run_game(server_id, game_id, game_state, redis_conn, stream_key, cancellation_token).await;
+            run_game(server_id, game_id, game_state, redis_conn, stream_key, rx, cancellation_token).await;
             // Remove from active games when done
             // Note: In real implementation, you'd need a shared state for this
             info!("Game {} has ended", game_id);
@@ -308,7 +275,15 @@ pub async fn run_game_executor(
                                                             let redis_conn_clone = redis_conn.clone();
                                                             let stream_key_clone = stream_key.clone();
                                                             let cancellation_token_clone = cancellation_token.clone();
-                                                            try_start_game(game_id, game_state, redis_conn_clone, stream_key_clone, cancellation_token_clone, &mut active_games);
+                                                            try_start_game(
+                                                                game_id, 
+                                                                game_state, 
+                                                                redis_conn_clone, 
+                                                                stream_key_clone, 
+                                                                cancellation_token_clone, 
+                                                                &mut active_games, 
+                                                                &mut game_channels
+                                                            );
                                                         }
                                                     }
                                                     StreamEvent::StatusUpdated { game_id, status } => {
@@ -321,16 +296,30 @@ pub async fn run_game_executor(
                                                                     debug!("Game {} stopped, may need restart", game_id);
                                                                 }
                                                                 GameStatus::Complete { .. } => {
-                                                                    // Game completed, remove from active games
+                                                                    // Game completed, remove from active games and channel
                                                                     active_games.remove(&game_id);
+                                                                    game_channels.remove(&game_id);
                                                                     info!("Game {} completed", game_id);
                                                                 }
                                                                 _ => {}
                                                             }
                                                         }
                                                     }
+                                                    StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
+                                                        // Route command to the appropriate game
+                                                        if let Some(tx) = game_channels.get(&game_id) {
+                                                            if let Err(e) = tx.send(command).await {
+                                                                warn!("Failed to send command to game {}: {}", game_id, e);
+                                                                // The game might have ended, remove from channels
+                                                                game_channels.remove(&game_id);
+                                                                active_games.remove(&game_id);
+                                                            }
+                                                        } else {
+                                                            debug!("Received command for inactive game {}", game_id);
+                                                        }
+                                                    }
                                                     _ => {
-                                                        // Other events are handled by individual game loops
+                                                        // Other events are not routed to individual games
                                                         debug!("Received event in partition executor: {:?}", event);
                                                     }
                                                 }
