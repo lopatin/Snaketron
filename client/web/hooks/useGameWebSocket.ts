@@ -139,45 +139,17 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
         
-        setCurrentGameId(message.data.game_id);
+        const gameId = message.data.game_id;
+        setCurrentGameId(gameId);
         
-        // Initialize a basic game state since server doesn't send initial snapshot
-        // This is a workaround - ideally server should send GameEvent::Snapshot
-        const initialGameState: GameState = {
-          tick: 0,
-          status: { Started: { server_id: 1 } },
-          arena: {
-            width: 40,
-            height: 40,
-            snakes: [
-              {
-                body: [
-                  { x: 20, y: 20 },  // head
-                  { x: 16, y: 20 }   // tail (snake length 4)
-                ],
-                direction: "Right" as const,
-                is_alive: true,
-                food: 0
-              }
-            ],
-            food: []
-          },
-          game_type: { Custom: { settings: { game_mode: 'Solo' } } } as GameType,
-          properties: { available_food_target: 3 },
-          players: {
-            // Assume the authenticated user is player 0 with snake 0
-            // This will be overridden when we get the actual game state
-            0: { user_id: 0, snake_id: 0 }
-          },
-          game_id: String(message.data.game_id),
-          start_ms: Date.now()  // Initialize with current time as a temporary workaround
-        };
-        
-        console.log('Setting initial game state:', initialGameState);
-        setGameState(initialGameState);
+        // Send JoinGame message to actually join the game and receive initial snapshot
+        console.log('Sending JoinGame message for solo game:', gameId);
+        sendMessage({
+          JoinGame: gameId
+        });
         
         // Navigate to the game arena
-        navigate(`/play/${message.data.game_id}`);
+        navigate(`/play/${gameId}`);
       })
     );
 

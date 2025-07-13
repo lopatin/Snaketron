@@ -499,16 +499,16 @@ impl GameState {
         // debug!("tick_forward: Checking for commands at tick {}", self.tick);
         eprintln!("COMMON DEBUG: tick_forward checking commands at tick {}", self.tick);
         while let Some(command_message) = self.command_queue.pop(self.tick) {
-            // debug!("tick_forward: Popped command from queue: {:?}", command_message);
+            debug!("tick_forward: Popped command from queue: {:?}", command_message);
             eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             match self.exec_command(command_message.command) {
                 Ok(events) => {
-                    // debug!("tick_forward: exec_command returned {} events", events.len());
+                    debug!("tick_forward: exec_command returned {} events", events.len());
                     eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
                     out.extend(events);
                 }
                 Err(e) => {
-                    // debug!("tick_forward: exec_command failed with error: {:?}", e);
+                    debug!("tick_forward: exec_command failed with error: {:?}", e);
                     eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
                 }
             }

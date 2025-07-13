@@ -406,9 +406,28 @@ impl ReplicationManager {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         
-        // Get current game state
-        let game_state = self.get_game_state(game_id).await
-            .ok_or_else(|| anyhow::anyhow!("Game {} not found", game_id))?;
+        // Get current game state with retry logic to handle race conditions
+        // This is especially important for newly created games where the GameCreated
+        // event might not have been processed by the replication manager yet
+        let mut game_state = None;
+        let state_start = std::time::Instant::now();
+        let state_timeout = std::time::Duration::from_secs(5); // 5 second timeout for game state
+        
+        while game_state.is_none() {
+            game_state = self.get_game_state(game_id).await;
+            
+            if game_state.is_none() {
+                if state_start.elapsed() > state_timeout {
+                    return Err(anyhow::anyhow!("Game {} not found after {} seconds", game_id, state_timeout.as_secs()));
+                }
+                debug!("Game {} not found yet, retrying... (elapsed: {:?})", game_id, state_start.elapsed());
+                // Short sleep before retry
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        
+        let game_state = game_state.unwrap();
+        info!("Successfully found game state for game {} after {:?}", game_id, state_start.elapsed());
         
         // Get or create broadcast channel for this game
         let mut broadcasters = self.game_event_broadcasters.write().await;

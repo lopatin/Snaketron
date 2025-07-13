@@ -50,6 +50,7 @@ export default function GameArena() {
   const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
+  const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
   
   // Start game engine when server state is available and game is not ended
   useEffect(() => {
@@ -216,6 +217,31 @@ export default function GameArena() {
     const render = () => {
       try {
         console.log('rendering game state:', JSON.stringify(gameState.arena.snakes[0].body));
+        
+        // Check head position for non-adjacent movement
+        if (gameState.arena.snakes.length > 0 && gameState.arena.snakes[0].body.length > 0) {
+          const currentHead = gameState.arena.snakes[0].body[0];
+          
+          if (lastHeadPositionRef.current) {
+            const dx = Math.abs(currentHead.x - lastHeadPositionRef.current.x);
+            const dy = Math.abs(currentHead.y - lastHeadPositionRef.current.y);
+            
+            // Check if the head moved more than 1 cell (not adjacent)
+            if ((dx > 1 || dy > 1) || (dx === 1 && dy === 1)) {
+              console.error('Non-adjacent head movement detected!', {
+                previous: lastHeadPositionRef.current,
+                current: currentHead,
+                dx,
+                dy
+              });
+              debugger; // Enter debugger when non-adjacent movement is detected
+            }
+          }
+          
+          // Update last head position
+          lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
+        }
+        
         wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize);
       } catch (error) {
         console.error('Error rendering game:', error);

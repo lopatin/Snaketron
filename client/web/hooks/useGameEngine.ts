@@ -169,6 +169,7 @@ export const useGameEngine = ({
   // Update initial state ref when it changes
   useEffect(() => {
     if (initialState && !initialStateRef.current) {
+      console.log('Setting initial state for the first time - tick:', initialState.tick, 'status:', initialState.status, 'start_ms:', initialState.start_ms);
       initialStateRef.current = initialState;
     }
   }, [initialState]);

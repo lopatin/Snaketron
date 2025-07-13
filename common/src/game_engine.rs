@@ -113,10 +113,13 @@ impl GameEngine {
             command,
         };
         
+        // Add to committed state command queue
+        self.committed_state.schedule_command(&command_message);
+        
         // Add to predicted state command queue
-        if let Some(predicted_state) = &mut self.predicted_state {
-            predicted_state.schedule_command(&command_message);
-        }
+        // if let Some(predicted_state) = &mut self.predicted_state {
+        //     predicted_state.schedule_command(&command_message);
+        // }
         
         Ok(command_message)
     }
