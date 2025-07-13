@@ -1,7 +1,7 @@
 use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
 use common::{GameState, GameEvent, GameEventMessage, GameStatus};
@@ -11,6 +11,9 @@ use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 
 /// In-memory game state storage
 pub type GameStateStore = Arc<RwLock<HashMap<u32, GameState>>>;
+
+/// Game event broadcast channels
+pub type GameEventBroadcasters = Arc<RwLock<HashMap<u32, broadcast::Sender<GameEventMessage>>>>;
 
 /// Tracks the replication status
 #[derive(Debug, Clone)]
@@ -25,6 +28,7 @@ pub struct PartitionReplica {
     partition_id: u32,
     redis_conn: ConnectionManager,
     game_states: GameStateStore,
+    game_event_broadcasters: GameEventBroadcasters,
     status: Arc<RwLock<ReplicationStatus>>,
     stream_key: String,
     cancellation_token: CancellationToken,
@@ -35,6 +39,7 @@ impl PartitionReplica {
         partition_id: u32,
         redis_conn: ConnectionManager,
         game_states: GameStateStore,
+        game_event_broadcasters: GameEventBroadcasters,
         cancellation_token: CancellationToken,
     ) -> Self {
         let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
@@ -48,6 +53,7 @@ impl PartitionReplica {
             partition_id,
             redis_conn,
             game_states,
+            game_event_broadcasters,
             status,
             stream_key,
             cancellation_token,
@@ -115,10 +121,11 @@ impl PartitionReplica {
                 let game_id = event_msg.game_id;
                 let mut states = self.game_states.write().await;
                 
-                match event_msg.event {
+                match &event_msg.event {
                     GameEvent::Snapshot { game_state } => {
                         info!("Received snapshot for game {} at tick {}", game_id, event_msg.tick);
-                        states.insert(game_id, game_state);
+                        // Always update with the latest snapshot
+                        states.insert(game_id, game_state.clone());
                     }
                     _ => {
                         if let Some(game_state) = states.get_mut(&game_id) {
@@ -137,6 +144,15 @@ impl PartitionReplica {
                         }                       
                     }
                 }
+                
+                // Broadcast the event to any subscribers
+                {
+                    let broadcasters = self.game_event_broadcasters.read().await;
+                    if let Some(sender) = broadcasters.get(&game_id) {
+                        // Ignore send errors (means no receivers)
+                        let _ = sender.send(event_msg);
+                    }
+                }
             }
             StreamEvent::StatusUpdated { game_id, status } => {
                 let mut states = self.game_states.write().await;
@@ -150,16 +166,23 @@ impl PartitionReplica {
                         // or move them to a different storage
                         info!("Game {} completed, removing from replication", game_id);
                         states.remove(&game_id);
+                        
+                        // Also remove the broadcast channel
+                        let mut broadcasters = self.game_event_broadcasters.write().await;
+                        broadcasters.remove(&game_id);
                     }
                 }
             }
-            StreamEvent::GameCreated { .. } => {
-                // Only process games that belong to this partition
-                // if game_id % PARTITION_COUNT == self.partition_id {
-                //     info!("Replicating new game {} in partition {}", game_id, self.partition_id);
-                //     let mut states = self.game_states.write().await;
-                //     states.insert(game_id, game_state);
-                // }
+            StreamEvent::GameCreated { game_id, game_state } => {
+                // Clear any existing state for this game ID to handle test reruns
+                // or game ID reuse scenarios
+                info!("Processing GameCreated for game {} in partition {}", game_id, self.partition_id);
+                let mut states = self.game_states.write().await;
+                states.insert(game_id, game_state);
+                
+                // Also clear any existing broadcast channel
+                let mut broadcasters = self.game_event_broadcasters.write().await;
+                broadcasters.remove(&game_id);
             }
             StreamEvent::GameCommandSubmitted { .. } => {
                 // Commands are not relevant for state replication
@@ -326,6 +349,7 @@ impl PartitionReplica {
 pub struct ReplicationManager {
     workers: Vec<tokio::task::JoinHandle<Result<()>>>,
     game_states: GameStateStore,
+    game_event_broadcasters: GameEventBroadcasters,
     statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
 }
 
@@ -368,6 +392,37 @@ impl GameStateReader for ReplicationManager {
 }
 
 impl ReplicationManager {
+    /// Subscribe to game events for a specific game
+    /// Returns the current game state as a snapshot and a receiver for subsequent events
+    pub async fn subscribe_to_game(&self, game_id: u32) -> Result<(GameState, broadcast::Receiver<GameEventMessage>)> {
+        // Wait for replication to be ready first
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        
+        while !self.is_ready().await {
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!("Timeout waiting for replication to be ready"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        
+        // Get current game state
+        let game_state = self.get_game_state(game_id).await
+            .ok_or_else(|| anyhow::anyhow!("Game {} not found", game_id))?;
+        
+        // Get or create broadcast channel for this game
+        let mut broadcasters = self.game_event_broadcasters.write().await;
+        let sender = broadcasters.entry(game_id)
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(256); // Buffer up to 256 events
+                tx
+            });
+        
+        let receiver = sender.subscribe();
+        
+        Ok((game_state, receiver))
+    }
+    
     /// Get a game state, waiting for replication to be ready first
     /// This is the main method that game executors should use
     pub async fn get_game_state_when_ready(&self, game_id: u32) -> Option<GameState> {
@@ -394,6 +449,7 @@ impl ReplicationManager {
         redis_conn: ConnectionManager,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
+        let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
         
@@ -403,6 +459,7 @@ impl ReplicationManager {
                 partition_id,
                 redis_conn.clone(),
                 game_states.clone(),
+                game_event_broadcasters.clone(),
                 cancellation_token.clone(),
             );
             
@@ -420,6 +477,7 @@ impl ReplicationManager {
         Ok(Self {
             workers,
             game_states,
+            game_event_broadcasters,
             statuses,
         })
     }

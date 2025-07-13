@@ -377,7 +377,12 @@ async fn create_adaptive_match(
         mmr_range = max_mmr_diff,
         "Match created"
     );
-
+    
+    // Check if any of the matched players have active WebSocket connections
+    // and should be automatically transitioned to the game
+    // This is done by checking if they have queued_at set in the game_requests table
+    // which indicates they're actively waiting for a match
+    
     Ok(Some((game_id, user_ids)))
 }
 

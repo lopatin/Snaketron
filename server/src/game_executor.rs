@@ -33,7 +33,7 @@ pub enum StreamEvent {
 
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
-    _server_id: u64,
+    server_id: u64,
     game_id: u32,
     game_state: GameState,
     mut redis_conn: ConnectionManager,
@@ -45,8 +45,26 @@ async fn run_game(
     
     // Create the game engine from the provided game state
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut engine = GameEngine::new_from_state(game_id, start_ms, game_state);
-    info!("Created game engine for game {} from provided state", game_id);
+    
+    // If the game is in Stopped status, start it before creating the engine
+    let mut initial_state = game_state;
+    if matches!(initial_state.status, GameStatus::Stopped) {
+        info!("Game {} is in Stopped status, starting it", game_id);
+        initial_state.status = GameStatus::Started { server_id };
+        
+        // Emit status update to notify other components
+        let status_event = StreamEvent::StatusUpdated {
+            game_id,
+            status: GameStatus::Started { server_id },
+        };
+        
+        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &status_event).await {
+            error!("Failed to publish game started status: {}", e);
+        }
+    }
+    
+    let mut engine = GameEngine::new_from_state(game_id, start_ms, initial_state);
+    info!("Created game engine for game {} with status: {:?}", game_id, engine.get_committed_state().status);
 
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -93,21 +93,7 @@ impl GameServer {
         let redis_conn = ConnectionManager::new(client).await
             .context("Failed to create Redis connection manager")?;
 
-        // Start WebSocket server
-        let ws_pool = db_pool.clone();
-        let ws_token = cancellation_token.clone();
-        let ws_addr_clone = ws_addr.clone();
-        let ws_jwt_verifier = jwt_verifier.clone();
-        let ws_redis_url = redis_url.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_websocket_server(
-                &ws_addr_clone,
-                ws_pool,
-                ws_redis_url,
-                ws_token,
-                ws_jwt_verifier,
-            ).await;
-        }));
+        // WebSocket server will be started after ReplicationManager is created
 
         // Start the matchmaking service
         info!("Starting matchmaking service");
@@ -148,6 +134,25 @@ impl GameServer {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        
+        // Start WebSocket server after replication manager is ready
+        info!("Starting WebSocket server");
+        let ws_pool = db_pool.clone();
+        let ws_token = cancellation_token.clone();
+        let ws_addr_clone = ws_addr.clone();
+        let ws_jwt_verifier = jwt_verifier.clone();
+        let ws_redis_url = redis_url.clone();
+        let ws_replication_manager = replication_manager.clone();
+        handles.push(tokio::spawn(async move {
+            let _ = run_websocket_server(
+                &ws_addr_clone,
+                ws_pool,
+                ws_redis_url,
+                ws_token,
+                ws_jwt_verifier,
+                ws_replication_manager,
+            ).await;
+        }));
 
         // Start game executors for each partition as cluster singletons
         // This provides automatic failover - if one server goes down, another will

@@ -38,18 +38,48 @@ async fn test_simple_game() -> Result<()> {
     
     println!("Clients queued");
     
-    // Wait for game snapshots - clients should receive these when matched
+    // Wait for JoinGame messages first
+    let join_msg1 = timeout(Duration::from_secs(10), async {
+        client1.receive_message().await
+    }).await??;
+    
+    println!("Client1 received: {:?}", join_msg1);
+    
+    let join_msg2 = timeout(Duration::from_secs(10), async {
+        client2.receive_message().await
+    }).await??;
+    
+    println!("Client2 received: {:?}", join_msg2);
+    
+    // Verify both clients received JoinGame messages for the same game
+    let game_id = match (&join_msg1, &join_msg2) {
+        (WSMessage::JoinGame(id1), WSMessage::JoinGame(id2)) => {
+            assert_eq!(id1, id2, "Both clients should join the same game");
+            *id1
+        }
+        _ => panic!("Expected JoinGame messages, got {:?} and {:?}", join_msg1, join_msg2),
+    };
+    
+    println!("Both clients joined game {}", game_id);
+    
+    // Clients need to acknowledge the join by sending JoinGame back
+    client1.join_game(game_id).await?;
+    client2.join_game(game_id).await?;
+    
+    println!("Clients acknowledged join");
+    
+    // Now wait for game snapshots after joining
     let msg1 = timeout(Duration::from_secs(10), async {
         client1.receive_message().await
     }).await??;
     
-    println!("Client1 received: {:?}", msg1);
+    println!("Client1 received after join: {:?}", msg1);
     
     let msg2 = timeout(Duration::from_secs(10), async {
         client2.receive_message().await
     }).await??;
     
-    println!("Client2 received: {:?}", msg2);
+    println!("Client2 received after join: {:?}", msg2);
     
     // Verify both clients received game snapshots and extract game_id and snake_ids
     let (_game_id, snake1_id, snake2_id) = match (&msg1, &msg2) {
