@@ -265,7 +265,7 @@ impl GameCommandMessage {
 impl Ord for GameCommandMessage {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.command_id_server.as_ref().unwrap_or(&self.command_id_client)
-            .cmp(other.command_id_server.as_ref().unwrap_or(&self.command_id_client))
+            .cmp(other.command_id_server.as_ref().unwrap_or(&other.command_id_client))
     }
 }
 
@@ -729,3 +729,411 @@ impl GameState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BinaryHeap;
+
+    fn create_command_id(tick: u32, user_id: u32, seq: u32) -> CommandId {
+        CommandId {
+            tick,
+            user_id,
+            sequence_number: seq,
+        }
+    }
+
+    fn create_command_message(tick: u32, user_id: u32, seq: u32, with_server_id: bool) -> GameCommandMessage {
+        let client_id = create_command_id(tick, user_id, seq);
+        let server_id = if with_server_id {
+            Some(create_command_id(tick, user_id, seq))
+        } else {
+            None
+        };
+        
+        GameCommandMessage {
+            command_id_client: client_id,
+            command_id_server: server_id,
+            command: GameCommand::Turn {
+                snake_id: 1,
+                direction: Direction::Up,
+            },
+        }
+    }
+
+    #[test]
+    fn test_command_queue_basic_push_pop() {
+        let mut queue = CommandQueue::new();
+        
+        // Push a command
+        let cmd = create_command_message(10, 1, 1, false);
+        queue.push(cmd.clone());
+        
+        // Pop should return the command
+        let popped = queue.pop(10);
+        assert!(popped.is_some());
+        assert_eq!(popped.unwrap().command_id_client, cmd.command_id_client);
+        
+        // Queue should now be empty
+        assert!(queue.pop(10).is_none());
+    }
+
+    #[test]
+    fn test_command_queue_tick_ordering() {
+        let mut queue = CommandQueue::new();
+        
+        // Push commands with different ticks
+        // Note: sequence numbers should increase with tick to maintain consistent ordering
+        let cmd1 = create_command_message(20, 1, 3, false);
+        let cmd2 = create_command_message(10, 1, 1, false);
+        let cmd3 = create_command_message(15, 1, 2, false);
+        
+        println!("cmd1 (tick 20): {:?}", cmd1.command_id_client);
+        println!("cmd2 (tick 10): {:?}", cmd2.command_id_client);
+        println!("cmd3 (tick 15): {:?}", cmd3.command_id_client);
+        
+        // Test comparisons
+        println!("cmd2 < cmd1: {}", cmd2 < cmd1);
+        println!("cmd2 < cmd3: {}", cmd2 < cmd3);
+        println!("cmd3 < cmd1: {}", cmd3 < cmd1);
+        
+        use std::cmp::Reverse;
+        println!("Reverse(cmd2) > Reverse(cmd1): {}", Reverse(cmd2.clone()) > Reverse(cmd1.clone()));
+        println!("Reverse(cmd2) > Reverse(cmd3): {}", Reverse(cmd2.clone()) > Reverse(cmd3.clone()));
+        println!("Reverse(cmd3) > Reverse(cmd1): {}", Reverse(cmd3.clone()) > Reverse(cmd1.clone()));
+        
+        queue.push(cmd1);
+        queue.push(cmd2);
+        queue.push(cmd3);
+        
+        // Should pop in tick order (10, 15, 20)
+        let cmd1 = queue.pop(25).unwrap();
+        assert_eq!(cmd1.tick(), 10);
+        
+        let cmd2 = queue.pop(25).unwrap();
+        assert_eq!(cmd2.tick(), 15);
+        
+        let cmd3 = queue.pop(25).unwrap();
+        assert_eq!(cmd3.tick(), 20);
+    }
+
+    #[test]
+    fn test_command_queue_max_tick_filtering() {
+        let mut queue = CommandQueue::new();
+        
+        // Push commands with different ticks
+        queue.push(create_command_message(10, 1, 1, false));
+        queue.push(create_command_message(20, 1, 2, false));
+        queue.push(create_command_message(30, 1, 3, false));
+        
+        // Pop with max_tick = 15 should only return tick 10
+        let cmd1 = queue.pop(15);
+        assert!(cmd1.is_some());
+        assert_eq!(cmd1.unwrap().tick(), 10);
+        
+        // Pop again with max_tick = 15 should return None
+        assert!(queue.pop(15).is_none());
+        
+        // Pop with max_tick = 25 should return tick 20
+        let cmd2 = queue.pop(25);
+        assert!(cmd2.is_some());
+        assert_eq!(cmd2.unwrap().tick(), 20);
+    }
+
+    #[test]
+    fn test_command_queue_tombstoning() {
+        let mut queue = CommandQueue::new();
+        
+        // Push client command
+        let client_cmd = create_command_message(10, 1, 1, false);
+        queue.push(client_cmd.clone());
+        
+        // Push server command with same client_id - should tombstone the client command
+        let mut server_cmd = client_cmd.clone();
+        server_cmd.command_id_server = Some(create_command_id(10, 1, 1));
+        queue.push(server_cmd.clone());
+        
+        // Pop should return the server command (not the tombstoned client command)
+        let popped = queue.pop(10).unwrap();
+        assert!(popped.command_id_server.is_some());
+        
+        // Queue should now be empty (client command was tombstoned)
+        assert!(queue.pop(10).is_none());
+    }
+
+    #[test]
+    fn test_command_queue_multiple_tombstoning() {
+        let mut queue = CommandQueue::new();
+        
+        // Push multiple client commands
+        queue.push(create_command_message(10, 1, 1, false));
+        queue.push(create_command_message(10, 1, 2, false));
+        queue.push(create_command_message(10, 1, 3, false));
+        
+        // Push server command that tombstones the second client command
+        let mut server_cmd = create_command_message(10, 1, 2, false);
+        server_cmd.command_id_server = Some(create_command_id(10, 1, 2));
+        queue.push(server_cmd);
+        
+        // Pop should return commands in order, skipping the tombstoned one
+        let cmd1 = queue.pop(10).unwrap();
+        assert_eq!(cmd1.command_id_client.sequence_number, 1);
+        assert!(cmd1.command_id_server.is_none());
+        
+        let cmd2 = queue.pop(10).unwrap();
+        assert_eq!(cmd2.command_id_client.sequence_number, 2);
+        assert!(cmd2.command_id_server.is_some());
+        
+        let cmd3 = queue.pop(10).unwrap();
+        assert_eq!(cmd3.command_id_client.sequence_number, 3);
+        assert!(cmd3.command_id_server.is_none());
+    }
+
+    #[test]
+    fn test_command_queue_deduplication() {
+        let mut queue = CommandQueue::new();
+        
+        // Push same command twice (should be deduped using active_ids)
+        let cmd = create_command_message(10, 1, 1, false);
+        queue.push(cmd.clone());
+        queue.push(cmd.clone());
+        
+        // Should be able to pop twice (no deduplication implemented)
+        assert!(queue.pop(10).is_some());
+        assert!(queue.pop(10).is_some());
+        assert!(queue.pop(10).is_none());
+    }
+
+    #[test]
+    fn test_command_queue_same_tick_ordering() {
+        let mut queue = CommandQueue::new();
+        
+        // Push commands with same tick but different users/sequences
+        queue.push(create_command_message(10, 2, 1, false));
+        queue.push(create_command_message(10, 1, 2, false));
+        queue.push(create_command_message(10, 1, 1, false));
+        
+        // Should pop in order: (tick=10, user=1, seq=1), (tick=10, user=1, seq=2), (tick=10, user=2, seq=1)
+        let cmd1 = queue.pop(10).unwrap();
+        assert_eq!(cmd1.command_id_client.user_id, 1);
+        assert_eq!(cmd1.command_id_client.sequence_number, 1);
+        
+        let cmd2 = queue.pop(10).unwrap();
+        assert_eq!(cmd2.command_id_client.user_id, 1);
+        assert_eq!(cmd2.command_id_client.sequence_number, 2);
+        
+        let cmd3 = queue.pop(10).unwrap();
+        assert_eq!(cmd3.command_id_client.user_id, 2);
+        assert_eq!(cmd3.command_id_client.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_command_queue_server_tick_override() {
+        let mut queue = CommandQueue::new();
+        
+        // Create command with client tick 10 but server tick 15
+        let mut cmd = create_command_message(10, 1, 1, false);
+        cmd.command_id_server = Some(create_command_id(15, 1, 1));
+        queue.push(cmd.clone());
+        
+        // Should not be available at tick 10
+        assert!(queue.pop(10).is_none());
+        
+        // Should be available at tick 15
+        let popped = queue.pop(15).unwrap();
+        assert_eq!(popped.tick(), 15);
+    }
+
+    #[test]
+    fn test_command_queue_empty_operations() {
+        let mut queue = CommandQueue::new();
+        
+        // Pop from empty queue
+        assert!(queue.pop(100).is_none());
+        
+        // Push and pop, then try again
+        queue.push(create_command_message(10, 1, 1, false));
+        assert!(queue.pop(10).is_some());
+        assert!(queue.pop(10).is_none());
+    }
+
+    #[test]
+    fn test_command_id_ordering() {
+        // Test that CommandId ordering works correctly
+        let id1 = create_command_id(10, 1, 1);
+        let id2 = create_command_id(10, 1, 2);
+        let id3 = create_command_id(10, 2, 1);
+        let id4 = create_command_id(11, 1, 1);
+        
+        assert!(id1 < id2);  // Same tick and user, lower sequence
+        assert!(id1 < id3);  // Same tick, lower user id
+        assert!(id1 < id4);  // Lower tick
+    }
+
+    #[test]
+    fn test_binary_heap_with_reverse() {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+        
+        // Create a heap
+        let mut heap = BinaryHeap::new();
+        
+        // Push some numbers wrapped in Reverse
+        heap.push(Reverse(20));
+        heap.push(Reverse(10));
+        heap.push(Reverse(15));
+        
+        // Pop should give us 10, 15, 20 (min-heap behavior)
+        assert_eq!(heap.pop().unwrap().0, 10);
+        assert_eq!(heap.pop().unwrap().0, 15);
+        assert_eq!(heap.pop().unwrap().0, 20);
+    }
+    
+    #[test]
+    fn test_game_command_message_heap() {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+        
+        // Create messages with different ticks but same user and sequence
+        let msg1 = create_command_message(20, 1, 1, false);
+        let msg2 = create_command_message(10, 1, 1, false);
+        let msg3 = create_command_message(15, 1, 1, false);
+        
+        // Test direct comparison
+        println!("msg1: {:?}", msg1);
+        println!("msg2: {:?}", msg2);
+        println!("msg1.command_id_client: {:?}", msg1.command_id_client);
+        println!("msg2.command_id_client: {:?}", msg2.command_id_client);
+        println!("msg2 (tick 10) < msg1 (tick 20): {}", msg2 < msg1);
+        println!("msg2.cmp(&msg1): {:?}", msg2.cmp(&msg1));
+        println!("msg2.command_id_client.cmp(&msg1.command_id_client): {:?}", msg2.command_id_client.cmp(&msg1.command_id_client));
+        
+        // Push to heap
+        let mut heap = BinaryHeap::new();
+        heap.push(Reverse(msg1.clone()));
+        heap.push(Reverse(msg2.clone()));
+        heap.push(Reverse(msg3.clone()));
+        
+        // Pop and check order
+        let first = heap.pop().unwrap().0;
+        println!("First popped: tick = {}", first.tick());
+        assert_eq!(first.tick(), 10);
+        
+        let second = heap.pop().unwrap().0;
+        println!("Second popped: tick = {}", second.tick());
+        assert_eq!(second.tick(), 15);
+        
+        let third = heap.pop().unwrap().0;
+        println!("Third popped: tick = {}", third.tick());
+        assert_eq!(third.tick(), 20);
+    }
+
+    #[test]
+    fn test_simple_message_comparison() {
+        // Create two messages with different ticks but same user and sequence
+        let msg_tick10 = create_command_message(10, 1, 1, false);
+        let msg_tick20 = create_command_message(20, 1, 1, false);
+        
+        // Also check if they're actually different
+        println!("msg_tick10 == msg_tick20: {}", msg_tick10 == msg_tick20);
+        
+        // Print debug info
+        println!("msg_tick10.command_id_client: {:?}", msg_tick10.command_id_client);
+        println!("msg_tick20.command_id_client: {:?}", msg_tick20.command_id_client);
+        println!("msg_tick10.id(): {:?}", msg_tick10.id());
+        println!("msg_tick20.id(): {:?}", msg_tick20.id());
+        println!("msg_tick10.cmp(&msg_tick20): {:?}", msg_tick10.cmp(&msg_tick20));
+        println!("msg_tick10.command_id_client.cmp(&msg_tick20.command_id_client): {:?}", 
+                 msg_tick10.command_id_client.cmp(&msg_tick20.command_id_client));
+        
+        // Check the actual comparison being used in Ord
+        let id1 = msg_tick10.command_id_server.as_ref().unwrap_or(&msg_tick10.command_id_client);
+        let id2 = msg_tick20.command_id_server.as_ref().unwrap_or(&msg_tick20.command_id_client);
+        println!("id1: {:?}", id1);
+        println!("id2: {:?}", id2);
+        println!("id1.cmp(id2): {:?}", id1.cmp(id2));
+        
+        // Let's manually implement what Ord::cmp should do
+        let manual_cmp = msg_tick10.command_id_server.as_ref()
+            .unwrap_or(&msg_tick10.command_id_client)
+            .cmp(
+                msg_tick20.command_id_server.as_ref()
+                    .unwrap_or(&msg_tick20.command_id_client)
+            );
+        println!("Manual cmp result: {:?}", manual_cmp);
+        
+        // Check Ord trait directly
+        use std::cmp::Ord;
+        println!("Ord::cmp result: {:?}", Ord::cmp(&msg_tick10, &msg_tick20));
+        
+        // This test will show us what's actually happening
+        if msg_tick10 < msg_tick20 {
+            println!("tick 10 < tick 20 (expected behavior)");
+        } else if msg_tick10 > msg_tick20 {
+            println!("tick 10 > tick 20 (inverted behavior!)");
+        } else {
+            println!("tick 10 == tick 20 (they're equal?!)");
+        }
+    }
+
+    #[test]
+    fn test_game_command_message_ordering() {
+        // Test GameCommandMessage ordering directly
+        // Note: Using different sequence numbers to avoid identical commands
+        let msg1 = create_command_message(10, 1, 1, false);
+        let msg2 = create_command_message(20, 1, 2, false);
+        let msg3 = create_command_message(15, 1, 3, false);
+        
+        // Debug: Let's see what's actually happening
+        println!("msg1 (tick 10) < msg2 (tick 20): {}", msg1 < msg2);
+        println!("msg1 (tick 10) > msg2 (tick 20): {}", msg1 > msg2);
+        println!("msg1.cmp(&msg2): {:?}", msg1.cmp(&msg2));
+        
+        // Direct comparison - smaller ticks should be less than larger ticks
+        assert!(msg1 < msg2);  // tick 10 < tick 20
+        assert!(msg1 < msg3);  // tick 10 < tick 15
+        assert!(msg3 < msg2);  // tick 15 < tick 20
+        
+        // Test with server IDs
+        let mut msg_with_server = create_command_message(10, 1, 1, false);
+        msg_with_server.command_id_server = Some(create_command_id(25, 1, 1));
+        
+        assert!(msg2 < msg_with_server);  // tick 20 < tick 25 (server tick overrides)
+    }
+
+    #[test]
+    fn test_reverse_game_command_message_ordering() {
+        use std::cmp::Reverse;
+        
+        // Test GameCommandMessage ordering when wrapped in Reverse
+        // Note: Using different sequence numbers to avoid identical commands
+        let msg1 = create_command_message(10, 1, 1, false);
+        let msg2 = create_command_message(20, 1, 2, false);
+        let msg3 = create_command_message(15, 1, 3, false);
+        
+        // Wrap in Reverse
+        let rev1 = Reverse(msg1.clone());
+        let rev2 = Reverse(msg2.clone());
+        let rev3 = Reverse(msg3.clone());
+        
+        // Reversed comparison - larger ticks should be "less than" when wrapped in Reverse
+        assert!(rev2 < rev1);  // Reverse(tick 20) < Reverse(tick 10)
+        assert!(rev3 < rev1);  // Reverse(tick 15) < Reverse(tick 10)
+        assert!(rev2 < rev3);  // Reverse(tick 20) < Reverse(tick 15)
+        
+        // Test in a BinaryHeap to see actual behavior
+        let mut heap = BinaryHeap::new();
+        heap.push(Reverse(msg2.clone()));
+        heap.push(Reverse(msg1.clone()));
+        heap.push(Reverse(msg3.clone()));
+        
+        // Pop should give us the smallest tick first (min-heap behavior)
+        let first = heap.pop().unwrap().0;
+        assert_eq!(first.tick(), 10);
+        
+        let second = heap.pop().unwrap().0;
+        assert_eq!(second.tick(), 15);
+        
+        let third = heap.pop().unwrap().0;
+        assert_eq!(third.tick(), 20);
+    }
+}

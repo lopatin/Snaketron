@@ -54,7 +54,6 @@ export const useGameEngine = ({
   const initialStateRef = useRef<GameState | undefined>(initialState);
   const engineGameIdRef = useRef<string | null>(null);
   const latencyMsRef = useRef(latencyMs);
-  const lastCommandTickRef = useRef<number | null>(null);
 
   // Update latency ref when it changes
   useEffect(() => {
@@ -285,7 +284,7 @@ export const useGameEngine = ({
       // For solo games, the player ID is typically the user's ID from auth
       // The snake ID is usually 0 for the first/only snake
       const snakeId = 0; // In solo games, there's typically only one snake with ID 0
-      
+
       // Process command based on type
       let commandMessageJson: string;
        if (typeof command === 'object' && 'Turn' in command) {
@@ -303,18 +302,6 @@ export const useGameEngine = ({
       // Parse and send to server
       const commandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
-
-      // Transform tick if needed based on minimum tick requirement
-      const originalTick = commandMessage.command_id_client.tick;
-      if (lastCommandTickRef.current !== null && originalTick <= lastCommandTickRef.current) {
-        commandMessage.command_id_client.tick = lastCommandTickRef.current + 1;
-        console.log(`Transformed command tick from ${originalTick} to ${commandMessage.command_id_client.tick} (last command was tick ${lastCommandTickRef.current})`);
-      } else {
-        console.log('Command tick is valid:', originalTick);
-      }
-
-      // Update last command tick
-      lastCommandTickRef.current = commandMessage.command_id_client.tick;
 
       onCommandReady?.(commandMessage);
       console.log('Command sent to server at', Date.now());
@@ -350,7 +337,7 @@ export const useGameEngine = ({
         // Update the local game state to mark it as ended
         setGameState(prev => prev ? {
           ...prev,
-          status: { Ended: {} }
+          status: { Complete: { winning_snake_id: null } }
         } : prev);
         // Stop the game loop
         isRunningRef.current = false;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId, CommandQueue};
+use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
 
 pub struct GameEngine {
     game_id: u32,
@@ -15,6 +15,8 @@ pub struct GameEngine {
 
     start_ms: i64,
     command_counter: u32,
+    /// Track the last command tick sent
+    last_command_tick: Option<u32>,
 }
 
 
@@ -30,6 +32,7 @@ impl GameEngine {
             local_player_id: None,
             start_ms,
             command_counter: 0,
+            last_command_tick: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl GameEngine {
             local_player_id: None,
             start_ms,
             command_counter: 0,
+            last_command_tick: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl GameEngine {
             local_player_id: None,
             start_ms: actual_start_ms,
             command_counter: 0,
+            last_command_tick: None,
         }
     }
 
@@ -98,9 +103,19 @@ impl GameEngine {
             return Err(anyhow::anyhow!("Local player ID not set"));
         };
         
-        let predicted_tick = self.predicted_state.as_ref()
+        let mut predicted_tick = self.predicted_state.as_ref()
             .map(|s| s.current_tick())
             .unwrap_or(0);
+        
+        // Ensure the tick is higher than the last command sent
+        if let Some(last_tick) = self.last_command_tick {
+            if predicted_tick <= last_tick {
+                predicted_tick = last_tick + 1;
+            }
+        }
+        
+        // Update the last command tick
+        self.last_command_tick = Some(predicted_tick);
         
         // Create command with client ID
         let command_message = GameCommandMessage {
@@ -126,7 +141,7 @@ impl GameEngine {
 
 
     /// Process a server event and reconcile with local predictions
-    pub fn process_server_event(&mut self, event_message: &GameEventMessage, current_ts: i64) -> Result<()> {
+    pub fn process_server_event(&mut self, event_message: &GameEventMessage, _current_ts: i64) -> Result<()> {
         // For CommandScheduled events, we can skip them as they're already handled locally
         // if matches!(event_message.event, GameEvent::CommandScheduled { .. }) {
         //     return Ok(());
