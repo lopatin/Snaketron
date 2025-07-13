@@ -1224,9 +1224,13 @@ async fn subscribe_to_game_events(
     let mut redis_conn = redis_conn;
     
     // Track the last message ID we've read
-    let mut last_id = "$".to_string(); // Start from latest messages
+    // Start from beginning (0) to ensure we don't miss the initial snapshot
+    let mut last_id = "0".to_string();
+
+    info!("Subscribing to Redis stream: {}", stream_key);
     
     loop {
+        debug!("WebSocket subscription loop iteration for game {}", game_id);
         // Read from Redis stream
         let options = StreamReadOptions::default()
             .count(10)
@@ -1235,6 +1239,7 @@ async fn subscribe_to_game_events(
         match redis_conn.xread_options(&[&stream_key], &[&last_id], &options).await {
             Ok(reply) => {
                 let reply: StreamReadReply = reply;
+                debug!("WebSocket subscription got {} streams from Redis for game {}", reply.keys.len(), game_id);
                 for stream_data in reply.keys {
                     for stream_id in stream_data.ids {
                         last_id = stream_id.id.clone();
@@ -1243,26 +1248,30 @@ async fn subscribe_to_game_events(
                         if let Some(data) = stream_id.map.get("data") {
                             if let redis::Value::BulkString(bytes) = data {
                                 match serde_json::from_slice::<StreamEvent>(bytes) {
-                                    Ok(StreamEvent::GameEvent(event_msg)) if event_msg.game_id == game_id => {
-                                        // Forward to WebSocket client
-                                        let ws_msg = WSMessage::GameEvent(event_msg.clone());
-                                        let json_msg = serde_json::to_string(&ws_msg)?;
-                                        let msg = Message::Text(Utf8Bytes::from(json_msg));
-                                        
-                                        // Send through the channel
-                                        if ws_tx.send(msg).await.is_err() {
-                                            // Channel closed, client disconnected
-                                            return Ok(());
-                                        }
-                                        
-                                        // Check if game ended
-                                        match &event_msg.event {
-                                            GameEvent::SoloGameEnded { .. } | 
-                                            GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
-                                                info!("Game {} ended, stopping event subscription", game_id);
+                                    Ok(StreamEvent::GameEvent(event_msg)) => {
+                                        debug!("WebSocket parsed GameEvent for game {} (looking for game {})", event_msg.game_id, game_id);
+                                        if event_msg.game_id == game_id {
+                                            debug!("WebSocket subscription received game event for game {}: {:?}", game_id, event_msg);
+                                            // Forward to WebSocket client
+                                            let ws_msg = WSMessage::GameEvent(event_msg.clone());
+                                            let json_msg = serde_json::to_string(&ws_msg)?;
+                                            let msg = Message::Text(Utf8Bytes::from(json_msg));
+                                            
+                                            // Send through the channel
+                                            if ws_tx.send(msg).await.is_err() {
+                                                // Channel closed, client disconnected
                                                 return Ok(());
                                             }
-                                            _ => {}
+                                            
+                                            // Check if game ended
+                                            match &event_msg.event {
+                                                GameEvent::SoloGameEnded { .. } | 
+                                                GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
+                                                    info!("Game {} ended, stopping event subscription", game_id);
+                                                    return Ok(());
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
                                     Ok(_) => {

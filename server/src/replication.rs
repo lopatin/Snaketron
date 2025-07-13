@@ -137,7 +137,6 @@ impl PartitionReplica {
                         }                       
                     }
                 }
-
             }
             StreamEvent::StatusUpdated { game_id, status } => {
                 let mut states = self.game_states.write().await;
