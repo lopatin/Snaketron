@@ -4,6 +4,7 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
 import { UIGameSettings, SpeedMap, FoodSpawnMap, GameMode } from '../types';
+import { GAME_SPEED_TO_MS } from '../constants';
 
 function CustomGameCreator() {
   const navigate = useNavigate();
@@ -86,7 +87,7 @@ function CustomGameCreator() {
       const serverSettings = {
         arena_width: settings.arenaWidth,
         arena_height: settings.arenaHeight,
-        tick_duration_ms: gameSpeedToMs[settings.gameSpeed as keyof typeof gameSpeedToMs],
+        tick_duration_ms: GAME_SPEED_TO_MS[settings.gameSpeed as keyof typeof GAME_SPEED_TO_MS],
         food_spawn_rate: foodSpawnRates[settings.foodSpawnRate as keyof typeof foodSpawnRates],
         max_players: settings.gameMode === 'duel' ? 2 : settings.gameMode === 'solo' ? 1 : settings.maxPlayers,
         game_mode: settings.gameMode === 'solo' ? 'Solo' as GameMode : 
@@ -106,12 +107,6 @@ function CustomGameCreator() {
     }
   };
 
-  const gameSpeedToMs = {
-    slow: 500,
-    normal: 300,
-    fast: 200,
-    extreme: 100,
-  };
 
   const foodSpawnRates = {
     low: 1.5,

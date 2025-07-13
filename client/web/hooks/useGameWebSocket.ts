@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, GameType, GameCommand, Command, CustomGameSettings } from '../types';
+import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 
 interface UseGameWebSocketReturn {
   isConnected: boolean;
@@ -237,7 +238,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     // For multiplayer games, use custom game as a placeholder for now
     createCustomGame({
       max_players: gameType === 'duel' ? 2 : 8,
-      tick_duration_ms: 100, // Normal speed
+      tick_duration_ms: DEFAULT_TICK_INTERVAL_MS as number, // Normal speed
       arena_width: 40,      // Medium map size
       arena_height: 40
     });

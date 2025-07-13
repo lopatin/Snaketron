@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId};
+use crate::{GameCommand, GameEventMessage, GameEvent, GameState, GameCommandMessage, GameType, CommandId, DEFAULT_TICK_INTERVAL_MS};
 
 pub struct GameEngine {
     game_id: u32,
@@ -27,7 +27,7 @@ impl GameEngine {
             committed_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms),
             predicted_state: Some(GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms)),
             event_log: Vec::new(),
-            tick_duration_ms: 300,
+            tick_duration_ms: DEFAULT_TICK_INTERVAL_MS as u32,
             committed_state_lag_ms: 500,
             local_player_id: None,
             start_ms,
@@ -48,7 +48,7 @@ impl GameEngine {
                 settings.arena_height,
                 settings.tick_duration_ms as u32,
             ),
-            _ => (40, 40, 300), // Default dimensions for non-custom games
+            _ => (40, 40, DEFAULT_TICK_INTERVAL_MS as u32), // Default dimensions for non-custom games
         };
         
         GameEngine {
@@ -69,7 +69,7 @@ impl GameEngine {
         // Extract tick duration from custom settings if available
         let tick_duration_ms = match &game_state.game_type {
             GameType::Custom { settings } => settings.tick_duration_ms as u32,
-            _ => 300, // Default for non-custom games
+            _ => DEFAULT_TICK_INTERVAL_MS as u32, // Default for non-custom games
         };
         
         // Use start_ms from game_state if available, otherwise use the provided start_ms

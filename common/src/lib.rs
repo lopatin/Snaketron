@@ -3,6 +3,7 @@ mod arena;
 mod game_state;
 mod game_engine;
 mod ai;
+mod constants;
 
 pub mod util;
 
@@ -11,6 +12,7 @@ pub use game_state::*;
 pub use game_engine::*;
 pub use ai::*;
 pub use util::PseudoRandom;
+pub use constants::*;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
-use crate::{Direction, Player, Position, Snake};
+use crate::{Direction, Player, Position, Snake, DEFAULT_CUSTOM_GAME_TICK_MS};
 use crate::util::PseudoRandom;
 use log::debug;
 
@@ -80,7 +80,7 @@ impl Default for CustomGameSettings {
         CustomGameSettings {
             arena_width: 40,
             arena_height: 40,
-            tick_duration_ms: 200,
+            tick_duration_ms: DEFAULT_CUSTOM_GAME_TICK_MS,
             food_spawn_rate: 3.0,
             max_players: 4,
             game_mode: GameMode::FreeForAll { max_players: 4 },

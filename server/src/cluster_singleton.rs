@@ -8,6 +8,7 @@ use tokio::time::{interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, error, debug};
 use rand::{Rng, SeedableRng};
+use common::CLUSTER_RENEWAL_INTERVAL_MS;
 use rand::rngs::StdRng;
 
 /// A cluster singleton ensures that only one instance of a service runs across the entire cluster
@@ -109,7 +110,7 @@ impl ClusterSingleton {
     pub async fn run(mut self, user_service: impl Fn(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
         info!("Starting cluster singleton for server_id={}", self.server_id);
         
-        let mut renew_interval = interval(Duration::from_millis(300));
+        let mut renew_interval = interval(Duration::from_millis(CLUSTER_RENEWAL_INTERVAL_MS));
         renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         // Add a health check interval to detect connection issues proactively

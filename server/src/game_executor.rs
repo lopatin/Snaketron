@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
-use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMessage, GameState};
+use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMessage, GameState, EXECUTOR_POLL_INTERVAL_MS};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
 use serde::{Serialize, Deserialize};
@@ -66,7 +66,7 @@ async fn run_game(
     let mut engine = GameEngine::new_from_state(game_id, start_ms, initial_state);
     info!("Created game engine for game {} with status: {:?}", game_id, engine.get_committed_state().status);
 
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     
     loop {

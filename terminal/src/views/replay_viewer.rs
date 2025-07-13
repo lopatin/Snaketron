@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::time::{Duration, Instant};
+use common::DEFAULT_TICK_INTERVAL_MS;
 use std::cell::{RefCell, Cell};
 use common::{GameStatus};
 
@@ -135,7 +136,7 @@ impl View for ReplayViewerState {
             
             // Step forward when we've accumulated enough time for a tick
             // Assuming 3 ticks per second as standard game speed
-            const SECONDS_PER_TICK: f32 = 1.0 / 3.0;
+            const SECONDS_PER_TICK: f32 = DEFAULT_TICK_INTERVAL_MS as f32 / 1000.0;
             while self.playback_accumulator >= SECONDS_PER_TICK {
                 self.player.step_forward(1);
                 self.playback_accumulator -= SECONDS_PER_TICK;
