@@ -5,11 +5,20 @@ use server::ws_server::WSMessage;
 use ::common::{GameEvent, GameType, GameCommand, GameCommandMessage, Direction, GameStatus, CommandId};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
+use redis::AsyncCommands;
 
 #[tokio::test]
 async fn test_simple_game() -> Result<()> {
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();
+    
+    // Clean up Redis before starting the test
+    let redis_client = redis::Client::open("redis://localhost:6379")?;
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    
+    // Small delay to ensure Redis is ready
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Create environment
     let mut env = TestEnvironment::new("test_simple_game").await?;
@@ -82,7 +91,7 @@ async fn test_simple_game() -> Result<()> {
     println!("Client2 received after join: {:?}", msg2);
     
     // Verify both clients received game snapshots and extract game_id and snake_ids
-    let (_game_id, snake1_id, snake2_id) = match (&msg1, &msg2) {
+    let (_game_id, snake1_id, snake2_id, snake1_dir, snake2_dir) = match (&msg1, &msg2) {
         (WSMessage::GameEvent(event1), WSMessage::GameEvent(event2)) => {
             // Check that both events are snapshots for the same game
             assert_eq!(event1.game_id, event2.game_id);
@@ -113,9 +122,20 @@ async fn test_simple_game() -> Result<()> {
                         .expect("Player 2 should have a snake").snake_id;
                     
                     println!("Initial game state - Status: {:?}, Snakes count: {}", state1.status, state1.arena.snakes.len());
-                    println!("Snake 1 ID: {}, Snake 2 ID: {}", snake1_id, snake2_id);
+                    println!("Player 1 (user_id {}): snake_id {}", env.user_ids()[0], snake1_id);
+                    println!("Player 2 (user_id {}): snake_id {}", env.user_ids()[1], snake2_id);
                     
-                    (game_id, snake1_id, snake2_id)
+                    // Debug: Print snake positions and directions
+                    for (idx, snake) in state1.arena.snakes.iter().enumerate() {
+                        println!("Snake {} - alive: {}, direction: {:?}, position: {:?}", 
+                            idx, snake.is_alive, snake.direction, snake.body.get(0));
+                    }
+                    
+                    // Get initial directions
+                    let snake1_dir = state1.arena.snakes[snake1_id as usize].direction;
+                    let snake2_dir = state1.arena.snakes[snake2_id as usize].direction;
+                    
+                    (game_id, snake1_id, snake2_id, snake1_dir, snake2_dir)
                 }
                 _ => panic!("Expected Snapshot events, got {:?} and {:?}", event1.event, event2.event),
             }
@@ -127,44 +147,59 @@ async fn test_simple_game() -> Result<()> {
              _game_id, snake1_id, snake2_id);
     
     // Now simulate the game:
-    // Snake 1 (user 1) has snake at x=3 going RIGHT - will hit right wall
-    // Snake 2 (user 2) has snake at x=36 going LEFT - will hit left wall
-    // We'll make snake 2 turn to avoid crashing
+    // We need to determine which snake each player controls and their positions
+    // Player assignments to snake positions can vary due to HashMap iteration order
     
-    // Snake 2 turns up before the collision point to avoid head-on crash
-    // Need to turn before tick 15 to avoid collision at the center
-    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+    // Determine which player has which snake based on initial direction
+    let (turning_player_client, turning_snake_id, turning_user_id) = {
+        // The snake going LEFT (from right side) needs to turn to avoid wall
+        if matches!(snake1_dir, Direction::Left) {
+            println!("Player 1's snake is going LEFT, needs to turn");
+            (&mut client1, snake1_id, env.user_ids()[0] as u32)
+        } else {
+            println!("Player 2's snake is going LEFT, needs to turn");
+            (&mut client2, snake2_id, env.user_ids()[1] as u32)
+        }
+    };
     
-    client2.send_message(WSMessage::GameCommand(
+    // Store which snake should win (the one that turns)
+    let expected_winner = turning_snake_id;
+    
+    // Wait a bit then make the LEFT-going snake turn up
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    
+    turning_player_client.send_message(WSMessage::GameCommand(
         GameCommandMessage {
             command_id_client: CommandId {
                 tick: 0,
-                user_id: env.user_ids()[1] as u32,
+                user_id: turning_user_id,
                 sequence_number: 0,
             },
             command_id_server: None,
             command: GameCommand::Turn { 
-                snake_id: snake2_id, 
+                snake_id: turning_snake_id, 
                 direction: Direction::Up 
             },
         }
     )).await?;
     
-    tokio::time::sleep(Duration::from_millis(3000)).await; // Wait 10 ticks
+    // Wait then turn left to continue avoiding walls
+    tokio::time::sleep(Duration::from_millis(3000)).await;
      
-    client2.send_message(WSMessage::GameCommand( GameCommandMessage {
-             command_id_client: CommandId {
-                 tick: 0,
-                 user_id: env.user_ids()[1] as u32,
-                 sequence_number: 0,
-             },
-             command_id_server: None,
-             command: GameCommand::Turn { 
-                 snake_id: snake2_id, 
-                 direction: Direction::Left 
-             },
-         }
-     )).await?;
+    turning_player_client.send_message(WSMessage::GameCommand(
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: turning_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn { 
+                snake_id: turning_snake_id, 
+                direction: Direction::Left 
+            },
+        }
+    )).await?;
     
     // Continue the game and collect events
     let mut snake1_died = false;
@@ -195,7 +230,7 @@ async fn test_simple_game() -> Result<()> {
                                     println!("Game ended in a draw - both snakes died");
                                     return Ok::<(), anyhow::Error>(());
                                 }
-                                assert_eq!(*winning_snake_id, Some(snake2_id), "Snake 2 should win");
+                                assert_eq!(*winning_snake_id, Some(expected_winner), "The snake that turned should win");
                                 return Ok::<(), anyhow::Error>(());
                             }
                         }
@@ -225,7 +260,7 @@ async fn test_simple_game() -> Result<()> {
                                     println!("Game ended in a draw - both snakes died");
                                     return Ok::<(), anyhow::Error>(());
                                 }
-                                assert_eq!(*winning_snake_id, Some(snake2_id), "Snake 2 should win");
+                                assert_eq!(*winning_snake_id, Some(expected_winner), "The snake that turned should win");
                                 return Ok::<(), anyhow::Error>(());
                             }
                         }
@@ -271,8 +306,26 @@ async fn test_simple_game() -> Result<()> {
     
     assert!(game_ended.is_ok(), "Game should have ended with a completion status");
     
-    assert!(snake1_died, "Snake 1 should have died");
-    assert!(!snake2_died, "Snake 2 should not have died");
+    // Debug final state
+    println!("Final state - Snake 1 (id {}) died: {}, Snake 2 (id {}) died: {}", 
+        snake1_id, snake1_died, snake2_id, snake2_died);
+    
+    // The snake that went straight (RIGHT direction) should die hitting the wall
+    // The snake that turned (originally LEFT direction) should survive
+    let right_going_snake_died = if matches!(snake1_dir, Direction::Right) {
+        snake1_died
+    } else {
+        snake2_died
+    };
+    
+    let left_going_snake_died = if matches!(snake1_dir, Direction::Left) {
+        snake1_died
+    } else {
+        snake2_died
+    };
+    
+    assert!(right_going_snake_died, "The snake going RIGHT should have died hitting the wall");
+    assert!(!left_going_snake_died, "The snake that turned (originally going LEFT) should survive");
     
     // Output the replay file location
     if let Some(server) = env.server(0) {
