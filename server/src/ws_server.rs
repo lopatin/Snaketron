@@ -1359,7 +1359,6 @@ async fn subscribe_to_game_events_via_replication(
                         
                         // Check if game ended
                         match &event_msg.event {
-                            GameEvent::SoloGameEnded { .. } | 
                             GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
                                 info!("Game {} ended, stopping event subscription", game_id);
                                 return Ok(());

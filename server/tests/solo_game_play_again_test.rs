@@ -68,9 +68,10 @@ async fn test_solo_game_play_again() -> Result<()> {
 }
 
 #[derive(Debug)]
-enum GameCompletionResult {
-    SoloGameEnded { score: u32, duration: u32 },
-    StatusComplete { winning_snake_id: Option<u32> },
+struct GameCompletionResult {
+    winning_snake_id: Option<u32>,
+    score: u32,
+    duration: u32,
 }
 
 async fn play_single_solo_game(client: &mut TestClient, user_id: i32) -> Result<GameCompletionResult> {
@@ -151,17 +152,21 @@ async fn play_single_solo_game(client: &mut TestClient, user_id: i32) -> Result<
                     GameEvent::StatusUpdated { status } => {
                         println!("Game status updated to {:?}", status);
                         if let GameStatus::Complete { winning_snake_id } = status {
-                            println!("Game complete! Winner: {:?} - waiting for SoloGameEnded event", winning_snake_id);
-                            // Don't return immediately, wait for SoloGameEnded event
+                            println!("Game complete! Winner: {:?}", winning_snake_id);
+                            game_completed = true;
+                            
+                            // Calculate score from the last known state
+                            // For now, we'll use placeholder values since we need to get the final state
+                            // In a real implementation, you'd extract this from the game state
+                            let score = 0; // TODO: Calculate from game state
+                            let duration = event.tick;
+                            
+                            return Ok(GameCompletionResult {
+                                winning_snake_id: *winning_snake_id,
+                                score,
+                                duration,
+                            });
                         }
-                    }
-                    GameEvent::SoloGameEnded { score, duration } => {
-                        println!("Solo game ended! Score: {}, Duration: {}", score, duration);
-                        game_completed = true;
-                        return Ok(GameCompletionResult::SoloGameEnded { 
-                            score: *score, 
-                            duration: *duration 
-                        });
                     }
                     _ => {
                         // Other events like food spawning, etc.

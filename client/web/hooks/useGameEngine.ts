@@ -146,9 +146,9 @@ export const useGameEngine = ({
       const newState = JSON.parse(stateJson);
       setGameState(newState);
       
-      // Stop the loop if game is ended
-      if ('Ended' in newState.status) {
-        console.log('Game ended, stopping game loop');
+      // Stop the loop if game is complete
+      if ('Complete' in newState.status) {
+        console.log('Game completed, stopping game loop');
         isRunningRef.current = false;
         setIsRunning(false);
         return;
@@ -330,26 +330,8 @@ export const useGameEngine = ({
         };
       }
       
-      // Handle SoloGameEnded event specially
-      const event = fullEventMessage.event || fullEventMessage;
-      if (event.SoloGameEnded) {
-        console.log('Processing SoloGameEnded event');
-        // Update the local game state to mark it as ended
-        setGameState(prev => prev ? {
-          ...prev,
-          status: { Complete: { winning_snake_id: null } }
-        } : prev);
-        // Stop the game loop
-        isRunningRef.current = false;
-        setIsRunning(false);
-        if (animationFrameRef.current !== null) {
-          cancelAnimationFrame(animationFrameRef.current);
-          animationFrameRef.current = null;
-        }
-        return;
-      }
-      
       // Convert the event if it contains a Snapshot with game state
+      const event = fullEventMessage.event || fullEventMessage;
       if (event.Snapshot && event.Snapshot.game_state) {
         fullEventMessage = {
           ...fullEventMessage,

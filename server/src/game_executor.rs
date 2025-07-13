@@ -126,46 +126,6 @@ async fn run_game(
                                 warn!("Failed to publish game event: {}", e);
                             }
                         }
-                        
-                        // Check for solo game end
-                        // TODO: Why is this here, and why does SoloGameEnded even exist?
-                        // Shouldn't the game engine emit the game end event?
-                        let game_state = engine.get_committed_state();
-                        if game_state.game_type.is_solo() && game_state.players.len() == 1 {
-                                // Get the single player
-                                if let Some((user_id, player)) = game_state.players.iter().next() {
-                                    if let Some(snake) = game_state.arena.snakes.get(player.snake_id as usize) {
-                                        if !snake.is_alive {
-                                            // Calculate score: actual snake length - starting length
-                                            let starting_length = match &game_state.game_type {
-                                                common::GameType::Custom { settings } => settings.snake_start_length as usize,
-                                                _ => 4,  // Default starting length
-                                            };
-                                            let score = snake.length().saturating_sub(starting_length) as u32;
-                                            let duration = engine.current_tick();
-                                            
-                                            // Send solo game ended event
-                                            let event = GameEvent::SoloGameEnded { score, duration };
-                                            let event_msg = GameEventMessage {
-                                                game_id,
-                                                tick: engine.current_tick(),
-                                                user_id: Some(*user_id),
-                                                event,
-                                            };
-                                            
-                                            // Publish to Redis stream
-                                            let stream_event = StreamEvent::GameEvent(event_msg.clone());
-                                            if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
-                                                warn!("Failed to publish solo game ended event: {}", e);
-                                            }
-                                            
-                                            // Exit the game loop for solo games
-                                            info!("Solo game {} ended. Score: {}, Duration: {} ticks", game_id, score, duration);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
                     }
                     Err(e) => {
                         eprintln!("Error running game tick: {:?}", e);

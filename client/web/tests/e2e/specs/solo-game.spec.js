@@ -107,7 +107,7 @@ test.describe('Solo Game', () => {
 
     // Step 3: Wait for game end event
     const gameEndPromise = wsMonitor.waitForMessage('GameEvent', (msg) => {
-      return msg.GameEvent?.event?.SoloGameEnded !== undefined;
+      return msg.GameEvent?.event?.StatusUpdated?.status?.Complete !== undefined;
     });
 
     // Keep the snake moving in a tight pattern to force a crash
@@ -124,10 +124,9 @@ test.describe('Solo Game', () => {
 
     const gameEndEvent = await gameEndPromise;
     
-    // Verify game ended with score and duration
-    expect(gameEndEvent.GameEvent.event).toHaveProperty('SoloGameEnded');
-    expect(gameEndEvent.GameEvent.event.SoloGameEnded).toHaveProperty('score');
-    expect(gameEndEvent.GameEvent.event.SoloGameEnded).toHaveProperty('duration');
+    // Verify game ended with Complete status
+    expect(gameEndEvent.GameEvent.event).toHaveProperty('StatusUpdated');
+    expect(gameEndEvent.GameEvent.event.StatusUpdated.status).toHaveProperty('Complete');
 
     // Step 4: Verify game over UI is displayed
     await expect(page.locator('text=Game Over')).toBeVisible();

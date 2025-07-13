@@ -59,13 +59,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           // Full game state snapshot
           console.log('Received Snapshot:', event.Snapshot);
           setGameState(event.Snapshot.game_state);
-        } else if (event.SoloGameEnded) {
-          // Solo game ended
-          console.log('Received SoloGameEnded event');
-          setGameState(prev => prev ? {
-            ...prev,
-            status: { Ended: {} }
-          } : prev);
         } else if (event.StatusUpdated) {
           // Update game status
           console.log('StatusUpdated event:', event.StatusUpdated);

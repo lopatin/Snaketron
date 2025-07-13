@@ -35,7 +35,6 @@ pub enum GameEvent {
     CommandScheduled { command_message: GameCommandMessage },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated { status: GameStatus },
-    SoloGameEnded { score: u32, duration: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -719,10 +718,6 @@ impl GameState {
             
             GameEvent::StatusUpdated { status } => {
                 self.status = status;
-            }
-            
-            GameEvent::SoloGameEnded { .. } => {
-                // This event is informational only, no state change needed
             }
         }
 
