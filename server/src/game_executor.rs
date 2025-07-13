@@ -126,6 +126,13 @@ async fn run_game(
                                 warn!("Failed to publish game event: {}", e);
                             }
                         }
+                        
+                        // Check if game has completed
+                        let game_state = engine.get_committed_state();
+                        if matches!(game_state.status, GameStatus::Complete { .. }) {
+                            info!("Game {} has completed, exiting game loop", game_id);
+                            break;
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error running game tick: {:?}", e);
