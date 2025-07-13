@@ -65,9 +65,9 @@ export interface GameState {
 }
 
 export type GameStatus = 
-  | { Waiting: {} }
+  | 'Stopped'
   | { Started: { server_id: number } }
-  | { Ended: {} };
+  | { Complete: { winning_snake_id: number | null } };
 
 export type GameType = 
   | { Custom: { settings: CustomGameSettings } }

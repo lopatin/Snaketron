@@ -108,26 +108,36 @@ impl PartitionReplica {
         }
     }
 
-    /// Process a single stream event and update game state
+    /// Process a single stream event and update the game state
     async fn process_event(&self, event: StreamEvent) -> Result<()> {
         match event {
             StreamEvent::GameEvent(event_msg) => {
                 let game_id = event_msg.game_id;
                 let mut states = self.game_states.write().await;
-                if let Some(game_state) = states.get_mut(&game_id) {
-                    // Tick forward until we reach the event's tick
-                    if event_msg.tick > game_state.tick {
-                        if let Err(e) = game_state.tick_forward() {
-                            error!("Error during tick_forward: {:?}", e);
-                        }
+                
+                match event_msg.event {
+                    GameEvent::Snapshot { game_state } => {
+                        info!("Received snapshot for game {} at tick {}", game_id, event_msg.tick);
+                        states.insert(game_id, game_state);
                     }
-                    
-                    // Apply event to game state
-                    game_state.apply_event(event_msg.event.clone(), None);
-                    debug!("Applied event to game {} state: {:?}", game_id, event_msg.event);
-                } else {
-                    warn!("Received event for unknown game {}", game_id);
+                    _ => {
+                        if let Some(game_state) = states.get_mut(&game_id) {
+                            // Tick forward until we reach the event's tick
+                            if event_msg.tick > game_state.tick {
+                                if let Err(e) = game_state.tick_forward() {
+                                    error!("Error during tick_forward: {:?}", e);
+                                }
+                            }
+
+                            // Apply event to game state
+                            game_state.apply_event(event_msg.event.clone(), None);
+                            debug!("Applied event to game {} state: {:?}", game_id, event_msg.event);
+                        } else {
+                            warn!("Received event for unknown game {}", game_id);
+                        }                       
+                    }
                 }
+
             }
             StreamEvent::StatusUpdated { game_id, status } => {
                 let mut states = self.game_states.write().await;

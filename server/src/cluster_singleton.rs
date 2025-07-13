@@ -136,8 +136,8 @@ impl ClusterSingleton {
                     break;
                 }
                 _ = &mut claim_sleep => {
-                    debug!("Attempting to become leader for server_id={}", self.server_id);
                     if !self.is_leader() {
+                        // debug!("Attempting to become leader for server_id={}", self.server_id);
                         match self.try_acquire_lease().await {
                             Ok(true) => {
                                 info!("Became leader for server_id={}", self.server_id);
@@ -169,8 +169,8 @@ impl ClusterSingleton {
                     // debug!("Next claim attempt in {}ms", claim_duration_ms);
                 }
                 _ = renew_interval.tick() => {
-                    debug!("Renewing lease for server_id={}", self.server_id);
                     if self.is_leader() {
+                        // debug!("Renewing lease for server_id={}", self.server_id);
                         match self.renew_lease().await {
                             Ok(true) => {
                                 // debug!("Successfully renewed lease");
@@ -193,7 +193,7 @@ impl ClusterSingleton {
                     }
                 }
                 _ = health_check_interval.tick() => {
-                    debug!("Performing Redis health check for server_id={}", self.server_id);
+                    // debug!("Performing Redis health check for server_id={}", self.server_id);
                     // Periodic health check to ensure connection is still valid
                     if self.redis_client.is_some() {
                         if let Some(ref mut client) = self.redis_client {
