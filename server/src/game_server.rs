@@ -12,7 +12,6 @@ use crate::{
     game_executor::{run_game_executor, StreamEvent},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
-    raft::{RaftNode, StateChangeEvent},
     learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
     cluster_singleton::ClusterSingleton,
@@ -56,8 +55,6 @@ pub struct GameServer {
     cancellation_token: CancellationToken,
     /// Handles for all spawned tasks
     handles: Vec<JoinHandle<()>>,
-    /// Raft consensus node
-    // raft: Option<Arc<RaftNode>>,
     /// Optional replay listener
     // replay_listener: Option<Arc<ReplayListener>>,
     /// Replication manager for game state
@@ -281,7 +278,6 @@ impl GameServer {
             db_pool,
             cancellation_token,
             handles,
-            // raft: Some(raft),
             // replay_listener,
             replication_manager: Some(replication_manager),
         })

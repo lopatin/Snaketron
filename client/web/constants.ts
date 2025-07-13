@@ -1,8 +1,8 @@
 // Game tick interval constants (matching Rust constants)
-export const DEFAULT_TICK_INTERVAL_MS = 300;
+export const DEFAULT_TICK_INTERVAL_MS = 150;
 export const EXECUTOR_POLL_INTERVAL_MS = 100;
-export const DEFAULT_CUSTOM_GAME_TICK_MS = 200;
-export const CLUSTER_RENEWAL_INTERVAL_MS = 300;
+export const DEFAULT_CUSTOM_GAME_TICK_MS = 150;
+export const CLUSTER_RENEWAL_INTERVAL_MS = 150;
 
 // Game speed mappings
 export const GAME_SPEED_TO_MS = {
