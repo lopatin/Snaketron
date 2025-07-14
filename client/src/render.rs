@@ -73,12 +73,43 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
 
     // Draw food
     if let Some(food_array) = arena["food"].as_array() {
-        ctx.set_fill_style(&JsValue::from_str("#ff6b6b"));
+        // First pass: Draw white squares to erase grid dots
+        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
         for food in food_array {
             if let (Some(x), Some(y)) = (food["x"].as_i64(), food["y"].as_i64()) {
                 let cell_x = x as f64 * cell_size;
                 let cell_y = y as f64 * cell_size;
-                ctx.fill_rect(cell_x, cell_y, cell_size, cell_size);
+                // Draw white rectangle 1px larger than the cell to erase dots
+                ctx.fill_rect(cell_x - 1.0, cell_y - 1.0, cell_size + 2.0, cell_size + 2.0);
+            }
+        }
+        
+        // Second pass: Draw the actual food
+        for food in food_array {
+            if let (Some(x), Some(y)) = (food["x"].as_i64(), food["y"].as_i64()) {
+                let cell_x = x as f64 * cell_size;
+                let cell_y = y as f64 * cell_size;
+                let center_x = cell_x + cell_size / 2.0;
+                let center_y = cell_y + cell_size / 2.0;
+                let radius = cell_size / 2.0;
+                
+                // Draw darker border
+                ctx.set_fill_style(&JsValue::from_str("#4a6a4a"));
+                ctx.begin_path();
+                ctx.arc(center_x, center_y, radius + 1.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                ctx.fill();
+                
+                // Draw food base
+                ctx.set_fill_style(&JsValue::from_str("#6e9e6e"));
+                ctx.begin_path();
+                ctx.arc(center_x, center_y, radius, 0.0, 2.0 * std::f64::consts::PI)?;
+                ctx.fill();
+                
+                // Draw single light reflection in top-left
+                ctx.set_fill_style(&JsValue::from_str("#8fb08f"));
+                ctx.begin_path();
+                ctx.arc(center_x - radius * 0.35, center_y - radius * 0.35, radius * 0.25, 0.0, 2.0 * std::f64::consts::PI)?;
+                ctx.fill();
             }
         }
     }
@@ -89,7 +120,7 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             if snake["is_alive"].as_bool().unwrap_or(false) {
                 // Choose snake color based on index
                 let color = match index % 4 {
-                    0 => "#4ecdc4",
+                    0 => "#70bfe3",  // Slightly darker with a touch more teal
                     1 => "#556270",
                     2 => "#ff6b6b",
                     _ => "#f7b731",
@@ -97,7 +128,7 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 
                 // Calculate darker shade for border (darken by ~30%)
                 let border_color = match index % 4 {
-                    0 => "#349a92",  // Darker teal
+                    0 => "#5299bb",  // Darker with teal influence
                     1 => "#353c47",  // Darker gray
                     2 => "#b84444",  // Darker red
                     _ => "#a87d1f",  // Darker yellow
