@@ -95,19 +95,19 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 let radius = cell_size / 2.0;
                 
                 // Draw darker border
-                ctx.set_fill_style(&JsValue::from_str("#4a6a4a"));
+                ctx.set_fill_style(&JsValue::from_str("#5e8a5e"));
                 ctx.begin_path();
                 ctx.arc(center_x, center_y, radius + 1.0, 0.0, 2.0 * std::f64::consts::PI)?;
                 ctx.fill();
                 
                 // Draw food base
-                ctx.set_fill_style(&JsValue::from_str("#6e9e6e"));
+                ctx.set_fill_style(&JsValue::from_str("#85b885"));
                 ctx.begin_path();
                 ctx.arc(center_x, center_y, radius, 0.0, 2.0 * std::f64::consts::PI)?;
                 ctx.fill();
                 
                 // Draw single light reflection in top-left
-                ctx.set_fill_style(&JsValue::from_str("#8fb08f"));
+                ctx.set_fill_style(&JsValue::from_str("#a0c8a0"));
                 ctx.begin_path();
                 ctx.arc(center_x - radius * 0.35, center_y - radius * 0.35, radius * 0.25, 0.0, 2.0 * std::f64::consts::PI)?;
                 ctx.fill();
@@ -358,9 +358,10 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     }
                     
                     // Draw white overlay on segments within 10 cells of head
-                    // Use rectangles instead of strokes to avoid corner overlap
-                    let mut overlaid_cells = std::collections::HashSet::new();
+                    // First, collect all cells with their distances
+                    let mut cells_with_distance = Vec::new();
                     let mut current_distance = 0.0;
+                    let mut seen_cells = HashSet::new();
                     
                     for (seg_idx, window) in body.windows(2).enumerate() {
                         if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
@@ -369,71 +370,68 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                             let x2 = p2["x"].as_i64().unwrap_or(0);
                             let y2 = p2["y"].as_i64().unwrap_or(0);
                             
-                            // Draw overlay for each cell in the segment
+                            // Process each cell in the segment, respecting direction
                             if x1 == x2 {
                                 // Vertical segment
                                 let x = x1;
-                                let min_y = y1.min(y2);
-                                let max_y = y1.max(y2);
+                                let step = if y2 > y1 { 1 } else { -1 };
+                                let mut y = y1;
                                 
-                                for y in min_y..=max_y {
-                                    if current_distance >= 10.0 {
-                                        break;
-                                    }
-                                    
+                                loop {
                                     let cell_key = format!("{},{}", x, y);
-                                    if !overlaid_cells.contains(&cell_key) {
-                                        overlaid_cells.insert(cell_key);
-                                        
-                                        let opacity = (1.0 - current_distance / 10.0) * 0.3;
-                                        ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
-                                        
-                                        // Draw a filled square for this cell
-                                        ctx.fill_rect(
-                                            x as f64 * cell_size,
-                                            y as f64 * cell_size,
-                                            cell_size,
-                                            cell_size
-                                        );
-                                    }
                                     
-                                    if y != min_y || seg_idx > 0 {  // Don't increment for the first cell if it's not the first segment
+                                    // Skip the first cell of non-first segments (it's a corner already processed)
+                                    if !(seg_idx > 0 && y == y1) && !seen_cells.contains(&cell_key) {
+                                        seen_cells.insert(cell_key.clone());
+                                        if current_distance < 10.0 {
+                                            cells_with_distance.push((x, y, current_distance));
+                                        }
                                         current_distance += 1.0;
                                     }
+                                    
+                                    if y == y2 {
+                                        break;
+                                    }
+                                    y += step;
                                 }
                             } else if y1 == y2 {
                                 // Horizontal segment
                                 let y = y1;
-                                let min_x = x1.min(x2);
-                                let max_x = x1.max(x2);
+                                let step = if x2 > x1 { 1 } else { -1 };
+                                let mut x = x1;
                                 
-                                for x in min_x..=max_x {
-                                    if current_distance >= 10.0 {
-                                        break;
-                                    }
-                                    
+                                loop {
                                     let cell_key = format!("{},{}", x, y);
-                                    if !overlaid_cells.contains(&cell_key) {
-                                        overlaid_cells.insert(cell_key);
-                                        
-                                        let opacity = (1.0 - current_distance / 10.0) * 0.3;
-                                        ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
-                                        
-                                        // Draw a filled square for this cell
-                                        ctx.fill_rect(
-                                            x as f64 * cell_size,
-                                            y as f64 * cell_size,
-                                            cell_size,
-                                            cell_size
-                                        );
-                                    }
                                     
-                                    if x != min_x || seg_idx > 0 {  // Don't increment for the first cell if it's not the first segment
+                                    // Skip the first cell of non-first segments (it's a corner already processed)
+                                    if !(seg_idx > 0 && x == x1) && !seen_cells.contains(&cell_key) {
+                                        seen_cells.insert(cell_key.clone());
+                                        if current_distance < 10.0 {
+                                            cells_with_distance.push((x, y, current_distance));
+                                        }
                                         current_distance += 1.0;
                                     }
+                                    
+                                    if x == x2 {
+                                        break;
+                                    }
+                                    x += step;
                                 }
                             }
                         }
+                    }
+                    
+                    // Now draw all collected cells with their proper distances
+                    for (x, y, distance) in cells_with_distance {
+                        let opacity = (1.0 - distance / 10.0) * 0.3;
+                        ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
+                        
+                        ctx.fill_rect(
+                            x as f64 * cell_size,
+                            y as f64 * cell_size,
+                            cell_size,
+                            cell_size
+                        );
                     }
                     
                     
