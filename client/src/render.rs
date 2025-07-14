@@ -1,5 +1,6 @@
 use wasm_bindgen::prelude::*;
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// Renders the game state to a canvas element
 /// Takes a JSON string representation of the game state
@@ -338,7 +339,112 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     ctx.arc(tail_center_x, tail_center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
                     ctx.fill();
 
-                    // Draw head as full circle
+                    // Fourth pass: Add white overlay gradient for first 10 cells from head
+                    // Calculate cumulative distances from head
+                    let mut cumulative_distance = 0.0;
+                    let mut segment_distances = Vec::new();
+                    
+                    for window in body.windows(2) {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
+                            let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
+                            let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
+                            let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            let segment_length = ((x2 - x1).abs() + (y2 - y1).abs()) as f64;
+                            segment_distances.push((cumulative_distance, segment_length));
+                            cumulative_distance += segment_length;
+                        }
+                    }
+                    
+                    // Draw white overlay on segments within 10 cells of head
+                    // Use rectangles instead of strokes to avoid corner overlap
+                    let mut overlaid_cells = std::collections::HashSet::new();
+                    let mut current_distance = 0.0;
+                    
+                    for (seg_idx, window) in body.windows(2).enumerate() {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0);
+                            let y1 = p1["y"].as_i64().unwrap_or(0);
+                            let x2 = p2["x"].as_i64().unwrap_or(0);
+                            let y2 = p2["y"].as_i64().unwrap_or(0);
+                            
+                            // Draw overlay for each cell in the segment
+                            if x1 == x2 {
+                                // Vertical segment
+                                let x = x1;
+                                let min_y = y1.min(y2);
+                                let max_y = y1.max(y2);
+                                
+                                for y in min_y..=max_y {
+                                    if current_distance >= 10.0 {
+                                        break;
+                                    }
+                                    
+                                    let cell_key = format!("{},{}", x, y);
+                                    if !overlaid_cells.contains(&cell_key) {
+                                        overlaid_cells.insert(cell_key);
+                                        
+                                        let opacity = (1.0 - current_distance / 10.0) * 0.3;
+                                        ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
+                                        
+                                        // Draw a filled square for this cell
+                                        ctx.fill_rect(
+                                            x as f64 * cell_size,
+                                            y as f64 * cell_size,
+                                            cell_size,
+                                            cell_size
+                                        );
+                                    }
+                                    
+                                    if y != min_y || seg_idx > 0 {  // Don't increment for the first cell if it's not the first segment
+                                        current_distance += 1.0;
+                                    }
+                                }
+                            } else if y1 == y2 {
+                                // Horizontal segment
+                                let y = y1;
+                                let min_x = x1.min(x2);
+                                let max_x = x1.max(x2);
+                                
+                                for x in min_x..=max_x {
+                                    if current_distance >= 10.0 {
+                                        break;
+                                    }
+                                    
+                                    let cell_key = format!("{},{}", x, y);
+                                    if !overlaid_cells.contains(&cell_key) {
+                                        overlaid_cells.insert(cell_key);
+                                        
+                                        let opacity = (1.0 - current_distance / 10.0) * 0.3;
+                                        ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
+                                        
+                                        // Draw a filled square for this cell
+                                        ctx.fill_rect(
+                                            x as f64 * cell_size,
+                                            y as f64 * cell_size,
+                                            cell_size,
+                                            cell_size
+                                        );
+                                    }
+                                    
+                                    if x != min_x || seg_idx > 0 {  // Don't increment for the first cell if it's not the first segment
+                                        current_distance += 1.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    
+                    // Draw head as full circle (after overlay for proper layering)
+                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.begin_path();
+                    ctx.arc(head_center_x, head_center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                    ctx.fill();
+                    
+                    // Draw white overlay on head (strongest opacity)
+                    ctx.set_fill_style(&JsValue::from_str("rgba(255, 255, 255, 0.3)"));
                     ctx.begin_path();
                     ctx.arc(head_center_x, head_center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
                     ctx.fill();
@@ -348,9 +454,6 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     ctx.begin_path();
                     ctx.arc(head_center_x, head_center_y, cell_size * 0.38, 0.0, 2.0 * std::f64::consts::PI)?;
                     ctx.fill();
-                    
-                    // Reset fill style back to snake color
-                    ctx.set_fill_style(&JsValue::from_str(color));
                 }
             }
         }
