@@ -6,7 +6,10 @@ use tokio::time::{timeout, Duration};
 mod common;
 use self::common::{TestEnvironment, TestClient};
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_cleanup_abandoned_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_abandoned_game").await?;
     env.add_server().await?;
@@ -59,7 +62,10 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_cleanup_finished_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_finished_game").await?;
     env.add_server().await?;
@@ -110,7 +116,10 @@ async fn test_cleanup_finished_game() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
     let mut env = TestEnvironment::new("test_cleanup_stale_matchmaking_requests").await?;
     env.add_server().await?;
@@ -148,7 +157,10 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_multiple_games_cleanup() -> Result<()> {
     let mut env = TestEnvironment::new("test_multiple_games_cleanup").await?;
     env.add_server().await?;

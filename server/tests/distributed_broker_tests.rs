@@ -7,7 +7,10 @@ use tracing::info;
 mod common;
 use self::common::{TestEnvironment, TestClient};
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_distributed_broker_local_game() -> Result<()> {
     // Initialize tracing for tests
     let _ = tracing_subscriber::fmt()
@@ -102,7 +105,10 @@ async fn test_distributed_broker_local_game() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_distributed_broker_cross_server() -> Result<()> {
     // Create test environment with two servers
     let mut env = TestEnvironment::new("test_distributed_broker_cross_server").await?;
@@ -155,7 +161,10 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test] 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
+#[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     // Create test environment
     let mut env = TestEnvironment::new("test_game_lifecycle_with_cleanup").await?;

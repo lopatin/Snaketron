@@ -7,7 +7,13 @@ use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 use redis::AsyncCommands;
 
+// INFRASTRUCTURE REQUIRED: This test requires Redis (localhost:6379) and a database to be running.
+// To run this test:
+// 1. Start Redis: docker run -d -p 6379:6379 redis
+// 2. Start PostgreSQL: docker-compose up -d db
+// 3. Run with: cargo test test_simple_game -- --ignored
 #[tokio::test]
+#[ignore = "Requires Redis and database infrastructure"]
 async fn test_simple_game() -> Result<()> {
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();

@@ -6,7 +6,10 @@ use tracing::info;
 use server::ws_server::WSMessage;
 use crate::common::{TestEnvironment, TestClient};
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_ping_pong() -> Result<()> {
     // Wrap the entire test in a timeout
     timeout(Duration::from_secs(10), async {
@@ -58,7 +61,10 @@ async fn test_ping_pong() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("Test timed out after 10 seconds"))?
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_join_game_receives_snapshot() -> Result<()> {
     // Wrap the entire test in a timeout
     timeout(Duration::from_secs(10), async {
@@ -128,7 +134,10 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("Test timed out after 10 seconds"))?
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_authenticated_connection() -> Result<()> {
     timeout(Duration::from_secs(10), async {
         let _ = tracing_subscriber::fmt::try_init();

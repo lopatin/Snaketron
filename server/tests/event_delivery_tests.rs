@@ -6,7 +6,10 @@ use ::common::{GameEvent, GameEventMessage, GameType, GameCommand, GameCommandMe
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_game_events_delivered() -> Result<()> {
     // Initialize tracing for tests
     let _ = tracing_subscriber::fmt::try_init();
@@ -145,7 +148,10 @@ async fn test_game_events_delivered() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Initialize tracing for tests
     let _ = tracing_subscriber::fmt::try_init();

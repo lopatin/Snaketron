@@ -7,7 +7,10 @@ use futures_util::future::join_all;
 mod common;
 use self::common::{TestEnvironment, TestClient};
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_minimal() -> Result<()> {
     // Minimal test to check timing
     println!("Test started");
@@ -16,7 +19,10 @@ async fn test_minimal() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_simple_two_player_match() -> Result<()> {
     // Simple test with just 2 players to debug matchmaking
     let mut env = TestEnvironment::new("test_simple_two_player_match").await?;
@@ -83,7 +89,10 @@ async fn test_simple_two_player_match() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_basic_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
     env.add_server().await?;
@@ -119,7 +128,10 @@ async fn test_basic_matchmaking() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_leave_queue() -> Result<()> {
     let mut env = TestEnvironment::new("test_leave_queue").await?;
     env.add_server().await?;
@@ -148,7 +160,10 @@ async fn test_leave_queue() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_team_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_team_matchmaking").await?;
     env.add_server().await?;
@@ -191,7 +206,10 @@ async fn test_team_matchmaking() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_concurrent_matchmaking() -> Result<()> {
     let mut env = TestEnvironment::new("test_concurrent_matchmaking").await?;
     env.add_server().await?;
@@ -266,7 +284,10 @@ async fn test_concurrent_matchmaking() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_disconnect_during_queue() -> Result<()> {
     let mut env = TestEnvironment::new("test_disconnect_during_queue").await?;
     env.add_server().await?;
@@ -303,7 +324,10 @@ async fn test_disconnect_during_queue() -> Result<()> {
     Ok(())
 }
 
+// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
+// To run: docker-compose up -d
 #[tokio::test]
+#[ignore = "Requires database and Redis infrastructure"]
 async fn test_rejoin_active_game() -> Result<()> {
     let mut env = TestEnvironment::new("test_rejoin_active_game").await?;
     env.add_server().await?;

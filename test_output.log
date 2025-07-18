@@ -1,0 +1,966 @@
+warning: virtual workspace defaulting to `resolver = "1"` despite one or more workspace members being on edition 2024 which implies `resolver = "3"`
+note: to keep the current resolver, specify `workspace.resolver = "1"` in the workspace root's manifest
+note: to use the edition 2024 resolver, specify `workspace.resolver = "3"` in the workspace root's manifest
+note: for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions
+warning: unused import: `Snake`
+ --> common/src/ai.rs:1:45
+  |
+1 | use crate::{Direction, GameState, Position, Snake};
+  |                                             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `player_id`
+   --> common/src/game_state.rs:444:20
+    |
+444 |         for (idx, (player_id, player)) in self.players.iter().enumerate() {
+    |                    ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_player_id`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `common` (lib) generated 2 warnings (run `cargo fix --lib -p common` to apply 1 suggestion)
+   Compiling server v0.1.0 (/root/repo/server)
+   Compiling sqlx v0.8.3
+   Compiling tokio-native-tls v0.3.1
+   Compiling tokio-tungstenite v0.26.2
+   Compiling tower-http v0.5.2
+   Compiling gethostname v1.0.1
+   Compiling base64 v0.21.7
+   Compiling rustix v0.38.44
+   Compiling dotenv v0.15.0
+   Compiling rustls-pemfile v1.0.4
+   Compiling hyper-tls v0.5.0
+   Compiling signal-hook v0.3.18
+   Compiling darling_macro v0.20.11
+   Compiling encoding_rs v0.8.35
+   Compiling ipnet v2.11.0
+   Compiling linux-raw-sys v0.4.15
+   Compiling sync_wrapper v0.1.2
+   Compiling paste v1.0.15
+   Compiling reqwest v0.11.27
+   Compiling darling v0.20.11
+   Compiling signal-hook-mio v0.2.4
+warning: unused imports: `StreamEvent`, `grpc_server::run_game_relay_server`, and `replay::ReplayListener`
+  --> server/src/game_server.rs:12:40
+   |
+12 |     game_executor::{run_game_executor, StreamEvent},
+   |                                        ^^^^^^^^^^^
+13 |     grpc_server::run_game_relay_server,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+14 |     matchmaking::run_matchmaking_loop,
+15 |     replay::ReplayListener,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `crate::ws_server::discover_peers`
+  --> server/src/game_server.rs:19:5
+   |
+19 | use crate::ws_server::discover_peers;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `redis::AsyncCommands`
+  --> server/src/game_server.rs:22:5
+   |
+22 | use redis::AsyncCommands;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> server/src/grpc_server.rs:7:5
+  |
+7 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `Postgres` and `Transaction`
+ --> server/src/matchmaking.rs:3:30
+  |
+3 | use sqlx::{Executor, PgPool, Postgres, Transaction};
+  |                              ^^^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `warn`
+ --> server/src/matchmaking.rs:4:35
+  |
+4 | use tracing::{error, info, trace, warn};
+  |                                   ^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> server/src/matchmaking.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `Stream`
+ --> server/src/ws_server.rs:9:29
+  |
+9 | use futures_util::{SinkExt, Stream};
+  |                             ^^^^^^
+
+warning: unused imports: `Mutex`, `RwLock`, `broadcast`, and `oneshot`
+  --> server/src/ws_server.rs:11:19
+   |
+11 | use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
+   |                   ^^^^^^^^^  ^^^^^^^        ^^^^^  ^^^^^^
+
+warning: unused import: `sleep`
+  --> server/src/ws_server.rs:14:26
+   |
+14 | use tokio::time::{Sleep, sleep};
+   |                          ^^^^^
+
+warning: unused import: `redis::AsyncCommands`
+  --> server/src/ws_server.rs:21:5
+   |
+21 | use redis::AsyncCommands;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `tracing::info`
+ --> server/src/replay/recorder.rs:6:5
+  |
+6 | use tracing::info;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `tokio::sync::broadcast`
+ --> server/src/replay/listener.rs:2:5
+  |
+2 | use tokio::sync::broadcast;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Path`
+ --> server/src/replay/directory.rs:1:17
+  |
+1 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+
+warning: unused import: `anyhow`
+ --> server/src/cluster_singleton.rs:1:14
+  |
+1 | use anyhow::{anyhow, Result, Context};
+  |              ^^^^^^
+
+warning: unused variable: `replay_dir`
+  --> server/src/game_server.rs:72:13
+   |
+72 |             replay_dir,
+   |             ^^^^^^^^^^ help: try ignoring the field: `replay_dir: _`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: value assigned to `state` is never read
+   --> server/src/ws_server.rs:474:33
+    |
+474 | ...                   state = ConnectionState::Unauthenticated;
+    |                       ^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: unused variable: `is_private`
+    --> server/src/ws_server.rs:1161:19
+     |
+1161 |     let (game_id, is_private): (i32, bool) = sqlx::query_as(
+     |                   ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_private`
+
+warning: unused variable: `pattern`
+  --> server/src/replay/listener.rs:95:13
+   |
+95 |         let pattern = format!("game_{}_*.replay", game_id);
+   |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pattern`
+
+warning: unused import: `redis::AsyncCommands`
+  --> server/src/matchmaking.rs:10:5
+   |
+10 | use redis::AsyncCommands;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `response_tx`
+  --> server/src/grpc_server.rs:43:14
+   |
+43 |         let (response_tx, response_rx) = mpsc::channel(32);
+   |              ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_response_tx`
+
+   Compiling strum_macros v0.26.4
+warning: fields `server_id` and `grpc_addr` are never read
+  --> server/src/grpc_server.rs:16:5
+   |
+15 | pub struct GameRelayService {
+   |            ---------------- fields in this struct
+16 |     server_id: String,
+   |     ^^^^^^^^^
+17 |     grpc_addr: String,
+   |     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: fields `id`, `current_game_count`, and `max_game_capacity` are never read
+  --> server/src/matchmaking.rs:47:5
+   |
+46 | struct ServerLoad {
+   |        ---------- fields in this struct
+47 |     id: i32,
+   |     ^^
+48 |     current_game_count: i32,
+   |     ^^^^^^^^^^^^^^^^^^
+49 |     max_game_capacity: i32,
+   |     ^^^^^^^^^^^^^^^^^
+   |
+   = note: `ServerLoad` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: method `handle_game_event` is never used
+  --> server/src/replay/listener.rs:20:14
+   |
+11 | impl ReplayListener {
+   | ------------------- method in this implementation
+...
+20 |     async fn handle_game_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
+   |              ^^^^^^^^^^^^^^^^^
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:359:5
+    |
+359 |     async fn get_game_state(&self, game_id: u32) -> Option<GameState>;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+    = note: `#[warn(async_fn_in_trait)]` on by default
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+359 -     async fn get_game_state(&self, game_id: u32) -> Option<GameState>;
+359 +     fn get_game_state(&self, game_id: u32) -> impl std::future::Future<Output = Option<GameState>> + Send;
+    |
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:362:5
+    |
+362 |     async fn get_partition_games(&self, partition_id: u32) -> Vec<(u32, GameState)>;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+362 -     async fn get_partition_games(&self, partition_id: u32) -> Vec<(u32, GameState)>;
+362 +     fn get_partition_games(&self, partition_id: u32) -> impl std::future::Future<Output = Vec<(u32, GameState)>> + Send;
+    |
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:365:5
+    |
+365 |     async fn is_ready(&self) -> bool;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+365 -     async fn is_ready(&self) -> bool;
+365 +     fn is_ready(&self) -> impl std::future::Future<Output = bool> + Send;
+    |
+
+   Compiling castaway v0.2.3
+   Compiling unicode-segmentation v1.12.0
+   Compiling unicode-width v0.1.14
+   Compiling indoc v2.0.6
+   Compiling static_assertions v1.1.0
+   Compiling compact_str v0.8.1
+warning: `server` (lib) generated 27 warnings (run `cargo fix --lib -p server` to apply 15 suggestions)
+   Compiling instability v0.3.7
+   Compiling unicode-truncate v1.1.0
+   Compiling strum v0.26.3
+   Compiling crossterm v0.28.1
+   Compiling lru v0.12.5
+   Compiling cassowary v0.3.0
+   Compiling ratatui v0.28.1
+   Compiling web-sys v0.3.77
+   Compiling snaketron-terminal v0.1.0 (/root/repo/terminal)
+warning: field `last_update` is never read
+  --> terminal/src/views/replay_viewer.rs:43:5
+   |
+41 | pub struct ReplayViewerState {
+   |            ----------------- field in this struct
+42 |     player: ReplayPlayer,
+43 |     last_update: Instant,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `snaketron-terminal` (lib) generated 1 warning
+   Compiling console_error_panic_hook v0.1.7
+warning: methods `current_tick` and `current_state` are never used
+   --> terminal/src/replay/player.rs:96:12
+    |
+12  | impl ReplayPlayer {
+    | ----------------- methods in this implementation
+...
+96  |     pub fn current_tick(&self) -> u32 {
+    |            ^^^^^^^^^^^^
+...
+101 |     pub fn current_state(&self) -> &GameState {
+    |            ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: field `last_update` is never read
+  --> terminal/src/views/replay_viewer.rs:43:5
+   |
+41 | pub struct ReplayViewerState {
+   |            ----------------- field in this struct
+42 |     player: ReplayPlayer,
+43 |     last_update: Instant,
+   |     ^^^^^^^^^^^
+
+warning: fields `logical_width` and `logical_height` are never read
+  --> terminal/src/render/types.rs:23:5
+   |
+20 | pub struct CharGrid {
+   |            -------- fields in this struct
+...
+23 |     logical_width: usize,
+   |     ^^^^^^^^^^^^^
+24 |     logical_height: usize,
+   |     ^^^^^^^^^^^^^^
+
+warning: methods `into_lines`, `physical_width`, and `physical_height` are never used
+  --> terminal/src/render/types.rs:63:12
+   |
+28 | impl CharGrid {
+   | ------------- methods in this implementation
+...
+63 |     pub fn into_lines(self) -> Vec<Vec<char>> {
+   |            ^^^^^^^^^^
+...
+71 |     pub fn physical_width(&self) -> usize {
+   |            ^^^^^^^^^^^^^^
+...
+75 |     pub fn physical_height(&self) -> usize {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated functions `new_with_styles` and `single_with_style` are never used
+   --> terminal/src/render/types.rs:101:12
+    |
+86  | impl CharPattern {
+    | ---------------- associated functions in this implementation
+...
+101 |     pub fn new_with_styles(chars: Vec<Vec<char>>, styles: Vec<Vec<Style>>) -> Self {
+    |            ^^^^^^^^^^^^^^^
+...
+110 |     pub fn single_with_style(ch: char, dims: CharDimensions, style: Style) -> Self {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: methods `char_dimensions` and `render_empty` are never used
+  --> terminal/src/render/traits.rs:5:8
+   |
+4  | pub trait GameObjectRenderer {
+   |           ------------------ methods in this trait
+5  |     fn char_dimensions(&self) -> CharDimensions;
+   |        ^^^^^^^^^^^^^^^
+...
+16 |     fn render_empty(&self) -> CharPattern;
+   |        ^^^^^^^^^^^^
+
+warning: `snaketron-terminal` (bin "snaketron" test) generated 6 warnings
+   Compiling wasm-logger v0.2.0
+   Compiling client v0.1.0 (/root/repo/client)
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+  --> client/src/render.rs:35:9
+   |
+35 |     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+  --> client/src/render.rs:46:9
+   |
+46 |     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+   |         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+  --> client/src/render.rs:50:9
+   |
+50 |     ctx.set_fill_style(&JsValue::from_str("rgba(0, 0, 0, 0.3)")); // Same as background dots
+   |         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+  --> client/src/render.rs:78:13
+   |
+78 |         ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+   |             ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+  --> client/src/render.rs:98:21
+   |
+98 |                 ctx.set_fill_style(&JsValue::from_str("#5e8a5e"));
+   |                     ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:104:21
+    |
+104 |                 ctx.set_fill_style(&JsValue::from_str("#85b885"));
+    |                     ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:110:21
+    |
+110 |                 ctx.set_fill_style(&JsValue::from_str("#a0c8a0"));
+    |                     ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:138:21
+    |
+138 |                 ctx.set_fill_style(&JsValue::from_str(color));
+    |                     ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:154:37
+    |
+154 | ...                   ctx.set_fill_style(&JsValue::from_str(border_color));
+    |                           ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:160:37
+    |
+160 | ...                   ctx.set_fill_style(&JsValue::from_str(color));
+    |                           ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:166:37
+    |
+166 | ...                   ctx.set_fill_style(&JsValue::from_str("#333"));
+    |                           ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:170:37
+    |
+170 | ...                   ctx.set_fill_style(&JsValue::from_str(color));
+    |                           ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:177:25
+    |
+177 |                     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_stroke_style`
+   --> client/src/render.rs:213:25
+    |
+213 |                     ctx.set_stroke_style(&JsValue::from_str(border_color));
+    |                         ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:252:25
+    |
+252 |                     ctx.set_fill_style(&JsValue::from_str(border_color));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_stroke_style`
+   --> client/src/render.rs:267:25
+    |
+267 |                     ctx.set_stroke_style(&JsValue::from_str(color));
+    |                         ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:268:25
+    |
+268 |                     ctx.set_fill_style(&JsValue::from_str(color));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:335:25
+    |
+335 |                     ctx.set_fill_style(&JsValue::from_str(color));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:427:29
+    |
+427 |                         ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
+    |                             ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:439:25
+    |
+439 |                     ctx.set_fill_style(&JsValue::from_str(color));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:445:25
+    |
+445 |                     ctx.set_fill_style(&JsValue::from_str("rgba(255, 255, 255, 0.3)"));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:451:25
+    |
+451 |                     ctx.set_fill_style(&JsValue::from_str("#333"));
+    |                         ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `web_sys::CanvasRenderingContext2d::set_fill_style`
+   --> client/src/render.rs:461:9
+    |
+461 |     ctx.set_fill_style(&JsValue::from_str("#333"));
+    |         ^^^^^^^^^^^^^^
+
+warning: unused variable: `width`
+  --> client/src/render.rs:24:9
+   |
+24 |     let width = arena["width"].as_u64().unwrap_or(10) as u32;
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_width`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `height`
+  --> client/src/render.rs:25:9
+   |
+25 |     let height = arena["height"].as_u64().unwrap_or(10) as u32;
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_height`
+
+warning: `client` (lib test) generated 25 warnings
+warning: variable does not need to be mutable
+  --> terminal/tests/render_test.rs:11:9
+   |
+11 |     let mut arena = Arena {
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: `snaketron-terminal` (test "render_test") generated 1 warning (run `cargo fix --test "render_test"` to apply 1 suggestion)
+warning: `snaketron-terminal` (lib test) generated 1 warning (1 duplicate)
+warning: unused import: `mock_jwt::MockJwtVerifier`
+ --> server/tests/common/mod.rs:6:9
+  |
+6 | pub use mock_jwt::MockJwtVerifier;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `TestDatabaseGuard` and `TestDatabase`
+ --> server/tests/common/mod.rs:8:25
+  |
+8 | pub use test_database::{TestDatabase, TestDatabaseGuard};
+  |                         ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `GameEventMessage`
+ --> server/tests/event_delivery_tests.rs:5:27
+  |
+5 | use ::common::{GameEvent, GameEventMessage, GameType, GameCommand, GameCommandMessage, Direction, CommandId};
+  |                           ^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> server/tests/common/test_database.rs:57:13
+   |
+57 |         let mut db = Self {
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: `snaketron-terminal` (bin "snaketron") generated 6 warnings (6 duplicates)
+warning: associated items `new` and `with_token` are never used
+  --> server/tests/common/mock_jwt.rs:27:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+27 |     pub fn new() -> Self {
+   |            ^^^
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: methods `send_ping`, `expect_pong`, `join_game`, `receive_text`, and `receive_game_event` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+...
+90 |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: methods `add_server_with_jwt`, `grpc_addr`, and `server` are never used
+   --> server/tests/common/test_environment.rs:96:18
+    |
+22  | impl TestEnvironment {
+    | -------------------- methods in this implementation
+...
+96  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+137 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+...
+144 |     pub fn server(&self, index: usize) -> Option<&GameServer> {
+    |            ^^^^^^
+
+warning: `server` (test "event_delivery_tests") generated 7 warnings (run `cargo fix --test "event_delivery_tests"` to apply 4 suggestions)
+warning: methods `send_ping`, `expect_pong`, `join_game`, and `receive_text` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+
+warning: unused variable: `server2_addr`
+   --> server/tests/multi_server_integration_tests.rs:187:9
+    |
+187 |     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
+    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_server2_addr`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: function `wait_for_match` is never used
+   --> server/tests/multi_server_integration_tests.rs:377:10
+    |
+377 | async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
+    |          ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: associated items `new` and `with_token` are never used
+  --> server/tests/common/mock_jwt.rs:27:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+27 |     pub fn new() -> Self {
+   |            ^^^
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+
+warning: methods `send_ping`, `expect_pong`, `receive_text`, and `receive_game_event` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+...
+90 |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: `server` (test "game_cleanup_tests") generated 6 warnings (5 duplicates)
+warning: unused import: `test_client::TestClient`
+ --> server/tests/common/mod.rs:7:9
+  |
+7 | pub use test_client::TestClient;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `test_environment::TestEnvironment`
+ --> server/tests/common/mod.rs:9:9
+  |
+9 | pub use test_environment::TestEnvironment;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::time::SystemTime`
+  --> server/tests/replay_test.rs:82:9
+   |
+82 |     use std::time::SystemTime;
+   |         ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> server/tests/replay_test.rs:20:9
+   |
+20 |     let mut server = GameServer::start(server::game_server::GameServerConfig {
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: associated items `with_token` and `accept_any` are never used
+  --> server/tests/common/mock_jwt.rs:33:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+...
+40 |     pub fn accept_any() -> Self {
+   |            ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: struct `TestClient` is never constructed
+  --> server/tests/common/test_client.rs:10:12
+   |
+10 | pub struct TestClient {
+   |            ^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> server/tests/common/test_client.rs:16:18
+    |
+15  | impl TestClient {
+    | --------------- associated items in this implementation
+16  |     pub async fn connect(addr: &str) -> Result<Self> {
+    |                  ^^^^^^^
+...
+24  |     pub async fn authenticate(&mut self, user_id: i32) -> Result<()> {
+    |                  ^^^^^^^^^^^^
+...
+31  |     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+...
+38  |     pub async fn send_ping(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+42  |     pub async fn expect_pong(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^^^
+...
+50  |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+54  |     pub async fn send_message(&mut self, msg: WSMessage) -> Result<()> {
+    |                  ^^^^^^^^^^^^
+...
+60  |     pub async fn receive_message(&mut self) -> Result<WSMessage> {
+    |                  ^^^^^^^^^^^^^^^
+...
+76  |     pub async fn receive_text(&mut self) -> Result<String> {
+    |                  ^^^^^^^^^^^^
+...
+90  |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+117 |     pub async fn disconnect(mut self) -> Result<()> {
+    |                  ^^^^^^^^^^
+
+warning: field `url` is never read
+  --> server/tests/common/test_database.rs:11:9
+   |
+7  | pub struct TestDatabase {
+   |            ------------ field in this struct
+...
+11 |     pub url: String,
+   |         ^^^
+
+warning: static `DB_COUNTER` is never used
+  --> server/tests/common/test_database.rs:19:8
+   |
+19 | static DB_COUNTER: AtomicU32 = AtomicU32::new(0);
+   |        ^^^^^^^^^^
+
+warning: associated items `new` and `run_migrations` are never used
+  --> server/tests/common/test_database.rs:23:18
+   |
+21 | impl TestDatabase {
+   | ----------------- associated items in this implementation
+22 |     /// Create a new test database with a unique name
+23 |     pub async fn new(test_name: &str) -> Result<Self> {
+   |                  ^^^
+...
+71 |     async fn run_migrations(&self) -> Result<()> {
+   |              ^^^^^^^^^^^^^^
+
+warning: associated items `new`, `pool`, and `url` are never used
+   --> server/tests/common/test_database.rs:138:18
+    |
+137 | impl TestDatabaseGuard {
+    | ---------------------- associated items in this implementation
+138 |     pub async fn new(test_name: &str) -> Result<Self> {
+    |                  ^^^
+...
+143 |     pub fn pool(&self) -> &PgPool {
+    |            ^^^^
+...
+147 |     pub fn url(&self) -> &str {
+    |            ^^^
+
+warning: struct `TestEnvironment` is never constructed
+  --> server/tests/common/test_environment.rs:11:12
+   |
+11 | pub struct TestEnvironment {
+   |            ^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> server/tests/common/test_environment.rs:24:18
+    |
+22  | impl TestEnvironment {
+    | -------------------- associated items in this implementation
+23  |     /// Create a new test environment with an isolated database
+24  |     pub async fn new(test_name: &str) -> Result<Self> {
+    |                  ^^^
+...
+40  |     pub fn db_url(&self) -> &str {
+    |            ^^^^^^
+...
+45  |     pub fn db_pool(&self) -> &sqlx::PgPool {
+    |            ^^^^^^^
+...
+50  |     pub async fn add_server(&mut self) -> Result<(usize, u64)> {
+    |                  ^^^^^^^^^^
+...
+55  |     pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<(usize, u64)> {
+    |                  ^^^^^^^^^^^^^^^^^^^^
+...
+96  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+112 |     pub async fn create_user(&mut self) -> Result<i32> {
+    |                  ^^^^^^^^^^^
+...
+132 |     pub fn ws_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^
+...
+137 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+...
+144 |     pub fn server(&self, index: usize) -> Option<&GameServer> {
+    |            ^^^^^^
+...
+149 |     pub fn user_ids(&self) -> &[i32] {
+    |            ^^^^^^^^
+...
+154 |     pub async fn shutdown(mut self) -> Result<()> {
+    |                  ^^^^^^^^
+
+warning: `server` (test "multi_server_integration_tests") generated 8 warnings (4 duplicates)
+warning: unused import: `futures_util::future::join_all`
+ --> server/tests/matchmaking_integration_tests.rs:5:5
+  |
+5 | use futures_util::future::join_all;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `mock_jwt::MockJwtVerifier`
+ --> server/tests/common/mod.rs:6:9
+  |
+6 | pub use mock_jwt::MockJwtVerifier;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `server` (test "replay_test") generated 16 warnings (3 duplicates) (run `cargo fix --test "replay_test"` to apply 4 suggestions)
+warning: methods `send_ping`, `expect_pong`, `join_game`, and `receive_message` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+60 |     pub async fn receive_message(&mut self) -> Result<WSMessage> {
+   |                  ^^^^^^^^^^^^^^^
+
+warning: `server` (test "matchmaking_integration_tests") generated 7 warnings (5 duplicates) (run `cargo fix --test "matchmaking_integration_tests"` to apply 2 suggestions)
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/simple_game_test.rs:17:39
+   |
+17 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/simple_game_test.rs:8:5
+  |
+8 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `snake2_dir`
+  --> server/tests/simple_game_test.rs:94:54
+   |
+94 |     let (_game_id, snake1_id, snake2_id, snake1_dir, snake2_dir) = match (&msg1, &msg2) {
+   |                                                      ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_snake2_dir`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `server`
+   --> server/tests/simple_game_test.rs:331:17
+    |
+331 |     if let Some(server) = env.server(0) {
+    |                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_server`
+
+warning: methods `send_ping`, `expect_pong`, `receive_text`, `receive_game_event`, and `disconnect` are never used
+   --> server/tests/common/test_client.rs:38:18
+    |
+15  | impl TestClient {
+    | --------------- methods in this implementation
+...
+38  |     pub async fn send_ping(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+42  |     pub async fn expect_pong(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^^^
+...
+76  |     pub async fn receive_text(&mut self) -> Result<String> {
+    |                  ^^^^^^^^^^^^
+...
+90  |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+117 |     pub async fn disconnect(mut self) -> Result<()> {
+    |                  ^^^^^^^^^^
+
+warning: methods `add_server_with_jwt` and `grpc_addr` are never used
+   --> server/tests/common/test_environment.rs:96:18
+    |
+22  | impl TestEnvironment {
+    | -------------------- methods in this implementation
+...
+96  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+137 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+
+warning: `server` (test "websocket_tests") generated 6 warnings (5 duplicates)
+warning: value assigned to `game_completed` is never read
+   --> server/tests/solo_game_play_again_test.rs:156:29
+    |
+156 | ...                   game_completed = true;
+    |                       ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: fields `winning_snake_id`, `score`, and `duration` are never read
+  --> server/tests/solo_game_play_again_test.rs:72:5
+   |
+71 | struct GameCompletionResult {
+   |        -------------------- fields in this struct
+72 |     winning_snake_id: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^
+73 |     score: u32,
+   |     ^^^^^
+74 |     duration: u32,
+   |     ^^^^^^^^
+   |
+   = note: `GameCompletionResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+
