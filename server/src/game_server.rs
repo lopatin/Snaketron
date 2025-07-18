@@ -12,7 +12,6 @@ use crate::{
     game_executor::{run_game_executor, StreamEvent},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
-    learner_join::LearnerJoinProtocol,
     replay::ReplayListener,
     cluster_singleton::ClusterSingleton,
     replication::ReplicationManager,

@@ -42,7 +42,6 @@ prost = "0.13.5"
 async-trait = "0.1"
 jsonwebtoken = "9.3"
 bincode = { version = "2.0", features = ["serde"] }
-async-raft = "0.6"
 flate2 = "1.0"
 rand = "0.8"
 # HTTP API dependencies

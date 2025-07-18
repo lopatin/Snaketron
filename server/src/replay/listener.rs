@@ -1,6 +1,5 @@
 use super::*;
 use tokio::sync::broadcast;
-use crate::raft::StateChangeEvent;
 use common::GameEvent;
 use std::fs;
 
@@ -17,20 +16,6 @@ impl ReplayListener {
         }
     }
 
-    pub async fn subscribe_to_raft(&self, mut rx: broadcast::Receiver<StateChangeEvent>) {
-        tracing::info!("Replay listener started, saving replays to {:?}", self.output_dir);
-        
-        while let Ok(event) = rx.recv().await {
-            match event {
-                StateChangeEvent::GameEvent { event: event_msg } => {
-                    if let Err(e) = self.handle_game_event(event_msg.game_id, event_msg).await {
-                        tracing::error!("Failed to record game event: {}", e);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 
     async fn handle_game_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
         // Check if this is a completion event before acquiring the lock
