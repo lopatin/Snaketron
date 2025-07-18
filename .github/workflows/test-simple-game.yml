@@ -1,0 +1,186 @@
+name: Test Simple Game
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  test-simple-game:
+    runs-on: ubuntu-latest
+    
+    # Required for posting comments to PR
+    permissions:
+      pull-requests: write
+      contents: read
+      
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: snaketron
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Build proto files
+        run: |
+          # Install protoc
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+          
+      - name: Run test_simple_game
+        id: test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron
+          REDIS_URL: redis://localhost:6379
+          RUST_LOG: info
+          RUST_BACKTRACE: 1
+        run: |
+          # Run the specific test and capture output
+          set +e  # Don't exit on error
+          
+          # Run test with JSON output format for easier parsing
+          cargo test -p server test_simple_game -- --exact --nocapture --format json > test_output.json 2>&1
+          TEST_EXIT_CODE=$?
+          
+          # Also run with pretty output for human-readable results
+          cargo test -p server test_simple_game -- --exact --nocapture > test_output_pretty.txt 2>&1
+          
+          # Set outputs for later steps
+          echo "exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Create a summary of the test results
+          if [ $TEST_EXIT_CODE -eq 0 ]; then
+            echo "status=✅ **PASSED**" >> $GITHUB_OUTPUT
+            echo "Test passed successfully!" > test_summary.txt
+          else
+            echo "status=❌ **FAILED**" >> $GITHUB_OUTPUT
+            echo "Test failed with exit code $TEST_EXIT_CODE" > test_summary.txt
+          fi
+          
+          # Exit with the test exit code
+          exit $TEST_EXIT_CODE
+          
+      - name: Extract test duration
+        if: always()
+        id: duration
+        run: |
+          # Try to extract test duration from the output
+          DURATION=$(grep -oP 'test result:.*finished in \K[0-9.]+s' test_output_pretty.txt || echo "N/A")
+          echo "duration=$DURATION" >> $GITHUB_OUTPUT
+          
+      - name: Extract replay file location
+        if: always()
+        id: replay
+        run: |
+          # Try to extract replay file path from the output
+          REPLAY_PATH=$(grep -oP 'Game replay saved to: \K.*' test_output_pretty.txt || echo "")
+          if [ -n "$REPLAY_PATH" ]; then
+            echo "path=\`$REPLAY_PATH\`" >> $GITHUB_OUTPUT
+          else
+            echo "path=No replay file generated" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Post test results to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read the test output
+            let testOutput = '';
+            try {
+              testOutput = fs.readFileSync('test_output_pretty.txt', 'utf8');
+            } catch (e) {
+              testOutput = 'Could not read test output file';
+            }
+            
+            // Truncate output if too long for GitHub comment
+            const maxLength = 30000;
+            if (testOutput.length > maxLength) {
+              testOutput = testOutput.substring(0, maxLength) + '\n\n... (output truncated)';
+            }
+            
+            // Create the comment body
+            const status = '${{ steps.test.outputs.status }}';
+            const exitCode = '${{ steps.test.outputs.exit_code }}';
+            const duration = '${{ steps.duration.outputs.duration }}';
+            const replayPath = '${{ steps.replay.outputs.path }}';
+            
+            const body = `## 🎮 Simple Game Test Results
+            
+**Status**: ${status}
+**Duration**: ${duration}
+**Exit Code**: ${exitCode}
+**Replay File**: ${replayPath}
+
+<details>
+<summary>📋 Test Output</summary>
+
+\`\`\`
+${testOutput}
+\`\`\`
+
+</details>
+
+---
+*This test simulates a simple 2-player Snake game where one snake turns to avoid walls while the other continues straight into a wall.*`;
+            
+            // Post the comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+            
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-simple-game-results
+          path: |
+            test_output.json
+            test_output_pretty.txt
+            test_summary.txt
+          retention-days: 7
