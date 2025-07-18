@@ -17,7 +17,7 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
    - Authoritative game server built on Tokio async runtime
    - WebSocket connections for real-time gameplay
    - gRPC for inter-server communication in cluster
-   - Raft for game state replication
+   - Redis for cluster coordination and singleton management
    - PostgreSQL database for persistence
    - Designed for horizontal scaling with automatic failover
 
@@ -28,9 +28,9 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 
 ### Key Architectural Decisions
 
-- **Service Discovery**: Servers register themselves in the database and send heartbeats. This is used for discovering Raft peers.
+- **Service Discovery**: Servers register themselves in the database and send heartbeats for health monitoring.
 - **Real-time Communication**: WebSocket for client-server, gRPC streaming for server-server.
-- **Raft**: Game and server state is replicated using Raft. This enables automatic failover and leader election.
+- **Cluster Coordination**: Redis-based singleton management for matchmaking and game distribution.
 - **Shared Game Logic**: Common crate compiled to both native (server) and WASM (client) enables consistent game behavior and client-side prediction.
 - **Decoupling**: The server which is running the game loop is not necessarily the same server that is running the WebSocket server that the game client connects to.
 - **Database Schema**: Well-structured tables for servers, users, games, and matchmaking with proper indexes for performance.
