@@ -3,10 +3,19 @@ name: Test Simple Game
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: Run Simple Game Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     
     services:
       postgres:
@@ -24,7 +33,7 @@ jobs:
           --health-retries 5
           
       redis:
-        image: redis:7
+        image: redis:7-alpine
         ports:
           - 6379:6379
         options: >-
@@ -36,29 +45,45 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
         
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
+          components: rustfmt, clippy
           
-      - name: Cache cargo dependencies
-        uses: actions/cache@v3
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
+          cache-on-failure: true
           
-      - name: Install protoc
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+          protoc --version
+          
+      - name: Check database connection
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron
+        run: |
+          sudo apt-get install -y -qq postgresql-client
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "Waiting for postgres..."
+            sleep 1
+          done
+          echo "PostgreSQL is ready!"
+          
+      - name: Check Redis connection
+        run: |
+          sudo apt-get install -y -qq redis-tools
+          until redis-cli -h localhost -p 6379 ping; do
+            echo "Waiting for Redis..."
+            sleep 1
+          done
+          echo "Redis is ready!"
           
       - name: Run test_simple_game
         env:
@@ -67,4 +92,15 @@ jobs:
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |
-          cargo test -p server test_simple_game -- --exact --nocapture
+          echo "Running test_simple_game..."
+          cargo test -p server test_simple_game -- --exact --nocapture --test-threads=1
+          
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            target/debug/deps/*.json
+            **/*.log
+          retention-days: 7
