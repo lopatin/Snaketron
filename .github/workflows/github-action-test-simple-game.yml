@@ -85,7 +85,7 @@ jobs:
           done
           echo "Redis is ready!"
           
-      - name: Run test_simple_game
+      - name: Run all tests
         env:
           DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
           TEST_DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/postgres
@@ -93,8 +93,8 @@ jobs:
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |
-          echo "Running test_simple_game..."
-          cargo test -p server test_simple_game -- --exact --nocapture --test-threads=1
+          echo "Running all tests..."
+          cargo test --all -- --nocapture --test-threads=1
           
       - name: Upload test results
         if: failure()
