@@ -4,7 +4,7 @@ services:
   db:
     image: postgres:13.3
     container_name: snaketron-postgres
-    platform: linux/arm64
+    platform: linux/amd64
     environment:
       POSTGRES_USER: snaketron
       POSTGRES_PASSWORD: snaketron
