@@ -19,10 +19,10 @@ jobs:
     
     services:
       postgres:
-        image: postgres:14
+        image: postgres:13.3
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: snaketron
+          POSTGRES_PASSWORD: snaketron
           POSTGRES_DB: snaketron
         ports:
           - 5432:5432
@@ -67,10 +67,10 @@ jobs:
           
       - name: Check database connection
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron
+          DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
         run: |
           sudo apt-get install -y -qq postgresql-client
-          until pg_isready -h localhost -p 5432 -U postgres; do
+          until pg_isready -h localhost -p 5432 -U snaketron; do
             echo "Waiting for postgres..."
             sleep 1
           done
@@ -87,8 +87,8 @@ jobs:
           
       - name: Run test_simple_game
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron
-          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
+          TEST_DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
           RUST_LOG: info
           RUST_BACKTRACE: 1
