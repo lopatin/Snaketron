@@ -9,10 +9,7 @@ use std::sync::Arc;
 mod common;
 use crate::common::mock_jwt::MockJwtVerifier;
 
-// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
-// To run: docker-compose up -d
 #[tokio::test]
-#[ignore = "Requires database and Redis infrastructure"]
 async fn test_replay_with_tick_forward() -> Result<()> {
     // Setup test environment
     let db_url = std::env::var("DATABASE_URL")

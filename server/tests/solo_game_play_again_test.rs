@@ -6,10 +6,7 @@ use ::common::{GameEvent, GameStatus, SoloMode};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
-// INFRASTRUCTURE REQUIRED: This test requires database and Redis infrastructure.
-// To run: docker-compose up -d
 #[tokio::test]
-#[ignore = "Requires database and Redis infrastructure"]
 async fn test_solo_game_play_again() -> Result<()> {
     timeout(Duration::from_secs(45), async {
         // Initialize tracing
