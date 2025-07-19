@@ -88,6 +88,7 @@ jobs:
       - name: Run test_simple_game
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/snaketron
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
           RUST_LOG: info
           RUST_BACKTRACE: 1
