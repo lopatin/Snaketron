@@ -6,10 +6,10 @@ export const CLUSTER_RENEWAL_INTERVAL_MS = 150;
 
 // Game speed mappings
 export const GAME_SPEED_TO_MS = {
-  slow: 500,
+  slow: 300,
   normal: DEFAULT_TICK_INTERVAL_MS,
-  fast: 200,
-  extreme: 100,
+  fast: 100,
+  extreme: 50,
 } as const;
 
 // Replay viewer constants
