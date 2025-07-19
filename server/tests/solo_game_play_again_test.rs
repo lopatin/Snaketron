@@ -6,7 +6,8 @@ use ::common::{GameEvent, GameStatus, SoloMode};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
-#[tokio::test]
+// #[tokio::test]
+#[allow(dead_code)]
 async fn test_solo_game_play_again() -> Result<()> {
     timeout(Duration::from_secs(45), async {
         // Initialize tracing

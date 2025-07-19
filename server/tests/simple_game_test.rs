@@ -127,9 +127,10 @@ async fn test_simple_game() -> Result<()> {
                     
                     // Debug: Print snake positions and directions
                     for (idx, snake) in state1.arena.snakes.iter().enumerate() {
-                        println!("Snake {} - alive: {}, direction: {:?}, position: {:?}", 
-                            idx, snake.is_alive, snake.direction, snake.body.get(0));
+                        println!("Snake {} - alive: {}, direction: {:?}, body: {:?}, length: {}", 
+                            idx, snake.is_alive, snake.direction, snake.body, snake.length());
                     }
+                    println!("Arena dimensions: {}x{}", state1.arena.width, state1.arena.height);
                     
                     // Get initial directions
                     let snake1_dir = state1.arena.snakes[snake1_id as usize].direction;
@@ -145,6 +146,7 @@ async fn test_simple_game() -> Result<()> {
     
     println!("Game started with ID: {}, Snake 1 ID: {}, Snake 2 ID: {}", 
              _game_id, snake1_id, snake2_id);
+    println!("Snake 1 initial direction: {:?}, Snake 2 initial direction: {:?}", snake1_dir, snake2_dir);
     
     // Now simulate the game:
     // We need to determine which snake each player controls and their positions
@@ -165,8 +167,11 @@ async fn test_simple_game() -> Result<()> {
     // Store which snake should win (the one that turns)
     let expected_winner = turning_snake_id;
     
-    // Wait a bit then make the LEFT-going snake turn up
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Send turn command early to ensure the snake turns before hitting the wall
+    // Both snakes start 35 cells from opposite walls, so they'd hit at tick 35
+    // But they're dying at tick 15, which suggests a different issue
+    // Let's turn very early - within first few ticks
+    tokio::time::sleep(Duration::from_millis(300)).await;
     
     turning_player_client.send_message(WSMessage::GameCommand(
         GameCommandMessage {
@@ -184,7 +189,7 @@ async fn test_simple_game() -> Result<()> {
     )).await?;
     
     // Wait then turn left to continue avoiding walls
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
      
     turning_player_client.send_message(WSMessage::GameCommand(
         GameCommandMessage {
@@ -215,10 +220,12 @@ async fn test_simple_game() -> Result<()> {
                     match &event.event {
                         GameEvent::SnakeDied { snake_id } => {
                             if *snake_id == snake1_id {
-                                println!("Snake 1 died! event= {:?}", event);
+                                println!("Snake 1 (id={}) died at tick {}! Initial direction was {:?}", 
+                                    snake1_id, event.tick, snake1_dir);
                                 snake1_died = true;
                             } else if *snake_id == snake2_id {
-                                println!("Snake 2 died! event= {:?}", event);
+                                println!("Snake 2 (id={}) died at tick {}! Initial direction was {:?}", 
+                                    snake2_id, event.tick, snake2_dir);
                                 snake2_died = true;
                             }
                         }
@@ -226,10 +233,7 @@ async fn test_simple_game() -> Result<()> {
                             println!("Client1: Game status updated to {:?}", status);
                             if let GameStatus::Complete { winning_snake_id } = status {
                                 println!("Game complete! Winner: {:?}", winning_snake_id);
-                                if *winning_snake_id == None {
-                                    println!("Game ended in a draw - both snakes died");
-                                    return Ok::<(), anyhow::Error>(());
-                                }
+                                assert_ne!(*winning_snake_id, None, "Game should not end in a draw");
                                 assert_eq!(*winning_snake_id, Some(expected_winner), "The snake that turned should win");
                                 return Ok::<(), anyhow::Error>(());
                             }
@@ -245,10 +249,12 @@ async fn test_simple_game() -> Result<()> {
                     match &event.event {
                         GameEvent::SnakeDied { snake_id } => {
                             if *snake_id == snake1_id {
-                                println!("Snake 1 died! event= {:?}", event);
+                                println!("Snake 1 (id={}) died at tick {}! Initial direction was {:?}", 
+                                    snake1_id, event.tick, snake1_dir);
                                 snake1_died = true;
                             } else if *snake_id == snake2_id {
-                                println!("Snake 2 died! event= {:?}", event);
+                                println!("Snake 2 (id={}) died at tick {}! Initial direction was {:?}", 
+                                    snake2_id, event.tick, snake2_dir);
                                 snake2_died = true;
                             }
                         }
@@ -256,10 +262,7 @@ async fn test_simple_game() -> Result<()> {
                             println!("Client2: Game status updated to {:?}", status);
                             if let GameStatus::Complete { winning_snake_id } = status {
                                 println!("Game complete! Winner: {:?}", winning_snake_id);
-                                if *winning_snake_id == None {
-                                    println!("Game ended in a draw - both snakes died");
-                                    return Ok::<(), anyhow::Error>(());
-                                }
+                                assert_ne!(*winning_snake_id, None, "Game should not end in a draw");
                                 assert_eq!(*winning_snake_id, Some(expected_winner), "The snake that turned should win");
                                 return Ok::<(), anyhow::Error>(());
                             }
@@ -309,6 +312,9 @@ async fn test_simple_game() -> Result<()> {
     // Debug final state
     println!("Final state - Snake 1 (id {}) died: {}, Snake 2 (id {}) died: {}", 
         snake1_id, snake1_died, snake2_id, snake2_died);
+    
+    // The test should not end in a draw
+    assert!(!(snake1_died && snake2_died), "Game should not end in a draw - only one snake should die");
     
     // The snake that went straight (RIGHT direction) should die hitting the wall
     // The snake that turned (originally LEFT direction) should survive
