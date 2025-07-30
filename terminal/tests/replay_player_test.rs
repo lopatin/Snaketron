@@ -39,6 +39,7 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
         event: GameEventMessage {
             game_id: 1,
             tick: 1,
+            sequence: 1,
             user_id: Some(1),
             event: GameEvent::CommandScheduled { command_message: command_msg },
         },
@@ -51,6 +52,7 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
         event: GameEventMessage {
             game_id: 1,
             tick: 3,
+            sequence: 2,
             user_id: None,
             event: GameEvent::SnakeTurned { snake_id: 0, direction: Direction::Up },
         },

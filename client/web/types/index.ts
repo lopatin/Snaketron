@@ -62,6 +62,7 @@ export interface GameState {
   final_score?: number;
   duration?: number;
   start_ms: number;
+  event_sequence: number;
 }
 
 export type GameStatus = 

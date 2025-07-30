@@ -820,7 +820,7 @@ async fn process_ws_message(
                     
                     match publish_to_stream(redis_conn, &stream_key, &event).await {
                         Ok(_) => {
-                            debug!("Successfully submitted game command to Redis stream");
+                            debug!("Successfully submitted game command to Redis stream: {:?}", event);
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
@@ -1321,6 +1321,7 @@ async fn subscribe_to_game_events_via_replication(
     let snapshot_event = GameEventMessage {
         game_id,
         tick: game_state.tick,
+        sequence: game_state.event_sequence,
         user_id: None, // System-generated snapshot
         event: GameEvent::Snapshot { game_state },
     };

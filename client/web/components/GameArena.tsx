@@ -58,7 +58,9 @@ export default function GameArena() {
     if (serverGameState && !isRunning) {
       console.log('GameArena - Starting engine with server state, status:', serverGameState.status);
       // Only start if the game is not completed
-      if (serverGameState.status !== 'Stopped' && !('Complete' in serverGameState.status)) {
+      const status = serverGameState.status;
+      const isComplete = (typeof status === 'object' && 'Complete' in status) || status === 'Stopped';
+      if (!isComplete) {
         startEngine();
       } else {
         console.log('GameArena - Game is stopped or completed, not starting engine');
@@ -152,9 +154,13 @@ export default function GameArena() {
     }
     
     // Also check if game status is Complete
-    if (gameState && ('Complete' in gameState.status || gameState.status === 'Stopped') && !gameOver) {
-      setGameOver(true);
-      // stopEngine(); // Stop the engine when game ends
+    if (gameState && !gameOver) {
+      const status = gameState.status;
+      const isComplete = (typeof status === 'object' && 'Complete' in status) || status === 'Stopped';
+      if (isComplete) {
+        setGameOver(true);
+        // stopEngine(); // Stop the engine when game ends
+      }
     }
   }, [gameState, user?.id, gameOver, stopEngine]);
 
@@ -171,7 +177,12 @@ export default function GameArena() {
         return;
       }
       
-      if (gameOver || !gameState || 'Complete' in gameState.status || gameState.status === 'Stopped') {
+      if (gameOver || !gameState) {
+        return;
+      }
+      
+      const status = gameState.status;
+      if ((typeof status === 'object' && 'Complete' in status) || status === 'Stopped') {
         return;
       }
       

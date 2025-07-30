@@ -21,6 +21,7 @@ pub enum GameCommand {
 pub struct GameEventMessage {
     pub game_id: u32,
     pub tick: u32,
+    pub sequence: u64,
     pub user_id: Option<u32>,
     pub event: GameEvent,
 }
@@ -221,6 +222,8 @@ pub struct GameState {
     pub host_user_id: Option<u32>,
     // Game start timestamp in milliseconds
     pub start_ms: i64,
+    // Event sequence number for this game
+    pub event_sequence: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -315,6 +318,7 @@ impl GameState {
             game_code: None,
             host_user_id: None,
             start_ms,
+            event_sequence: 0,
         }
     }
 
@@ -485,13 +489,14 @@ impl GameState {
     pub fn join(&mut self, _user_id: u32) {
     }
     
-    pub fn tick_forward(&mut self) -> Result<Vec<GameEvent>> {
+    pub fn tick_forward(&mut self) -> Result<Vec<(u64, GameEvent)>> {
 
-        let mut out: Vec<GameEvent> = Vec::new();
+        let mut out: Vec<(u64, GameEvent)> = Vec::new();
 
         // Emit snapshot on first tick
         if self.tick == 0 {
-            out.push(GameEvent::Snapshot { game_state: self.clone() });
+            self.event_sequence += 1;
+            out.push((self.event_sequence, GameEvent::Snapshot { game_state: self.clone() }));
         }
        
         // Exec commands in the queue until the only ones left are for after this tick
@@ -615,10 +620,10 @@ impl GameState {
         Ok(out)
     }
 
-    fn exec_command(&mut self, command: GameCommand) -> Result<Vec<GameEvent>> {
+    fn exec_command(&mut self, command: GameCommand) -> Result<Vec<(u64, GameEvent)>> {
         debug!("exec_command: Entering with command {:?}", command);
         eprintln!("COMMON DEBUG: exec_command called with {:?}", command);
-        let mut out: Vec<GameEvent> = Vec::new();
+        let mut out: Vec<(u64, GameEvent)> = Vec::new();
         match command {
             GameCommand::Turn { snake_id, direction } => {
                 debug!("exec_command: Processing Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
@@ -675,9 +680,10 @@ impl GameState {
         Ok(out)
     }
 
-    pub fn apply_event(&mut self, event: GameEvent, out: Option<&mut Vec<GameEvent>>) {
+    pub fn apply_event(&mut self, event: GameEvent, out: Option<&mut Vec<(u64, GameEvent)>>) {
         if let Some(out) = out {
-            out.push(event.clone());
+            self.event_sequence += 1;
+            out.push((self.event_sequence, event.clone()));
         }
 
         match event {

@@ -23,6 +23,33 @@ pub struct ReplicationStatus {
     pub last_processed_id: String,
 }
 
+/// A wrapper around broadcast::Receiver that filters out events before a certain sequence number
+pub struct FilteredEventReceiver {
+    inner: broadcast::Receiver<GameEventMessage>,
+    min_sequence: u64,
+    game_id: u32,
+}
+
+impl FilteredEventReceiver {
+    /// Receive the next event that passes the filter
+    pub async fn recv(&mut self) -> Result<GameEventMessage, broadcast::error::RecvError> {
+        loop {
+            let event = self.inner.recv().await?;
+            
+            // Only forward events after our snapshot sequence
+            if event.sequence > self.min_sequence {
+                debug!("Forwarding event for game {} with sequence {} (min_sequence: {})", 
+                    self.game_id, event.sequence, self.min_sequence);
+                return Ok(event);
+            } else {
+                debug!("Filtering out stale event for game {} with sequence {} (min_sequence: {})", 
+                    self.game_id, event.sequence, self.min_sequence);
+                // Continue to next event
+            }
+        }
+    }
+}
+
 /// PartitionReplica subscribes to Redis stream partitions and maintains game states
 pub struct PartitionReplica {
     partition_id: u32,
@@ -394,7 +421,7 @@ impl GameStateReader for ReplicationManager {
 impl ReplicationManager {
     /// Subscribe to game events for a specific game
     /// Returns the current game state as a snapshot and a receiver for subsequent events
-    pub async fn subscribe_to_game(&self, game_id: u32) -> Result<(GameState, broadcast::Receiver<GameEventMessage>)> {
+    pub async fn subscribe_to_game(&self, game_id: u32) -> Result<(GameState, FilteredEventReceiver)> {
         // Wait for replication to be ready first
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(30);
@@ -406,7 +433,23 @@ impl ReplicationManager {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         
-        // Get current game state with retry logic to handle race conditions
+        // Get or create broadcast channel for this game and subscribe first
+        // This prevents race conditions where events could be broadcast between
+        // getting the snapshot and subscribing
+        let receiver = {
+            let mut broadcasters = self.game_event_broadcasters.write().await;
+            let sender = broadcasters.entry(game_id)
+                .or_insert_with(|| {
+                    let (tx, _) = broadcast::channel(1028);
+                    tx
+                });
+            
+            // Subscribe while holding the lock to ensure atomicity
+            sender.subscribe()
+            // Lock is dropped here
+        };
+        
+        // Now get current game state with retry logic to handle race conditions
         // This is especially important for newly created games where the GameCreated
         // event might not have been processed by the replication manager yet
         let mut game_state = None;
@@ -429,17 +472,15 @@ impl ReplicationManager {
         let game_state = game_state.unwrap();
         info!("Successfully found game state for game {} after {:?}", game_id, state_start.elapsed());
         
-        // Get or create broadcast channel for this game
-        let mut broadcasters = self.game_event_broadcasters.write().await;
-        let sender = broadcasters.entry(game_id)
-            .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(256); // Buffer up to 256 events
-                tx
-            });
+        // Filter out any events that are already included in the snapshot
+        let snapshot_sequence = game_state.event_sequence;
+        let filtered_receiver = FilteredEventReceiver {
+            inner: receiver,
+            min_sequence: snapshot_sequence, // Only accept events with sequence > snapshot_sequence
+            game_id,
+        };
         
-        let receiver = sender.subscribe();
-        
-        Ok((game_state, receiver))
+        Ok((game_state, filtered_receiver))
     }
     
     /// Get a game state, waiting for replication to be ready first

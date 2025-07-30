@@ -128,7 +128,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         console.log('Received SoloGameCreated message:', message);
         
         // Check if current game is already ended - don't reinitialize
-        if (gameState && 'Ended' in gameState.status) {
+        if (gameState && typeof gameState.status === 'object' && 'Ended' in gameState.status) {
           console.log('Current game is ended, not reinitializing for new game');
           return;
         }

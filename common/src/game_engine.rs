@@ -209,17 +209,17 @@ impl GameEngine {
 
     /// Run the required amount of ticks so that the game is at the given timestamp.
     /// Can be called from a very fast interval loop or requestAnimationFrame.
-    pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, GameEvent)>> {
+    pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, u64, GameEvent)>> {
         let predicted_target_tick = ((ts_ms - self.start_ms) / self.tick_duration_ms as i64) as u32;
         let lag_ticks = self.committed_state_lag_ms / self.tick_duration_ms;
         let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
-        let mut out: Vec<(u32, GameEvent)> = Vec::new();
+        let mut out: Vec<(u32, u64, GameEvent)> = Vec::new();
 
         while self.committed_state.current_tick() < lagged_target_tick {
             let current_tick = self.committed_state.current_tick();
-            for event in self.committed_state.tick_forward()? {
-                eprintln!("game_engine: Emitting event at tick {}: {:?}", current_tick, event);
-                out.push((current_tick, event));
+            for (sequence, event) in self.committed_state.tick_forward()? {
+                eprintln!("game_engine: Emitting event at tick {} seq {}: {:?}", current_tick, sequence, event);
+                out.push((current_tick, sequence, event));
             }
         }
 

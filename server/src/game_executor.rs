@@ -88,9 +88,11 @@ async fn run_game(
                     Ok(scheduled_command) => {
                         // Emit CommandScheduled event
                         let event = GameEvent::CommandScheduled { command_message: scheduled_command };
+                        let current_state = engine.get_committed_state();
                         let event_msg = GameEventMessage {
                             game_id,
                             tick: engine.current_tick(),
+                            sequence: current_state.event_sequence + 1, // Use next sequence since this event hasn't been processed yet
                             user_id: None,
                             event,
                         };
@@ -112,10 +114,11 @@ async fn run_game(
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 match engine.run_until(now_ms) {
                     Ok(events) => {
-                        for (tick, event) in &events {
+                        for (tick, sequence, event) in &events {
                             let event_msg = GameEventMessage {
                                 game_id,
                                 tick: *tick,
+                                sequence: *sequence,
                                 user_id: None,
                                 event: event.clone(),
                             };

@@ -60,9 +60,10 @@ impl GameClient {
         // Convert to a format that's easier to work with in JavaScript
         let events_with_ticks: Vec<serde_json::Value> = events
             .into_iter()
-            .map(|(tick, event)| {
+            .map(|(tick, sequence, event)| {
                 serde_json::json!({
                     "tick": tick,
+                    "sequence": sequence,
                     "event": event
                 })
             })
@@ -121,6 +122,7 @@ impl GameClient {
         let event_message = GameEventMessage {
             game_id: self.engine.game_id(),
             tick: game_state.current_tick(),
+            sequence: game_state.event_sequence,
             user_id: None,
             event: GameEvent::Snapshot { game_state },
         };
