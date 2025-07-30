@@ -219,52 +219,6 @@ impl GameServer {
         //     None
         // };
 
-        // Redis cluster singleton
-        info!("Starting cluster singleton service with Redis");
-        let lock_token = cancellation_token.clone();
-        let lock_region = region.clone();
-        handles.push(tokio::spawn(async move {
-            // Example: Run a simple service that logs when it holds the lock
-            let cluster_singleton = match ClusterSingleton::new(
-                &redis_url,
-                server_id,
-                format!("snaketron:singleton:{}", lock_region),
-                Duration::from_secs(2),
-                lock_token,
-            ).await {
-                Ok(e) => e,
-                Err(e) => {
-                    error!("Failed to create cluster singleton: {}", e);
-                    return;
-                }
-            };
-            
-            // Example service that runs as a singleton across the cluster
-            let service = |token: CancellationToken| Box::pin(async move {
-                info!("This server is now running the singleton service!");
-                
-                // Example of how to use the cancellation token in your service
-                loop {
-                    tokio::select! {
-                        _ = token.cancelled() => {
-                            info!("Singleton service received cancellation signal");
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                            // Your actual service logic would go here
-                            debug!("Singleton service is running...");
-                        }
-                    }
-                }
-                
-                Ok::<(), anyhow::Error>(())
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
-            
-            if let Err(e) = cluster_singleton.run(service).await {
-                error!("Cluster singleton error: {}", e);
-            }
-        }));
-
         // Wait a moment for all services to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
