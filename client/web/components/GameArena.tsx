@@ -111,10 +111,13 @@ export default function GameArena() {
       setIsArenaVisible(true);
     }, 300); // Delay to ensure smooth transition after fade-out
 
+    console.log('GAME ARENA MOUNTED');
+
     return () => {
       clearTimeout(timer);
       // Restore background dots when leaving game view
       document.body.classList.remove('hide-background-dots');
+      console.log('GAME ARENA UNMOUNTED');
     };
   }, []);
 
