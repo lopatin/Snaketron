@@ -14,11 +14,16 @@ export default function GameArena() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
+  // Track mount state for React strict mode
+  const isMountedRef = useRef(false);
+  const hasJoinedGameRef = useRef(false);
+  
   const {
     gameState: serverGameState,
     sendCommand: sendServerCommand,
     connected, sendGameCommand,
-    lastGameEvent
+    lastGameEvent,
+    leaveGame
   } = useGameWebSocket();
 
   const { user } = useAuth();
@@ -68,12 +73,34 @@ export default function GameArena() {
     }
   }, [serverGameState, isRunning, startEngine]);
   
-  // Stop engine on unmount
+  // Track mount state and handle cleanup with React strict mode protection
   useEffect(() => {
+    // Mark as mounted
+    isMountedRef.current = true;
+    
+    // Track that we've joined this game
+    if (gameId) {
+      hasJoinedGameRef.current = true;
+      console.log('GameArena mounted for game:', gameId);
+    }
+    
     return () => {
+      // Check if this is a real unmount or just strict mode re-render
+      isMountedRef.current = false;
+      
+      // Use a timeout to check if we're really unmounting
+      setTimeout(() => {
+        if (!isMountedRef.current && hasJoinedGameRef.current) {
+          console.log('GameArena unmounting - sending LeaveGame');
+          leaveGame();
+          hasJoinedGameRef.current = false;
+        }
+      }, 0);
+      
+      // Always stop the engine on unmount
       stopEngine();
     };
-  }, [stopEngine]);
+  }, [gameId, leaveGame, stopEngine]);
 
   // Trigger fade-in animation when component mounts and hide background dots
   useEffect(() => {

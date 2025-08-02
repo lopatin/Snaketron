@@ -26,6 +26,7 @@ use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
 pub enum WSMessage {
     Token(String),
     JoinGame(u32),
+    LeaveGame,
     GameCommand(GameCommandMessage),
     GameEvent(GameEventMessage),
     Chat(String),
@@ -843,6 +844,11 @@ async fn process_ws_message(
                     let json_msg = serde_json::to_string(&response)?;
                     ws_stream.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::InGame { metadata, game_id })
+                }
+                WSMessage::LeaveGame => {
+                    info!("User {} ({}) leaving game {}", metadata.username, metadata.user_id, game_id);
+                    // Transition back to authenticated state
+                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::StartCustomGame => {
                     info!("User {} ({}) starting custom game {}", metadata.username, metadata.user_id, game_id);

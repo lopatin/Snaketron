@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, GameType, GameCommand, Command, CustomGameSettings } from '../types';
@@ -15,6 +15,7 @@ interface UseGameWebSocketReturn {
   createGame: (gameType: string) => void;
   createSoloGame: (mode: 'Classic' | 'Tactical') => void;
   joinCustomGame: (gameCode: string) => void;
+  leaveGame: () => void;
   updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
   startCustomGame: () => void;
   spectateGame: (gameId: string, gameCode?: string | null) => void;
@@ -127,12 +128,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('SoloGameCreated', (message: any) => {
         console.log('Received SoloGameCreated message:', message);
         
-        // Check if current game is already ended - don't reinitialize
-        if (gameState && typeof gameState.status === 'object' && 'Ended' in gameState.status) {
-          console.log('Current game is ended, not reinitializing for new game');
-          return;
-        }
-        
         const gameId = message.data.game_id;
         setCurrentGameId(gameId);
         
@@ -159,45 +154,45 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     return () => {
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [onMessage, navigate, gameState]);
+  }, [onMessage, navigate]);
 
   // Game actions
-  const createCustomGame = (settings: Partial<CustomGameSettings>) => {
+  const createCustomGame = useCallback((settings: Partial<CustomGameSettings>) => {
     sendMessage({
       CreateCustomGame: { settings }
     });
-  };
+  }, [sendMessage]);
 
-  const joinCustomGame = (gameCode: string) => {
+  const joinCustomGame = useCallback((gameCode: string) => {
     sendMessage({
       JoinCustomGame: { game_code: gameCode }
     });
-  };
+  }, [sendMessage]);
 
-  const updateCustomGameSettings = (settings: Partial<CustomGameSettings>) => {
+  const updateCustomGameSettings = useCallback((settings: Partial<CustomGameSettings>) => {
     sendMessage({
       UpdateCustomGameSettings: { settings }
     });
-  };
+  }, [sendMessage]);
 
-  const startCustomGame = () => {
+  const startCustomGame = useCallback(() => {
     sendMessage('StartCustomGame');
-  };
+  }, [sendMessage]);
 
-  const spectateGame = (gameId: string, gameCode?: string | null) => {
+  const spectateGame = useCallback((gameId: string, gameCode?: string | null) => {
     sendMessage({
       SpectateGame: { game_id: gameId, game_code: gameCode || null }
     });
-  };
+  }, [sendMessage]);
 
-  const sendGameCommand = (command: GameCommand) => {
+  const sendGameCommand = useCallback((command: GameCommand) => {
     console.log('Sending game command (sendGameCommand):', command);
     sendMessage({
       GameCommand: command
     });
-  };
+  }, [sendMessage]);
   
-  const sendCommand = (command: Command) => {
+  const sendCommand = useCallback((command: Command) => {
     console.log('Sending game command (sendCommand):', command);
     console.log('Current game ID:', currentGameId);
     console.log('Connected:', isConnected);
@@ -214,17 +209,27 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         command
       }
     });
-  };
+  }, [sendMessage, currentGameId, isConnected]);
 
-  const createSoloGame = (mode: 'Classic' | 'Tactical') => {
+  const createSoloGame = useCallback((mode: 'Classic' | 'Tactical') => {
     console.log('Sending CreateSoloGame message with mode:', mode);
     sendMessage({
       CreateSoloGame: { mode }
     });
-  };
+  }, [sendMessage]);
+
+  const leaveGame = useCallback(() => {
+    console.log('Sending LeaveGame message');
+    sendMessage('LeaveGame');
+    // Clear current game state
+    setCurrentGameId(null);
+    setGameState(null);
+    setIsHost(false);
+    setCustomGameCode(null);
+  }, [sendMessage]);
 
   // Create a quick match or competitive game
-  const createGame = (gameType: string) => {
+  const createGame = useCallback((gameType: string) => {
     console.log('Creating game:', gameType);
     
     // Handle solo games separately
@@ -242,7 +247,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       arena_width: 40,      // Medium map size
       arena_height: 40
     });
-  };
+  }, [createSoloGame, createCustomGame]);
 
   return {
     isConnected,
@@ -255,6 +260,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     createGame,
     createSoloGame,
     joinCustomGame,
+    leaveGame,
     updateCustomGameSettings,
     startCustomGame,
     spectateGame,
