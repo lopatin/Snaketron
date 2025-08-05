@@ -638,30 +638,13 @@ async fn process_ws_message(
                 WSMessage::JoinGame(game_id) => {
                     info!("User {} ({}) joining game {}", metadata.username, metadata.user_id, game_id);
                     
-                    // Verify the user is actually part of this game
-                    let is_player: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS(
-                            SELECT 1 FROM game_requests 
-                            WHERE user_id = $1 AND game_id = $2
-                        )
-                        "#
-                    )
-                    .bind(metadata.user_id)
-                    .bind(game_id as i32)
-                    .fetch_one(db_pool)
-                    .await?;
-                    
-                    if is_player {
-                        // Transition to InGame state
-                        Ok(ConnectionState::InGame { 
-                            metadata,
-                            game_id,
-                        })
-                    } else {
-                        error!("User {} tried to join game {} but is not a player", metadata.user_id, game_id);
-                        Ok(ConnectionState::Authenticated { metadata })
-                    }
+                    // Transition to InGame state
+                    // TODO: Validate that the user can join.
+                    //  Most games will be joinable except for private custom games.
+                    Ok(ConnectionState::InGame {
+                        metadata,
+                        game_id,
+                    })
                 }
                 WSMessage::LeaveQueue => {
                     info!("User {} ({}) leaving matchmaking queue", metadata.username, metadata.user_id);
@@ -783,11 +766,7 @@ async fn process_ws_message(
                             let json_msg = serde_json::to_string(&response)?;
                             ws_stream.send(Message::Text(json_msg.into())).await?;
                             
-                            // Transition to in-game state
-                            Ok(ConnectionState::InGame { 
-                                metadata,
-                                game_id,
-                            })
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                         Err(e) => {
                             error!("Failed to create solo game: {}", e);

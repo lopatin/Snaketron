@@ -10,6 +10,10 @@ import Scoreboard from './Scoreboard';
 
 export default function GameArena() {
   const { gameId } = useParams();
+  if (!gameId) {
+    throw new Error('GameArena must be used with a gameId parameter');
+  }
+
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -21,10 +25,14 @@ export default function GameArena() {
   const {
     gameState: serverGameState,
     sendCommand: sendServerCommand,
-    connected, sendGameCommand,
+    connected,
+    sendGameCommand,
+    joinGame,
     lastGameEvent,
     leaveGame
   } = useGameWebSocket();
+
+  console.log('GameArena - serverGameState (initial state):', serverGameState);
 
   const { user } = useAuth();
   const { latencyMs } = useWebSocket();
@@ -72,35 +80,6 @@ export default function GameArena() {
       }
     }
   }, [serverGameState, isRunning, startEngine]);
-  
-  // Track mount state and handle cleanup with React strict mode protection
-  useEffect(() => {
-    // Mark as mounted
-    isMountedRef.current = true;
-    
-    // Track that we've joined this game
-    if (gameId) {
-      hasJoinedGameRef.current = true;
-      console.log('GameArena mounted for game:', gameId);
-    }
-    
-    return () => {
-      // Check if this is a real unmount or just strict mode re-render
-      isMountedRef.current = false;
-      
-      // Use a timeout to check if we're really unmounting
-      setTimeout(() => {
-        if (!isMountedRef.current && hasJoinedGameRef.current) {
-          console.log('GameArena unmounting - sending LeaveGame');
-          leaveGame();
-          hasJoinedGameRef.current = false;
-        }
-      }, 0);
-      
-      // Always stop the engine on unmount
-      stopEngine();
-    };
-  }, [gameId, leaveGame, stopEngine]);
 
   // Trigger fade-in animation when component mounts and hide background dots
   useEffect(() => {
@@ -111,13 +90,19 @@ export default function GameArena() {
       setIsArenaVisible(true);
     }, 300); // Delay to ensure smooth transition after fade-out
 
-    console.log('GAME ARENA MOUNTED');
+    console.log('GAME ARENA MOUNTED, initial state:', { gameState, isRunning, serverGameState });
+
+    // debugger;
+    joinGame(gameId);
 
     return () => {
       clearTimeout(timer);
       // Restore background dots when leaving game view
       document.body.classList.remove('hide-background-dots');
-      console.log('GAME ARENA UNMOUNTED');
+      console.log('GAME ARENA UNMOUNTED, initial state issue');
+
+      leaveGame();
+      stopEngine();
     };
   }, []);
 
@@ -186,10 +171,10 @@ export default function GameArena() {
     // Also check if game status is Complete
     if (gameState && !gameOver) {
       const status = gameState.status;
-      const isComplete = (typeof status === 'object' && 'Complete' in status) || status === 'Stopped';
+      const isComplete = (typeof status === 'object' && 'Complete' in status);
       if (isComplete) {
         setGameOver(true);
-        // stopEngine(); // Stop the engine when game ends
+        stopEngine(); // Stop the engine when game ends
       }
     }
   }, [gameState, user?.id, gameOver, stopEngine]);
@@ -257,7 +242,7 @@ export default function GameArena() {
     let animationId: number;
     const render = () => {
       try {
-        console.log('rendering game state:', JSON.stringify(gameState.arena.snakes[0].body));
+        // console.log('rendering game state:', JSON.stringify(gameState.arena.snakes[0].body));
         
         // Check head position for non-adjacent movement
         if (gameState.arena.snakes.length > 0 && gameState.arena.snakes[0].body.length > 0) {
@@ -275,7 +260,7 @@ export default function GameArena() {
                 dx,
                 dy
               });
-              debugger; // Enter debugger when non-adjacent movement is detected
+              // debugger; // Enter debugger when non-adjacent movement is detected
             }
           }
           

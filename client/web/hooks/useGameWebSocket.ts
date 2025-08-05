@@ -15,6 +15,7 @@ interface UseGameWebSocketReturn {
   createGame: (gameType: string) => void;
   createSoloGame: (mode: 'Classic' | 'Tactical') => void;
   joinCustomGame: (gameCode: string) => void;
+  joinGame: (gameId: string, gameCode?: string | null) => void;
   leaveGame: () => void;
   updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
   startCustomGame: () => void;
@@ -36,6 +37,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   // Handle game-specific messages
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
+
+    console.log('Creating game WebSocket listeners (initial state issue)');
 
     // Game events (including game state updates)
     unsubscribers.push(
@@ -59,11 +62,11 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         // Handle different event types
         if (event.Snapshot) {
           // Full game state snapshot
-          console.log('Received Snapshot:', event.Snapshot);
+          console.log('Received Snapshot (initial state):', event.Snapshot);
           setGameState(event.Snapshot.game_state);
         } else if (event.StatusUpdated) {
           // Update game status
-          console.log('StatusUpdated event:', event.StatusUpdated);
+          console.log('StatusUpdated event (initial state):', event.StatusUpdated);
           setGameState(prev => prev ? { ...prev, status: event.StatusUpdated.status } : prev);
         } else if (event.FoodSpawned) {
           // Add food to arena
@@ -131,12 +134,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         const gameId = message.data.game_id;
         setCurrentGameId(gameId);
         
-        // Send JoinGame message to actually join the game and receive initial snapshot
-        console.log('Sending JoinGame message for solo game:', gameId);
-        sendMessage({
-          JoinGame: gameId
-        });
-        
         // Navigate to the game arena
         navigate(`/play/${gameId}`);
       })
@@ -152,9 +149,10 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
 
     // Cleanup
     return () => {
+      console.log('Cleaning up game WebSocket listeners (initial state issue)');
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [onMessage, navigate]);
+  }, [onMessage, navigate, setGameState]);
 
   // Game actions
   const createCustomGame = useCallback((settings: Partial<CustomGameSettings>) => {
@@ -166,6 +164,13 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const joinCustomGame = useCallback((gameCode: string) => {
     sendMessage({
       JoinCustomGame: { game_code: gameCode }
+    });
+  }, [sendMessage]);
+
+  const joinGame = useCallback((gameId: string, gameCode?: string | null) => {
+    // debugger;
+    sendMessage({
+      JoinGame: parseInt(gameId)
     });
   }, [sendMessage]);
 
@@ -219,7 +224,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   }, [sendMessage]);
 
   const leaveGame = useCallback(() => {
-    console.log('Sending LeaveGame message');
+    console.log('Sending LeaveGame message (initial state issue):');
     sendMessage('LeaveGame');
     // Clear current game state
     setCurrentGameId(null);
@@ -260,6 +265,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     createGame,
     createSoloGame,
     joinCustomGame,
+    joinGame,
     leaveGame,
     updateCustomGameSettings,
     startCustomGame,

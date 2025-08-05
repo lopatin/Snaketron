@@ -181,8 +181,7 @@ impl GameEngine {
         let predicted_target_tick = ((current_ts - self.start_ms) / self.tick_duration_ms as i64) as u32;
         
         // Check if we need to rebuild by comparing with existing predicted state
-        let needs_rebuild = self.predicted_state
-            .as_ref()
+        let needs_rebuild = self.predicted_state.as_ref()
             .map_or(false, |state| predicted_target_tick > state.current_tick());
         
         if needs_rebuild {

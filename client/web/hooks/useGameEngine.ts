@@ -55,12 +55,13 @@ export const useGameEngine = ({
   const engineGameIdRef = useRef<string | null>(null);
   const latencyMsRef = useRef(latencyMs);
 
+  // console.log('useGameEngine called (initial state:', !!initialState);
+
   // Update latency ref when it changes
   useEffect(() => {
     latencyMsRef.current = latencyMs;
   }, [latencyMs]);
 
-  // Game loop - no dependencies to avoid recreation
   const runGameLoop = useCallback(() => {
     // Check if we should continue running
     if (!engineRef.current || !isRunningRef.current) {
@@ -153,17 +154,14 @@ export const useGameEngine = ({
         setIsRunning(false);
         return;
       }
-      
-      // Continue loop if still running
-      if (isRunningRef.current) {
-        animationFrameRef.current = requestAnimationFrame(runGameLoop);
-      }
+
+      animationFrameRef.current = requestAnimationFrame(runGameLoop);
     } catch (error) {
       console.error('Game loop error:', error);
       isRunningRef.current = false;
       setIsRunning(false);
     }
-  }, []); // No dependencies - uses refs instead
+  }, []);
 
   // Update initial state ref when it changes
   useEffect(() => {
@@ -175,14 +173,14 @@ export const useGameEngine = ({
 
   // Initialize game engine
   useEffect(() => {
-    console.log('useGameEngine effect running - gameId:', gameId, 'playerId:', playerId);
+    console.log('useGameEngine effect running - gameId:', gameId, 'playerId:', playerId, 'hasInitialState:', !!initialStateRef.current);
     
     const initEngine = async () => {
       try {
         // Check if engine already exists for this game
         if (engineRef.current && engineGameIdRef.current === gameId) {
           console.log('Engine already initialized for game:', gameId);
-          return;
+          // return;
         }
 
         // Wait for WASM to be initialized
@@ -227,6 +225,8 @@ export const useGameEngine = ({
         if (isRunningRef.current) {
           console.log('Engine initialized while running - starting game loop');
           runGameLoop();
+        } else {
+          console.warn('Engine initialized but not running');
         }
       } catch (error) {
         console.error('Failed to initialize game engine:', error);
@@ -241,9 +241,8 @@ export const useGameEngine = ({
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
-      // Don't clear the engine here - let the next effect run decide if it needs to reinitialize
     };
-  }, [gameId, playerId, runGameLoop]);
+  }, [gameId, playerId, runGameLoop, initialState]);
 
   // Start/stop engine
   const startEngine = useCallback(() => {
