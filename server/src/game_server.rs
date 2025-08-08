@@ -109,7 +109,7 @@ impl GameServer {
 
         // Start replication manager for all partitions BEFORE game executors
         info!("Starting replication manager for game state replication");
-        let replication_partitions: Vec<u32> = (1..=10).collect();
+        let replication_partitions: Vec<u32> = (0..PARTITION_COUNT).collect();
         let replication_manager = Arc::new(
             ReplicationManager::new(
                 replication_partitions,
