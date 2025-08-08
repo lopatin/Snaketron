@@ -63,7 +63,7 @@ async fn run_game(
         }
     }
     
-    let mut engine = GameEngine::new_from_state(game_id, start_ms, initial_state);
+    let mut engine = GameEngine::new_from_state(game_id, initial_state);
     info!("Created game engine for game {} with status: {:?}", game_id, engine.get_committed_state().status);
 
     let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));

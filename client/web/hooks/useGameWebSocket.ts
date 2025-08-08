@@ -6,7 +6,6 @@ import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 
 interface UseGameWebSocketReturn {
   isConnected: boolean;
-  gameState: GameState | null;
   currentGameId: string | null;
   customGameCode: string | null;
   isHost: boolean;
@@ -21,14 +20,12 @@ interface UseGameWebSocketReturn {
   startCustomGame: () => void;
   spectateGame: (gameId: string, gameCode?: string | null) => void;
   sendGameCommand: (command: GameCommand) => void;
-  sendCommand: (command: Command) => void;
   connected: boolean;
 }
 
 export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const { isConnected, sendMessage, onMessage } = useWebSocket();
   const navigate = useNavigate();
-  const [gameState, setGameState] = useState<GameState | null>(null);
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [customGameCode, setCustomGameCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
@@ -60,53 +57,53 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         const event = eventMessage.event || eventMessage;
         
         // Handle different event types
-        if (event.Snapshot) {
-          // Full game state snapshot
-          console.log('Received Snapshot (initial state):', event.Snapshot);
-          setGameState(event.Snapshot.game_state);
-        } else if (event.StatusUpdated) {
-          // Update game status
-          console.log('StatusUpdated event (initial state):', event.StatusUpdated);
-          setGameState(prev => prev ? { ...prev, status: event.StatusUpdated.status } : prev);
-        } else if (event.FoodSpawned) {
-          // Add food to arena
-          console.log('FoodSpawned event:', event.FoodSpawned);
-          setGameState(prev => {
-            if (!prev || !prev.arena) return prev;
-            return {
-              ...prev,
-              arena: {
-                ...prev.arena,
-                food: [...(prev.arena.food || []), event.FoodSpawned.position]
-              }
-            };
-          });
-        } else if (event.FoodEaten) {
-          // Remove food and grow snake
-          console.log('FoodEaten event:', event.FoodEaten);
-          setGameState(prev => {
-            if (!prev || !prev.arena) return prev;
-            return {
-              ...prev,
-              arena: {
-                ...prev.arena,
-                food: prev.arena.food.filter(f => 
-                  f.x !== event.FoodEaten.position.x || 
-                  f.y !== event.FoodEaten.position.y
-                )
-              }
-            };
-          });
-        } else if (event.SnakeTurned || event.SnakeDied) {
-          // These need full state updates from server
-          console.log('Snake event (need full state):', event);
-        } else if (event.CommandScheduled) {
-          // CommandScheduled events need to be passed to the game engine
-          console.log('CommandScheduled event:', event.CommandScheduled);
-        } else {
-          // Other events
-          console.log('Unhandled game event:', event);
-        }
+        // if (event.Snapshot) {
+        //   // Full game state snapshot
+        //   console.log('Received Snapshot (initial state):', event.Snapshot);
+        //   setGameState(event.Snapshot.game_state);
+        // } else if (event.StatusUpdated) {
+        //   // Update game status
+        //   console.log('StatusUpdated event (initial state):', event.StatusUpdated);
+        //   setGameState(prev => prev ? { ...prev, status: event.StatusUpdated.status } : prev);
+        // } else if (event.FoodSpawned) {
+        //   // Add food to arena
+        //   console.log('FoodSpawned event:', event.FoodSpawned);
+        //   setGameState(prev => {
+        //     if (!prev || !prev.arena) return prev;
+        //     return {
+        //       ...prev,
+        //       arena: {
+        //         ...prev.arena,
+        //         food: [...(prev.arena.food || []), event.FoodSpawned.position]
+        //       }
+        //     };
+        //   });
+        // } else if (event.FoodEaten) {
+        //   // Remove food and grow snake
+        //   console.log('FoodEaten event:', event.FoodEaten);
+        //   setGameState(prev => {
+        //     if (!prev || !prev.arena) return prev;
+        //     return {
+        //       ...prev,
+        //       arena: {
+        //         ...prev.arena,
+        //         food: prev.arena.food.filter(f =>
+        //           f.x !== event.FoodEaten.position.x ||
+        //           f.y !== event.FoodEaten.position.y
+        //         )
+        //       }
+        //     };
+        //   });
+        // } else if (event.SnakeTurned || event.SnakeDied) {
+        //   // These need full state updates from server
+        //   console.log('Snake event (need full state):', event);
+        // } else if (event.CommandScheduled) {
+        //   // CommandScheduled events need to be passed to the game engine
+        //   console.log('CommandScheduled event:', event.CommandScheduled);
+        // } else {
+        //   // Other events
+        //   console.log('Unhandled game event:', event);
+        // }
       })
     );
 
@@ -152,7 +149,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       console.log('Cleaning up game WebSocket listeners (initial state issue)');
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [onMessage, navigate, setGameState]);
+  }, [onMessage, navigate]);
 
   // Game actions
   const createCustomGame = useCallback((settings: Partial<CustomGameSettings>) => {
@@ -196,25 +193,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       GameCommand: command
     });
   }, [sendMessage]);
-  
-  const sendCommand = useCallback((command: Command) => {
-    console.log('Sending game command (sendCommand):', command);
-    console.log('Current game ID:', currentGameId);
-    console.log('Connected:', isConnected);
-    
-    // For solo games, we need to wrap the command in the proper format
-    sendMessage({
-      GameCommand: {
-        command_id_client: {
-          tick: 0, // Will be set by server
-          user_id: 0, // Will be set by server
-          sequence_number: 0
-        },
-        command_id_server: null,
-        command
-      }
-    });
-  }, [sendMessage, currentGameId, isConnected]);
 
   const createSoloGame = useCallback((mode: 'Classic' | 'Tactical') => {
     console.log('Sending CreateSoloGame message with mode:', mode);
@@ -228,7 +206,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     sendMessage('LeaveGame');
     // Clear current game state
     setCurrentGameId(null);
-    setGameState(null);
     setIsHost(false);
     setCustomGameCode(null);
   }, [sendMessage]);
@@ -256,7 +233,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
 
   return {
     isConnected,
-    gameState,
     currentGameId,
     customGameCode,
     isHost,
@@ -271,7 +247,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     startCustomGame,
     spectateGame,
     sendGameCommand,
-    sendCommand,
     connected: isConnected,
   };
 };

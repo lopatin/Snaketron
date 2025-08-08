@@ -29,7 +29,7 @@ impl GameClient {
     
     /// Creates a new game client instance from an existing game state
     #[wasm_bindgen(js_name = newFromState)]
-    pub fn new_from_state(game_id: u32, start_ms: i64, state_json: &str) -> Result<GameClient, JsValue> {
+    pub fn new_from_state(game_id: u32, state_json: &str) -> Result<GameClient, JsValue> {
         // Set panic hook for better error messages in browser console
         console_error_panic_hook::set_once();
         
@@ -40,7 +40,7 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
         Ok(GameClient {
-            engine: GameEngine::new_from_state(game_id, start_ms, game_state),
+            engine: GameEngine::new_from_state(game_id, game_state),
         })
     }
 
@@ -104,11 +104,11 @@ impl GameClient {
     
     /// Process a server event for reconciliation
     #[wasm_bindgen(js_name = processServerEvent)]
-    pub fn process_server_event(&mut self, event_message_json: &str, current_ts: i64) -> Result<(), JsValue> {
+    pub fn process_server_event(&mut self, event_message_json: &str) -> Result<(), JsValue> {
         let event_message: GameEventMessage = serde_json::from_str(event_message_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        self.engine.process_server_event(&event_message, current_ts)
+        self.engine.process_server_event(&event_message)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
     
@@ -127,7 +127,7 @@ impl GameClient {
             event: GameEvent::Snapshot { game_state },
         };
         
-        self.engine.process_server_event(&event_message, current_ts)
+        self.engine.process_server_event(&event_message)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

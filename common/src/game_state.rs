@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
-use crate::{Direction, Player, Position, Snake, DEFAULT_CUSTOM_GAME_TICK_MS};
+use crate::{Direction, Player, Position, Snake, DEFAULT_CUSTOM_GAME_TICK_MS, DEFAULT_FOOD_TARGET, DEFAULT_TICK_INTERVAL_MS};
 use crate::util::PseudoRandom;
 use log::debug;
 
@@ -60,13 +60,14 @@ impl Arena {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct GameProperties {
     pub available_food_target: usize,
+    pub tick_duration_ms: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct CustomGameSettings {
     pub arena_width: u16,
     pub arena_height: u16,
-    pub tick_duration_ms: u16,
+    pub tick_duration_ms: u32,
     pub food_spawn_rate: f32,  // food per minute
     pub max_players: u8,
     pub game_mode: GameMode,
@@ -108,6 +109,7 @@ pub enum SoloMode {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum GameType {
+    Solo,
     TeamMatch { per_team: u8 },
     FreeForAll { max_players: u8 },
     Custom { settings: CustomGameSettings },
@@ -286,17 +288,15 @@ impl GameState {
         rng_seed: Option<u64>,
         start_ms: i64
     ) -> Self {
-        // Calculate food target based on custom settings or defaults
-        let available_food_target = match &game_type {
-            GameType::Custom { settings } => {
-                // Convert food per minute to approximate target count
-                // Assuming 300ms ticks (3.33 ticks/sec), we get ~200 ticks/min
-                // So food_target = food_spawn_rate * arena_size / 200
-                let arena_size = (settings.arena_width * settings.arena_height) as f32;
-                let base_target = (settings.food_spawn_rate * arena_size / 1600.0).max(1.0);
-                base_target.round() as usize
+        let properties = match &game_type { 
+            GameType::Custom { settings } => GameProperties {
+                available_food_target: DEFAULT_FOOD_TARGET,
+                tick_duration_ms: settings.tick_duration_ms,
             },
-            _ => 5, // Default for non-custom games
+            _ => GameProperties {
+                available_food_target: DEFAULT_FOOD_TARGET,
+                tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
+            },
         };
         
         GameState {
@@ -309,9 +309,7 @@ impl GameState {
                 food: Vec::new(),
             },
             game_type,
-            properties: GameProperties {
-                available_food_target,
-            },
+            properties,
             command_queue: CommandQueue::new(),
             players: HashMap::new(),
             rng: rng_seed.map(PseudoRandom::new),

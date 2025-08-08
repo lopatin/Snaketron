@@ -8,6 +8,17 @@ import { GameState, CanvasRef } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 
+// Helper function for loading screen markup
+const LoadingScreen = ({ message }: { message: string }) => (
+  <div className="fixed inset-0 flex items-center justify-center bg-white">
+    <div className="text-center">
+      <h2 className="text-2xl font-black italic uppercase tracking-1 mb-4 text-black-70">
+        {message}
+      </h2>
+    </div>
+  </div>
+);
+
 export default function GameArena() {
   const { gameId } = useParams();
   if (!gameId) {
@@ -23,8 +34,6 @@ export default function GameArena() {
   const hasJoinedGameRef = useRef(false);
   
   const {
-    gameState: serverGameState,
-    sendCommand: sendServerCommand,
     connected,
     sendGameCommand,
     joinGame,
@@ -32,28 +41,27 @@ export default function GameArena() {
     leaveGame
   } = useGameWebSocket();
 
-  console.log('GameArena - serverGameState (initial state):', serverGameState);
-
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const { latencyMs } = useWebSocket();
   
+  // Early return if auth is not ready - before useGameEngine
+  if (authLoading || !user) {
+    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
+  }
+  
   // Use game engine for client-side prediction
+  // Now user.id is guaranteed to exist
   const {
     gameEngine,
     gameState,
-    isRunning,
+    // isRunning,
     sendCommand,
     processServerEvent,
-    startEngine,
     stopEngine
   } = useGameEngine({
-    gameId: gameId || '0',
-    playerId: user?.id,
-    initialState: serverGameState || undefined,
-    onCommandReady: (commandMessage) => {
-      // Send command to server
-      sendGameCommand(commandMessage);
-    },
+    gameId,
+    playerId: user.id,
+    onCommandReady: sendGameCommand,
     latencyMs
   });
   
@@ -64,36 +72,26 @@ export default function GameArena() {
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
-  
-  // Start game engine when server state is available and game is not ended
-  useEffect(() => {
-    console.log('GameArena - serverGameState:', !!serverGameState, 'isRunning:', isRunning);
-    if (serverGameState && !isRunning) {
-      console.log('GameArena - Starting engine with server state, status:', serverGameState.status);
-      // Only start if the game is not completed
-      const status = serverGameState.status;
-      const isComplete = (typeof status === 'object' && 'Complete' in status) || status === 'Stopped';
-      if (!isComplete) {
-        startEngine();
-      } else {
-        console.log('GameArena - Game is stopped or completed, not starting engine');
-      }
-    }
-  }, [serverGameState, isRunning, startEngine]);
 
-  // Trigger fade-in animation when component mounts and hide background dots
+  // Join game when user becomes available
+  useEffect(() => {
+    if (user && gameId) {
+      console.log('User authenticated, joining game:', gameId);
+      joinGame(gameId);
+    }
+  }, [user, gameId, joinGame]);
+
+
   useEffect(() => {
     // Hide background dots
     document.body.classList.add('hide-background-dots');
-    
+
+    // Trigger fade-in animation when component mounts and hide background dots
     const timer = setTimeout(() => {
       setIsArenaVisible(true);
     }, 300); // Delay to ensure smooth transition after fade-out
 
-    console.log('GAME ARENA MOUNTED, initial state:', { gameState, isRunning, serverGameState });
-
-    // debugger;
-    joinGame(gameId);
+    console.log('GAME ARENA MOUNTED, initial state:', gameState);
 
     return () => {
       clearTimeout(timer);
@@ -105,6 +103,7 @@ export default function GameArena() {
       stopEngine();
     };
   }, []);
+
 
   // Calculate optimal cell size and canvas dimensions
   useEffect(() => {
@@ -292,57 +291,60 @@ export default function GameArena() {
     }
   }, [lastGameEvent, processServerEvent]);
   
-  // Don't show any loading message - just render empty until game state is ready
+  // Show loading screen while waiting for game state
   if (!gameState) {
-    return null;
+    return <LoadingScreen message="Joining Game..." />;
   }
   
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
-      {/* Scoreboard */}
-      <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} />
-      
-      {/* Game Arena */}
-      <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '140px', paddingBottom: '40px' }}>
-        <div 
-          className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
-            isArenaVisible ? 'opacity-100' : 'opacity-0'
-          }`}
-          ref={containerRef}
-          style={{
-            width: `${panelSize.width}px`,
-            height: `${panelSize.height}px`,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center'
-          }}
-        >
-          <canvas 
-            ref={canvasRef}
-            width={canvasSize.width}
-            height={canvasSize.height}
-            className="bg-white block"
-            style={{ 
-              border: 'none'
+
+      <>
+        {/* Scoreboard */}
+        <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} />
+
+        {/* Game Arena */}
+        <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '140px', paddingBottom: '40px' }}>
+          <div
+            className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
+              isArenaVisible ? 'opacity-100' : 'opacity-0'
+            }`}
+            ref={containerRef}
+            style={{
+              width: `${panelSize.width}px`,
+              height: `${panelSize.height}px`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
             }}
-          />
-        </div>
-      </div>
-      
-      {gameOver && (
-        <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="panel bg-white p-8 text-center">
-            <h2 className="text-3xl font-black italic uppercase tracking-1 mb-4 text-black-70">Game Over!</h2>
-            <p className="text-xl mb-6 text-black-70 font-bold">Final Score: {score}</p>
-            <button
-              onClick={() => navigate('/')}
-              className="btn-primary"
-            >
-              Play Again
-            </button>
+          >
+            <canvas
+              ref={canvasRef}
+              width={canvasSize.width}
+              height={canvasSize.height}
+              className="bg-white block"
+              style={{
+                border: 'none'
+              }}
+            />
           </div>
         </div>
-      )}
+
+        {gameOver && (
+          <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="panel bg-white p-8 text-center">
+              <h2 className="text-3xl font-black italic uppercase tracking-1 mb-4 text-black-70">Game Over!</h2>
+              <p className="text-xl mb-6 text-black-70 font-bold">Final Score: {score}</p>
+              <button
+                onClick={() => navigate('/')}
+                className="btn-primary"
+              >
+                Play Again
+              </button>
+            </div>
+          </div>
+        )}
+      </>
     </div>
   );
 }

@@ -5,17 +5,10 @@ pub struct GameEngine {
     game_id: u32,
     committed_state: GameState,
     predicted_state: Option<GameState>,
-
     event_log: Vec<GameEventMessage>,
-
-    tick_duration_ms: u32,
     committed_state_lag_ms: u32,
-
     local_player_id: Option<u32>,
-
-    start_ms: i64,
     command_counter: u32,
-    /// Track the last command tick sent
     last_command_tick: Option<u32>,
 }
 
@@ -27,10 +20,8 @@ impl GameEngine {
             committed_state: GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms),
             predicted_state: Some(GameState::new(10, 10, GameType::TeamMatch { per_team: 1 }, None, start_ms)),
             event_log: Vec::new(),
-            tick_duration_ms: DEFAULT_TICK_INTERVAL_MS as u32,
             committed_state_lag_ms: 500,
             local_player_id: None,
-            start_ms,
             command_counter: 0,
             last_command_tick: None,
         }
@@ -56,38 +47,21 @@ impl GameEngine {
             committed_state: GameState::new(width, height, game_type.clone(), Some(rng_seed), start_ms),
             predicted_state: Some(GameState::new(width, height, game_type, None, start_ms)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
-            tick_duration_ms,
             committed_state_lag_ms: 500,
             local_player_id: None,
-            start_ms,
             command_counter: 0,
             last_command_tick: None,
         }
     }
 
-    pub fn new_from_state(game_id: u32, start_ms: i64, game_state: GameState) -> Self {
-        // Extract tick duration from custom settings if available
-        let tick_duration_ms = match &game_state.game_type {
-            GameType::Custom { settings } => settings.tick_duration_ms as u32,
-            _ => DEFAULT_TICK_INTERVAL_MS as u32, // Default for non-custom games
-        };
-        
-        // Use start_ms from game_state if available, otherwise use the provided start_ms
-        let actual_start_ms = if game_state.start_ms != 0 {
-            game_state.start_ms
-        } else {
-            start_ms
-        };
-        
+    pub fn new_from_state(game_id: u32, game_state: GameState) -> Self {
         GameEngine {
             game_id,
             committed_state: game_state.clone(),
             predicted_state: Some(game_state),
             event_log: Vec::new(),
-            tick_duration_ms,
             committed_state_lag_ms: 500,
             local_player_id: None,
-            start_ms: actual_start_ms,
             command_counter: 0,
             last_command_tick: None,
         }
@@ -131,44 +105,23 @@ impl GameEngine {
         // Add to committed state command queue
         self.committed_state.schedule_command(&command_message);
         
-        // Add to predicted state command queue
-        // if let Some(predicted_state) = &mut self.predicted_state {
-        //     predicted_state.schedule_command(&command_message);
-        // }
-        
         Ok(command_message)
     }
 
-
     /// Process a server event and reconcile with local predictions
-    pub fn process_server_event(&mut self, event_message: &GameEventMessage, _current_ts: i64) -> Result<()> {
-        // For CommandScheduled events, we can skip them as they're already handled locally
-        // if matches!(event_message.event, GameEvent::CommandScheduled { .. }) {
-        //     return Ok(());
-        // }
-        
+    pub fn process_server_event(&mut self, event_message: &GameEventMessage) -> Result<()> {
         // Step the committed state forward to the event tick before applying the event
         // This ensures events are applied at the correct tick (similar to ReplayViewer)
         while self.committed_state.current_tick() < event_message.tick {
             self.committed_state.tick_forward()?;
         }
-        
-        match &event_message.event {
-            GameEvent::Snapshot { game_state } => {
-                self.committed_state = game_state.clone();
-            }
-            GameEvent::CommandScheduled { .. } => {
-                // Apply event to committed state
-                self.committed_state.apply_event(event_message.event.clone(), None);
-                
-                // Also schedule in predicted state if it exists
-                if let Some(predicted_state) = &mut self.predicted_state {
-                    predicted_state.apply_event(event_message.event.clone(), None);
-                }
-            }
-            _ => {
-                // Otherwise apply event just to the committed state
-                self.committed_state.apply_event(event_message.event.clone(), None);
+
+        self.committed_state.apply_event(event_message.event.clone(), None);
+
+        // Also schedule in predicted state if it exists
+        if let GameEvent::CommandScheduled { command_message } = &event_message.event {
+            if let Some(predicted_state) = &mut self.predicted_state {
+                predicted_state.apply_event(event_message.event.clone(), None);
             }
         }
         
@@ -178,23 +131,17 @@ impl GameEngine {
     /// Rebuild predicted state from committed state and advance to current time
     pub fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
         // Calculate target tick
-        let predicted_target_tick = ((current_ts - self.start_ms) / self.tick_duration_ms as i64) as u32;
+        let tick_duration_ms = self.committed_state.properties.tick_duration_ms as i64;
+        let predicted_target_tick = ((current_ts - self.committed_state.start_ms) / tick_duration_ms) as u32;
         
         // Check if we need to rebuild by comparing with existing predicted state
         let needs_rebuild = self.predicted_state.as_ref()
             .map_or(false, |state| predicted_target_tick > state.current_tick());
         
         if needs_rebuild {
-            // Preserve the command queue from the old predicted state
-            // let command_queue = self.predicted_state
-            //     .as_ref()
-            //     .map(|state| state.command_queue.clone())
-            //     .unwrap_or_else(|| CommandQueue::new());
-            
-            // Clone committed state and restore command queue
+            // Clone committed state
             let mut new_predicted_state = self.committed_state.clone();
-            // new_predicted_state.command_queue = command_queue;
-            
+
             // Advance to target tick
             while new_predicted_state.current_tick() < predicted_target_tick {
                 new_predicted_state.tick_forward()?;
@@ -209,15 +156,16 @@ impl GameEngine {
     /// Run the required amount of ticks so that the game is at the given timestamp.
     /// Can be called from a very fast interval loop or requestAnimationFrame.
     pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, u64, GameEvent)>> {
-        let predicted_target_tick = ((ts_ms - self.start_ms) / self.tick_duration_ms as i64) as u32;
-        let lag_ticks = self.committed_state_lag_ms / self.tick_duration_ms;
+        let tick_duration_ms = self.committed_state.properties.tick_duration_ms;
+        let predicted_target_tick = ((ts_ms - self.committed_state.start_ms) / tick_duration_ms as i64) as u32;
+        let lag_ticks = self.committed_state_lag_ms / tick_duration_ms;
         let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
         let mut out: Vec<(u32, u64, GameEvent)> = Vec::new();
 
         while self.committed_state.current_tick() < lagged_target_tick {
             let current_tick = self.committed_state.current_tick();
             for (sequence, event) in self.committed_state.tick_forward()? {
-                eprintln!("game_engine: Emitting event at tick {} seq {}: {:?}", current_tick, sequence, event);
+                // eprintln!("game_engine: Emitting event at tick {} seq {}: {:?}", current_tick, sequence, event);
                 out.push((current_tick, sequence, event));
             }
         }
@@ -295,22 +243,3 @@ impl GameEngine {
     }
 
 }
-
-// Standalone function for server-side command processing
-// pub fn server_process_incoming_command(
-//     engine: &mut GameEngine,
-//     command_msg: GameCommandMessage,
-// ) -> Vec<GameEventMessage> {
-//     // Add the command to the engine's pending commands
-//     engine.pending_commands.push(command_msg.clone());
-//     
-//     // Return event indicating command is pending on server
-//     vec![GameEventMessage {
-//         game_id: engine.game_id,
-//         tick: engine.committed_state.current_tick(),
-//         user_id: None,
-//         event: GameEvent::CommandPendingOnServer { 
-//             command_message: command_msg 
-//         },
-//     }]
-// }

@@ -1076,7 +1076,7 @@ async fn create_solo_game(
     let settings = common::CustomGameSettings {
         arena_width: 40,
         arena_height: 40,
-        tick_duration_ms: DEFAULT_TICK_INTERVAL_MS as u16,
+        tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
         food_spawn_rate: 3.0,
         max_players: 1,  // Solo game
         game_mode: common::GameMode::Solo,
