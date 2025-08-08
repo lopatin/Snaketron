@@ -85,7 +85,6 @@ export interface CustomGameSettings {
   is_private: boolean;
   allow_spectators: boolean;
   snake_start_length: number;
-  tactical_mode: boolean;
 }
 
 export type GameMode = 
@@ -130,11 +129,7 @@ export interface JoinCustomGameMessage {
   };
 }
 
-export interface CreateSoloGameMessage {
-  CreateSoloGame: {
-    mode: 'Classic' | 'Tactical';
-  };
-}
+export type CreateSoloGameMessage = 'CreateSoloGame';
 
 export interface GameCommandMessage {
   GameCommand: GameCommand;
@@ -204,7 +199,7 @@ export type CanvasRef = React.RefObject<HTMLCanvasElement>;
 
 // State Types
 export type UsernameStatus = 'authenticated' | 'available' | 'exists' | null;
-export type GameModeId = 'quick' | 'competitive' | 'solo-classic' | 'solo-tactical' | 'custom' | 'duel' | 'freeforall';
+export type GameModeId = 'quick' | 'competitive' | 'solo' | 'custom' | 'duel' | 'freeforall';
 
 // Index Signature Types
 export interface SpeedMap {
@@ -245,7 +240,6 @@ export interface UIGameSettings {
   maxPlayers: number;
   foodSpawnRate: 'low' | 'medium' | 'high' | 'extreme';
   gameSpeed: 'slow' | 'normal' | 'fast' | 'extreme';
-  tacticalMode: boolean;
   allowJoin: boolean;
   allowSpectators: boolean;
   snakeStartLength: number;

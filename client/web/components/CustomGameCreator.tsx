@@ -29,7 +29,6 @@ function CustomGameCreator() {
     maxPlayers: 4,
     foodSpawnRate: 'medium',
     gameSpeed: 'normal',
-    tacticalMode: false,
     allowJoin: true,
     allowSpectators: true,
     snakeStartLength: 3,
@@ -96,7 +95,6 @@ function CustomGameCreator() {
         is_private: !settings.allowJoin,
         allow_spectators: settings.allowSpectators,
         snake_start_length: settings.snakeStartLength,
-        tactical_mode: settings.tacticalMode,
       };
 
       createCustomGame(serverSettings);
@@ -251,25 +249,6 @@ function CustomGameCreator() {
                 className={`btn-toggle ${settings.foodSpawnRate === 'extreme' ? 'active' : ''}`}
               >
                 Extreme
-              </button>
-            </div>
-          </div>
-
-          {/* Game Style */}
-          <div>
-            <label className="block text-sm font-bold uppercase tracking-1 mb-2">Game Style</label>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => handleSettingChange('tacticalMode', false)}
-                className={`btn-toggle ${!settings.tacticalMode ? 'active' : ''}`}
-              >
-                Classic
-              </button>
-              <button
-                onClick={() => handleSettingChange('tacticalMode', true)}
-                className={`btn-toggle ${settings.tacticalMode ? 'active' : ''}`}
-              >
-                Tactical
               </button>
             </div>
           </div>

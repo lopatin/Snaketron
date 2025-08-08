@@ -72,7 +72,7 @@ fn test_1x1_rendering() {
         food: vec![Position { x: 3, y: 3 }],
     };
 
-    // Create renderer with 1x1 configuration (classic mode)
+    // Create renderer with 1x1 configuration
     let char_dims = CharDimensions::new(1, 1);
     let renderer = StandardRenderer::new(char_dims);
     let arena_renderer = ArenaRenderer::new(renderer);

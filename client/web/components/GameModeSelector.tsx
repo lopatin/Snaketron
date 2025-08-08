@@ -24,8 +24,7 @@ const GAME_MODES = {
   'solo': {
     title: 'SOLO',
     modes: [
-      { id: 'solo-classic', name: 'CLASSIC', description: 'Classic single-player Snake' },
-      { id: 'solo-tactical', name: 'TACTICAL', description: 'Enhanced movement' }
+      { id: 'solo', name: 'SINGLE PLAYER', description: 'Practice your skills' }
     ]
   }
 };

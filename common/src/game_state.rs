@@ -74,7 +74,6 @@ pub struct CustomGameSettings {
     pub is_private: bool,
     pub allow_spectators: bool,
     pub snake_start_length: u8,
-    pub tactical_mode: bool,  // vs classic mode
 }
 
 impl Default for CustomGameSettings {
@@ -89,7 +88,6 @@ impl Default for CustomGameSettings {
             is_private: true,
             allow_spectators: true,
             snake_start_length: 4,
-            tactical_mode: false,
         }
     }
 }
@@ -101,11 +99,6 @@ pub enum GameMode {
     FreeForAll { max_players: u8 },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum SoloMode {
-    Classic,   // Classic snake movement
-    Tactical,  // Enhanced movement (no 180-degree turns)
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum GameType {
@@ -627,13 +620,6 @@ impl GameState {
                 debug!("exec_command: Processing Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
                 eprintln!("COMMON DEBUG: Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
                 
-                // Check if tactical mode is enabled before borrowing snake mutably
-                let is_tactical = match &self.game_type {
-                    GameType::Custom { settings } => settings.tactical_mode,
-                    _ => false,
-                };
-                debug!("exec_command: Tactical mode: {}", is_tactical);
-                
                 // Get current snake state
                 let snake = self.arena.snakes.get(snake_id as usize)
                     .context("Snake not found")?;
@@ -646,11 +632,11 @@ impl GameState {
                 if snake.is_alive && snake.direction != direction {
                     debug!("exec_command: Snake is alive and direction is different");
                     
-                    // In tactical mode, prevent 180-degree turns
-                    if is_tactical && snake.direction.is_opposite(&direction) {
-                        debug!("exec_command: Ignoring command - 180-degree turn attempted in tactical mode");
-                        eprintln!("COMMON DEBUG: Ignoring 180-degree turn in tactical mode");
-                        // Ignore the command - cannot turn 180 degrees in tactical mode
+                    // Always prevent 180-degree turns
+                    if snake.direction.is_opposite(&direction) {
+                        debug!("exec_command: Ignoring command - 180-degree turn attempted");
+                        eprintln!("COMMON DEBUG: Ignoring 180-degree turn");
+                        // Ignore the command - cannot turn 180 degrees
                         return Ok(out);
                     }
                     

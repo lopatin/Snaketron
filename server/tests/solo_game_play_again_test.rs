@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::Result;
 use server::ws_server::WSMessage;
-use ::common::{GameEvent, GameStatus, SoloMode};
+use ::common::{GameEvent, GameStatus};
 use tokio::time::{timeout, Duration};
 use crate::common::{TestEnvironment, TestClient};
 
@@ -77,9 +77,7 @@ struct GameCompletionResult {
 
 async fn play_single_solo_game(client: &mut TestClient, user_id: i32) -> Result<GameCompletionResult> {
     // Create solo game
-    client.send_message(WSMessage::CreateSoloGame { 
-        mode: SoloMode::Classic 
-    }).await?;
+    client.send_message(WSMessage::CreateSoloGame).await?;
     
     println!("Solo game creation message sent");
     

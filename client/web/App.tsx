@@ -13,6 +13,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider, useUI } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { LatencySettings } from './components/LatencySettings';
+import { useGameWebSocket } from './hooks/useGameWebSocket';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -149,6 +150,29 @@ function GameCanvas() {
 
 function Home() {
   const navigate = useNavigate();
+  const { createSoloGame, currentGameId } = useGameWebSocket();
+  const { user, register } = useAuth();
+  const [isCreatingSolo, setIsCreatingSolo] = useState(false);
+  
+  // Navigate to game when solo game is created
+  useEffect(() => {
+    if (currentGameId && isCreatingSolo) {
+      navigate(`/play/${currentGameId}`);
+      setIsCreatingSolo(false);
+    }
+  }, [currentGameId, isCreatingSolo, navigate]);
+  
+  const handleSoloClick = async () => {
+    // If not logged in, create a guest user
+    if (!user) {
+      const guestUsername = `Guest${Math.floor(Math.random() * 10000)}`;
+      await register(guestUsername, null);
+    }
+    
+    // Create solo game
+    setIsCreatingSolo(true);
+    createSoloGame();
+  };
   
   return (
     <>
@@ -176,7 +200,7 @@ function Home() {
           {/* Column 3: Solo & Custom Game */}
           <div className="-skew-x-[10deg] flex flex-col gap-[18px]">
             <button 
-              onClick={() => navigate('/game-modes/solo')}
+              onClick={handleSoloClick}
               className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center rounded-lg flex items-center justify-center main-menu-button">
               <span className="skew-x-[10deg]">SOLO</span>
             </button>

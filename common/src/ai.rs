@@ -22,12 +22,7 @@ pub fn calculate_ai_move(
     let arena_width = game_state.arena.width as i16;
     let arena_height = game_state.arena.height as i16;
     
-    // Get all possible directions (excluding opposite of current direction in tactical mode)
-    let is_tactical = match &game_state.game_type {
-        crate::GameType::Custom { settings } => settings.tactical_mode,
-        _ => false,
-    };
-    
+    // Get all possible directions (always excluding opposite of current direction)
     let mut possible_directions = vec![
         Direction::Up,
         Direction::Down,
@@ -35,10 +30,8 @@ pub fn calculate_ai_move(
         Direction::Right,
     ];
     
-    if is_tactical {
-        // Remove opposite direction in tactical mode
-        possible_directions.retain(|&d| !current_direction.is_opposite(&d));
-    }
+    // Always remove opposite direction to prevent 180-degree turns
+    possible_directions.retain(|&d| !current_direction.is_opposite(&d));
     
     // Find the nearest food using BFS
     let nearest_food = find_nearest_food(game_state, head, arena_width, arena_height)?;

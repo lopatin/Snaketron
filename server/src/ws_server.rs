@@ -46,7 +46,7 @@ pub enum WSMessage {
     StartCustomGame,
     SpectateGame { game_id: u32, game_code: Option<String> },
     // Solo game messages
-    CreateSoloGame { mode: common::SoloMode },
+    CreateSoloGame,
     // Custom game responses
     CustomGameCreated { game_id: u32, game_code: String },
     CustomGameJoined { game_id: u32 },
@@ -756,10 +756,10 @@ async fn process_ws_message(
                         }
                     }
                 }
-                WSMessage::CreateSoloGame { mode } => {
-                    info!("User {} ({}) creating solo game with mode: {:?}", metadata.username, metadata.user_id, mode);
+                WSMessage::CreateSoloGame => {
+                    info!("User {} ({}) creating solo game", metadata.username, metadata.user_id);
                     
-                    match create_solo_game(db_pool, redis_conn, metadata.user_id, mode).await {
+                    match create_solo_game(db_pool, redis_conn, metadata.user_id).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -1063,7 +1063,6 @@ async fn create_solo_game(
     pool: &PgPool,
     redis_conn: &mut ConnectionManager,
     user_id: i32,
-    mode: common::SoloMode,
 ) -> Result<u32> {
     // Get current server ID from database
     let server_id: i32 = sqlx::query_scalar(
@@ -1072,7 +1071,7 @@ async fn create_solo_game(
     .fetch_one(pool)
     .await?;
     
-    // Create game settings based on solo mode
+    // Create game settings for solo game
     let settings = common::CustomGameSettings {
         arena_width: 40,
         arena_height: 40,
@@ -1083,7 +1082,6 @@ async fn create_solo_game(
         is_private: true,
         allow_spectators: false,
         snake_start_length: 4,
-        tactical_mode: mode == common::SoloMode::Tactical,
     };
     
     // Create game entry

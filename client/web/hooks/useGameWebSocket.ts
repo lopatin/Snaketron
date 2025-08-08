@@ -12,7 +12,7 @@ interface UseGameWebSocketReturn {
   lastGameEvent: any | null;
   createCustomGame: (settings: Partial<CustomGameSettings>) => void;
   createGame: (gameType: string) => void;
-  createSoloGame: (mode: 'Classic' | 'Tactical') => void;
+  createSoloGame: () => void;
   joinCustomGame: (gameCode: string) => void;
   joinGame: (gameId: string, gameCode?: string | null) => void;
   leaveGame: () => void;
@@ -194,11 +194,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     });
   }, [sendMessage]);
 
-  const createSoloGame = useCallback((mode: 'Classic' | 'Tactical') => {
-    console.log('Sending CreateSoloGame message with mode:', mode);
-    sendMessage({
-      CreateSoloGame: { mode }
-    });
+  const createSoloGame = useCallback(() => {
+    console.log('Sending CreateSoloGame message');
+    sendMessage('CreateSoloGame');
   }, [sendMessage]);
 
   const leaveGame = useCallback(() => {
@@ -215,10 +213,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     console.log('Creating game:', gameType);
     
     // Handle solo games separately
-    if (gameType.startsWith('solo-')) {
-      const mode = gameType === 'solo-tactical' ? 'Tactical' : 'Classic';
-      console.log('Detected solo game type:', gameType, 'mode:', mode);
-      createSoloGame(mode);
+    if (gameType === 'solo') {
+      console.log('Detected solo game type:', gameType);
+      createSoloGame();
       return;
     }
     
