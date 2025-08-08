@@ -19,23 +19,6 @@ interface UseGameEngineReturn {
   stopEngine: () => void;
 }
 
-// Convert TypeScript GameStatus to Rust GameStatus format
-const convertGameStatus = (status: any): any => {
-  if (status.Ended) {
-    return { Complete: { winning_snake_id: null } };
-  } else if (status.Waiting) {
-    return 'Stopped';
-  }
-  return status;
-};
-
-// Convert game state from TypeScript format to Rust format
-const convertGameState = (state: GameState): any => {
-  return {
-    ...state,
-    status: convertGameStatus(state.status)
-  };
-};
 
 export const useGameEngine = ({
   gameId,
@@ -140,7 +123,7 @@ export const useGameEngine = ({
       setGameState(newState);
 
       // Stop the loop if game is complete
-      if ('Complete' in newState.status) {
+      if (typeof newState.status === 'object' && newState.status !== null && 'Complete' in newState.status) {
         console.log('Game completed, stopping game loop');
         return;
       }
@@ -233,24 +216,14 @@ export const useGameEngine = ({
         };
       }
       
-      // Convert the event if it contains a Snapshot with game state
+      // No conversion needed - TypeScript types match Rust serialization
       const event = fullEventMessage.event || fullEventMessage;
       if (event.Snapshot && event.Snapshot.game_state) {
-        fullEventMessage = {
-          ...fullEventMessage,
-          event: {
-            ...event,
-            Snapshot: {
-              game_state: convertGameState(event.Snapshot.game_state)
-            }
-          }
-        };
-
         // Initialize the game engine
         if (!engineRef.current) {
           engineRef.current = window.wasm.GameClient.newFromState(
               parseInt(gameId),
-              JSON.stringify(fullEventMessage.event.Snapshot.game_state)
+              JSON.stringify(event.Snapshot.game_state)
           );
           engineRef.current.setLocalPlayerId(playerId);
           runGameLoop();

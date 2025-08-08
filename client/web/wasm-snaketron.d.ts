@@ -4,18 +4,30 @@ declare module 'wasm-snaketron' {
     y: number;
   }
 
+  export type GameStatus = 
+    | 'Stopped'
+    | { Started: { server_id: number } }
+    | { Complete: { winning_snake_id: number | null } };
+
+  export type GameType = 
+    | { Custom: { settings: any } }
+    | 'QuickPlay'
+    | 'Competitive'
+    | { TeamMatch: { per_team: number } }
+    | 'Solo';
+
   export interface GameState {
     tick: number;
-    status: any;
+    status: GameStatus;
     arena: {
       width: number;
       height: number;
       snakes: Snake[];
       food: Position[];
     };
-    game_type: any;
+    game_type: GameType;
     properties: any;
-    players: any;
+    players: Record<number, { snake_id: number }>;
     game_id: string;
   }
 

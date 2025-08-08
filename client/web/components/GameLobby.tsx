@@ -8,7 +8,6 @@ function GameLobby() {
   const navigate = useNavigate();
   const { 
     isConnected, 
-    gameState, 
     currentGameId, 
     startCustomGame,
     isHost 
