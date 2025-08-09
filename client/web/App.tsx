@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { BrowserRouter, Route, useNavigate, Link } from 'react-router-dom';
 import './index.css';
+import Auth from './components/Auth';
 import CustomGameCreator from './components/CustomGameCreator';
 import GameLobby from './components/GameLobby';
 import GameArena from './components/GameArena';
@@ -151,7 +152,7 @@ function GameCanvas() {
 function Home() {
   const navigate = useNavigate();
   const { createSoloGame, currentGameId } = useGameWebSocket();
-  const { user, register } = useAuth();
+  const { user } = useAuth();
   const [isCreatingSolo, setIsCreatingSolo] = useState(false);
   
   // Navigate to game when solo game is created
@@ -162,16 +163,15 @@ function Home() {
     }
   }, [currentGameId, isCreatingSolo, navigate]);
   
-  const handleSoloClick = async () => {
-    // If not logged in, create a guest user
+  const handleSoloClick = () => {
     if (!user) {
-      const guestUsername = `Guest${Math.floor(Math.random() * 10000)}`;
-      await register(guestUsername, null);
+      // Not logged in - redirect to auth page
+      navigate('/auth?action=solo');
+    } else {
+      // Already logged in - create solo game immediately
+      setIsCreatingSolo(true);
+      createSoloGame();
     }
-    
-    // Create solo game
-    setIsCreatingSolo(true);
-    createSoloGame();
   };
   
   return (
@@ -273,6 +273,7 @@ function AppContent() {
       <Header />
       <AnimatedRoutes>
         <Route path="/" element={<Home />} />
+        <Route path="/auth" element={<Auth />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
         <Route path="/custom" element={<CustomGameCreator />} />
         <Route path="/game/:gameCode" element={
