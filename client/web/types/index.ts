@@ -73,7 +73,9 @@ export type GameStatus =
 export type GameType = 
   | { Custom: { settings: CustomGameSettings } }
   | 'QuickPlay'
-  | 'Competitive';
+  | 'Competitive'
+  | { TeamMatch: { per_team: number } }
+  | 'Solo';
 
 export interface CustomGameSettings {
   arena_width: number;

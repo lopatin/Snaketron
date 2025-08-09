@@ -116,9 +116,9 @@ export default function GameArena() {
       const vh = window.innerHeight;
       const vw = window.innerWidth;
       
-      // Account for scoreboard (~140px), bottom padding (40px), 
+      // Account for scoreboard (~80px), bottom padding (40px), 
       // container padding (2*16px), and panel border+shadow (~10px)
-      const availableHeight = vh - 220 - 32 - 10;
+      const availableHeight = vh - 160 - 32 - 10;
       const availableWidth = vw - 100 - 32 - 10;
       
       // Start with max cell size and reduce until it fits
@@ -301,10 +301,10 @@ export default function GameArena() {
 
       <>
         {/* Scoreboard */}
-        <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} />
+        <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} currentUserId={user?.id} />
 
         {/* Game Arena */}
-        <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '140px', paddingBottom: '40px' }}>
+        <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '80px', paddingBottom: '40px' }}>
           <div
             className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
               isArenaVisible ? 'opacity-100' : 'opacity-0'
