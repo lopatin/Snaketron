@@ -165,14 +165,13 @@ export class GameClient {
     /**
      * Creates a new game client instance from an existing game state
      * @param {number} game_id
-     * @param {bigint} start_ms
      * @param {string} state_json
      * @returns {GameClient}
      */
-    static newFromState(game_id, start_ms, state_json) {
+    static newFromState(game_id, state_json) {
         const ptr0 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.gameclient_newFromState(game_id, start_ms, ptr0, len0);
+        const ret = wasm.gameclient_newFromState(game_id, ptr0, len0);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -187,7 +186,7 @@ export class GameClient {
     }
     /**
      * Run the game engine until the specified timestamp
-     * Returns a JSON array of game events that occurred
+     * Returns a JSON array of game events that occurred with their tick numbers
      * @param {bigint} ts_ms
      * @returns {string}
      */
@@ -207,6 +206,15 @@ export class GameClient {
             return getStringFromWasm0(ptr1, len1);
         } finally {
             wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @param {bigint} ts_ms
+     */
+    rebuildPredictedState(ts_ms) {
+        const ret = wasm.gameclient_rebuildPredictedState(this.__wbg_ptr, ts_ms);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
         }
     }
     /**
@@ -239,12 +247,11 @@ export class GameClient {
     /**
      * Process a server event for reconciliation
      * @param {string} event_message_json
-     * @param {bigint} current_ts
      */
-    processServerEvent(event_message_json, current_ts) {
+    processServerEvent(event_message_json) {
         const ptr0 = passStringToWasm0(event_message_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.gameclient_processServerEvent(this.__wbg_ptr, ptr0, len0, current_ts);
+        const ret = wasm.gameclient_processServerEvent(this.__wbg_ptr, ptr0, len0);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -329,11 +336,27 @@ export class GameClient {
         }
     }
     /**
-     * Get the current tick number
+     * Get the current tick number (alias for getCommittedTick)
      * @returns {number}
      */
     getCurrentTick() {
-        const ret = wasm.gameclient_getCurrentTick(this.__wbg_ptr);
+        const ret = wasm.gameclient_getCommittedTick(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Get the committed tick number (server-authoritative state tick)
+     * @returns {number}
+     */
+    getCommittedTick() {
+        const ret = wasm.gameclient_getCommittedTick(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Get the predicted tick number (client-side predicted state tick)
+     * @returns {number}
+     */
+    getPredictedTick() {
+        const ret = wasm.gameclient_getPredictedTick(this.__wbg_ptr);
         return ret >>> 0;
     }
     /**
@@ -386,6 +409,12 @@ function __wbg_get_imports() {
     imports.wbg.__wbg_beginPath_0198cb08b8521814 = function(arg0) {
         arg0.beginPath();
     };
+    imports.wbg.__wbg_debug_e17b51583ca6a632 = function(arg0, arg1, arg2, arg3) {
+        console.debug(arg0, arg1, arg2, arg3);
+    };
+    imports.wbg.__wbg_error_524f506f44df1645 = function(arg0) {
+        console.error(arg0);
+    };
     imports.wbg.__wbg_error_7534b8e9a36f1ab4 = function(arg0, arg1) {
         let deferred0_0;
         let deferred0_1;
@@ -396,6 +425,9 @@ function __wbg_get_imports() {
         } finally {
             wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
         }
+    };
+    imports.wbg.__wbg_error_80de38b3f7cc3c3c = function(arg0, arg1, arg2, arg3) {
+        console.error(arg0, arg1, arg2, arg3);
     };
     imports.wbg.__wbg_fillRect_c38d5d56492a2368 = function(arg0, arg1, arg2, arg3, arg4) {
         arg0.fillRect(arg1, arg2, arg3, arg4);
@@ -414,6 +446,9 @@ function __wbg_get_imports() {
         const ret = arg0.height;
         return ret;
     };
+    imports.wbg.__wbg_info_033d8b8a0838f1d3 = function(arg0, arg1, arg2, arg3) {
+        console.info(arg0, arg1, arg2, arg3);
+    };
     imports.wbg.__wbg_instanceof_CanvasRenderingContext2d_df82a4d3437bf1cc = function(arg0) {
         let result;
         try {
@@ -427,12 +462,18 @@ function __wbg_get_imports() {
     imports.wbg.__wbg_lineTo_2fc468a0e2210784 = function(arg0, arg1, arg2) {
         arg0.lineTo(arg1, arg2);
     };
+    imports.wbg.__wbg_log_cad59bb680daec67 = function(arg0, arg1, arg2, arg3) {
+        console.log(arg0, arg1, arg2, arg3);
+    };
     imports.wbg.__wbg_moveTo_123c5e7629da2e1e = function(arg0, arg1, arg2) {
         arg0.moveTo(arg1, arg2);
     };
     imports.wbg.__wbg_new_8a6f238a6ece86ea = function() {
         const ret = new Error();
         return ret;
+    };
+    imports.wbg.__wbg_quadraticCurveTo_b041a65b53047af3 = function(arg0, arg1, arg2, arg3, arg4) {
+        arg0.quadraticCurveTo(arg1, arg2, arg3, arg4);
     };
     imports.wbg.__wbg_restore_cc5ae2746f7b5043 = function(arg0) {
         arg0.restore();
@@ -455,6 +496,12 @@ function __wbg_get_imports() {
     imports.wbg.__wbg_setstrokeStyle_88eaacb0e9a0c645 = function(arg0, arg1) {
         arg0.strokeStyle = arg1;
     };
+    imports.wbg.__wbg_settextAlign_e516a64e49622a08 = function(arg0, arg1, arg2) {
+        arg0.textAlign = getStringFromWasm0(arg1, arg2);
+    };
+    imports.wbg.__wbg_settextBaseline_c28d2a6aa4ff9d9d = function(arg0, arg1, arg2) {
+        arg0.textBaseline = getStringFromWasm0(arg1, arg2);
+    };
     imports.wbg.__wbg_stack_0ed75d68575b0f3c = function(arg0, arg1) {
         const ret = arg1.stack;
         const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -468,6 +515,9 @@ function __wbg_get_imports() {
     imports.wbg.__wbg_translate_ecc049c3f0beab4c = function() { return handleError(function (arg0, arg1, arg2) {
         arg0.translate(arg1, arg2);
     }, arguments) };
+    imports.wbg.__wbg_warn_aaf1f4664a035bd6 = function(arg0, arg1, arg2, arg3) {
+        console.warn(arg0, arg1, arg2, arg3);
+    };
     imports.wbg.__wbg_width_5dde457d606ba683 = function(arg0) {
         const ret = arg0.width;
         return ret;

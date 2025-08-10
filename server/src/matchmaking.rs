@@ -28,9 +28,9 @@ const WAIT_THRESHOLDS: [i64; 4] = [5, 10, 20, 30];
 
 // Minimum players based on wait time
 const MIN_PLAYERS_BY_WAIT: [usize; 4] = [
-    10,  // 0-5s: Try for full matches
-    6,   // 5-10s: Accept partial matches
-    4,   // 10-20s: Accept smaller matches
+    2,   // 0-5s: Accept matches quickly
+    2,   // 5-10s: Still accept quick matches
+    2,   // 10-20s: Accept any match
     2,   // 20s+: Accept any match
 ];
 

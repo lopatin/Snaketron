@@ -1,5 +1,6 @@
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
+use crate::TeamId;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
 pub enum Direction {
@@ -49,6 +50,7 @@ pub struct Snake {
     pub direction: Direction,
     pub is_alive: bool,
     pub food: u32,
+    pub team_id: Option<TeamId>, // New field for team assignment
 }
 
 impl Snake {

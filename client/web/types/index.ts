@@ -71,11 +71,10 @@ export type GameStatus =
   | { Complete: { winning_snake_id: number | null } };
 
 export type GameType = 
-  | { Custom: { settings: CustomGameSettings } }
-  | 'QuickPlay'
-  | 'Competitive'
+  | 'Solo'
   | { TeamMatch: { per_team: number } }
-  | 'Solo';
+  | { FreeForAll: { max_players: number } }
+  | { Custom: { settings: CustomGameSettings } };
 
 export interface CustomGameSettings {
   arena_width: number;
@@ -131,6 +130,16 @@ export interface JoinCustomGameMessage {
   };
 }
 
+export interface JoinGameMessage {
+  JoinGame: number;
+}
+
+export interface QueueForMatchMessage {
+  QueueForMatch: {
+    game_type: GameType;
+  };
+}
+
 export type CreateSoloGameMessage = 'CreateSoloGame';
 
 export interface GameCommandMessage {
@@ -144,6 +153,8 @@ export interface TokenMessage {
 export type WebSocketMessage = 
   | CreateCustomGameMessage
   | JoinCustomGameMessage
+  | JoinGameMessage
+  | QueueForMatchMessage
   | CreateSoloGameMessage
   | GameCommandMessage
   | TokenMessage

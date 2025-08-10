@@ -55,8 +55,8 @@ services:
       RUST_LOG: info,server=debug
       # Replay directory (using volume)
       SNAKETRON_REPLAY_DIR: /var/lib/snaketron/replays
-      # Test mode - accept any token
-      SNAKETRON_TEST_MODE: "true"
+      # Test mode - accept any token (set to "true" for testing without auth)
+      # SNAKETRON_TEST_MODE: "true"
       # JWT secret (use a secure secret in production)
       SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
       # Redis configuration for cluster singleton coordination
