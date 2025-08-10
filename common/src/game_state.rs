@@ -39,11 +39,24 @@ pub enum GameEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TeamZoneConfig {
+    pub end_zone_depth: u16,  // Depth of each end zone (10 cells)
+    pub goal_width: u16,       // Width of goal opening in cells
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
+pub enum TeamId {
+    TeamA,
+    TeamB,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Arena {
     pub width: u16,
     pub height: u16,
     pub snakes: Vec<Snake>,
     pub food: Vec<Position>,
+    pub team_zone_config: Option<TeamZoneConfig>, // New field - minimal state
 }
 
 impl Arena {
@@ -54,6 +67,85 @@ impl Arena {
         let id = self.snakes.len() as u32;
         self.snakes.push(snake);
         Ok(id)
+    }
+
+    /// Calculate Team A end zone bounds (left side)
+    pub fn team_a_zone_bounds(&self) -> Option<(i16, i16, i16, i16)> {
+        self.team_zone_config.as_ref().map(|config| {
+            (0, config.end_zone_depth as i16 - 1, 0, self.height as i16 - 1)
+        })
+    }
+    
+    /// Calculate Team B end zone bounds (right side)
+    pub fn team_b_zone_bounds(&self) -> Option<(i16, i16, i16, i16)> {
+        self.team_zone_config.as_ref().map(|config| {
+            let x_start = self.width as i16 - config.end_zone_depth as i16;
+            (x_start, self.width as i16 - 1, 0, self.height as i16 - 1)
+        })
+    }
+    
+    /// Calculate main field bounds
+    pub fn main_field_bounds(&self) -> Option<(i16, i16)> {
+        self.team_zone_config.as_ref().map(|config| {
+            (config.end_zone_depth as i16, 
+             self.width as i16 - config.end_zone_depth as i16 - 1)
+        })
+    }
+    
+    /// Calculate goal position for a given team
+    pub fn goal_bounds(&self, team: TeamId) -> Option<(i16, i16, i16)> {
+        self.team_zone_config.as_ref().map(|config| {
+            let goal_center = self.height as i16 / 2;
+            let half_width = config.goal_width as i16 / 2;
+            let y_start = goal_center - half_width;
+            let y_end = goal_center + half_width;
+            
+            let x_pos = match team {
+                TeamId::TeamA => config.end_zone_depth as i16 - 1,  // Right edge of Team A zone
+                TeamId::TeamB => self.width as i16 - config.end_zone_depth as i16,  // Left edge of Team B zone
+            };
+            
+            (x_pos, y_start, y_end)
+        })
+    }
+    
+    /// Check if a position is within a wall (not in goal opening)
+    pub fn is_wall_position(&self, pos: &Position) -> bool {
+        if let Some(config) = &self.team_zone_config {
+            // Check if at zone boundary
+            let at_team_a_boundary = pos.x == config.end_zone_depth as i16 - 1;
+            let at_team_b_boundary = pos.x == self.width as i16 - config.end_zone_depth as i16;
+            
+            if at_team_a_boundary || at_team_b_boundary {
+                // Check if within goal opening
+                if let Some((_x, y_start, y_end)) = self.goal_bounds(
+                    if at_team_a_boundary { TeamId::TeamA } else { TeamId::TeamB }
+                ) {
+                    return pos.y < y_start || pos.y > y_end;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a snake has reached the enemy goal
+    pub fn has_reached_goal(&self, snake: &Snake, team_id: TeamId) -> bool {
+        if let (Some(head), Some(config)) = (snake.head().ok(), &self.team_zone_config) {
+            // Team A's goal is to reach Team B's end zone (right side)
+            // Team B's goal is to reach Team A's end zone (left side)
+            match team_id {
+                TeamId::TeamA => {
+                    // Check if in Team B's end zone
+                    head.x >= self.width as i16 - config.end_zone_depth as i16
+                }
+                TeamId::TeamB => {
+                    // Check if in Team A's end zone  
+                    head.x < config.end_zone_depth as i16
+                }
+            }
+        } else {
+            false
+        }
     }
 }
 
@@ -292,6 +384,22 @@ impl GameState {
             },
         };
         
+        // Set up team zones for team-based games
+        let team_zone_config = match &game_type {
+            GameType::TeamMatch { .. } => {
+                // Calculate goal width as 20% of arena height
+                let goal_width = ((height as f32 * 0.2).round() as u16).max(3);
+                // Make sure it's odd for symmetry
+                let goal_width = if goal_width % 2 == 0 { goal_width + 1 } else { goal_width };
+                
+                Some(TeamZoneConfig {
+                    end_zone_depth: 10,
+                    goal_width,
+                })
+            }
+            _ => None,
+        };
+        
         GameState {
             tick: 0,
             status: GameStatus::Stopped,
@@ -300,6 +408,7 @@ impl GameState {
                 height,
                 snakes: Vec::new(),
                 food: Vec::new(),
+                team_zone_config,
             },
             game_type,
             properties,
@@ -347,24 +456,31 @@ impl GameState {
             _ => DEFAULT_SNAKE_LENGTH as i16,
         };
         
+        // For team games, adjust starting positions to be in the main field
+        let (left_boundary, right_boundary) = if let Some((left, right)) = self.arena.main_field_bounds() {
+            (left + 2, right - 2)  // Add buffer from walls
+        } else {
+            (0, arena_width - 1)
+        };
+        
         match player_count {
             0 => {},
             1 => {
-                // Single snake starts on the right, facing left
-                let x = arena_width - snake_length - 1;
+                // Single snake starts on the right side of main field, facing left
+                let x = right_boundary - snake_length;
                 let y = arena_height / 2;
                 positions.push((Position { x, y }, Direction::Left));
             },
             2 => {
-                // Two snakes start on opposite sides, facing each other
+                // Two snakes start on opposite sides of main field, facing each other
                 let y = arena_height / 2;
                 
-                // Right side, facing left
-                let x_right = arena_width - snake_length - 1;
+                // Right side of main field, facing left (Team B position)
+                let x_right = right_boundary - snake_length;
                 positions.push((Position { x: x_right, y }, Direction::Left));
                 
-                // Left side, facing right
-                let x_left = snake_length;
+                // Left side of main field, facing right (Team A position)
+                let x_left = left_boundary + snake_length;
                 positions.push((Position { x: x_left, y }, Direction::Right));
             },
             _ => {
@@ -376,8 +492,8 @@ impl GameState {
                 let vertical_margin = 2;
                 let usable_height = arena_height - 2 * vertical_margin;
                 
-                // Left column (facing right)
-                let x_left = snake_length;
+                // Left column (facing right) - use main field boundaries
+                let x_left = left_boundary + snake_length;
                 for i in 0..left_count {
                     let y = if left_count == 1 {
                         arena_height / 2
@@ -387,8 +503,8 @@ impl GameState {
                     positions.push((Position { x: x_left, y }, Direction::Right));
                 }
                 
-                // Right column (facing left)
-                let x_right = arena_width - snake_length - 1;
+                // Right column (facing left) - use main field boundaries
+                let x_right = right_boundary - snake_length;
                 for i in 0..right_count {
                     let y = if right_count == 1 {
                         arena_height / 2
@@ -413,12 +529,27 @@ impl GameState {
             return Err(anyhow::anyhow!("Cannot add player after the game has started"));
         }
 
+        // Determine team assignment for team games
+        let team_id = match &self.game_type {
+            GameType::TeamMatch { .. } => {
+                // Assign teams alternately: A, B, A, B...
+                let existing_player_count = self.players.len();
+                if existing_player_count % 2 == 0 {
+                    Some(TeamId::TeamA)
+                } else {
+                    Some(TeamId::TeamB)
+                }
+            }
+            _ => None,
+        };
+        
         // Add new player first with temporary position
         let snake = Snake {
             body: vec![Position { x: 0, y: 0 }, Position { x: 0, y: 0 }],
             direction: Direction::Right,
             is_alive: true,
             food: 0,
+            team_id,
         };
 
         let snake_id = self.arena.add_snake(snake)?;
@@ -436,7 +567,7 @@ impl GameState {
         };
         
         // Rearrange all snakes to their starting positions
-        for (idx, (player_id, player)) in self.players.iter().enumerate() {
+        for (idx, (_player_id, player)) in self.players.iter().enumerate() {
             if idx < starting_positions.len() {
                 let (head_pos, direction) = &starting_positions[idx];
                 let snake = &mut self.arena.snakes[player.snake_id as usize];
@@ -527,6 +658,12 @@ impl GameState {
         'main_snake_loop: for (snake_id, snake) in self.iter_snakes() {
             let head = snake.head()?;
             if snake.is_alive {
+                // Check for wall collisions in team games
+                if self.arena.is_wall_position(head) {
+                    crashed_snake_ids.push(snake_id);
+                    continue 'main_snake_loop;
+                }
+                
                 // If not within bounds
                 if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
                     crashed_snake_ids.push(snake_id);
@@ -579,6 +716,31 @@ impl GameState {
             }
         }
 
+        // Check for goal scoring in team games
+        if let GameType::TeamMatch { .. } = &self.game_type {
+            let mut winning_snake = None;
+            for (snake_id, snake) in self.iter_snakes() {
+                if snake.is_alive {
+                    if let Some(team_id) = snake.team_id {
+                        if self.arena.has_reached_goal(snake, team_id) {
+                            // Team scored! Game ends with this team as winner
+                            winning_snake = Some(snake_id);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if let Some(snake_id) = winning_snake {
+                self.apply_event(
+                    GameEvent::StatusUpdated { 
+                        status: GameStatus::Complete { winning_snake_id: Some(snake_id) }
+                    },
+                    Some(&mut out)
+                );
+            }
+        }
+        
         // Check if game should end (only one or no snakes alive)
         let alive_snakes: Vec<u32> = self.arena.snakes
             .iter()
@@ -587,16 +749,35 @@ impl GameState {
             .map(|(idx, _)| idx as u32)
             .collect();
         
-        // For solo games, only end when no snakes are alive
-        // For multiplayer games, end when 1 or fewer snakes are alive
-        let should_end = if self.game_type.is_solo() {
+        // For team games, check if all snakes of one team are dead
+        let should_end = if let GameType::TeamMatch { .. } = &self.game_type {
+            // Check if all Team A or all Team B snakes are dead
+            let team_a_alive = self.arena.snakes.iter()
+                .any(|s| s.is_alive && s.team_id == Some(TeamId::TeamA));
+            let team_b_alive = self.arena.snakes.iter()
+                .any(|s| s.is_alive && s.team_id == Some(TeamId::TeamB));
+            
+            !team_a_alive || !team_b_alive
+        } else if self.game_type.is_solo() {
+            // For solo games, only end when no snakes are alive
             alive_snakes.is_empty()
         } else {
+            // For multiplayer games, end when 1 or fewer snakes are alive
             alive_snakes.len() <= 1
         };
         
         if should_end && matches!(self.status, GameStatus::Started { .. }) {
-            let winning_snake_id = alive_snakes.first().copied();
+            // For team games, the winning snake is from the surviving team
+            let winning_snake_id = if let GameType::TeamMatch { .. } = &self.game_type {
+                // Find a snake from the surviving team
+                self.arena.snakes.iter()
+                    .enumerate()
+                    .find(|(_, s)| s.is_alive)
+                    .map(|(idx, _)| idx as u32)
+            } else {
+                alive_snakes.first().copied()
+            };
+            
             self.apply_event(
                 GameEvent::StatusUpdated { 
                     status: GameStatus::Complete { winning_snake_id } 

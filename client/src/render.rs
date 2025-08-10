@@ -46,6 +46,45 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
     ctx.fill_rect(0.0, 0.0, canvas_width - 2.0 * padding, canvas_height - 2.0 * padding);
 
+    // Draw team zones if present
+    let team_zone_config_data = arena["team_zone_config"].as_object().cloned();
+    if let Some(team_zone_config) = &team_zone_config_data {
+        let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
+        
+        // Draw Team A end zone (left side)
+        ctx.set_fill_style(&JsValue::from_str("#e6f4fa")); // Light blue background
+        ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height as f64 * cell_size);
+        
+        // Draw Team B end zone (right side)
+        ctx.set_fill_style(&JsValue::from_str("#ffe6e6")); // Light red background
+        ctx.fill_rect(
+            (width as f64 - end_zone_depth) * cell_size, 
+            0.0, 
+            end_zone_depth * cell_size, 
+            height as f64 * cell_size
+        );
+        
+        // Draw team names in end zones
+        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+        ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+        ctx.set_text_align("center");
+        ctx.set_text_baseline("middle");
+        
+        // Team A text
+        ctx.fill_text(
+            "TEAM A",
+            end_zone_depth * cell_size / 2.0,
+            height as f64 * cell_size / 2.0
+        )?;
+        
+        // Team B text
+        ctx.fill_text(
+            "TEAM B",
+            (width as f64 - end_zone_depth / 2.0) * cell_size,
+            height as f64 * cell_size / 2.0
+        )?;
+    }
+    
     // Draw dots at grid intersections (like the background pattern)
     ctx.set_fill_style(&JsValue::from_str("rgba(0, 0, 0, 0.3)")); // Same as background dots
     
@@ -69,6 +108,77 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             ctx.begin_path();
             ctx.arc(dot_x, dot_y, dot_radius, 0.0, 2.0 * std::f64::consts::PI)?;
             ctx.fill();
+        }
+    }
+    
+    // Draw walls after dots so they cover the dots
+    if let Some(team_zone_config) = &team_zone_config_data {
+        let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
+        let goal_width = team_zone_config["goal_width"].as_u64().unwrap_or(5) as f64;
+        
+        // Draw walls as 3px solid rectangles between field and endzone cells
+        let wall_thickness = 3.0;
+        
+        let goal_center = height as f64 / 2.0;
+        let goal_half_width = goal_width / 2.0;
+        let goal_y_start = goal_center - goal_half_width;
+        let goal_y_end = goal_center + goal_half_width;
+        
+        // Round goal boundaries to nearest cell edges
+        let goal_y_start_aligned = goal_y_start.floor();
+        let goal_y_end_aligned = goal_y_end.ceil();
+        
+        // Team A boundary wall (between endzone and field)
+        // Using solid color that matches the previous semi-transparent appearance
+        // Previous: rgba(150, 200, 220, 0.8) over white = roughly rgb(170, 210, 225)
+        ctx.set_fill_style(&JsValue::from_str("#7aa8c1")); // Darker blue wall
+        
+        let team_a_wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
+        
+        // Top wall segment (before goal)
+        if goal_y_start_aligned > 0.0 {
+            ctx.fill_rect(
+                team_a_wall_x,
+                0.0,
+                wall_thickness,
+                goal_y_start_aligned * cell_size
+            );
+        }
+        
+        // Bottom wall segment (after goal)
+        if goal_y_end_aligned < height as f64 {
+            ctx.fill_rect(
+                team_a_wall_x,
+                goal_y_end_aligned * cell_size,
+                wall_thickness,
+                (height as f64 - goal_y_end_aligned) * cell_size
+            );
+        }
+        
+        // Team B boundary wall (between field and endzone)
+        // Previous: rgba(220, 150, 150, 0.8) over white = roughly rgb(225, 170, 170)
+        ctx.set_fill_style(&JsValue::from_str("#c18888")); // Darker red wall
+        
+        let team_b_wall_x = (width as f64 - end_zone_depth) * cell_size - wall_thickness / 2.0;
+        
+        // Top wall segment (before goal)
+        if goal_y_start_aligned > 0.0 {
+            ctx.fill_rect(
+                team_b_wall_x,
+                0.0,
+                wall_thickness,
+                goal_y_start_aligned * cell_size
+            );
+        }
+        
+        // Bottom wall segment (after goal)
+        if goal_y_end_aligned < height as f64 {
+            ctx.fill_rect(
+                team_b_wall_x,
+                goal_y_end_aligned * cell_size,
+                wall_thickness,
+                (height as f64 - goal_y_end_aligned) * cell_size
+            );
         }
     }
 
@@ -119,20 +229,29 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     if let Some(snakes) = arena["snakes"].as_array() {
         for (index, snake) in snakes.iter().enumerate() {
             if snake["is_alive"].as_bool().unwrap_or(false) {
-                // Choose snake color based on index
-                let color = match index % 4 {
-                    0 => "#70bfe3",  // Slightly darker with a touch more teal
-                    1 => "#556270",
-                    2 => "#ff6b6b",
-                    _ => "#f7b731",
-                };
-                
-                // Calculate darker shade for border (darken by ~30%)
-                let border_color = match index % 4 {
-                    0 => "#5299bb",  // Darker with teal influence
-                    1 => "#353c47",  // Darker gray
-                    2 => "#b84444",  // Darker red
-                    _ => "#a87d1f",  // Darker yellow
+                // Choose snake color based on team_id if present, otherwise based on index
+                let (color, border_color) = if let Some(team_id) = snake["team_id"].as_str() {
+                    match team_id {
+                        "TeamA" => ("#70bfe3", "#5299bb"),  // Blue team
+                        "TeamB" => ("#ff6b6b", "#b84444"),  // Red team
+                        _ => {
+                            // Fallback to index-based colors
+                            match index % 4 {
+                                0 => ("#70bfe3", "#5299bb"),
+                                1 => ("#556270", "#353c47"),
+                                2 => ("#ff6b6b", "#b84444"),
+                                _ => ("#f7b731", "#a87d1f"),
+                            }
+                        }
+                    }
+                } else {
+                    // No team_id, use index-based colors
+                    match index % 4 {
+                        0 => ("#70bfe3", "#5299bb"),  // Slightly darker with a touch more teal
+                        1 => ("#556270", "#353c47"),  // Darker gray
+                        2 => ("#ff6b6b", "#b84444"),  // Darker red
+                        _ => ("#f7b731", "#a87d1f"),  // Darker yellow
+                    }
                 };
                 
                 ctx.set_fill_style(&JsValue::from_str(color));

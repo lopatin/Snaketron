@@ -337,7 +337,14 @@ async fn create_adaptive_match(
     let game_type_enum: GameType = serde_json::from_value(game_type.clone())
         .map_err(|e| anyhow::anyhow!("Failed to deserialize game type: {}", e))?;
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut game_state = GameState::new(40, 40, game_type_enum, None, start_ms);
+    
+    // For TeamMatch games, add extra width for end zones (10 cells each side)
+    let (width, height) = match &game_type_enum {
+        GameType::TeamMatch { .. } => (60, 40),  // 40 + 10 + 10 for end zones
+        _ => (40, 40),
+    };
+    
+    let mut game_state = GameState::new(width, height, game_type_enum, None, start_ms);
     
     // Add players to the game state
     for user_id in user_ids.iter() {
