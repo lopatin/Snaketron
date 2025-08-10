@@ -53,8 +53,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
     if (typeof gameType === 'object') {
       if ('TeamMatch' in gameType) {
         const perTeam = gameType.TeamMatch.per_team;
-        if (perTeam === 1) return 'Quick Match 1v1';
-        return `Team Battle ${perTeam}v${perTeam}`;
+        if (perTeam === 1) return 'Quick Match';
+        return `Team Battle`;
       }
       if ('FreeForAll' in gameType) {
         return `Free For All`;
@@ -160,7 +160,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
         padding: '10px 18px',
         marginLeft: 'auto',
         marginRight: 'auto',
-        maxWidth: solo ? '600px' : '1000px',
+        maxWidth: solo ? '600px' : '650px',
         background: 'linear-gradient(to bottom, #ffffff, #fafafa)',
         borderLeft: '3px solid white',
         borderRight: '3px solid white',
@@ -236,10 +236,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
           )}
         </div>
       ) : (
-        // Multiplayer Game Scoreboard - Compact Design
-        <div className="flex items-center justify-between gap-3">
+        // Multiplayer Game Scoreboard - Minimal Design
+        <div className="flex items-center justify-center gap-8">
           {/* Left - Logo with separator */}
-          <div className="flex items-center gap-4 flex-shrink-0 ml-1">
+          <div className="flex items-center gap-6">
             <img 
               src="/SnaketronLogo.png" 
               alt="Snaketron" 
@@ -253,51 +253,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
             <div className="h-7 w-px bg-gray-300 opacity-40" />
           </div>
 
-          {/* Game Mode & Total Wins */}
-          <div className="flex flex-col items-center">
-            <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-              {getGameModeText()}
-            </div>
-            <div className="text-gray-600 font-bold text-lg -mt-0.5">
-              0 - 0
-            </div>
-          </div>
-
-          {/* Divider */}
-          <div className="w-px h-8 bg-gray-300 opacity-50" />
-
-          {/* Left Team Section */}
-          <div className="flex items-center gap-2">
-            {/* Team 1 Players */}
-            <div className="flex gap-1.5">
-              {teamStats?.team1.snakes.map((info, idx) => (
-                <div 
-                  key={idx}
-                  className="flex items-center gap-1 px-2 py-1 rounded"
-                  style={{ 
-                    backgroundColor: info.snake.is_alive ? 'rgba(59, 130, 246, 0.08)' : 'rgba(156, 163, 175, 0.08)',
-                    border: `1px solid ${info.snake.is_alive ? 'rgba(59, 130, 246, 0.2)' : 'rgba(156, 163, 175, 0.2)'}`
-                  }}
-                >
-                  <div 
-                    className="w-3 h-3 rounded-sm"
-                    style={{ backgroundColor: info.color }}
-                  />
-                  <span className={`text-sm font-semibold ${info.isCurrentPlayer ? 'text-blue-600' : 'text-gray-700'}`}>
-                    {info.name}
-                  </span>
-                  <div className={`w-2 h-2 rounded-full ${
-                    info.snake.is_alive ? 'bg-green-500' : 'bg-gray-400'
-                  }`} />
-                </div>
-              ))}
-            </div>
-          </div>
-
           {/* Center Section - Scores flanking Time */}
           <div className="flex items-center gap-8">
             {/* Team 1 Match Score */}
-            <span className="text-2xl font-black tabular-nums min-w-[2ch] text-right" style={{ color: '#3b82f6' }}>
+            <span className="text-2xl font-black tabular-nums" style={{ color: '#3b82f6' }}>
               {teamStats?.team1.score || 0}
             </span>
 
@@ -312,36 +271,21 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
             </div>
 
             {/* Team 2 Match Score */}
-            <span className="text-2xl font-black tabular-nums min-w-[2ch] text-left" style={{ color: '#ef4444' }}>
+            <span className="text-2xl font-black tabular-nums" style={{ color: '#ef4444' }}>
               {teamStats?.team2.score || 0}
             </span>
           </div>
 
-          {/* Right Team Section */}
-          <div className="flex items-center gap-2">
-            {/* Team 2 Players */}
-            <div className="flex gap-1.5">
-              {teamStats?.team2.snakes.map((info, idx) => (
-                <div 
-                  key={idx}
-                  className="flex items-center gap-1 px-2 py-1 rounded"
-                  style={{ 
-                    backgroundColor: info.snake.is_alive ? 'rgba(239, 68, 68, 0.08)' : 'rgba(156, 163, 175, 0.08)',
-                    border: `1px solid ${info.snake.is_alive ? 'rgba(239, 68, 68, 0.2)' : 'rgba(156, 163, 175, 0.2)'}`
-                  }}
-                >
-                  <div className={`w-2 h-2 rounded-full ${
-                    info.snake.is_alive ? 'bg-green-500' : 'bg-gray-400'
-                  }`} />
-                  <span className={`text-sm font-semibold ${info.isCurrentPlayer ? 'text-red-600' : 'text-gray-700'}`}>
-                    {info.name}
-                  </span>
-                  <div 
-                    className="w-3 h-3 rounded-sm"
-                    style={{ backgroundColor: info.color }}
-                  />
-                </div>
-              ))}
+          {/* Divider */}
+          <div className="w-px h-8 bg-gray-300 opacity-50" />
+
+          {/* Game Mode & Total Wins */}
+          <div className="flex flex-col items-center">
+            <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+              {getGameModeText()}
+            </div>
+            <div className="text-gray-600 font-bold text-lg -mt-0.5">
+              0 - 0
             </div>
           </div>
         </div>
