@@ -153,8 +153,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           setCurrentGameId(gameId.toString());
           setIsQueued(false);
           
-          // Acknowledge the join
-          sendMessage({ JoinGame: parseInt(gameId.toString()) });
+          // DON'T send JoinGame back - GameArena will handle joining
+          // sendMessage({ JoinGame: parseInt(gameId.toString()) });
           
           // Navigate to the game arena
           navigate(`/play/${gameId}`);

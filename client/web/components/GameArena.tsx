@@ -76,8 +76,9 @@ export default function GameArena() {
 
   // Join game when user becomes available
   useEffect(() => {
-    if (user && gameId) {
+    if (user && gameId && !hasJoinedGameRef.current) {
       console.log('User authenticated, joining game:', gameId);
+      hasJoinedGameRef.current = true;
       joinGame(gameId);
     }
   }, [user, gameId, joinGame]);
@@ -100,6 +101,7 @@ export default function GameArena() {
       document.body.classList.remove('hide-background-dots');
       console.log('GAME ARENA UNMOUNTED, initial state issue');
 
+      hasJoinedGameRef.current = false; // Reset for next mount
       leaveGame();
       stopEngine();
     };
