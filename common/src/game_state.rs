@@ -472,16 +472,28 @@ impl GameState {
                 positions.push((Position { x, y }, Direction::Left));
             },
             2 => {
-                // Two snakes start on opposite sides of main field, facing each other
-                let y = arena_height / 2;
-                
-                // Right side of main field, facing left (Team B position)
-                let x_right = right_boundary - snake_length;
-                positions.push((Position { x: x_right, y }, Direction::Left));
-                
-                // Left side of main field, facing right (Team A position)
-                let x_left = left_boundary + snake_length;
-                positions.push((Position { x: x_left, y }, Direction::Right));
+                // Check if this is a TeamMatch (duel) game
+                if let GameType::TeamMatch { per_team: 1 } = &self.game_type {
+                    // Duel mode: snakes start in their own endzones
+                    let y = arena_height / 2;
+                    
+                    // Team A in left endzone (centered at x=5), facing right toward Team B's goal
+                    positions.push((Position { x: 5, y }, Direction::Right));
+                    
+                    // Team B in right endzone (centered at x=arena_width-5), facing left toward Team A's goal
+                    positions.push((Position { x: arena_width - 5, y }, Direction::Left));
+                } else {
+                    // FreeForAll: Two snakes start on opposite sides of main field, facing each other
+                    let y = arena_height / 2;
+                    
+                    // Right side of main field, facing left
+                    let x_right = right_boundary - snake_length;
+                    positions.push((Position { x: x_right, y }, Direction::Left));
+                    
+                    // Left side of main field, facing right
+                    let x_left = left_boundary + snake_length;
+                    positions.push((Position { x: x_left, y }, Direction::Right));
+                }
             },
             _ => {
                 // More than 2 players: arranged in two columns facing each other
