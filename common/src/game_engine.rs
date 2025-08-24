@@ -130,9 +130,15 @@ impl GameEngine {
     
     /// Rebuild predicted state from committed state and advance to current time
     pub fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
+        // Handle pre-start case: if current time is before start time, don't advance
+        let elapsed_ms = current_ts - self.committed_state.start_ms;
+        if elapsed_ms < 0 {
+            return Ok(());
+        }
+        
         // Calculate target tick
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms as i64;
-        let predicted_target_tick = ((current_ts - self.committed_state.start_ms) / tick_duration_ms) as u32;
+        let predicted_target_tick = (elapsed_ms / tick_duration_ms) as u32;
         
         // Check if we need to rebuild by comparing with existing predicted state
         let needs_rebuild = self.predicted_state.as_ref()
@@ -157,7 +163,14 @@ impl GameEngine {
     /// Can be called from a very fast interval loop or requestAnimationFrame.
     pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, u64, GameEvent)>> {
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms;
-        let predicted_target_tick = ((ts_ms - self.committed_state.start_ms) / tick_duration_ms as i64) as u32;
+        
+        // Handle pre-start case: if current time is before start time, don't advance
+        let elapsed_ms = ts_ms - self.committed_state.start_ms;
+        if elapsed_ms < 0 {
+            return Ok(Vec::new());
+        }
+        
+        let predicted_target_tick = (elapsed_ms / tick_duration_ms as i64) as u32;
         let lag_ticks = self.committed_state_lag_ms / tick_duration_ms;
         let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
         let mut out: Vec<(u32, u64, GameEvent)> = Vec::new();

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useReducer } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
@@ -71,6 +71,7 @@ export default function GameArena() {
   const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
+  const [, forceUpdate] = useReducer(x => x + 1, 0);
   const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
 
   // Join game when user becomes available
@@ -291,10 +292,32 @@ export default function GameArena() {
     }
   }, [lastGameEvent, processServerEvent]);
   
+  // Update countdown display
+  useEffect(() => {
+    if (!gameState) return;
+    
+    const intervalId = setInterval(() => {
+      const timeLeft = gameState.start_ms - Date.now();
+      if (timeLeft <= 0) {
+        clearInterval(intervalId);
+      } else {
+        // Force re-render to update countdown
+        forceUpdate();
+      }
+    }, 100); // Update every 100ms for smooth countdown
+    
+    return () => clearInterval(intervalId);
+  }, [gameState, forceUpdate]);
+  
   // Show loading screen while waiting for game state
   if (!gameState) {
     return <LoadingScreen message="Joining Game..." />;
   }
+  
+  // Calculate countdown from game start time
+  const timeUntilStart = gameState.start_ms - Date.now();
+  const countdownSeconds = Math.ceil(timeUntilStart / 1000);
+  const showCountdown = countdownSeconds > 0;
   
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
@@ -315,7 +338,8 @@ export default function GameArena() {
               height: `${panelSize.height}px`,
               display: 'flex',
               alignItems: 'center',
-              justifyContent: 'center'
+              justifyContent: 'center',
+              position: 'relative'
             }}
           >
             <canvas
@@ -327,6 +351,19 @@ export default function GameArena() {
                 border: 'none'
               }}
             />
+            
+            {/* Countdown Overlay */}
+            {showCountdown && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/30 z-10">
+                <div className="text-white font-black italic uppercase" style={{
+                  fontSize: '120px',
+                  textShadow: '0 4px 8px rgba(0,0,0,0.5)',
+                  letterSpacing: '0.05em'
+                }}>
+                  {countdownSeconds}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

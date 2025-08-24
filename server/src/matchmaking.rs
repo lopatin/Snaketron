@@ -13,6 +13,7 @@ use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
 const MAX_PLAYERS: usize = 10;
+const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 // Initial game state will be null
 
 // MMR matching ranges that expand over time
@@ -336,7 +337,7 @@ async fn create_adaptive_match(
     // Create game state with players
     let game_type_enum: GameType = serde_json::from_value(game_type.clone())
         .map_err(|e| anyhow::anyhow!("Failed to deserialize game type: {}", e))?;
-    let start_ms = chrono::Utc::now().timestamp_millis();
+    let start_ms = chrono::Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
     
     // For TeamMatch games, add extra width for end zones (10 cells each side)
     let (width, height) = match &game_type_enum {
