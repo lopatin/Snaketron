@@ -7,6 +7,7 @@ pub mod replay;
 pub mod api;
 pub mod cluster_singleton;
 pub mod replication;
+pub mod pubsub_manager;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

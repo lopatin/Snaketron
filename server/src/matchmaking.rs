@@ -1,14 +1,12 @@
 use std::time::Duration;
 use chrono::Utc;
-use sqlx::{Executor, PgPool, Postgres, Transaction};
-use tracing::{error, info, trace, warn};
+use sqlx::{Executor, PgPool};
+use tracing::{error, info, trace};
 use tokio_util::sync::CancellationToken;
-use std::sync::Arc;
 use anyhow::Context;
 use common::{GameState, GameType};
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
-use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
+use crate::game_executor::{StreamEvent, PARTITION_COUNT};
+use crate::pubsub_manager::PubSubManager;
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
@@ -59,11 +57,9 @@ pub async fn run_matchmaking_loop(
 ) -> anyhow::Result<()> {
     info!(?server_id, "Starting adaptive matchmaking loop");
 
-    // Create Redis connection for publishing game events
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client")?;
-    let redis_conn = ConnectionManager::new(client).await
-        .context("Failed to create Redis connection manager")?;
+    // Create PubSub manager for publishing game events
+    let pubsub = PubSubManager::new(&redis_url).await
+        .context("Failed to create PubSub manager")?;
 
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -101,7 +97,7 @@ pub async fn run_matchmaking_loop(
         });
         
         for game_type in &game_types {
-            match create_adaptive_match(&pool, redis_conn.clone(), game_type.clone(), server_id).await {
+            match create_adaptive_match(&pool, pubsub.clone(), game_type.clone(), server_id).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
@@ -146,7 +142,7 @@ async fn update_heartbeat(pool: &PgPool, server_id: u64) -> Result<(), sqlx::Err
 /// Create an adaptive match using expanding skill ranges
 async fn create_adaptive_match(
     pool: &PgPool,
-    mut redis_conn: ConnectionManager,
+    mut pubsub: PubSubManager,
     game_type: serde_json::Value,
     server_id: u64,
 ) -> anyhow::Result<Option<(i32, Vec<i32>)>> {
@@ -355,15 +351,22 @@ async fn create_adaptive_match(
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
-    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {
         game_id: game_id_u32,
-        game_state,
+        game_state: game_state.clone(),
     };
     
-    publish_to_stream(&mut redis_conn, &stream_key, &event).await
-        .context("Failed to publish GameCreated event to Redis stream")?;
+    // Publish initial snapshot when game is created
+    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
+    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+        .context("Failed to publish initial game snapshot")?;
+    
+    // Also send GameCreated event via partition command channel
+    let serialized = serde_json::to_vec(&event)
+        .context("Failed to serialize GameCreated event")?;
+    pubsub.publish_command(partition_id, &serialized).await
+        .context("Failed to publish GameCreated event")?;
     
     info!(game_id, partition_id, "Game created and published to Redis stream");
 

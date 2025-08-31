@@ -4,15 +4,15 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
 use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMessage, GameState, EXECUTOR_POLL_INTERVAL_MS};
-use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use crate::pubsub_manager::{PubSubManager, SnapshotRequest, PartitionSubscription};
 
 pub const PARTITION_COUNT: u32 = 10;
+pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks (1 second at 100ms tick rate)
 
-/// Events that can be sent through Redis streams
+/// Events that can be sent through PubSub
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
     GameCreated { 
@@ -31,27 +31,21 @@ pub enum StreamEvent {
     },
 }
 
-/// Wrapper for StreamEvent that includes timestamp for latency tracking
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TimestampedStreamEvent {
-    pub event: StreamEvent,
-    pub timestamp_ms: i64,
-}
-
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
     server_id: u64,
     game_id: u32,
     game_state: GameState,
-    mut redis_conn: ConnectionManager,
-    stream_key: String,
+    mut pubsub: PubSubManager,
     mut command_receiver: mpsc::Receiver<GameCommandMessage>,
+    mut snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
     cancellation_token: CancellationToken,
 ) {
-    info!("run_game called for game {} on stream {}", game_id, stream_key);
+    info!("run_game called for game {}", game_id);
+    let partition_id = game_id % PARTITION_COUNT;
     
     // Create the game engine from the provided game state
-    let start_ms = chrono::Utc::now().timestamp_millis();
+    let _start_ms = chrono::Utc::now().timestamp_millis();
     
     // If the game is in Stopped status, start it before creating the engine
     let mut initial_state = game_state;
@@ -59,13 +53,18 @@ async fn run_game(
         info!("Game {} is in Stopped status, starting it", game_id);
         initial_state.status = GameStatus::Started { server_id };
         
-        // Emit status update to notify other components
-        let status_event = StreamEvent::StatusUpdated {
+        // Emit status update event
+        let status_event = GameEventMessage {
             game_id,
-            status: GameStatus::Started { server_id },
+            tick: initial_state.tick,
+            sequence: initial_state.event_sequence + 1,
+            user_id: None,
+            event: GameEvent::StatusUpdated { 
+                status: GameStatus::Started { server_id }
+            },
         };
         
-        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &status_event).await {
+        if let Err(e) = pubsub.publish_event(partition_id, &status_event).await {
             error!("Failed to publish game started status: {}", e);
         }
     }
@@ -73,8 +72,15 @@ async fn run_game(
     let mut engine = GameEngine::new_from_state(game_id, initial_state);
     info!("Created game engine for game {} with status: {:?}", game_id, engine.get_committed_state().status);
 
+    // Publish initial snapshot
+    if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &engine.get_committed_state()).await {
+        error!("Failed to publish initial snapshot: {}", e);
+    }
+
     let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
+    let mut last_snapshot_tick = 0u32;
     
     loop {
         tokio::select! {
@@ -83,6 +89,18 @@ async fn run_game(
             _ = cancellation_token.cancelled() => {
                 info!("Game loop for game {} shutting down", game_id);
                 break;
+            }
+            
+            // Handle snapshot requests
+            Some(request) = snapshot_request_receiver.recv() => {
+                debug!("Received snapshot request for partition {}", request.partition_id);
+                // Only publish snapshot if this game belongs to the requested partition
+                if game_id % PARTITION_COUNT == request.partition_id {
+                    let snapshot = engine.get_committed_state();
+                    if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &snapshot).await {
+                        error!("Failed to publish requested snapshot: {}", e);
+                    }
+                }
             }
             
             // Process commands from the channel
@@ -99,14 +117,13 @@ async fn run_game(
                         let event_msg = GameEventMessage {
                             game_id,
                             tick: engine.current_tick(),
-                            sequence: current_state.event_sequence + 1, // Use next sequence since this event hasn't been processed yet
+                            sequence: current_state.event_sequence + 1,
                             user_id: None,
                             event,
                         };
                         
-                        // Publish to Redis stream
-                        let stream_event = StreamEvent::GameEvent(event_msg);
-                        if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
+                        // Publish event via PubSub
+                        if let Err(e) = pubsub.publish_event(game_id, &event_msg).await {
                             warn!("Failed to publish command scheduled event: {}", e);
                         }
                     }
@@ -130,17 +147,30 @@ async fn run_game(
                                 event: event.clone(),
                             };
                             
-                            // Publish to Redis stream
-                            let stream_event = StreamEvent::GameEvent(event_msg.clone());
-                            if let Err(e) = publish_to_stream(&mut redis_conn, &stream_key, &stream_event).await {
+                            // Publish event via PubSub
+                            if let Err(e) = pubsub.publish_event(game_id, &event_msg).await {
                                 warn!("Failed to publish game event: {}", e);
                             }
+                        }
+                        
+                        // Publish periodic snapshots
+                        let current_tick = engine.current_tick();
+                        if current_tick >= last_snapshot_tick + SNAPSHOT_INTERVAL_TICKS {
+                            let snapshot = engine.get_committed_state();
+                            if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &snapshot).await {
+                                warn!("Failed to publish periodic snapshot: {}", e);
+                            }
+                            last_snapshot_tick = current_tick;
                         }
                         
                         // Check if game has completed
                         let game_state = engine.get_committed_state();
                         if matches!(game_state.status, GameStatus::Complete { .. }) {
                             info!("Game {} has completed, exiting game loop", game_id);
+                            // Publish final snapshot
+                            if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &game_state).await {
+                                warn!("Failed to publish final snapshot: {}", e);
+                            }
                             break;
                         }
                     }
@@ -153,85 +183,55 @@ async fn run_game(
     }
 }
 
-/// Helper function to publish events to Redis stream with timestamp
-pub async fn publish_to_stream_with_timestamp(
-    redis_conn: &mut ConnectionManager,
-    stream_key: &str,
-    event: &StreamEvent,
-) -> Result<()> {
-    let timestamped_event = TimestampedStreamEvent {
-        event: event.clone(),
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-    };
-    
-    let data = serde_json::to_vec(&timestamped_event)
-        .context("Failed to serialize timestamped stream event")?;
-    
-    let _: String = redis_conn.xadd(
-        stream_key,
-        "*", // Auto-generate ID
-        &[("data", data)],
-    ).await
-    .context("Failed to add event to Redis stream")?;
-    
-    Ok(())
-}
-
-/// Legacy helper function to publish events to Redis stream (for backward compatibility)
+/// Helper function to publish events via PubSub (for backward compatibility)
 pub async fn publish_to_stream(
-    redis_conn: &mut ConnectionManager,
-    stream_key: &str,
+    pubsub: &mut PubSubManager,
+    _partition_id: u32,
     event: &StreamEvent,
 ) -> Result<()> {
-    // Use the timestamped version internally
-    publish_to_stream_with_timestamp(redis_conn, stream_key, event).await
-}
-
-/// Helper function to read and deserialize timestamped events with latency tracking
-pub fn read_timestamped_event(bytes: &[u8]) -> Result<StreamEvent> {
-    // Try to deserialize as TimestampedStreamEvent first
-    match serde_json::from_slice::<TimestampedStreamEvent>(bytes) {
-        Ok(timestamped) => {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let latency_ms = now_ms - timestamped.timestamp_ms;
-            
-            // Extract event details for logging
-            let (event_type, game_id) = match &timestamped.event {
-                StreamEvent::GameCreated { game_id, .. } => ("GameCreated", Some(*game_id)),
-                StreamEvent::GameCommandSubmitted { game_id, .. } => ("GameCommandSubmitted", Some(*game_id)),
-                StreamEvent::GameEvent(msg) => {
-                    let event_name = match &msg.event {
-                        GameEvent::Snapshot { .. } => "Snapshot",
-                        GameEvent::SnakeTurned { .. } => "SnakeTurned",
-                        GameEvent::SnakeDied { .. } => "SnakeDied",
-                        GameEvent::FoodSpawned { .. } => "FoodSpawned",
-                        GameEvent::FoodEaten { .. } => "FoodEaten",
-                        GameEvent::StatusUpdated { .. } => "StatusUpdated",
-                        GameEvent::CommandScheduled { .. } => "CommandScheduled",
-                    };
-                    (event_name, Some(msg.game_id))
-                },
-                StreamEvent::StatusUpdated { game_id, .. } => ("StatusUpdated", Some(*game_id)),
-            };
-            
-            // Log latency with context
-            if latency_ms > 100 {
-                warn!("High Redis stream latency: {}ms for {} event (game: {:?})", 
-                    latency_ms, event_type, game_id);
-            } else if latency_ms > 20 {
-                debug!("Redis stream latency: {}ms for {} event (game: {:?})", 
-                    latency_ms, event_type, game_id);
-            }
-            
-            Ok(timestamped.event)
+    // Convert StreamEvent to appropriate PubSub message
+    match event {
+        StreamEvent::GameEvent(event_msg) => {
+            let partition_id = event_msg.game_id % PARTITION_COUNT;
+            pubsub.publish_event(partition_id, event_msg).await?;
         }
-        Err(_) => {
-            // Fall back to deserializing as plain StreamEvent for backward compatibility
-            debug!("Reading non-timestamped event (legacy format)");
-            serde_json::from_slice::<StreamEvent>(bytes)
-                .context("Failed to deserialize stream event")
+        StreamEvent::GameCreated { game_id, game_state } => {
+            let partition_id = game_id % PARTITION_COUNT;
+            // Publish initial snapshot when game is created
+            pubsub.publish_snapshot(partition_id, *game_id, game_state).await?;
+            
+            // Also publish a GameCreated event
+            let event_msg = GameEventMessage {
+                game_id: *game_id,
+                tick: 0,
+                sequence: 0,
+                user_id: None,
+                event: GameEvent::Snapshot { game_state: game_state.clone() },
+            };
+            pubsub.publish_event(partition_id, &event_msg).await?;
+        }
+        StreamEvent::StatusUpdated { game_id, status } => {
+            let partition_id = game_id % PARTITION_COUNT;
+            // Publish status update as an event
+            let event_msg = GameEventMessage {
+                game_id: *game_id,
+                tick: 0,
+                sequence: 0,
+                user_id: None,
+                event: GameEvent::StatusUpdated { status: status.clone() },
+            };
+            pubsub.publish_event(partition_id, &event_msg).await?;
+        }
+        StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
+            let partition_id = game_id % PARTITION_COUNT;
+            // Commands are sent directly to the game via channel, not through PubSub
+            // This is handled differently now
+            let serialized = serde_json::to_vec(command)?;
+            pubsub.publish_command(partition_id, &serialized).await?;
         }
     }
+    
+    Ok(())
 }
 
 /// Run the game executor service for a specific partition
@@ -244,26 +244,29 @@ pub async fn run_game_executor(
 ) -> Result<()> {
     info!("Starting game executor for server {} partition {}", server_id, partition_id);
 
-    // Create Redis connection
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client")?;
-    let mut redis_conn = ConnectionManager::new(client).await
-        .context("Failed to create Redis connection manager")?;
+    // Create PubSub manager
+    let mut pubsub = PubSubManager::new(&redis_url).await
+        .context("Failed to create PubSub manager")?;
     
-    // Stream key for this partition
-    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+    // Subscribe to partition commands and snapshot requests
+    let partition_sub = pubsub.subscribe_to_partition(partition_id).await
+        .context("Failed to subscribe to partition")?;
     
-    // Consumer group for this executor
-    let group_name = format!("executor-{}", server_id);
-    let consumer_name = format!("server-{}-partition-{}", server_id, partition_id);
+    let PartitionSubscription { 
+        partition_id: _,
+        mut event_receiver,
+        mut command_receiver,
+        mut snapshot_request_receiver
+    } = partition_sub;
     
-    // Create consumer group if it doesn't exist
-    let _: Result<(), _> = redis_conn.xgroup_create_mkstream(&stream_key, &group_name, "$").await;
-
     // Track game channels
-    let mut game_channels: HashMap<u32, mpsc::Sender<GameCommandMessage>> = HashMap::new();
+    let mut game_channels: HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)> = HashMap::new();
     
-    let try_start_game = |game_id: u32, game_state: GameState, redis_conn: ConnectionManager, stream_key: String, cancellation_token: CancellationToken, game_channels: &mut HashMap<u32, mpsc::Sender<GameCommandMessage>>| {
+    let try_start_game = |game_id: u32, 
+                          game_state: GameState, 
+                          pubsub: PubSubManager, 
+                          cancellation_token: CancellationToken, 
+                          game_channels: &mut HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)>| {
         if game_id % PARTITION_COUNT != partition_id {
             debug!("Game {} belongs to partition {}, not partition {}", game_id, game_id % PARTITION_COUNT, partition_id);
             return;
@@ -276,15 +279,14 @@ pub async fn run_game_executor(
         
         info!("Partition {} will start game {}", partition_id, game_id);
         
-        // Create a channel for this game
-        let (tx, rx) = mpsc::channel(100);
-        game_channels.insert(game_id, tx);
+        // Create channels for this game
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+        let (snap_tx, snap_rx) = mpsc::channel(10);
+        game_channels.insert(game_id, (cmd_tx, snap_tx));
         
         tokio::spawn(async move {
             // Run the game loop
-            run_game(server_id, game_id, game_state, redis_conn, stream_key, rx, cancellation_token).await;
-            // Remove from active games when done
-            // Note: In real implementation, you'd need a shared state for this
+            run_game(server_id, game_id, game_state, pubsub, cmd_rx, snap_rx, cancellation_token).await;
             info!("Game {} has ended", game_id);
         });
     };
@@ -298,94 +300,74 @@ pub async fn run_game_executor(
                 break;
             }
             
-            // Read from Redis stream using a consumer group
-            stream_read = async {
-                let options = StreamReadOptions::default()
-                    .group(&group_name, &consumer_name)
-                    .count(10)
-                    .block(5);
-                    
-                redis_conn.xread_options(&[&stream_key], &[">"], &options).await
-            } => {
-                match stream_read {
-                    Ok(reply) => {
-                        let reply: StreamReadReply = reply;
-                        for stream_data in reply.keys {
-                            for stream_id in stream_data.ids {
-                                let msg_id = stream_id.id.clone();
-                                
-                                // Parse the event from Redis stream
-                                if let Some(data) = stream_id.map.get("data") {
-                                    if let redis::Value::BulkString(bytes) = data {
-                                        match read_timestamped_event(bytes) {
-                                            Ok(event) => {
-                                                match event {
-                                                    StreamEvent::GameCreated { game_id, game_state } => {
-                                                        info!("Received GameCreated event for game {}", game_id);
-                                                        let redis_conn_clone = redis_conn.clone();
-                                                        let stream_key_clone = stream_key.clone();
-                                                        let cancellation_token_clone = cancellation_token.clone();
-                                                        try_start_game(
-                                                            game_id, 
-                                                            game_state, 
-                                                            redis_conn_clone, 
-                                                            stream_key_clone, 
-                                                            cancellation_token_clone, 
-                                                            &mut game_channels
-                                                        );
-                                                    }
-                                                    StreamEvent::StatusUpdated { game_id, status } => {
-                                                        match status {
-                                                            GameStatus::Stopped => {
-                                                                // Game stopped, it might need to be restarted
-                                                                // In this implementation, we'd need to fetch game state
-                                                                // from somewhere (e.g., Redis or database)
-                                                                debug!("Game {} stopped, may need restart", game_id);
-                                                            }
-                                                            GameStatus::Complete { .. } => {
-                                                                // Game completed, remove channel
-                                                                game_channels.remove(&game_id);
-                                                                info!("Game {} completed", game_id);
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                    StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
-                                                        // Route command to the appropriate game
-                                                        if let Some(tx) = game_channels.get(&game_id) {
-                                                            if let Err(e) = tx.send(command).await {
-                                                                warn!("Failed to send command to game {}: {}", game_id, e);
-                                                                // The game might have ended, remove from channels
-                                                                game_channels.remove(&game_id);
-                                                            }
-                                                        } else {
-                                                            debug!("Received command for inactive game {}", game_id);
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        // Other events are not routed to individual games
-                                                        debug!("Received event in partition executor: {:?}", event);
-                                                    }
-                                                }
-                                                
-                                                // Acknowledge the message
-                                                let _: Result<(), _> = redis_conn.xack(&stream_key, &group_name, &[&msg_id]).await;
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to parse stream event: {}", e);
-                                                // Still acknowledge to avoid reprocessing
-                                                let _: Result<(), _> = redis_conn.xack(&stream_key, &group_name, &[&msg_id]).await;
-                                            }
-                                        }
+            // Process events from partition channel  
+            Some(event) = event_receiver.recv() => {
+                // Events flow through to replication manager automatically via PubSub
+                // The replication manager is subscribed to the same partition channel
+                // We just need to publish snapshots to PubSub
+                if let GameEvent::Snapshot { .. } = &event.event {
+                    debug!("Received snapshot event for game {} on partition {}", event.game_id, partition_id);
+                }
+            }
+            
+            // Process snapshot requests
+            Some(request) = snapshot_request_receiver.recv() => {
+                debug!("Received snapshot request for partition {}", request.partition_id);
+                // Forward to all games in this partition
+                if request.partition_id == partition_id {
+                    for (game_id, (_, snap_tx)) in game_channels.iter() {
+                        let _ = snap_tx.send(request.clone()).await;
+                    }
+                }
+            }
+            
+            // Process commands from PubSub
+            Some(command_data) = command_receiver.recv() => {
+                // Deserialize and process the command
+                match serde_json::from_slice::<StreamEvent>(&command_data) {
+                    Ok(event) => {
+                        match event {
+                            StreamEvent::GameCreated { game_id, game_state } => {
+                                info!("Received GameCreated event for game {}", game_id);
+                                let pubsub_clone = pubsub.clone();
+                                let cancellation_token_clone = cancellation_token.clone();
+                                try_start_game(
+                                    game_id, 
+                                    game_state, 
+                                    pubsub_clone, 
+                                    cancellation_token_clone, 
+                                    &mut game_channels
+                                );
+                            }
+                            StreamEvent::StatusUpdated { game_id, status } => {
+                                match status {
+                                    GameStatus::Complete { .. } => {
+                                        // Game completed, remove channels
+                                        game_channels.remove(&game_id);
+                                        info!("Game {} completed", game_id);
                                     }
+                                    _ => {}
                                 }
+                            }
+                            StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
+                                // Route command to the appropriate game
+                                if let Some((cmd_tx, _)) = game_channels.get(&game_id) {
+                                    if let Err(e) = cmd_tx.send(command).await {
+                                        warn!("Failed to send command to game {}: {}", game_id, e);
+                                        // The game might have ended, remove from channels
+                                        game_channels.remove(&game_id);
+                                    }
+                                } else {
+                                    debug!("Received command for inactive game {}", game_id);
+                                }
+                            }
+                            _ => {
+                                debug!("Received other event in partition executor: {:?}", event);
                             }
                         }
                     }
                     Err(e) => {
-                        debug!("Failed to read from Redis stream: {}", e);
-                        // Sleep briefly before retrying
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        error!("Failed to deserialize command: {}", e);
                     }
                 }
             }

@@ -17,10 +17,9 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
 use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, DEFAULT_TICK_INTERVAL_MS};
-use crate::game_executor::{StreamEvent, publish_to_stream, PARTITION_COUNT};
+use crate::game_executor::{StreamEvent, PARTITION_COUNT};
+use crate::pubsub_manager::PubSubManager;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -235,10 +234,8 @@ pub async fn run_websocket_server(
 ) -> Result<()> {
 
     // Create shared Redis connection manager
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client")?;
-    let redis_conn = ConnectionManager::new(client).await
-        .context("Failed to create Redis connection manager")?;
+    let pubsub = PubSubManager::new(&redis_url).await
+        .context("Failed to create PubSub manager")?;
 
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -261,9 +258,9 @@ pub async fn run_websocket_server(
                         let connection_token = cancellation_token.child_token();
                         let jwt_verifier_clone = jwt_verifier.clone();
                         let db_pool_clone = db_pool.clone();
-                        let redis_conn_clone = redis_conn.clone();
+                        let pubsub_clone = pubsub.clone();
                         let replication_manager_clone = replication_manager.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, redis_conn_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone));
+                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone));
                         connection_handles.push(handle);
                     }
 
@@ -300,7 +297,7 @@ pub async fn run_websocket_server(
 
 async fn handle_websocket_connection(
     db_pool: PgPool,
-    redis_conn: ConnectionManager,
+    pubsub: PubSubManager,
     stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
@@ -406,7 +403,7 @@ async fn handle_websocket_connection(
                         let was_in_game = matches!(&state, ConnectionState::InGame { .. });
                         
                         // Clone the connection manager for this call
-                        let mut redis_conn_clone = redis_conn.clone();
+                        let mut pubsub_clone = pubsub.clone();
                         
                         let process_result = process_ws_message(
                             state,
@@ -415,7 +412,7 @@ async fn handle_websocket_connection(
                             &db_pool,
                             &ws_tx,
                             &mut ws_stream,
-                            &mut redis_conn_clone,
+                            &mut pubsub_clone,
                             &replication_manager,
                         ).await;
                         
@@ -510,7 +507,7 @@ async fn process_ws_message(
     db_pool: &PgPool,
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
-    redis_conn: &mut ConnectionManager,
+    pubsub: &mut PubSubManager,
     _replication_manager: &Arc<crate::replication::ReplicationManager>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
@@ -678,7 +675,7 @@ async fn process_ws_message(
                 WSMessage::CreateCustomGame { settings } => {
                     info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
                     
-                    match create_custom_game(db_pool, redis_conn, metadata.user_id, settings).await {
+                    match create_custom_game(db_pool, pubsub, metadata.user_id, settings).await {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
@@ -759,7 +756,7 @@ async fn process_ws_message(
                 WSMessage::CreateSoloGame => {
                     info!("User {} ({}) creating solo game", metadata.username, metadata.user_id);
                     
-                    match create_solo_game(db_pool, redis_conn, metadata.user_id).await {
+                    match create_solo_game(db_pool, pubsub, metadata.user_id).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -788,9 +785,8 @@ async fn process_ws_message(
         ConnectionState::InGame { metadata, game_id } => {
             match ws_message {
                 WSMessage::GameCommand(command_message) => {
-                    // Submit command directly to Redis stream
+                    // Submit command via PubSub
                     let partition_id = game_id % PARTITION_COUNT;
-                    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
                     
                     let event = StreamEvent::GameCommandSubmitted {
                         game_id,
@@ -798,13 +794,16 @@ async fn process_ws_message(
                         command: command_message,
                     };
                     
-                    match publish_to_stream(redis_conn, &stream_key, &event).await {
+                    // Send command via PubSub
+                    let serialized = serde_json::to_vec(&event)
+                        .context("Failed to serialize command")?;
+                    match pubsub.publish_command(partition_id, &serialized).await {
                         Ok(_) => {
-                            debug!("Successfully submitted game command to Redis stream: {:?}", event);
+                            debug!("Successfully submitted game command via PubSub: {:?}", event);
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
-                            error!("Failed to submit command to Redis stream: {}", e);
+                            error!("Failed to submit command via PubSub: {}", e);
                             // Keep the connection in game state, don't disconnect
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
@@ -850,16 +849,24 @@ async fn process_ws_message(
                     .fetch_one(db_pool)
                     .await?;
                     
-                    // Start the game by publishing StatusUpdated event to Redis
-                    let partition_id = game_id % PARTITION_COUNT;
-                    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
+                    // Start the game by publishing StatusUpdated event via PubSub
+                    let _partition_id = game_id % PARTITION_COUNT;
                     
-                    let status_event = StreamEvent::StatusUpdated { 
+                    let _status_event = StreamEvent::StatusUpdated { 
                         game_id,
                         status: GameStatus::Started { server_id: server_id as u64 },
                     };
                     
-                    match publish_to_stream(redis_conn, &stream_key, &status_event).await {
+                    // Publish game started event via PubSub
+                    let event_msg = GameEventMessage {
+                        game_id,
+                        tick: 0,
+                        sequence: 0,
+                        user_id: None,
+                        event: GameEvent::StatusUpdated { status: GameStatus::Started { server_id: server_id as u64 } },
+                    };
+                    let partition_id = game_id % crate::game_executor::PARTITION_COUNT;
+                    match pubsub.publish_event(partition_id, &event_msg).await {
                         Ok(_) => {
                             let response = WSMessage::CustomGameStarting;
                             let json_msg = serde_json::to_string(&response)?;
@@ -979,7 +986,7 @@ fn generate_game_code() -> String {
 
 async fn create_custom_game(
     pool: &PgPool,
-    redis_conn: &mut ConnectionManager,
+    pubsub: &mut PubSubManager,
     user_id: i32,
     settings: common::CustomGameSettings,
 ) -> Result<(u32, String)> {
@@ -1046,22 +1053,29 @@ async fn create_custom_game(
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
-    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {
         game_id: game_id_u32,
-        game_state,
+        game_state: game_state.clone(),
     };
     
-    publish_to_stream(redis_conn, &stream_key, &event).await
-        .context("Failed to publish GameCreated event to Redis stream")?;
+    // Publish initial snapshot when game is created
+    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
+    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+        .context("Failed to publish initial game snapshot")?;
+    
+    // Also send GameCreated event via partition command channel
+    let serialized = serde_json::to_vec(&event)
+        .context("Failed to serialize GameCreated event")?;
+    pubsub.publish_command(partition_id, &serialized).await
+        .context("Failed to publish GameCreated event")?;
     
     Ok((game_id as u32, game_code))
 }
 
 async fn create_solo_game(
     pool: &PgPool,
-    redis_conn: &mut ConnectionManager,
+    pubsub: &mut PubSubManager,
     user_id: i32,
 ) -> Result<u32> {
     // Get current server ID from database
@@ -1113,15 +1127,22 @@ async fn create_solo_game(
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
-    let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
     
     let event = StreamEvent::GameCreated {
         game_id: game_id_u32,
-        game_state,
+        game_state: game_state.clone(),
     };
     
-    publish_to_stream(redis_conn, &stream_key, &event).await
-        .context("Failed to publish GameCreated event to Redis stream")?;
+    // Publish initial snapshot when game is created
+    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
+    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+        .context("Failed to publish initial game snapshot")?;
+    
+    // Also send GameCreated event via partition command channel
+    let serialized = serde_json::to_vec(&event)
+        .context("Failed to serialize GameCreated event")?;
+    pubsub.publish_command(partition_id, &serialized).await
+        .context("Failed to publish GameCreated event")?;
     
     // Start the game immediately (no waiting in solo mode)
     let status_event = StreamEvent::StatusUpdated { 
@@ -1129,8 +1150,10 @@ async fn create_solo_game(
         status: GameStatus::Started { server_id: server_id as u64 },
     };
     
-    publish_to_stream(redis_conn, &stream_key, &status_event).await
-        .context("Failed to publish StatusUpdated event to Redis stream")?;
+    let status_serialized = serde_json::to_vec(&status_event)
+        .context("Failed to serialize StatusUpdated event")?;
+    pubsub.publish_command(partition_id, &status_serialized).await
+        .context("Failed to publish StatusUpdated event")?;
     
     Ok(game_id as u32)
 }

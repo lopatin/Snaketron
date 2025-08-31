@@ -1,13 +1,12 @@
 use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, debug};
-use common::{GameState, GameEvent, GameEventMessage, GameStatus};
-use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
-use crate::game_executor::{StreamEvent, PARTITION_COUNT, read_timestamped_event};
+use common::{GameState, GameEvent, GameEventMessage};
+use crate::pubsub_manager::PubSubManager;
+use crate::game_executor::PARTITION_COUNT;
 
 /// In-memory game state storage
 pub type GameStateStore = Arc<RwLock<HashMap<u32, GameState>>>;
@@ -20,7 +19,6 @@ pub type GameEventBroadcasters = Arc<RwLock<HashMap<u32, broadcast::Sender<GameE
 pub struct ReplicationStatus {
     pub partition_id: u32,
     pub is_ready: bool,
-    pub last_processed_id: String,
 }
 
 /// A wrapper around broadcast::Receiver that filters out events before a certain sequence number
@@ -50,39 +48,35 @@ impl FilteredEventReceiver {
     }
 }
 
-/// PartitionReplica subscribes to Redis stream partitions and maintains game states
+/// PartitionReplica subscribes to partition events via PubSub and maintains game states
 pub struct PartitionReplica {
     partition_id: u32,
-    redis_conn: ConnectionManager,
+    pubsub: Arc<Mutex<PubSubManager>>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
     status: Arc<RwLock<ReplicationStatus>>,
-    stream_key: String,
     cancellation_token: CancellationToken,
 }
 
 impl PartitionReplica {
     pub fn new(
         partition_id: u32,
-        redis_conn: ConnectionManager,
+        pubsub: Arc<Mutex<PubSubManager>>,
         game_states: GameStateStore,
         game_event_broadcasters: GameEventBroadcasters,
         cancellation_token: CancellationToken,
     ) -> Self {
-        let stream_key = format!("snaketron:game-events:partition-{}", partition_id);
         let status = Arc::new(RwLock::new(ReplicationStatus {
             partition_id,
-            is_ready: false,
-            last_processed_id: "0-0".to_string(),
+            is_ready: true, // With PubSub, we're immediately ready
         }));
 
         Self {
             partition_id,
-            redis_conn,
+            pubsub,
             game_states,
             game_event_broadcasters,
             status,
-            stream_key,
             cancellation_token,
         }
     }
@@ -92,228 +86,66 @@ impl PartitionReplica {
         self.status.clone()
     }
     
-    /// Get the current tail ID of the stream to use as a catch-up target
-    async fn get_stream_tail_id(&mut self) -> Option<String> {
-        // Use XINFO STREAM to get stream info including last-generated-id
-        let cmd = redis::cmd("XINFO")
-            .arg("STREAM")
-            .arg(&self.stream_key)
-            .clone();
+    /// Process a game event and update the game state
+    async fn process_event(&self, event_msg: GameEventMessage) -> Result<()> {
+        let game_id = event_msg.game_id;
+        debug!("Processing game event for game {} in partition {}", game_id, self.partition_id);
         
-        match self.redis_conn.send_packed_command(&cmd).await {
-            Ok(redis::Value::Array(info)) => {
-                // Parse the XINFO STREAM response to find last-generated-id
-                let mut last_id = None;
-                let mut i = 0;
-                while i < info.len() - 1 {
-                    if let redis::Value::BulkString(key) = &info[i] {
-                        if key == b"last-generated-id" {
-                            if let redis::Value::BulkString(id) = &info[i + 1] {
-                                if let Ok(id_str) = String::from_utf8(id.clone()) {
-                                    last_id = Some(id_str);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    i += 2;
-                }
-                
-                if let Some(id) = last_id {
-                    info!("Partition {} will catch up to stream position: {}", 
-                        self.partition_id, id);
-                    Some(id)
-                } else {
-                    info!("Partition {} stream has no last-generated-id", self.partition_id);
-                    None
-                }
-            }
-            Ok(_) => {
-                warn!("Unexpected response format from XINFO STREAM for partition {}", self.partition_id);
-                None
-            }
-            Err(e) => {
-                // Stream might not exist yet, which is fine
-                debug!("Failed to get stream info for partition {}: {}. Stream might be empty.", 
-                    self.partition_id, e);
-                None
-            }
-        }
-    }
-
-    /// Process a single stream event and update the game state
-    async fn process_event(&self, event: StreamEvent) -> Result<()> {
-        match event {
-            StreamEvent::GameEvent(event_msg) => {
-                let game_id = event_msg.game_id;
-                debug!("Processing game event for game {} in partition {}", game_id, self.partition_id);
+        match &event_msg.event {
+            GameEvent::Snapshot { game_state } => {
+                info!("Received snapshot for game {} at tick {}", game_id, event_msg.tick);
+                // Always update with the latest snapshot
                 let mut states = self.game_states.write().await;
-                
-                match &event_msg.event {
-                    GameEvent::Snapshot { game_state } => {
-                        info!("Received snapshot for game {} at tick {}", game_id, event_msg.tick);
-                        // Always update with the latest snapshot
-                        states.insert(game_id, game_state.clone());
-                    }
-                    _ => {
-                        if let Some(game_state) = states.get_mut(&game_id) {
-                            // Tick forward until we reach the event's tick
-                            if event_msg.tick > game_state.tick {
-                                if let Err(e) = game_state.tick_forward() {
-                                    error!("Error during tick_forward: {:?}", e);
-                                }
-                            }
-
-                            // Apply event to game state
-                            game_state.apply_event(event_msg.event.clone(), None);
-                            debug!("Applied event to game {} state: {:?}", game_id, event_msg.event);
-                        } else {
-                            warn!("Received event for unknown game {}", game_id);
-                        }                       
-                    }
-                }
-                
-                // Broadcast the event to any subscribers
-                {
-                    let broadcasters = self.game_event_broadcasters.read().await;
-                    if let Some(sender) = broadcasters.get(&game_id) {
-                        // Ignore send errors (means no receivers)
-                        let _ = sender.send(event_msg);
-                    }
-                }
+                states.insert(game_id, game_state.clone());
             }
-            StreamEvent::StatusUpdated { game_id, status } => {
+            _ => {
                 let mut states = self.game_states.write().await;
                 if let Some(game_state) = states.get_mut(&game_id) {
-                    game_state.status = status.clone();
-                    debug!("Updated status for game {} to {:?}", game_id, status);
-                    
-                    // Remove completed games from memory after some time
-                    if matches!(status, GameStatus::Complete { .. }) {
-                        // In production, you might want to keep completed games for a while
-                        // or move them to a different storage
-                        info!("Game {} completed, removing from replication", game_id);
-                        states.remove(&game_id);
-                        
-                        // Also remove the broadcast channel
-                        let mut broadcasters = self.game_event_broadcasters.write().await;
-                        broadcasters.remove(&game_id);
+                    // Tick forward until we reach the event's tick
+                    if event_msg.tick > game_state.tick {
+                        if let Err(e) = game_state.tick_forward() {
+                            error!("Error during tick_forward: {:?}", e);
+                        }
                     }
-                }
-            }
-            StreamEvent::GameCreated { game_id, game_state } => {
-                // Clear any existing state for this game ID to handle test reruns
-                // or game ID reuse scenarios
-                info!("Processing GameCreated for game {} in partition {}", game_id, self.partition_id);
-                let mut states = self.game_states.write().await;
-                states.insert(game_id, game_state);
-                
-                // Also clear any existing broadcast channel
-                let mut broadcasters = self.game_event_broadcasters.write().await;
-                broadcasters.remove(&game_id);
-            }
-            StreamEvent::GameCommandSubmitted { .. } => {
-                // Commands are not relevant for state replication
-                debug!("Ignoring GameCommandSubmitted event for replication");
+
+                    // Apply event to game state
+                    game_state.apply_event(event_msg.event.clone(), None);
+                    debug!("Applied event to game {} state: {:?}", game_id, event_msg.event);
+                } else {
+                    warn!("Received event for unknown game {}", game_id);
+                }                       
             }
         }
+        
+        // Broadcast the event to any local subscribers
+        {
+            let broadcasters = self.game_event_broadcasters.read().await;
+            if let Some(sender) = broadcasters.get(&game_id) {
+                // Ignore send errors (means no receivers)
+                let _ = sender.send(event_msg);
+            }
+        }
+        
         Ok(())
     }
 
-    /// Catch up by reading all events from the stream
-    async fn catch_up(&mut self) -> Result<()> {
-        info!("Starting catch-up for partition {}", self.partition_id);
-        
-        // First, get the current tail of the stream to have a fixed target
-        let target_id = self.get_stream_tail_id().await;
-        
-        let mut last_id = "0-0".to_string();
-        let mut events_processed = 0;
-        
-        loop {
-            // Read in batches
-            let options = StreamReadOptions::default()
-                .count(100); // Read up to 100 messages at a time
-                
-            let reply: StreamReadReply = self.redis_conn
-                .xread_options(&[&self.stream_key], &[&last_id], &options)
-                .await
-                .context("Failed to read from stream during catch-up")?;
-            
-            let mut batch_empty = true;
-            let mut reached_target = false;
-            
-            for stream_data in reply.keys {
-                for stream_id in stream_data.ids {
-                    batch_empty = false;
-                    let current_id = stream_id.id.clone();
-                    
-                    // Parse and process the event
-                    if let Some(data) = stream_id.map.get("data") {
-                        if let redis::Value::BulkString(bytes) = data {
-                            match read_timestamped_event(bytes) {
-                                Ok(event) => {
-                                    if let Err(e) = self.process_event(event).await {
-                                        error!("Failed to process event during catch-up: {}", e);
-                                    } else {
-                                        // Only process games that belong to this partition
-                                        events_processed += 1;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to parse stream event during catch-up: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Check if we've reached our target
-                    if let Some(ref target) = target_id {
-                        if &current_id == target {
-                            reached_target = true;
-                            info!("Partition {} reached target position during catch-up", self.partition_id);
-                        }
-                    }
-                    
-                    last_id = current_id;
-                }
-            }
-            
-            // Update status
-            self.status.write().await.last_processed_id = last_id.clone();
-            
-            if events_processed % 1000 == 0 {
-                info!("Partition {} catch-up progress: {} events processed", 
-                    self.partition_id, events_processed);
-            }
-
-            // Exit if we've reached our target or if there are no more messages
-            if reached_target || batch_empty {
-                break;
-            }
-        }
-
-        Ok(())
-    }
 
     /// Run the replication worker
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         info!("Starting replication worker for partition {}", self.partition_id);
         
-        // First, catch up with existing events
-        self.catch_up().await?;
+        // Subscribe to the partition
+        let mut pubsub = self.pubsub.lock().await;
+        let mut subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
         
-        // Catch up again
-        self.catch_up().await?;
-
-        // Mark as ready
+        // Request initial snapshots for this partition
+        pubsub.request_partition_snapshots(self.partition_id).await?;
+        drop(pubsub); // Release lock
+        
+        // Mark as ready immediately (no catch-up needed with PubSub)
         self.status.write().await.is_ready = true;
 
-        info!("Partition {} catch-up complete to last ID: {}", 
-            self.partition_id, self.status.read().await.last_processed_id);
-
-        // Then, continuously process new events
-        let mut last_id = self.status.read().await.last_processed_id.clone();
+        // Main event processing loop
         loop {
             tokio::select! {
                 biased;
@@ -323,47 +155,10 @@ impl PartitionReplica {
                     break;
                 }
                 
-                // Read new events with blocking
-                stream_read = async {
-                    let options = StreamReadOptions::default()
-                        .count(10)
-                        .block(5);
-                    
-                    self.redis_conn.xread_options(&[&self.stream_key], &[&last_id], &options).await
-                } => {
-                    match stream_read {
-                        Ok(reply) => {
-                            let reply: StreamReadReply = reply;
-                            for stream_data in reply.keys {
-                                for stream_id in stream_data.ids {
-                                    last_id = stream_id.id.clone();
-                                    
-                                    // Parse and process the event
-                                    if let Some(data) = stream_id.map.get("data") {
-                                        if let redis::Value::BulkString(bytes) = data {
-                                            match read_timestamped_event(bytes) {
-                                                Ok(event) => {
-                                                    if let Err(e) = self.process_event(event).await {
-                                                        error!("Failed to process event: {}", e);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to parse stream event: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Update status
-                                    self.status.write().await.last_processed_id = last_id.clone();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to read from Redis stream: {}", e);
-                            // Sleep briefly before retrying
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        }
+                // Process events from partition subscription
+                Some(event) = subscription.recv_event() => {
+                    if let Err(e) = self.process_event(event).await {
+                        error!("Failed to process event in partition {}: {}", self.partition_id, e);
                     }
                 }
             }
@@ -379,6 +174,7 @@ pub struct ReplicationManager {
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
     statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
+    pubsub: Arc<Mutex<PubSubManager>>,
 }
 
 /// API for querying replicated game states
@@ -408,13 +204,7 @@ impl GameStateReader for ReplicationManager {
     }
     
     async fn is_ready(&self) -> bool {
-        let statuses = self.statuses.read().await;
-        for (_, status) in statuses.iter() {
-            let s = status.read().await;
-            if !s.is_ready {
-                return false;
-            }
-        }
+        // With PubSub, we're always ready
         true
     }
 }
@@ -423,20 +213,11 @@ impl ReplicationManager {
     /// Subscribe to game events for a specific game
     /// Returns the current game state as a snapshot and a receiver for subsequent events
     pub async fn subscribe_to_game(&self, game_id: u32) -> Result<(GameState, FilteredEventReceiver)> {
-        // Wait for replication to be ready first
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
+        // Get state from memory or fail
+        let game_state = self.get_game_state(game_id).await
+            .context("Game not available in replication manager")?;
         
-        while !self.is_ready().await {
-            if start.elapsed() > timeout {
-                return Err(anyhow::anyhow!("Timeout waiting for replication to be ready"));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        
-        // Get or create broadcast channel for this game and subscribe first
-        // This prevents race conditions where events could be broadcast between
-        // getting the snapshot and subscribing
+        // Get or create broadcast channel for this game
         let receiver = {
             let mut broadcasters = self.game_event_broadcasters.write().await;
             let sender = broadcasters.entry(game_id)
@@ -445,61 +226,22 @@ impl ReplicationManager {
                     tx
                 });
             
-            // Subscribe while holding the lock to ensure atomicity
             sender.subscribe()
-            // Lock is dropped here
         };
         
-        // Now get current game state with retry logic to handle race conditions
-        // This is especially important for newly created games where the GameCreated
-        // event might not have been processed by the replication manager yet
-        let mut game_state = None;
-        let state_start = std::time::Instant::now();
-        let state_timeout = std::time::Duration::from_secs(5); // 5 second timeout for game state
-        
-        while game_state.is_none() {
-            game_state = self.get_game_state(game_id).await;
-            
-            if game_state.is_none() {
-                if state_start.elapsed() > state_timeout {
-                    return Err(anyhow::anyhow!("Game {} not found after {} seconds", game_id, state_timeout.as_secs()));
-                }
-                debug!("Game {} not found yet, retrying... (elapsed: {:?})", game_id, state_start.elapsed());
-                // Short sleep before retry
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        
-        let game_state = game_state.unwrap();
-        info!("Successfully found game state for game {} after {:?}", game_id, state_start.elapsed());
-        
-        // Filter out any events that are already included in the snapshot
+        // Create filtered receiver
         let snapshot_sequence = game_state.event_sequence;
         let filtered_receiver = FilteredEventReceiver {
             inner: receiver,
-            min_sequence: snapshot_sequence, // Only accept events with sequence > snapshot_sequence
+            min_sequence: snapshot_sequence,
             game_id,
         };
         
         Ok((game_state, filtered_receiver))
     }
     
-    /// Get a game state, waiting for replication to be ready first
-    /// This is the main method that game executors should use
+    /// Get a game state, always ready with PubSub
     pub async fn get_game_state_when_ready(&self, game_id: u32) -> Option<GameState> {
-        // Wait for replication to be ready (with timeout)
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
-        
-        while !self.is_ready().await {
-            if start.elapsed() > timeout {
-                warn!("Timeout waiting for replication to be ready when fetching game {}", game_id);
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        
-        // Now get the game state
         self.get_game_state(game_id).await
     }
     
@@ -507,18 +249,21 @@ impl ReplicationManager {
     pub async fn new(
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
-        redis_conn: ConnectionManager,
+        redis_url: &str,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
         
+        // Create PubSub manager
+        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url).await?));
+        
         for partition_id in partitions {
             // Create worker
             let worker = PartitionReplica::new(
                 partition_id,
-                redis_conn.clone(),
+                pubsub.clone(),
                 game_states.clone(),
                 game_event_broadcasters.clone(),
                 cancellation_token.clone(),
@@ -540,6 +285,7 @@ impl ReplicationManager {
             game_states,
             game_event_broadcasters,
             statuses,
+            pubsub,
         })
     }
     
@@ -548,15 +294,8 @@ impl ReplicationManager {
         self.game_states.clone()
     }
     
-    /// Check if all workers are ready
+    /// Check if all workers are ready (always true with PubSub)
     pub async fn is_ready(&self) -> bool {
-        let statuses = self.statuses.read().await;
-        for (_, status) in statuses.iter() {
-            let s = status.read().await;
-            if !s.is_ready {
-                return false;
-            }
-        }
         true
     }
     

@@ -114,7 +114,7 @@ impl GameServer {
             ReplicationManager::new(
                 replication_partitions,
                 cancellation_token.clone(),
-                redis_conn.clone(),
+                &redis_url,
             ).await.context("Failed to create replication manager")?
         );
         
