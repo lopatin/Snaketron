@@ -169,9 +169,13 @@ export const useGameEngine = ({
     }
 
     try {
-      // For solo games, the player ID is typically the user's ID from auth
-      // The snake ID is usually 0 for the first/only snake
-      const snakeId = 0; // In solo games, there's typically only one snake with ID 0
+      // Look up the snake ID for the current player from the game state
+      const snakeId = engineRef.current.getSnakeIdForUser(playerId);
+      
+      if (snakeId === undefined || snakeId === null) {
+        console.error('Cannot find snake for player ID:', playerId);
+        return;
+      }
 
       // Process command based on type
       let commandMessageJson: string;

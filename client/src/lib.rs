@@ -176,6 +176,21 @@ impl GameClient {
     pub fn get_game_id(&self) -> u32 {
         self.engine.game_id()
     }
+    
+    /// Get the snake ID for a given user ID
+    /// Returns None if the user is not in the game
+    #[wasm_bindgen(js_name = getSnakeIdForUser)]
+    pub fn get_snake_id_for_user(&self, user_id: u32) -> Option<u32> {
+        // Get the predicted state and look up the player
+        if let Ok(state_json) = self.engine.get_predicted_state_json() {
+            if let Ok(state) = serde_json::from_str::<GameState>(&state_json) {
+                if let Some(player) = state.players.get(&user_id) {
+                    return Some(player.snake_id);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Render functions exposed to JavaScript

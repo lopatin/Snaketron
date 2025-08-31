@@ -579,33 +579,77 @@ impl GameState {
         };
         
         // Rearrange all snakes to their starting positions
-        for (idx, (_player_id, player)) in self.players.iter().enumerate() {
-            if idx < starting_positions.len() {
-                let (head_pos, direction) = &starting_positions[idx];
+        // Use deterministic assignment based on team or snake_id
+        if let GameType::TeamMatch { .. } = &self.game_type {
+            // For team games, assign positions based on team_id
+            for (_user_id, player) in self.players.iter() {
                 let snake = &mut self.arena.snakes[player.snake_id as usize];
                 
-                // Build compressed snake body: just head and tail for a straight snake
-                let tail_pos = match direction {
-                    Direction::Left => Position { 
-                        x: head_pos.x + (snake_length - 1) as i16, 
-                        y: head_pos.y 
-                    },
-                    Direction::Right => Position { 
-                        x: head_pos.x - (snake_length - 1) as i16, 
-                        y: head_pos.y 
-                    },
-                    Direction::Up => Position { 
-                        x: head_pos.x, 
-                        y: head_pos.y + (snake_length - 1) as i16 
-                    },
-                    Direction::Down => Position { 
-                        x: head_pos.x, 
-                        y: head_pos.y - (snake_length - 1) as i16 
-                    },
+                // Determine position index based on team
+                let position_idx = match snake.team_id {
+                    Some(TeamId::TeamA) => 0,  // TeamA gets first position (left endzone)
+                    Some(TeamId::TeamB) => 1,  // TeamB gets second position (right endzone)
+                    None => continue,  // Should not happen in team games
                 };
                 
-                snake.body = vec![*head_pos, tail_pos];
-                snake.direction = *direction;
+                if position_idx < starting_positions.len() {
+                    let (head_pos, direction) = &starting_positions[position_idx];
+                    
+                    // Build compressed snake body: just head and tail for a straight snake
+                    let tail_pos = match direction {
+                        Direction::Left => Position { 
+                            x: head_pos.x + (snake_length - 1) as i16, 
+                            y: head_pos.y 
+                        },
+                        Direction::Right => Position { 
+                            x: head_pos.x - (snake_length - 1) as i16, 
+                            y: head_pos.y 
+                        },
+                        Direction::Up => Position { 
+                            x: head_pos.x, 
+                            y: head_pos.y + (snake_length - 1) as i16 
+                        },
+                        Direction::Down => Position { 
+                            x: head_pos.x, 
+                            y: head_pos.y - (snake_length - 1) as i16 
+                        },
+                    };
+                    
+                    snake.body = vec![*head_pos, tail_pos];
+                    snake.direction = *direction;
+                }
+            }
+        } else {
+            // For non-team games, use snake_id as position index for deterministic assignment
+            for (_user_id, player) in self.players.iter() {
+                let snake_id = player.snake_id as usize;
+                if snake_id < starting_positions.len() {
+                    let (head_pos, direction) = &starting_positions[snake_id];
+                    let snake = &mut self.arena.snakes[snake_id];
+                    
+                    // Build compressed snake body: just head and tail for a straight snake
+                    let tail_pos = match direction {
+                        Direction::Left => Position { 
+                            x: head_pos.x + (snake_length - 1) as i16, 
+                            y: head_pos.y 
+                        },
+                        Direction::Right => Position { 
+                            x: head_pos.x - (snake_length - 1) as i16, 
+                            y: head_pos.y 
+                        },
+                        Direction::Up => Position { 
+                            x: head_pos.x, 
+                            y: head_pos.y + (snake_length - 1) as i16 
+                        },
+                        Direction::Down => Position { 
+                            x: head_pos.x, 
+                            y: head_pos.y - (snake_length - 1) as i16 
+                        },
+                    };
+                    
+                    snake.body = vec![*head_pos, tail_pos];
+                    snake.direction = *direction;
+                }
             }
         }
         

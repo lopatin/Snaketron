@@ -31,6 +31,13 @@ pub enum StreamEvent {
     },
 }
 
+/// Wrapper for StreamEvent that includes timestamp for latency tracking
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TimestampedStreamEvent {
+    pub event: StreamEvent,
+    pub timestamp_ms: i64,
+}
+
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
     server_id: u64,
@@ -146,14 +153,19 @@ async fn run_game(
     }
 }
 
-/// Helper function to publish events to Redis stream
-pub async fn publish_to_stream(
+/// Helper function to publish events to Redis stream with timestamp
+pub async fn publish_to_stream_with_timestamp(
     redis_conn: &mut ConnectionManager,
     stream_key: &str,
     event: &StreamEvent,
 ) -> Result<()> {
-    let data = serde_json::to_vec(event)
-        .context("Failed to serialize stream event")?;
+    let timestamped_event = TimestampedStreamEvent {
+        event: event.clone(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    
+    let data = serde_json::to_vec(&timestamped_event)
+        .context("Failed to serialize timestamped stream event")?;
     
     let _: String = redis_conn.xadd(
         stream_key,
@@ -163,6 +175,63 @@ pub async fn publish_to_stream(
     .context("Failed to add event to Redis stream")?;
     
     Ok(())
+}
+
+/// Legacy helper function to publish events to Redis stream (for backward compatibility)
+pub async fn publish_to_stream(
+    redis_conn: &mut ConnectionManager,
+    stream_key: &str,
+    event: &StreamEvent,
+) -> Result<()> {
+    // Use the timestamped version internally
+    publish_to_stream_with_timestamp(redis_conn, stream_key, event).await
+}
+
+/// Helper function to read and deserialize timestamped events with latency tracking
+pub fn read_timestamped_event(bytes: &[u8]) -> Result<StreamEvent> {
+    // Try to deserialize as TimestampedStreamEvent first
+    match serde_json::from_slice::<TimestampedStreamEvent>(bytes) {
+        Ok(timestamped) => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let latency_ms = now_ms - timestamped.timestamp_ms;
+            
+            // Extract event details for logging
+            let (event_type, game_id) = match &timestamped.event {
+                StreamEvent::GameCreated { game_id, .. } => ("GameCreated", Some(*game_id)),
+                StreamEvent::GameCommandSubmitted { game_id, .. } => ("GameCommandSubmitted", Some(*game_id)),
+                StreamEvent::GameEvent(msg) => {
+                    let event_name = match &msg.event {
+                        GameEvent::Snapshot { .. } => "Snapshot",
+                        GameEvent::SnakeTurned { .. } => "SnakeTurned",
+                        GameEvent::SnakeDied { .. } => "SnakeDied",
+                        GameEvent::FoodSpawned { .. } => "FoodSpawned",
+                        GameEvent::FoodEaten { .. } => "FoodEaten",
+                        GameEvent::StatusUpdated { .. } => "StatusUpdated",
+                        GameEvent::CommandScheduled { .. } => "CommandScheduled",
+                    };
+                    (event_name, Some(msg.game_id))
+                },
+                StreamEvent::StatusUpdated { game_id, .. } => ("StatusUpdated", Some(*game_id)),
+            };
+            
+            // Log latency with context
+            if latency_ms > 100 {
+                warn!("High Redis stream latency: {}ms for {} event (game: {:?})", 
+                    latency_ms, event_type, game_id);
+            } else if latency_ms > 20 {
+                debug!("Redis stream latency: {}ms for {} event (game: {:?})", 
+                    latency_ms, event_type, game_id);
+            }
+            
+            Ok(timestamped.event)
+        }
+        Err(_) => {
+            // Fall back to deserializing as plain StreamEvent for backward compatibility
+            debug!("Reading non-timestamped event (legacy format)");
+            serde_json::from_slice::<StreamEvent>(bytes)
+                .context("Failed to deserialize stream event")
+        }
+    }
 }
 
 /// Run the game executor service for a specific partition
@@ -234,7 +303,7 @@ pub async fn run_game_executor(
                 let options = StreamReadOptions::default()
                     .group(&group_name, &consumer_name)
                     .count(10)
-                    .block(100);
+                    .block(5);
                     
                 redis_conn.xread_options(&[&stream_key], &[">"], &options).await
             } => {
@@ -248,7 +317,7 @@ pub async fn run_game_executor(
                                 // Parse the event from Redis stream
                                 if let Some(data) = stream_id.map.get("data") {
                                     if let redis::Value::BulkString(bytes) = data {
-                                        match serde_json::from_slice::<StreamEvent>(bytes) {
+                                        match read_timestamped_event(bytes) {
                                             Ok(event) => {
                                                 match event {
                                                     StreamEvent::GameCreated { game_id, game_state } => {

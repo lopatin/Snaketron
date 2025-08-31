@@ -27,7 +27,7 @@ declare module 'wasm-snaketron' {
     };
     game_type: GameType;
     properties: any;
-    players: Record<number, { snake_id: number }>;
+    players: Record<number, { user_id: number; snake_id: number }>;
     game_id: string;
   }
 
@@ -54,6 +54,7 @@ declare module 'wasm-snaketron' {
     getCommittedTick(): number;
     getPredictedTick(): number;
     getGameId(): number;
+    getSnakeIdForUser(userId: number): number | undefined;
   }
 
   export class Game {
@@ -62,7 +63,7 @@ declare module 'wasm-snaketron' {
   }
 
   export function render(game: GameClient, canvas: HTMLCanvasElement): void;
-  export function render_game(gameStateJson: string, canvas: HTMLCanvasElement, cellSize: number): void;
+  export function render_game(gameStateJson: string, canvas: HTMLCanvasElement, cellSize: number, localUserId: number | null): void;
 
   const init: () => Promise<void>;
   export default init;

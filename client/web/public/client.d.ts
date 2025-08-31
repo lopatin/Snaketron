@@ -2,9 +2,9 @@
 /* eslint-disable */
 /**
  * Renders the game state to a canvas element
- * Takes a JSON string representation of the game state
+ * Takes a JSON string representation of the game state and the local user ID
  */
-export function render_game(game_state_json: string, canvas: HTMLCanvasElement, cell_size: number): void;
+export function render_game(game_state_json: string, canvas: HTMLCanvasElement, cell_size: number, local_user_id?: number | null): void;
 /**
  * The main client-side game interface exposed to JavaScript.
  * This wraps the GameEngine and provides a clean WASM boundary.
@@ -18,16 +18,17 @@ export class GameClient {
   /**
    * Creates a new game client instance from an existing game state
    */
-  static newFromState(game_id: number, start_ms: bigint, state_json: string): GameClient;
+  static newFromState(game_id: number, state_json: string): GameClient;
   /**
    * Set the local player ID
    */
   setLocalPlayerId(player_id: number): void;
   /**
    * Run the game engine until the specified timestamp
-   * Returns a JSON array of game events that occurred
+   * Returns a JSON array of game events that occurred with their tick numbers
    */
   runUntil(ts_ms: bigint): string;
+  rebuildPredictedState(ts_ms: bigint): void;
   /**
    * Process a turn command for a snake with client-side prediction
    * Returns the command message that should be sent to the server
@@ -36,7 +37,7 @@ export class GameClient {
   /**
    * Process a server event for reconciliation
    */
-  processServerEvent(event_message_json: string, current_ts: bigint): void;
+  processServerEvent(event_message_json: string): void;
   /**
    * Initialize game state from a snapshot
    */
@@ -54,33 +55,50 @@ export class GameClient {
    */
   getEventLogJson(): string;
   /**
-   * Get the current tick number
+   * Get the current tick number (alias for getCommittedTick)
    */
   getCurrentTick(): number;
+  /**
+   * Get the committed tick number (server-authoritative state tick)
+   */
+  getCommittedTick(): number;
+  /**
+   * Get the predicted tick number (client-side predicted state tick)
+   */
+  getPredictedTick(): number;
   /**
    * Get the game ID
    */
   getGameId(): number;
+  /**
+   * Get the snake ID for a given user ID
+   * Returns None if the user is not in the game
+   */
+  getSnakeIdForUser(user_id: number): number | undefined;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
-  readonly render_game: (a: number, b: number, c: any, d: number) => [number, number];
+  readonly render_game: (a: number, b: number, c: any, d: number, e: number) => [number, number];
   readonly __wbg_gameclient_free: (a: number, b: number) => void;
   readonly gameclient_new: (a: number, b: bigint) => number;
-  readonly gameclient_newFromState: (a: number, b: bigint, c: number, d: number) => [number, number, number];
+  readonly gameclient_newFromState: (a: number, b: number, c: number) => [number, number, number];
   readonly gameclient_setLocalPlayerId: (a: number, b: number) => void;
   readonly gameclient_runUntil: (a: number, b: bigint) => [number, number, number, number];
+  readonly gameclient_rebuildPredictedState: (a: number, b: bigint) => [number, number];
   readonly gameclient_processTurn: (a: number, b: number, c: number, d: number) => [number, number, number, number];
-  readonly gameclient_processServerEvent: (a: number, b: number, c: number, d: bigint) => [number, number];
+  readonly gameclient_processServerEvent: (a: number, b: number, c: number) => [number, number];
   readonly gameclient_initializeFromSnapshot: (a: number, b: number, c: number, d: bigint) => [number, number];
   readonly gameclient_getGameStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getCommittedStateJson: (a: number) => [number, number, number, number];
   readonly gameclient_getEventLogJson: (a: number) => [number, number, number, number];
-  readonly gameclient_getCurrentTick: (a: number) => number;
+  readonly gameclient_getCommittedTick: (a: number) => number;
+  readonly gameclient_getPredictedTick: (a: number) => number;
   readonly gameclient_getGameId: (a: number) => number;
+  readonly gameclient_getSnakeIdForUser: (a: number, b: number) => number;
+  readonly gameclient_getCurrentTick: (a: number) => number;
   readonly __wbindgen_exn_store: (a: number) => void;
   readonly __externref_table_alloc: () => number;
   readonly __wbindgen_export_2: WebAssembly.Table;

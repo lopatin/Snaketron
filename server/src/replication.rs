@@ -7,7 +7,7 @@ use tracing::{info, error, warn, debug};
 use common::{GameState, GameEvent, GameEventMessage, GameStatus};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
-use crate::game_executor::{StreamEvent, PARTITION_COUNT};
+use crate::game_executor::{StreamEvent, PARTITION_COUNT, read_timestamped_event};
 
 /// In-memory game state storage
 pub type GameStateStore = Arc<RwLock<HashMap<u32, GameState>>>;
@@ -146,6 +146,7 @@ impl PartitionReplica {
         match event {
             StreamEvent::GameEvent(event_msg) => {
                 let game_id = event_msg.game_id;
+                debug!("Processing game event for game {} in partition {}", game_id, self.partition_id);
                 let mut states = self.game_states.write().await;
                 
                 match &event_msg.event {
@@ -250,7 +251,7 @@ impl PartitionReplica {
                     // Parse and process the event
                     if let Some(data) = stream_id.map.get("data") {
                         if let redis::Value::BulkString(bytes) = data {
-                            match serde_json::from_slice::<StreamEvent>(bytes) {
+                            match read_timestamped_event(bytes) {
                                 Ok(event) => {
                                     if let Err(e) = self.process_event(event).await {
                                         error!("Failed to process event during catch-up: {}", e);
@@ -326,7 +327,7 @@ impl PartitionReplica {
                 stream_read = async {
                     let options = StreamReadOptions::default()
                         .count(10)
-                        .block(100);
+                        .block(5);
                     
                     self.redis_conn.xread_options(&[&self.stream_key], &[&last_id], &options).await
                 } => {
@@ -340,7 +341,7 @@ impl PartitionReplica {
                                     // Parse and process the event
                                     if let Some(data) = stream_id.map.get("data") {
                                         if let redis::Value::BulkString(bytes) = data {
-                                            match serde_json::from_slice::<StreamEvent>(bytes) {
+                                            match read_timestamped_event(bytes) {
                                                 Ok(event) => {
                                                     if let Err(e) = self.process_event(event).await {
                                                         error!("Failed to process event: {}", e);

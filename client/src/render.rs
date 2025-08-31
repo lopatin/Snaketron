@@ -3,9 +3,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 /// Renders the game state to a canvas element
-/// Takes a JSON string representation of the game state
+/// Takes a JSON string representation of the game state and the local user ID
 #[wasm_bindgen]
-pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, cell_size: f64) -> Result<(), JsValue> {
+pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, cell_size: f64, local_user_id: Option<u32>) -> Result<(), JsValue> {
     // Parse the JSON game state
     let game_state: Value = serde_json::from_str(game_state_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse game state: {}", e)))?;
@@ -225,32 +225,37 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         }
     }
 
+    // Determine which snake belongs to the local player
+    let local_snake_id = if let Some(user_id) = local_user_id {
+        if let Some(players) = game_state["players"].as_object() {
+            players.get(&user_id.to_string())
+                .and_then(|player| player["snake_id"].as_u64())
+                .map(|id| id as usize)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Draw snakes
     if let Some(snakes) = arena["snakes"].as_array() {
         for (index, snake) in snakes.iter().enumerate() {
             if snake["is_alive"].as_bool().unwrap_or(false) {
-                // Choose snake color based on team_id if present, otherwise based on index
-                let (color, border_color) = if let Some(team_id) = snake["team_id"].as_str() {
-                    match team_id {
-                        "TeamA" => ("#70bfe3", "#5299bb"),  // Blue team
-                        "TeamB" => ("#ff6b6b", "#b84444"),  // Red team
-                        _ => {
-                            // Fallback to index-based colors
-                            match index % 4 {
-                                0 => ("#70bfe3", "#5299bb"),
-                                1 => ("#556270", "#353c47"),
-                                2 => ("#ff6b6b", "#b84444"),
-                                _ => ("#f7b731", "#a87d1f"),
-                            }
-                        }
-                    }
+                // Choose snake color based on perspective
+                let (color, border_color) = if Some(index) == local_snake_id {
+                    // Local player is always blue
+                    ("#70bfe3", "#5299bb")
+                } else if snakes.len() == 2 {
+                    // In 2-player games, opponent is always red
+                    ("#ff6b6b", "#b84444")
                 } else {
-                    // No team_id, use index-based colors
+                    // Multi-player: use different colors for other players
                     match index % 4 {
-                        0 => ("#70bfe3", "#5299bb"),  // Slightly darker with a touch more teal
-                        1 => ("#556270", "#353c47"),  // Darker gray
-                        2 => ("#ff6b6b", "#b84444"),  // Darker red
-                        _ => ("#f7b731", "#a87d1f"),  // Darker yellow
+                        0 if local_snake_id.is_none() => ("#70bfe3", "#5299bb"),  // Blue if no local player
+                        1 => ("#ff6b6b", "#b84444"),  // Red
+                        2 => ("#556270", "#353c47"),  // Gray
+                        _ => ("#f7b731", "#a87d1f"),  // Yellow
                     }
                 };
                 

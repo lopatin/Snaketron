@@ -97,6 +97,15 @@ async fn test_game_events_delivered() -> Result<()> {
     assert_eq!(snapshot1.game_id, snapshot2.game_id);
     assert_eq!(snapshot1.game_id, game_id);
     
+    // Extract snake_id from snapshot
+    let snake1_id = if let GameEvent::Snapshot { ref game_state } = snapshot1.event {
+        game_state.players.get(&(env.user_ids()[0] as u32))
+            .map(|p| p.snake_id)
+            .expect("Player 1 should have a snake")
+    } else {
+        panic!("Expected snapshot event");
+    };
+    
     // Send a command from client1
     client1.send_message(WSMessage::GameCommand(GameCommandMessage {
         command_id_client: CommandId {
@@ -106,7 +115,7 @@ async fn test_game_events_delivered() -> Result<()> {
         },
         command_id_server: None,
         command: GameCommand::Turn { 
-            snake_id: env.user_ids()[0] as u32, 
+            snake_id: snake1_id, 
             direction: Direction::Up 
         },
     })).await?;
@@ -184,7 +193,7 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     client.send_message(WSMessage::JoinGame(game_id)).await?;
     
     // Wait for initial snapshot
-    let _snapshot = timeout(Duration::from_secs(5), async {
+    let snapshot = timeout(Duration::from_secs(5), async {
         loop {
             if let WSMessage::GameEvent(event) = client.receive_message().await? {
                 if matches!(event.event, GameEvent::Snapshot { .. }) {
@@ -193,6 +202,15 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
             }
         }
     }).await??;
+    
+    // Extract snake_id from snapshot
+    let snake_id = if let GameEvent::Snapshot { ref game_state } = snapshot.event {
+        game_state.players.get(&(env.user_ids()[0] as u32))
+            .map(|p| p.snake_id)
+            .expect("Player should have a snake")
+    } else {
+        panic!("Expected snapshot event");
+    };
     
     // Send a command
     client.send_message(WSMessage::GameCommand(GameCommandMessage {
@@ -203,7 +221,7 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
         },
         command_id_server: None,
         command: GameCommand::Turn { 
-            snake_id: env.user_ids()[0] as u32, 
+            snake_id, 
             direction: Direction::Up 
         },
     })).await?;
@@ -238,7 +256,7 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
         }
     }).await??;
     
-    // Send another command
+    // Send another command (using the same snake_id from earlier)
     client.send_message(WSMessage::GameCommand(GameCommandMessage {
         command_id_client: CommandId {
             tick: 0,
@@ -247,7 +265,7 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
         },
         command_id_server: None,
         command: GameCommand::Turn { 
-            snake_id: env.user_ids()[0] as u32, 
+            snake_id, 
             direction: Direction::Down 
         },
     })).await?;

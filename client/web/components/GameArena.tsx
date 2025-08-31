@@ -270,7 +270,7 @@ export default function GameArena() {
           lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
         }
         
-        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize);
+        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize, user?.id || null);
       } catch (error) {
         console.error('Error rendering game:', error);
       }

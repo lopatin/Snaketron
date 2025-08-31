@@ -109,15 +109,16 @@ function takeFromExternrefTable0(idx) {
 }
 /**
  * Renders the game state to a canvas element
- * Takes a JSON string representation of the game state
+ * Takes a JSON string representation of the game state and the local user ID
  * @param {string} game_state_json
  * @param {HTMLCanvasElement} canvas
  * @param {number} cell_size
+ * @param {number | null} [local_user_id]
  */
-export function render_game(game_state_json, canvas, cell_size) {
+export function render_game(game_state_json, canvas, cell_size, local_user_id) {
     const ptr0 = passStringToWasm0(game_state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.render_game(ptr0, len0, canvas, cell_size);
+    const ret = wasm.render_game(ptr0, len0, canvas, cell_size, isLikeNone(local_user_id) ? 0x100000001 : (local_user_id) >>> 0);
     if (ret[1]) {
         throw takeFromExternrefTable0(ret[0]);
     }
@@ -367,6 +368,16 @@ export class GameClient {
         const ret = wasm.gameclient_getGameId(this.__wbg_ptr);
         return ret >>> 0;
     }
+    /**
+     * Get the snake ID for a given user ID
+     * Returns None if the user is not in the game
+     * @param {number} user_id
+     * @returns {number | undefined}
+     */
+    getSnakeIdForUser(user_id) {
+        const ret = wasm.gameclient_getSnakeIdForUser(this.__wbg_ptr, user_id);
+        return ret === 0x100000001 ? undefined : ret;
+    }
 }
 
 async function __wbg_load(module, imports) {
@@ -471,9 +482,6 @@ function __wbg_get_imports() {
     imports.wbg.__wbg_new_8a6f238a6ece86ea = function() {
         const ret = new Error();
         return ret;
-    };
-    imports.wbg.__wbg_quadraticCurveTo_b041a65b53047af3 = function(arg0, arg1, arg2, arg3, arg4) {
-        arg0.quadraticCurveTo(arg1, arg2, arg3, arg4);
     };
     imports.wbg.__wbg_restore_cc5ae2746f7b5043 = function(arg0) {
         arg0.restore();
