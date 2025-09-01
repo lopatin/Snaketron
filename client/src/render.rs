@@ -127,8 +127,8 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     // Draw dots at grid intersections (like the background pattern)
     ctx.set_fill_style(&JsValue::from_str("rgba(0, 0, 0, 0.3)")); // Same as background dots
     
-    // Only draw dots at 15px intervals to match background, regardless of cell size
-    let dot_spacing = 15.0;
+    // Scale dot spacing with cell size to maintain consistent visual density
+    let dot_spacing = cell_size;
     let dots_x = ((canvas_width - 2.0 * padding) / dot_spacing).ceil() as u32;
     let dots_y = ((canvas_height - 2.0 * padding) / dot_spacing).ceil() as u32;
     
