@@ -45,18 +45,57 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     // Fill the game area with white again to ensure clean background
     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
     ctx.fill_rect(0.0, 0.0, canvas_width - 2.0 * padding, canvas_height - 2.0 * padding);
+    
+    // Determine which snake belongs to the local player and their team (needed for perspective-based rendering)
+    let (local_snake_id, local_player_team) = if let Some(user_id) = local_user_id {
+        if let Some(players) = game_state["players"].as_object() {
+            let snake_id = players.get(&user_id.to_string())
+                .and_then(|player| player["snake_id"].as_u64())
+                .map(|id| id as usize);
+            
+            // Get the team of the local player's snake
+            let team = if let (Some(sid), Some(snakes)) = (snake_id, arena["snakes"].as_array()) {
+                snakes.get(sid)
+                    .and_then(|snake| snake["team_id"].as_u64())
+            } else {
+                None
+            };
+            
+            (snake_id, team)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
 
     // Draw team zones if present
     let team_zone_config_data = arena["team_zone_config"].as_object().cloned();
     if let Some(team_zone_config) = &team_zone_config_data {
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
         
-        // Draw Team A end zone (left side)
-        ctx.set_fill_style(&JsValue::from_str("#e6f4fa")); // Light blue background
+        // Determine colors based on local player's team
+        let (left_color, right_color, left_label, right_label) = match local_player_team {
+            Some(0) => {
+                // Local player is Team 0 (left) - they see blue on left, red on right
+                ("#e6f4fa", "#ffe6e6", "YOUR GOAL", "ENEMY GOAL")
+            },
+            Some(1) => {
+                // Local player is Team 1 (right) - they see red on left, blue on right
+                ("#ffe6e6", "#e6f4fa", "ENEMY GOAL", "YOUR GOAL")
+            },
+            _ => {
+                // No local player or unknown team - use default
+                ("#e6f4fa", "#ffe6e6", "TEAM 0", "TEAM 1")
+            }
+        };
+        
+        // Draw left end zone
+        ctx.set_fill_style(&JsValue::from_str(left_color));
         ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height as f64 * cell_size);
         
-        // Draw Team B end zone (right side)
-        ctx.set_fill_style(&JsValue::from_str("#ffe6e6")); // Light red background
+        // Draw right end zone
+        ctx.set_fill_style(&JsValue::from_str(right_color));
         ctx.fill_rect(
             (width as f64 - end_zone_depth) * cell_size, 
             0.0, 
@@ -70,16 +109,16 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         ctx.set_text_align("center");
         ctx.set_text_baseline("middle");
         
-        // Team A text
+        // Left zone text
         ctx.fill_text(
-            "TEAM A",
+            left_label,
             end_zone_depth * cell_size / 2.0,
             height as f64 * cell_size / 2.0
         )?;
         
-        // Team B text
+        // Right zone text
         ctx.fill_text(
-            "TEAM B",
+            right_label,
             (width as f64 - end_zone_depth / 2.0) * cell_size,
             height as f64 * cell_size / 2.0
         )?;
@@ -128,10 +167,15 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         let goal_y_start_aligned = goal_y_start.floor();
         let goal_y_end_aligned = goal_y_end.ceil();
         
-        // Team A boundary wall (between endzone and field)
-        // Using solid color that matches the previous semi-transparent appearance
-        // Previous: rgba(150, 200, 220, 0.8) over white = roughly rgb(170, 210, 225)
-        ctx.set_fill_style(&JsValue::from_str("#7aa8c1")); // Darker blue wall
+        // Determine wall colors based on local player's team
+        let (left_wall_color, right_wall_color) = match local_player_team {
+            Some(0) => ("#7aa8c1", "#c18888"),  // Local is Team 0: blue left, red right
+            Some(1) => ("#c18888", "#7aa8c1"),  // Local is Team 1: red left, blue right
+            _ => ("#7aa8c1", "#c18888"),        // Default: blue left, red right
+        };
+        
+        // Left boundary wall (between endzone and field)
+        ctx.set_fill_style(&JsValue::from_str(left_wall_color));
         
         let team_a_wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
         
@@ -155,9 +199,8 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             );
         }
         
-        // Team B boundary wall (between field and endzone)
-        // Previous: rgba(220, 150, 150, 0.8) over white = roughly rgb(225, 170, 170)
-        ctx.set_fill_style(&JsValue::from_str("#c18888")); // Darker red wall
+        // Right boundary wall (between field and endzone)
+        ctx.set_fill_style(&JsValue::from_str(right_wall_color));
         
         let team_b_wall_x = (width as f64 - end_zone_depth) * cell_size - wall_thickness / 2.0;
         
@@ -225,37 +268,36 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         }
     }
 
-    // Determine which snake belongs to the local player
-    let local_snake_id = if let Some(user_id) = local_user_id {
-        if let Some(players) = game_state["players"].as_object() {
-            players.get(&user_id.to_string())
-                .and_then(|player| player["snake_id"].as_u64())
-                .map(|id| id as usize)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Draw snakes
     if let Some(snakes) = arena["snakes"].as_array() {
         for (index, snake) in snakes.iter().enumerate() {
             if snake["is_alive"].as_bool().unwrap_or(false) {
-                // Choose snake color based on perspective
-                let (color, border_color) = if Some(index) == local_snake_id {
-                    // Local player is always blue
-                    ("#70bfe3", "#5299bb")
-                } else if snakes.len() == 2 {
-                    // In 2-player games, opponent is always red
-                    ("#ff6b6b", "#b84444")
+                // Choose snake color based on perspective in team games
+                let (color, border_color) = if team_zone_config_data.is_some() {
+                    // Team game: use perspective-based coloring
+                    if Some(index) == local_snake_id {
+                        // Local player is always blue
+                        ("#70bfe3", "#5299bb")
+                    } else {
+                        // Opponent is always red (in 2-team games)
+                        ("#ff6b6b", "#b84444")
+                    }
                 } else {
-                    // Multi-player: use different colors for other players
-                    match index % 4 {
-                        0 if local_snake_id.is_none() => ("#70bfe3", "#5299bb"),  // Blue if no local player
-                        1 => ("#ff6b6b", "#b84444"),  // Red
-                        2 => ("#556270", "#353c47"),  // Gray
-                        _ => ("#f7b731", "#a87d1f"),  // Yellow
+                    // Non-team game: use existing perspective-based logic
+                    if Some(index) == local_snake_id {
+                        // Local player is always blue
+                        ("#70bfe3", "#5299bb")
+                    } else if snakes.len() == 2 {
+                        // In 2-player games, opponent is always red
+                        ("#ff6b6b", "#b84444")
+                    } else {
+                        // Multi-player: use different colors for other players
+                        match index % 4 {
+                            0 if local_snake_id.is_none() => ("#70bfe3", "#5299bb"),  // Blue if no local player
+                            1 => ("#ff6b6b", "#b84444"),  // Red
+                            2 => ("#556270", "#353c47"),  // Gray
+                            _ => ("#f7b731", "#a87d1f"),  // Yellow
+                        }
                     }
                 };
                 
