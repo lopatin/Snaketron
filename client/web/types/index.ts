@@ -95,6 +95,7 @@ export type GameMode =
 
 export interface GameProperties {
   available_food_target: number;
+  tick_duration_ms: number;
 }
 
 export interface Player {

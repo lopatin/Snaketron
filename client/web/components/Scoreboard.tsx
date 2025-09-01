@@ -125,25 +125,25 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
     };
   };
 
-  // Update elapsed time
+  // Calculate elapsed time from game ticks (pure function of game state)
   useEffect(() => {
-    if (!gameState || !gameState.start_ms) return;
+    if (!gameState) return;
 
-    const updateTime = () => {
-      const now = Date.now();
-      const startTime = gameState.start_ms;
-      const elapsed = Math.max(0, Math.floor((now - startTime) / 1000));
-      
-      const minutes = Math.floor(elapsed / 60);
-      const seconds = elapsed % 60;
-      
-      setElapsedTime(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
-    };
+    // If game hasn't started yet (countdown phase)
+    if (Date.now() < gameState.start_ms) {
+      setElapsedTime('00:00');
+      return;
+    }
 
-    updateTime();
-    const interval = setInterval(updateTime, 1000);
+    // Calculate elapsed time from ticks that have occurred since start
+    // The tick count represents the actual game progress
+    const tick_duration_ms = gameState.properties?.tick_duration_ms || 100;
+    const elapsedMs = gameState.tick * tick_duration_ms;
+    const elapsedSeconds = Math.floor(elapsedMs / 1000);
+    const minutes = Math.floor(elapsedSeconds / 60);
+    const seconds = elapsedSeconds % 60;
     
-    return () => clearInterval(interval);
+    setElapsedTime(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
   }, [gameState]);
 
   const solo = isSoloGame();
