@@ -191,12 +191,12 @@ async fn test_duel_game() -> Result<()> {
                     }
                     
                     // Verify that each team has one snake
-                    let team_a_count = [snake1, snake2].iter()
-                        .filter(|s| s.team_id == Some(TeamId::TeamA)).count();
-                    let team_b_count = [snake1, snake2].iter()
-                        .filter(|s| s.team_id == Some(TeamId::TeamB)).count();
-                    assert_eq!(team_a_count, 1, "There should be exactly one Team A snake");
-                    assert_eq!(team_b_count, 1, "There should be exactly one Team B snake");
+                    let team_0_count = [snake1, snake2].iter()
+                        .filter(|s| s.team_id == Some(TeamId(0))).count();
+                    let team_1_count = [snake1, snake2].iter()
+                        .filter(|s| s.team_id == Some(TeamId(1))).count();
+                    assert_eq!(team_0_count, 1, "There should be exactly one Team 0 snake");
+                    assert_eq!(team_1_count, 1, "There should be exactly one Team 1 snake");
                     
                     println!("Arena dimensions: {}x{}", state1.arena.width, state1.arena.height);
                     println!("End zone depth: {}", team_config.end_zone_depth);

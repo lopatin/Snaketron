@@ -123,7 +123,7 @@ async fn run_game(
                         };
                         
                         // Publish event via PubSub
-                        if let Err(e) = pubsub.publish_event(game_id, &event_msg).await {
+                        if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
                             warn!("Failed to publish command scheduled event: {}", e);
                         }
                     }
@@ -148,7 +148,7 @@ async fn run_game(
                             };
                             
                             // Publish event via PubSub
-                            if let Err(e) = pubsub.publish_event(game_id, &event_msg).await {
+                            if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
                                 warn!("Failed to publish game event: {}", e);
                             }
                         }

@@ -44,10 +44,13 @@ pub struct TeamZoneConfig {
     pub goal_width: u16,       // Width of goal opening in cells
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
-pub enum TeamId {
-    TeamA,
-    TeamB,
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy, Hash, PartialOrd, Ord)]
+pub struct TeamId(pub u8);
+
+impl TeamId {
+    pub fn new(index: u8) -> Self {
+        TeamId(index)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -69,18 +72,24 @@ impl Arena {
         Ok(id)
     }
 
-    /// Calculate Team A end zone bounds (left side)
-    pub fn team_a_zone_bounds(&self) -> Option<(i16, i16, i16, i16)> {
+    /// Calculate team end zone bounds
+    pub fn team_zone_bounds(&self, team_id: TeamId) -> Option<(i16, i16, i16, i16)> {
         self.team_zone_config.as_ref().map(|config| {
-            (0, config.end_zone_depth as i16 - 1, 0, self.height as i16 - 1)
-        })
-    }
-    
-    /// Calculate Team B end zone bounds (right side)
-    pub fn team_b_zone_bounds(&self) -> Option<(i16, i16, i16, i16)> {
-        self.team_zone_config.as_ref().map(|config| {
-            let x_start = self.width as i16 - config.end_zone_depth as i16;
-            (x_start, self.width as i16 - 1, 0, self.height as i16 - 1)
+            match team_id.0 {
+                0 => {
+                    // Team 0 zone (left side)
+                    (0, config.end_zone_depth as i16 - 1, 0, self.height as i16 - 1)
+                }
+                1 => {
+                    // Team 1 zone (right side)
+                    let x_start = self.width as i16 - config.end_zone_depth as i16;
+                    (x_start, self.width as i16 - 1, 0, self.height as i16 - 1)
+                }
+                _ => {
+                    // For additional teams, could extend to top/bottom or other zones
+                    (0, config.end_zone_depth as i16 - 1, 0, self.height as i16 - 1)
+                }
+            }
         })
     }
     
@@ -100,9 +109,10 @@ impl Arena {
             let y_start = goal_center - half_width;
             let y_end = goal_center + half_width;
             
-            let x_pos = match team {
-                TeamId::TeamA => config.end_zone_depth as i16 - 1,  // Right edge of Team A zone
-                TeamId::TeamB => self.width as i16 - config.end_zone_depth as i16,  // Left edge of Team B zone
+            let x_pos = match team.0 {
+                0 => config.end_zone_depth as i16 - 1,  // Right edge of Team 0 zone
+                1 => self.width as i16 - config.end_zone_depth as i16,  // Left edge of Team 1 zone
+                _ => config.end_zone_depth as i16 - 1,  // Default to team 0 position for other teams
             };
             
             (x_pos, y_start, y_end)
@@ -119,7 +129,7 @@ impl Arena {
             if at_team_a_boundary || at_team_b_boundary {
                 // Check if within goal opening
                 if let Some((_x, y_start, y_end)) = self.goal_bounds(
-                    if at_team_a_boundary { TeamId::TeamA } else { TeamId::TeamB }
+                    if at_team_a_boundary { TeamId(0) } else { TeamId(1) }
                 ) {
                     return pos.y < y_start || pos.y > y_end;
                 }
@@ -131,17 +141,18 @@ impl Arena {
     /// Check if a snake has reached the enemy goal
     pub fn has_reached_goal(&self, snake: &Snake, team_id: TeamId) -> bool {
         if let (Some(head), Some(config)) = (snake.head().ok(), &self.team_zone_config) {
-            // Team A's goal is to reach Team B's end zone (right side)
-            // Team B's goal is to reach Team A's end zone (left side)
-            match team_id {
-                TeamId::TeamA => {
-                    // Check if in Team B's end zone
+            // Team 0's goal is to reach Team 1's end zone (right side)
+            // Team 1's goal is to reach Team 0's end zone (left side)
+            match team_id.0 {
+                0 => {
+                    // Check if in Team 1's end zone
                     head.x >= self.width as i16 - config.end_zone_depth as i16
                 }
-                TeamId::TeamB => {
-                    // Check if in Team A's end zone  
+                1 => {
+                    // Check if in Team 0's end zone  
                     head.x < config.end_zone_depth as i16
                 }
+                _ => false,  // Other teams default to false
             }
         } else {
             false
@@ -546,11 +557,8 @@ impl GameState {
             GameType::TeamMatch { .. } => {
                 // Assign teams alternately: A, B, A, B...
                 let existing_player_count = self.players.len();
-                if existing_player_count % 2 == 0 {
-                    Some(TeamId::TeamA)
-                } else {
-                    Some(TeamId::TeamB)
-                }
+                let team_index = (existing_player_count % 2) as u8;
+                Some(TeamId(team_index))
             }
             _ => None,
         };
@@ -587,8 +595,9 @@ impl GameState {
                 
                 // Determine position index based on team
                 let position_idx = match snake.team_id {
-                    Some(TeamId::TeamA) => 0,  // TeamA gets first position (left endzone)
-                    Some(TeamId::TeamB) => 1,  // TeamB gets second position (right endzone)
+                    Some(TeamId(0)) => 0,  // Team 0 gets first position (left endzone)
+                    Some(TeamId(1)) => 1,  // Team 1 gets second position (right endzone)
+                    Some(TeamId(n)) => n as usize,  // Other teams use their index
                     None => continue,  // Should not happen in team games
                 };
                 
@@ -808,12 +817,12 @@ impl GameState {
         // For team games, check if all snakes of one team are dead
         let should_end = if let GameType::TeamMatch { .. } = &self.game_type {
             // Check if all Team A or all Team B snakes are dead
-            let team_a_alive = self.arena.snakes.iter()
-                .any(|s| s.is_alive && s.team_id == Some(TeamId::TeamA));
-            let team_b_alive = self.arena.snakes.iter()
-                .any(|s| s.is_alive && s.team_id == Some(TeamId::TeamB));
+            let team_0_alive = self.arena.snakes.iter()
+                .any(|s| s.is_alive && s.team_id == Some(TeamId(0)));
+            let team_1_alive = self.arena.snakes.iter()
+                .any(|s| s.is_alive && s.team_id == Some(TeamId(1)));
             
-            !team_a_alive || !team_b_alive
+            !team_0_alive || !team_1_alive
         } else if self.game_type.is_solo() {
             // For solo games, only end when no snakes are alive
             alive_snakes.is_empty()

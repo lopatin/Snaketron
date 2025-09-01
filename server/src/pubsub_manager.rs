@@ -141,13 +141,13 @@ impl PubSubManager {
         debug!("Requested snapshots for partition {}", partition_id);
         Ok(())
     }
-    
+
     /// Get stored snapshot from Redis
     pub async fn get_stored_snapshot(&mut self, game_id: u32) -> Result<Option<GameState>> {
         let key = format!("snaketron:snapshot:game:{}", game_id);
         let data: Option<Vec<u8>> = self.redis_conn.get(&key).await
             .context("Failed to get snapshot from Redis")?;
-        
+
         match data {
             Some(bytes) => {
                 let snapshot = serde_json::from_slice(&bytes)
@@ -157,8 +157,8 @@ impl PubSubManager {
             None => Ok(None)
         }
     }
-    
-    
+
+
     /// Subscribe to a partition's events, commands and snapshot requests
     pub async fn subscribe_to_partition(&mut self, partition_id: u32) -> Result<PartitionSubscription> {
         let event_channel = channels::partition_events(partition_id);
