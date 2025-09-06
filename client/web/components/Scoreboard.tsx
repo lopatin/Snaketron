@@ -6,6 +6,9 @@ interface ScoreboardProps {
   score: number;
   isVisible: boolean;
   currentUserId?: number;
+  showGameOver?: boolean;
+  onBackToMenu?: () => void;
+  onPlayAgain?: () => void;
 }
 
 // Snake colors matching render.rs
@@ -16,9 +19,20 @@ const SNAKE_COLORS = [
   '#f7b731', // Yellow/gold
 ];
 
-const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, currentUserId }) => {
+const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, currentUserId, showGameOver, onBackToMenu, onPlayAgain }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [logoHovered, setLogoHovered] = useState(false);
+  const [gameOverExpanded, setGameOverExpanded] = useState(false);
+  
+  // Trigger slide-in animation when showGameOver becomes true
+  useEffect(() => {
+    if (showGameOver) {
+      const timer = setTimeout(() => setGameOverExpanded(true), 50);
+      return () => clearTimeout(timer);
+    } else {
+      setGameOverExpanded(false);
+    }
+  }, [showGameOver]);
 
   // Determine if this is a solo game
   const isSoloGame = () => {
@@ -146,9 +160,124 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
     setElapsedTime(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
   }, [gameState]);
 
+  // Check if game is complete
+  const isGameComplete = () => {
+    if (!gameState) return false;
+    const status = gameState.status;
+    return typeof status === 'object' && 'Complete' in status;
+  };
+
+  // Get winning snake ID from game status
+  const getWinningSnakeId = (): number | null => {
+    if (!gameState) return null;
+    const status = gameState.status;
+    if (typeof status === 'object' && 'Complete' in status) {
+      return status.Complete.winning_snake_id;
+    }
+    return null;
+  };
+
+  // Calculate snake statistics for game over
+  const getSnakeStats = () => {
+    if (!gameState || !gameState.arena || !gameState.arena.snakes) return [];
+
+    return gameState.arena.snakes.map((snake, index) => {
+      // Find player for this snake
+      const playerEntry = Object.entries(gameState.players || {}).find(
+        ([_, player]) => player.snake_id === index
+      );
+      const userId = playerEntry ? parseInt(playerEntry[0]) : null;
+      const isCurrentPlayer = userId === currentUserId;
+      
+      // Calculate actual snake length
+      let length = 0;
+      if (snake.body.length >= 2) {
+        for (let i = 0; i < snake.body.length - 1; i++) {
+          const p1 = snake.body[i];
+          const p2 = snake.body[i + 1];
+          const distance = Math.abs(p2.x - p1.x) + Math.abs(p2.y - p1.y);
+          length += distance;
+        }
+        length += 1; // Add 1 for the head
+      } else {
+        length = snake.body.length;
+      }
+      
+      // Calculate food eaten (length growth from initial size)
+      const initialLength = 2; // Snakes start at length 2
+      const foodEaten = Math.max(0, length - initialLength);
+      
+      return {
+        index,
+        snake,
+        color: SNAKE_COLORS[index % SNAKE_COLORS.length],
+        userId,
+        isCurrentPlayer,
+        name: isCurrentPlayer ? 'You' : `Player ${index + 1}`,
+        finalLength: length,
+        foodEaten,
+        isWinner: index === getWinningSnakeId(),
+        team: index % 2 === 0 ? 1 : 2,
+      };
+    });
+  };
+  
+  // Calculate game stats (XP, enemy food eaten)
+  const calculateGameStats = () => {
+    const stats = getSnakeStats();
+    const currentPlayer = stats.find(s => s.isCurrentPlayer);
+    
+    if (!currentPlayer) return { xpGained: 0, foodEaten: 0, enemyFoodEaten: 0 };
+    
+    // Calculate XP (base on performance)
+    let xpGained = 10; // Base XP for playing
+    if (currentPlayer.isWinner) xpGained += 50; // Bonus for winning
+    xpGained += currentPlayer.foodEaten * 5; // 5 XP per food
+    
+    // Calculate enemy food eaten (in multiplayer, count kills as "enemy food")
+    // For now, we'll estimate based on whether enemies died
+    const enemyFoodEaten = stats.filter(s => !s.isCurrentPlayer && !s.snake.is_alive).length;
+    
+    return {
+      xpGained,
+      foodEaten: currentPlayer.foodEaten,
+      enemyFoodEaten
+    };
+  };
+
+  // Determine game result text
+  const getResultText = () => {
+    const winningSnakeId = getWinningSnakeId();
+    const snakeStats = getSnakeStats();
+    const currentPlayerSnake = snakeStats.find(s => s.isCurrentPlayer);
+    
+    if (isSoloGame()) {
+      return 'Game Over';
+    }
+    
+    if (winningSnakeId === null) {
+      return 'Draw!';
+    }
+    
+    if (currentPlayerSnake && currentPlayerSnake.index === winningSnakeId) {
+      return 'Victory!';
+    }
+    
+    const winner = snakeStats.find(s => s.index === winningSnakeId);
+    if (winner) {
+      return winner.isCurrentPlayer ? 'Victory!' : `${winner.name} Wins!`;
+    }
+    
+    return 'Game Over';
+  };
+
   const solo = isSoloGame();
   const snakeInfo = getSnakeInfo();
   const teamStats = !solo ? getTeamStats() : null;
+  const snakeStats = getSnakeStats();
+  const currentPlayerStats = snakeStats.find(s => s.isCurrentPlayer);
+  const resultText = getResultText();
+  const gameStats = calculateGameStats();
 
   return (
     <div 
@@ -286,6 +415,113 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
             </div>
             <div className="text-gray-600 font-bold text-lg -mt-0.5">
               0 - 0
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Game Over Section */}
+      {showGameOver && (
+        <div 
+          className={`transition-all duration-500 ease-out overflow-hidden ${
+            gameOverExpanded ? 'max-h-32' : 'max-h-0'
+          }`}
+        >
+          {/* Separator */}
+          <div className="w-full h-px bg-gray-200 opacity-50 my-2" />
+          
+          {/* Game Over Content */}
+          <div className="flex items-center justify-between">
+            {/* Left side - Result and Stats */}
+            <div className="flex items-center gap-5">
+              {/* Result Text */}
+              <div className="font-black italic uppercase tracking-1 text-black-70" style={{ fontSize: '18px' }}>
+                {resultText}
+              </div>
+              
+              {/* Divider */}
+              <div className="h-6 w-px bg-gray-300 opacity-40" />
+              
+              {/* Stats */}
+              <div className="flex items-center gap-4">
+                {solo ? (
+                  // Solo game stats
+                  <>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        XP
+                      </div>
+                      <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
+                        +{gameStats.xpGained}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        Food
+                      </div>
+                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                        {gameStats.foodEaten}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        Length
+                      </div>
+                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                        {currentPlayerStats?.finalLength || 0}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  // Multiplayer game stats
+                  <>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        XP
+                      </div>
+                      <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
+                        +{gameStats.xpGained}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        Food
+                      </div>
+                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                        {gameStats.foodEaten}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                        Kills
+                      </div>
+                      <div className="text-red-600 font-black text-lg -mt-0.5 tabular-nums">
+                        {gameStats.enemyFoodEaten}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Right side - Action Buttons */}
+            <div className="flex items-center gap-3">
+              <button
+                onClick={onBackToMenu}
+                className="px-3 py-1 text-xs border border-gray-400 rounded font-semibold uppercase bg-white text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
+                style={{ letterSpacing: '0.5px' }}
+              >
+                Menu
+              </button>
+              <button
+                onClick={onPlayAgain}
+                className="px-3 py-1 text-xs rounded font-bold uppercase bg-green-600 text-white hover:bg-green-700 transition-all cursor-pointer"
+                style={{ 
+                  letterSpacing: '0.5px',
+                }}
+              >
+                Play Again
+              </button>
             </div>
           </div>
         </div>

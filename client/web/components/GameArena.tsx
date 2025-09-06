@@ -38,7 +38,9 @@ export default function GameArena() {
     sendGameCommand,
     joinGame,
     lastGameEvent,
-    leaveGame
+    leaveGame,
+    queueForMatch,
+    createSoloGame
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
@@ -67,6 +69,7 @@ export default function GameArena() {
   
   const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
+  const [showGameOverPanel, setShowGameOverPanel] = useState(false);
   const [cellSize, setCellSize] = useState(15);
   const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
@@ -164,7 +167,8 @@ export default function GameArena() {
           // Check if snake is dead
           if (!snake.is_alive && !gameOver) {
             setGameOver(true);
-            // stopEngine(); // Stop the engine when game ends
+            // Show game over panel after a short delay
+            setTimeout(() => setShowGameOverPanel(true), 500);
           }
         }
       }
@@ -177,6 +181,8 @@ export default function GameArena() {
       if (isComplete) {
         setGameOver(true);
         stopEngine(); // Stop the engine when game ends
+        // Show game over panel after a short delay
+        setTimeout(() => setShowGameOverPanel(true), 500);
       }
     }
   }, [gameState, user?.id, gameOver, stopEngine]);
@@ -321,15 +327,49 @@ export default function GameArena() {
   const countdownSeconds = Math.ceil(timeUntilStart / 1000);
   const showCountdown = countdownSeconds > 0;
   
+  // Handle back to menu
+  const handleBackToMenu = () => {
+    navigate('/');
+  };
+  
+  // Handle play again
+  const handlePlayAgain = () => {
+    if (!gameState) return;
+    
+    const gameType = gameState.game_type;
+    
+    // For solo games, create a new solo game
+    if (gameType === 'Solo' || 
+        (typeof gameType === 'object' && 'Custom' in gameType && 
+         gameType.Custom.settings.game_mode === 'Solo')) {
+      createSoloGame();
+      return;
+    }
+    
+    // For multiplayer games, queue for the same type
+    if (typeof gameType === 'object') {
+      queueForMatch(gameType);
+    }
+  };
+  
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
 
       <>
         {/* Scoreboard */}
-        <Scoreboard gameState={gameState} score={score} isVisible={isArenaVisible} currentUserId={user?.id} />
+        <Scoreboard 
+          gameState={gameState} 
+          score={score} 
+          isVisible={isArenaVisible} 
+          currentUserId={user?.id}
+          showGameOver={showGameOverPanel}
+          onBackToMenu={handleBackToMenu}
+          onPlayAgain={handlePlayAgain}
+        />
 
-        {/* Game Arena */}
-        <div className="flex-1 flex items-center justify-center p-4" style={{ paddingTop: '80px', paddingBottom: '40px' }}>
+        {/* Game Arena Container */}
+        <div className="flex-1 flex flex-col items-center justify-center p-4" style={{ paddingTop: '80px', paddingBottom: '40px' }}>
+          {/* Game Canvas */}
           <div
             className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
               isArenaVisible ? 'opacity-100' : 'opacity-0'
@@ -369,20 +409,6 @@ export default function GameArena() {
           </div>
         </div>
 
-        {gameOver && (
-          <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="panel bg-white p-8 text-center">
-              <h2 className="text-3xl font-black italic uppercase tracking-1 mb-4 text-black-70">Game Over!</h2>
-              <p className="text-xl mb-6 text-black-70 font-bold">Final Score: {score}</p>
-              <button
-                onClick={() => navigate('/')}
-                className="btn-primary"
-              >
-                Play Again
-              </button>
-            </div>
-          </div>
-        )}
       </>
     </div>
   );
