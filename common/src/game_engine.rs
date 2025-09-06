@@ -55,10 +55,13 @@ impl GameEngine {
     }
 
     pub fn new_from_state(game_id: u32, game_state: GameState) -> Self {
+        let mut predicted_state = game_state.clone();
+        predicted_state.rng = None;  // Remove RNG so client doesn't generate food
+        
         GameEngine {
             game_id,
-            committed_state: game_state.clone(),
-            predicted_state: Some(game_state),
+            committed_state: game_state,
+            predicted_state: Some(predicted_state),
             event_log: Vec::new(),
             committed_state_lag_ms: 500,
             local_player_id: None,
@@ -147,6 +150,9 @@ impl GameEngine {
         if needs_rebuild {
             // Clone committed state
             let mut new_predicted_state = self.committed_state.clone();
+            
+            // Remove RNG from predicted state so it doesn't generate food locally
+            new_predicted_state.rng = None;
 
             // Advance to target tick
             while new_predicted_state.current_tick() < predicted_target_tick {
