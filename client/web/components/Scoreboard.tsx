@@ -515,7 +515,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
               </button>
               <button
                 onClick={onPlayAgain}
-                className="px-3 py-1 text-xs rounded font-bold uppercase bg-green-600 text-white hover:bg-green-700 transition-all cursor-pointer"
+                className="px-3 py-1 text-xs border border-green-700 rounded font-semibold uppercase bg-green-600 text-white transition-all cursor-pointer"
                 style={{ 
                   letterSpacing: '0.5px',
                 }}

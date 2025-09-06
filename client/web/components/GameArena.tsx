@@ -7,17 +7,7 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, CanvasRef } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
-
-// Helper function for loading screen markup
-const LoadingScreen = ({ message }: { message: string }) => (
-  <div className="fixed inset-0 flex items-center justify-center bg-white">
-    <div className="text-center">
-      <h2 className="text-2xl font-black italic uppercase tracking-1 mb-4 text-black-70">
-        {message}
-      </h2>
-    </div>
-  </div>
-);
+import LoadingScreen from './LoadingScreen';
 
 export default function GameArena() {
   const { gameId } = useParams();
@@ -338,18 +328,14 @@ export default function GameArena() {
     
     const gameType = gameState.game_type;
     
-    // For solo games, create a new solo game
-    if (gameType === 'Solo' || 
-        (typeof gameType === 'object' && 'Custom' in gameType && 
-         gameType.Custom.settings.game_mode === 'Solo')) {
-      createSoloGame();
-      return;
-    }
-    
-    // For multiplayer games, queue for the same type
-    if (typeof gameType === 'object') {
-      queueForMatch(gameType);
-    }
+    // Navigate away to trigger unmount and natural cleanup
+    // Pass the game type as state so we know what to queue for
+    navigate('/queue', { 
+      state: { 
+        gameType,
+        autoQueue: true 
+      } 
+    });
   };
   
   return (

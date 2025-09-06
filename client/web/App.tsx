@@ -5,6 +5,7 @@ import Auth from './components/Auth';
 import CustomGameCreator from './components/CustomGameCreator';
 import GameLobby from './components/GameLobby';
 import GameArena from './components/GameArena';
+import Queue from './components/Queue';
 import JoinGameModal from './components/JoinGameModal';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
@@ -284,6 +285,11 @@ function AppContent() {
         <Route path="/play/:gameId" element={
           <ProtectedRoute>
             <GameArena />
+          </ProtectedRoute>
+        } />
+        <Route path="/queue" element={
+          <ProtectedRoute>
+            <Queue />
           </ProtectedRoute>
         } />
       </AnimatedRoutes>

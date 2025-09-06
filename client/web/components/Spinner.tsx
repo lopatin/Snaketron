@@ -1,6 +1,10 @@
 import React from 'react';
 
-function Spinner({ className = '' }) {
+interface SpinnerProps {
+  className?: string;
+}
+
+function Spinner({ className = '' }: SpinnerProps) {
   return (
     <svg 
       className={`animate-spin ${className}`} 

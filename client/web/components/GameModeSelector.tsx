@@ -33,7 +33,7 @@ function GameModeSelector() {
   const { category } = useParams();
   const navigate = useNavigate();
   const { user, login, register } = useAuth();
-  const { isConnected, createGame, currentGameId, customGameCode, queueForMatch, isQueued } = useGameWebSocket();
+  const { isConnected, createGame, currentGameId, customGameCode } = useGameWebSocket();
   
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -135,11 +135,21 @@ function GameModeSelector() {
       console.log('Starting game with modeId:', modeId);
       
       if (modeId === 'duel') {
-        // Queue for a duel match (1v1)
-        queueForMatch({ TeamMatch: { per_team: 1 } });
+        // Navigate to queue screen for duel match (1v1)
+        navigate('/queue', { 
+          state: { 
+            gameType: { TeamMatch: { per_team: 1 } },
+            autoQueue: true 
+          } 
+        });
       } else if (modeId === 'free-for-all') {
-        // Queue for free-for-all
-        queueForMatch({ FreeForAll: { max_players: 8 } });
+        // Navigate to queue screen for free-for-all
+        navigate('/queue', { 
+          state: { 
+            gameType: { FreeForAll: { max_players: 8 } },
+            autoQueue: true 
+          } 
+        });
       } else if (modeId === 'solo') {
         // Create solo game
         createGame(modeId);
@@ -159,20 +169,6 @@ function GameModeSelector() {
   };
 
   if (!gameModeConfig) return null;
-
-  // Show loading screen when queued for matchmaking
-  if (isQueued) {
-    return (
-      <div className="fixed inset-0 flex items-center justify-center bg-white z-50">
-        <div className="text-center">
-          <h2 className="text-2xl font-black italic uppercase tracking-1 mb-4 text-black-70">
-            Finding match...
-          </h2>
-          <p className="text-sm text-gray-600">Please wait while we find an opponent</p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="flex-1 p-8">
