@@ -4,7 +4,7 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef } from '../types';
+import { GameState, CanvasRef, ArenaRotation } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
@@ -66,6 +66,7 @@ export default function GameArena() {
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   const [, forceUpdate] = useReducer(x => x + 1, 0);
   const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const [rotation, setRotation] = useState<ArenaRotation>(0);
 
   // Join game when user becomes available
   useEffect(() => {
@@ -117,16 +118,21 @@ export default function GameArena() {
       const availableHeight = vh - 160 - 32 - 10;
       const availableWidth = vw - 100 - 32 - 10;
       
+      // For vertical orientations (90° and 270°), we need to swap dimensions
+      const isVertical = rotation === 90 || rotation === 270;
+      const effectiveGridWidth = isVertical ? gridHeight : gridWidth;
+      const effectiveGridHeight = isVertical ? gridWidth : gridHeight;
+      
       // Start with max cell size and reduce until it fits
       let optimalCellSize = 15;
-      let canvasWidth = gridWidth * optimalCellSize;
-      let canvasHeight = gridHeight * optimalCellSize;
+      let canvasWidth = effectiveGridWidth * optimalCellSize;
+      let canvasHeight = effectiveGridHeight * optimalCellSize;
       
       // Reduce cell size by 1px until canvas fits in available space
       while ((canvasWidth > availableWidth || canvasHeight > availableHeight) && optimalCellSize > 5) {
         optimalCellSize--;
-        canvasWidth = gridWidth * optimalCellSize;
-        canvasHeight = gridHeight * optimalCellSize;
+        canvasWidth = effectiveGridWidth * optimalCellSize;
+        canvasHeight = effectiveGridHeight * optimalCellSize;
       }
       
       setCellSize(optimalCellSize);
@@ -142,7 +148,7 @@ export default function GameArena() {
     window.addEventListener('resize', calculateSizes);
     
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [gameState]);
+  }, [gameState, rotation]);
 
   // Update score when game state changes
   useEffect(() => {
@@ -177,6 +183,43 @@ export default function GameArena() {
     }
   }, [gameState, user?.id, gameOver, stopEngine]);
 
+  // Transform direction based on rotation
+  // We need to apply the INVERSE transformation of the coordinate system
+  // When arena is rotated 90° CW, UP on screen corresponds to LEFT in game coordinates
+  const transformDirection = (direction: 'Up' | 'Down' | 'Left' | 'Right', rotation: ArenaRotation): 'Up' | 'Down' | 'Left' | 'Right' => {
+    switch (rotation) {
+      case 0:
+        return direction;
+      case 90:
+        // 90° CW rotation: inverse is 270° CW
+        // Screen Up → Game Left, Screen Right → Game Up, Screen Down → Game Right, Screen Left → Game Down
+        switch (direction) {
+          case 'Up': return 'Left';
+          case 'Right': return 'Up';
+          case 'Down': return 'Right';
+          case 'Left': return 'Down';
+        }
+      case 180:
+        // 180° rotation: inverse is also 180°
+        // Screen Up → Game Down, Screen Down → Game Up, Screen Left → Game Right, Screen Right → Game Left
+        switch (direction) {
+          case 'Up': return 'Down';
+          case 'Down': return 'Up';
+          case 'Left': return 'Right';
+          case 'Right': return 'Left';
+        }
+      case 270:
+        // 270° CW rotation: inverse is 90° CW
+        // Screen Up → Game Right, Screen Right → Game Down, Screen Down → Game Left, Screen Left → Game Up
+        switch (direction) {
+          case 'Up': return 'Right';
+          case 'Right': return 'Down';
+          case 'Down': return 'Left';
+          case 'Left': return 'Up';
+        }
+    }
+  };
+
   useEffect(() => {
     if (!window.wasm) {
       console.log('WASM not loaded yet');
@@ -187,6 +230,21 @@ export default function GameArena() {
     const handleKeyPress = (e: KeyboardEvent) => {
       // Ignore repeat events
       if (e.repeat) {
+        return;
+      }
+      
+      // Handle rotation key (R)
+      if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault();
+        setRotation(prev => {
+          switch (prev) {
+            case 0: return 90;
+            case 90: return 180;
+            case 180: return 270;
+            case 270: return 0;
+            default: return 0;
+          }
+        });
         return;
       }
       
@@ -209,11 +267,13 @@ export default function GameArena() {
       
       if (direction) {
         e.preventDefault();
-        console.log('Keydown event - sending turn command:', direction, 'repeat:', e.repeat, 'timestamp:', Date.now());
+        const originalDirection = direction as 'Up' | 'Down' | 'Left' | 'Right';
+        const transformedDirection = transformDirection(originalDirection, rotation);
+        console.log('Keydown event - sending turn command:', originalDirection, 'transformed to:', transformedDirection, 'rotation:', rotation, 'timestamp:', Date.now());
         
         // Send command through game engine (handles both local prediction and server)
         sendCommand({
-          Turn: { direction: direction as 'Up' | 'Down' | 'Left' | 'Right' }
+          Turn: { direction: transformedDirection }
         });
         
         console.log('sendCommand call completed at:', Date.now());
@@ -222,7 +282,7 @@ export default function GameArena() {
     
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [sendCommand, gameOver, connected, gameState]);
+  }, [sendCommand, gameOver, connected, gameState, rotation]);
   
   // Render game state
   useEffect(() => {
@@ -266,7 +326,7 @@ export default function GameArena() {
           lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
         }
         
-        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize, user?.id || null);
+        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize, user?.id || null, rotation);
       } catch (error) {
         console.error('Error rendering game:', error);
       }
@@ -280,7 +340,7 @@ export default function GameArena() {
         cancelAnimationFrame(animationId);
       }
     };
-  }, [gameState, cellSize]);
+  }, [gameState, cellSize, rotation, user?.id]);
   
   // Process server events through game engine
   useEffect(() => {

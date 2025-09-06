@@ -258,3 +258,6 @@ export interface UIGameSettings {
   allowSpectators: boolean;
   snakeStartLength: number;
 }
+
+// Arena rotation angles (in degrees)
+export type ArenaRotation = 0 | 90 | 180 | 270;

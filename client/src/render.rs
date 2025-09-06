@@ -2,10 +2,28 @@ use wasm_bindgen::prelude::*;
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Transform coordinates based on rotation angle
+fn transform_coords(x: f64, y: f64, width: f64, height: f64, rotation: i32) -> (f64, f64) {
+    match rotation {
+        90 => (height - y - 1.0, x),
+        180 => (width - x - 1.0, height - y - 1.0),
+        270 => (y, width - x - 1.0),
+        _ => (x, y), // 0 degrees or default
+    }
+}
+
+/// Get effective dimensions based on rotation (swap width/height for 90/270)
+fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
+    match rotation {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    }
+}
+
 /// Renders the game state to a canvas element
-/// Takes a JSON string representation of the game state and the local user ID
+/// Takes a JSON string representation of the game state, the local user ID, and rotation angle
 #[wasm_bindgen]
-pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, cell_size: f64, local_user_id: Option<u32>) -> Result<(), JsValue> {
+pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, cell_size: f64, local_user_id: Option<u32>, rotation: f64) -> Result<(), JsValue> {
     // Parse the JSON game state
     let game_state: Value = serde_json::from_str(game_state_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse game state: {}", e)))?;
@@ -21,8 +39,12 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
 
     // Extract arena dimensions
     let arena = &game_state["arena"];
-    let width = arena["width"].as_u64().unwrap_or(10) as u32;
-    let height = arena["height"].as_u64().unwrap_or(10) as u32;
+    let game_width = arena["width"].as_u64().unwrap_or(10) as f64;
+    let game_height = arena["height"].as_u64().unwrap_or(10) as f64;
+    let rotation_int = rotation as i32;
+    
+    // Get effective dimensions for rendering (swapped for vertical orientations)
+    let (width, height) = get_effective_dimensions(game_width, game_height, rotation_int);
 
     // Use a fixed dot radius of 1px to match the background dots
     let dot_radius = 1.0;
@@ -38,11 +60,11 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     // Add 1px padding offset for all drawing operations
     let padding = 1.0;
     
-    // Save the current state and translate for padding
+    // Save the current state
     ctx.save();
     ctx.translate(padding, padding)?;
     
-    // Fill the game area with white again to ensure clean background
+    // Fill the game area with white to ensure clean background
     ctx.set_fill_style(&JsValue::from_str("#ffffff"));
     ctx.fill_rect(0.0, 0.0, canvas_width - 2.0 * padding, canvas_height - 2.0 * padding);
     
@@ -90,38 +112,86 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             }
         };
         
-        // Draw left end zone
-        ctx.set_fill_style(&JsValue::from_str(left_color));
-        ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height as f64 * cell_size);
-        
-        // Draw right end zone
-        ctx.set_fill_style(&JsValue::from_str(right_color));
-        ctx.fill_rect(
-            (width as f64 - end_zone_depth) * cell_size, 
-            0.0, 
-            end_zone_depth * cell_size, 
-            height as f64 * cell_size
-        );
-        
-        // Draw team names in end zones
-        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-        ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
-        ctx.set_text_align("center");
-        ctx.set_text_baseline("middle");
-        
-        // Left zone text
-        ctx.fill_text(
-            left_label,
-            end_zone_depth * cell_size / 2.0,
-            height as f64 * cell_size / 2.0
-        )?;
-        
-        // Right zone text
-        ctx.fill_text(
-            right_label,
-            (width as f64 - end_zone_depth / 2.0) * cell_size,
-            height as f64 * cell_size / 2.0
-        )?;
+        // In the original orientation, zones are on left and right
+        // We need to transform these based on rotation
+        match rotation_int {
+            90 => {
+                // 90° CW: left zone becomes top, right zone becomes bottom
+                // Top zone
+                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
+                
+                // Bottom zone
+                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.fill_rect(0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size);
+                
+                // Zone text
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                ctx.set_text_align("center");
+                ctx.set_text_baseline("middle");
+                
+                ctx.fill_text(left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                ctx.fill_text(right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+            },
+            180 => {
+                // 180°: left zone becomes right, right zone becomes left
+                // Right zone (was left)
+                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.fill_rect((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size);
+                
+                // Left zone (was right)
+                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
+                
+                // Zone text
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                ctx.set_text_align("center");
+                ctx.set_text_baseline("middle");
+                
+                ctx.fill_text(left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                ctx.fill_text(right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+            },
+            270 => {
+                // 270° CW: left zone becomes bottom, right zone becomes top
+                // Bottom zone (was left)
+                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.fill_rect(0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size);
+                
+                // Top zone (was right)
+                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
+                
+                // Zone text
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                ctx.set_text_align("center");
+                ctx.set_text_baseline("middle");
+                
+                ctx.fill_text(left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                ctx.fill_text(right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+            },
+            _ => {
+                // 0° or default: normal orientation
+                // Left zone
+                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
+                
+                // Right zone
+                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.fill_rect((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size);
+                
+                // Zone text
+                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                ctx.set_text_align("center");
+                ctx.set_text_baseline("middle");
+                
+                ctx.fill_text(left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                ctx.fill_text(right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+            }
+        }
     }
     
     // Draw dots at grid intersections (like the background pattern)
@@ -129,8 +199,8 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     
     // Scale dot spacing with cell size to maintain consistent visual density
     let dot_spacing = cell_size;
-    let dots_x = ((canvas_width - 2.0 * padding) / dot_spacing).ceil() as u32;
-    let dots_y = ((canvas_height - 2.0 * padding) / dot_spacing).ceil() as u32;
+    let dots_x = (width).ceil() as u32;
+    let dots_y = (height).ceil() as u32;
     
     // Start from 1 and end at dots_x/y - 1 to skip outer edge dots
     for x in 1..dots_x {
@@ -138,8 +208,8 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             let dot_x = x as f64 * dot_spacing;
             let dot_y = y as f64 * dot_spacing;
             
-            // Skip dots that are on or outside the canvas edges (accounting for padding)
-            if dot_x >= canvas_width - 2.0 * padding || dot_y >= canvas_height - 2.0 * padding {
+            // Skip dots that are on the exact edges
+            if dot_x >= width * cell_size || dot_y >= height * cell_size {
                 continue;
             }
             
@@ -158,15 +228,6 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         // Draw walls as 3px solid rectangles between field and endzone cells
         let wall_thickness = 3.0;
         
-        let goal_center = height as f64 / 2.0;
-        let goal_half_width = goal_width / 2.0;
-        let goal_y_start = goal_center - goal_half_width;
-        let goal_y_end = goal_center + goal_half_width;
-        
-        // Round goal boundaries to nearest cell edges
-        let goal_y_start_aligned = goal_y_start.floor();
-        let goal_y_end_aligned = goal_y_end.ceil();
-        
         // Determine wall colors based on local player's team
         let (left_wall_color, right_wall_color) = match local_player_team {
             Some(0) => ("#7aa8c1", "#c18888"),  // Local is Team 0: blue left, red right
@@ -174,54 +235,124 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
             _ => ("#7aa8c1", "#c18888"),        // Default: blue left, red right
         };
         
-        // Left boundary wall (between endzone and field)
-        ctx.set_fill_style(&JsValue::from_str(left_wall_color));
-        
-        let team_a_wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
-        
-        // Top wall segment (before goal)
-        if goal_y_start_aligned > 0.0 {
-            ctx.fill_rect(
-                team_a_wall_x,
-                0.0,
-                wall_thickness,
-                goal_y_start_aligned * cell_size
-            );
-        }
-        
-        // Bottom wall segment (after goal)
-        if goal_y_end_aligned < height as f64 {
-            ctx.fill_rect(
-                team_a_wall_x,
-                goal_y_end_aligned * cell_size,
-                wall_thickness,
-                (height as f64 - goal_y_end_aligned) * cell_size
-            );
-        }
-        
-        // Right boundary wall (between field and endzone)
-        ctx.set_fill_style(&JsValue::from_str(right_wall_color));
-        
-        let team_b_wall_x = (width as f64 - end_zone_depth) * cell_size - wall_thickness / 2.0;
-        
-        // Top wall segment (before goal)
-        if goal_y_start_aligned > 0.0 {
-            ctx.fill_rect(
-                team_b_wall_x,
-                0.0,
-                wall_thickness,
-                goal_y_start_aligned * cell_size
-            );
-        }
-        
-        // Bottom wall segment (after goal)
-        if goal_y_end_aligned < height as f64 {
-            ctx.fill_rect(
-                team_b_wall_x,
-                goal_y_end_aligned * cell_size,
-                wall_thickness,
-                (height as f64 - goal_y_end_aligned) * cell_size
-            );
+        // Draw walls based on rotation
+        match rotation_int {
+            90 => {
+                // 90° CW: walls are horizontal at top and bottom
+                let goal_center = width / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_x_start = (goal_center - goal_half_width).floor();
+                let goal_x_end = (goal_center + goal_half_width).ceil();
+                
+                // Top wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+                
+                // Bottom wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+            },
+            180 => {
+                // 180°: walls are vertical but swapped positions
+                let goal_center = height / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_y_start = (goal_center - goal_half_width).floor();
+                let goal_y_end = (goal_center + goal_half_width).ceil();
+                
+                // Right wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+                
+                // Left wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+            },
+            270 => {
+                // 270° CW: walls are horizontal at bottom and top
+                let goal_center = width / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_x_start = (goal_center - goal_half_width).floor();
+                let goal_x_end = (goal_center + goal_half_width).ceil();
+                
+                // Bottom wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+                
+                // Top wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+            },
+            _ => {
+                // 0° or default: normal vertical walls
+                let goal_center = height / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_y_start = (goal_center - goal_half_width).floor();
+                let goal_y_end = (goal_center + goal_half_width).ceil();
+                
+                // Left wall
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+                
+                // Right wall
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+            }
         }
     }
 
@@ -231,8 +362,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         ctx.set_fill_style(&JsValue::from_str("#ffffff"));
         for food in food_array {
             if let (Some(x), Some(y)) = (food["x"].as_i64(), food["y"].as_i64()) {
-                let cell_x = x as f64 * cell_size;
-                let cell_y = y as f64 * cell_size;
+                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                let cell_x = tx * cell_size;
+                let cell_y = ty * cell_size;
                 // Draw white rectangle 1px larger than the cell to erase dots
                 ctx.fill_rect(cell_x - 1.0, cell_y - 1.0, cell_size + 2.0, cell_size + 2.0);
             }
@@ -241,8 +373,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
         // Second pass: Draw the actual food
         for food in food_array {
             if let (Some(x), Some(y)) = (food["x"].as_i64(), food["y"].as_i64()) {
-                let cell_x = x as f64 * cell_size;
-                let cell_y = y as f64 * cell_size;
+                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                let cell_x = tx * cell_size;
+                let cell_y = ty * cell_size;
                 let center_x = cell_x + cell_size / 2.0;
                 let center_y = cell_y + cell_size / 2.0;
                 let radius = cell_size / 2.0;
@@ -313,8 +446,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     if body.len() == 1 {
                         if let Some(head) = body.first() {
                             if let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64()) {
-                                let center_x = x as f64 * cell_size + cell_size / 2.0;
-                                let center_y = y as f64 * cell_size + cell_size / 2.0;
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
                                 
                                 // Draw border
                                 ctx.set_fill_style(&JsValue::from_str(border_color));
@@ -349,18 +483,22 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
                             let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
 
-                            if x1 == x2 {
-                                // Vertical segment - draw rectangle
-                                let x = x1 * cell_size;
-                                let min_y = y1.min(y2) * cell_size;
-                                let max_y = y1.max(y2) * cell_size;
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation - draw rectangle
+                                let x = tx1 * cell_size;
+                                let min_y = ty1.min(ty2) * cell_size;
+                                let max_y = ty1.max(ty2) * cell_size;
                                 ctx.fill_rect(x - 1.0, min_y - 1.0, cell_size + 2.0, (max_y - min_y) + cell_size + 2.0);
-                            } else if y1 == y2 {
-                                // Horizontal segment - draw rectangle
-                                let y = y1 * cell_size;
-                                let min_x = x1.min(x2) * cell_size;
-                                let max_x = x1.max(x2) * cell_size;
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation - draw rectangle
+                                let y = ty1 * cell_size;
+                                let min_x = tx1.min(tx2) * cell_size;
+                                let max_x = tx1.max(tx2) * cell_size;
                                 ctx.fill_rect(min_x - 1.0, y - 1.0, (max_x - min_x) + cell_size + 2.0, cell_size + 2.0);
                             }
                         }
@@ -369,8 +507,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     // Fill white rectangles for all body points (expanded by 1px)
                     for point in body.iter() {
                         if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                            let rect_x = x as f64 * cell_size - 1.0;
-                            let rect_y = y as f64 * cell_size - 1.0;
+                            let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                            let rect_x = tx * cell_size - 1.0;
+                            let rect_y = ty * cell_size - 1.0;
                             ctx.fill_rect(rect_x, rect_y, cell_size + 2.0, cell_size + 2.0);
                         }
                     }
@@ -385,12 +524,16 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
                             let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
 
-                            if x1 == x2 {
-                                // Vertical segment
-                                let x = x1 * cell_size + cell_size / 2.0;
-                                let min_y = y1.min(y2) * cell_size + cell_size / 2.0;
-                                let max_y = y1.max(y2) * cell_size + cell_size / 2.0;
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation
+                                let x = tx1 * cell_size + cell_size / 2.0;
+                                let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
+                                let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
                                 
                                 ctx.set_line_width(cell_size + 2.0);
                                 ctx.set_line_cap("round");
@@ -398,11 +541,11 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                                 ctx.move_to(x, min_y);
                                 ctx.line_to(x, max_y);
                                 ctx.stroke();
-                            } else if y1 == y2 {
-                                // Horizontal segment
-                                let y = y1 * cell_size + cell_size / 2.0;
-                                let min_x = x1.min(x2) * cell_size + cell_size / 2.0;
-                                let max_x = x1.max(x2) * cell_size + cell_size / 2.0;
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation
+                                let y = ty1 * cell_size + cell_size / 2.0;
+                                let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
+                                let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
                                 
                                 ctx.set_line_width(cell_size + 2.0);
                                 ctx.set_line_cap("round");
@@ -419,8 +562,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     for i in 1..body.len()-1 {
                         if let Some(point) = body.get(i) {
                             if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let center_x = x as f64 * cell_size + cell_size / 2.0;
-                                let center_y = y as f64 * cell_size + cell_size / 2.0;
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
                                 
                                 ctx.begin_path();
                                 ctx.arc(center_x, center_y, cell_size / 2.0 + 1.0, 0.0, 2.0 * std::f64::consts::PI)?;
@@ -440,12 +584,16 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
                             let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
 
-                            if x1 == x2 {
-                                // Vertical segment
-                                let x = x1 * cell_size + cell_size / 2.0;
-                                let min_y = y1.min(y2) * cell_size + cell_size / 2.0;
-                                let max_y = y1.max(y2) * cell_size + cell_size / 2.0;
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation
+                                let x = tx1 * cell_size + cell_size / 2.0;
+                                let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
+                                let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
                                 
                                 ctx.set_line_width(cell_size);
                                 ctx.set_line_cap("round");
@@ -453,11 +601,11 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                                 ctx.move_to(x, min_y);
                                 ctx.line_to(x, max_y);
                                 ctx.stroke();
-                            } else if y1 == y2 {
-                                // Horizontal segment
-                                let y = y1 * cell_size + cell_size / 2.0;
-                                let min_x = x1.min(x2) * cell_size + cell_size / 2.0;
-                                let max_x = x1.max(x2) * cell_size + cell_size / 2.0;
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation
+                                let y = ty1 * cell_size + cell_size / 2.0;
+                                let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
+                                let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
                                 
                                 ctx.set_line_width(cell_size);
                                 ctx.set_line_cap("round");
@@ -473,8 +621,9 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     for i in 1..body.len()-1 {
                         if let Some(point) = body.get(i) {
                             if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let center_x = x as f64 * cell_size + cell_size / 2.0;
-                                let center_y = y as f64 * cell_size + cell_size / 2.0;
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
                                 
                                 ctx.begin_path();
                                 ctx.arc(center_x, center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
@@ -487,14 +636,16 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                     let head = body.first().unwrap();
                     let head_x = head["x"].as_i64().unwrap_or(0) as f64;
                     let head_y = head["y"].as_i64().unwrap_or(0) as f64;
-                    let head_center_x = head_x * cell_size + cell_size / 2.0;
-                    let head_center_y = head_y * cell_size + cell_size / 2.0;
+                    let (head_tx, head_ty) = transform_coords(head_x, head_y, game_width, game_height, rotation_int);
+                    let head_center_x = head_tx * cell_size + cell_size / 2.0;
+                    let head_center_y = head_ty * cell_size + cell_size / 2.0;
                     
                     let tail = body.last().unwrap();
                     let tail_x = tail["x"].as_i64().unwrap_or(0) as f64;
                     let tail_y = tail["y"].as_i64().unwrap_or(0) as f64;
-                    let tail_center_x = tail_x * cell_size + cell_size / 2.0;
-                    let tail_center_y = tail_y * cell_size + cell_size / 2.0;
+                    let (tail_tx, tail_ty) = transform_coords(tail_x, tail_y, game_width, game_height, rotation_int);
+                    let tail_center_x = tail_tx * cell_size + cell_size / 2.0;
+                    let tail_center_y = tail_ty * cell_size + cell_size / 2.0;
 
                     // Draw actual tail and head (no separate border circles needed)
                     // The round line caps already provide the border
@@ -592,9 +743,10 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                         let opacity = (1.0 - distance / 10.0) * 0.3;
                         ctx.set_fill_style(&JsValue::from_str(&format!("rgba(255, 255, 255, {})", opacity)));
                         
+                        let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
                         ctx.fill_rect(
-                            x as f64 * cell_size,
-                            y as f64 * cell_size,
+                            tx * cell_size,
+                            ty * cell_size,
                             cell_size,
                             cell_size
                         );
