@@ -67,6 +67,7 @@ export default function GameArena() {
   const [, forceUpdate] = useReducer(x => x + 1, 0);
   const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
   const [rotation, setRotation] = useState<ArenaRotation>(0);
+  const rotationSetRef = useRef(false); // Track if rotation has been set
 
   // Join game when user becomes available
   useEffect(() => {
@@ -96,6 +97,7 @@ export default function GameArena() {
       console.log('GAME ARENA UNMOUNTED, initial state issue');
 
       hasJoinedGameRef.current = false; // Reset for next mount
+      rotationSetRef.current = false; // Reset rotation flag for next game
       leaveGame();
       stopEngine();
     };
@@ -220,6 +222,31 @@ export default function GameArena() {
     }
   };
 
+  // Set rotation based on user's team when game state is first available
+  useEffect(() => {
+    if (gameState && user?.id && !rotationSetRef.current) {
+      const player = gameState.players?.[user.id];
+      if (player) {
+        const snakeId = player.snake_id;
+        
+        // In team games, team 0 has their endzone on the left, team 1 on the right
+        // We determine team by snake_id: even indices are team 0, odd indices are team 1
+        const teamId = snakeId % 2;
+        
+        if (teamId === 0) {
+          // Team 0: endzone is on the left - rotate 270° so it appears at bottom
+          setRotation(270);
+        } else {
+          // Team 1: endzone is on the right - rotate 90° so it appears at bottom
+          setRotation(90);
+        }
+        
+        // Mark rotation as set so we don't recalculate
+        rotationSetRef.current = true;
+      }
+    }
+  }, [gameState, user?.id]); // Only run when gameState or user changes
+
   useEffect(() => {
     if (!window.wasm) {
       console.log('WASM not loaded yet');
@@ -230,21 +257,6 @@ export default function GameArena() {
     const handleKeyPress = (e: KeyboardEvent) => {
       // Ignore repeat events
       if (e.repeat) {
-        return;
-      }
-      
-      // Handle rotation key (R)
-      if (e.key === 'r' || e.key === 'R') {
-        e.preventDefault();
-        setRotation(prev => {
-          switch (prev) {
-            case 0: return 90;
-            case 90: return 180;
-            case 180: return 270;
-            case 270: return 0;
-            default: return 0;
-          }
-        });
         return;
       }
       
