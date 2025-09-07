@@ -677,6 +677,42 @@ impl GameState {
         Ok(player)
     }
     
+    /// Spawns initial food items when the game starts
+    pub fn spawn_initial_food(&mut self) {
+        if self.rng.is_none() {
+            return; // Can't spawn food without RNG
+        }
+        
+        let target_food = self.properties.available_food_target;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 1000; // Prevent infinite loop
+        
+        while self.arena.food.len() < target_food && attempts < MAX_ATTEMPTS {
+            attempts += 1;
+            
+            if let Some(rng) = &mut self.rng {
+                // For team games, only spawn food in the main field (not in endzones)
+                let (x_min, x_max) = if let Some((left, right)) = self.arena.main_field_bounds() {
+                    (left, right)
+                } else {
+                    (0, self.arena.width as i16 - 1)
+                };
+                
+                let x_range = (x_max - x_min + 1) as u16;
+                let position = Position {
+                    x: x_min + (rng.next_u16() % x_range) as i16,
+                    y: (rng.next_u16() % self.arena.height) as i16,
+                };
+                
+                // Check if position is valid (not occupied by food or snake)
+                if !self.arena.food.contains(&position) &&
+                    !self.arena.snakes.iter().any(|s| s.is_alive && s.contains_point(&position)) {
+                    self.arena.food.push(position);
+                }
+            }
+        }
+    }
+    
     pub fn schedule_command(&mut self, command_message: &GameCommandMessage) {
         self.apply_event(GameEvent::CommandScheduled { command_message: command_message.clone() }, None);
     }
@@ -781,8 +817,16 @@ impl GameState {
             // The client will not have rng so it won't be able to spawn food.
             // This is by design as there's no reason for the client to spawn food.
             if let Some(rng) = &mut self.rng {
+                // For team games, only spawn food in the main field (not in endzones)
+                let (x_min, x_max) = if let Some((left, right)) = self.arena.main_field_bounds() {
+                    (left, right)
+                } else {
+                    (0, self.arena.width as i16 - 1)
+                };
+                
+                let x_range = (x_max - x_min + 1) as u16;
                 let position = Position {
-                    x: (rng.next_u16() % self.arena.width) as i16,
+                    x: x_min + (rng.next_u16() % x_range) as i16,
                     y: (rng.next_u16() % self.arena.height) as i16,
                 };
 

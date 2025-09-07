@@ -343,12 +343,17 @@ async fn create_adaptive_match(
         _ => (40, 40),
     };
     
-    let mut game_state = GameState::new(width, height, game_type_enum, None, start_ms);
+    // Generate a random seed for the game to enable food spawning
+    let rng_seed = Some(chrono::Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
+    let mut game_state = GameState::new(width, height, game_type_enum, rng_seed, start_ms);
     
     // Add players to the game state with their usernames
     for player in matched_players.iter() {
         game_state.add_player(player.user_id as u32, Some(player.username.clone()))?;
     }
+    
+    // Spawn initial food items
+    game_state.spawn_initial_food();
     
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;

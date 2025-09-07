@@ -1051,6 +1051,9 @@ async fn create_custom_game(
     // Add the host as the first player
     game_state.add_player(user_id as u32, Some(username))?;
     
+    // Spawn initial food items
+    game_state.spawn_initial_food();
+    
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
@@ -1125,6 +1128,9 @@ async fn create_solo_game(
     
     // Add the player (only one player for solo mode)
     game_state.add_player(user_id as u32, Some(username))?;
+    
+    // Spawn initial food items
+    game_state.spawn_initial_food();
 
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
