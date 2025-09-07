@@ -189,62 +189,95 @@ pub fn render_game(
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
         
         // Retrieve the previously calculated colors and labels
-        // Using lighter shades for better visibility
+        // Using much lighter shades for better visibility
         let (_, _, left_text_color, right_text_color, left_label, right_label) = match local_player_team {
             Some(0) => {
                 let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
                 let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
-                // Lighter blue (#8ab4cc) and lighter red (#cc8a8a)
-                ("#e6f4fa", "#ffe6e6", "#8ab4cc", "#cc8a8a", local_name, opponent_name)
+                // Much lighter blue (#c0d8e4) and lighter red (#e4c0c0)
+                ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0", local_name, opponent_name)
             },
             Some(1) => {
                 let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
                 let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
-                // Lighter red (#cc8a8a) and lighter blue (#8ab4cc)
-                ("#ffe6e6", "#e6f4fa", "#cc8a8a", "#8ab4cc", opponent_name, local_name)
+                // Much lighter red (#e4c0c0) and lighter blue (#c0d8e4)
+                ("#ffe6e6", "#e6f4fa", "#e4c0c0", "#c0d8e4", opponent_name, local_name)
             },
             _ => {
                 let user0 = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
                 let user1 = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
-                // Lighter blue (#8ab4cc) and lighter red (#cc8a8a)
-                ("#e6f4fa", "#ffe6e6", "#8ab4cc", "#cc8a8a", user0, user1)
+                // Much lighter blue (#c0d8e4) and lighter red (#e4c0c0)
+                ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0", user0, user1)
             }
         };
         
-        // Set font for zone text - larger, all caps, bold
-        ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
-        ctx.set_text_align("center");
+        // Set font for zone text - stadium-style: larger, bold, epic font
+        // Try Impact first (common sports font), fall back to Arial Black, then sans-serif
+        ctx.set_font(&format!("900 {}px Impact, 'Arial Black', sans-serif", cell_size * 4.0));  
         ctx.set_text_baseline("middle");
+        
+        // Helper function to draw text with letter spacing
+        let draw_spaced_text = |ctx: &web_sys::CanvasRenderingContext2d, text: &str, x: f64, y: f64, spacing: f64| -> Result<(), JsValue> {
+            let chars: Vec<char> = text.chars().collect();
+            if chars.is_empty() {
+                return Ok(());
+            }
+            
+            // Use approximate character width based on font size
+            // For Impact/Arial Black, characters are roughly 0.5x the font size (more condensed)
+            let font_size = cell_size * 4.0;
+            let char_width = font_size * 0.5;
+            
+            // Calculate total width with spacing
+            let total_width = (chars.len() as f64 * char_width) + ((chars.len() - 1) as f64 * spacing);
+            
+            // Start position (centered)
+            let mut current_x = x - total_width / 2.0 + char_width / 2.0;
+            
+            // Draw each character
+            ctx.set_text_align("center");
+            for (i, ch) in chars.iter().enumerate() {
+                let ch_str = ch.to_string();
+                ctx.fill_text(&ch_str, current_x, y)?;
+                current_x += char_width;
+                if i < chars.len() - 1 {
+                    current_x += spacing;
+                }
+            }
+            Ok(())
+        };
+        
+        let letter_spacing = cell_size * 0.6;  // Wider space between letters for more epic look
         
         // Draw text based on rotation
         match rotation_int {
             90 => {
                 // Top and bottom zones
                 ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                ctx.fill_text(&left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0, letter_spacing)?;
                 ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                ctx.fill_text(&right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                draw_spaced_text(&ctx, &right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size, letter_spacing)?;
             },
             180 => {
                 // Right and left zones
                 ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                ctx.fill_text(&left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0, letter_spacing)?;
                 ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                ctx.fill_text(&right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0, letter_spacing)?;
             },
             270 => {
                 // Bottom and top zones
                 ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                ctx.fill_text(&left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                draw_spaced_text(&ctx, &left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size, letter_spacing)?;
                 ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                ctx.fill_text(&right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0, letter_spacing)?;
             },
             _ => {
                 // Left and right zones (default)
                 ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                ctx.fill_text(&left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0, letter_spacing)?;
                 ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                ctx.fill_text(&right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                draw_spaced_text(&ctx, &right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0, letter_spacing)?;
             }
         }
     }
