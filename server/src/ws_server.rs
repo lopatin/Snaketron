@@ -675,7 +675,7 @@ async fn process_ws_message(
                 WSMessage::CreateCustomGame { settings } => {
                     info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
                     
-                    match create_custom_game(db_pool, pubsub, metadata.user_id, settings).await {
+                    match create_custom_game(db_pool, pubsub, metadata.user_id, metadata.username.clone(), settings).await {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
@@ -756,7 +756,7 @@ async fn process_ws_message(
                 WSMessage::CreateSoloGame => {
                     info!("User {} ({}) creating solo game", metadata.username, metadata.user_id);
                     
-                    match create_solo_game(db_pool, pubsub, metadata.user_id).await {
+                    match create_solo_game(db_pool, pubsub, metadata.user_id, metadata.username.clone()).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -988,6 +988,7 @@ async fn create_custom_game(
     pool: &PgPool,
     pubsub: &mut PubSubManager,
     user_id: i32,
+    username: String,
     settings: common::CustomGameSettings,
 ) -> Result<(u32, String)> {
     let game_code = generate_game_code();
@@ -1048,7 +1049,7 @@ async fn create_custom_game(
     game_state.host_user_id = Some(user_id as u32);
     
     // Add the host as the first player
-    game_state.add_player(user_id as u32)?;
+    game_state.add_player(user_id as u32, Some(username))?;
     
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
@@ -1077,6 +1078,7 @@ async fn create_solo_game(
     pool: &PgPool,
     pubsub: &mut PubSubManager,
     user_id: i32,
+    username: String,
 ) -> Result<u32> {
     // Get current server ID from database
     let server_id: i32 = sqlx::query_scalar(
@@ -1122,7 +1124,7 @@ async fn create_solo_game(
     );
     
     // Add the player (only one player for solo mode)
-    game_state.add_player(user_id as u32)?;
+    game_state.add_player(user_id as u32, Some(username))?;
 
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;

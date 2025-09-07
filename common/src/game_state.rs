@@ -322,6 +322,8 @@ pub struct GameState {
     pub start_ms: i64,
     // Event sequence number for this game
     pub event_sequence: u64,
+    // Username mappings by user_id
+    pub usernames: HashMap<u32, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -430,10 +432,15 @@ impl GameState {
             host_user_id: None,
             start_ms,
             event_sequence: 0,
+            usernames: HashMap::new(),
         }
     }
 
     pub fn current_tick(&self) -> u32 { self.tick }
+    
+    pub fn is_complete(&self) -> bool {
+        matches!(self.status, GameStatus::Complete { .. })
+    }
 
     fn get_snake_mut(&mut self, snake_id: u32) -> Result<&mut Snake> {
         self.arena.snakes.get_mut(snake_id as usize).context("Snake not found")
@@ -542,7 +549,7 @@ impl GameState {
         positions
     }
 
-    pub fn add_player(&mut self, user_id: u32) -> Result<Player> {
+    pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
         if self.players.contains_key(&user_id) {
             return Err(anyhow::anyhow!("Player with user_id {} already exists", user_id));
         }
@@ -550,6 +557,11 @@ impl GameState {
         // Only rearrange players on tick 0
         if self.tick != 0 {
             return Err(anyhow::anyhow!("Cannot add player after the game has started"));
+        }
+
+        // Store username if provided
+        if let Some(name) = username {
+            self.usernames.insert(user_id, name);
         }
 
         // Determine team assignment for team games

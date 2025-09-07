@@ -38,6 +38,7 @@ struct MatchmakingPlayer {
     game_request_id: i32,
     user_id: i32,
     mmr: i32,
+    username: String,
     wait_seconds: i64,
 }
 
@@ -203,6 +204,7 @@ async fn create_adaptive_match(
             gr.id as game_request_id,
             gr.user_id,
             u.mmr,
+            u.username,
             EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds
         FROM game_requests gr
         INNER JOIN users u ON gr.user_id = u.id
@@ -343,9 +345,9 @@ async fn create_adaptive_match(
     
     let mut game_state = GameState::new(width, height, game_type_enum, None, start_ms);
     
-    // Add players to the game state
-    for user_id in user_ids.iter() {
-        game_state.add_player(*user_id as u32)?;
+    // Add players to the game state with their usernames
+    for player in matched_players.iter() {
+        game_state.add_player(player.user_id as u32, Some(player.username.clone()))?;
     }
     
     // Publish GameCreated event to Redis stream

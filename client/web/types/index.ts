@@ -57,6 +57,7 @@ export interface GameState {
   game_type: GameType;
   properties: GameProperties;
   players: Record<number, Player>;
+  usernames: Record<number, string>;  // Username mappings by user_id
   game_id: string;
   game_ended?: boolean;
   final_score?: number;

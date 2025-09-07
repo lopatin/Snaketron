@@ -98,13 +98,17 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
       const userId = playerEntry ? parseInt(playerEntry[0]) : null;
       const isCurrentPlayer = userId === currentUserId;
       
+      // Get username from game state or fall back to generic name
+      const username = userId && gameState.usernames ? 
+        gameState.usernames[userId] : null;
+      
       return {
         index,
         snake,
         color: SNAKE_COLORS[index % SNAKE_COLORS.length],
         userId,
         isCurrentPlayer,
-        name: isCurrentPlayer ? 'You' : `Player ${index + 1}`,
+        name: isCurrentPlayer ? 'You' : (username || `Player ${index + 1}`),
         team: index % 2 === 0 ? 1 : 2, // Even indices = team 1, odd = team 2
       };
     });
@@ -189,6 +193,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
       const userId = playerEntry ? parseInt(playerEntry[0]) : null;
       const isCurrentPlayer = userId === currentUserId;
       
+      // Get username from game state or fall back to generic name
+      const username = userId && gameState.usernames ? 
+        gameState.usernames[userId] : null;
+      
       // Calculate actual snake length
       let length = 0;
       if (snake.body.length >= 2) {
@@ -213,7 +221,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
         color: SNAKE_COLORS[index % SNAKE_COLORS.length],
         userId,
         isCurrentPlayer,
-        name: isCurrentPlayer ? 'You' : `Player ${index + 1}`,
+        name: isCurrentPlayer ? 'You' : (username || `Player ${index + 1}`),
         finalLength: length,
         foodEaten,
         isWinner: index === getWinningSnakeId(),
@@ -432,76 +440,70 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
           
           {/* Game Over Content */}
           <div className="flex items-center justify-between">
-            {/* Left side - Result and Stats */}
-            <div className="flex items-center gap-5">
-              {/* Result Text */}
-              <div className="font-black italic uppercase tracking-1 text-black-70" style={{ fontSize: '18px' }}>
-                {resultText}
-              </div>
-              
-              {/* Divider */}
-              <div className="h-6 w-px bg-gray-300 opacity-40" />
-              
-              {/* Stats */}
-              <div className="flex items-center gap-4">
-                {solo ? (
-                  // Solo game stats
-                  <>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        XP
-                      </div>
-                      <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
-                        +{gameStats.xpGained}
-                      </div>
+            {/* Left side - Stats */}
+            <div className="flex items-center gap-4">
+              {solo ? (
+                // Solo game stats
+                <>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      XP
                     </div>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        Food
-                      </div>
-                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
-                        {gameStats.foodEaten}
-                      </div>
+                    <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
+                      +{gameStats.xpGained}
                     </div>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        Length
-                      </div>
-                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
-                        {currentPlayerStats?.finalLength || 0}
-                      </div>
+                  </div>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      Food
                     </div>
-                  </>
-                ) : (
-                  // Multiplayer game stats
-                  <>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        XP
-                      </div>
-                      <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
-                        +{gameStats.xpGained}
-                      </div>
+                    <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                      {gameStats.foodEaten}
                     </div>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        Food
-                      </div>
-                      <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
-                        {gameStats.foodEaten}
-                      </div>
+                  </div>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      Length
                     </div>
-                    <div className="flex flex-col items-center">
-                      <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                        Kills
-                      </div>
-                      <div className="text-red-600 font-black text-lg -mt-0.5 tabular-nums">
-                        {gameStats.enemyFoodEaten}
-                      </div>
+                    <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                      {currentPlayerStats?.finalLength || 0}
                     </div>
-                  </>
-                )}
-              </div>
+                  </div>
+                </>
+              ) : (
+                // Multiplayer game stats
+                <>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      XP
+                    </div>
+                    <div className="text-green-600 font-black text-lg -mt-0.5 tabular-nums">
+                      +{gameStats.xpGained}
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      Food
+                    </div>
+                    <div className="text-black-70 font-black text-lg -mt-0.5 tabular-nums">
+                      {gameStats.foodEaten}
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-center">
+                    <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
+                      Kills
+                    </div>
+                    <div className="text-red-600 font-black text-lg -mt-0.5 tabular-nums">
+                      {gameStats.enemyFoodEaten}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Center - Result Text */}
+            <div className="font-black italic uppercase tracking-1 text-black-70" style={{ fontSize: '18px' }}>
+              {resultText}
             </div>
 
             {/* Right side - Action Buttons */}

@@ -155,7 +155,8 @@ impl GameEngine {
             new_predicted_state.rng = None;
 
             // Advance to target tick
-            while new_predicted_state.current_tick() < predicted_target_tick {
+            while !new_predicted_state.is_complete() 
+                && new_predicted_state.current_tick() < predicted_target_tick {
                 new_predicted_state.tick_forward()?;
             }
             
@@ -181,7 +182,8 @@ impl GameEngine {
         let lagged_target_tick = predicted_target_tick.saturating_sub(lag_ticks);
         let mut out: Vec<(u32, u64, GameEvent)> = Vec::new();
 
-        while self.committed_state.current_tick() < lagged_target_tick {
+        while !self.committed_state.is_complete() 
+            && self.committed_state.current_tick() < lagged_target_tick {
             let current_tick = self.committed_state.current_tick();
             for (sequence, event) in self.committed_state.tick_forward()? {
                 // eprintln!("game_engine: Emitting event at tick {} seq {}: {:?}", current_tick, sequence, event);
@@ -191,7 +193,8 @@ impl GameEngine {
 
         // Run predicted state to current time (not lagged)
         if let Some(predicted_state) = &mut self.predicted_state {
-            while predicted_state.current_tick() < predicted_target_tick {
+            while !predicted_state.is_complete() 
+                && predicted_state.current_tick() < predicted_target_tick {
                 predicted_state.tick_forward()?;
             }
         }

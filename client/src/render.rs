@@ -104,26 +104,11 @@ pub fn render_game(
     if let Some(team_zone_config) = &team_zone_config_data {
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
         
-        // Determine colors and labels based on local player's team
-        let (left_color, right_color, left_faded, right_faded, left_label, right_label) = match local_player_team {
-            Some(0) => {
-                // Local player is Team 0 (left) - they see blue on left, red on right
-                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
-                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
-                ("#e6f4fa", "#ffe6e6", "rgba(122, 168, 193, 0.25)", "rgba(193, 136, 136, 0.25)", local_name, opponent_name)
-            },
-            Some(1) => {
-                // Local player is Team 1 (right) - they see red on left, blue on right
-                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
-                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
-                ("#ffe6e6", "#e6f4fa", "rgba(193, 136, 136, 0.25)", "rgba(122, 168, 193, 0.25)", opponent_name, local_name)
-            },
-            _ => {
-                // No local player or unknown team - use default
-                let user0 = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
-                let user1 = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
-                ("#e6f4fa", "#ffe6e6", "rgba(122, 168, 193, 0.25)", "rgba(193, 136, 136, 0.25)", user0, user1)
-            }
+        // Determine zone background colors based on local player's team
+        let (left_color, right_color) = match local_player_team {
+            Some(0) => ("#e6f4fa", "#ffe6e6"),  // Blue left, red right
+            Some(1) => ("#ffe6e6", "#e6f4fa"),  // Red left, blue right
+            _ => ("#e6f4fa", "#ffe6e6"),        // Default: blue left, red right
         };
         
         // In the original orientation, zones are on left and right
@@ -138,16 +123,6 @@ pub fn render_game(
                 // Bottom zone
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size);
-                
-                // Zone text - larger, all caps, faded
-                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
-                ctx.set_text_align("center");
-                ctx.set_text_baseline("middle");
-                
-                ctx.set_fill_style(&JsValue::from_str(&left_faded));
-                ctx.fill_text(&left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
-                ctx.set_fill_style(&JsValue::from_str(&right_faded));
-                ctx.fill_text(&right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
             },
             180 => {
                 // 180°: left zone becomes right, right zone becomes left
@@ -158,16 +133,6 @@ pub fn render_game(
                 // Left zone (was right)
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
-                
-                // Zone text - larger, all caps, faded
-                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
-                ctx.set_text_align("center");
-                ctx.set_text_baseline("middle");
-                
-                ctx.set_fill_style(&JsValue::from_str(&left_faded));
-                ctx.fill_text(&left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
-                ctx.set_fill_style(&JsValue::from_str(&right_faded));
-                ctx.fill_text(&right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
             },
             270 => {
                 // 270° CW: left zone becomes bottom, right zone becomes top
@@ -178,16 +143,6 @@ pub fn render_game(
                 // Top zone (was right)
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
-                
-                // Zone text - larger, all caps, faded
-                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
-                ctx.set_text_align("center");
-                ctx.set_text_baseline("middle");
-                
-                ctx.set_fill_style(&JsValue::from_str(&left_faded));
-                ctx.fill_text(&left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
-                ctx.set_fill_style(&JsValue::from_str(&right_faded));
-                ctx.fill_text(&right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
             },
             _ => {
                 // 0° or default: normal orientation
@@ -198,16 +153,6 @@ pub fn render_game(
                 // Right zone
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size);
-                
-                // Zone text - larger, all caps, faded
-                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
-                ctx.set_text_align("center");
-                ctx.set_text_baseline("middle");
-                
-                ctx.set_fill_style(&JsValue::from_str(&left_faded));
-                ctx.fill_text(&left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
-                ctx.set_fill_style(&JsValue::from_str(&right_faded));
-                ctx.fill_text(&right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
             }
         }
     }
@@ -238,7 +183,73 @@ pub fn render_game(
         }
     }
     
-    // Draw walls after dots so they cover the dots
+    // Draw endzone text after dots but before walls and snakes
+    // This ensures text is visible over dots but under snakes
+    if let Some(team_zone_config) = &team_zone_config_data {
+        let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
+        
+        // Retrieve the previously calculated colors and labels
+        // Using lighter shades for better visibility
+        let (_, _, left_text_color, right_text_color, left_label, right_label) = match local_player_team {
+            Some(0) => {
+                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                // Lighter blue (#8ab4cc) and lighter red (#cc8a8a)
+                ("#e6f4fa", "#ffe6e6", "#8ab4cc", "#cc8a8a", local_name, opponent_name)
+            },
+            Some(1) => {
+                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                // Lighter red (#cc8a8a) and lighter blue (#8ab4cc)
+                ("#ffe6e6", "#e6f4fa", "#cc8a8a", "#8ab4cc", opponent_name, local_name)
+            },
+            _ => {
+                let user0 = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                let user1 = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                // Lighter blue (#8ab4cc) and lighter red (#cc8a8a)
+                ("#e6f4fa", "#ffe6e6", "#8ab4cc", "#cc8a8a", user0, user1)
+            }
+        };
+        
+        // Set font for zone text - larger, all caps, bold
+        ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
+        ctx.set_text_align("center");
+        ctx.set_text_baseline("middle");
+        
+        // Draw text based on rotation
+        match rotation_int {
+            90 => {
+                // Top and bottom zones
+                ctx.set_fill_style(&JsValue::from_str(left_text_color));
+                ctx.fill_text(&left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(right_text_color));
+                ctx.fill_text(&right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+            },
+            180 => {
+                // Right and left zones
+                ctx.set_fill_style(&JsValue::from_str(left_text_color));
+                ctx.fill_text(&left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(right_text_color));
+                ctx.fill_text(&right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+            },
+            270 => {
+                // Bottom and top zones
+                ctx.set_fill_style(&JsValue::from_str(left_text_color));
+                ctx.fill_text(&left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                ctx.set_fill_style(&JsValue::from_str(right_text_color));
+                ctx.fill_text(&right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+            },
+            _ => {
+                // Left and right zones (default)
+                ctx.set_fill_style(&JsValue::from_str(left_text_color));
+                ctx.fill_text(&left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(right_text_color));
+                ctx.fill_text(&right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+            }
+        }
+    }
+    
+    // Draw walls after dots and text so they cover the dots
     if let Some(team_zone_config) = &team_zone_config_data {
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
         let goal_width = team_zone_config["goal_width"].as_u64().unwrap_or(5) as f64;

@@ -338,14 +338,15 @@ export default function GameArena() {
           lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
         }
         
-        // Get opponent username if in a team game
+        // Get opponent username for team games
         let opponentUsername: string | null = null;
-        if (gameState.players && Object.keys(gameState.players).length > 1) {
-          // Find the other player
-          const otherPlayerId = Object.keys(gameState.players).find(id => parseInt(id) !== user?.id);
-          if (otherPlayerId) {
-            // For now, we don't have usernames in gameState, so use placeholder
-            opponentUsername = `User ${otherPlayerId}`;
+        if (gameState.usernames && user?.id) {
+          // Find the first opponent (different user ID)
+          const opponentEntry = Object.entries(gameState.usernames).find(
+            ([userId, _]) => parseInt(userId) !== user.id
+          );
+          if (opponentEntry) {
+            opponentUsername = opponentEntry[1];
           }
         }
         
