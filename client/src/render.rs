@@ -21,9 +21,17 @@ fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64
 }
 
 /// Renders the game state to a canvas element
-/// Takes a JSON string representation of the game state, the local user ID, and rotation angle
+/// Takes a JSON string representation of the game state, the local user ID, rotation angle, and usernames
 #[wasm_bindgen]
-pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, cell_size: f64, local_user_id: Option<u32>, rotation: f64) -> Result<(), JsValue> {
+pub fn render_game(
+    game_state_json: &str, 
+    canvas: web_sys::HtmlCanvasElement, 
+    cell_size: f64, 
+    local_user_id: Option<u32>, 
+    rotation: f64,
+    local_username: Option<String>,
+    opponent_username: Option<String>
+) -> Result<(), JsValue> {
     // Parse the JSON game state
     let game_state: Value = serde_json::from_str(game_state_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse game state: {}", e)))?;
@@ -96,19 +104,25 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
     if let Some(team_zone_config) = &team_zone_config_data {
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
         
-        // Determine colors based on local player's team
-        let (left_color, right_color, left_label, right_label) = match local_player_team {
+        // Determine colors and labels based on local player's team
+        let (left_color, right_color, left_faded, right_faded, left_label, right_label) = match local_player_team {
             Some(0) => {
                 // Local player is Team 0 (left) - they see blue on left, red on right
-                ("#e6f4fa", "#ffe6e6", "YOUR GOAL", "ENEMY GOAL")
+                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                ("#e6f4fa", "#ffe6e6", "rgba(122, 168, 193, 0.25)", "rgba(193, 136, 136, 0.25)", local_name, opponent_name)
             },
             Some(1) => {
                 // Local player is Team 1 (right) - they see red on left, blue on right
-                ("#ffe6e6", "#e6f4fa", "ENEMY GOAL", "YOUR GOAL")
+                let local_name = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                let opponent_name = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                ("#ffe6e6", "#e6f4fa", "rgba(193, 136, 136, 0.25)", "rgba(122, 168, 193, 0.25)", opponent_name, local_name)
             },
             _ => {
                 // No local player or unknown team - use default
-                ("#e6f4fa", "#ffe6e6", "TEAM 0", "TEAM 1")
+                let user0 = opponent_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 0".to_string());
+                let user1 = local_username.as_ref().map(|s| s.to_uppercase()).unwrap_or_else(|| "USER 1".to_string());
+                ("#e6f4fa", "#ffe6e6", "rgba(122, 168, 193, 0.25)", "rgba(193, 136, 136, 0.25)", user0, user1)
             }
         };
         
@@ -125,14 +139,15 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size);
                 
-                // Zone text
-                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                // Zone text - larger, all caps, faded
+                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
                 ctx.set_text_align("center");
                 ctx.set_text_baseline("middle");
                 
-                ctx.fill_text(left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
-                ctx.fill_text(right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                ctx.set_fill_style(&JsValue::from_str(&left_faded));
+                ctx.fill_text(&left_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&right_faded));
+                ctx.fill_text(&right_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
             },
             180 => {
                 // 180°: left zone becomes right, right zone becomes left
@@ -144,14 +159,15 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
                 
-                // Zone text
-                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                // Zone text - larger, all caps, faded
+                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
                 ctx.set_text_align("center");
                 ctx.set_text_baseline("middle");
                 
-                ctx.fill_text(left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
-                ctx.fill_text(right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&left_faded));
+                ctx.fill_text(&left_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&right_faded));
+                ctx.fill_text(&right_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
             },
             270 => {
                 // 270° CW: left zone becomes bottom, right zone becomes top
@@ -163,14 +179,15 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
                 
-                // Zone text
-                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                // Zone text - larger, all caps, faded
+                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
                 ctx.set_text_align("center");
                 ctx.set_text_baseline("middle");
                 
-                ctx.fill_text(left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
-                ctx.fill_text(right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&left_faded));
+                ctx.fill_text(&left_label, width * cell_size / 2.0, (height - end_zone_depth / 2.0) * cell_size)?;
+                ctx.set_fill_style(&JsValue::from_str(&right_faded));
+                ctx.fill_text(&right_label, width * cell_size / 2.0, end_zone_depth * cell_size / 2.0)?;
             },
             _ => {
                 // 0° or default: normal orientation
@@ -182,14 +199,15 @@ pub fn render_game(game_state_json: &str, canvas: web_sys::HtmlCanvasElement, ce
                 ctx.set_fill_style(&JsValue::from_str(right_color));
                 ctx.fill_rect((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size);
                 
-                // Zone text
-                ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-                ctx.set_font(&format!("{}px bold italic sans-serif", cell_size * 2.0));
+                // Zone text - larger, all caps, faded
+                ctx.set_font(&format!("700 {}px sans-serif", cell_size * 2.5));
                 ctx.set_text_align("center");
                 ctx.set_text_baseline("middle");
                 
-                ctx.fill_text(left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
-                ctx.fill_text(right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&left_faded));
+                ctx.fill_text(&left_label, end_zone_depth * cell_size / 2.0, height * cell_size / 2.0)?;
+                ctx.set_fill_style(&JsValue::from_str(&right_faded));
+                ctx.fill_text(&right_label, (width - end_zone_depth / 2.0) * cell_size, height * cell_size / 2.0)?;
             }
         }
     }

@@ -63,7 +63,15 @@ declare module 'wasm-snaketron' {
   }
 
   export function render(game: GameClient, canvas: HTMLCanvasElement): void;
-  export function render_game(gameStateJson: string, canvas: HTMLCanvasElement, cellSize: number, localUserId: number | null, rotation: number): void;
+  export function render_game(
+    gameStateJson: string, 
+    canvas: HTMLCanvasElement, 
+    cellSize: number, 
+    localUserId: number | null, 
+    rotation: number,
+    localUsername: string | null,
+    opponentUsername: string | null
+  ): void;
 
   const init: () => Promise<void>;
   export default init;

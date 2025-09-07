@@ -115,9 +115,9 @@ export default function GameArena() {
       const vh = window.innerHeight;
       const vw = window.innerWidth;
       
-      // Account for scoreboard (~80px), bottom padding (40px), 
+      // Account for scoreboard (~120px), bottom padding (40px), 
       // container padding (2*16px), and panel border+shadow (~10px)
-      const availableHeight = vh - 160 - 32 - 10;
+      const availableHeight = vh - 200 - 32 - 10;
       const availableWidth = vw - 100 - 32 - 10;
       
       // For vertical orientations (90° and 270°), we need to swap dimensions
@@ -338,7 +338,26 @@ export default function GameArena() {
           lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
         }
         
-        wasm.render_game(JSON.stringify(gameState), canvasRef.current!, cellSize, user?.id || null, rotation);
+        // Get opponent username if in a team game
+        let opponentUsername: string | null = null;
+        if (gameState.players && Object.keys(gameState.players).length > 1) {
+          // Find the other player
+          const otherPlayerId = Object.keys(gameState.players).find(id => parseInt(id) !== user?.id);
+          if (otherPlayerId) {
+            // For now, we don't have usernames in gameState, so use placeholder
+            opponentUsername = `User ${otherPlayerId}`;
+          }
+        }
+        
+        wasm.render_game(
+          JSON.stringify(gameState), 
+          canvasRef.current!, 
+          cellSize, 
+          user?.id || null, 
+          rotation,
+          user?.username || null,
+          opponentUsername
+        );
       } catch (error) {
         console.error('Error rendering game:', error);
       }
@@ -426,7 +445,7 @@ export default function GameArena() {
         />
 
         {/* Game Arena Container */}
-        <div className="flex-1 flex flex-col items-center justify-center p-4" style={{ paddingTop: '80px', paddingBottom: '40px' }}>
+        <div className="flex-1 flex flex-col items-center justify-center p-4" style={{ paddingTop: '120px', paddingBottom: '40px' }}>
           {/* Game Canvas */}
           <div
             className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
