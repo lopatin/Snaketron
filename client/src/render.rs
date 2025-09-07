@@ -282,141 +282,7 @@ pub fn render_game(
         }
     }
     
-    // Draw walls after dots and text so they cover the dots
-    if let Some(team_zone_config) = &team_zone_config_data {
-        let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
-        let goal_width = team_zone_config["goal_width"].as_u64().unwrap_or(5) as f64;
-        
-        // Draw walls as 3px solid rectangles between field and endzone cells
-        let wall_thickness = 3.0;
-        
-        // Determine wall colors based on local player's team
-        let (left_wall_color, right_wall_color) = match local_player_team {
-            Some(0) => ("#7aa8c1", "#c18888"),  // Local is Team 0: blue left, red right
-            Some(1) => ("#c18888", "#7aa8c1"),  // Local is Team 1: red left, blue right
-            _ => ("#7aa8c1", "#c18888"),        // Default: blue left, red right
-        };
-        
-        // Draw walls based on rotation
-        match rotation_int {
-            90 => {
-                // 90° CW: walls are horizontal at top and bottom
-                let goal_center = width / 2.0;
-                let goal_half_width = goal_width / 2.0;
-                let goal_x_start = (goal_center - goal_half_width).floor();
-                let goal_x_end = (goal_center + goal_half_width).ceil();
-                
-                // Top wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
-                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
-                
-                if goal_x_start > 0.0 {
-                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
-                }
-                if goal_x_end < width {
-                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
-                }
-                
-                // Bottom wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
-                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
-                
-                if goal_x_start > 0.0 {
-                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
-                }
-                if goal_x_end < width {
-                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
-                }
-            },
-            180 => {
-                // 180°: walls are vertical but swapped positions
-                let goal_center = height / 2.0;
-                let goal_half_width = goal_width / 2.0;
-                let goal_y_start = (goal_center - goal_half_width).floor();
-                let goal_y_end = (goal_center + goal_half_width).ceil();
-                
-                // Right wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
-                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
-                
-                if goal_y_start > 0.0 {
-                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
-                }
-                if goal_y_end < height {
-                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
-                }
-                
-                // Left wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
-                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
-                
-                if goal_y_start > 0.0 {
-                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
-                }
-                if goal_y_end < height {
-                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
-                }
-            },
-            270 => {
-                // 270° CW: walls are horizontal at bottom and top
-                let goal_center = width / 2.0;
-                let goal_half_width = goal_width / 2.0;
-                let goal_x_start = (goal_center - goal_half_width).floor();
-                let goal_x_end = (goal_center + goal_half_width).ceil();
-                
-                // Bottom wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
-                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
-                
-                if goal_x_start > 0.0 {
-                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
-                }
-                if goal_x_end < width {
-                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
-                }
-                
-                // Top wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
-                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
-                
-                if goal_x_start > 0.0 {
-                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
-                }
-                if goal_x_end < width {
-                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
-                }
-            },
-            _ => {
-                // 0° or default: normal vertical walls
-                let goal_center = height / 2.0;
-                let goal_half_width = goal_width / 2.0;
-                let goal_y_start = (goal_center - goal_half_width).floor();
-                let goal_y_end = (goal_center + goal_half_width).ceil();
-                
-                // Left wall
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
-                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
-                
-                if goal_y_start > 0.0 {
-                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
-                }
-                if goal_y_end < height {
-                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
-                }
-                
-                // Right wall
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
-                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
-                
-                if goal_y_start > 0.0 {
-                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
-                }
-                if goal_y_end < height {
-                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
-                }
-            }
-        }
-    }
+    // Note: Walls will be drawn after snakes to ensure dead snakes appear behind walls
 
     // Draw food
     if let Some(food_array) = arena["food"].as_array() {
@@ -463,10 +329,12 @@ pub fn render_game(
         }
     }
 
-    // Draw snakes
+    // Draw snakes (both alive and dead)
     if let Some(snakes) = arena["snakes"].as_array() {
         for (index, snake) in snakes.iter().enumerate() {
-            if snake["is_alive"].as_bool().unwrap_or(false) {
+            let is_alive = snake["is_alive"].as_bool().unwrap_or(false);
+            
+            if is_alive {
                 // Choose snake color based on perspective in team games
                 let (color, border_color) = if team_zone_config_data.is_some() {
                     // Team game: use perspective-based coloring
@@ -832,6 +700,390 @@ pub fn render_game(
                     ctx.begin_path();
                     ctx.arc(head_center_x, head_center_y, cell_size * 0.38, 0.0, 2.0 * std::f64::consts::PI)?;
                     ctx.fill();
+                }
+            } else {
+                // Render dead snake with faint solid color
+                let color = "#f0f0f0";  // Light gray for dead snakes
+                let border_color = "#d0d0d0";  // Slightly darker border
+                
+                ctx.set_fill_style(&JsValue::from_str(color));
+
+                // Draw snake body
+                if let Some(body) = snake["body"].as_array() {
+                    if body.is_empty() {
+                        continue;
+                    }
+                    
+                    // Handle single-segment snake (just a head)
+                    if body.len() == 1 {
+                        if let Some(head) = body.first() {
+                            if let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64()) {
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
+                                
+                                // Draw border
+                                ctx.set_fill_style(&JsValue::from_str(border_color));
+                                ctx.begin_path();
+                                ctx.arc(center_x, center_y, cell_size / 2.0 + 1.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                                ctx.fill();
+                                
+                                // Draw as a full circle
+                                ctx.set_fill_style(&JsValue::from_str(color));
+                                ctx.begin_path();
+                                ctx.arc(center_x, center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                                ctx.fill();
+                                
+                                // Draw X mark on head
+                                ctx.set_stroke_style(&JsValue::from_str("#666"));
+                                ctx.set_line_width(2.0);
+                                let x_size = cell_size * 0.3;
+                                ctx.begin_path();
+                                ctx.move_to(center_x - x_size, center_y - x_size);
+                                ctx.line_to(center_x + x_size, center_y + x_size);
+                                ctx.stroke();
+                                ctx.begin_path();
+                                ctx.move_to(center_x - x_size, center_y + x_size);
+                                ctx.line_to(center_x + x_size, center_y - x_size);
+                                ctx.stroke();
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // First pass: Fill with white rectangles to cover grid dots
+                    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                    
+                    // Fill white rectangles for body segments (expanded by 1px)
+                    for window in body.windows(2) {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
+                            let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
+                            let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
+                            let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
+
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation - draw rectangle
+                                let x = tx1 * cell_size;
+                                let min_y = ty1.min(ty2) * cell_size;
+                                let max_y = ty1.max(ty2) * cell_size;
+                                ctx.fill_rect(x - 1.0, min_y - 1.0, cell_size + 2.0, (max_y - min_y) + cell_size + 2.0);
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation - draw rectangle
+                                let y = ty1 * cell_size;
+                                let min_x = tx1.min(tx2) * cell_size;
+                                let max_x = tx1.max(tx2) * cell_size;
+                                ctx.fill_rect(min_x - 1.0, y - 1.0, (max_x - min_x) + cell_size + 2.0, cell_size + 2.0);
+                            }
+                        }
+                    }
+
+                    // Fill white rectangles for all body points (expanded by 1px)
+                    for point in body.iter() {
+                        if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
+                            let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                            let rect_x = tx * cell_size - 1.0;
+                            let rect_y = ty * cell_size - 1.0;
+                            ctx.fill_rect(rect_x, rect_y, cell_size + 2.0, cell_size + 2.0);
+                        }
+                    }
+
+                    // Second pass: Draw borders (1px larger)
+                    ctx.set_stroke_style(&JsValue::from_str(border_color));
+                    
+                    // Draw border for body segments
+                    for window in body.windows(2) {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
+                            let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
+                            let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
+                            let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
+
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation
+                                let x = tx1 * cell_size + cell_size / 2.0;
+                                let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
+                                let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
+                                
+                                ctx.set_line_width(cell_size + 2.0);
+                                ctx.set_line_cap("round");
+                                ctx.begin_path();
+                                ctx.move_to(x, min_y);
+                                ctx.line_to(x, max_y);
+                                ctx.stroke();
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation
+                                let y = ty1 * cell_size + cell_size / 2.0;
+                                let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
+                                let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
+                                
+                                ctx.set_line_width(cell_size + 2.0);
+                                ctx.set_line_cap("round");
+                                ctx.begin_path();
+                                ctx.move_to(min_x, y);
+                                ctx.line_to(max_x, y);
+                                ctx.stroke();
+                            }
+                        }
+                    }
+
+                    // Draw border for corner joints
+                    ctx.set_fill_style(&JsValue::from_str(border_color));
+                    for i in 1..body.len()-1 {
+                        if let Some(point) = body.get(i) {
+                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
+                                
+                                ctx.begin_path();
+                                ctx.arc(center_x, center_y, cell_size / 2.0 + 1.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                                ctx.fill();
+                            }
+                        }
+                    }
+
+                    // Third pass: Draw the actual snake
+                    ctx.set_stroke_style(&JsValue::from_str(color));
+                    ctx.set_fill_style(&JsValue::from_str(color));
+
+                    // Draw main body segments
+                    for window in body.windows(2) {
+                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                            let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
+                            let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
+                            let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
+                            let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
+                            
+                            // Transform both points
+                            let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
+                            let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
+
+                            if (tx1 - tx2).abs() < 0.01 {
+                                // Vertical segment after transformation
+                                let x = tx1 * cell_size + cell_size / 2.0;
+                                let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
+                                let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
+                                
+                                ctx.set_line_width(cell_size);
+                                ctx.set_line_cap("round");
+                                ctx.begin_path();
+                                ctx.move_to(x, min_y);
+                                ctx.line_to(x, max_y);
+                                ctx.stroke();
+                            } else if (ty1 - ty2).abs() < 0.01 {
+                                // Horizontal segment after transformation
+                                let y = ty1 * cell_size + cell_size / 2.0;
+                                let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
+                                let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
+                                
+                                ctx.set_line_width(cell_size);
+                                ctx.set_line_cap("round");
+                                ctx.begin_path();
+                                ctx.move_to(min_x, y);
+                                ctx.line_to(max_x, y);
+                                ctx.stroke();
+                            }
+                        }
+                    }
+
+                    // Draw corner joints as circles to create smooth turns
+                    for i in 1..body.len()-1 {
+                        if let Some(point) = body.get(i) {
+                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
+                                let (tx, ty) = transform_coords(x as f64, y as f64, game_width, game_height, rotation_int);
+                                let center_x = tx * cell_size + cell_size / 2.0;
+                                let center_y = ty * cell_size + cell_size / 2.0;
+                                
+                                ctx.begin_path();
+                                ctx.arc(center_x, center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                                ctx.fill();
+                            }
+                        }
+                    }
+
+                    // Get head and tail information
+                    let head = body.first().unwrap();
+                    let head_x = head["x"].as_i64().unwrap_or(0) as f64;
+                    let head_y = head["y"].as_i64().unwrap_or(0) as f64;
+                    let (head_tx, head_ty) = transform_coords(head_x, head_y, game_width, game_height, rotation_int);
+                    let head_center_x = head_tx * cell_size + cell_size / 2.0;
+                    let head_center_y = head_ty * cell_size + cell_size / 2.0;
+                    
+                    let tail = body.last().unwrap();
+                    let tail_x = tail["x"].as_i64().unwrap_or(0) as f64;
+                    let tail_y = tail["y"].as_i64().unwrap_or(0) as f64;
+                    let (tail_tx, tail_ty) = transform_coords(tail_x, tail_y, game_width, game_height, rotation_int);
+                    let tail_center_x = tail_tx * cell_size + cell_size / 2.0;
+                    let tail_center_y = tail_ty * cell_size + cell_size / 2.0;
+
+                    // Draw tail as full circle
+                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.begin_path();
+                    ctx.arc(tail_center_x, tail_center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                    ctx.fill();
+                    
+                    // Draw head as full circle
+                    ctx.begin_path();
+                    ctx.arc(head_center_x, head_center_y, cell_size / 2.0, 0.0, 2.0 * std::f64::consts::PI)?;
+                    ctx.fill();
+
+                    // Draw X mark on dead snake head
+                    ctx.set_stroke_style(&JsValue::from_str("#666"));
+                    ctx.set_line_width(2.0);
+                    let x_size = cell_size * 0.3;
+                    ctx.begin_path();
+                    ctx.move_to(head_center_x - x_size, head_center_y - x_size);
+                    ctx.line_to(head_center_x + x_size, head_center_y + x_size);
+                    ctx.stroke();
+                    ctx.begin_path();
+                    ctx.move_to(head_center_x - x_size, head_center_y + x_size);
+                    ctx.line_to(head_center_x + x_size, head_center_y - x_size);
+                    ctx.stroke();
+                }
+            }
+        }
+    }
+    
+    // Draw walls AFTER snakes so dead snakes appear behind walls
+    if let Some(team_zone_config) = &team_zone_config_data {
+        let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
+        let goal_width = team_zone_config["goal_width"].as_u64().unwrap_or(5) as f64;
+        
+        // Draw walls as 3px solid rectangles between field and endzone cells
+        let wall_thickness = 3.0;
+        
+        // Determine wall colors based on local player's team
+        let (left_wall_color, right_wall_color) = match local_player_team {
+            Some(0) => ("#7aa8c1", "#c18888"),  // Local is Team 0: blue left, red right
+            Some(1) => ("#c18888", "#7aa8c1"),  // Local is Team 1: red left, blue right
+            _ => ("#7aa8c1", "#c18888"),        // Default: blue left, red right
+        };
+        
+        // Draw walls based on rotation
+        match rotation_int {
+            90 => {
+                // 90° CW: walls are horizontal at top and bottom
+                let goal_center = width / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_x_start = (goal_center - goal_half_width).floor();
+                let goal_x_end = (goal_center + goal_half_width).ceil();
+                
+                // Top wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+                
+                // Bottom wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+            },
+            180 => {
+                // 180°: walls are vertical but swapped positions
+                let goal_center = height / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_y_start = (goal_center - goal_half_width).floor();
+                let goal_y_end = (goal_center + goal_half_width).ceil();
+                
+                // Right wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+                
+                // Left wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+            },
+            270 => {
+                // 270° CW: walls are horizontal at bottom and top
+                let goal_center = width / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_x_start = (goal_center - goal_half_width).floor();
+                let goal_x_end = (goal_center + goal_half_width).ceil();
+                
+                // Bottom wall (was left wall)
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+                
+                // Top wall (was right wall)
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_x_start > 0.0 {
+                    ctx.fill_rect(0.0, wall_y, goal_x_start * cell_size, wall_thickness);
+                }
+                if goal_x_end < width {
+                    ctx.fill_rect(goal_x_end * cell_size, wall_y, (width - goal_x_end) * cell_size, wall_thickness);
+                }
+            },
+            _ => {
+                // 0° or default: normal vertical walls
+                let goal_center = height / 2.0;
+                let goal_half_width = goal_width / 2.0;
+                let goal_y_start = (goal_center - goal_half_width).floor();
+                let goal_y_end = (goal_center + goal_half_width).ceil();
+                
+                // Left wall
+                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
+                }
+                
+                // Right wall
+                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
+                
+                if goal_y_start > 0.0 {
+                    ctx.fill_rect(wall_x, 0.0, wall_thickness, goal_y_start * cell_size);
+                }
+                if goal_y_end < height {
+                    ctx.fill_rect(wall_x, goal_y_end * cell_size, wall_thickness, (height - goal_y_end) * cell_size);
                 }
             }
         }
