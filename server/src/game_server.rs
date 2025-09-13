@@ -93,14 +93,29 @@ impl GameServer {
 
         // Start the matchmaking service
         info!("Starting matchmaking service");
-        let match_pool = db_pool.clone();
         let match_redis_url = redis_url.clone();
         let match_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
+            // Create matchmaking manager and pubsub for matchmaking
+            let matchmaking_manager = match crate::matchmaking_manager::MatchmakingManager::new(&match_redis_url).await {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    error!("Failed to create matchmaking manager: {}", e);
+                    return;
+                }
+            };
+            
+            let pubsub = match crate::pubsub_manager::PubSubManager::new(&match_redis_url).await {
+                Ok(ps) => ps,
+                Err(e) => {
+                    error!("Failed to create pubsub manager for matchmaking: {}", e);
+                    return;
+                }
+            };
+            
             if let Err(e) = run_matchmaking_loop(
-                match_pool,
-                match_redis_url,
-                server_id,
+                matchmaking_manager,
+                pubsub,
                 match_token,
             ).await {
                 error!("Matchmaking loop error: {}", e);

@@ -38,6 +38,10 @@ pub enum WSMessage {
     // Matchmaking messages
     QueueForMatch { game_type: common::GameType },
     LeaveQueue,
+    // Real-time matchmaking updates
+    MatchFound { game_id: u32 },
+    QueueUpdate { position: u32, estimated_wait_seconds: u32 },
+    QueueLeft,
     // Custom game messages
     CreateCustomGame { settings: common::CustomGameSettings },
     JoinCustomGame { game_code: String },
@@ -140,63 +144,6 @@ impl JwtVerifier for TestJwtVerifier {
     }
 }
 
-async fn add_to_matchmaking_queue(
-    pool: &PgPool,
-    user_id: i32,
-    game_type: common::GameType,
-) -> Result<()> {
-    // Get the first available server from the database
-    let server_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM servers WHERE status = 'active' LIMIT 1"
-    )
-    .fetch_one(pool)
-    .await
-    .context("No active servers available")?;
-    
-    // Remove any existing queue entry for this user
-    sqlx::query(
-        "DELETE FROM game_requests WHERE user_id = $1"
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    
-    // Insert new queue entry
-    sqlx::query(
-        r#"
-        INSERT INTO game_requests (server_id, user_id, game_type, request_time)
-        VALUES ($1, $2, $3, NOW())
-        "#
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .bind(serde_json::to_value(&game_type)?)
-    .execute(pool)
-    .await?;
-    
-    info!("User {} added to matchmaking queue for game type {:?}", user_id, game_type);
-    Ok(())
-}
-
-async fn remove_from_matchmaking_queue(
-    pool: &PgPool,
-    user_id: i32,
-) -> Result<()> {
-    let result = sqlx::query(
-        "DELETE FROM game_requests WHERE user_id = $1"
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    
-    if result.rows_affected() > 0 {
-        info!("User {} removed from matchmaking queue", user_id);
-    } else {
-        info!("User {} was not in matchmaking queue", user_id);
-    }
-    
-    Ok(())
-}
 
 
 // Connection state machine
@@ -578,57 +525,9 @@ async fn process_ws_message(
                 WSMessage::QueueForMatch { game_type } => {
                     info!("User {} ({}) queuing for match type: {:?}", metadata.username, metadata.user_id, game_type);
 
-                    // Add to matchmaking queue
-                    if let Err(e) = add_to_matchmaking_queue(db_pool, metadata.user_id, game_type.clone()).await {
-                        error!("Failed to add user to matchmaking queue: {}", e);
-                        return Ok(ConnectionState::Authenticated { metadata });
-                    }
-
-                    // Start a background task to poll for match completion
-                    let db_pool_clone = db_pool.clone();
-                    let user_id = metadata.user_id;
-                    let ws_tx_clone = ws_tx.clone();
-                    
-                    tokio::spawn(async move {
-                        let mut check_interval = tokio::time::interval(Duration::from_millis(500));
-                        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        
-                        for _ in 0..60 { // Check for 30 seconds max
-                            check_interval.tick().await;
-                            
-                            // Check if user has been matched
-                            match check_match_status(&db_pool_clone, user_id).await {
-                                Ok(Some(game_id)) => {
-                                    info!("User {} matched to game {}", user_id, game_id);
-                                    // Send JoinGame message to trigger state transition
-                                    let join_msg = WSMessage::JoinGame(game_id);
-                                    let json_msg = match serde_json::to_string(&join_msg) {
-                                        Ok(msg) => msg,
-                                        Err(e) => {
-                                            error!("Failed to serialize join game message: {}", e);
-                                            return;
-                                        }
-                                    };
-                                    
-                                    // Send the message through the channel
-                                    if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_err() {
-                                        // Channel closed, client disconnected
-                                        return;
-                                    }
-                                    
-                                    return;
-                                }
-                                Ok(None) => {
-                                    // Still waiting for match
-                                }
-                                Err(e) => {
-                                    error!("Error checking match status: {}", e);
-                                    return;
-                                }
-                            }
-                        }
-                        warn!("Match polling timeout for user {}", user_id);
-                    });
+                    // TODO: Add to matchmaking queue using Redis-based matchmaking
+                    // This will be handled in a future update to integrate with the matchmaking manager
+                    warn!("Matchmaking queue integration pending");
 
                     Ok(ConnectionState::Authenticated { metadata })
                 }
@@ -646,10 +545,9 @@ async fn process_ws_message(
                 WSMessage::LeaveQueue => {
                     info!("User {} ({}) leaving matchmaking queue", metadata.username, metadata.user_id);
 
-                    // Remove from matchmaking queue
-                    if let Err(e) = remove_from_matchmaking_queue(db_pool, metadata.user_id).await {
-                        error!("Failed to remove user from matchmaking queue: {}", e);
-                    }
+                    // TODO: Remove from matchmaking queue using Redis-based matchmaking
+                    // This will be handled in a future update to integrate with the matchmaking manager
+                    warn!("Matchmaking queue removal integration pending");
 
                     Ok(ConnectionState::Authenticated { metadata })
                 }
@@ -899,24 +797,6 @@ async fn process_ws_message(
 
 
 
-/// Check if a user has been matched to a game
-async fn check_match_status(db_pool: &PgPool, user_id: i32) -> Result<Option<u32>> {
-    let game_id: Option<i32> = sqlx::query_scalar(
-        r#"
-        SELECT game_id 
-        FROM game_requests 
-        WHERE user_id = $1 
-        AND game_id IS NOT NULL 
-        ORDER BY request_time DESC 
-        LIMIT 1
-        "#
-    )
-    .bind(user_id)
-    .fetch_optional(db_pool)
-    .await?;
-    
-    Ok(game_id.map(|id| id as u32))
-}
 
 pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) -> Result<u64> {
     info!("Registering server instance");

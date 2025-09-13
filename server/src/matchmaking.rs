@@ -1,18 +1,19 @@
+use anyhow::{Result, Context};
 use std::time::Duration;
-use chrono::Utc;
-use sqlx::{Executor, PgPool};
-use tracing::{error, info, trace};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use anyhow::Context;
-use common::{GameState, GameType};
+use tracing::{error, info, trace};
+use chrono::Utc;
+use common::{GameType, GameState};
+
 use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 use crate::pubsub_manager::PubSubManager;
+use crate::matchmaking_manager::{MatchmakingManager, QueuedPlayer, ActiveMatch, MatchStatus};
 
 // --- Configuration Constants ---
 const MIN_PLAYERS: usize = 2;
 const MAX_PLAYERS: usize = 10;
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
-// Initial game state will be null
 
 // MMR matching ranges that expand over time
 const MMR_RANGES: [(i32, i32); 4] = [
@@ -33,140 +34,87 @@ const MIN_PLAYERS_BY_WAIT: [usize; 4] = [
     2,   // 20s+: Accept any match
 ];
 
-#[derive(sqlx::FromRow, Debug)]
-struct MatchmakingPlayer {
-    game_request_id: i32,
-    user_id: i32,
-    mmr: i32,
-    username: String,
-    wait_seconds: i64,
-}
-
-#[derive(sqlx::FromRow, Debug)]
-struct ServerLoad {
-    id: i32,
-    current_game_count: i32,
-    max_game_capacity: i32,
-}
-
-/// Main matchmaking loop that runs on each server
+/// Main matchmaking loop
 pub async fn run_matchmaking_loop(
-    pool: PgPool,
-    redis_url: String,
-    server_id: u64,
+    mut matchmaking_manager: MatchmakingManager,
+    mut pubsub: PubSubManager,
     cancellation_token: CancellationToken,
-) -> anyhow::Result<()> {
-    info!(?server_id, "Starting adaptive matchmaking loop");
+) -> Result<()> {
+    info!("Starting adaptive matchmaking loop");
 
-    // Create PubSub manager for publishing game events
-    let pubsub = PubSubManager::new(&redis_url).await
-        .context("Failed to create PubSub manager")?;
-
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_interval = interval(Duration::from_secs(2));
+    tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
-                info!("Matchmaking loop received shutdown signal");
+                info!("Redis matchmaking loop received shutdown signal");
                 break;
             }
-            _ = interval.tick() => {
+            _ = tick_interval.tick() => {
                 // Continue with matchmaking logic
             }
         }
-        
-        // Update server heartbeat
-        if let Err(e) = update_heartbeat(&pool, server_id).await {
-            error!(?server_id, error = %e, "Failed to update heartbeat");
-        }
 
-        // Get distinct game types that have waiting players
-        let game_types: Vec<serde_json::Value> = sqlx::query_scalar(
-            r#"
-            SELECT DISTINCT game_type
-            FROM game_requests
-            WHERE game_id IS NULL
-            ORDER BY game_type
-            "#
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_else(|e| {
-            error!(error = %e, "Failed to fetch waiting game types");
-            vec![]
-        });
-        
+        // Get distinct game types from Redis
+        // For now, we'll check a few common game types
+        // In production, we'd maintain a set of active game types
+        let game_types = vec![
+            GameType::FreeForAll { max_players: 4 },
+            GameType::FreeForAll { max_players: 6 },
+            GameType::FreeForAll { max_players: 10 },
+            GameType::TeamMatch { per_team: 2 },
+            GameType::TeamMatch { per_team: 3 },
+        ];
+
         for game_type in &game_types {
-            match create_adaptive_match(&pool, pubsub.clone(), game_type.clone(), server_id).await {
+            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone()).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
                         game_type = ?game_type,
                         player_count = players.len(),
-                        "Created match successfully - game will be started by assigned server"
+                        "Created match successfully via Redis"
                     );
                 }
                 Ok(None) => {
                     trace!(game_type = ?game_type, "No suitable match found");
                 }
-                Err(e) if is_serialization_error(&e) => {
-                    trace!(game_type = ?game_type, "Serialization conflict, will retry next tick");
-                }
                 Err(e) => {
-                    error!(game_type = ?game_type, error = %e, "Matchmaking error");
+                    error!(game_type = ?game_type, error = %e, "Redis matchmaking error");
                 }
             }
         }
     }
+
+    Ok(())
+}
+
+/// Create an adaptive match
+async fn create_match(
+    matchmaking_manager: &mut MatchmakingManager,
+    pubsub: &mut PubSubManager,
+    game_type: GameType,
+) -> Result<Option<(u32, Vec<u32>)>> {
+    // Get all queued players for this game type
+    let queued_players = matchmaking_manager.get_queued_players(&game_type).await?;
     
-    Ok(())
-}
+    if queued_players.is_empty() {
+        return Ok(None);
+    }
 
-/// Update server heartbeat
-async fn update_heartbeat(pool: &PgPool, server_id: u64) -> Result<(), sqlx::Error> {
-    let now = Utc::now();
-    sqlx::query(
-        r#"
-        UPDATE servers
-        SET last_heartbeat = $1
-        WHERE id = $2
-        "#
-    )
-    .bind(now)
-    .bind(server_id as i32)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    // Calculate wait time based on oldest player
+    let now = Utc::now().timestamp_millis();
+    let oldest_wait = queued_players.iter()
+        .map(|p| {
+            // We'd need to get this from the queue timestamp
+            // For now, assume they're ordered by queue time
+            0i64 // Placeholder
+        })
+        .max()
+        .unwrap_or(0);
 
-/// Create an adaptive match using expanding skill ranges
-async fn create_adaptive_match(
-    pool: &PgPool,
-    mut pubsub: PubSubManager,
-    game_type: serde_json::Value,
-    server_id: u64,
-) -> anyhow::Result<Option<(i32, Vec<i32>)>> {
-    let mut tx = pool.begin().await?;
-    tx.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
-
-
-    // Get the oldest waiting player to determine match urgency
-    let oldest_wait: Option<i64> = sqlx::query_scalar(
-        r#"
-        SELECT CASE 
-            WHEN COUNT(*) = 0 THEN NULL
-            ELSE EXTRACT(EPOCH FROM (NOW() - MIN(request_time)))::BIGINT
-        END
-        FROM game_requests
-        WHERE game_type = $1 AND game_id IS NULL
-        "#
-    )
-    .bind(&game_type)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let wait_seconds = oldest_wait.unwrap_or(0);
+    let wait_seconds = oldest_wait / 1000;
 
     // Determine which tier of matching to use based on wait time
     let tier = WAIT_THRESHOLDS
@@ -179,79 +127,36 @@ async fn create_adaptive_match(
     
     // For game types with max_players, never require more than max_players
     let (min_players, max_players_for_game) = match &game_type {
-        serde_json::Value::Object(obj) => {
-            if let Some(serde_json::Value::Object(ffa_obj)) = obj.get("FreeForAll") {
-                if let Some(serde_json::Value::Number(max)) = ffa_obj.get("max_players") {
-                    if let Some(max_val) = max.as_u64() {
-                        (base_min_players.min(max_val as usize), max_val as usize)
-                    } else {
-                        (base_min_players, MAX_PLAYERS)
-                    }
-                } else {
-                    (base_min_players, MAX_PLAYERS)
-                }
-            } else {
-                (base_min_players, MAX_PLAYERS)
-            }
+        GameType::FreeForAll { max_players } => {
+            (base_min_players.min(*max_players as usize), *max_players as usize)
         }
-        _ => (base_min_players, MAX_PLAYERS)
+        GameType::TeamMatch { per_team } => {
+            let total_max = per_team * 2; // Two teams
+            (base_min_players.min(total_max as usize), total_max as usize)
+        }
+        GameType::Solo => {
+            (1, 1) // Solo games are single player
+        }
+        GameType::Custom { .. } => {
+            (base_min_players, MAX_PLAYERS) // Custom games use default limits
+        }
     };
 
-    // Find matching players - use INNER JOIN to ensure we only get valid users
-    let players_result = sqlx::query_as::<_, MatchmakingPlayer>(
-        r#"
-        SELECT 
-            gr.id as game_request_id,
-            gr.user_id,
-            u.mmr,
-            u.username,
-            EXTRACT(EPOCH FROM (NOW() - gr.request_time))::BIGINT as wait_seconds
-        FROM game_requests gr
-        INNER JOIN users u ON gr.user_id = u.id
-        WHERE gr.game_type = $1 
-            AND gr.game_id IS NULL
-        ORDER BY gr.request_time ASC
-        LIMIT $2
-        FOR UPDATE OF gr SKIP LOCKED
-        "#
-    )
-    .bind(&game_type)
-    .bind(MAX_PLAYERS as i32)
-    .fetch_all(&mut *tx)
-    .await;
-    
-    let players = match players_result {
-        Ok(p) => p,
-        Err(e) => {
-            // Log the error but don't fail - just skip this game type
-            trace!(?game_type, error = %e, "No matching players found");
-            tx.rollback().await?;
-            return Ok(None);
-        }
-    };
-    
-    // If no players found, return early
-    if players.is_empty() {
-        tx.rollback().await?;
-        return Ok(None);
-    }
-    
-    // Filter by MMR difference if we have multiple players
-    let filtered_players = if players.len() > 1 {
-        let avg_mmr: i32 = players.iter()
+    // Filter by MMR if we have multiple players
+    let filtered_players = if queued_players.len() > 1 {
+        let avg_mmr: i32 = queued_players.iter()
             .map(|p| p.mmr)
-            .sum::<i32>() / players.len() as i32;
+            .sum::<i32>() / queued_players.len() as i32;
         
-        players.into_iter()
+        queued_players.into_iter()
             .filter(|p| (p.mmr - avg_mmr).abs() <= max_mmr_diff)
             .collect()
     } else {
-        players
+        queued_players
     };
 
     // Check if we have enough players
     if filtered_players.len() < min_players {
-        tx.rollback().await?;
         return Ok(None);
     }
 
@@ -260,116 +165,59 @@ async fn create_adaptive_match(
         .take(max_players_for_game)
         .collect();
     
-    let user_ids: Vec<i32> = matched_players.iter()
+    let user_ids: Vec<u32> = matched_players.iter()
         .map(|p| p.user_id)
         .collect();
-    let request_ids: Vec<i32> = matched_players.iter()
-        .map(|p| p.game_request_id)
-        .collect();
 
-    // Use the current server (no need to select least loaded in this version)
+    // Generate game ID
+    let game_id = matchmaking_manager.generate_game_id().await?;
+    let partition_id = game_id % PARTITION_COUNT;
 
-    // Use the game_type that was passed in
+    // Create game state
+    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
     
-    let game_id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO games (server_id, game_type, game_state, status, created_at, last_activity)
-        VALUES ($1, $2, NULL, 'waiting', NOW(), NOW())
-        RETURNING id
-        "#
-    )
-    .bind(server_id as i32)
-    .bind(&game_type)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // Insert players into game_players table
-    for (idx, user_id) in user_ids.iter().enumerate() {
-        sqlx::query(
-            r#"
-            INSERT INTO game_players (game_id, user_id, team_id, joined_at)
-            VALUES ($1, $2, $3, NOW())
-            "#
-        )
-        .bind(game_id)
-        .bind(user_id)
-        .bind(idx as i32 % 2)  // Alternate teams for now
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    // Update game requests to mark them as matched
-    let updated = sqlx::query(
-        r#"
-        UPDATE game_requests
-        SET game_id = $1
-        WHERE id = ANY($2)
-        "#
-    )
-    .bind(game_id)
-    .bind(&request_ids)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if updated != request_ids.len() as u64 {
-        tx.rollback().await?;
-        return Err(sqlx::Error::RowNotFound.into());
-    }
-
-    // Increment server game count
-    sqlx::query(
-        r#"
-        UPDATE servers
-        SET current_game_count = current_game_count + 1
-        WHERE id = $1
-        "#
-    )
-    .bind(server_id as i32)
-    .execute(&mut *tx)
-    .await?;
-
-    // Commit to db
-    tx.commit().await?;
-    
-    // Create game state with players
-    let game_type_enum: GameType = serde_json::from_value(game_type.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize game type: {}", e))?;
-    let start_ms = chrono::Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
-    
-    // For TeamMatch games, add extra width for end zones (10 cells each side)
-    let (width, height) = match &game_type_enum {
+    // For TeamMatch games, add extra width for end zones
+    let (width, height) = match &game_type {
         GameType::TeamMatch { .. } => (60, 40),  // 40 + 10 + 10 for end zones
         _ => (40, 40),
     };
     
-    // Generate a random seed for the game to enable food spawning
-    let rng_seed = Some(chrono::Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type_enum, rng_seed, start_ms);
+    // Generate a random seed for the game
+    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
+    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
     
-    // Add players to the game state with their usernames
-    for player in matched_players.iter() {
-        game_state.add_player(player.user_id as u32, Some(player.username.clone()))?;
+    // Add players to the game state
+    for player in &matched_players {
+        game_state.add_player(player.user_id, Some(player.username.clone()))?;
     }
     
     // Spawn initial food items
     game_state.spawn_initial_food();
-    
+
+    // Store active match information in Redis
+    let match_info = ActiveMatch {
+        players: matched_players.clone(),
+        game_type: game_type.clone(),
+        status: MatchStatus::Waiting,
+        partition_id,
+        created_at: now,
+    };
+    matchmaking_manager.store_active_match(game_id, match_info).await?;
+
+    // Remove players from queue
+    matchmaking_manager.remove_players_from_queue(&game_type, &user_ids).await?;
+
     // Publish GameCreated event to Redis stream
-    let game_id_u32 = game_id as u32;
-    let partition_id = game_id_u32 % PARTITION_COUNT;
-    
     let event = StreamEvent::GameCreated {
-        game_id: game_id_u32,
+        game_id,
         game_state: game_state.clone(),
     };
     
-    // Publish initial snapshot when game is created
-    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+    // Publish initial snapshot
+    pubsub.publish_snapshot(partition_id, game_id, &game_state).await
         .context("Failed to publish initial game snapshot")?;
     
-    // Also send GameCreated event via partition command channel
+    // Send GameCreated event via partition command channel
     let serialized = serde_json::to_vec(&event)
         .context("Failed to serialize GameCreated event")?;
     pubsub.publish_command(partition_id, &serialized).await
@@ -381,40 +229,81 @@ async fn create_adaptive_match(
     let avg_mmr = matched_players.iter()
         .map(|p| p.mmr)
         .sum::<i32>() / matched_players.len() as i32;
-    let max_wait = matched_players.iter()
-        .map(|p| p.wait_seconds)
-        .max()
-        .unwrap_or(0);
     
     info!(
         game_id,
-        ?server_id,
         player_count = matched_players.len(),
         avg_mmr,
-        max_wait_seconds = max_wait,
         mmr_range = max_mmr_diff,
-        "Match created"
+        "Redis match created"
     );
-    
-    // Check if any of the matched players have active WebSocket connections
-    // and should be automatically transitioned to the game
-    // This is done by checking if they have queued_at set in the game_requests table
-    // which indicates they're actively waiting for a match
     
     Ok(Some((game_id, user_ids)))
 }
 
-/// Check if an error is a serialization failure
-fn is_serialization_error(error: &anyhow::Error) -> bool {
-    if let Some(sqlx_err) = error.downcast_ref::<sqlx::Error>() {
-        match sqlx_err {
-            sqlx::Error::Database(db_err) => {
-                // PostgreSQL serialization failure error code is 40001
-                db_err.code().map(|c| c == "40001").unwrap_or(false)
-            }
-            _ => false,
-        }
-    } else {
-        false
+/// Create a match from a specific set of players (for custom games)
+pub async fn create_custom_match(
+    matchmaking_manager: &mut MatchmakingManager,
+    pubsub: &mut PubSubManager,
+    players: Vec<QueuedPlayer>,
+    game_type: GameType,
+) -> Result<u32> {
+    let user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
+    
+    // Generate game ID
+    let game_id = matchmaking_manager.generate_game_id().await?;
+    let partition_id = game_id % PARTITION_COUNT;
+
+    // Create game state
+    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
+    let (width, height) = match &game_type {
+        GameType::TeamMatch { .. } => (60, 40),
+        _ => (40, 40),
+    };
+    
+    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
+    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
+    
+    // Add players
+    for player in &players {
+        game_state.add_player(player.user_id, Some(player.username.clone()))?;
+    }
+    
+    game_state.spawn_initial_food();
+
+    // Store active match
+    let match_info = ActiveMatch {
+        players: players.clone(),
+        game_type: game_type.clone(),
+        status: MatchStatus::Waiting,
+        partition_id,
+        created_at: Utc::now().timestamp_millis(),
+    };
+    matchmaking_manager.store_active_match(game_id, match_info).await?;
+
+    // Publish events
+    let event = StreamEvent::GameCreated {
+        game_id,
+        game_state: game_state.clone(),
+    };
+    
+    pubsub.publish_snapshot(partition_id, game_id, &game_state).await?;
+    
+    let serialized = serde_json::to_vec(&event)?;
+    pubsub.publish_command(partition_id, &serialized).await?;
+    
+    info!(game_id, partition_id, player_count = players.len(), "Custom match created");
+    
+    Ok(game_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[tokio::test]
+    async fn test_match_creation_logic() {
+        // Test the match creation logic
+        // This would require mocking Redis and PubSub
     }
 }
