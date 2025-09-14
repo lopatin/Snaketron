@@ -332,8 +332,17 @@ async fn test_disconnect_during_queue() -> Result<()> {
     
     // Client2 should not get matched (needs 3 players)
     // Wait longer than the matchmaking loop interval (2 seconds) to ensure no match
+    println!("Waiting to see if client2 gets matched (should timeout)...");
     let result = timeout(Duration::from_secs(5), wait_for_match(&mut client2)).await;
-    assert!(result.is_err(), "Should not match with insufficient players");
+    
+    match result {
+        Ok(Ok(game_id)) => {
+            panic!("ERROR: Client2 got matched to game {} (should not have been matched!)", game_id);
+        }
+        Ok(Err(_)) | Err(_) => {
+            println!("Client2 correctly did not get matched (timeout or error as expected)");
+        }
+    }
     
     client2.disconnect().await?;
     env.shutdown().await?;

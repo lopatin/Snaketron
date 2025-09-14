@@ -452,6 +452,29 @@ async fn handle_websocket_connection(
         handle.abort();
     }
     
+    // Clean up matchmaking queue if user was authenticated
+    match &state {
+        ConnectionState::Authenticated { metadata } | ConnectionState::InGame { metadata, .. } => {
+            // Remove from matchmaking queue if they were in one
+            let mut matchmaking_manager = matchmaking_manager.lock().await;
+            match remove_from_matchmaking_queue(
+                &mut *matchmaking_manager,
+                metadata.user_id as u32,
+            ).await {
+                Ok(()) => {
+                    debug!("Cleaned up matchmaking queue for user {} on disconnect", metadata.user_id);
+                }
+                Err(e) => {
+                    // This is expected if the user wasn't in queue
+                    debug!("User {} was not in matchmaking queue on disconnect: {}", metadata.user_id, e);
+                }
+            }
+        }
+        ConnectionState::Unauthenticated | ConnectionState::ShuttingDown { .. } => {
+            // No cleanup needed for unauthenticated connections or when already shutting down
+        }
+    }
+    
     // Clean up connection
     let _ = ws_stream.close(None).await;
     
