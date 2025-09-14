@@ -153,6 +153,7 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
+                &environment,
             ).await.context("Failed to create replication manager")?
         );
         

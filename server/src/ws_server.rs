@@ -468,7 +468,7 @@ async fn process_ws_message(
     ws_stream: &mut WebSocketStream<TcpStream>,
     pubsub: &mut PubSubManager,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    _replication_manager: &Arc<crate::replication::ReplicationManager>,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -562,6 +562,7 @@ async fn process_ws_message(
                             // Start listening for match notifications
                             let user_id = metadata.user_id;
                             let ws_tx_clone = ws_tx.clone();
+                            let replication_manager_clone = replication_manager.clone();
                             tokio::spawn(async move {
                                 // Subscribe to match notifications
                                 let channel = format!("matchmaking:notification:{}", user_id);
@@ -577,14 +578,25 @@ async fn process_ws_message(
                                                     // Parse the notification
                                                     if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
                                                         if let Some(game_id) = notification["game_id"].as_u64() {
-                                                            info!("User {} matched to game {}, sending JoinGame message", user_id, game_id);
-                                                            // Send JoinGame message to client
-                                                            let join_msg = WSMessage::JoinGame(game_id as u32);
-                                                            let json_msg = serde_json::to_string(&join_msg).unwrap();
-                                                            if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_ok() {
-                                                                info!("JoinGame message sent to user {}", user_id);
-                                                                // Exit after sending the match notification
-                                                                break;
+                                                            info!("User {} matched to game {}, waiting for game to be available", user_id, game_id);
+                                                            
+                                                            // Wait for the game to become available in the replication manager
+                                                            match replication_manager_clone.wait_for_game(game_id as u32, 10).await {
+                                                                Ok(_game_state) => {
+                                                                    info!("Game {} is now available in replication manager, sending JoinGame message to user {}", game_id, user_id);
+                                                                    // Send JoinGame message to client
+                                                                    let join_msg = WSMessage::JoinGame(game_id as u32);
+                                                                    let json_msg = serde_json::to_string(&join_msg).unwrap();
+                                                                    if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                        info!("JoinGame message sent to user {}", user_id);
+                                                                        // Exit after sending the match notification
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("Failed to wait for game {} to become available: {}", game_id, e);
+                                                                    // Continue listening for other notifications
+                                                                }
                                                             }
                                                         }
                                                     }

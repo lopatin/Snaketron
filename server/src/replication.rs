@@ -245,11 +245,46 @@ impl ReplicationManager {
         self.get_game_state(game_id).await
     }
     
+    /// Wait for a game to become available in the replication manager
+    /// Returns the game state once available, or an error if timeout is reached
+    pub async fn wait_for_game(&self, game_id: u32, timeout_secs: u64) -> Result<GameState> {
+        use tokio::time::{timeout, Duration};
+        
+        let deadline = timeout(Duration::from_secs(timeout_secs), async {
+            let mut backoff_ms = 10;
+            const MAX_BACKOFF_MS: u64 = 500;
+            
+            loop {
+                // Check if game is available
+                if let Some(game_state) = self.get_game_state(game_id).await {
+                    debug!("Game {} found in replication manager", game_id);
+                    return Ok(game_state);
+                }
+                
+                // Wait with exponential backoff
+                debug!("Game {} not yet available, waiting {}ms", game_id, backoff_ms);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                
+                // Increase backoff for next iteration
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+        });
+        
+        match deadline.await {
+            Ok(result) => result,
+            Err(_) => {
+                error!("Timeout waiting for game {} to become available after {} seconds", game_id, timeout_secs);
+                Err(anyhow::anyhow!("Game {} did not become available within {} seconds", game_id, timeout_secs))
+            }
+        }
+    }
+    
     /// Create and start replication workers for specified partitions
     pub async fn new(
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
         redis_url: &str,
+        environment: &str,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
@@ -257,7 +292,7 @@ impl ReplicationManager {
         let mut workers = Vec::new();
         
         // Create PubSub manager
-        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url, "dev").await?));
+        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url, environment).await?));
         
         for partition_id in partitions {
             // Create worker
