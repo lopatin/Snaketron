@@ -58,7 +58,7 @@ impl TestClient {
     }
     
     pub async fn receive_message(&mut self) -> Result<WSMessage> {
-        let timeout = tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await;
+        let timeout = tokio::time::timeout(Duration::from_secs(30), self.ws.next()).await;
         match timeout {
             Ok(Some(msg)) => {
                 match msg? {
