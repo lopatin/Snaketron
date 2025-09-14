@@ -177,19 +177,18 @@ pub async fn run_websocket_server(
     addr: &str,
     db_pool: PgPool,
     redis_url: String,
-    environment: String,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
 ) -> Result<()> {
 
     // Create shared Redis connection manager
-    let pubsub = PubSubManager::new(&redis_url, &environment).await
+    let pubsub = PubSubManager::new(&redis_url).await
         .context("Failed to create PubSub manager")?;
     
     // Create matchmaking manager
     let matchmaking_manager = Arc::new(Mutex::new(
-        MatchmakingManager::new(&redis_url, &environment).await
+        MatchmakingManager::new(&redis_url).await
             .context("Failed to create matchmaking manager")?
     ));
 
@@ -217,7 +216,8 @@ pub async fn run_websocket_server(
                         let pubsub_clone = pubsub.clone();
                         let replication_manager_clone = replication_manager.clone();
                         let matchmaking_manager_clone = matchmaking_manager.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone));
+                        let redis_url_clone = redis_url.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
                         connection_handles.push(handle);
                     }
 
@@ -260,6 +260,7 @@ async fn handle_websocket_connection(
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
     replication_manager: Arc<crate::replication::ReplicationManager>,
+    redis_url: String,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("Handling WebSocket connection from: {}", peer_addr);
@@ -373,6 +374,7 @@ async fn handle_websocket_connection(
                             &mut pubsub_clone,
                             &matchmaking_manager,
                             &replication_manager,
+                            &redis_url,
                         ).await;
                         
                         match process_result {
@@ -492,6 +494,7 @@ async fn process_ws_message(
     pubsub: &mut PubSubManager,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
+    redis_url: &str,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -586,13 +589,13 @@ async fn process_ws_message(
                             let user_id = metadata.user_id;
                             let ws_tx_clone = ws_tx.clone();
                             let replication_manager_clone = replication_manager.clone();
+                            let redis_url_clone = redis_url.to_string();
                             tokio::spawn(async move {
                                 // Subscribe to match notifications
-                                let environment = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
-                                let redis_keys = crate::redis_keys::RedisKeys::new(&environment);
+                                let redis_keys = crate::redis_keys::RedisKeys::new();
                                 let channel = redis_keys.matchmaking_notification_channel(user_id as u32);
                                 info!("Subscribing to match notifications on channel: {}", channel);
-                                if let Ok(client) = redis::Client::open("redis://127.0.0.1:6379") {
+                                if let Ok(client) = redis::Client::open(redis_url_clone.as_ref()) {
                                     if let Ok(mut pubsub) = client.get_async_pubsub().await {
                                         if pubsub.subscribe(&channel).await.is_ok() {
                                             info!("Successfully subscribed to match notifications for user {}", user_id);

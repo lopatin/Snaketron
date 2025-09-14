@@ -12,8 +12,8 @@ async fn test_duel_game() -> Result<()> {
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();
     
-    // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://localhost:6379")?;
+    // Clean up Redis test database before starting the test
+    let redis_client = redis::Client::open("redis://localhost:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     

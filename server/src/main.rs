@@ -121,10 +121,6 @@ async fn main() -> Result<()> {
         .context("SNAKETRON_REDIS_URL environment variable is required")?;
     info!("Redis leader election enabled at {}", redis_url);
 
-    // Get environment (dev, test, prod) - defaults to "dev"
-    let environment = env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
-    info!("Running in environment: {}", environment);
-
     // Create server configuration
     let config = GameServerConfig {
         db_pool,
@@ -134,7 +130,6 @@ async fn main() -> Result<()> {
         jwt_verifier,
         replay_dir,
         redis_url,
-        environment,
     };
 
     // Clone db_pool for API server

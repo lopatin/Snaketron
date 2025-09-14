@@ -58,7 +58,6 @@ pub async fn check_match_status(
 /// Subscribe to match notifications for a user
 pub async fn subscribe_to_match_notifications(
     redis_url: &str,
-    environment: &str,
     user_id: u32,
     notification_tx: mpsc::Sender<MatchNotification>,
 ) -> Result<()> {
@@ -68,7 +67,7 @@ pub async fn subscribe_to_match_notifications(
     let mut pubsub = client.get_async_pubsub().await
         .context("Failed to create PubSub connection")?;
     
-    let redis_keys = RedisKeys::new(environment);
+    let redis_keys = RedisKeys::new();
     let channel = redis_keys.matchmaking_notification_channel(user_id);
     pubsub.subscribe(&channel).await
         .context("Failed to subscribe to notification channel")?;
@@ -105,11 +104,10 @@ pub async fn subscribe_to_match_notifications(
 /// Publish a match notification
 pub async fn publish_match_notification(
     redis_conn: &mut ConnectionManager,
-    environment: &str,
     user_id: u32,
     notification: MatchNotification,
 ) -> Result<()> {
-    let redis_keys = RedisKeys::new(environment);
+    let redis_keys = RedisKeys::new();
     let channel = redis_keys.matchmaking_notification_channel(user_id);
     let payload = serde_json::to_string(&notification)?;
     
@@ -132,8 +130,7 @@ pub async fn notify_matched_players(
             players: vec![], // Could include player details if needed
         };
         
-        let environment = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
-        publish_match_notification(redis_conn, &environment, *user_id, notification).await?;
+        publish_match_notification(redis_conn, *user_id, notification).await?;
     }
     
     Ok(())
@@ -155,8 +152,7 @@ pub async fn send_queue_position_update(
             estimated_wait_seconds,
         };
         
-        let environment = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
-        publish_match_notification(redis_conn, &environment, user_id, notification).await?;
+        publish_match_notification(redis_conn, user_id, notification).await?;
     }
     
     Ok(())
@@ -175,7 +171,7 @@ impl MatchmakingHandler {
         redis_url: &str,
         ws_tx: mpsc::Sender<WSMessage>,
     ) -> Result<(Self, mpsc::Sender<MatchNotification>)> {
-        let matchmaking_manager = MatchmakingManager::new_from_env(redis_url).await?;
+        let matchmaking_manager = MatchmakingManager::new(redis_url).await?;
         
         let client = Client::open(redis_url)?;
         let redis_conn = ConnectionManager::new(client.clone()).await?;

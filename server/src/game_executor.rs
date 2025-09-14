@@ -239,14 +239,13 @@ pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
     redis_url: String,
-    environment: String,
     _replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     info!("Starting game executor for server {} partition {}", server_id, partition_id);
 
     // Create PubSub manager
-    let mut pubsub = PubSubManager::new(&redis_url, &environment).await
+    let mut pubsub = PubSubManager::new(&redis_url).await
         .context("Failed to create PubSub manager")?;
     
     // Subscribe to partition commands and snapshot requests

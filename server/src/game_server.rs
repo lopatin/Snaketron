@@ -39,8 +39,6 @@ pub struct GameServerConfig {
     pub replay_dir: Option<PathBuf>,
     /// Redis URL for cluster singleton coordination (e.g., "redis://127.0.0.1:6379")
     pub redis_url: String,
-    /// Environment name for Redis key isolation (e.g., "dev", "test", "prod")
-    pub environment: String,
 }
 
 /// A complete game server instance with all components
@@ -92,7 +90,6 @@ impl GameServer {
             jwt_verifier,
             replay_dir,
             redis_url,
-            environment,
         } = config;
 
         // Register server in database
@@ -116,11 +113,10 @@ impl GameServer {
         // Start the matchmaking service
         info!("Starting matchmaking service");
         let match_redis_url = redis_url.clone();
-        let match_environment = environment.clone();
         let match_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             // Create matchmaking manager and pubsub for matchmaking
-            let matchmaking_manager = match crate::matchmaking_manager::MatchmakingManager::new(&match_redis_url, &match_environment).await {
+            let matchmaking_manager = match crate::matchmaking_manager::MatchmakingManager::new(&match_redis_url).await {
                 Ok(mgr) => mgr,
                 Err(e) => {
                     error!("Failed to create matchmaking manager: {}", e);
@@ -128,7 +124,7 @@ impl GameServer {
                 }
             };
             
-            let pubsub = match crate::pubsub_manager::PubSubManager::new(&match_redis_url, &match_environment).await {
+            let pubsub = match crate::pubsub_manager::PubSubManager::new(&match_redis_url).await {
                 Ok(ps) => ps,
                 Err(e) => {
                     error!("Failed to create pubsub manager for matchmaking: {}", e);
@@ -153,7 +149,6 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
-                &environment,
             ).await.context("Failed to create replication manager")?
         );
         
@@ -177,14 +172,12 @@ impl GameServer {
         let ws_addr_clone = ws_addr.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
         let ws_redis_url = redis_url.clone();
-        let ws_environment = environment.clone();
         let ws_replication_manager = replication_manager.clone();
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
                 ws_pool,
                 ws_redis_url,
-                ws_environment,
                 ws_token,
                 ws_jwt_verifier,
                 ws_replication_manager,
@@ -199,7 +192,6 @@ impl GameServer {
             let exec_token = cancellation_token.clone();
             let exec_redis_url = redis_url.clone();
             let exec_replication_manager = replication_manager.clone();
-            let exec_environment = environment.clone();
             
             handles.push(tokio::spawn(async move {
                 info!("Starting cluster singleton for game executor partition {}", partition_id);
@@ -207,7 +199,7 @@ impl GameServer {
                 let singleton = match ClusterSingleton::new(
                     &exec_redis_url,
                     server_id,
-                    RedisKeys::new(&exec_environment).partition_executor_lease(partition_id),
+                    RedisKeys::new().partition_executor_lease(partition_id),
                     Duration::from_secs(1),
                     exec_token.clone(),
                 ).await {
@@ -221,7 +213,6 @@ impl GameServer {
                 // Service that runs the game executor for this partition
                 let service = move |token: CancellationToken| {
                     let redis_url_clone = exec_redis_url.clone();
-                    let environment_clone = exec_environment.clone();
                     let replication_manager_clone = exec_replication_manager.clone();
                     Box::pin(async move {
                         info!("Game executor for partition {} is now active", partition_id);
@@ -230,7 +221,6 @@ impl GameServer {
                             server_id,
                             partition_id,
                             redis_url_clone,
-                            environment_clone,
                             replication_manager_clone,
                             token,
                         ).await {
@@ -374,8 +364,7 @@ pub async fn start_test_server_with_grpc(
         region: "test-region".to_string(),
         jwt_verifier,
         replay_dir,
-        redis_url: "redis://127.0.0.1:6379".to_string(),
-        environment: "test".to_string(),
+        redis_url: "redis://127.0.0.1:6379/1".to_string(),
     };
 
     GameServer::start(config).await

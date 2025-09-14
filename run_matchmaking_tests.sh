@@ -5,17 +5,17 @@ echo "Running matchmaking integration tests..."
 echo "Note: Make sure Redis and PostgreSQL are running (e.g., via docker-compose)"
 echo ""
 
-# Try to clear Redis state (ignore errors if redis-cli is not installed)
+# Try to clear Redis test database (database 1)
 if command -v redis-cli &> /dev/null; then
-    echo "Clearing Redis state..."
-    redis-cli FLUSHDB 2>/dev/null || echo "Warning: Could not flush Redis (might not be running)"
+    echo "Clearing Redis test database (database 1)..."
+    redis-cli -n 1 FLUSHDB 2>/dev/null || echo "Warning: Could not flush Redis database 1 (might not be running)"
 else
     echo "Warning: redis-cli not found, skipping Redis cleanup"
-    echo "You may want to install redis-cli or manually clear Redis state"
+    echo "You may want to install redis-cli or manually clear Redis test database"
 fi
 
-# Set the environment to 'test' for proper channel isolation
-export SNAKETRON_ENV=test
+# Set the Redis URL to use database 1 for tests
+export SNAKETRON_REDIS_URL="redis://127.0.0.1:6379/1"
 
 # Run the tests with serial execution to avoid race conditions
 echo "Running tests serially (--test-threads=1) to avoid server startup conflicts..."

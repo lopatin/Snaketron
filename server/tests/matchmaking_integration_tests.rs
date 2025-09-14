@@ -26,7 +26,7 @@ async fn test_simple_two_player_match() -> Result<()> {
     // Set test environment
     
     // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     
@@ -299,7 +299,7 @@ async fn test_concurrent_matchmaking() -> Result<()> {
 async fn test_disconnect_during_queue() -> Result<()> {
     
     // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -353,7 +353,7 @@ async fn test_disconnect_during_queue() -> Result<()> {
 async fn test_rejoin_active_game() -> Result<()> {
     
     // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -452,7 +452,7 @@ async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
 async fn test_mmr_based_matchmaking() -> Result<()> {
     
     // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -566,7 +566,7 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
 async fn test_matchmaking_load() -> Result<()> {
     
     // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;

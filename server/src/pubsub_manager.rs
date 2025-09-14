@@ -51,7 +51,7 @@ pub struct PubSubManager {
 
 impl PubSubManager {
     /// Create a new PubSub manager
-    pub async fn new(redis_url: &str, environment: &str) -> Result<Self> {
+    pub async fn new(redis_url: &str) -> Result<Self> {
         let client = Client::open(redis_url)
             .context("Failed to create Redis client")?;
         let redis_conn = ConnectionManager::new(client).await
@@ -60,7 +60,7 @@ impl PubSubManager {
         Ok(Self {
             redis_conn,
             redis_url: redis_url.to_string(),
-            redis_keys: RedisKeys::new(environment),
+            redis_keys: RedisKeys::new(),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
         })
     }

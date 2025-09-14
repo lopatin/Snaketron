@@ -24,7 +24,7 @@ async fn test_replay_with_tick_forward() -> Result<()> {
         port: 0, // Use a random port
         database_url: database_url.clone(),
         jwt_secret: "test_secret".to_string(),
-        redis_url: "redis://localhost:6379".to_string(),
+        redis_url: "redis://localhost:6379/1".to_string(),
         replay_dir: tmp_dir.path().to_path_buf(),
         use_redis: false,
         environment: "test".to_string(),

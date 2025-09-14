@@ -284,7 +284,6 @@ impl ReplicationManager {
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
         redis_url: &str,
-        environment: &str,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
@@ -292,7 +291,7 @@ impl ReplicationManager {
         let mut workers = Vec::new();
         
         // Create PubSub manager
-        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url, environment).await?));
+        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url).await?));
         
         for partition_id in partitions {
             // Create worker

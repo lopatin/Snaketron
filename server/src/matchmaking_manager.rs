@@ -68,7 +68,7 @@ pub struct MatchmakingManager {
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
-    pub async fn new(redis_url: &str, environment: &str) -> Result<Self> {
+    pub async fn new(redis_url: &str) -> Result<Self> {
         let client = Client::open(redis_url)
             .context("Failed to create Redis client for matchmaking")?;
         
@@ -76,26 +76,12 @@ impl MatchmakingManager {
         
         Ok(Self {
             conn,
-            redis_keys: RedisKeys::new(environment),
+            redis_keys: RedisKeys::new(),
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
         })
     }
     
-    /// Create a new Redis matchmaking manager using environment from SNAKETRON_ENV
-    pub async fn new_from_env(redis_url: &str) -> Result<Self> {
-        let client = Client::open(redis_url)
-            .context("Failed to create Redis client for matchmaking")?;
-        
-        let conn = Self::connect_with_retry(&client, 3).await?;
-        
-        Ok(Self {
-            conn,
-            redis_keys: RedisKeys::from_env(),
-            max_retries: 3,
-            retry_delay: Duration::from_millis(500),
-        })
-    }
     
     /// Connect to Redis with retry logic
     async fn connect_with_retry(client: &Client, max_attempts: u32) -> Result<ConnectionManager> {
@@ -377,7 +363,7 @@ impl MatchmakingPool {
         let mut managers = Vec::with_capacity(pool_size);
         
         for _ in 0..pool_size {
-            managers.push(MatchmakingManager::new_from_env(redis_url).await?);
+            managers.push(MatchmakingManager::new(redis_url).await?);
         }
         
         Ok(Self {

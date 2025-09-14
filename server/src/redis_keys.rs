@@ -1,39 +1,18 @@
-/// Utility module for managing environment-prefixed Redis keys
-/// This ensures complete isolation between dev, test, and prod environments
+/// Utility module for managing Redis keys
+/// Isolation between environments is handled by Redis database selection
 
 use common::GameType;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Redis key builder that adds environment prefix to all keys
-#[derive(Clone, Debug)]
-pub struct RedisKeys {
-    environment: String,
-}
+/// Redis key builder
+#[derive(Clone, Debug, Default)]
+pub struct RedisKeys;
 
 impl RedisKeys {
-    /// Create a new RedisKeys instance for the given environment
-    pub fn new(environment: impl Into<String>) -> Self {
-        Self {
-            environment: environment.into(),
-        }
-    }
-    
-    /// Create a RedisKeys instance from environment variable (SNAKETRON_ENV)
-    /// Defaults to "dev" if not set
-    pub fn from_env() -> Self {
-        let env = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
-        Self::new(env)
-    }
-    
-    /// Get the environment name
-    pub fn environment(&self) -> &str {
-        &self.environment
-    }
-    
-    /// Prefix a key with the environment namespace
-    fn prefix(&self, key: &str) -> String {
-        format!("{}:{}", self.environment, key)
+    /// Create a new RedisKeys instance
+    pub fn new() -> Self {
+        Self
     }
     
     // === Matchmaking Keys ===
@@ -48,7 +27,7 @@ impl RedisKeys {
     
     /// Queue for a specific game type (by hash)
     pub fn matchmaking_queue_hash(&self, game_type_hash: u64) -> String {
-        self.prefix(&format!("matchmaking:queue:{}", game_type_hash))
+        format!("matchmaking:queue:{}", game_type_hash)
     }
     
     /// Queue for a specific game type
@@ -59,7 +38,7 @@ impl RedisKeys {
     
     /// MMR index for a game type (by hash)
     pub fn matchmaking_mmr_index_hash(&self, game_type_hash: u64) -> String {
-        self.prefix(&format!("matchmaking:mmr:{}", game_type_hash))
+        format!("matchmaking:mmr:{}", game_type_hash)
     }
     
     /// MMR index for a game type
@@ -70,51 +49,51 @@ impl RedisKeys {
     
     /// User status in matchmaking
     pub fn matchmaking_user_status(&self, user_id: u32) -> String {
-        self.prefix(&format!("matchmaking:user:{}", user_id))
+        format!("matchmaking:user:{}", user_id)
     }
     
     /// Active matches
     pub fn matchmaking_active_matches(&self) -> String {
-        self.prefix("matchmaking:matches:active")
+        "matchmaking:matches:active".to_string()
     }
     
     /// Game ID counter
     pub fn game_id_counter(&self) -> String {
-        self.prefix("game:id:counter")
+        "game:id:counter".to_string()
     }
     
     /// Match notification channel for a user
     pub fn matchmaking_notification_channel(&self, user_id: u32) -> String {
-        self.prefix(&format!("matchmaking:notification:{}", user_id))
+        format!("matchmaking:notification:{}", user_id)
     }
     
     // === PubSub Channels ===
     
     /// Partition events channel
     pub fn partition_events(&self, partition_id: u32) -> String {
-        self.prefix(&format!("snaketron:events:partition:{}", partition_id))
+        format!("snaketron:events:partition:{}", partition_id)
     }
     
     /// Partition commands channel
     pub fn partition_commands(&self, partition_id: u32) -> String {
-        self.prefix(&format!("snaketron:commands:partition:{}", partition_id))
+        format!("snaketron:commands:partition:{}", partition_id)
     }
     
     /// Snapshot requests channel
     pub fn snapshot_requests(&self, partition_id: u32) -> String {
-        self.prefix(&format!("snaketron:snapshot-requests:partition:{}", partition_id))
+        format!("snaketron:snapshot-requests:partition:{}", partition_id)
     }
     
     /// Game snapshot key
     pub fn game_snapshot(&self, game_id: u32) -> String {
-        self.prefix(&format!("game:snapshot:{}", game_id))
+        format!("game:snapshot:{}", game_id)
     }
     
     // === Cluster Singleton Keys ===
     
     /// Lease key for a singleton service
     pub fn singleton_lease(&self, service_name: &str) -> String {
-        self.prefix(&format!("singleton:lease:{}", service_name))
+        format!("singleton:lease:{}", service_name)
     }
     
     /// Matchmaking singleton lease
@@ -133,19 +112,18 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_environment_isolation() {
-        let dev_keys = RedisKeys::new("dev");
-        let test_keys = RedisKeys::new("test");
-        let prod_keys = RedisKeys::new("prod");
+    fn test_key_generation() {
+        let keys = RedisKeys::new();
         
-        // Same logical key should have different prefixes
-        assert_eq!(dev_keys.game_id_counter(), "dev:game:id:counter");
-        assert_eq!(test_keys.game_id_counter(), "test:game:id:counter");
-        assert_eq!(prod_keys.game_id_counter(), "prod:game:id:counter");
+        // Test that keys are generated correctly without prefixes
+        assert_eq!(keys.game_id_counter(), "game:id:counter");
+        assert_eq!(keys.matchmaking_active_matches(), "matchmaking:matches:active");
+        assert_eq!(keys.matchmaking_user_status(123), "matchmaking:user:123");
+        assert_eq!(keys.partition_events(0), "snaketron:events:partition:0");
         
-        // Ensure no overlap between environments
+        // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };
-        assert_ne!(dev_keys.matchmaking_queue(&game_type), test_keys.matchmaking_queue(&game_type));
-        assert_ne!(test_keys.partition_events(0), prod_keys.partition_events(0));
+        let queue_key = keys.matchmaking_queue(&game_type);
+        assert!(queue_key.starts_with("matchmaking:queue:"));
     }
 }
