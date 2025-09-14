@@ -7,46 +7,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use common::GameType;
 use chrono::Utc;
-
-// Constants for Redis keys
-pub mod keys {
-    use common::GameType;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    pub fn queue(game_type: &GameType) -> String {
-        let hash = hash_game_type(game_type);
-        format!("matchmaking:queue:{}", hash)
-    }
-    
-    pub fn mmr_index(game_type: &GameType) -> String {
-        let hash = hash_game_type(game_type);
-        format!("matchmaking:mmr:{}", hash)
-    }
-    
-    pub fn user_status(user_id: u32) -> String {
-        format!("matchmaking:user:{}", user_id)
-    }
-    
-    pub fn active_matches() -> String {
-        "matchmaking:matches:active".to_string()
-    }
-    
-    pub fn game_id_counter() -> String {
-        "game:id:counter".to_string()
-    }
-    
-    pub fn match_notification_channel(user_id: u32) -> String {
-        format!("matchmaking:notifications:{}", user_id)
-    }
-    
-    fn hash_game_type(game_type: &GameType) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        let json = serde_json::to_string(game_type).unwrap_or_default();
-        json.hash(&mut hasher);
-        hasher.finish()
-    }
-}
+use crate::redis_keys::RedisKeys;
 
 // Data structures for Redis storage
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -100,13 +61,14 @@ pub enum MatchNotification {
 #[derive(Clone)]
 pub struct MatchmakingManager {
     conn: ConnectionManager,
+    redis_keys: RedisKeys,
     max_retries: u32,
     retry_delay: Duration,
 }
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
-    pub async fn new(redis_url: &str) -> Result<Self> {
+    pub async fn new(redis_url: &str, environment: &str) -> Result<Self> {
         let client = Client::open(redis_url)
             .context("Failed to create Redis client for matchmaking")?;
         
@@ -114,6 +76,22 @@ impl MatchmakingManager {
         
         Ok(Self {
             conn,
+            redis_keys: RedisKeys::new(environment),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(500),
+        })
+    }
+    
+    /// Create a new Redis matchmaking manager using environment from SNAKETRON_ENV
+    pub async fn new_from_env(redis_url: &str) -> Result<Self> {
+        let client = Client::open(redis_url)
+            .context("Failed to create Redis client for matchmaking")?;
+        
+        let conn = Self::connect_with_retry(&client, 3).await?;
+        
+        Ok(Self {
+            conn,
+            redis_keys: RedisKeys::from_env(),
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
         })
@@ -146,9 +124,9 @@ impl MatchmakingManager {
     
     /// Add a player to the matchmaking queue
     pub async fn add_to_queue(&mut self, user_id: u32, username: String, mmr: i32, game_type: GameType) -> Result<()> {
-        let queue_key = keys::queue(&game_type);
-        let mmr_key = keys::mmr_index(&game_type);
-        let user_key = keys::user_status(user_id);
+        let queue_key = self.redis_keys.matchmaking_queue(&game_type);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(&game_type);
+        let user_key = self.redis_keys.matchmaking_user_status(user_id);
         
         let player = QueuedPlayer {
             user_id,
@@ -206,15 +184,15 @@ impl MatchmakingManager {
     
     /// Remove a player from the matchmaking queue
     pub async fn remove_from_queue(&mut self, user_id: u32) -> Result<Option<GameType>> {
-        let user_key = keys::user_status(user_id);
+        let user_key = self.redis_keys.matchmaking_user_status(user_id);
         
         // Get user status to find their game type
         let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
         
         if let Some(json) = status_json {
             let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = keys::queue(&status.game_type);
-            let mmr_key = keys::mmr_index(&status.game_type);
+            let queue_key = self.redis_keys.matchmaking_queue(&status.game_type);
+            let mmr_key = self.redis_keys.matchmaking_mmr_index(&status.game_type);
             
             // Find and remove the player from queue
             let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
@@ -243,7 +221,7 @@ impl MatchmakingManager {
     
     /// Check if a user is in queue and get their status
     pub async fn get_queue_status(&mut self, user_id: u32) -> Result<Option<UserQueueStatus>> {
-        let user_key = keys::user_status(user_id);
+        let user_key = self.redis_keys.matchmaking_user_status(user_id);
         
         let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
         
@@ -255,7 +233,7 @@ impl MatchmakingManager {
     
     /// Get queue position for a user
     pub async fn get_queue_position(&mut self, user_id: u32, game_type: &GameType) -> Result<Option<usize>> {
-        let queue_key = keys::queue(game_type);
+        let queue_key = self.redis_keys.matchmaking_queue(game_type);
         
         // Get all queued players
         let members: Vec<String> = self.conn.zrange(&queue_key, 0, -1).await?;
@@ -273,7 +251,7 @@ impl MatchmakingManager {
     
     /// Generate a new game ID atomically
     pub async fn generate_game_id(&mut self) -> Result<u32> {
-        let counter_key = keys::game_id_counter();
+        let counter_key = self.redis_keys.game_id_counter();
         let id: u32 = self.conn.incr(&counter_key, 1).await?;
         Ok(id)
     }
@@ -313,7 +291,7 @@ impl MatchmakingManager {
     
     /// Get all players in queue for a game type
     pub async fn get_queued_players(&mut self, game_type: &GameType) -> Result<Vec<QueuedPlayer>> {
-        let queue_key = keys::queue(game_type);
+        let queue_key = self.redis_keys.matchmaking_queue(game_type);
         
         let members: Vec<String> = self.conn.zrange(&queue_key, 0, -1).await?;
         let mut players = Vec::new();
@@ -329,7 +307,7 @@ impl MatchmakingManager {
     
     /// Get players in MMR range
     pub async fn get_players_in_mmr_range(&mut self, game_type: &GameType, min_mmr: i32, max_mmr: i32) -> Result<Vec<u32>> {
-        let mmr_key = keys::mmr_index(game_type);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type);
         
         let user_ids: Vec<String> = self.conn.zrangebyscore(&mmr_key, min_mmr, max_mmr).await?;
         
@@ -340,7 +318,7 @@ impl MatchmakingManager {
     
     /// Store active match information
     pub async fn store_active_match(&mut self, game_id: u32, match_info: ActiveMatch) -> Result<()> {
-        let matches_key = keys::active_matches();
+        let matches_key = self.redis_keys.matchmaking_active_matches();
         let match_json = serde_json::to_string(&match_info)?;
         
         let _: () = self.conn.hset(&matches_key, game_id.to_string(), match_json).await?;
@@ -350,7 +328,7 @@ impl MatchmakingManager {
     
     /// Get active match information
     pub async fn get_active_match(&mut self, game_id: u32) -> Result<Option<ActiveMatch>> {
-        let matches_key = keys::active_matches();
+        let matches_key = self.redis_keys.matchmaking_active_matches();
         
         let match_json: Option<String> = self.conn.hget(&matches_key, game_id.to_string()).await?;
         
@@ -362,8 +340,8 @@ impl MatchmakingManager {
     
     /// Remove players from queue (for match creation)
     pub async fn remove_players_from_queue(&mut self, game_type: &GameType, user_ids: &[u32]) -> Result<()> {
-        let queue_key = keys::queue(game_type);
-        let mmr_key = keys::mmr_index(game_type);
+        let queue_key = self.redis_keys.matchmaking_queue(game_type);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type);
         
         // Get all members to find which ones to remove
         let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
@@ -376,7 +354,7 @@ impl MatchmakingManager {
                 if user_ids.contains(&player.user_id) {
                     pipe.zrem(&queue_key, &member_json);
                     pipe.zrem(&mmr_key, player.user_id.to_string());
-                    pipe.del(keys::user_status(player.user_id));
+                    pipe.del(self.redis_keys.matchmaking_user_status(player.user_id));
                 }
             }
         }
@@ -399,7 +377,7 @@ impl MatchmakingPool {
         let mut managers = Vec::with_capacity(pool_size);
         
         for _ in 0..pool_size {
-            managers.push(MatchmakingManager::new(redis_url).await?);
+            managers.push(MatchmakingManager::new_from_env(redis_url).await?);
         }
         
         Ok(Self {
@@ -424,7 +402,7 @@ mod tests {
         // This test requires Redis to be running
         let redis_url = "redis://localhost:6379";
         
-        match MatchmakingManager::new(redis_url).await {
+        match MatchmakingManager::new_from_env(redis_url).await {
             Ok(mut manager) => {
                 assert!(manager.health_check().await.is_ok());
             }
@@ -438,7 +416,7 @@ mod tests {
     async fn test_queue_operations() {
         let redis_url = "redis://localhost:6379";
         
-        let mut manager = match MatchmakingManager::new(redis_url).await {
+        let mut manager = match MatchmakingManager::new(redis_url, "test").await {
             Ok(m) => m,
             Err(_) => {
                 eprintln!("Redis not available for testing");

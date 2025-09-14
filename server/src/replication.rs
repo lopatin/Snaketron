@@ -257,7 +257,7 @@ impl ReplicationManager {
         let mut workers = Vec::new();
         
         // Create PubSub manager
-        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url).await?));
+        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url, "dev").await?));
         
         for partition_id in partitions {
             // Create worker

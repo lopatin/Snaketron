@@ -60,9 +60,12 @@ pub async fn run_matchmaking_loop(
         // For now, we'll check a few common game types
         // In production, we'd maintain a set of active game types
         let game_types = vec![
+            GameType::FreeForAll { max_players: 2 },
+            GameType::FreeForAll { max_players: 3 },
             GameType::FreeForAll { max_players: 4 },
             GameType::FreeForAll { max_players: 6 },
             GameType::FreeForAll { max_players: 10 },
+            GameType::TeamMatch { per_team: 1 },
             GameType::TeamMatch { per_team: 2 },
             GameType::TeamMatch { per_team: 3 },
         ];
@@ -204,6 +207,41 @@ async fn create_match(
     };
     matchmaking_manager.store_active_match(game_id, match_info).await?;
 
+    // Update each player's status with the matched game ID
+    for user_id in &user_ids {
+        // Update the user's queue status to include the matched game ID
+        // This allows the WebSocket handler to detect the match
+        let channel = format!("matchmaking:notification:{}", user_id);
+        let notification = serde_json::json!({
+            "type": "MatchFound",
+            "game_id": game_id,
+            "partition_id": partition_id
+        });
+        
+        info!("Publishing match notification to channel: {} for user {}", channel, user_id);
+        
+        // Publish notification to user's channel using Redis connection
+        if let Ok(client) = redis::Client::open("redis://127.0.0.1:6379") {
+            if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
+                match redis::cmd("PUBLISH")
+                    .arg(&channel)
+                    .arg(notification.to_string())
+                    .query_async::<i32>(&mut conn).await {
+                    Ok(subscribers) => {
+                        info!("Published match notification to {} subscribers", subscribers);
+                    }
+                    Err(e) => {
+                        error!("Failed to publish match notification: {}", e);
+                    }
+                }
+            } else {
+                error!("Failed to get Redis connection for notifications");
+            }
+        } else {
+            error!("Failed to create Redis client for notifications");
+        }
+    }
+    
     // Remove players from queue
     matchmaking_manager.remove_players_from_queue(&game_type, &user_ids).await?;
 

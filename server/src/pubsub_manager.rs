@@ -8,21 +8,7 @@ use redis::aio::{ConnectionManager, PubSub};
 use redis::{AsyncCommands, Client};
 use common::{GameState, GameEventMessage, GameEvent};
 use futures_util::StreamExt;
-
-/// Channel patterns for PubSub
-pub mod channels {
-    pub fn partition_events(partition_id: u32) -> String {
-        format!("snaketron:events:partition:{}", partition_id)
-    }
-    
-    pub fn partition_commands(partition_id: u32) -> String {
-        format!("snaketron:commands:partition:{}", partition_id)
-    }
-    
-    pub fn snapshot_requests(partition_id: u32) -> String {
-        format!("snaketron:snapshot-requests:partition:{}", partition_id)
-    }
-}
+use crate::redis_keys::RedisKeys;
 
 /// Snapshot request message for a partition
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,12 +45,13 @@ impl PartitionSubscription {
 pub struct PubSubManager {
     pub(crate) redis_conn: ConnectionManager,
     pub(crate) redis_url: String,
+    pub(crate) redis_keys: RedisKeys,
     pub(crate) subscriptions: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl PubSubManager {
     /// Create a new PubSub manager
-    pub async fn new(redis_url: &str) -> Result<Self> {
+    pub async fn new(redis_url: &str, environment: &str) -> Result<Self> {
         let client = Client::open(redis_url)
             .context("Failed to create Redis client")?;
         let redis_conn = ConnectionManager::new(client).await
@@ -73,6 +60,7 @@ impl PubSubManager {
         Ok(Self {
             redis_conn,
             redis_url: redis_url.to_string(),
+            redis_keys: RedisKeys::new(environment),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -84,7 +72,7 @@ impl PubSubManager {
     
     /// Publish an event to a partition channel
     pub async fn publish_event(&mut self, partition_id: u32, event: &GameEventMessage) -> Result<()> {
-        let channel = channels::partition_events(partition_id);
+        let channel = self.redis_keys.partition_events(partition_id);
         let data = serde_json::to_vec(event)
             .context("Failed to serialize event")?;
         
@@ -107,7 +95,7 @@ impl PubSubManager {
         };
         
         // Publish to partition events channel
-        let channel = channels::partition_events(partition_id);
+        let channel = self.redis_keys.partition_events(partition_id);
         let data = serde_json::to_vec(&event)
             .context("Failed to serialize snapshot event")?;
         
@@ -115,7 +103,7 @@ impl PubSubManager {
             .context("Failed to publish snapshot")?;
         
         // Also store in Redis with TTL (5 minutes)
-        let key = format!("snaketron:snapshot:game:{}", game_id);
+        let key = self.redis_keys.game_snapshot(game_id);
         let snapshot_data = serde_json::to_vec(snapshot)
             .context("Failed to serialize snapshot for storage")?;
         let _: () = self.redis_conn.set_ex(&key, snapshot_data, 300).await
@@ -127,7 +115,7 @@ impl PubSubManager {
     
     /// Request snapshots for all games in a partition
     pub async fn request_partition_snapshots(&mut self, partition_id: u32) -> Result<()> {
-        let channel = channels::snapshot_requests(partition_id);
+        let channel = self.redis_keys.snapshot_requests(partition_id);
         let request = SnapshotRequest {
             partition_id,
             requester_id: None,
@@ -144,7 +132,7 @@ impl PubSubManager {
 
     /// Get stored snapshot from Redis
     pub async fn get_stored_snapshot(&mut self, game_id: u32) -> Result<Option<GameState>> {
-        let key = format!("snaketron:snapshot:game:{}", game_id);
+        let key = self.redis_keys.game_snapshot(game_id);
         let data: Option<Vec<u8>> = self.redis_conn.get(&key).await
             .context("Failed to get snapshot from Redis")?;
 
@@ -161,9 +149,9 @@ impl PubSubManager {
 
     /// Subscribe to a partition's events, commands and snapshot requests
     pub async fn subscribe_to_partition(&mut self, partition_id: u32) -> Result<PartitionSubscription> {
-        let event_channel = channels::partition_events(partition_id);
-        let command_channel = channels::partition_commands(partition_id);
-        let request_channel = channels::snapshot_requests(partition_id);
+        let event_channel = self.redis_keys.partition_events(partition_id);
+        let command_channel = self.redis_keys.partition_commands(partition_id);
+        let request_channel = self.redis_keys.snapshot_requests(partition_id);
         
         // Create channels for receiving messages
         let (event_tx, event_rx) = mpsc::channel(1000);
@@ -196,7 +184,7 @@ impl PubSubManager {
     
     /// Publish a command to a partition
     pub async fn publish_command(&mut self, partition_id: u32, command: &[u8]) -> Result<()> {
-        let channel = channels::partition_commands(partition_id);
+        let channel = self.redis_keys.partition_commands(partition_id);
         let _: () = self.redis_conn.publish(&channel, command).await
             .context("Failed to publish command")?;
         Ok(())

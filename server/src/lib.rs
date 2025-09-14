@@ -10,6 +10,7 @@ pub mod cluster_singleton;
 pub mod replication;
 pub mod pubsub_manager;
 pub mod ws_matchmaking;
+pub mod redis_keys;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

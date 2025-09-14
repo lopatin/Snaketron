@@ -110,21 +110,27 @@ impl TestEnvironment {
     
     /// Create a test user in the database
     pub async fn create_user(&mut self) -> Result<i32> {
+        self.create_user_with_mmr(1000).await
+    }
+    
+    /// Create a test user with specific MMR
+    pub async fn create_user_with_mmr(&mut self, mmr: i32) -> Result<i32> {
         let index = self.user_ids.len();
         let username = format!("test_user_{}", index);
         let user_id: i32 = sqlx::query_scalar(
             r#"
             INSERT INTO users (username, password_hash, mmr)
-            VALUES ($1, 'test_hash', 1000)
+            VALUES ($1, 'test_hash', $2)
             RETURNING id
             "#
         )
         .bind(&username)
+        .bind(mmr)
         .fetch_one(self.db_pool())
         .await?;
         
         self.user_ids.push(user_id);
-        info!("Created test user {} with ID {}", username, user_id);
+        info!("Created test user {} with ID {} and MMR {}", username, user_id, mmr);
         Ok(user_id)
     }
     

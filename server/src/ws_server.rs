@@ -20,6 +20,8 @@ use tungstenite::Utf8Bytes;
 use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, DEFAULT_TICK_INTERVAL_MS};
 use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 use crate::pubsub_manager::PubSubManager;
+use crate::matchmaking_manager::MatchmakingManager;
+use crate::ws_matchmaking::{add_to_matchmaking_queue, remove_from_matchmaking_queue};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -175,14 +177,21 @@ pub async fn run_websocket_server(
     addr: &str,
     db_pool: PgPool,
     redis_url: String,
+    environment: String,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
 ) -> Result<()> {
 
     // Create shared Redis connection manager
-    let pubsub = PubSubManager::new(&redis_url).await
+    let pubsub = PubSubManager::new(&redis_url, &environment).await
         .context("Failed to create PubSub manager")?;
+    
+    // Create matchmaking manager
+    let matchmaking_manager = Arc::new(Mutex::new(
+        MatchmakingManager::new(&redis_url, &environment).await
+            .context("Failed to create matchmaking manager")?
+    ));
 
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -207,7 +216,8 @@ pub async fn run_websocket_server(
                         let db_pool_clone = db_pool.clone();
                         let pubsub_clone = pubsub.clone();
                         let replication_manager_clone = replication_manager.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone));
+                        let matchmaking_manager_clone = matchmaking_manager.clone();
+                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone));
                         connection_handles.push(handle);
                     }
 
@@ -245,6 +255,7 @@ pub async fn run_websocket_server(
 async fn handle_websocket_connection(
     db_pool: PgPool,
     pubsub: PubSubManager,
+    matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
@@ -360,6 +371,7 @@ async fn handle_websocket_connection(
                             &ws_tx,
                             &mut ws_stream,
                             &mut pubsub_clone,
+                            &matchmaking_manager,
                             &replication_manager,
                         ).await;
                         
@@ -455,6 +467,7 @@ async fn process_ws_message(
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
     pubsub: &mut PubSubManager,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     _replication_manager: &Arc<crate::replication::ReplicationManager>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
@@ -525,9 +538,69 @@ async fn process_ws_message(
                 WSMessage::QueueForMatch { game_type } => {
                     info!("User {} ({}) queuing for match type: {:?}", metadata.username, metadata.user_id, game_type);
 
-                    // TODO: Add to matchmaking queue using Redis-based matchmaking
-                    // This will be handled in a future update to integrate with the matchmaking manager
-                    warn!("Matchmaking queue integration pending");
+                    // Fetch user's MMR from database
+                    let mmr: i32 = sqlx::query_scalar(
+                        "SELECT mmr FROM users WHERE id = $1"
+                    )
+                    .bind(metadata.user_id)
+                    .fetch_one(db_pool)
+                    .await
+                    .unwrap_or(1500); // Default MMR if not found
+
+                    // Add to matchmaking queue using Redis-based matchmaking
+                    let mut matchmaking_manager = matchmaking_manager.lock().await;
+                    match add_to_matchmaking_queue(
+                        &mut *matchmaking_manager,
+                        metadata.user_id as u32,
+                        metadata.username.clone(),
+                        mmr,
+                        game_type,
+                    ).await {
+                        Ok(()) => {
+                            info!("User {} added to matchmaking queue", metadata.user_id);
+                            
+                            // Start listening for match notifications
+                            let user_id = metadata.user_id;
+                            let ws_tx_clone = ws_tx.clone();
+                            tokio::spawn(async move {
+                                // Subscribe to match notifications
+                                let channel = format!("matchmaking:notification:{}", user_id);
+                                info!("Subscribing to match notifications on channel: {}", channel);
+                                if let Ok(client) = redis::Client::open("redis://127.0.0.1:6379") {
+                                    if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                                        if pubsub.subscribe(&channel).await.is_ok() {
+                                            info!("Successfully subscribed to match notifications for user {}", user_id);
+                                            // Wait for match notification in a loop
+                                            let mut pubsub_stream = pubsub.on_message();
+                                            while let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
+                                                if let Ok(payload) = msg.get_payload::<String>() {
+                                                    // Parse the notification
+                                                    if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
+                                                        if let Some(game_id) = notification["game_id"].as_u64() {
+                                                            info!("User {} matched to game {}, sending JoinGame message", user_id, game_id);
+                                                            // Send JoinGame message to client
+                                                            let join_msg = WSMessage::JoinGame(game_id as u32);
+                                                            let json_msg = serde_json::to_string(&join_msg).unwrap();
+                                                            if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_ok() {
+                                                                info!("JoinGame message sent to user {}", user_id);
+                                                                // Exit after sending the match notification
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            error!("Failed to subscribe to channel {} for user {}", channel, user_id);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to add user to matchmaking queue: {}", e);
+                        }
+                    }
 
                     Ok(ConnectionState::Authenticated { metadata })
                 }
@@ -545,9 +618,19 @@ async fn process_ws_message(
                 WSMessage::LeaveQueue => {
                     info!("User {} ({}) leaving matchmaking queue", metadata.username, metadata.user_id);
 
-                    // TODO: Remove from matchmaking queue using Redis-based matchmaking
-                    // This will be handled in a future update to integrate with the matchmaking manager
-                    warn!("Matchmaking queue removal integration pending");
+                    // Remove from matchmaking queue using Redis-based matchmaking
+                    let mut matchmaking_manager = matchmaking_manager.lock().await;
+                    match remove_from_matchmaking_queue(
+                        &mut *matchmaking_manager,
+                        metadata.user_id as u32,
+                    ).await {
+                        Ok(()) => {
+                            info!("User {} removed from matchmaking queue", metadata.user_id);
+                        }
+                        Err(e) => {
+                            error!("Failed to remove user from matchmaking queue: {}", e);
+                        }
+                    }
 
                     Ok(ConnectionState::Authenticated { metadata })
                 }
