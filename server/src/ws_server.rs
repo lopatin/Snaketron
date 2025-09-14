@@ -565,7 +565,9 @@ async fn process_ws_message(
                             let replication_manager_clone = replication_manager.clone();
                             tokio::spawn(async move {
                                 // Subscribe to match notifications
-                                let channel = format!("matchmaking:notification:{}", user_id);
+                                let environment = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
+                                let redis_keys = crate::redis_keys::RedisKeys::new(&environment);
+                                let channel = redis_keys.matchmaking_notification_channel(user_id as u32);
                                 info!("Subscribing to match notifications on channel: {}", channel);
                                 if let Ok(client) = redis::Client::open("redis://127.0.0.1:6379") {
                                     if let Ok(mut pubsub) = client.get_async_pubsub().await {

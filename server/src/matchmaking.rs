@@ -211,7 +211,9 @@ async fn create_match(
     for user_id in &user_ids {
         // Update the user's queue status to include the matched game ID
         // This allows the WebSocket handler to detect the match
-        let channel = format!("matchmaking:notification:{}", user_id);
+        let environment = std::env::var("SNAKETRON_ENV").unwrap_or_else(|_| "dev".to_string());
+        let redis_keys = crate::redis_keys::RedisKeys::new(&environment);
+        let channel = redis_keys.matchmaking_notification_channel(*user_id);
         let notification = serde_json::json!({
             "type": "MatchFound",
             "game_id": game_id,
