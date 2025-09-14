@@ -6,15 +6,16 @@ use axum::{
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{error, info};
 
+use crate::db::Database;
+
 use super::jwt::JwtManager;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthState {
-    pub db_pool: PgPool,
+    pub db: Arc<dyn Database>,
     pub jwt_manager: Arc<JwtManager>,
 }
 
@@ -135,14 +136,8 @@ pub async fn register(
     }
 
     // Check if username already exists
-    let existing: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE username = $1"
-    )
-    .bind(&req.username)
-    .fetch_optional(&state.db_pool)
-    .await?;
-
-    if existing.is_some() {
+    let existing_user = state.db.get_user_by_username(&req.username).await?;
+    if existing_user.is_some() {
         return Err(anyhow::anyhow!("Username already exists").into());
     }
 
@@ -151,22 +146,12 @@ pub async fn register(
         .context("Failed to hash password")?;
 
     // Create user
-    let user: (i32, String, i32) = sqlx::query_as(
-        r#"
-        INSERT INTO users (username, password_hash, mmr)
-        VALUES ($1, $2, 1000)
-        RETURNING id, username, mmr
-        "#
-    )
-    .bind(&req.username)
-    .bind(&password_hash)
-    .fetch_one(&state.db_pool)
-    .await?;
+    let user = state.db.create_user(&req.username, &password_hash, 1000).await?;
 
     let user_info = UserInfo {
-        id: user.0,
-        username: user.1,
-        mmr: user.2,
+        id: user.id,
+        username: user.username,
+        mmr: user.mmr,
     };
 
     // Generate JWT token
@@ -185,17 +170,11 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     // Find user by username
-    let user: Option<(i32, String, String, i32)> = sqlx::query_as(
-        "SELECT id, username, password_hash, mmr FROM users WHERE username = $1"
-    )
-    .bind(&req.username)
-    .fetch_optional(&state.db_pool)
-    .await?;
-
-    let user = user.ok_or_else(|| anyhow::anyhow!("Invalid username or password"))?;
+    let user = state.db.get_user_by_username(&req.username).await?
+        .ok_or_else(|| anyhow::anyhow!("Invalid username or password"))?;
 
     // Verify password
-    let is_valid = verify(&req.password, &user.2)
+    let is_valid = verify(&req.password, &user.password_hash)
         .context("Failed to verify password")?;
 
     if !is_valid {
@@ -203,9 +182,9 @@ pub async fn login(
     }
 
     let user_info = UserInfo {
-        id: user.0,
-        username: user.1,
-        mmr: user.3,
+        id: user.id,
+        username: user.username,
+        mmr: user.mmr,
     };
 
     // Generate JWT token
@@ -223,19 +202,13 @@ pub async fn get_current_user(
     State(state): State<AuthState>,
     Extension(user_id): Extension<i32>, // This will be extracted from JWT by middleware
 ) -> Result<Json<UserInfo>, AppError> {
-    let user: Option<(i32, String, i32)> = sqlx::query_as(
-        "SELECT id, username, mmr FROM users WHERE id = $1"
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db_pool)
-    .await?;
-
-    let user = user.ok_or_else(|| anyhow::anyhow!("User not found"))?;
+    let user = state.db.get_user_by_id(user_id).await?
+        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
     Ok(Json(UserInfo {
-        id: user.0,
-        username: user.1,
-        mmr: user.2,
+        id: user.id,
+        username: user.username,
+        mmr: user.mmr,
     }))
 }
 
@@ -248,14 +221,8 @@ pub async fn check_username(
     
     // If format is valid, check if username exists in database
     if errors.is_empty() {
-        let existing: Option<i32> = sqlx::query_scalar(
-            "SELECT id FROM users WHERE username = $1"
-        )
-        .bind(&req.username)
-        .fetch_optional(&state.db_pool)
-        .await?;
-        
-        if existing.is_some() {
+        let existing_user = state.db.get_user_by_username(&req.username).await?;
+        if existing_user.is_some() {
             errors.push("Username is already taken".to_string());
         }
     }

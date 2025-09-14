@@ -4,11 +4,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+
+use crate::db::Database;
 
 use super::auth::{self, AuthState};
 use super::jwt::JwtManager;
@@ -17,13 +18,13 @@ use super::rate_limit::{rate_limit_layer, rate_limit_middleware};
 
 pub async fn run_api_server(
     addr: &str,
-    db_pool: PgPool,
+    db: Arc<dyn Database>,
     jwt_secret: &str,
 ) -> Result<()> {
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     
     let auth_state = AuthState {
-        db_pool,
+        db,
         jwt_manager: jwt_manager.clone(),
     };
 

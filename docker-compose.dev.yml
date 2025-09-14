@@ -4,6 +4,14 @@
 version: '3.8'
 
 services:
+  localstack:
+    environment:
+      - DEBUG=1
+      - LS_LOG=debug
+    volumes:
+      - "./localstack-data:/var/lib/localstack"
+      - "./scripts/init-dynamodb.sh:/etc/localstack/init/ready.d/init-dynamodb.sh"
+
   server:
     # Use a different build strategy for development
     build:

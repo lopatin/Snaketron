@@ -222,7 +222,9 @@ async fn create_match(
         info!("Publishing match notification to channel: {} for user {}", channel, user_id);
         
         // Publish notification to user's channel using Redis connection
-        if let Ok(client) = redis::Client::open("redis://127.0.0.1:6379") {
+        let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        if let Ok(client) = redis::Client::open(redis_url.as_str()) {
             if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
                 match redis::cmd("PUBLISH")
                     .arg(&channel)

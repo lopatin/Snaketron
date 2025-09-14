@@ -2,7 +2,7 @@ use std::pin::Pin;
 use tracing::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use crate::db::Database;
 use chrono::Utc;
 use std::time::Duration;
 use futures_util::future::join_all;
@@ -94,12 +94,12 @@ pub trait JwtVerifier: Send + Sync {
 
 // Test implementation that accepts any token and creates users as needed
 pub struct TestJwtVerifier {
-    db_pool: PgPool,
+    db: Arc<dyn Database>,
 }
 
 impl TestJwtVerifier {
-    pub fn new(db_pool: PgPool) -> Self {
-        Self { db_pool }
+    pub fn new(db: Arc<dyn Database>) -> Self {
+        Self { db }
     }
 }
 
@@ -115,30 +115,15 @@ impl JwtVerifier for TestJwtVerifier {
         };
         
         // Try to find existing user first
-        let existing_user: Option<i32> = sqlx::query_scalar(
-            "SELECT id FROM users WHERE username = $1"
-        )
-        .bind(&username)
-        .fetch_optional(&self.db_pool)
-        .await?;
+        let existing_user = self.db.get_user_by_username(&username).await?;
         
         let user_id = match existing_user {
-            Some(id) => id,
+            Some(user) => user.id,
             None => {
                 // Create new test user
-                let new_id: i32 = sqlx::query_scalar(
-                    r#"
-                    INSERT INTO users (username, password_hash, mmr)
-                    VALUES ($1, 'test_password_hash', 1000)
-                    RETURNING id
-                    "#
-                )
-                .bind(&username)
-                .fetch_one(&self.db_pool)
-                .await?;
-                
-                info!("Created test user {} with ID {}", username, new_id);
-                new_id
+                let new_user = self.db.create_user(&username, "test_password_hash", 1000).await?;
+                info!("Created test user {} with ID {}", username, new_user.id);
+                new_user.id
             }
         };
         
@@ -175,7 +160,7 @@ enum ConnectionState {
 
 pub async fn run_websocket_server(
     addr: &str,
-    db_pool: PgPool,
+    db: Arc<dyn Database>,
     redis_url: String,
     cancellation_token: CancellationToken,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -212,12 +197,12 @@ pub async fn run_websocket_server(
                         info!("Accepted connection from: {}", peer_addr);
                         let connection_token = cancellation_token.child_token();
                         let jwt_verifier_clone = jwt_verifier.clone();
-                        let db_pool_clone = db_pool.clone();
+                        let db_clone = db.clone();
                         let pubsub_clone = pubsub.clone();
                         let replication_manager_clone = replication_manager.clone();
                         let matchmaking_manager_clone = matchmaking_manager.clone();
                         let redis_url_clone = redis_url.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_pool_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
+                        let handle = tokio::spawn(handle_websocket_connection(db_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
                         connection_handles.push(handle);
                     }
 
@@ -253,7 +238,7 @@ pub async fn run_websocket_server(
 
 
 async fn handle_websocket_connection(
-    db_pool: PgPool,
+    db: Arc<dyn Database>,
     pubsub: PubSubManager,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     stream: TcpStream,
@@ -368,7 +353,7 @@ async fn handle_websocket_connection(
                             state,
                             ws_message,
                             &jwt_verifier,
-                            &db_pool,
+                            &db,
                             &ws_tx,
                             &mut ws_stream,
                             &mut pubsub_clone,
@@ -488,7 +473,7 @@ async fn process_ws_message(
     state: ConnectionState,
     ws_message: WSMessage,
     jwt_verifier: &Arc<dyn JwtVerifier>,
-    db_pool: &PgPool,
+    db: &Arc<dyn Database>,
     ws_tx: &mpsc::Sender<Message>,
     ws_stream: &mut WebSocketStream<TcpStream>,
     pubsub: &mut PubSubManager,
@@ -518,18 +503,10 @@ async fn process_ws_message(
                             info!("Token verified successfully, user_id: {}", user_token.user_id);
                             
                             // Fetch username from database
-                            let username: String = match sqlx::query_scalar(
-                                "SELECT username FROM users WHERE id = $1"
-                            )
-                            .bind(user_token.user_id)
-                            .fetch_optional(db_pool)
-                            .await? {
-                                Some(name) => name,
-                                None => {
-                                    error!("User {} not found in database", user_token.user_id);
-                                    return Err(anyhow::anyhow!("User not found"));
-                                }
-                            };
+                            let user = db.get_user_by_id(user_token.user_id)
+                                .await?
+                                .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+                            let username = user.username;
                             
                             // Create player metadata
                             let metadata = PlayerMetadata {
@@ -565,13 +542,10 @@ async fn process_ws_message(
                     info!("User {} ({}) queuing for match type: {:?}", metadata.username, metadata.user_id, game_type);
 
                     // Fetch user's MMR from database
-                    let mmr: i32 = sqlx::query_scalar(
-                        "SELECT mmr FROM users WHERE id = $1"
-                    )
-                    .bind(metadata.user_id)
-                    .fetch_one(db_pool)
-                    .await
-                    .unwrap_or(1500); // Default MMR if not found
+                    let user = db.get_user_by_id(metadata.user_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+                    let mmr = user.mmr;
 
                     // Add to matchmaking queue using Redis-based matchmaking
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
@@ -696,7 +670,7 @@ async fn process_ws_message(
                 WSMessage::CreateCustomGame { settings } => {
                     info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
                     
-                    match create_custom_game(db_pool, pubsub, metadata.user_id, metadata.username.clone(), settings).await {
+                    match create_custom_game(db, pubsub, metadata.user_id, metadata.username.clone(), settings).await {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
@@ -723,7 +697,7 @@ async fn process_ws_message(
                 WSMessage::JoinCustomGame { game_code } => {
                     info!("User {} ({}) joining custom game with code: {}", metadata.username, metadata.user_id, game_code);
                     
-                    match join_custom_game(db_pool, metadata.user_id, &game_code).await {
+                    match join_custom_game(db, metadata.user_id, &game_code).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::CustomGameJoined { game_id };
@@ -750,7 +724,7 @@ async fn process_ws_message(
                 WSMessage::SpectateGame { game_id, game_code } => {
                     info!("User {} ({}) attempting to spectate game {}", metadata.username, metadata.user_id, game_id);
                     
-                    match spectate_game(db_pool, metadata.user_id, game_id, game_code.as_deref()).await {
+                    match spectate_game(db, metadata.user_id, game_id, game_code.as_deref()).await {
                         Ok(actual_game_id) => {
                             // Send success response
                             let response = WSMessage::SpectatorJoined;
@@ -777,7 +751,7 @@ async fn process_ws_message(
                 WSMessage::CreateSoloGame => {
                     info!("User {} ({}) creating solo game", metadata.username, metadata.user_id);
                     
-                    match create_solo_game(db_pool, pubsub, metadata.user_id, metadata.username.clone()).await {
+                    match create_solo_game(db, pubsub, metadata.user_id, metadata.username.clone()).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -853,7 +827,7 @@ async fn process_ws_message(
                     info!("User {} ({}) starting custom game {}", metadata.username, metadata.user_id, game_id);
                     
                     // Check if user is the host
-                    let is_host = check_game_host(db_pool, game_id, metadata.user_id).await?;
+                    let is_host = check_game_host(db, game_id, metadata.user_id).await?;
                     if !is_host {
                         let response = WSMessage::AccessDenied { 
                             reason: "Only the host can start the game".to_string() 
@@ -864,11 +838,8 @@ async fn process_ws_message(
                     }
                     
                     // Get server ID from database
-                    let server_id: i32 = sqlx::query_scalar(
-                        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
-                    )
-                    .fetch_one(db_pool)
-                    .await?;
+                    let server_id = db.get_server_for_load_balancing("default")
+                        .await?;
                     
                     // Start the game by publishing StatusUpdated event via PubSub
                     let _partition_id = game_id % PARTITION_COUNT;
@@ -921,21 +892,11 @@ async fn process_ws_message(
 
 
 
-pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) -> Result<u64> {
+pub async fn register_server(db: &Arc<dyn Database>, grpc_address: &str, region: &str) -> Result<u64> {
     info!("Registering server instance");
 
     // Insert a new record and return the generated ID
-    let id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO servers (grpc_address, last_heartbeat, region, created_at)
-        VALUES ($1, NULL, $2, $3)
-        RETURNING id
-        "#
-    )
-        .bind(grpc_address)
-        .bind(region)
-        .bind(Utc::now())
-        .fetch_one(pool)
+    let id = db.register_server(grpc_address, region)
         .await
         .context("Failed to register server in database")?;
 
@@ -944,23 +905,13 @@ pub async fn register_server(pool: &PgPool, grpc_address: &str, region: &str) ->
     Ok(id_u64)
 }
 
-pub async fn discover_peers(pool: &PgPool, region: &str) -> Result<Vec<(u64, String)>> {
+pub async fn discover_peers(db: &Arc<dyn Database>, region: &str) -> Result<Vec<(u64, String)>> {
     info!("Discovering peers in region: {}", region);
     
-    let now = Utc::now();
-    
     // Query to find all servers in the specified region
-    let servers = sqlx::query_as::<_, (i32, String)>(
-        r#"
-        SELECT id, grpc_address FROM servers
-        WHERE region = $1 AND last_heartbeat > $2 - INTERVAL '30 seconds'
-        "#
-    )
-    .bind(region)
-    .bind(now)
-    .fetch_all(pool)
-    .await
-    .context("Failed to fetch server records")?;
+    let servers = db.get_active_servers(region)
+        .await
+        .context("Failed to fetch server records")?;
     
     if servers.is_empty() {
         warn!("No servers found in region: {}", region);
@@ -988,7 +939,7 @@ fn generate_game_code() -> String {
 }
 
 async fn create_custom_game(
-    pool: &PgPool,
+    db: &Arc<dyn Database>,
     pubsub: &mut PubSubManager,
     user_id: i32,
     username: String,
@@ -997,47 +948,26 @@ async fn create_custom_game(
     let game_code = generate_game_code();
     
     // Get current server ID from database
-    let server_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
-    )
-    .fetch_one(pool)
-    .await?;
+    let server_id = db.get_server_for_load_balancing("default").await?;
     
     // Create lobby entry
-    let lobby_id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO custom_game_lobbies (game_code, host_user_id, settings, created_at, expires_at, state)
-        VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '1 hour', 'waiting')
-        RETURNING id
-        "#
-    )
-    .bind(&game_code)
-    .bind(user_id)
-    .bind(serde_json::to_value(&settings)?)
-    .fetch_one(pool)
-    .await?;
+    let lobby_id = db.create_custom_lobby(
+        &game_code,
+        user_id,
+        &serde_json::to_value(&settings)?,
+    ).await?;
     
     // Create game entry
-    let game_id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO games (server_id, game_type, status, game_mode, is_private, game_code)
-        VALUES ($1, $2, 'waiting', 'custom', $3, $4)
-        RETURNING id
-        "#
-    )
-    .bind(server_id)
-    .bind(serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?)
-    .bind(settings.is_private)
-    .bind(&game_code)
-    .fetch_one(pool)
-    .await?;
+    let game_id = db.create_game(
+        server_id,
+        &serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?,
+        "custom",
+        settings.is_private,
+        Some(&game_code),
+    ).await?;
     
     // Update lobby with game_id
-    sqlx::query("UPDATE custom_game_lobbies SET game_id = $1 WHERE id = $2")
-        .bind(game_id)
-        .bind(lobby_id)
-        .execute(pool)
-        .await?;
+    db.update_custom_lobby_game_id(lobby_id, game_id).await?;
     
     // Create game state
     let start_ms = chrono::Utc::now().timestamp_millis();
@@ -1081,17 +1011,13 @@ async fn create_custom_game(
 }
 
 async fn create_solo_game(
-    pool: &PgPool,
+    db: &Arc<dyn Database>,
     pubsub: &mut PubSubManager,
     user_id: i32,
     username: String,
 ) -> Result<u32> {
     // Get current server ID from database
-    let server_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM servers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' ORDER BY current_game_count ASC LIMIT 1"
-    )
-    .fetch_one(pool)
-    .await?;
+    let server_id = db.get_server_for_load_balancing("default").await?;
     
     // Create game settings for solo game
     let settings = common::CustomGameSettings {
@@ -1107,17 +1033,13 @@ async fn create_solo_game(
     };
     
     // Create game entry
-    let game_id: i32 = sqlx::query_scalar(
-        r#"
-        INSERT INTO games (server_id, game_type, status, game_mode, is_private)
-        VALUES ($1, $2, 'waiting', 'solo', true)
-        RETURNING id
-        "#
-    )
-    .bind(server_id)
-    .bind(serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?)
-    .fetch_one(pool)
-    .await?;
+    let game_id = db.create_game(
+        server_id,
+        &serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?,
+        "solo",
+        true,  // Solo games are private
+        None,  // No game code for solo games
+    ).await?;
     
     // Create game state with one player
     let start_ms = chrono::Utc::now().timestamp_millis();
@@ -1170,40 +1092,32 @@ async fn create_solo_game(
 }
 
 async fn join_custom_game(
-    pool: &PgPool,
+    db: &Arc<dyn Database>,
     user_id: i32,
     game_code: &str,
 ) -> Result<u32> {
     // Find the game by code
-    let (game_id, is_private): (i32, bool) = sqlx::query_as(
-        "SELECT id, is_private FROM games WHERE game_code = $1 AND status = 'waiting'"
-    )
-    .bind(game_code)
-    .fetch_one(pool)
-    .await
-    .context("Game not found or already started")?;
+    let game = db.get_game_by_code(game_code).await?
+        .context("Game not found or already started")?;
+    
+    // Check that game is waiting
+    if game.status != "waiting" {
+        return Err(anyhow::anyhow!("Game already started"));
+    }
+    
+    let game_id = game.id;
     
     // Check if game is full
-    let player_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM game_players WHERE game_id = $1"
-    )
-    .bind(game_id)
-    .fetch_one(pool)
-    .await?;
+    let player_count = db.get_player_count(game_id).await?;
     
     // Get max players from game settings
-    let max_players: i32 = sqlx::query_scalar(
-        r#"
-        SELECT (game_type->'settings'->>'max_players')::int
-        FROM games
-        WHERE id = $1
-        "#
-    )
-    .bind(game_id)
-    .fetch_one(pool)
-    .await?;
+    let max_players = game.game_type
+        .get("settings")
+        .and_then(|s| s.get("max_players"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(4) as i64;
     
-    if player_count >= max_players as i64 {
+    if player_count >= max_players {
         return Err(anyhow::anyhow!("Game is full"));
     }
     
@@ -1211,14 +1125,8 @@ async fn join_custom_game(
     // only allows adding players on tick 0. We'll need to implement a proper
     // lobby system or modify the game engine to support late joins.
     
-    // Add player to the game_players table
-    sqlx::query(
-        "INSERT INTO game_players (game_id, user_id, team_id) VALUES ($1, $2, 0)"
-    )
-    .bind(game_id)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    // Add player to the game
+    db.add_player_to_game(game_id, user_id, 0).await?;
     
     // TODO: Implement proper player joining through Redis events when game hasn't started yet
     warn!("Player joining for custom games needs proper implementation");
@@ -1227,97 +1135,57 @@ async fn join_custom_game(
 }
 
 async fn check_game_host(
-    pool: &PgPool,
+    db: &Arc<dyn Database>,
     game_id: u32,
     user_id: i32,
 ) -> Result<bool> {
-    let host_user_id: Option<i32> = sqlx::query_scalar(
-        r#"
-        SELECT host_user_id
-        FROM custom_game_lobbies
-        WHERE game_id = $1
-        "#
-    )
-    .bind(game_id as i32)
-    .fetch_optional(pool)
-    .await?;
-    
+    let host_user_id = db.get_custom_lobby_host(game_id as i32).await?;
     Ok(host_user_id == Some(user_id))
 }
 
 async fn spectate_game(
-    pool: &PgPool,
+    db: &Arc<dyn Database>,
     user_id: i32,
     game_id: u32,
     game_code: Option<&str>,
 ) -> Result<u32> {
     // If game_code is provided, look up game by code
     let actual_game_id = if let Some(code) = game_code {
-        let result: Option<(i32, bool)> = sqlx::query_as(
-            r#"
-            SELECT g.id, g.is_private
-            FROM games g
-            WHERE g.game_code = $1
-            "#
-        )
-        .bind(code)
-        .fetch_optional(pool)
-        .await?;
+        let game = db.get_game_by_code(code).await?
+            .ok_or_else(|| anyhow::anyhow!("Invalid game code"))?;
         
-        if let Some((id, is_private)) = result {
-            // Check if spectators are allowed for private games
-            if is_private {
-                let allow_spectators: Option<bool> = sqlx::query_scalar(
-                    r#"
-                    SELECT allow_spectators
-                    FROM custom_game_lobbies
-                    WHERE game_id = $1
-                    "#
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        // Check if spectators are allowed for private games
+        if game.is_private {
+            let lobby = db.get_custom_lobby_by_code(code).await?;
+            
+            if let Some(lobby) = lobby {
+                let allow_spectators = lobby.settings
+                    .get("allow_spectators")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 
-                if !allow_spectators.unwrap_or(false) {
+                if !allow_spectators {
                     return Err(anyhow::anyhow!("Spectators are not allowed for this game"));
                 }
+            } else {
+                // Private game without lobby, no spectators allowed
+                return Err(anyhow::anyhow!("Spectators are not allowed for this game"));
             }
-            id as u32
-        } else {
-            return Err(anyhow::anyhow!("Invalid game code"));
         }
+        game.id as u32
     } else {
         // Direct game_id access - check if game exists and is public
-        let is_private: Option<bool> = sqlx::query_scalar(
-            r#"
-            SELECT is_private
-            FROM games
-            WHERE id = $1
-            "#
-        )
-        .bind(game_id as i32)
-        .fetch_optional(pool)
-        .await?;
+        let game = db.get_game_by_id(game_id as i32).await?;
         
-        match is_private {
-            Some(false) => game_id, // Public game, allow spectating
-            Some(true) => return Err(anyhow::anyhow!("Cannot spectate private game without code")),
+        match game {
+            Some(g) if !g.is_private => game_id, // Public game, allow spectating
+            Some(_) => return Err(anyhow::anyhow!("Cannot spectate private game without code")),
             None => return Err(anyhow::anyhow!("Game not found")),
         }
     };
     
-    // Add spectator to the game_spectators table
-    sqlx::query(
-        r#"
-        INSERT INTO game_spectators (game_id, user_id, joined_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (game_id, user_id) DO NOTHING
-        "#
-    )
-    .bind(actual_game_id as i32)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    // Add spectator to the game
+    db.add_spectator_to_game(actual_game_id as i32, user_id).await?;
     
     info!("User {} joined as spectator for game {}", user_id, actual_game_id);
     Ok(actual_game_id)

@@ -1,18 +1,24 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:13.3
-    container_name: snaketron-postgres
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: snaketron-localstack
     environment:
-      POSTGRES_USER: snaketron
-      POSTGRES_PASSWORD: snaketron
-      POSTGRES_DB: snaketron
+      - SERVICES=dynamodb
+      - DEBUG=0
+      - PERSISTENCE=1
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
     ports:
-      - "5432:5432"
+      - "4566:4566"
+    volumes:
+      - "./localstack-data:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./localstack-init.sh:/etc/localstack/init/ready.d/init-dynamodb.sh"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U snaketron"]
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,7 +28,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: snaketron-redis
-    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
     restart: unless-stopped
@@ -40,12 +45,12 @@ services:
       dockerfile: server/Dockerfile
     container_name: snaketron-server
     environment:
-      # Database configuration
-      SNAKETRON_DB_HOST: db
-      SNAKETRON_DB_PORT: 5432
-      SNAKETRON_DB_USER: snaketron
-      SNAKETRON_DB_PASS: snaketron
-      SNAKETRON_DB_NAME: snaketron
+      # DynamoDB configuration
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      DYNAMODB_TABLE_PREFIX: snaketron
       # Server configuration
       SNAKETRON_WS_PORT: 8080
       SNAKETRON_GRPC_PORT: 50051
@@ -69,7 +74,7 @@ services:
     volumes:
       - ./replays:/var/lib/snaketron/replays
     depends_on:
-      db:
+      localstack:
         condition: service_healthy
       redis:
         condition: service_healthy

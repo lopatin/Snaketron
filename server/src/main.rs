@@ -1,17 +1,11 @@
 use std::env;
 use anyhow::{Context, Result};
 use tracing::info;
-use sqlx::postgres::PgPoolOptions;
-use refinery::config::{Config, ConfigDbType};
 use std::sync::Arc;
 use server::game_server::{GameServer, GameServerConfig};
 use server::ws_server::TestJwtVerifier;
 use server::api::{jwt::{JwtManager, ProductionJwtVerifier}, run_api_server};
-
-mod migrations {
-    use refinery::embed_migrations;
-    embed_migrations!("./migrations");
-}
+use server::db::{Database, dynamodb::DynamoDatabase};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,43 +28,15 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Database setup
-    let db_host = env::var("SNAKETRON_DB_HOST")
-        .context("SNAKETRON_DB_HOST must be set in environment or .env file")?;
-    let db_port = env::var("SNAKETRON_DB_PORT")
-        .context("SNAKETRON_DB_PORT must be set in environment or .env file")?;
-    let db_user = env::var("SNAKETRON_DB_USER")
-        .context("SNAKETRON_DB_USER must be set in environment or .env file")?;
-    let db_pass = env::var("SNAKETRON_DB_PASS")
-        .context("SNAKETRON_DB_PASS must be set in environment or .env file")?;
-    let db_name = env::var("SNAKETRON_DB_NAME")
-        .context("SNAKETRON_DB_NAME must be set in environment or .env file")?;
+    // Database setup - now using DynamoDB
+    let db: Arc<dyn Database> = Arc::new(
+        DynamoDatabase::new()
+            .await
+            .context("Failed to initialize DynamoDB client")?
+    );
+    info!("DynamoDB client initialized");
 
     let region = env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
-
-    // Build database connection string
-    let db_url = format!(
-        "postgres://{}:{}@{}:{}/{}",
-        db_user, db_pass, db_host, db_port, db_name
-    );
-
-    // Run migrations
-    let mut db_config = Config::new(ConfigDbType::Postgres)
-        .set_db_host(&db_host)
-        .set_db_port(&db_port)
-        .set_db_user(&db_user)
-        .set_db_pass(&db_pass)
-        .set_db_name(&db_name);
-
-    let _migrations_report = migrations::migrations::runner().run_async(&mut db_config).await?;
-    info!("Database migrations completed");
-
-    // Create database pool
-    let db_pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .context("Failed to create PostgreSQL connection pool")?;
 
     // Server configuration
     let ws_port = env::var("SNAKETRON_WS_PORT").unwrap_or_else(|_| "8080".to_string());
@@ -89,7 +55,7 @@ async fn main() -> Result<()> {
     let jwt_verifier: Arc<dyn server::ws_server::JwtVerifier> = 
         if env::var("SNAKETRON_TEST_MODE").unwrap_or_default() == "true" {
             info!("Running in TEST MODE - JWT verification disabled");
-            Arc::new(TestJwtVerifier::new(db_pool.clone()))
+            Arc::new(TestJwtVerifier::new(db.clone()))
         } else {
             let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
             Arc::new(ProductionJwtVerifier::new(jwt_manager))
@@ -123,7 +89,7 @@ async fn main() -> Result<()> {
 
     // Create server configuration
     let config = GameServerConfig {
-        db_pool,
+        db: db.clone(),
         ws_addr,
         grpc_addr,
         region,
@@ -132,8 +98,8 @@ async fn main() -> Result<()> {
         redis_url,
     };
 
-    // Clone db_pool for API server
-    let api_db_pool = config.db_pool.clone();
+    // Clone db for API server
+    let api_db = db.clone();
 
     // Start the game server
     let game_server = GameServer::start(config).await?;
@@ -148,7 +114,7 @@ async fn main() -> Result<()> {
     let api_addr = format!("0.0.0.0:{}", api_port);
     
     let api_handle = tokio::spawn(async move {
-        if let Err(e) = run_api_server(&api_addr, api_db_pool, &jwt_secret).await {
+        if let Err(e) = run_api_server(&api_addr, api_db, &jwt_secret).await {
             tracing::error!("API server error: {}", e);
         }
     });

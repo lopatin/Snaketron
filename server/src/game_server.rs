@@ -4,11 +4,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::{info, error, warn, trace, debug};
 
 use crate::{
-    ws_server::{register_server, run_websocket_server, JwtVerifier},
+    ws_server::{run_websocket_server, JwtVerifier},
     game_executor::{run_game_executor, StreamEvent},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
@@ -16,6 +15,7 @@ use crate::{
     cluster_singleton::ClusterSingleton,
     replication::ReplicationManager,
     redis_keys::RedisKeys,
+    db::Database,
 };
 use crate::ws_server::discover_peers;
 use std::path::PathBuf;
@@ -25,8 +25,8 @@ use crate::game_executor::PARTITION_COUNT;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
-    /// Database connection pool
-    pub db_pool: PgPool,
+    /// Database connection
+    pub db: Arc<dyn Database>,
     /// WebSocket server address (e.g., "127.0.0.1:8080")
     pub ws_addr: String,
     /// gRPC server address for game relay (e.g., "127.0.0.1:50051")
@@ -49,8 +49,8 @@ pub struct GameServer {
     pub ws_addr: String,
     /// gRPC server address (if enabled)
     pub grpc_addr: String,
-    /// Database pool
-    db_pool: PgPool,
+    /// Database connection
+    db: Arc<dyn Database>,
     /// Cancellation token for graceful shutdown
     cancellation_token: CancellationToken,
     /// Handles for all spawned tasks
@@ -83,7 +83,7 @@ impl GameServer {
     /// Create and start a new game server instance
     pub async fn start(config: GameServerConfig) -> Result<Self> {
         let GameServerConfig {
-            db_pool,
+            db,
             ws_addr,
             grpc_addr,
             region,
@@ -94,8 +94,8 @@ impl GameServer {
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
-        let server_id: u64 = register_server(&db_pool, &grpc_addr, &region).await
-            .context("Failed to register server")?;
+        let server_id = db.register_server(&grpc_addr, &region).await
+            .context("Failed to register server")? as u64;
         info!("Server registered with ID: {}", server_id);
         
         // Create cancellation token for graceful shutdown
@@ -167,7 +167,7 @@ impl GameServer {
         
         // Start WebSocket server after replication manager is ready
         info!("Starting WebSocket server");
-        let ws_pool = db_pool.clone();
+        let ws_db = db.clone();
         let ws_token = cancellation_token.clone();
         let ws_addr_clone = ws_addr.clone();
         let ws_jwt_verifier = jwt_verifier.clone();
@@ -176,7 +176,7 @@ impl GameServer {
         handles.push(tokio::spawn(async move {
             let _ = run_websocket_server(
                 &ws_addr_clone,
-                ws_pool,
+                ws_db,
                 ws_redis_url,
                 ws_token,
                 ws_jwt_verifier,
@@ -262,7 +262,7 @@ impl GameServer {
             server_id,
             ws_addr,
             grpc_addr,
-            db_pool,
+            db,
             cancellation_token,
             handles,
             // replay_listener,
@@ -270,9 +270,9 @@ impl GameServer {
         })
     }
 
-    /// Get a reference to the database pool
-    pub fn db_pool(&self) -> &PgPool {
-        &self.db_pool
+    /// Get a reference to the database
+    pub fn db(&self) -> &Arc<dyn Database> {
+        &self.db
     }
 
     /// Get a reference to the replay listener
@@ -291,9 +291,7 @@ impl GameServer {
         
         // Step 1: Stop accepting new games
         info!("Updating server status to 'draining'");
-        sqlx::query("UPDATE servers SET status = 'draining' WHERE id = $1")
-            .bind(self.server_id as i32)
-            .execute(&self.db_pool)
+        self.db.update_server_status(self.server_id as i32, "draining")
             .await
             .context("Failed to update server status")?;
         
@@ -311,9 +309,7 @@ impl GameServer {
         }
 
         // Update server status to offline
-        sqlx::query("UPDATE servers SET status = 'offline' WHERE id = $1")
-            .bind(self.server_id as i32)
-            .execute(&self.db_pool)
+        self.db.update_server_status(self.server_id as i32, "offline")
             .await
             .context("Failed to update server status to offline")?;
 
@@ -323,26 +319,20 @@ impl GameServer {
 }
 
 /// Helper function to start a game server for testing
-/// Creates a database pool and determines ports automatically
+/// Creates a database connection and determines ports automatically
 pub async fn start_test_server(
-    db_url: &str,
+    db: Arc<dyn Database>,
     jwt_verifier: Arc<dyn JwtVerifier>,
 ) -> Result<GameServer> {
-    start_test_server_with_grpc(db_url, jwt_verifier, false).await
+    start_test_server_with_grpc(db, jwt_verifier, false).await
 }
 
 /// Helper function to start a game server for testing with optional gRPC
 pub async fn start_test_server_with_grpc(
-    db_url: &str,
+    db: Arc<dyn Database>,
     jwt_verifier: Arc<dyn JwtVerifier>,
     _enable_grpc: bool,
 ) -> Result<GameServer> {
-    // Create database pool
-    let db_pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(db_url)
-        .await
-        .context("Failed to connect to database")?;
 
     // Get available ports
     let ws_port = get_available_port();
@@ -358,7 +348,7 @@ pub async fn start_test_server_with_grpc(
     let replay_dir = Some(replay_path);
     
     let config = GameServerConfig {
-        db_pool,
+        db,
         ws_addr,
         grpc_addr,
         region: "test-region".to_string(),
@@ -381,7 +371,7 @@ pub fn get_available_port() -> u16 {
 
 /// Run a loop to update last_heartbeat in the database
 pub async fn run_heartbeat_loop(
-    pool: PgPool,
+    db: Arc<dyn Database>,
     server_id: u64,
     cancellation_token: CancellationToken
 ) {
@@ -397,26 +387,9 @@ pub async fn run_heartbeat_loop(
             }
 
             _ = interval.tick() => {
-                let now = Utc::now();
-
-                match sqlx::query(
-                    r#"
-                    UPDATE servers
-                    SET last_heartbeat = $1
-                    WHERE id = $2
-                    "#
-                )
-                    .bind::<DateTime<Utc>>(now)
-                    .bind(server_id as i32)
-                    .execute(&pool)
-                    .await
-                {
-                    Ok(result) => {
-                        if result.rows_affected() == 1 {
-                            trace!(?server_id, timestamp = %now, "Heartbeat sent successfully.");
-                        } else {
-                            warn!(?server_id, "Heartbeat update affected {} rows (expected 1). Server record might be missing.", result.rows_affected());
-                        }
+                match db.update_server_heartbeat(server_id as i32).await {
+                    Ok(()) => {
+                        trace!(?server_id, "Heartbeat sent successfully.");
                     }
                     Err(e) => {
                         error!(?server_id, error = %e, "Failed to send heartbeat");
