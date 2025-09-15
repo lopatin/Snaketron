@@ -1,5 +1,5 @@
 # Development Dockerfile with hot reloading
-FROM rust:1.80-bookworm
+FROM rust:1.89-trixie
 
 # Install cargo-watch for auto-reloading
 RUN cargo install cargo-watch
