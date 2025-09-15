@@ -105,7 +105,12 @@ impl GameServer {
         // Redis connection manager
         let client = redis::Client::open(redis_url.as_str())
             .context("Failed to create Redis client")?;
-        let redis_conn = ConnectionManager::new(client).await
+        let redis_conn = tokio::time::timeout(
+            Duration::from_secs(30),
+            ConnectionManager::new(client)
+        ) 
+            .await 
+            .context("Redis connection timed out after 30 seconds")? 
             .context("Failed to create Redis connection manager")?;
 
         // WebSocket server will be started after ReplicationManager is created
