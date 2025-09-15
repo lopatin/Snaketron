@@ -24,7 +24,7 @@ COPY terminal ./terminal
 RUN cargo build --release --bin server
 
 # Runtime stage
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
