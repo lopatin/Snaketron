@@ -32,8 +32,8 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 snaketron
+# Create non-root user (using UID 10001 to avoid conflicts)
+RUN useradd -m -u 10001 snaketron
 
 # Copy the binary from builder
 COPY --from=builder /usr/src/app/target/release/server /usr/local/bin/server
