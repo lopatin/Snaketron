@@ -17,6 +17,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, DEFAULT_TICK_INTERVAL_MS};
 use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 use crate::pubsub_manager::PubSubManager;
@@ -202,7 +203,7 @@ pub async fn run_websocket_server(
                         let replication_manager_clone = replication_manager.clone();
                         let matchmaking_manager_clone = matchmaking_manager.clone();
                         let redis_url_clone = redis_url.clone();
-                        let handle = tokio::spawn(handle_websocket_connection(db_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
+                        let handle = tokio::spawn(handle_connection(db_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
                         connection_handles.push(handle);
                     }
 
@@ -237,22 +238,48 @@ pub async fn run_websocket_server(
 }
 
 
-async fn handle_websocket_connection(
+async fn handle_connection(
     db: Arc<dyn Database>,
     pubsub: PubSubManager,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
     replication_manager: Arc<crate::replication::ReplicationManager>,
     redis_url: String,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
+    
+    // Peek at the first few bytes to determine if it's an HTTP request
+    let mut buf = [0u8; 1024];
+    let n = stream.peek(&mut buf).await?;
+    
+    if n > 0 {
+        let request_start = String::from_utf8_lossy(&buf[..n]);
+        
+        // Check if it's an HTTP health check request
+        if request_start.starts_with("GET /health") || request_start.starts_with("GET /api/health") {
+            debug!("Health check request from: {}", peer_addr);
+            
+            // Send a simple HTTP 200 OK response
+            let response = "HTTP/1.1 200 OK\r\n\
+                           Content-Type: text/plain\r\n\
+                           Content-Length: 2\r\n\
+                           Connection: close\r\n\
+                           \r\n\
+                           OK";
+            stream.write_all(response.as_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    }
+    
     info!("Handling WebSocket connection from: {}", peer_addr);
-
+    
+    // Not a health check, proceed with WebSocket handling
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
-        .expect("Failed to accept WebSocket connection");
+        .context("Failed to accept WebSocket connection")?;
 
     // Create a channel for sending messages to the WebSocket
     let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
