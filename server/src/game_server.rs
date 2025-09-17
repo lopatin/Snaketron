@@ -103,8 +103,9 @@ impl GameServer {
         let mut handles = Vec::new();
 
         // Redis connection manager
+        info!("Redis URL: {}", redis_url.as_str());
         let client = redis::Client::open(redis_url.as_str())
-            .context("Failed to create Redis client")?;
+            .context("Failed to connect to the cache")?;
         let redis_conn = tokio::time::timeout(
             Duration::from_secs(30),
             ConnectionManager::new(client)
