@@ -51,7 +51,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Password hashing
 bcrypt = "0.15"
 # Redis for leader election
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tokio-native-tls-comp"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", features = ["prost"] }

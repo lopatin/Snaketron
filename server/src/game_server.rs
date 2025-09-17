@@ -107,7 +107,7 @@ impl GameServer {
         let client = redis::Client::open(redis_url.as_str())
             .context("Failed to connect to the cache")?;
         let redis_conn = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             ConnectionManager::new(client)
         ) 
             .await 
