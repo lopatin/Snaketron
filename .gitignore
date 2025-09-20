@@ -2,6 +2,7 @@
 target
 client/web/node_modules
 node_modules
+localstack-data
 client/web/dist
 .env
 states
