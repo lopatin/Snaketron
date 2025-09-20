@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 use common::GameType;
 use chrono::Utc;
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils;
 
 // Data structures for Redis storage
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -84,28 +85,10 @@ impl MatchmakingManager {
     
     
     /// Connect to Redis with retry logic
-    async fn connect_with_retry(client: &Client, max_attempts: u32) -> Result<ConnectionManager> {
-        let mut attempts = 0;
-        let mut delay = Duration::from_millis(100);
-        
-        loop {
-            attempts += 1;
-            match ConnectionManager::new(client.clone()).await {
-                Ok(conn) => {
-                    info!("Successfully connected to Redis for matchmaking");
-                    return Ok(conn);
-                }
-                Err(e) if attempts < max_attempts => {
-                    warn!("Failed to connect to Redis (attempt {}/{}): {}", attempts, max_attempts, e);
-                    sleep(delay).await;
-                    delay *= 2; // Exponential backoff
-                }
-                Err(e) => {
-                    error!("Failed to connect to Redis after {} attempts", max_attempts);
-                    return Err(anyhow!("Redis connection failed: {}", e));
-                }
-            }
-        }
+    async fn connect_with_retry(client: &Client, _max_attempts: u32) -> Result<ConnectionManager> {
+        // Use the standardized connection manager with built-in retry logic
+        redis_utils::create_connection_manager(client.clone()).await
+            .context("Failed to connect to Redis for matchmaking")
     }
     
     /// Add a player to the matchmaking queue

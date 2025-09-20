@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 
 use crate::matchmaking_manager::{MatchmakingManager, MatchNotification};
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils;
 use crate::ws_server::WSMessage;
 use common::GameType;
 
@@ -172,9 +173,9 @@ impl MatchmakingHandler {
         ws_tx: mpsc::Sender<WSMessage>,
     ) -> Result<(Self, mpsc::Sender<MatchNotification>)> {
         let matchmaking_manager = MatchmakingManager::new(redis_url).await?;
-        
+
         let client = Client::open(redis_url)?;
-        let redis_conn = ConnectionManager::new(client.clone()).await?;
+        let redis_conn = redis_utils::create_connection_manager(client.clone()).await?;
         
         let (notification_tx, notification_rx) = mpsc::channel(32);
         

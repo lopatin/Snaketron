@@ -26,13 +26,13 @@ services:
       - snaketron-network
 
   redis:
-    image: redis:7-alpine
+    image: apache/kvrocks:latest
     container_name: snaketron-redis
     ports:
-      - "6379:6379"
+      - "6379:6666"  # Kvrocks uses port 6666 by default, mapping to 6379 for compatibility
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-p", "6666", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -66,7 +66,7 @@ services:
       # JWT secret (use a secure secret in production)
       SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
       # Redis configuration for cluster singleton coordination
-      SNAKETRON_REDIS_URL: "redis://redis:6379"
+      SNAKETRON_REDIS_URL: "redis://redis:6666"
     ports:
       - "8080:8080"   # WebSocket port
       - "50051:50051" # gRPC port

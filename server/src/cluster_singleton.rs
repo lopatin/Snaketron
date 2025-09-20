@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result, Context};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
+use crate::redis_utils;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -70,14 +71,11 @@ impl ClusterSingleton {
     async fn create_connection(redis_url: &str) -> Result<ConnectionManager> {
         let client = redis::Client::open(redis_url)
             .context("Failed to create Redis client")?;
-        
-        // Add a timeout to prevent blocking forever on connection attempts
-        let connection_timeout = Duration::from_secs(2);
-        let redis_client = timeout(connection_timeout, ConnectionManager::new(client))
+
+        let redis_client = redis_utils::create_connection_manager(client)
             .await
-            .context("Connection attempt timed out")?
             .context("Failed to create Redis connection manager")?;
-            
+
         Ok(redis_client)
     }
     

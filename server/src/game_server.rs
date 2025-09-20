@@ -15,6 +15,7 @@ use crate::{
     cluster_singleton::ClusterSingleton,
     replication::ReplicationManager,
     redis_keys::RedisKeys,
+    redis_utils,
     db::Database,
 };
 use crate::ws_server::discover_peers;
@@ -106,12 +107,8 @@ impl GameServer {
         info!("Redis URL: {}", redis_url.as_str());
         let client = redis::Client::open(redis_url.as_str())
             .context("Failed to connect to the cache")?;
-        let redis_conn = tokio::time::timeout(
-            Duration::from_secs(60),
-            ConnectionManager::new(client)
-        ) 
-            .await 
-            .context("Redis connection timed out after 30 seconds")? 
+        let redis_conn = redis_utils::create_connection_manager(client)
+            .await
             .context("Failed to create Redis connection manager")?;
 
         // WebSocket server will be started after ReplicationManager is created

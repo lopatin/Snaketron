@@ -11,6 +11,7 @@ pub mod replication;
 pub mod pubsub_manager;
 pub mod ws_matchmaking;
 pub mod redis_keys;
+pub mod redis_utils;
 pub mod db;
 
 pub mod game_relay {

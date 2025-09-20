@@ -9,6 +9,7 @@ use redis::{AsyncCommands, Client};
 use common::{GameState, GameEventMessage, GameEvent};
 use futures_util::StreamExt;
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils;
 
 /// Snapshot request message for a partition
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,7 +55,7 @@ impl PubSubManager {
     pub async fn new(redis_url: &str) -> Result<Self> {
         let client = Client::open(redis_url)
             .context("Failed to create Redis client")?;
-        let redis_conn = ConnectionManager::new(client).await
+        let redis_conn = redis_utils::create_connection_manager(client).await
             .context("Failed to create Redis connection manager")?;
         
         Ok(Self {
