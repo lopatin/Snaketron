@@ -53,9 +53,8 @@ function Header() {
             <nav className="flex gap-6">
               <Link to="/" className="text-black-70 font-black italic uppercase tracking-1 opacity-100 underline underline-offset-6">Play</Link>
               <a href="#" className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity">Leaderboards</a>
-              <a href="#" className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity">Spectate</a>
-              <a 
-                href="#" 
+              <a
+                href="#"
                 onClick={(e) => {
                   e.preventDefault();
                   setShowJoinModal(true);
