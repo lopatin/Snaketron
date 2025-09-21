@@ -14,6 +14,7 @@ interface UseGameEngineProps {
 interface UseGameEngineReturn {
   gameEngine: GameClient | null;
   gameState: GameState | null;
+  isGameComplete: boolean;
   sendCommand: (command: Command) => void;
   processServerEvent: (event: any) => void;
   stopEngine: () => void;
@@ -29,6 +30,7 @@ export const useGameEngine = ({
   const engineRef = useRef<GameClient | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
+  const [isGameComplete, setIsGameComplete] = useState(false);
   const engineGameIdRef = useRef<string | null>(null);
   const latencyMsRef = useRef(latencyMs);
 
@@ -122,17 +124,29 @@ export const useGameEngine = ({
       const newState = JSON.parse(stateJson);
       setGameState(newState);
 
-      // Stop the loop if game is complete
-      if (typeof newState.status === 'object' && newState.status !== null && 'Complete' in newState.status) {
-        console.log('Game completed, stopping game loop');
-        return;
+      // Check if COMMITTED state is complete (for game over UI)
+      const committedStateJson = engineRef.current.getCommittedStateJson();
+      const committedState = JSON.parse(committedStateJson);
+      if (typeof committedState.status === 'object' &&
+          committedState.status !== null &&
+          'Complete' in committedState.status) {
+        if (!isGameComplete) {
+          console.log('Committed state is complete, triggering game over UI');
+          setIsGameComplete(true);
+        }
       }
+
+      // Stop the loop if game is complete
+      // if (typeof newState.status === 'object' && newState.status !== null && 'Complete' in newState.status) {
+      //   console.log('Game completed, stopping game loop');
+      //   return;
+      // }
 
       animationFrameRef.current = requestAnimationFrame(runGameLoop);
     } catch (error) {
       console.error('Game loop error:', error);
     }
-  }, []);
+  }, [isGameComplete]);
 
 
   // // Start/stop engine
@@ -209,7 +223,7 @@ export const useGameEngine = ({
       let fullEventMessage = eventMessage;
       
       // If we only received the event, we need to wrap it in a GameEventMessage
-      // This handles backward compatibility
+      // TODO: Is this necessary? Shouldn't the server always send full messages?
       if (!eventMessage.game_id && !eventMessage.tick && !eventMessage.event) {
         console.warn('Received bare event, wrapping in GameEventMessage structure');
         fullEventMessage = {
@@ -220,7 +234,6 @@ export const useGameEngine = ({
         };
       }
       
-      // No conversion needed - TypeScript types match Rust serialization
       const event = fullEventMessage.event || fullEventMessage;
       if (event.Snapshot && event.Snapshot.game_state) {
         // Initialize the game engine
@@ -235,18 +248,21 @@ export const useGameEngine = ({
       }
 
       if (engineRef.current) {
+        console.log('Processing server event:', fullEventMessage);
         engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
+        console.log('Current game status:', engineRef.current.getCommittedStateJson());
       } else {
         console.error('Game engine not initialized, cannot process server event:', fullEventMessage);
       }
     } catch (error) {
       console.error('Failed to process server event:', error);
     }
-  }, [playerId, gameId, runGameLoop]);
+  }, [playerId, gameId, runGameLoop, setIsGameComplete]);
 
   return {
     gameEngine: engineRef.current,
     gameState,
+    isGameComplete,
     sendCommand,
     processServerEvent,
     stopEngine,

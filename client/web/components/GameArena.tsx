@@ -46,6 +46,7 @@ export default function GameArena() {
   const {
     gameEngine,
     gameState,
+    isGameComplete,
     // isRunning,
     sendCommand,
     processServerEvent,
@@ -154,36 +155,35 @@ export default function GameArena() {
 
   // Update score when game state changes
   useEffect(() => {
-    if (gameState && user?.id) {
-      const player = gameState.players?.[user.id];
-      if (player) {
-        const snake = gameState.arena.snakes.find(s => s.body.length > 0);
-        if (snake) {
-          const newScore = Math.max(0, snake.body.length - 2);
-          setScore(newScore);
-          
-          // Check if snake is dead
-          if (!snake.is_alive && !gameOver) {
-            setGameOver(true);
-            // Show game over panel after a short delay
-            setTimeout(() => setShowGameOverPanel(true), 500);
-          }
-        }
-      }
-    }
+    // if (gameState && user?.id) {
+    //   const player = gameState.players?.[user.id];
+    //   if (player) {
+    //     const snake = gameState.arena.snakes.find(s => s.body.length > 0);
+    //     if (snake) {
+    //       const newScore = Math.max(0, snake.body.length - 2);
+    //       setScore(newScore);
+    //
+    //       // Check if snake is dead
+    //       if (!snake.is_alive && !gameOver) {
+    //         setGameOver(true);
+    //         // Show game over panel after a short delay
+    //         setTimeout(() => setShowGameOverPanel(true), 500);
+    //       }
+    //     }
+    //   }
+    // }
     
-    // Also check if game status is Complete
-    if (gameState && !gameOver) {
-      const status = gameState.status;
-      const isComplete = (typeof status === 'object' && 'Complete' in status);
-      if (isComplete) {
-        setGameOver(true);
-        stopEngine(); // Stop the engine when game ends
-        // Show game over panel after a short delay
-        setTimeout(() => setShowGameOverPanel(true), 500);
-      }
+    // Check if committed state is Complete (from useGameEngine)
+    console.log('isGameComplete:', isGameComplete, 'gameOver:', gameOver);
+    if (isGameComplete && !gameOver) {
+      console.log('Game complete (from committed state), showing game over UI');
+      setGameOver(true);
+      stopEngine(); // Stop the engine when game ends
+      setShowGameOverPanel(true);
+      // Show game over panel after a short delay
+      // setTimeout(() => setShowGameOverPanel(true), 500);
     }
-  }, [gameState, user?.id, gameOver, stopEngine]);
+  }, [gameState, user?.id, gameOver, isGameComplete, stopEngine]);
 
   // Transform direction based on rotation
   // We need to apply the INVERSE transformation of the coordinate system
@@ -436,7 +436,7 @@ export default function GameArena() {
       <>
         {/* Scoreboard */}
         <Scoreboard 
-          gameState={gameState} 
+          gameState={gameState}
           score={score} 
           isVisible={isArenaVisible} 
           currentUserId={user?.id}

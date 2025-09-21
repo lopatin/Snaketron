@@ -138,31 +138,40 @@ impl GameEngine {
         if elapsed_ms < 0 {
             return Ok(());
         }
-        
+
         // Calculate target tick
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms as i64;
         let predicted_target_tick = (elapsed_ms / tick_duration_ms) as u32;
-        
+
+        // Special case: if committed state is complete, always rebuild predicted from it
+        // This ensures the predicted state shows the authoritative final outcome
+        if self.committed_state.is_complete() {
+            let mut new_predicted_state = self.committed_state.clone();
+            new_predicted_state.rng = None;
+            self.predicted_state = Some(new_predicted_state);
+            return Ok(());
+        }
+
         // Check if we need to rebuild by comparing with existing predicted state
         let needs_rebuild = self.predicted_state.as_ref()
-            .map_or(false, |state| predicted_target_tick > state.current_tick());
+            .map_or(true, |state| predicted_target_tick > state.current_tick());
 
         if needs_rebuild {
             // Clone committed state
             let mut new_predicted_state = self.committed_state.clone();
-            
+
             // Remove RNG from predicted state so it doesn't generate food locally
             new_predicted_state.rng = None;
 
-            // Advance to target tick
-            while !new_predicted_state.is_complete() 
+            // Advance to target tick (stops if game completes)
+            while !new_predicted_state.is_complete()
                 && new_predicted_state.current_tick() < predicted_target_tick {
                 new_predicted_state.tick_forward()?;
             }
-            
+
             self.predicted_state = Some(new_predicted_state);
         }
-        
+
         Ok(())
     }
 
