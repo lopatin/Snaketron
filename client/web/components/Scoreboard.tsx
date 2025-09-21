@@ -3,7 +3,6 @@ import { GameState } from '../types';
 
 interface ScoreboardProps {
   gameState: GameState | null;
-  score: number;
   isVisible: boolean;
   currentUserId?: number;
   showGameOver?: boolean;
@@ -19,7 +18,7 @@ const SNAKE_COLORS = [
   '#f7b731', // Yellow/gold
 ];
 
-const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, currentUserId, showGameOver, onBackToMenu, onPlayAgain }) => {
+const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUserId, showGameOver, onBackToMenu, onPlayAgain }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [logoHovered, setLogoHovered] = useState(false);
   const [gameOverExpanded, setGameOverExpanded] = useState(false);
@@ -109,7 +108,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
         userId,
         isCurrentPlayer,
         name: isCurrentPlayer ? 'You' : (username || `Player ${index + 1}`),
-        team: index % 2 === 0 ? 1 : 2, // Even indices = team 1, odd = team 2
+        team: snake.team_id !== undefined && snake.team_id !== null ? snake.team_id + 1 : (index % 2 === 0 ? 1 : 2), // Use actual team_id if available (convert 0-based to 1-based)
       };
     });
   };
@@ -120,26 +119,45 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
     const team1Snakes = snakeInfo.filter(info => info.team === 1);
     const team2Snakes = snakeInfo.filter(info => info.team === 2);
 
-    const calculateTeamScore = (teamSnakes: any[]) => {
-      return teamSnakes.reduce((total, info) => {
-        const snakeScore = info.snake.is_alive ? Math.max(0, info.snake.body.length - 2) : 0;
-        return total + snakeScore;
-      }, 0);
-    };
+    // For team games with rounds, use round wins as the score
+    // Otherwise use snake-based scores
+    const isTeamGame = gameState?.game_type && typeof gameState.game_type === 'object' &&
+                       'TeamMatch' in gameState.game_type;
+
+    let team1Score = 0;
+    let team2Score = 0;
+
+    if (isTeamGame && gameState?.round_wins) {
+      // Use round wins for team games
+      team1Score = gameState.round_wins[0] || 0;
+      team2Score = gameState.round_wins[1] || 0;
+    } else {
+      // Fall back to team scores for non-round games
+      team1Score = gameState?.team_scores?.[0] || 0;
+      team2Score = gameState?.team_scores?.[1] || 0;
+    }
+
+    // Find which team the current player is on
+    const currentPlayerInfo = snakeInfo.find(info => info.isCurrentPlayer);
+    const currentPlayerTeam = currentPlayerInfo ? currentPlayerInfo.team : null;
 
     return {
       team1: {
         snakes: team1Snakes,
-        score: calculateTeamScore(team1Snakes),
+        score: team1Score,
         alive: team1Snakes.filter(info => info.snake.is_alive).length,
         total: team1Snakes.length
       },
       team2: {
         snakes: team2Snakes,
-        score: calculateTeamScore(team2Snakes),
+        score: team2Score,
         alive: team2Snakes.filter(info => info.snake.is_alive).length,
         total: team2Snakes.length
-      }
+      },
+      currentPlayerTeam,
+      currentRound: gameState?.current_round || 1,
+      totalRounds: gameState?.rounds_to_win ? (gameState.rounds_to_win * 2 - 1) : 1,  // Best of X rounds
+      isTransitioning: gameState?.is_transitioning || false
     };
   };
 
@@ -197,23 +215,11 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
       const username = userId && gameState.usernames ? 
         gameState.usernames[userId] : null;
       
-      // Calculate actual snake length
-      let length = 0;
-      if (snake.body.length >= 2) {
-        for (let i = 0; i < snake.body.length - 1; i++) {
-          const p1 = snake.body[i];
-          const p2 = snake.body[i + 1];
-          const distance = Math.abs(p2.x - p1.x) + Math.abs(p2.y - p1.y);
-          length += distance;
-        }
-        length += 1; // Add 1 for the head
-      } else {
-        length = snake.body.length;
-      }
-      
-      // Calculate food eaten (length growth from initial size)
-      const initialLength = 2; // Snakes start at length 2
-      const foodEaten = Math.max(0, length - initialLength);
+      // Use server-provided score
+      const serverScore = gameState?.scores?.[index] || 0;
+
+      // Calculate food eaten based on score
+      const foodEaten = serverScore; // Score is already length - 2
       
       return {
         index,
@@ -222,10 +228,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
         userId,
         isCurrentPlayer,
         name: isCurrentPlayer ? 'You' : (username || `Player ${index + 1}`),
-        finalLength: length,
+        finalLength: serverScore + 2, // Score is length - 2, so add 2 back
         foodEaten,
         isWinner: index === getWinningSnakeId(),
-        team: index % 2 === 0 ? 1 : 2,
+        team: snake.team_id !== undefined && snake.team_id !== null ? snake.team_id + 1 : (index % 2 === 0 ? 1 : 2), // Use actual team_id if available
       };
     });
   };
@@ -332,7 +338,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
                 Score
               </div>
               <div className="text-black-70 font-black text-2xl -mt-0.5 tabular-nums" style={{ color: '#22c55e' }}>
-                {score.toString().padStart(3, '0')}
+                {(gameState?.scores?.[0] || 0).toString().padStart(3, '0')}
               </div>
             </div>
             
@@ -392,9 +398,9 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
 
           {/* Center Section - Scores flanking Time */}
           <div className="flex items-center gap-8">
-            {/* Team 1 Match Score */}
+            {/* Current Player's Team Score (always left, blue) */}
             <span className="text-2xl font-black tabular-nums" style={{ color: '#3b82f6' }}>
-              {teamStats?.team1.score || 0}
+              {teamStats?.currentPlayerTeam === 1 ? (teamStats?.team1.score || 0) : (teamStats?.team2.score || 0)}
             </span>
 
             {/* Time in the middle */}
@@ -407,22 +413,25 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, score, isVisible, cu
               </div>
             </div>
 
-            {/* Team 2 Match Score */}
+            {/* Opponent Team Score (always right, red) */}
             <span className="text-2xl font-black tabular-nums" style={{ color: '#ef4444' }}>
-              {teamStats?.team2.score || 0}
+              {teamStats?.currentPlayerTeam === 1 ? (teamStats?.team2.score || 0) : (teamStats?.team1.score || 0)}
             </span>
           </div>
 
           {/* Divider */}
           <div className="w-px h-8 bg-gray-300 opacity-50" />
 
-          {/* Game Mode & Total Wins */}
+          {/* Game Mode & Round Info */}
           <div className="flex flex-col items-center">
             <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-              {getGameModeText()}
+              {teamStats && teamStats.totalRounds > 1 ?
+                `Round ${teamStats.currentRound} of ${teamStats.totalRounds}` :
+                getGameModeText()
+              }
             </div>
             <div className="text-gray-600 font-bold text-lg -mt-0.5">
-              0 - 0
+              {teamStats?.isTransitioning ? 'Next Round...' : getGameModeText()}
             </div>
           </div>
         </div>

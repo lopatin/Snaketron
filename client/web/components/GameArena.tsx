@@ -59,7 +59,6 @@ export default function GameArena() {
     latencyMs
   });
   
-  const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
   const [showGameOverPanel, setShowGameOverPanel] = useState(false);
   const [cellSize, setCellSize] = useState(15);
@@ -154,26 +153,8 @@ export default function GameArena() {
     return () => window.removeEventListener('resize', calculateSizes);
   }, [gameState, rotation]);
 
-  // Update score when game state changes
+  // Check for game completion
   useEffect(() => {
-    // if (gameState && user?.id) {
-    //   const player = gameState.players?.[user.id];
-    //   if (player) {
-    //     const snake = gameState.arena.snakes.find(s => s.body.length > 0);
-    //     if (snake) {
-    //       const newScore = Math.max(0, snake.body.length - 2);
-    //       setScore(newScore);
-    //
-    //       // Check if snake is dead
-    //       if (!snake.is_alive && !gameOver) {
-    //         setGameOver(true);
-    //         // Show game over panel after a short delay
-    //         setTimeout(() => setShowGameOverPanel(true), 500);
-    //       }
-    //     }
-    //   }
-    // }
-    
     // Check if committed state is Complete (from useGameEngine)
     console.log('isGameComplete:', isGameComplete, 'gameOver:', gameOver);
     if (isGameComplete && !gameOver) {
@@ -406,8 +387,15 @@ export default function GameArena() {
     return <LoadingScreen message="Joining Game..." />;
   }
   
-  // Calculate countdown from game start time
-  const timeUntilStart = gameState.start_ms - Date.now();
+  // Calculate countdown from game start time or round start time
+  let timeUntilStart = gameState.start_ms - Date.now();
+
+  // For round transitions, use the latest round start time
+  if (gameState.is_transitioning && gameState.round_start_times && gameState.round_start_times.length > 0) {
+    const latestRoundStartTime = gameState.round_start_times[gameState.round_start_times.length - 1];
+    timeUntilStart = latestRoundStartTime - Date.now();
+  }
+
   const countdownSeconds = Math.ceil(timeUntilStart / 1000);
   const showCountdown = countdownSeconds > 0;
   
@@ -437,10 +425,9 @@ export default function GameArena() {
 
       <>
         {/* Scoreboard */}
-        <Scoreboard 
+        <Scoreboard
           gameState={committedState}
-          score={score} 
-          isVisible={isArenaVisible} 
+          isVisible={isArenaVisible}
           currentUserId={user?.id}
           showGameOver={showGameOverPanel}
           onBackToMenu={handleBackToMenu}
@@ -476,7 +463,17 @@ export default function GameArena() {
             
             {/* Countdown Overlay */}
             {showCountdown && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/30 z-10">
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
+                {gameState.is_transitioning && (
+                  <div className="text-white font-bold text-3xl mb-4" style={{
+                    textShadow: '0 2px 4px rgba(0,0,0,0.5)'
+                  }}>
+                    {gameState.current_round > 1 ?
+                      `Round ${gameState.current_round}` :
+                      'Round 1'
+                    }
+                  </div>
+                )}
                 <div className="text-white font-black italic uppercase" style={{
                   fontSize: '120px',
                   textShadow: '0 4px 8px rgba(0,0,0,0.5)',

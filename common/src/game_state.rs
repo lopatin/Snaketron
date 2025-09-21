@@ -36,6 +36,21 @@ pub enum GameEvent {
     CommandScheduled { command_message: GameCommandMessage },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated { status: GameStatus },
+    ScoreUpdated { snake_id: u32, score: u32 },
+    TeamScoreUpdated { team_id: TeamId, score: u32 },
+
+    // Round lifecycle events
+    RoundCompleted { winning_team_id: TeamId, round_number: u32 },
+    RoundDraw { round_number: u32 },  // Round ended in a draw
+    RoundStarting { round_number: u32, start_time: i64 },
+    MatchCompleted { winning_team_id: TeamId },  // Removed final_scores - use GameState.round_wins instead
+
+    // Arena reset events (for new round)
+    ArenaReset,
+    SnakeRespawned { snake_id: u32, position: Position, direction: Direction },
+    AllFoodCleared,
+    FoodRespawned { positions: Vec<Position> },
+    RoundWinRecorded { team_id: TeamId, total_wins: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -324,6 +339,17 @@ pub struct GameState {
     pub event_sequence: u64,
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
+    // Score tracking - snake_id -> score
+    pub scores: HashMap<u32, u32>,
+    // Team scores for team games - team_id -> score
+    pub team_scores: Option<HashMap<TeamId, u32>>,
+
+    // Round-based scoring fields
+    pub current_round: u32,                    // Current round number (1, 2, 3...)
+    pub round_wins: HashMap<TeamId, u32>,      // Rounds won by each team
+    pub rounds_to_win: u32,                    // 1 for quick, 2 for competitive
+    pub round_start_times: Vec<i64>,           // Start time of each round (ms)
+    pub is_transitioning: bool,                // True during round transitions
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -413,6 +439,12 @@ impl GameState {
             _ => None,
         };
         
+        let team_scores = if matches!(&game_type, GameType::TeamMatch { .. }) {
+            Some(HashMap::new())
+        } else {
+            None
+        };
+
         GameState {
             tick: 0,
             status: GameStatus::Stopped,
@@ -423,7 +455,7 @@ impl GameState {
                 food: Vec::new(),
                 team_zone_config,
             },
-            game_type,
+            game_type: game_type.clone(),
             properties,
             command_queue: CommandQueue::new(),
             players: HashMap::new(),
@@ -433,6 +465,22 @@ impl GameState {
             start_ms,
             event_sequence: 0,
             usernames: HashMap::new(),
+            scores: HashMap::new(),
+            team_scores,
+
+            // Round tracking fields
+            current_round: 1,
+            round_wins: if matches!(&game_type, GameType::TeamMatch { .. }) {
+                let mut wins = HashMap::new();
+                wins.insert(TeamId(0), 0);
+                wins.insert(TeamId(1), 0);
+                wins
+            } else {
+                HashMap::new()
+            },
+            rounds_to_win: 1,  // Default to 1 round (quick match)
+            round_start_times: vec![start_ms],  // First round starts at game start time
+            is_transitioning: false,
         }
     }
 
@@ -837,28 +885,93 @@ impl GameState {
             }
         }
 
-        // Check for goal scoring in team games
+        // Calculate and update scores
+        let mut score_updates: Vec<(u32, u32)> = Vec::new();
+        for (snake_id, snake) in self.iter_snakes() {
+            // Calculate the actual length of the snake
+            let mut length = 0;
+            if snake.body.len() >= 2 {
+                for i in 0..snake.body.len() - 1 {
+                    let p1 = &snake.body[i];
+                    let p2 = &snake.body[i + 1];
+                    let distance = ((p2.x - p1.x).abs() + (p2.y - p1.y).abs()) as usize;
+                    length += distance;
+                }
+                length += 1; // Add 1 for the head
+            } else {
+                length = snake.body.len();
+            }
+
+            // Score is length minus initial size (2)
+            let score = if snake.is_alive {
+                length.saturating_sub(2) as u32
+            } else {
+                self.scores.get(&snake_id).copied().unwrap_or(0)
+            };
+
+            // Collect score updates
+            let old_score = self.scores.get(&snake_id).copied().unwrap_or(0);
+            if score != old_score {
+                score_updates.push((snake_id, score));
+            }
+        }
+
+        // Apply individual score updates
+        for (snake_id, score) in score_updates {
+            self.apply_event(
+                GameEvent::ScoreUpdated { snake_id, score },
+                Some(&mut out)
+            );
+        }
+
+        // Calculate team scores for team games
+        if let (GameType::TeamMatch { .. }, Some(_)) = (&self.game_type, &self.team_scores) {
+            let mut team_totals: HashMap<TeamId, u32> = HashMap::new();
+
+            for (snake_id, snake) in self.iter_snakes() {
+                if let Some(team_id) = snake.team_id {
+                    let snake_score = self.scores.get(&snake_id).copied().unwrap_or(0);
+                    *team_totals.entry(team_id).or_insert(0) += snake_score;
+                }
+            }
+
+            // Update team scores if changed
+            let mut team_updates: Vec<(TeamId, u32)> = Vec::new();
+            for (team_id, total_score) in team_totals {
+                let old_team_score = self.team_scores.as_ref()
+                    .and_then(|ts| ts.get(&team_id).copied())
+                    .unwrap_or(0);
+
+                if total_score != old_team_score {
+                    team_updates.push((team_id, total_score));
+                }
+            }
+
+            // Apply team score updates
+            for (team_id, score) in team_updates {
+                self.apply_event(
+                    GameEvent::TeamScoreUpdated { team_id, score },
+                    Some(&mut out)
+                );
+            }
+        }
+
+        // Check for goal scoring in team games (endzone reached)
+        let mut goal_scored = false;
+        let mut scoring_team: Option<TeamId> = None;
+
         if let GameType::TeamMatch { .. } = &self.game_type {
-            let mut winning_snake = None;
             for (snake_id, snake) in self.iter_snakes() {
                 if snake.is_alive {
                     if let Some(team_id) = snake.team_id {
                         if self.arena.has_reached_goal(snake, team_id) {
-                            // Team scored! Game ends with this team as winner
-                            winning_snake = Some(snake_id);
+                            // Team scored by reaching opponent's endzone!
+                            goal_scored = true;
+                            scoring_team = Some(team_id);
                             break;
                         }
                     }
                 }
-            }
-            
-            if let Some(snake_id) = winning_snake {
-                self.apply_event(
-                    GameEvent::StatusUpdated { 
-                        status: GameStatus::Complete { winning_snake_id: Some(snake_id) }
-                    },
-                    Some(&mut out)
-                );
             }
         }
         
@@ -870,15 +983,19 @@ impl GameState {
             .map(|(idx, _)| idx as u32)
             .collect();
         
-        // For team games, check if all snakes of one team are dead
-        let should_end = if let GameType::TeamMatch { .. } = &self.game_type {
-            // Check if all Team A or all Team B snakes are dead
-            let team_0_alive = self.arena.snakes.iter()
-                .any(|s| s.is_alive && s.team_id == Some(TeamId(0)));
-            let team_1_alive = self.arena.snakes.iter()
-                .any(|s| s.is_alive && s.team_id == Some(TeamId(1)));
-            
-            !team_0_alive || !team_1_alive
+        // For team games, check if round should end (goal scored or all snakes of one team are dead)
+        let should_end_round = if let GameType::TeamMatch { .. } = &self.game_type {
+            if goal_scored {
+                true  // End round if a goal was scored
+            } else {
+                // Check if all Team A or all Team B snakes are dead
+                let team_0_alive = self.arena.snakes.iter()
+                    .any(|s| s.is_alive && s.team_id == Some(TeamId(0)));
+                let team_1_alive = self.arena.snakes.iter()
+                    .any(|s| s.is_alive && s.team_id == Some(TeamId(1)));
+
+                !team_0_alive || !team_1_alive
+            }
         } else if self.game_type.is_solo() {
             // For solo games, only end when no snakes are alive
             alive_snakes.is_empty()
@@ -886,25 +1003,253 @@ impl GameState {
             // For multiplayer games, end when 1 or fewer snakes are alive
             alive_snakes.len() <= 1
         };
-        
-        if should_end && matches!(self.status, GameStatus::Started { .. }) {
-            // For team games, the winning snake is from the surviving team
-            let winning_snake_id = if let GameType::TeamMatch { .. } = &self.game_type {
-                // Find a snake from the surviving team
-                self.arena.snakes.iter()
-                    .enumerate()
-                    .find(|(_, s)| s.is_alive)
-                    .map(|(idx, _)| idx as u32)
+
+        if should_end_round && matches!(self.status, GameStatus::Started { .. }) {
+            // For team games with rounds, handle round completion
+            if let GameType::TeamMatch { .. } = &self.game_type {
+                // Determine winning team for this round
+                let winning_team = if let Some(team) = scoring_team {
+                    // If a goal was scored, the scoring team wins
+                    Some(team)
+                } else {
+                    // Otherwise, check which team has snakes alive
+                    let team_0_alive = self.arena.snakes.iter()
+                        .any(|s| s.is_alive && s.team_id == Some(TeamId(0)));
+                    let team_1_alive = self.arena.snakes.iter()
+                        .any(|s| s.is_alive && s.team_id == Some(TeamId(1)));
+
+                    if team_0_alive && !team_1_alive {
+                        Some(TeamId(0))
+                    } else if !team_0_alive && team_1_alive {
+                        Some(TeamId(1))
+                    } else {
+                        None // Draw or error - shouldn't happen
+                    }
+                };
+
+                if let Some(winning_team_id) = winning_team {
+                    // A team won this round
+                    // Emit round completed event
+                    self.apply_event(
+                        GameEvent::RoundCompleted {
+                            winning_team_id: winning_team_id,
+                            round_number: self.current_round
+                        },
+                        Some(&mut out)
+                    );
+
+                    // Update round wins
+                    let new_wins = self.round_wins.get(&winning_team_id).unwrap_or(&0) + 1;
+                    self.apply_event(
+                        GameEvent::RoundWinRecorded {
+                            team_id: winning_team_id,
+                            total_wins: new_wins
+                        },
+                        Some(&mut out)
+                    );
+
+                    // Check if match is complete
+                    if new_wins >= self.rounds_to_win {
+                        // Match is complete!
+                        self.apply_event(
+                            GameEvent::MatchCompleted {
+                                winning_team_id: winning_team_id,
+                            },
+                            Some(&mut out)
+                        );
+
+                        // Find a snake from winning team for compatibility
+                        let winning_snake_id = self.arena.snakes.iter()
+                            .enumerate()
+                            .find(|(_, s)| s.team_id == Some(winning_team_id))
+                            .map(|(idx, _)| idx as u32);
+
+                        self.apply_event(
+                            GameEvent::StatusUpdated {
+                                status: GameStatus::Complete { winning_snake_id }
+                            },
+                            Some(&mut out)
+                        );
+                    } else {
+                        // Start next round
+                        let next_round = self.current_round + 1;
+                        // Use the current timestamp + 3000ms for countdown
+                        let round_start_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64 + 3000; // 3 second countdown
+
+                        self.apply_event(
+                            GameEvent::RoundStarting {
+                                round_number: next_round,
+                                start_time: round_start_time
+                            },
+                            Some(&mut out)
+                        );
+
+                        // Reset arena
+                        self.apply_event(GameEvent::ArenaReset, Some(&mut out));
+                        self.apply_event(GameEvent::AllFoodCleared, Some(&mut out));
+
+                        // Respawn all snakes at their original positions
+                        let starting_positions = self.calculate_starting_positions(self.players.len());
+
+                        // Collect respawn data first
+                        let mut respawn_events = Vec::new();
+                        for (_user_id, player) in self.players.iter() {
+                            let snake = &self.arena.snakes[player.snake_id as usize];
+                            let team_id = snake.team_id;
+
+                            // Get position based on team
+                            let position_idx = match team_id {
+                                Some(TeamId(0)) => 0,
+                                Some(TeamId(1)) => 1,
+                                _ => player.snake_id as usize,
+                            };
+
+                            if position_idx < starting_positions.len() {
+                                let (pos, dir) = starting_positions[position_idx];
+                                respawn_events.push(GameEvent::SnakeRespawned {
+                                    snake_id: player.snake_id,
+                                    position: pos,
+                                    direction: dir
+                                });
+                            }
+                        }
+
+                        // Apply respawn events
+                        for event in respawn_events {
+                            self.apply_event(event, Some(&mut out));
+                        }
+
+                        // Respawn initial food
+                        if let Some(rng) = &mut self.rng {
+                            let mut food_positions = Vec::new();
+                            let target_food = self.properties.available_food_target;
+                            let (x_min, x_max) = if let Some((left, right)) = self.arena.main_field_bounds() {
+                                (left, right)
+                            } else {
+                                (0, self.arena.width as i16 - 1)
+                            };
+
+                            let mut attempts = 0;
+                            while food_positions.len() < target_food && attempts < 1000 {
+                                attempts += 1;
+                                let x_range = (x_max - x_min + 1) as u16;
+                                let position = Position {
+                                    x: x_min + (rng.next_u16() % x_range) as i16,
+                                    y: (rng.next_u16() % self.arena.height) as i16,
+                                };
+
+                                if !food_positions.contains(&position) {
+                                    food_positions.push(position);
+                                }
+                            }
+
+                            self.apply_event(
+                                GameEvent::FoodRespawned { positions: food_positions },
+                                Some(&mut out)
+                            );
+                        }
+                    }
+                } else {
+                    // Draw - both teams lost all snakes simultaneously
+                    // Emit draw event
+                    self.apply_event(
+                        GameEvent::RoundDraw { round_number: self.current_round },
+                        Some(&mut out)
+                    );
+
+                    // Restart the round without incrementing anyone's score
+                    let round_start_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64 + 3000; // 3 second countdown
+
+                    // Emit round starting event for the same round (replay)
+                    self.apply_event(
+                        GameEvent::RoundStarting {
+                            round_number: self.current_round,  // Keep same round number
+                            start_time: round_start_time
+                        },
+                        Some(&mut out)
+                    );
+
+                    // Reset arena
+                    self.apply_event(GameEvent::ArenaReset, Some(&mut out));
+                    self.apply_event(GameEvent::AllFoodCleared, Some(&mut out));
+
+                    // Respawn all snakes at their original positions
+                    let starting_positions = self.calculate_starting_positions(self.players.len());
+
+                    // Collect respawn data first
+                    let mut respawn_events = Vec::new();
+                    for (_user_id, player) in self.players.iter() {
+                        let snake = &self.arena.snakes[player.snake_id as usize];
+                        let team_id = snake.team_id;
+
+                        // Get position based on team
+                        let position_idx = match team_id {
+                            Some(TeamId(0)) => 0,
+                            Some(TeamId(1)) => 1,
+                            _ => player.snake_id as usize,
+                        };
+
+                        if position_idx < starting_positions.len() {
+                            let (pos, dir) = starting_positions[position_idx];
+                            respawn_events.push(GameEvent::SnakeRespawned {
+                                snake_id: player.snake_id,
+                                position: pos,
+                                direction: dir
+                            });
+                        }
+                    }
+
+                    // Apply respawn events
+                    for event in respawn_events {
+                        self.apply_event(event, Some(&mut out));
+                    }
+
+                    // Respawn initial food
+                    if let Some(rng) = &mut self.rng {
+                        let mut food_positions = Vec::new();
+                        let target_food = self.properties.available_food_target;
+                        let (x_min, x_max) = if let Some((left, right)) = self.arena.main_field_bounds() {
+                            (left, right)
+                        } else {
+                            (0, self.arena.width as i16 - 1)
+                        };
+
+                        let mut attempts = 0;
+                        while food_positions.len() < target_food && attempts < 1000 {
+                            attempts += 1;
+                            let x_range = (x_max - x_min + 1) as u16;
+                            let position = Position {
+                                x: x_min + (rng.next_u16() % x_range) as i16,
+                                y: (rng.next_u16() % self.arena.height) as i16,
+                            };
+
+                            if !food_positions.contains(&position) {
+                                food_positions.push(position);
+                            }
+                        }
+
+                        self.apply_event(
+                            GameEvent::FoodRespawned { positions: food_positions },
+                            Some(&mut out)
+                        );
+                    }
+                }
             } else {
-                alive_snakes.first().copied()
-            };
-            
-            self.apply_event(
-                GameEvent::StatusUpdated { 
-                    status: GameStatus::Complete { winning_snake_id } 
-                },
-                Some(&mut out)
-            );
+                // Non-team games: end normally
+                let winning_snake_id = alive_snakes.first().copied();
+                self.apply_event(
+                    GameEvent::StatusUpdated {
+                        status: GameStatus::Complete { winning_snake_id }
+                    },
+                    Some(&mut out)
+                );
+            }
         }
 
         // Increment tick
@@ -1010,6 +1355,83 @@ impl GameState {
             
             GameEvent::StatusUpdated { status } => {
                 self.status = status;
+            }
+
+            GameEvent::ScoreUpdated { snake_id, score } => {
+                self.scores.insert(snake_id, score);
+            }
+
+            GameEvent::TeamScoreUpdated { team_id, score } => {
+                if let Some(ref mut team_scores) = self.team_scores {
+                    team_scores.insert(team_id, score);
+                }
+            }
+
+            // Round lifecycle events
+            GameEvent::RoundCompleted { winning_team_id: _, round_number: _ } => {
+                // Log the round completion - actual handling is done via other events
+            }
+            GameEvent::RoundDraw { round_number: _ } => {
+                // Log the round draw - round will be replayed
+            }
+            GameEvent::RoundWinRecorded { team_id, total_wins } => {
+                self.round_wins.insert(team_id, total_wins);
+            }
+            GameEvent::RoundStarting { round_number, start_time } => {
+                self.current_round = round_number;
+                self.is_transitioning = true;
+                self.round_start_times.push(start_time);
+            }
+            GameEvent::MatchCompleted { winning_team_id: _ } => {
+                // Match is over, no more rounds
+            }
+
+            // Arena reset events
+            GameEvent::ArenaReset => {
+                // Clear transitioning flag when arena resets
+                self.is_transitioning = false;
+                // Don't reset tick counter - keep it continuous across rounds
+            }
+            GameEvent::AllFoodCleared => {
+                self.arena.food.clear();
+            }
+            GameEvent::SnakeRespawned { snake_id, position, direction } => {
+                // Get snake length from game settings first
+                let snake_length = match &self.game_type {
+                    GameType::Custom { settings } => settings.snake_start_length as i16,
+                    _ => 4, // Default snake length
+                };
+
+                // Build compressed snake body: just head and tail for a straight snake
+                let tail_pos = match direction {
+                    Direction::Left => Position {
+                        x: position.x + snake_length - 1,
+                        y: position.y
+                    },
+                    Direction::Right => Position {
+                        x: position.x - snake_length + 1,
+                        y: position.y
+                    },
+                    Direction::Up => Position {
+                        x: position.x,
+                        y: position.y + snake_length - 1
+                    },
+                    Direction::Down => Position {
+                        x: position.x,
+                        y: position.y - snake_length + 1
+                    },
+                };
+
+                // Now update the snake
+                if let Ok(snake) = self.get_snake_mut(snake_id) {
+                    snake.body = vec![position, tail_pos];
+                    snake.direction = direction;
+                    snake.is_alive = true;
+                    snake.food = 0;
+                }
+            }
+            GameEvent::FoodRespawned { positions } => {
+                self.arena.food = positions;
             }
         }
 

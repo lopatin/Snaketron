@@ -41,6 +41,7 @@ export interface Snake {
   direction: 'Up' | 'Down' | 'Left' | 'Right';
   is_alive: boolean;
   food: number;
+  team_id?: number | null;  // Team ID: 0 or 1 for team games
 }
 
 export interface Arena {
@@ -64,6 +65,15 @@ export interface GameState {
   duration?: number;
   start_ms: number;
   event_sequence: number;
+  scores: Record<number, number>;  // Snake ID to score mapping
+  team_scores?: Record<number, number>;  // Team ID to team score mapping (for team games)
+
+  // Round-based scoring fields
+  current_round: number;                     // Current round number (1, 2, 3...)
+  round_wins: Record<number, number>;        // TeamId to rounds won mapping
+  rounds_to_win: number;                     // 1 for quick match, 2 for competitive
+  round_start_times: number[];              // Start time of each round (ms timestamps)
+  is_transitioning: boolean;                // True during round transitions
 }
 
 export type GameStatus = 
