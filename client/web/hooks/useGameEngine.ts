@@ -14,6 +14,7 @@ interface UseGameEngineProps {
 interface UseGameEngineReturn {
   gameEngine: GameClient | null;
   gameState: GameState | null;
+  committedState: GameState | null;
   isGameComplete: boolean;
   sendCommand: (command: Command) => void;
   processServerEvent: (event: any) => void;
@@ -30,6 +31,7 @@ export const useGameEngine = ({
   const engineRef = useRef<GameClient | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
+  const [committedState, setCommittedState] = useState<GameState | null>(null);
   const [isGameComplete, setIsGameComplete] = useState(false);
   const engineGameIdRef = useRef<string | null>(null);
   const latencyMsRef = useRef(latencyMs);
@@ -127,6 +129,7 @@ export const useGameEngine = ({
       // Check if COMMITTED state is complete (for game over UI)
       const committedStateJson = engineRef.current.getCommittedStateJson();
       const committedState = JSON.parse(committedStateJson);
+      setCommittedState(committedState);
       if (typeof committedState.status === 'object' &&
           committedState.status !== null &&
           'Complete' in committedState.status) {
@@ -262,6 +265,7 @@ export const useGameEngine = ({
   return {
     gameEngine: engineRef.current,
     gameState,
+    committedState,
     isGameComplete,
     sendCommand,
     processServerEvent,

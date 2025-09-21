@@ -46,6 +46,7 @@ export default function GameArena() {
   const {
     gameEngine,
     gameState,
+    committedState,
     isGameComplete,
     // isRunning,
     sendCommand,
@@ -180,6 +181,7 @@ export default function GameArena() {
       setGameOver(true);
       stopEngine(); // Stop the engine when game ends
       setShowGameOverPanel(true);
+      // debugger;
       // Show game over panel after a short delay
       // setTimeout(() => setShowGameOverPanel(true), 500);
     }
@@ -436,7 +438,7 @@ export default function GameArena() {
       <>
         {/* Scoreboard */}
         <Scoreboard 
-          gameState={gameState}
+          gameState={committedState}
           score={score} 
           isVisible={isArenaVisible} 
           currentUserId={user?.id}
