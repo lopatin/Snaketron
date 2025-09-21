@@ -98,10 +98,17 @@ impl GameServer {
         let server_id = db.register_server(&grpc_addr, &region).await
             .context("Failed to register server")? as u64;
         info!("Server registered with ID: {}", server_id);
-        
+
         // Create cancellation token for graceful shutdown
         let cancellation_token = CancellationToken::new();
         let mut handles = Vec::new();
+
+        // Start heartbeat loop to keep server registration alive
+        let heartbeat_db = db.clone();
+        let heartbeat_token = cancellation_token.clone();
+        handles.push(tokio::spawn(async move {
+            run_heartbeat_loop(heartbeat_db, server_id, heartbeat_token).await;
+        }));
 
         // Redis connection manager
         info!("Redis URL: {}", redis_url.as_str());

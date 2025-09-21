@@ -1043,8 +1043,9 @@ async fn create_solo_game(
     user_id: i32,
     username: String,
 ) -> Result<u32> {
-    // Get current server ID from database
-    let server_id = db.get_server_for_load_balancing("default").await?;
+    // Get current server ID from database - use the region from environment or default
+    let region = std::env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
+    let server_id = db.get_server_for_load_balancing(&region).await?;
     
     // Create game settings for solo game
     let settings = common::CustomGameSettings {
