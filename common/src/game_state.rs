@@ -1073,11 +1073,9 @@ impl GameState {
                     } else {
                         // Start next round
                         let next_round = self.current_round + 1;
-                        // Use the current timestamp + 3000ms for countdown
-                        let round_start_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as i64 + 3000; // 3 second countdown
+                        // Calculate round start time based on current game time + 3000ms for countdown
+                        let elapsed_ms = (self.tick as i64) * (self.properties.tick_duration_ms as i64);
+                        let round_start_time = self.start_ms + elapsed_ms + 3000; // 3 second countdown
 
                         self.apply_event(
                             GameEvent::RoundStarting {
@@ -1161,10 +1159,9 @@ impl GameState {
                     );
 
                     // Restart the round without incrementing anyone's score
-                    let round_start_time = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as i64 + 3000; // 3 second countdown
+                    // Calculate round start time based on current game time + 3000ms for countdown
+                    let elapsed_ms = (self.tick as i64) * (self.properties.tick_duration_ms as i64);
+                    let round_start_time = self.start_ms + elapsed_ms + 3000; // 3 second countdown
 
                     // Emit round starting event for the same round (replay)
                     self.apply_event(
