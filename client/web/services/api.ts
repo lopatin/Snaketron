@@ -12,7 +12,7 @@ class API {
     // Use environment variable if available, otherwise default to localhost for development
     // For local development, we need to add /api prefix
     const envUrl = process.env.REACT_APP_API_URL;
-    this.baseURL = envUrl || 'http://localhost:3001/api';
+    this.baseURL = envUrl || 'http://localhost:8080/api';
     this.token = localStorage.getItem('token');
   }
 

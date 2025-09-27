@@ -1,7 +1,7 @@
 class AuthHelper {
   constructor(page) {
     this.page = page;
-    this.apiUrl = process.env.API_URL || 'http://localhost:3001';
+    this.apiUrl = process.env.API_URL || 'http://localhost:8080';
   }
 
   async register(username, password = 'testpassword123') {

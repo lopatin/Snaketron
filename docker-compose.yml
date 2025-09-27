@@ -52,9 +52,8 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       DYNAMODB_TABLE_PREFIX: snaketron
       # Server configuration
-      SNAKETRON_WS_PORT: 8080
+      SNAKETRON_HTTP_PORT: 8080
       SNAKETRON_GRPC_PORT: 50051
-      SNAKETRON_API_PORT: 3001
       SNAKETRON_REGION: local
       SNAKETRON_ENV: dev
       # Logging
@@ -68,9 +67,8 @@ services:
       # Redis configuration for cluster singleton coordination
       SNAKETRON_REDIS_URL: "redis://redis:6666"
     ports:
-      - "8080:8080"   # WebSocket port
+      - "8080:8080"   # HTTP port (API + WebSocket)
       - "50051:50051" # gRPC port
-      - "3001:3001"   # API port
     volumes:
       - ./replays:/var/lib/snaketron/replays
     depends_on:
