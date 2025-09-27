@@ -10,7 +10,9 @@ class API {
 
   constructor() {
     // Use environment variable if available, otherwise default to localhost for development
-    this.baseURL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+    // For local development, we need to add /api prefix
+    const envUrl = process.env.REACT_APP_API_URL;
+    this.baseURL = envUrl || 'http://localhost:3001/api';
     this.token = localStorage.getItem('token');
   }
 
@@ -54,7 +56,7 @@ class API {
   }
 
   async login(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/api/auth/login', {
+    const data = await this.request<LoginResponse>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -63,7 +65,7 @@ class API {
   }
 
   async register(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/api/auth/register', {
+    const data = await this.request<LoginResponse>('/auth/register', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -73,7 +75,7 @@ class API {
 
   async checkUsername(username: string): Promise<CheckUsernameResponse> {
     try {
-      const response = await this.request<CheckUsernameResponse>('/api/auth/check-username', {
+      const response = await this.request<CheckUsernameResponse>('/auth/check-username', {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
@@ -95,7 +97,7 @@ class API {
   }
 
   async getCurrentUser(): Promise<User> {
-    return this.request<User>('/api/auth/me');
+    return this.request<User>('/auth/me');
   }
 }
 
