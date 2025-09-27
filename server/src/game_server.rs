@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, error, warn, trace, debug};
 
 use crate::{
-    ws_server::{run_websocket_server, JwtVerifier},
+    ws_server::JwtVerifier,
     game_executor::{run_game_executor, StreamEvent},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
@@ -28,8 +28,8 @@ use crate::game_executor::PARTITION_COUNT;
 pub struct GameServerConfig {
     /// Database connection
     pub db: Arc<dyn Database>,
-    /// WebSocket server address (e.g., "127.0.0.1:8080")
-    pub ws_addr: String,
+    /// HTTP server address (e.g., "127.0.0.1:8080")
+    pub http_addr: String,
     /// gRPC server address for game relay (e.g., "127.0.0.1:50051")
     pub grpc_addr: String,
     /// Region identifier for the server
@@ -46,8 +46,8 @@ pub struct GameServerConfig {
 pub struct GameServer {
     /// Unique server ID in the database
     pub server_id: u64,
-    /// WebSocket server address
-    pub ws_addr: String,
+    /// HTTP server address
+    pub http_addr: String,
     /// gRPC server address (if enabled)
     pub grpc_addr: String,
     /// Database connection
@@ -63,9 +63,9 @@ pub struct GameServer {
 }
 
 impl GameServer {
-    /// Get the WebSocket server address
-    pub fn ws_addr(&self) -> &str {
-        &self.ws_addr
+    /// Get the HTTP server address
+    pub fn http_addr(&self) -> &str {
+        &self.http_addr
     }
     
     /// Get the server ID
@@ -85,7 +85,7 @@ impl GameServer {
     pub async fn start(config: GameServerConfig) -> Result<Self> {
         let GameServerConfig {
             db,
-            ws_addr,
+            http_addr,
             grpc_addr,
             region,
             jwt_verifier,
@@ -175,24 +175,9 @@ impl GameServer {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         
-        // Start WebSocket server after replication manager is ready
-        info!("Starting WebSocket server");
-        let ws_db = db.clone();
-        let ws_token = cancellation_token.clone();
-        let ws_addr_clone = ws_addr.clone();
-        let ws_jwt_verifier = jwt_verifier.clone();
-        let ws_redis_url = redis_url.clone();
-        let ws_replication_manager = replication_manager.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = run_websocket_server(
-                &ws_addr_clone,
-                ws_db,
-                ws_redis_url,
-                ws_token,
-                ws_jwt_verifier,
-                ws_replication_manager,
-            ).await;
-        }));
+        // Note: HTTP server will be started separately in main.rs
+        // This is because it needs both the replication manager and JWT verifier
+        info!("HTTP server will be started externally at {}", http_addr);
 
         // Start game executors for each partition as cluster singletons
         // This provides automatic failover - if one server goes down, another will
@@ -270,7 +255,7 @@ impl GameServer {
         
         Ok(Self {
             server_id,
-            ws_addr,
+            http_addr,
             grpc_addr,
             db,
             cancellation_token,
@@ -293,6 +278,11 @@ impl GameServer {
     /// Get the replication manager
     pub fn replication_manager(&self) -> Option<&Arc<ReplicationManager>> {
         self.replication_manager.as_ref()
+    }
+
+    /// Get the cancellation token
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
     }
 
     /// Shutdown the server gracefully
@@ -345,8 +335,8 @@ pub async fn start_test_server_with_grpc(
 ) -> Result<GameServer> {
 
     // Get available ports
-    let ws_port = get_available_port();
-    let ws_addr = format!("127.0.0.1:{}", ws_port);
+    let http_port = get_available_port();
+    let http_addr = format!("127.0.0.1:{}", http_port);
 
     // Enable gRPC if requested
     let grpc_addr = format!("127.0.0.1:{}", get_available_port());
@@ -356,10 +346,10 @@ pub async fn start_test_server_with_grpc(
     let replay_path = crate::replay::directory::get_test_replay_directory(&test_name);
     std::fs::create_dir_all(&replay_path).ok();
     let replay_dir = Some(replay_path);
-    
+
     let config = GameServerConfig {
         db,
-        ws_addr,
+        http_addr,
         grpc_addr,
         region: "test-region".to_string(),
         jwt_verifier,

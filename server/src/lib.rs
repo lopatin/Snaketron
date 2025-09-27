@@ -6,6 +6,7 @@ pub mod matchmaking_manager;
 pub mod ws_server;
 pub mod replay;
 pub mod api;
+pub mod http_server;
 pub mod cluster_singleton;
 pub mod replication;
 pub mod pubsub_manager;

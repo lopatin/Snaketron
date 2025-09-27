@@ -158,6 +158,270 @@ enum ConnectionState {
     },
 }
 
+/// Handle WebSocket connection from Axum
+pub async fn handle_websocket(
+    socket: axum::extract::ws::WebSocket,
+    db: Arc<dyn Database>,
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    redis_url: String,
+    replication_manager: Arc<crate::replication::ReplicationManager>,
+    cancellation_token: CancellationToken,
+) {
+    info!("New WebSocket connection established");
+
+    // Create PubSub manager
+    let pubsub = match PubSubManager::new(&redis_url).await {
+        Ok(ps) => ps,
+        Err(e) => {
+            error!("Failed to create pubsub manager: {}", e);
+            return;
+        }
+    };
+
+    // Create matchmaking manager
+    let matchmaking_manager = match MatchmakingManager::new(&redis_url).await {
+        Ok(mgr) => Arc::new(Mutex::new(mgr)),
+        Err(e) => {
+            error!("Failed to create matchmaking manager: {}", e);
+            return;
+        }
+    };
+
+    // Process the WebSocket connection
+    if let Err(e) = handle_websocket_connection(
+        socket,
+        db,
+        pubsub,
+        matchmaking_manager,
+        jwt_verifier,
+        cancellation_token,
+        replication_manager,
+        redis_url,
+    ).await {
+        error!("WebSocket connection error: {}", e);
+    }
+}
+
+/// Internal function to handle the WebSocket connection logic
+async fn handle_websocket_connection(
+    ws_stream: axum::extract::ws::WebSocket,
+    db: Arc<dyn Database>,
+    mut pubsub: PubSubManager,
+    matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    cancellation_token: CancellationToken,
+    replication_manager: Arc<crate::replication::ReplicationManager>,
+    redis_url: String,
+) -> Result<()> {
+    // Split the WebSocket into send and receive parts using futures_util
+    let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
+
+    // Create a channel for sending messages to the WebSocket
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
+
+    // Start in unauthenticated state
+    let mut state = ConnectionState::Unauthenticated;
+
+    // Create a shutdown timeout that starts as a never-completing future
+    let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
+    tokio::pin!(shutdown_timeout);
+    let mut shutdown_started = false;
+
+    // Will be used to track Redis stream subscription for game events
+    let mut game_event_handle: Option<JoinHandle<()>> = None;
+
+    // Spawn task to forward messages from channel to WebSocket
+    let ws_tx_clone = ws_tx.clone();
+    let forward_task = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            // Convert to Axum WebSocket message
+            let axum_msg = match msg {
+                Message::Text(text) => axum::extract::ws::Message::Text(text.to_string()),
+                Message::Binary(bin) => axum::extract::ws::Message::Binary(bin.to_vec()),
+                Message::Ping(data) => axum::extract::ws::Message::Ping(data.to_vec()),
+                Message::Pong(data) => axum::extract::ws::Message::Pong(data.to_vec()),
+                Message::Close(frame) => {
+                    let close = frame.map(|f| axum::extract::ws::CloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.to_string().into(),
+                    });
+                    axum::extract::ws::Message::Close(close)
+                },
+                _ => continue,
+            };
+
+            if let Err(e) = ws_sink.send(axum_msg).await {
+                error!("Failed to send message to WebSocket: {}", e);
+                break;
+            }
+        }
+    });
+
+    loop {
+        let state_name = match &state {
+            ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
+            ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
+            ConnectionState::InGame { game_id, .. } => format!("InGame({})", game_id),
+            ConnectionState::ShuttingDown { .. } => "ShuttingDown".to_string(),
+        };
+        debug!("WS: Select loop iteration, current state: {}", state_name);
+
+        tokio::select! {
+            // Handle shutdown timeout
+            _ = &mut shutdown_timeout, if shutdown_started => {
+                warn!("Shutdown timeout reached, closing connection");
+                break;
+            }
+            // Handle cancellation token
+            _ = cancellation_token.cancelled(), if !shutdown_started => {
+                // Send a Shutdown message to the client
+                info!("Sending shutdown message to client");
+                let json_msg = serde_json::json!(WSMessage::Shutdown);
+                let shutdown_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
+                if let Err(e) = ws_tx.send(shutdown_msg).await {
+                    error!("Failed to send shutdown message: {}", e);
+                }
+                // Start shutdown timeout
+                shutdown_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
+                shutdown_started = true;
+
+                // Transition to shutting down state
+                state = ConnectionState::ShuttingDown {
+                    timeout: Box::pin(tokio::time::sleep(Duration::from_secs(10))),
+                };
+            }
+            // Handle incoming WebSocket messages
+            Some(result) = ws_stream.next() => {
+                match result {
+                    Ok(msg) => {
+                        // Convert Axum message to tokio-tungstenite message for processing
+                        let tungstenite_msg = match msg {
+                            axum::extract::ws::Message::Text(text) => Message::Text(text.into()),
+                            axum::extract::ws::Message::Binary(bin) => Message::Binary(bin.into()),
+                            axum::extract::ws::Message::Ping(data) => Message::Ping(data.into()),
+                            axum::extract::ws::Message::Pong(data) => Message::Pong(data.into()),
+                            axum::extract::ws::Message::Close(frame) => {
+                                info!("Client initiated close");
+                                break;
+                            }
+                        };
+
+                        // Process the message
+                        if let Message::Text(text) = tungstenite_msg {
+                            match serde_json::from_str::<WSMessage>(&text) {
+                                Ok(ws_message) => {
+                                    // Check state before consuming it
+                                    let was_in_game = matches!(&state, ConnectionState::InGame { .. });
+
+                                    match process_ws_message(
+                                        state,
+                                        ws_message,
+                                        &jwt_verifier,
+                                        &db,
+                                        &ws_tx,
+                                        &mut pubsub,
+                                        &matchmaking_manager,
+                                        &replication_manager,
+                                        &redis_url,
+                                    ).await {
+                                        Ok(new_state) => {
+                                            // Check if we're entering a game
+                                            let entering_game = matches!(&new_state, ConnectionState::InGame { .. }) && !was_in_game;
+
+                                            // Handle state transitions
+                                            if entering_game {
+                                                if let ConnectionState::InGame { game_id, metadata, .. } = &new_state {
+                                                    // Subscribe to game events if entering a game
+                                                    if let Some(handle) = game_event_handle.take() {
+                                                        handle.abort();
+                                                    }
+
+                                                    let game_id = *game_id;
+                                                    let user_id = metadata.user_id as u32;
+                                                    let ws_tx_clone = ws_tx.clone();
+                                                    let replication_manager_clone = replication_manager.clone();
+
+                                                    game_event_handle = Some(tokio::spawn(async move {
+                                                        subscribe_to_game_events(
+                                                            game_id,
+                                                            user_id,
+                                                            ws_tx_clone,
+                                                            replication_manager_clone,
+                                                        ).await;
+                                                    }));
+                                                }
+                                            }
+                                            state = new_state;
+                                        }
+                                        Err(e) => {
+                                            error!("Error processing message: {}", e);
+                                            // State was consumed, need to reset
+                                            state = ConnectionState::Unauthenticated;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse WebSocket message: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("WebSocket error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    if let Some(handle) = game_event_handle {
+        handle.abort();
+    }
+    forward_task.abort();
+
+    info!("WebSocket connection closed");
+    Ok(())
+}
+
+// Helper function to subscribe to game events
+async fn subscribe_to_game_events(
+    game_id: u32,
+    user_id: u32,
+    ws_tx: mpsc::Sender<Message>,
+    replication_manager: Arc<crate::replication::ReplicationManager>,
+) {
+    info!("Subscribing to game {} events for user {}", game_id, user_id);
+
+    let (_game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to subscribe to game {}: {}", game_id, e);
+            return;
+        }
+    };
+
+    while let Ok(event_msg) = rx.recv().await {
+        // Check if the game has ended
+        if let GameEvent::StatusUpdated { status } = &event_msg.event {
+            if matches!(status, GameStatus::Complete { .. }) {
+                info!("Game {} completed, stopping event subscription", game_id);
+                // Send the final event before breaking
+                let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
+                let _ = ws_tx.send(Message::Text(json.into())).await;
+                break;
+            }
+        }
+
+        let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
+        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
 
 pub async fn run_websocket_server(
     addr: &str,
@@ -382,7 +646,6 @@ async fn handle_connection(
                             &jwt_verifier,
                             &db,
                             &ws_tx,
-                            &mut ws_stream,
                             &mut pubsub_clone,
                             &matchmaking_manager,
                             &replication_manager,
@@ -502,7 +765,6 @@ async fn process_ws_message(
     jwt_verifier: &Arc<dyn JwtVerifier>,
     db: &Arc<dyn Database>,
     ws_tx: &mpsc::Sender<Message>,
-    ws_stream: &mut WebSocketStream<TcpStream>,
     pubsub: &mut PubSubManager,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
@@ -554,7 +816,7 @@ async fn process_ws_message(
                 WSMessage::Ping => {
                     // Respond with Pong even in unauthenticated state
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                    ws_stream.send(pong_msg).await?;
+                    ws_tx.send(pong_msg).await?;
                     Ok(ConnectionState::Unauthenticated)
                 }
                 _ => {
@@ -678,7 +940,7 @@ async fn process_ws_message(
                 WSMessage::Ping => {
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                    ws_stream.send(pong_msg).await?;
+                    ws_tx.send(pong_msg).await?;
                     Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::ClockSyncRequest { client_time } => {
@@ -686,7 +948,7 @@ async fn process_ws_message(
                     let server_time = chrono::Utc::now().timestamp_millis();
                     let response = WSMessage::ClockSyncResponse { client_time, server_time };
                     let json_msg = serde_json::to_string(&response)?;
-                    ws_stream.send(Message::Text(json_msg.into())).await?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::GameEvent(event_msg) => {
@@ -702,7 +964,7 @@ async fn process_ws_message(
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             
                             // Transition to in-game state
                             Ok(ConnectionState::InGame { 
@@ -716,7 +978,7 @@ async fn process_ws_message(
                                 reason: format!("Failed to create game: {}", e) 
                             };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
@@ -729,7 +991,7 @@ async fn process_ws_message(
                             // Send success response
                             let response = WSMessage::CustomGameJoined { game_id };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             
                             // Transition to in-game state
                             Ok(ConnectionState::InGame { 
@@ -743,7 +1005,7 @@ async fn process_ws_message(
                                 reason: format!("Failed to join game: {}", e) 
                             };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
@@ -756,7 +1018,7 @@ async fn process_ws_message(
                             // Send success response
                             let response = WSMessage::SpectatorJoined;
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             
                             // Transition to in-game state as spectator
                             Ok(ConnectionState::InGame { 
@@ -770,7 +1032,7 @@ async fn process_ws_message(
                                 reason: format!("Failed to spectate game: {}", e) 
                             };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
@@ -783,7 +1045,7 @@ async fn process_ws_message(
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             
                             Ok(ConnectionState::Authenticated { metadata })
                         }
@@ -793,7 +1055,7 @@ async fn process_ws_message(
                                 reason: format!("Failed to create solo game: {}", e) 
                             };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
@@ -834,7 +1096,7 @@ async fn process_ws_message(
                 WSMessage::Ping => {
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                    ws_stream.send(pong_msg).await?;
+                    ws_tx.send(pong_msg).await?;
                     Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::ClockSyncRequest { client_time } => {
@@ -842,7 +1104,7 @@ async fn process_ws_message(
                     let server_time = chrono::Utc::now().timestamp_millis();
                     let response = WSMessage::ClockSyncResponse { client_time, server_time };
                     let json_msg = serde_json::to_string(&response)?;
-                    ws_stream.send(Message::Text(json_msg.into())).await?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::LeaveGame => {
@@ -860,7 +1122,7 @@ async fn process_ws_message(
                             reason: "Only the host can start the game".to_string() 
                         };
                         let json_msg = serde_json::to_string(&response)?;
-                        ws_stream.send(Message::Text(json_msg.into())).await?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
                         return Ok(ConnectionState::InGame { metadata, game_id });
                     }
                     
@@ -889,7 +1151,7 @@ async fn process_ws_message(
                         Ok(_) => {
                             let response = WSMessage::CustomGameStarting;
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
@@ -898,7 +1160,7 @@ async fn process_ws_message(
                                 reason: format!("Failed to start game: {}", e) 
                             };
                             let json_msg = serde_json::to_string(&response)?;
-                            ws_stream.send(Message::Text(json_msg.into())).await?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                     }

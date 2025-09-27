@@ -4,7 +4,8 @@ use tracing::info;
 use std::sync::Arc;
 use server::game_server::{GameServer, GameServerConfig};
 use server::ws_server::TestJwtVerifier;
-use server::api::{jwt::{JwtManager, ProductionJwtVerifier}, run_api_server};
+use server::api::jwt::{JwtManager, ProductionJwtVerifier};
+use server::http_server::run_http_server;
 use server::db::{Database, dynamodb::DynamoDatabase};
 
 #[tokio::main]
@@ -39,8 +40,10 @@ async fn main() -> Result<()> {
     let region = env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
 
     // Server configuration
-    let ws_port = env::var("SNAKETRON_WS_PORT").unwrap_or_else(|_| "8080".to_string());
-    let ws_addr = format!("0.0.0.0:{}", ws_port);
+    let http_port = env::var("SNAKETRON_HTTP_PORT")
+        .or_else(|_| env::var("SNAKETRON_WS_PORT")) // Fallback to old WS_PORT for compatibility
+        .unwrap_or_else(|_| "8080".to_string());
+    let http_addr = format!("0.0.0.0:{}", http_port);
     
     let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
@@ -90,32 +93,41 @@ async fn main() -> Result<()> {
     // Create server configuration
     let config = GameServerConfig {
         db: db.clone(),
-        ws_addr,
+        http_addr: http_addr.clone(),
         grpc_addr,
         region,
-        jwt_verifier,
+        jwt_verifier: jwt_verifier.clone(),
         replay_dir,
-        redis_url,
+        redis_url: redis_url.clone(),
     };
-
-    // Clone db for API server
-    let api_db = db.clone();
 
     // Start the game server
     let game_server = GameServer::start(config).await?;
     info!("Server {} started successfully", game_server.id());
-    info!("WebSocket server listening on: {}", game_server.ws_addr());
+    info!("HTTP server (API + WebSocket) will listen on: {}", game_server.http_addr());
     if let Some(grpc_addr) = game_server.grpc_addr() {
         info!("gRPC server listening on: {}", grpc_addr);
     }
 
-    // Start the API server
-    let api_port = env::var("SNAKETRON_API_PORT").unwrap_or_else(|_| "3001".to_string());
-    let api_addr = format!("0.0.0.0:{}", api_port);
-    
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = run_api_server(&api_addr, api_db, &jwt_secret).await {
-            tracing::error!("API server error: {}", e);
+    // Start the unified HTTP server (API + WebSocket)
+    let http_db = db.clone();
+    let http_jwt_verifier = jwt_verifier.clone();
+    let http_redis_url = redis_url.clone();
+    let http_replication_manager = game_server.replication_manager()
+        .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
+        .clone();
+    let http_cancellation_token = game_server.cancellation_token().clone();
+    let http_handle = tokio::spawn(async move {
+        if let Err(e) = run_http_server(
+            &http_addr,
+            http_db,
+            &jwt_secret,
+            http_jwt_verifier,
+            http_redis_url,
+            http_replication_manager,
+            http_cancellation_token,
+        ).await {
+            tracing::error!("HTTP server error: {}", e);
         }
     });
 
@@ -125,8 +137,8 @@ async fn main() -> Result<()> {
 
     info!("Received shutdown signal. Shutting down gracefully...");
     
-    // Shutdown both servers
-    api_handle.abort();
+    // Shutdown servers
+    http_handle.abort();
     game_server.shutdown().await?;
     
     info!("Server shut down successfully");

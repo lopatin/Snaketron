@@ -65,7 +65,7 @@ impl TestEnvironment {
             "Started server {} with ID {} on {} (gRPC: {:?})", 
             index, 
             server_id, 
-            server.ws_addr(),
+            server.http_addr(),
             server.grpc_addr()
         );
         
@@ -91,7 +91,7 @@ impl TestEnvironment {
         .context("Failed to start server")?;
         
         let index = self.servers.len();
-        info!("Started server {} with ID {} on {}", index, server.id(), server.ws_addr());
+        info!("Started server {} with ID {} on {}", index, server.id(), server.http_addr());
         
         self.servers.push(server);
         Ok(index)
@@ -122,7 +122,7 @@ impl TestEnvironment {
     
     /// Get the WebSocket address for a server by index
     pub fn ws_addr(&self, index: usize) -> Option<String> {
-        self.servers.get(index).map(|s| format!("ws://{}", s.ws_addr()))
+        self.servers.get(index).map(|s| format!("ws://{}", s.http_addr()))
     }
     
     /// Get the gRPC address for a server by index
