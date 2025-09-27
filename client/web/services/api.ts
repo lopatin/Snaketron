@@ -9,9 +9,8 @@ class API {
   private token: string | null;
 
   constructor() {
-    // In webpack, process.env needs to be defined in the webpack config
-    // For now, we'll use a simple fallback
-    this.baseURL = 'http://localhost:3001';
+    // Use environment variable if available, otherwise default to localhost for development
+    this.baseURL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
     this.token = localStorage.getItem('token');
   }
 

@@ -229,9 +229,10 @@ function AppContent() {
   const tokenSentRef = useRef<boolean>(false);
   
   useEffect(() => {
-    // Connect to WebSocket server running in Docker container
+    // Connect to WebSocket server - use environment variable if set, otherwise localhost for development
+    const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8080/ws';
     // Send authentication token when connection is established
-    connect('ws://localhost:8080/ws', () => {
+    connect(wsUrl, () => {
       console.log('WebSocket connected, checking for auth token...');
       setWsConnected(true);
       const token = getToken();
