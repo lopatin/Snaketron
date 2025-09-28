@@ -6,18 +6,19 @@ interface RequestOptions extends RequestInit {
 
 class API {
   private baseURL: string;
-  private token: string | null;
 
   constructor() {
     // Use environment variable if available, otherwise default to localhost for development
     // For local development, we need to add /api prefix
     const envUrl = process.env.REACT_APP_API_URL;
     this.baseURL = envUrl || 'http://localhost:8080/api';
-    this.token = localStorage.getItem('token');
+  }
+
+  private getToken(): string | null {
+    return localStorage.getItem('token');
   }
 
   setAuthToken(token: string | null): void {
-    this.token = token;
     if (token) {
       localStorage.setItem('token', token);
     } else {
@@ -35,8 +36,9 @@ class API {
       },
     };
 
-    if (this.token && config.headers) {
-      config.headers.Authorization = `Bearer ${this.token}`;
+    const token = this.getToken();
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`;
     }
 
     const response = await fetch(url, config);

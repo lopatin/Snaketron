@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Extension, Json, State},
-    http::StatusCode,
+    http::{StatusCode, header, HeaderValue},
     response::{IntoResponse, Response},
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -124,13 +124,13 @@ fn validate_username(username: &str) -> Vec<String> {
 pub async fn register(
     State(state): State<AuthState>,
     Json(req): Json<RegisterRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
+) -> Result<Response, AppError> {
     // Validate username format
     let username_errors = validate_username(&req.username);
     if !username_errors.is_empty() {
         return Err(anyhow::anyhow!("Invalid username: {}", username_errors.join(", ")).into());
     }
-    
+
     if req.password.is_empty() || req.password.len() < 6 {
         return Err(anyhow::anyhow!("Password must be at least 6 characters").into());
     }
@@ -159,16 +159,27 @@ pub async fn register(
 
     info!("User registered successfully: {}", user_info.username);
 
-    Ok(Json(AuthResponse {
+    // Build response with cache-control headers
+    let mut response = Json(AuthResponse {
         token,
         user: user_info,
-    }))
+    }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache")
+    );
+
+    Ok(response)
 }
 
 pub async fn login(
     State(state): State<AuthState>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
+) -> Result<Response, AppError> {
     // Find user by username
     let user = state.db.get_user_by_username(&req.username).await?
         .ok_or_else(|| anyhow::anyhow!("Invalid username or password"))?;
@@ -192,24 +203,52 @@ pub async fn login(
 
     info!("User logged in successfully: {}", user_info.username);
 
-    Ok(Json(AuthResponse {
+    // Build response with cache-control headers
+    let mut response = Json(AuthResponse {
         token,
         user: user_info,
-    }))
+    }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache")
+    );
+
+    Ok(response)
 }
 
 pub async fn get_current_user(
     State(state): State<AuthState>,
     Extension(user_id): Extension<i32>, // This will be extracted from JWT by middleware
-) -> Result<Json<UserInfo>, AppError> {
+) -> Result<Response, AppError> {
     let user = state.db.get_user_by_id(user_id).await?
         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
-    Ok(Json(UserInfo {
+    let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
-    }))
+    };
+
+    // Build response with cache-control headers to prevent caching
+    let mut response = Json(user_info).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache")
+    );
+    response.headers_mut().insert(
+        header::EXPIRES,
+        HeaderValue::from_static("0")
+    );
+
+    Ok(response)
 }
 
 pub async fn check_username(

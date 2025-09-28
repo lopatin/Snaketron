@@ -26,15 +26,14 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (token) {
-      fetchCurrentUser(token);
+      fetchCurrentUser();
     } else {
       setLoading(false);
     }
   }, []);
 
-  const fetchCurrentUser = async (token: string) => {
+  const fetchCurrentUser = async () => {
     try {
-      api.setAuthToken(token);
       const userInfo = await api.getCurrentUser();
       setUser(userInfo);
     } catch (err) {
