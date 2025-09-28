@@ -70,14 +70,14 @@ export default function GameArena() {
   const [rotation, setRotation] = useState<ArenaRotation>(0);
   const rotationSetRef = useRef(false); // Track if rotation has been set
 
-  // Join game when user becomes available
+  // Join game when user becomes available AND WebSocket is connected
   useEffect(() => {
-    if (user && gameId && !hasJoinedGameRef.current) {
-      console.log('User authenticated, joining game:', gameId);
+    if (user && gameId && connected && !hasJoinedGameRef.current) {
+      console.log('User authenticated and WebSocket connected, joining game:', gameId);
       hasJoinedGameRef.current = true;
       joinGame(gameId);
     }
-  }, [user, gameId, joinGame]);
+  }, [user, gameId, connected, joinGame]);
 
 
   useEffect(() => {
