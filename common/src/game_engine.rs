@@ -166,7 +166,7 @@ impl GameEngine {
             // Advance to target tick (stops if game completes)
             while !new_predicted_state.is_complete()
                 && new_predicted_state.current_tick() < predicted_target_tick {
-                new_predicted_state.tick_forward(true)?;
+                new_predicted_state.tick_forward(false)?;
             }
 
             self.predicted_state = Some(new_predicted_state);
