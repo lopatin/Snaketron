@@ -29,6 +29,15 @@ pub struct FilteredEventReceiver {
 }
 
 impl FilteredEventReceiver {
+    /// Create a new FilteredEventReceiver
+    pub fn new(inner: broadcast::Receiver<GameEventMessage>, min_sequence: u64, game_id: u32) -> Self {
+        Self {
+            inner,
+            min_sequence,
+            game_id,
+        }
+    }
+
     /// Receive the next event that passes the filter
     pub async fn recv(&mut self) -> Result<GameEventMessage, broadcast::error::RecvError> {
         loop {

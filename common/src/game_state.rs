@@ -347,7 +347,7 @@ pub struct GameState {
     // Round-based scoring fields
     pub current_round: u32,                    // Current round number (1, 2, 3...)
     pub round_wins: HashMap<TeamId, u32>,      // Rounds won by each team
-    pub rounds_to_win: u32,                    // 1 for quick, 2 for competitive
+    pub rounds_to_win: u32,                    // 1 for quick match, 2 for competitive
     pub round_start_times: Vec<i64>,           // Start time of each round (ms)
     pub is_transitioning: bool,                // True during round transitions
 }
@@ -957,23 +957,25 @@ impl GameState {
         }
 
         // Check for goal scoring in team games (endzone reached)
-        let mut goal_scored = false;
-        let mut scoring_team: Option<TeamId> = None;
+        let mut scoring_teams: Vec<TeamId> = Vec::new();
 
         if let GameType::TeamMatch { .. } = &self.game_type {
+            // Check all snakes to see which teams have reached the endzone
             for (snake_id, snake) in self.iter_snakes() {
                 if snake.is_alive {
                     if let Some(team_id) = snake.team_id {
                         if self.arena.has_reached_goal(snake, team_id) {
-                            // Team scored by reaching opponent's endzone!
-                            goal_scored = true;
-                            scoring_team = Some(team_id);
-                            break;
+                            // This team scored by reaching opponent's endzone!
+                            if !scoring_teams.contains(&team_id) {
+                                scoring_teams.push(team_id);
+                            }
                         }
                     }
                 }
             }
         }
+
+        let goal_scored = !scoring_teams.is_empty();
         
         // Check if game should end (only one or no snakes alive)
         let alive_snakes: Vec<u32> = self.arena.snakes
@@ -1008,11 +1010,14 @@ impl GameState {
             // For team games with rounds, handle round completion
             if let GameType::TeamMatch { .. } = &self.game_type {
                 // Determine winning team for this round
-                let winning_team = if let Some(team) = scoring_team {
-                    // If a goal was scored, the scoring team wins
-                    Some(team)
+                let winning_team = if scoring_teams.len() > 1 {
+                    // Both teams scored simultaneously - it's a draw!
+                    None
+                } else if scoring_teams.len() == 1 {
+                    // Only one team scored - they win the round
+                    Some(scoring_teams[0])
                 } else {
-                    // Otherwise, check which team has snakes alive
+                    // No goals scored, check which team has snakes alive
                     let team_0_alive = self.arena.snakes.iter()
                         .any(|s| s.is_alive && s.team_id == Some(TeamId(0)));
                     let team_1_alive = self.arena.snakes.iter()
@@ -1023,7 +1028,7 @@ impl GameState {
                     } else if !team_0_alive && team_1_alive {
                         Some(TeamId(1))
                     } else {
-                        None // Draw or error - shouldn't happen
+                        None // Draw - both teams lost all snakes simultaneously
                     }
                 };
 
@@ -1381,6 +1386,7 @@ impl GameState {
             }
             GameEvent::MatchCompleted { winning_team_id: _ } => {
                 // Match is over, no more rounds
+                self.is_transitioning = false;
             }
 
             // Arena reset events

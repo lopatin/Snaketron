@@ -18,11 +18,15 @@ const SNAKE_COLORS = [
   '#f7b731', // Yellow/gold
 ];
 
-const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUserId, showGameOver, onBackToMenu, onPlayAgain }) => {
+const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUserId, onBackToMenu, onPlayAgain }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [logoHovered, setLogoHovered] = useState(false);
   const [gameOverExpanded, setGameOverExpanded] = useState(false);
-  
+
+  const showGameOver = gameState != null && typeof gameState.status === 'object' &&
+      gameState.status !== null &&
+      'Complete' in gameState.status;
+
   // Trigger slide-in animation when showGameOver becomes true
   useEffect(() => {
     if (showGameOver) {

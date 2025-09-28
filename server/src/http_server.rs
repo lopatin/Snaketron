@@ -71,7 +71,7 @@ pub async fn run_http_server(
         .allow_headers(Any);
 
     // Create rate limiter for username check endpoint
-    let username_check_limiter = rate_limit_layer(10, 60);
+    let username_check_limiter = rate_limit_layer(1000, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()

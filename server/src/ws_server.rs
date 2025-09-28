@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tungstenite::Utf8Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, DEFAULT_TICK_INTERVAL_MS};
+use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, GameState, DEFAULT_TICK_INTERVAL_MS};
 use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 use crate::pubsub_manager::PubSubManager;
 use crate::matchmaking_manager::MatchmakingManager;
@@ -327,6 +327,7 @@ async fn handle_websocket_connection(
                                         Ok(new_state) => {
                                             // Check if we're entering a game
                                             let entering_game = matches!(&new_state, ConnectionState::InGame { .. }) && !was_in_game;
+                                            debug!("State transitioned to: entering_game: {}", entering_game);
 
                                             // Handle state transitions
                                             if entering_game {
@@ -340,6 +341,7 @@ async fn handle_websocket_connection(
                                                     let user_id = metadata.user_id as u32;
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let replication_manager_clone = replication_manager.clone();
+                                                    let db_clone = db.clone();
 
                                                     game_event_handle = Some(tokio::spawn(async move {
                                                         subscribe_to_game_events(
@@ -347,6 +349,7 @@ async fn handle_websocket_connection(
                                                             user_id,
                                                             ws_tx_clone,
                                                             replication_manager_clone,
+                                                            db_clone,
                                                         ).await;
                                                     }));
                                                 }
@@ -392,16 +395,68 @@ async fn subscribe_to_game_events(
     user_id: u32,
     ws_tx: mpsc::Sender<Message>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
+    db: Arc<dyn Database>,
 ) {
     info!("Subscribing to game {} events for user {}", game_id, user_id);
 
-    let (_game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
+    let (game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
         Ok(result) => result,
         Err(e) => {
-            error!("Failed to subscribe to game {}: {}", game_id, e);
-            return;
+            // If failed to get from memory, try to get from database
+            info!("Failed to subscribe to game {} from memory, checking database: {}", game_id, e);
+
+            match db.get_game_by_id(game_id as i32).await {
+                Ok(Some(game)) => {
+                    if let Some(game_state_json) = game.game_state {
+                        match serde_json::from_value::<GameState>(game_state_json) {
+                            Ok(game_state) => {
+                                info!("Loaded game {} state from database", game_id);
+                                // Send the loaded state as an initial snapshot
+                                let snapshot_event = GameEventMessage {
+                                    game_id,
+                                    tick: game_state.tick,
+                                    sequence: 0,
+                                    user_id: Some(user_id),
+                                    event: GameEvent::Snapshot { game_state: game_state.clone() },
+                                };
+                                let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
+                                let _ = ws_tx.send(Message::Text(json.into())).await;
+
+                                // Return early - we can't subscribe to future events without memory state
+                                return;
+                            }
+                            Err(e) => {
+                                error!("Failed to deserialize game state from database: {}", e);
+                                return;
+                            }
+                        }
+                    } else {
+                        error!("Game {} found in database but has no game_state", game_id);
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    error!("Game {} not found in database", game_id);
+                    return;
+                }
+                Err(e) => {
+                    error!("Failed to fetch game {} from database: {}", game_id, e);
+                    return;
+                }
+            }
         }
     };
+    
+    // Send the snapshot
+    let snapshot_event = GameEventMessage {
+        game_id,
+        tick: game_state.tick,
+        sequence: 0,
+        user_id: Some(user_id),
+        event: GameEvent::Snapshot { game_state: game_state.clone() },
+    };
+    let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
+    let _ = ws_tx.send(Message::Text(json.into())).await;
 
     while let Ok(event_msg) = rx.recv().await {
         // Check if the game has ended
@@ -420,342 +475,6 @@ async fn subscribe_to_game_events(
             break;
         }
     }
-}
-
-
-pub async fn run_websocket_server(
-    addr: &str,
-    db: Arc<dyn Database>,
-    redis_url: String,
-    cancellation_token: CancellationToken,
-    jwt_verifier: Arc<dyn JwtVerifier>,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
-) -> Result<()> {
-
-    // Create shared Redis connection manager
-    let pubsub = PubSubManager::new(&redis_url).await
-        .context("Failed to create PubSub manager")?;
-    
-    // Create matchmaking manager
-    let matchmaking_manager = Arc::new(Mutex::new(
-        MatchmakingManager::new(&redis_url).await
-            .context("Failed to create matchmaking manager")?
-    ));
-
-    let listener = TcpListener::bind(addr).await?;
-    info!("WebSocket server listening on {}", addr);
-
-    let mut connection_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
-
-    // Accept incoming connections in a loop until cancellation is requested
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                info!("External WebSocket server shutdown received");
-                break;
-            }
-
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, peer_addr)) => {
-                        info!("Accepted connection from: {}", peer_addr);
-                        let connection_token = cancellation_token.child_token();
-                        let jwt_verifier_clone = jwt_verifier.clone();
-                        let db_clone = db.clone();
-                        let pubsub_clone = pubsub.clone();
-                        let replication_manager_clone = replication_manager.clone();
-                        let matchmaking_manager_clone = matchmaking_manager.clone();
-                        let redis_url_clone = redis_url.clone();
-                        let handle = tokio::spawn(handle_connection(db_clone, pubsub_clone, matchmaking_manager_clone, stream, jwt_verifier_clone, connection_token, replication_manager_clone, redis_url_clone));
-                        connection_handles.push(handle);
-                    }
-
-                    Err(e) => {
-                        error!("Failed to accept connection: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    // Graceful shutdown of all connections
-    info!("Waiting for {} active connections to shut down...", connection_handles.len());
-    let results = join_all(connection_handles).await;
-
-    for result in results {
-        match result {
-            Ok(Ok(_)) => {
-                info!("Connection shut down");
-            }
-            Ok(Err(e)) => {
-                error!("Connection handler failed: {}", e);
-            }
-            Err(e) => {
-                error!("Connection handler panicked: {}", e);
-            }
-        }
-    }
-
-    info!("All connections shut down. WebSocket server exiting.");
-    Ok(())
-}
-
-
-async fn handle_connection(
-    db: Arc<dyn Database>,
-    pubsub: PubSubManager,
-    matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
-    mut stream: TcpStream,
-    jwt_verifier: Arc<dyn JwtVerifier>,
-    cancellation_token: CancellationToken,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
-    redis_url: String,
-) -> Result<()> {
-    let peer_addr = stream.peer_addr()?;
-    
-    // Peek at the first few bytes to determine if it's an HTTP request
-    let mut buf = [0u8; 1024];
-    let n = stream.peek(&mut buf).await?;
-    
-    if n > 0 {
-        let request_start = String::from_utf8_lossy(&buf[..n]);
-        
-        // Check if it's an HTTP health check request
-        if request_start.starts_with("GET /health") || request_start.starts_with("GET /api/health") {
-            debug!("Health check request from: {}", peer_addr);
-            
-            // Send a simple HTTP 200 OK response
-            let response = "HTTP/1.1 200 OK\r\n\
-                           Content-Type: text/plain\r\n\
-                           Content-Length: 2\r\n\
-                           Connection: close\r\n\
-                           \r\n\
-                           OK";
-            stream.write_all(response.as_bytes()).await?;
-            stream.flush().await?;
-            return Ok(());
-        }
-    }
-    
-    info!("Handling WebSocket connection from: {}", peer_addr);
-    
-    // Not a health check, proceed with WebSocket handling
-    let mut ws_stream = tokio_tungstenite::accept_async(stream)
-        .await
-        .context("Failed to accept WebSocket connection")?;
-
-    // Create a channel for sending messages to the WebSocket
-    let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
-    
-    // Start in unauthenticated state
-    let mut state = ConnectionState::Unauthenticated;
-    
-    // Create a shutdown timeout that starts as a never-completing future
-    let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
-    tokio::pin!(shutdown_timeout);
-    let mut shutdown_started = false;
-    
-    // Will be used to track Redis stream subscription for game events
-    let mut game_event_handle: Option<JoinHandle<()>> = None;
-    
-    loop {
-        let state_name = match &state {
-            ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
-            ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
-            ConnectionState::InGame { game_id, .. } => format!("InGame({})", game_id),
-            ConnectionState::ShuttingDown { .. } => "ShuttingDown".to_string(),
-        };
-        debug!("WS: Select loop iteration, current state: {}", state_name);
-        
-        tokio::select! {
-            // Handle shutdown timeout
-            _ = &mut shutdown_timeout, if shutdown_started => {
-                warn!("Shutdown timeout reached, closing connection");
-                break;
-            }
-
-            // Handle cancellation token
-            _ = cancellation_token.cancelled(), if !shutdown_started => {
-                // Send a Shutdown message to the client
-                info!("Sending shutdown message to client");
-                let json_msg = serde_json::json!(WSMessage::Shutdown);
-                let shutdown_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
-                if let Err(e) = ws_stream.send(shutdown_msg).await {
-                    error!("Failed to send shutdown message: {}", e);
-                }
-
-                // Start shutdown timeout
-                shutdown_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
-                shutdown_started = true;
-                
-                // Transition to shutting down state
-                state = ConnectionState::ShuttingDown {
-                    timeout: Box::pin(tokio::time::sleep(Duration::from_secs(10))),
-                };
-            }
-
-            // Handle messages from the channel (to send to client)
-            Some(msg) = ws_rx.recv() => {
-                if let Err(e) = ws_stream.send(msg).await {
-                    error!("Failed to send message to client: {}", e);
-                    break;
-                }
-            }
-            
-            
-            // Handle incoming WebSocket messages
-            message = ws_stream.next() => {
-                match message {
-                    Some(Ok(msg)) => {
-                        // Check if it's a close message
-                        if msg.is_close() {
-                            info!("Received close message from client");
-                            break;
-                        }
-                        
-                        // Try to parse as text message
-                        let text = match msg.to_text() {
-                            Ok(text) => text,
-                            Err(_) => {
-                                // Not a text message, ignore
-                                continue;
-                            }
-                        };
-                        
-                        let ws_message: WSMessage = match serde_json::from_str(text) {
-                            Ok(msg) => msg,
-                            Err(e) => {
-                                error!("Failed to parse WebSocket message: {}", e);
-                                continue;
-                            }
-                        };
-                        
-                        // Process message based on current state using the new helper function
-                        debug!("WS: Processing message: {:?}", ws_message);
-                        
-                        // Check current state before processing
-                        let was_in_game = matches!(&state, ConnectionState::InGame { .. });
-                        
-                        // Clone the connection manager for this call
-                        let mut pubsub_clone = pubsub.clone();
-                        
-                        let process_result = process_ws_message(
-                            state,
-                            ws_message,
-                            &jwt_verifier,
-                            &db,
-                            &ws_tx,
-                            &mut pubsub_clone,
-                            &matchmaking_manager,
-                            &replication_manager,
-                            &redis_url,
-                        ).await;
-                        
-                        match process_result {
-                            Ok(new_state) => {
-                                // Check if we're transitioning to InGame state
-                                let entering_game = matches!(&new_state, ConnectionState::InGame { .. }) 
-                                    && !was_in_game;
-                                let leaving_game = was_in_game 
-                                    && !matches!(&new_state, ConnectionState::InGame { .. });
-                                
-                                state = new_state;
-                                
-                                // Handle game state transitions
-                                if entering_game {
-                                    if let ConnectionState::InGame { game_id, .. } = &state {
-                                        // Start subscription via replication manager
-                                        let game_id_filter = *game_id;
-                                        let ws_tx_clone = ws_tx.clone();
-                                        let replication_manager_clone = replication_manager.clone();
-                                        
-                                        // Abort any existing subscription
-                                        if let Some(handle) = game_event_handle.take() {
-                                            handle.abort();
-                                        }
-                                        
-                                        // Start new subscription through replication manager
-                                        game_event_handle = Some(tokio::spawn(async move {
-                                            if let Err(e) = subscribe_to_game_events_via_replication(
-                                                replication_manager_clone,
-                                                game_id_filter,
-                                                ws_tx_clone
-                                            ).await {
-                                                error!("Game event subscription error: {}", e);
-                                            }
-                                        }));
-                                    }
-                                } else if leaving_game {
-                                    // Stop Redis stream subscription
-                                    if let Some(handle) = game_event_handle.take() {
-                                        handle.abort();
-                                    }
-                                }
-                                
-                                let new_state_name = match &state {
-                                    ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
-                                    ConnectionState::Authenticated { .. } => "Authenticated".to_string(),
-                                    ConnectionState::InGame { game_id, .. } => format!("InGame({})", game_id),
-                                    ConnectionState::ShuttingDown { .. } => "ShuttingDown".to_string(),
-                                };
-                                debug!("WS: State after processing message: {}", new_state_name);
-                            }
-                            Err(e) => {
-                                error!("Error processing message: {}", e);
-                                // Need to handle the error without losing state
-                                // Since process_ws_message consumed state, we need to set it to a valid value
-                                state = ConnectionState::Unauthenticated;
-                                break;
-                            }
-                        }
-                        
-                    }
-                    Some(Err(e)) => {
-                        error!("Error receiving message: {}", e);
-                        break;
-                    }
-                    None => {
-                        info!("WebSocket stream closed");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Clean up any active Redis stream subscription
-    if let Some(handle) = game_event_handle {
-        handle.abort();
-    }
-    
-    // Clean up matchmaking queue if user was authenticated
-    match &state {
-        ConnectionState::Authenticated { metadata } | ConnectionState::InGame { metadata, .. } => {
-            // Remove from matchmaking queue if they were in one
-            let mut matchmaking_manager = matchmaking_manager.lock().await;
-            match remove_from_matchmaking_queue(
-                &mut *matchmaking_manager,
-                metadata.user_id as u32,
-            ).await {
-                Ok(()) => {
-                    debug!("Cleaned up matchmaking queue for user {} on disconnect", metadata.user_id);
-                }
-                Err(e) => {
-                    // This is expected if the user wasn't in queue
-                    debug!("User {} was not in matchmaking queue on disconnect: {}", metadata.user_id, e);
-                }
-            }
-        }
-        ConnectionState::Unauthenticated | ConnectionState::ShuttingDown { .. } => {
-            // No cleanup needed for unauthenticated connections or when already shutting down
-        }
-    }
-    
-    // Clean up connection
-    let _ = ws_stream.close(None).await;
-    
-    Ok(())
 }
 
 
@@ -1486,11 +1205,37 @@ async fn subscribe_to_game_events_via_replication(
     replication_manager: Arc<crate::replication::ReplicationManager>,
     game_id: u32,
     ws_tx: mpsc::Sender<Message>,
+    db: Arc<dyn Database>,
 ) -> Result<()> {
     info!("Subscribing to game {} via replication manager", game_id);
-    
-    // Subscribe to the game through replication manager
-    let (game_state, mut event_receiver) = replication_manager.subscribe_to_game(game_id).await?;
+
+    // Try to subscribe to the game through replication manager
+    // If the game is not in memory (e.g., completed game), load from database
+    let (game_state, mut event_receiver) = match replication_manager.subscribe_to_game(game_id).await {
+        Ok(result) => result,
+        Err(e) => {
+            // Game not in replication manager, try to load from database
+            info!("Game {} not in replication manager, loading from database: {}", game_id, e);
+
+            // Load game from database
+            let game = db.get_game_by_id(game_id as i32).await?
+                .ok_or_else(|| anyhow::anyhow!("Game {} not found in database", game_id))?;
+
+            // Extract and deserialize game state
+            let game_state_json = game.game_state
+                .ok_or_else(|| anyhow::anyhow!("Game {} has no stored game state", game_id))?;
+
+            let game_state: GameState = serde_json::from_value(game_state_json)
+                .context("Failed to deserialize game state from database")?;
+
+            // For completed games, we just need to send the snapshot
+            // Create a dummy receiver that will never produce events
+            let (_tx, rx) = broadcast::channel(1);
+            let filtered_receiver = crate::replication::FilteredEventReceiver::new(rx, game_state.event_sequence, game_id);
+
+            (game_state, filtered_receiver)
+        }
+    };
     
     // Send the initial snapshot
     let snapshot_event = GameEventMessage {
@@ -1513,7 +1258,7 @@ async fn subscribe_to_game_events_via_replication(
     
     info!("Sent initial snapshot for game {} to WebSocket client", game_id);
     
-    // Listen for subsequent events
+    // Listen for further events
     loop {
         tokio::select! {
             event_result = event_receiver.recv() => {

@@ -115,9 +115,9 @@ impl GameEngine {
     pub fn process_server_event(&mut self, event_message: &GameEventMessage) -> Result<()> {
         // Step the committed state forward to the event tick before applying the event
         // This ensures events are applied at the correct tick (similar to ReplayViewer)
-        while self.committed_state.current_tick() < event_message.tick {
-            self.committed_state.tick_forward()?;
-        }
+        // while self.committed_state.current_tick() < event_message.tick {
+        //     self.committed_state.tick_forward()?;
+        // }
 
         self.committed_state.apply_event(event_message.event.clone(), None);
 
