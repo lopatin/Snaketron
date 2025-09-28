@@ -115,9 +115,9 @@ impl GameEngine {
     pub fn process_server_event(&mut self, event_message: &GameEventMessage) -> Result<()> {
         // Step the committed state forward to the event tick before applying the event
         // This ensures events are applied at the correct tick (similar to ReplayViewer)
-        // while self.committed_state.current_tick() < event_message.tick {
-        //     self.committed_state.tick_forward()?;
-        // }
+        while self.committed_state.current_tick() < event_message.tick {
+            self.committed_state.tick_forward(true)?;
+        }
 
         self.committed_state.apply_event(event_message.event.clone(), None);
 
@@ -166,7 +166,7 @@ impl GameEngine {
             // Advance to target tick (stops if game completes)
             while !new_predicted_state.is_complete()
                 && new_predicted_state.current_tick() < predicted_target_tick {
-                new_predicted_state.tick_forward()?;
+                new_predicted_state.tick_forward(true)?;
             }
 
             self.predicted_state = Some(new_predicted_state);
@@ -194,7 +194,7 @@ impl GameEngine {
         while !self.committed_state.is_complete() 
             && self.committed_state.current_tick() < lagged_target_tick {
             let current_tick = self.committed_state.current_tick();
-            for (sequence, event) in self.committed_state.tick_forward()? {
+            for (sequence, event) in self.committed_state.tick_forward(false)? {
                 // eprintln!("game_engine: Emitting event at tick {} seq {}: {:?}", current_tick, sequence, event);
                 out.push((current_tick, sequence, event));
             }
@@ -204,7 +204,7 @@ impl GameEngine {
         if let Some(predicted_state) = &mut self.predicted_state {
             while !predicted_state.is_complete() 
                 && predicted_state.current_tick() < predicted_target_tick {
-                predicted_state.tick_forward()?;
+                predicted_state.tick_forward(true)?;
             }
         }
 

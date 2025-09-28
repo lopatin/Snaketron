@@ -47,7 +47,7 @@ impl ReplayPlayer {
             
             // Now tick the game forward - this processes queued commands and advances the simulation
             // This is the same method the actual game engine uses
-            if let Err(e) = self.current_state.tick_forward() {
+            if let Err(e) = self.current_state.tick_forward(false) {
                 eprintln!("Error during tick_forward: {:?}", e);
             }
             

@@ -112,7 +112,7 @@ impl PartitionReplica {
                 if let Some(game_state) = states.get_mut(&game_id) {
                     // Tick forward until we reach the event's tick
                     if event_msg.tick > game_state.tick {
-                        if let Err(e) = game_state.tick_forward() {
+                        if let Err(e) = game_state.tick_forward(true) {
                             error!("Error during tick_forward: {:?}", e);
                         }
                     }

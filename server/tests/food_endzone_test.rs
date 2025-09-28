@@ -43,7 +43,7 @@ fn test_food_never_spawns_in_endzones() -> Result<()> {
     
     // Run many ticks to spawn lots of food
     for _ in 0..1000 {
-        game_state.tick_forward();
+        game_state.tick_forward(false);
     }
     
     // Check that all food is within main field bounds (x: 10 to 49)
