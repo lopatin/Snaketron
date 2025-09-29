@@ -318,7 +318,9 @@ impl MatchmakingManager {
                         pipe.del(self.redis_keys.matchmaking_user_status(player.user_id));
                         batch_removed += 1;
 
-                        debug!("Removing expired queue entry for user {}", player.user_id);
+                        // This is a warning because websockets should really be renewing
+                        // or cleaning up their own entries.
+                        warn!("Removing expired queue entry for user {}", player.user_id);
                     }
                 } else {
                     // Found a non-expired entry, stop processing
@@ -346,7 +348,6 @@ impl MatchmakingManager {
             }
         }
 
-        debug!("Cleaned up {} expired queue entries for {:?}", removed_count, game_type);
         Ok(removed_count)
     }
     

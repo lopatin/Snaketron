@@ -278,46 +278,46 @@ impl CommandQueue {
     
     pub fn push(&mut self, command_message: GameCommandMessage) {
         // debug!("CommandQueue::push: Command added to queue");
-        eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
+        // eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
         self.queue.push(Reverse(command_message.clone()));
 
         // Delete the non-server-sent command from the queue.
         if command_message.command_id_server.is_some() {
             // debug!("CommandQueue::push: Tombstoning client command {:?}", command_message.command_id_client);
-            eprintln!("COMMON DEBUG: Tombstoning client command {:?}", command_message.command_id_client);
+            // eprintln!("COMMON DEBUG: Tombstoning client command {:?}", command_message.command_id_client);
             self.tombstone_ids.insert(command_message.command_id_client);
         }
     }
     
     pub fn pop(&mut self, max_tick: u32) -> Option<GameCommandMessage> {
         // debug!("CommandQueue::pop: Called with max_tick {}", max_tick);
-        eprintln!("COMMON DEBUG: CommandQueue::pop called with max_tick {}", max_tick);
+        // eprintln!("COMMON DEBUG: CommandQueue::pop called with max_tick {}", max_tick);
         if let Some(Reverse(command_message)) = self.queue.peek() {
             // debug!("CommandQueue::pop: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
-            eprintln!("COMMON DEBUG: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
+            // eprintln!("COMMON DEBUG: Peeked command tick: {}, max_tick: {}", command_message.tick(), max_tick);
             if command_message.tick() > max_tick {
                 // debug!("CommandQueue::pop: No commands ready for this tick");
-                eprintln!("COMMON DEBUG: No commands ready for this tick");
+                // eprintln!("COMMON DEBUG: No commands ready for this tick");
                 return None; // No commands for this tick
             }
         }
         
         if let Some(Reverse(command_message)) = self.queue.pop() {
             // debug!("CommandQueue::pop: Popped command: {:?}", command_message);
-            eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
+            // eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             if command_message.command_id_server.is_none() && self.tombstone_ids.remove(&command_message.command_id_client) {
-                eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
+                // eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
                 // Ignore the command if it's a tombstone. 
                 // Continue popping the next command.
                 self.pop(max_tick)
             } else {
                 // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
-                eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
+                // eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
                 Some(command_message)
             }
         } else {
             // debug!("CommandQueue::pop: Queue is empty");
-            eprintln!("COMMON DEBUG: CommandQueue::pop: Queue is empty");
+            // eprintln!("COMMON DEBUG: CommandQueue::pop: Queue is empty");
             None
         }
     }
@@ -789,19 +789,19 @@ impl GameState {
 
         // Exec commands in the queue until the only ones left are for after this tick
         // debug!("tick_forward: Checking for commands at tick {}", self.tick);
-        eprintln!("COMMON DEBUG: tick_forward checking commands at tick {}", self.tick);
+        // eprintln!("COMMON DEBUG: tick_forward checking commands at tick {}", self.tick);
         while let Some(command_message) = self.command_queue.pop(self.tick) {
-            debug!("tick_forward: Popped command from queue: {:?}", command_message);
-            eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
+            // debug!("tick_forward: Popped command from queue: {:?}", command_message);
+            // eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
             match self.exec_command(command_message.command) {
                 Ok(events) => {
-                    debug!("tick_forward: exec_command returned {} events", events.len());
-                    eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
+                    // debug!("tick_forward: exec_command returned {} events", events.len());
+                    // eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
                     out.extend(events);
                 }
                 Err(e) => {
-                    debug!("tick_forward: exec_command failed with error: {:?}", e);
-                    eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
+                    // debug!("tick_forward: exec_command failed with error: {:?}", e);
+                    // eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
                 }
             }
         }
@@ -1268,55 +1268,55 @@ impl GameState {
     }
 
     fn exec_command(&mut self, command: GameCommand) -> Result<Vec<(u64, GameEvent)>> {
-        debug!("exec_command: Entering with command {:?}", command);
-        eprintln!("COMMON DEBUG: exec_command called with {:?}", command);
+        // debug!("exec_command: Entering with command {:?}", command);
+        // eprintln!("COMMON DEBUG: exec_command called with {:?}", command);
         let mut out: Vec<(u64, GameEvent)> = Vec::new();
         match command {
             GameCommand::Turn { snake_id, direction } => {
-                debug!("exec_command: Processing Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
-                eprintln!("COMMON DEBUG: Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
+                // debug!("exec_command: Processing Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
+                // eprintln!("COMMON DEBUG: Turn command - snake_id: {}, direction: {:?}", snake_id, direction);
                 
                 // Get current snake state
                 let snake = self.arena.snakes.get(snake_id as usize)
                     .context("Snake not found")?;
                 
-                debug!("exec_command: Snake {} state - alive: {}, current_direction: {:?}, requested_direction: {:?}", 
-                      snake_id, snake.is_alive, snake.direction, direction);
-                eprintln!("COMMON DEBUG: Snake {} - alive: {}, current: {:?}, requested: {:?}", 
-                         snake_id, snake.is_alive, snake.direction, direction);
+                // debug!("exec_command: Snake {} state - alive: {}, current_direction: {:?}, requested_direction: {:?}", 
+                //       snake_id, snake.is_alive, snake.direction, direction);
+                // eprintln!("COMMON DEBUG: Snake {} - alive: {}, current: {:?}, requested: {:?}", 
+                //          snake_id, snake.is_alive, snake.direction, direction);
                 
                 if snake.is_alive && snake.direction != direction {
-                    debug!("exec_command: Snake is alive and direction is different");
+                    // debug!("exec_command: Snake is alive and direction is different");
                     
                     // Always prevent 180-degree turns
                     if snake.direction.is_opposite(&direction) {
-                        debug!("exec_command: Ignoring command - 180-degree turn attempted");
-                        eprintln!("COMMON DEBUG: Ignoring 180-degree turn");
+                        // debug!("exec_command: Ignoring command - 180-degree turn attempted");
+                        // eprintln!("COMMON DEBUG: Ignoring 180-degree turn");
                         // Ignore the command - cannot turn 180 degrees
                         return Ok(out);
                     }
                     
-                    debug!("exec_command: Generating SnakeTurned event for snake {}", snake_id);
-                    eprintln!("COMMON DEBUG: Generating SnakeTurned event for snake {}", snake_id);
+                    // debug!("exec_command: Generating SnakeTurned event for snake {}", snake_id);
+                    // eprintln!("COMMON DEBUG: Generating SnakeTurned event for snake {}", snake_id);
                     self.apply_event(GameEvent::SnakeTurned { snake_id, direction }, Some(&mut out));
-                    debug!("exec_command: SnakeTurned event applied successfully");
+                    // debug!("exec_command: SnakeTurned event applied successfully");
                 } else {
                     if !snake.is_alive {
-                        debug!("exec_command: Ignoring command - snake {} is dead", snake_id);
-                        eprintln!("COMMON DEBUG: Ignoring - snake {} is dead", snake_id);
+                        // debug!("exec_command: Ignoring command - snake {} is dead", snake_id);
+                        // eprintln!("COMMON DEBUG: Ignoring - snake {} is dead", snake_id);
                     } else if snake.direction == direction {
-                        debug!("exec_command: Ignoring command - snake {} already facing {:?}", snake_id, direction);
-                        eprintln!("COMMON DEBUG: Ignoring - snake {} already facing {:?}", snake_id, direction);
+                        // debug!("exec_command: Ignoring command - snake {} already facing {:?}", snake_id, direction);
+                        // eprintln!("COMMON DEBUG: Ignoring - snake {} already facing {:?}", snake_id, direction);
                     }
                 }
             }
             GameCommand::UpdateStatus { .. } => {
-                debug!("exec_command: Processing UpdateStatus command");
+                // debug!("exec_command: Processing UpdateStatus command");
             }
         }
 
-        debug!("exec_command: Returning {} events", out.len());
-        eprintln!("COMMON DEBUG: exec_command returning {} events", out.len());
+        // debug!("exec_command: Returning {} events", out.len());
+        // eprintln!("COMMON DEBUG: exec_command returning {} events", out.len());
         Ok(out)
     }
 
