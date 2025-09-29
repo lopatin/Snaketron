@@ -559,9 +559,10 @@ async fn process_ws_message(
                     let mmr = user.mmr;
 
                     // Add to matchmaking queue using Redis-based matchmaking
-                    let mut matchmaking_manager = matchmaking_manager.lock().await;
+                    let matchmaking_manager_clone = matchmaking_manager.clone(); // Clone the Arc before locking
+                    let mut matchmaking_manager_guard = matchmaking_manager.lock().await;
                     match add_to_matchmaking_queue(
-                        &mut *matchmaking_manager,
+                        &mut *matchmaking_manager_guard,
                         metadata.user_id as u32,
                         metadata.username.clone(),
                         mmr,
@@ -570,13 +571,12 @@ async fn process_ws_message(
                     ).await {
                         Ok(()) => {
                             info!("User {} added to matchmaking queue", metadata.user_id);
-                            
+
                             // Start listening for match notifications and renewing queue position
                             let user_id = metadata.user_id;
                             let ws_tx_clone = ws_tx.clone();
                             let replication_manager_clone = replication_manager.clone();
                             let redis_url_clone = redis_url.to_string();
-                            let matchmaking_manager_clone = matchmaking_manager.clone();
                             tokio::spawn(async move {
                                 // Spawn a task to periodically renew queue position
                                 let renewal_handle = {
