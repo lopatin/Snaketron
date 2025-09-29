@@ -30,10 +30,19 @@ impl RedisKeys {
         format!("matchmaking:queue:{}", game_type_hash)
     }
     
-    /// Queue for a specific game type
-    pub fn matchmaking_queue(&self, game_type: &GameType) -> String {
+    /// Queue for a specific game type and queue mode
+    pub fn matchmaking_queue(&self, game_type: &GameType, queue_mode: &common::QueueMode) -> String {
         let hash = Self::hash_game_type(game_type);
-        self.matchmaking_queue_hash(hash)
+        let mode_str = match queue_mode {
+            common::QueueMode::Quickmatch => "quick",
+            common::QueueMode::Competitive => "comp",
+        };
+        format!("matchmaking:queue:{}:{}", mode_str, hash)
+    }
+
+    /// Queue for a specific game type (default to quickmatch for backward compatibility)
+    pub fn matchmaking_queue_default(&self, game_type: &GameType) -> String {
+        self.matchmaking_queue(game_type, &common::QueueMode::Quickmatch)
     }
     
     /// MMR index for a game type (by hash)
@@ -41,10 +50,19 @@ impl RedisKeys {
         format!("matchmaking:mmr:{}", game_type_hash)
     }
     
-    /// MMR index for a game type
-    pub fn matchmaking_mmr_index(&self, game_type: &GameType) -> String {
+    /// MMR index for a game type and queue mode
+    pub fn matchmaking_mmr_index(&self, game_type: &GameType, queue_mode: &common::QueueMode) -> String {
         let hash = Self::hash_game_type(game_type);
-        self.matchmaking_mmr_index_hash(hash)
+        let mode_str = match queue_mode {
+            common::QueueMode::Quickmatch => "quick",
+            common::QueueMode::Competitive => "comp",
+        };
+        format!("matchmaking:mmr:{}:{}", mode_str, hash)
+    }
+
+    /// MMR index for a game type (default to quickmatch for backward compatibility)
+    pub fn matchmaking_mmr_index_default(&self, game_type: &GameType) -> String {
+        self.matchmaking_mmr_index(game_type, &common::QueueMode::Quickmatch)
     }
     
     /// User status in matchmaking

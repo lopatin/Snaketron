@@ -39,7 +39,10 @@ pub enum WSMessage {
     ClockSyncRequest { client_time: i64 },
     ClockSyncResponse { client_time: i64, server_time: i64 },
     // Matchmaking messages
-    QueueForMatch { game_type: common::GameType },
+    QueueForMatch {
+        game_type: common::GameType,
+        queue_mode: common::QueueMode,  // Quickmatch or Competitive
+    },
     LeaveQueue,
     // Real-time matchmaking updates
     MatchFound { game_id: u32 },
@@ -546,8 +549,8 @@ async fn process_ws_message(
         }
         ConnectionState::Authenticated { metadata } => {
             match ws_message {
-                WSMessage::QueueForMatch { game_type } => {
-                    info!("User {} ({}) queuing for match type: {:?}", metadata.username, metadata.user_id, game_type);
+                WSMessage::QueueForMatch { game_type, queue_mode } => {
+                    info!("User {} ({}) queuing for match type: {:?}, mode: {:?}", metadata.username, metadata.user_id, game_type, queue_mode);
 
                     // Fetch user's MMR from database
                     let user = db.get_user_by_id(metadata.user_id)
@@ -563,16 +566,45 @@ async fn process_ws_message(
                         metadata.username.clone(),
                         mmr,
                         game_type,
+                        queue_mode,
                     ).await {
                         Ok(()) => {
                             info!("User {} added to matchmaking queue", metadata.user_id);
                             
-                            // Start listening for match notifications
+                            // Start listening for match notifications and renewing queue position
                             let user_id = metadata.user_id;
                             let ws_tx_clone = ws_tx.clone();
                             let replication_manager_clone = replication_manager.clone();
                             let redis_url_clone = redis_url.to_string();
+                            let matchmaking_manager_clone = matchmaking_manager.clone();
                             tokio::spawn(async move {
+                                // Spawn a task to periodically renew queue position
+                                let renewal_handle = {
+                                    let matchmaking_manager_clone2 = matchmaking_manager_clone.clone();
+                                    let user_id_copy = user_id;
+                                    tokio::spawn(async move {
+                                        let mut interval = tokio::time::interval(Duration::from_secs(30));
+                                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                                        loop {
+                                            interval.tick().await;
+                                            let mut mm_guard = matchmaking_manager_clone2.lock().await;
+                                            match mm_guard.renew_queue_position(user_id_copy as u32).await {
+                                                Ok(renewed) => {
+                                                    if renewed {
+                                                        debug!("Renewed queue position for user {}", user_id_copy);
+                                                    } else {
+                                                        // User no longer in queue, stop renewing
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to renew queue position for user {}: {}", user_id_copy, e);
+                                                }
+                                            }
+                                        }
+                                    })
+                                };
                                 // Subscribe to match notifications
                                 let redis_keys = crate::redis_keys::RedisKeys::new();
                                 let channel = redis_keys.matchmaking_notification_channel(user_id as u32);
@@ -599,6 +631,8 @@ async fn process_ws_message(
                                                                     let json_msg = serde_json::to_string(&join_msg).unwrap();
                                                                     if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_ok() {
                                                                         info!("JoinGame message sent to user {}", user_id);
+                                                                        // Cancel the renewal task
+                                                                        renewal_handle.abort();
                                                                         // Exit after sending the match notification
                                                                         break;
                                                                     }

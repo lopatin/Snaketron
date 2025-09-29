@@ -18,9 +18,10 @@ pub async fn add_to_matchmaking_queue(
     username: String,
     mmr: i32,
     game_type: GameType,
+    queue_mode: common::QueueMode,
 ) -> Result<()> {
     // Add to queue
-    matchmaking_manager.add_to_queue(user_id, username, mmr, game_type.clone()).await?;
+    matchmaking_manager.add_to_queue(user_id, username, mmr, game_type.clone(), queue_mode.clone()).await?;
     
     info!("User {} added to matchmaking queue for game type {:?}", user_id, game_type);
     Ok(())
@@ -143,8 +144,9 @@ pub async fn send_queue_position_update(
     redis_conn: &mut ConnectionManager,
     user_id: u32,
     game_type: &GameType,
+    queue_mode: &common::QueueMode,
 ) -> Result<()> {
-    if let Some(position) = matchmaking_manager.get_queue_position(user_id, game_type).await? {
+    if let Some(position) = matchmaking_manager.get_queue_position(user_id, game_type, queue_mode).await? {
         // Estimate wait time based on position (simplified)
         let estimated_wait_seconds = (position as u32) * 5; // 5 seconds per position
         

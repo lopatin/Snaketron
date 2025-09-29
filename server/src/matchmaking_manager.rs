@@ -21,6 +21,7 @@ pub struct QueuedPlayer {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserQueueStatus {
     pub game_type: GameType,
+    pub queue_mode: common::QueueMode,
     pub request_time: i64,
     pub mmr: i32,
     pub username: String,
@@ -92,9 +93,9 @@ impl MatchmakingManager {
     }
     
     /// Add a player to the matchmaking queue
-    pub async fn add_to_queue(&mut self, user_id: u32, username: String, mmr: i32, game_type: GameType) -> Result<()> {
-        let queue_key = self.redis_keys.matchmaking_queue(&game_type);
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(&game_type);
+    pub async fn add_to_queue(&mut self, user_id: u32, username: String, mmr: i32, game_type: GameType, queue_mode: common::QueueMode) -> Result<()> {
+        let queue_key = self.redis_keys.matchmaking_queue(&game_type, &queue_mode);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(&game_type, &queue_mode);
         let user_key = self.redis_keys.matchmaking_user_status(user_id);
         
         let player = QueuedPlayer {
@@ -119,6 +120,7 @@ impl MatchmakingManager {
         // Store user status
         let status = UserQueueStatus {
             game_type: game_type.clone(),
+            queue_mode: queue_mode.clone(),
             request_time: timestamp,
             mmr,
             username,
@@ -138,7 +140,7 @@ impl MatchmakingManager {
                 Err(e) if attempts < self.max_retries => {
                     warn!("Failed to add to queue (attempt {}/{}): {}", attempts, self.max_retries, e);
                     sleep(delay).await;
-                    delay *= 2;
+                    delay = (delay * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
                     error!("Failed to add to queue after {} attempts", self.max_retries);
@@ -151,6 +153,37 @@ impl MatchmakingManager {
         Ok(())
     }
     
+    /// Renew a player's position in queue (update timestamp to prevent expiration)
+    pub async fn renew_queue_position(&mut self, user_id: u32) -> Result<bool> {
+        let user_key = self.redis_keys.matchmaking_user_status(user_id);
+
+        // Get user status to find their game type
+        let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
+
+        if let Some(json) = status_json {
+            let status: UserQueueStatus = serde_json::from_str(&json)?;
+            let queue_key = self.redis_keys.matchmaking_queue(&status.game_type, &status.queue_mode);
+
+            // Find the player's entry in the queue
+            let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
+
+            for (member_json, _old_score) in members {
+                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
+                    if player.user_id == user_id {
+                        // Update timestamp to current time
+                        let new_timestamp = Utc::now().timestamp_millis();
+                        let _: () = self.conn.zadd(&queue_key, &member_json, new_timestamp).await?;
+
+                        debug!("Renewed queue position for user {}", user_id);
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Remove a player from the matchmaking queue
     pub async fn remove_from_queue(&mut self, user_id: u32) -> Result<Option<GameType>> {
         let user_key = self.redis_keys.matchmaking_user_status(user_id);
@@ -160,8 +193,8 @@ impl MatchmakingManager {
         
         if let Some(json) = status_json {
             let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = self.redis_keys.matchmaking_queue(&status.game_type);
-            let mmr_key = self.redis_keys.matchmaking_mmr_index(&status.game_type);
+            let queue_key = self.redis_keys.matchmaking_queue(&status.game_type, &status.queue_mode);
+            let mmr_key = self.redis_keys.matchmaking_mmr_index(&status.game_type, &status.queue_mode);
             
             // Find and remove the player from queue
             let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
@@ -201,8 +234,8 @@ impl MatchmakingManager {
     }
     
     /// Get queue position for a user
-    pub async fn get_queue_position(&mut self, user_id: u32, game_type: &GameType) -> Result<Option<usize>> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type);
+    pub async fn get_queue_position(&mut self, user_id: u32, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Option<usize>> {
+        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
         
         // Get all queued players
         let members: Vec<String> = self.conn.zrange(&queue_key, 0, -1).await?;
@@ -247,39 +280,109 @@ impl MatchmakingManager {
     }
     
     /// Clean up expired queue entries (maintenance task)
-    pub async fn cleanup_expired_entries(&mut self, max_age_seconds: i64) -> Result<usize> {
-        let _cutoff_time = Utc::now().timestamp_millis() - (max_age_seconds * 1000);
-        let removed_count = 0;
-        
-        // Get all game type queues (this would need to track active game types)
-        // For now, this is a placeholder - in production, we'd maintain a set of active game types
-        
-        debug!("Cleaned up {} expired queue entries", removed_count);
+    /// More efficient version that processes in batches and stops at first non-expired entry
+    pub async fn cleanup_expired_entries(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, max_age_seconds: i64) -> Result<usize> {
+        let cutoff_time = Utc::now().timestamp_millis() - (max_age_seconds * 1000);
+        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+
+        let mut removed_count = 0;
+        let mut offset = 0;
+        const BATCH_SIZE: isize = 100; // Process 100 entries at a time
+
+        loop {
+            // Get a batch of queued players with their timestamps
+            // Since the sorted set is ordered by timestamp, older entries come first
+            let members: Vec<(String, f64)> = self.conn.zrange_withscores(
+                &queue_key,
+                offset,
+                offset + BATCH_SIZE - 1
+            ).await?;
+
+            if members.is_empty() {
+                break; // No more entries
+            }
+
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            let mut batch_removed = 0;
+            let mut found_non_expired = false;
+
+            for (member_json, timestamp) in members {
+                // Check if entry is expired (timestamp is in milliseconds)
+                if timestamp < cutoff_time as f64 {
+                    if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
+                        // Remove from queue and MMR index
+                        pipe.zrem(&queue_key, &member_json);
+                        pipe.zrem(&mmr_key, player.user_id.to_string());
+                        pipe.del(self.redis_keys.matchmaking_user_status(player.user_id));
+                        batch_removed += 1;
+
+                        debug!("Removing expired queue entry for user {}", player.user_id);
+                    }
+                } else {
+                    // Found a non-expired entry, stop processing
+                    found_non_expired = true;
+                    break;
+                }
+            }
+
+            if batch_removed > 0 {
+                let _: () = pipe.query_async(&mut self.conn).await?;
+                removed_count += batch_removed;
+            }
+
+            if found_non_expired {
+                // All remaining entries are non-expired (since sorted by timestamp)
+                break;
+            }
+
+            // Move to next batch
+            // Note: we don't increment offset since removed items shift the indices
+            // We always start from 0 after removals
+            if batch_removed == 0 {
+                // No items were removed in this batch, move to the next
+                offset += BATCH_SIZE;
+            }
+        }
+
+        debug!("Cleaned up {} expired queue entries for {:?}", removed_count, game_type);
         Ok(removed_count)
     }
     
-    /// Get all players in queue for a game type
-    pub async fn get_queued_players(&mut self, game_type: &GameType) -> Result<Vec<QueuedPlayer>> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type);
-        
-        let members: Vec<String> = self.conn.zrange(&queue_key, 0, -1).await?;
+    /// Get all players in queue for a game type (limited to 5000)
+    pub async fn get_queued_players(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<QueuedPlayer>> {
+        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
+
+        // Limit to 5000 records to prevent excessive memory usage
+        const MAX_QUEUE_FETCH: isize = 4999; // 0-indexed, so 4999 = 5000 items
+        let members: Vec<String> = self.conn.zrange(&queue_key, 0, MAX_QUEUE_FETCH).await?;
         let mut players = Vec::new();
-        
+
         for member_json in members {
             if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
                 players.push(player);
             }
         }
-        
+
         Ok(players)
     }
     
-    /// Get players in MMR range
-    pub async fn get_players_in_mmr_range(&mut self, game_type: &GameType, min_mmr: i32, max_mmr: i32) -> Result<Vec<u32>> {
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type);
-        
-        let user_ids: Vec<String> = self.conn.zrangebyscore(&mmr_key, min_mmr, max_mmr).await?;
-        
+    /// Get players in MMR range (limited to 5000)
+    pub async fn get_players_in_mmr_range(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, min_mmr: i32, max_mmr: i32) -> Result<Vec<u32>> {
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+
+        // Use ZRANGEBYSCORE with LIMIT to prevent excessive memory usage
+        let user_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(&mmr_key)
+            .arg(min_mmr)
+            .arg(max_mmr)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(5000)
+            .query_async(&mut self.conn)
+            .await?;
+
         Ok(user_ids.into_iter()
             .filter_map(|s| s.parse::<u32>().ok())
             .collect())
@@ -308,9 +411,9 @@ impl MatchmakingManager {
     }
     
     /// Remove players from queue (for match creation)
-    pub async fn remove_players_from_queue(&mut self, game_type: &GameType, user_ids: &[u32]) -> Result<()> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type);
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type);
+    pub async fn remove_players_from_queue(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, user_ids: &[u32]) -> Result<()> {
+        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
         
         // Get all members to find which ones to remove
         let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
@@ -370,8 +473,8 @@ mod tests {
     async fn test_redis_connection() {
         // This test requires Redis to be running
         let redis_url = "redis://localhost:6379";
-        
-        match MatchmakingManager::new_from_env(redis_url).await {
+
+        match MatchmakingManager::new(redis_url).await {
             Ok(mut manager) => {
                 assert!(manager.health_check().await.is_ok());
             }
@@ -384,8 +487,8 @@ mod tests {
     #[tokio::test]
     async fn test_queue_operations() {
         let redis_url = "redis://localhost:6379";
-        
-        let mut manager = match MatchmakingManager::new(redis_url, "test").await {
+
+        let mut manager = match MatchmakingManager::new(redis_url).await {
             Ok(m) => m,
             Err(_) => {
                 eprintln!("Redis not available for testing");
@@ -403,7 +506,7 @@ mod tests {
         let _ = manager.remove_from_queue(user_id).await;
         
         // Add to queue
-        assert!(manager.add_to_queue(user_id, username.clone(), mmr, game_type.clone()).await.is_ok());
+        assert!(manager.add_to_queue(user_id, username.clone(), mmr, game_type.clone(), common::QueueMode::Quickmatch).await.is_ok());
         
         // Check status
         let status = manager.get_queue_status(user_id).await.unwrap();
@@ -413,7 +516,7 @@ mod tests {
         assert_eq!(status.mmr, mmr);
         
         // Check position
-        let position = manager.get_queue_position(user_id, &game_type).await.unwrap();
+        let position = manager.get_queue_position(user_id, &game_type, &common::QueueMode::Quickmatch).await.unwrap();
         assert_eq!(position, Some(1));
         
         // Remove from queue

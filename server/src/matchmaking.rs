@@ -71,20 +71,56 @@ pub async fn run_matchmaking_loop(
         ];
 
         for game_type in &game_types {
-            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone()).await {
+            // Clean up expired entries for both queue modes before attempting to create matches
+            // Expire entries older than 5 minutes (300 seconds)
+            const MAX_QUEUE_AGE_SECONDS: i64 = 300;
+
+            // Clean up quickmatch queue
+            if let Err(e) = matchmaking_manager.cleanup_expired_entries(game_type, &common::QueueMode::Quickmatch, MAX_QUEUE_AGE_SECONDS).await {
+                error!(game_type = ?game_type, error = %e, "Failed to cleanup expired quickmatch queue entries");
+            }
+
+            // Clean up competitive queue
+            if let Err(e) = matchmaking_manager.cleanup_expired_entries(game_type, &common::QueueMode::Competitive, MAX_QUEUE_AGE_SECONDS).await {
+                error!(game_type = ?game_type, error = %e, "Failed to cleanup expired competitive queue entries");
+            }
+
+            // Try to create matches for both queue modes
+            // First try quickmatch
+            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
                 Ok(Some((game_id, players))) => {
                     info!(
                         game_id,
                         game_type = ?game_type,
+                        queue_mode = "quickmatch",
                         player_count = players.len(),
-                        "Created match successfully via Redis"
+                        "Created quickmatch successfully via Redis"
                     );
                 }
                 Ok(None) => {
-                    trace!(game_type = ?game_type, "No suitable match found");
+                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable match found");
                 }
                 Err(e) => {
-                    error!(game_type = ?game_type, error = %e, "Redis matchmaking error");
+                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Redis matchmaking error");
+                }
+            }
+
+            // Then try competitive
+            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
+                Ok(Some((game_id, players))) => {
+                    info!(
+                        game_id,
+                        game_type = ?game_type,
+                        queue_mode = "competitive",
+                        player_count = players.len(),
+                        "Created competitive match successfully via Redis"
+                    );
+                }
+                Ok(None) => {
+                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable match found");
+                }
+                Err(e) => {
+                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Redis matchmaking error");
                 }
             }
         }
@@ -98,9 +134,10 @@ async fn create_match(
     matchmaking_manager: &mut MatchmakingManager,
     pubsub: &mut PubSubManager,
     game_type: GameType,
+    queue_mode: common::QueueMode,
 ) -> Result<Option<(u32, Vec<u32>)>> {
-    // Get all queued players for this game type
-    let queued_players = matchmaking_manager.get_queued_players(&game_type).await?;
+    // Get all queued players for this game type and queue mode
+    let queued_players = matchmaking_manager.get_queued_players(&game_type, &queue_mode).await?;
     
     if queued_players.is_empty() {
         return Ok(None);
@@ -246,7 +283,7 @@ async fn create_match(
     }
     
     // Remove players from queue
-    matchmaking_manager.remove_players_from_queue(&game_type, &user_ids).await?;
+    matchmaking_manager.remove_players_from_queue(&game_type, &queue_mode, &user_ids).await?;
 
     // Publish GameCreated event to Redis stream
     let event = StreamEvent::GameCreated {

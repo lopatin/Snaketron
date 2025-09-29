@@ -218,6 +218,12 @@ pub enum GameMode {
 }
 
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+pub enum QueueMode {
+    Quickmatch,   // Quick casual matches
+    Competitive,  // Ranked competitive matches
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum GameType {
     Solo,
