@@ -81,11 +81,13 @@ export type GameStatus =
   | { Started: { server_id: number } }
   | { Complete: { winning_snake_id: number | null } };
 
-export type GameType = 
+export type GameType =
   | 'Solo'
   | { TeamMatch: { per_team: number } }
   | { FreeForAll: { max_players: number } }
   | { Custom: { settings: CustomGameSettings } };
+
+export type QueueMode = 'Quickmatch' | 'Competitive';
 
 export interface CustomGameSettings {
   arena_width: number;
@@ -149,6 +151,7 @@ export interface JoinGameMessage {
 export interface QueueForMatchMessage {
   QueueForMatch: {
     game_type: GameType;
+    queue_mode: QueueMode;
   };
 }
 

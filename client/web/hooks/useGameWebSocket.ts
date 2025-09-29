@@ -226,11 +226,11 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     sendMessage('CreateSoloGame');
   }, [sendMessage]);
 
-  const queueForMatch = useCallback((gameType: GameType) => {
-    console.log('Queueing for match with game type:', gameType);
+  const queueForMatch = useCallback((gameType: GameType, queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
+    console.log('Queueing for match with game type:', gameType, 'mode:', queueMode);
     setIsQueued(true);
     sendMessage({
-      QueueForMatch: { game_type: gameType }
+      QueueForMatch: { game_type: gameType, queue_mode: queueMode }
     });
   }, [sendMessage]);
 
