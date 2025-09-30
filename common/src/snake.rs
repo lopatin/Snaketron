@@ -117,8 +117,20 @@ impl Snake {
         }
     }
 
-    pub fn contains_point(&self, point: &Position) -> bool {
-        self.iter_body().any(|(p1, p2)| point.is_between(p1, p2))
+    pub fn contains_point(&self, point: &Position, skip_head: bool) -> bool {
+        if skip_head && self.body.first().map_or(false, |head| *head == *point) {
+            false
+        } else {
+            self.iter_body().any(|(p1, p2)| point.is_between(p1, p2))
+        }
+    }
+    
+    pub fn is_head(&self, point: &Position) -> bool {
+        if let Some(head) = self.body.first() {
+            *head == *point
+        } else {
+            false
+        }
     }
 
     pub fn iter_body(&self) -> impl Iterator<Item=(&Position, &Position)> {

@@ -8,6 +8,8 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use crate::pubsub_manager::{PubSubManager, SnapshotRequest, PartitionSubscription};
+use crate::db::Database;
+use crate::xp_persistence;
 
 pub const PARTITION_COUNT: u32 = 10;
 pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks (1 second at 100ms tick rate)
@@ -39,6 +41,7 @@ async fn run_game(
     mut pubsub: PubSubManager,
     mut command_receiver: mpsc::Receiver<GameCommandMessage>,
     mut snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
+    db: Arc<dyn Database>,
     cancellation_token: CancellationToken,
 ) {
     info!("run_game called for game {}", game_id);
@@ -167,10 +170,20 @@ async fn run_game(
                         let game_state = engine.get_committed_state();
                         if matches!(game_state.status, GameStatus::Complete { .. }) {
                             info!("Game {} has completed, exiting game loop", game_id);
+
                             // Publish final snapshot
                             if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &game_state).await {
                                 warn!("Failed to publish final snapshot: {}", e);
                             }
+
+                            // Persist XP to database
+                            if !game_state.player_xp.is_empty() {
+                                info!("Persisting XP for {} players in game {}", game_state.player_xp.len(), game_id);
+                                if let Err(e) = xp_persistence::persist_player_xp(db.as_ref(), game_id, game_state.player_xp.clone()).await {
+                                    error!("Failed to persist XP for game {}: {:?}", game_id, e);
+                                }
+                            }
+
                             break;
                         }
                     }
@@ -239,6 +252,7 @@ pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
     redis_url: String,
+    db: Arc<dyn Database>,
     _replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
@@ -262,10 +276,11 @@ pub async fn run_game_executor(
     // Track game channels
     let mut game_channels: HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)> = HashMap::new();
     
-    let try_start_game = |game_id: u32, 
-                          game_state: GameState, 
-                          pubsub: PubSubManager, 
-                          cancellation_token: CancellationToken, 
+    let try_start_game = |game_id: u32,
+                          game_state: GameState,
+                          pubsub: PubSubManager,
+                          db: Arc<dyn Database>,
+                          cancellation_token: CancellationToken,
                           game_channels: &mut HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)>| {
         if game_id % PARTITION_COUNT != partition_id {
             debug!("Game {} belongs to partition {}, not partition {}", game_id, game_id % PARTITION_COUNT, partition_id);
@@ -286,7 +301,7 @@ pub async fn run_game_executor(
         
         tokio::spawn(async move {
             // Run the game loop
-            run_game(server_id, game_id, game_state, pubsub, cmd_rx, snap_rx, cancellation_token).await;
+            run_game(server_id, game_id, game_state, pubsub, cmd_rx, snap_rx, db, cancellation_token).await;
             info!("Game {} has ended", game_id);
         });
     };
@@ -330,12 +345,14 @@ pub async fn run_game_executor(
                             StreamEvent::GameCreated { game_id, game_state } => {
                                 info!("Received GameCreated event for game {}", game_id);
                                 let pubsub_clone = pubsub.clone();
+                                let db_clone = db.clone();
                                 let cancellation_token_clone = cancellation_token.clone();
                                 try_start_game(
-                                    game_id, 
-                                    game_state, 
-                                    pubsub_clone, 
-                                    cancellation_token_clone, 
+                                    game_id,
+                                    game_state,
+                                    pubsub_clone,
+                                    db_clone,
+                                    cancellation_token_clone,
                                     &mut game_channels
                                 );
                             }

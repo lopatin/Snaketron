@@ -102,7 +102,7 @@ fn is_within_bounds(pos: &Position, width: i16, height: i16) -> bool {
 
 fn would_collide_with_snake(game_state: &GameState, pos: &Position) -> bool {
     for snake in &game_state.arena.snakes {
-        if snake.is_alive && snake.contains_point(pos) {
+        if snake.is_alive && snake.contains_point(pos, false) {
             return true;
         }
     }

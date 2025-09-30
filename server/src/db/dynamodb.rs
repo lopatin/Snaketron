@@ -435,6 +435,7 @@ impl Database for DynamoDatabase {
         username_item.insert("userId".to_string(), Self::av_n(user_id));
         username_item.insert("passwordHash".to_string(), Self::av_s(password_hash));
         username_item.insert("mmr".to_string(), Self::av_n(mmr));
+        username_item.insert("xp".to_string(), Self::av_n(0));
         
         // This will fail if username already exists
         self.client
@@ -456,6 +457,7 @@ impl Database for DynamoDatabase {
         item.insert("username".to_string(), Self::av_s(username));
         item.insert("passwordHash".to_string(), Self::av_s(password_hash));
         item.insert("mmr".to_string(), Self::av_n(mmr));
+        item.insert("xp".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         
         self.client
@@ -471,6 +473,7 @@ impl Database for DynamoDatabase {
             username: username.to_string(),
             password_hash: password_hash.to_string(),
             mmr,
+            xp: 0,
             created_at: now,
         })
     }
@@ -494,6 +497,7 @@ impl Database for DynamoDatabase {
                     password_hash: Self::extract_string(&item, "passwordHash")
                         .ok_or_else(|| anyhow!("Missing password hash"))?,
                     mmr: Self::extract_number(&item, "mmr").unwrap_or(1000),
+                    xp: Self::extract_number(&item, "xp").unwrap_or(0),
                     created_at: Self::extract_string(&item, "createdAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
@@ -519,7 +523,7 @@ impl Database for DynamoDatabase {
             Some(item) => {
                 let user_id = Self::extract_number(&item, "userId")
                     .ok_or_else(|| anyhow!("Missing user ID"))?;
-                
+
                 // Return user data directly from username table (it has all needed fields)
                 let user = User {
                     id: user_id,
@@ -527,6 +531,7 @@ impl Database for DynamoDatabase {
                     password_hash: Self::extract_string(&item, "passwordHash")
                         .ok_or_else(|| anyhow!("Missing password hash"))?,
                     mmr: Self::extract_number(&item, "mmr").unwrap_or(1000),
+                    xp: Self::extract_number(&item, "xp").unwrap_or(0),
                     created_at: Utc::now(), // Not stored in username table, use current time
                 };
                 Ok(Some(user))
@@ -562,10 +567,47 @@ impl Database for DynamoDatabase {
             .send()
             .await
             .context("Failed to update user MMR in username table")?;
-        
+
         Ok(())
     }
-    
+
+    async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32> {
+        // Atomic ADD operation in DynamoDB main table
+        let response = self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{}", user_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD xp :xp_delta")
+            .expression_attribute_values(":xp_delta", Self::av_n(xp_to_add))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await
+            .context("Failed to add user XP")?;
+
+        // Extract and return new XP total
+        let new_xp = response.attributes
+            .and_then(|attrs| Self::extract_number(&attrs, "xp"))
+            .unwrap_or(xp_to_add);
+
+        // Also update username table for consistency
+        let user = self.get_user_by_id(user_id).await?
+            .ok_or_else(|| anyhow!("User not found"))?;
+
+        self.client
+            .update_item()
+            .table_name(self.usernames_table())
+            .key("username", Self::av_s(&user.username))
+            .update_expression("ADD xp :xp_delta")
+            .expression_attribute_values(":xp_delta", Self::av_n(xp_to_add))
+            .send()
+            .await
+            .context("Failed to update XP in username table")?;
+
+        info!("Added {} XP to user {} (new total: {})", xp_to_add, user_id, new_xp);
+        Ok(new_xp)
+    }
+
     // Game operations
     async fn create_game(
         &self,

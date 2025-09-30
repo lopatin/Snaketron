@@ -20,6 +20,7 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub mmr: i32,
+    pub xp: i32,
     pub created_at: DateTime<Utc>,
 }
 

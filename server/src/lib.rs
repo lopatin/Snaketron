@@ -14,6 +14,7 @@ pub mod ws_matchmaking;
 pub mod redis_keys;
 pub mod redis_utils;
 pub mod db;
+pub mod xp_persistence;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

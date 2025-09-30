@@ -24,7 +24,8 @@ pub trait Database: Send + Sync {
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;
-    
+    async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>;  // Returns new total XP
+
     // Game operations
     async fn create_game(
         &self,

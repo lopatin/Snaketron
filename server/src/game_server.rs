@@ -186,8 +186,9 @@ impl GameServer {
         for partition_id in 0..PARTITION_COUNT {
             let exec_token = cancellation_token.clone();
             let exec_redis_url = redis_url.clone();
+            let exec_db = db.clone();
             let exec_replication_manager = replication_manager.clone();
-            
+
             handles.push(tokio::spawn(async move {
                 info!("Starting cluster singleton for game executor partition {}", partition_id);
                 
@@ -208,20 +209,22 @@ impl GameServer {
                 // Service that runs the game executor for this partition
                 let service = move |token: CancellationToken| {
                     let redis_url_clone = exec_redis_url.clone();
+                    let db_clone = exec_db.clone();
                     let replication_manager_clone = exec_replication_manager.clone();
                     Box::pin(async move {
                         info!("Game executor for partition {} is now active", partition_id);
-                        
+
                         if let Err(e) = run_game_executor(
                             server_id,
                             partition_id,
                             redis_url_clone,
+                            db_clone,
                             replication_manager_clone,
                             token,
                         ).await {
                             error!("Game executor service error for partition {}: {}", partition_id, e);
                         }
-                        
+
                         Ok::<(), anyhow::Error>(())
                     }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
                 };
