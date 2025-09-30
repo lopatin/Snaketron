@@ -40,11 +40,11 @@ async fn test_simple_game() -> Result<()> {
     // Queue for match
     client1.send_message(WSMessage::QueueForMatch {
         game_type: GameType::FreeForAll { max_players: 2 },
-        queue_mode: common::QueueMode::Quickmatch,
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     client2.send_message(WSMessage::QueueForMatch {
         game_type: GameType::FreeForAll { max_players: 2 },
-        queue_mode: common::QueueMode::Quickmatch,
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     println!("Clients queued");

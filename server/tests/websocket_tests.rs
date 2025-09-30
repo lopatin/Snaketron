@@ -90,8 +90,8 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         
         // Queue for match
         let game_type = ::common::GameType::FreeForAll { max_players: 2 };
-        client1.send_message(WSMessage::QueueForMatch { game_type: game_type.clone() }).await?;
-        client2.send_message(WSMessage::QueueForMatch { game_type }).await?;
+        client1.send_message(WSMessage::QueueForMatch { game_type: game_type.clone(), queue_mode: ::common::QueueMode::Quickmatch }).await?;
+        client2.send_message(WSMessage::QueueForMatch { game_type, queue_mode: ::common::QueueMode::Quickmatch }).await?;
         info!("Clients queued for match");
         
         // Wait for automatic match and join

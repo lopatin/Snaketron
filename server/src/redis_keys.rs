@@ -141,7 +141,7 @@ mod tests {
         
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };
-        let queue_key = keys.matchmaking_queue(&game_type);
+        let queue_key = keys.matchmaking_queue(&game_type, &common::QueueMode::Quickmatch);
         assert!(queue_key.starts_with("matchmaking:queue:"));
     }
 }

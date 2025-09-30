@@ -23,12 +23,14 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
     client2.authenticate(env.user_ids()[1]).await?;
     
     // Get matched
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     let game_id = wait_for_match(&mut client1).await?;
@@ -76,12 +78,14 @@ async fn test_cleanup_finished_game() -> Result<()> {
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
     
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     let game_id = wait_for_match(&mut client1).await?;
@@ -129,12 +133,14 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
     client2.authenticate(env.user_ids()[1]).await?;
     
     // Queue for a match that requires 3 players
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 3 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 3 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 3 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 3 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Wait a bit but not long enough to get matched
@@ -171,13 +177,15 @@ async fn test_multiple_games_cleanup() -> Result<()> {
         client1.authenticate(env.user_ids()[i * 2]).await?;
         client2.authenticate(env.user_ids()[i * 2 + 1]).await?;
         
-        client1.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         
-        client2.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         
         let game_id = wait_for_match(&mut client1).await?;
         let _ = wait_for_match(&mut client2).await?;

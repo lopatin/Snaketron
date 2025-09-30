@@ -134,12 +134,14 @@ async fn test_distributed_broker_cross_server() -> Result<()> {
     // In a real distributed system, matchmaking would coordinate across servers
     // For this test, we verify servers can operate independently
     
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 4 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 4 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 4 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 4 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Give matchmaking time to process
@@ -181,12 +183,14 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     
     // Create a match
     println!("test_game_lifecycle_with_cleanup: Queuing players with IDs {} and {}", user1_id, user2_id);
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Wait for match - with auto-joining, we receive the game snapshot directly

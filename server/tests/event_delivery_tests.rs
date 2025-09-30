@@ -30,11 +30,13 @@ async fn test_game_events_delivered() -> Result<()> {
     
     // Create a game through matchmaking
     // Queue both clients for a match
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Wait for match found and join the game
@@ -173,8 +175,9 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     client.authenticate(env.user_ids()[0]).await?;
     
     // Create a game through matchmaking
-    client.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Wait for match found

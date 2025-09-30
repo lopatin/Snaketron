@@ -34,14 +34,16 @@ async fn test_multiple_servers_independent_games() -> Result<()> {
         
         // Queue on this server
         println!("Server {}: Client1 queuing for match", server_idx);
-        client1.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         
         println!("Server {}: Client2 queuing for match", server_idx);
-        client2.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         
         // Wait for matchmaking and game discovery to process
         println!("Server {}: Waiting for matchmaking and game discovery...", server_idx);
@@ -116,9 +118,10 @@ async fn test_server_load_distribution() -> Result<()> {
     
     // Queue all clients for matches with a small delay to avoid race conditions
     for (i, client) in clients_server1.iter_mut().enumerate() {
-        client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         // Add delay after every 2 clients to let matchmaking process
         if i % 2 == 1 {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -126,9 +129,10 @@ async fn test_server_load_distribution() -> Result<()> {
     }
     
     for (i, client) in clients_server2.iter_mut().enumerate() {
-        client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
-        }).await?;
+        client.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
         // Add delay after every 2 clients to let matchmaking process
         if i % 2 == 1 {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -199,13 +203,15 @@ async fn test_cross_server_matchmaking() -> Result<()> {
     
     // Queue both clients for the same game type
     println!("Queueing client1 for match");
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     println!("Queueing client2 for match");
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Wait a bit for matchmaking to process
@@ -270,13 +276,15 @@ async fn test_concurrent_operations_multiple_servers() -> Result<()> {
                     client1.authenticate(user1_id).await?;
                     client2.authenticate(user2_id).await?;
                     
-                    client1.send_message(WSMessage::QueueForMatch { 
-                        game_type: GameType::FreeForAll { max_players: 2 } 
-                    }).await?;
+                    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
                     
-                    client2.send_message(WSMessage::QueueForMatch { 
-                        game_type: GameType::FreeForAll { max_players: 2 } 
-                    }).await?;
+                    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
+    }).await?;
                     
                     // Wait a bit to let matchmaking process this pair
                     tokio::time::sleep(Duration::from_millis(500)).await;

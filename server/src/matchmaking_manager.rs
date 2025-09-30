@@ -368,6 +368,79 @@ impl MatchmakingManager {
 
         Ok(players)
     }
+
+    /// Get the longest waiting users (up to 5000) with their queue timestamps
+    pub async fn get_longest_waiting_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<(QueuedPlayer, i64)>> {
+        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
+
+        // Get oldest 5000 entries (score = timestamp)
+        const MAX_FETCH: isize = 4999; // 0-indexed, so 4999 = 5000 items
+        let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, MAX_FETCH).await?;
+
+        let mut players = Vec::new();
+        for (member_json, timestamp) in members {
+            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
+                players.push((player, timestamp as i64));
+            }
+        }
+
+        Ok(players)
+    }
+
+    /// Get users with lowest MMR (up to 5000)
+    pub async fn get_lowest_mmr_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<u32>> {
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+
+        // Get lowest 5000 MMR entries
+        const MAX_FETCH: isize = 4999;
+        let user_ids: Vec<String> = self.conn.zrange(&mmr_key, 0, MAX_FETCH).await?;
+
+        Ok(user_ids.into_iter()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect())
+    }
+
+    /// Get users with highest MMR (up to 5000)
+    pub async fn get_highest_mmr_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<u32>> {
+        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+
+        // Get highest 5000 MMR entries (reverse range)
+        const MAX_FETCH: isize = 4999;
+        let user_ids: Vec<String> = self.conn.zrevrange(&mmr_key, 0, MAX_FETCH).await?;
+
+        Ok(user_ids.into_iter()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect())
+    }
+
+    /// Batch get user status for multiple users
+    pub async fn batch_get_user_status(&mut self, user_ids: &[u32]) -> Result<Vec<(u32, UserQueueStatus)>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build pipeline to fetch all user statuses
+        let mut pipe = redis::pipe();
+        for user_id in user_ids {
+            let user_key = self.redis_keys.matchmaking_user_status(*user_id);
+            pipe.hget(&user_key, "status");
+        }
+
+        // Execute pipeline
+        let results: Vec<Option<String>> = pipe.query_async(&mut self.conn).await?;
+
+        // Parse results
+        let mut statuses = Vec::new();
+        for (user_id, status_json) in user_ids.iter().zip(results.into_iter()) {
+            if let Some(json) = status_json {
+                if let Ok(status) = serde_json::from_str::<UserQueueStatus>(&json) {
+                    statuses.push((*user_id, status));
+                }
+            }
+        }
+
+        Ok(statuses)
+    }
     
     /// Get players in MMR range (limited to 5000)
     pub async fn get_players_in_mmr_range(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, min_mmr: i32, max_mmr: i32) -> Result<Vec<u32>> {

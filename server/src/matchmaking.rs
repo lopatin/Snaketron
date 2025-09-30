@@ -70,6 +70,8 @@ pub async fn run_matchmaking_loop(
             GameType::TeamMatch { per_team: 3 },
         ];
 
+        let mut total_games_created = 0;
+
         for game_type in &game_types {
             // Clean up expired entries for both queue modes before attempting to create matches
             // Expire entries older than 5 minutes (300 seconds)
@@ -85,48 +87,299 @@ pub async fn run_matchmaking_loop(
                 error!(game_type = ?game_type, error = %e, "Failed to cleanup expired competitive queue entries");
             }
 
-            // Try to create matches for both queue modes
+            // Try to create matches for both queue modes using batch algorithm
             // First try quickmatch
-            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
-                Ok(Some((game_id, players))) => {
+            match create_matches_batch(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
+                Ok(games_count) if games_count > 0 => {
+                    total_games_created += games_count;
                     info!(
-                        game_id,
                         game_type = ?game_type,
                         queue_mode = "quickmatch",
-                        player_count = players.len(),
-                        "Created quickmatch successfully via Redis"
+                        games_count,
+                        "Created quickmatch games via batch matchmaking"
                     );
                 }
-                Ok(None) => {
-                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable match found");
+                Ok(_) => {
+                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable matches found");
                 }
                 Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Redis matchmaking error");
+                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Batch matchmaking error");
                 }
             }
 
             // Then try competitive
-            match create_match(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
-                Ok(Some((game_id, players))) => {
+            match create_matches_batch(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
+                Ok(games_count) if games_count > 0 => {
+                    total_games_created += games_count;
                     info!(
-                        game_id,
                         game_type = ?game_type,
                         queue_mode = "competitive",
-                        player_count = players.len(),
-                        "Created competitive match successfully via Redis"
+                        games_count,
+                        "Created competitive games via batch matchmaking"
                     );
                 }
-                Ok(None) => {
-                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable match found");
+                Ok(_) => {
+                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable matches found");
                 }
                 Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Redis matchmaking error");
+                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Batch matchmaking error");
                 }
             }
+        }
+
+        // If no games were created this round, add a small delay to avoid tight looping
+        if total_games_created == 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
     Ok(())
+}
+
+/// Helper struct to hold player data with time-weighted rank
+#[derive(Debug, Clone)]
+struct RankedPlayer {
+    player: QueuedPlayer,
+    wait_time_ms: i64,
+    time_weighted_rank: f64,
+}
+
+/// Create multiple matches from a batch of players using time-weighted ranking
+async fn create_matches_batch(
+    matchmaking_manager: &mut MatchmakingManager,
+    pubsub: &mut PubSubManager,
+    game_type: GameType,
+    queue_mode: common::QueueMode,
+) -> Result<usize> {
+    let now = Utc::now().timestamp_millis();
+
+    // Step 1: Load 3 batches from Redis
+    let longest_waiting = matchmaking_manager.get_longest_waiting_users(&game_type, &queue_mode).await?;
+    let lowest_mmr_ids = matchmaking_manager.get_lowest_mmr_users(&game_type, &queue_mode).await?;
+    let highest_mmr_ids = matchmaking_manager.get_highest_mmr_users(&game_type, &queue_mode).await?;
+
+    // Step 2: Build combined user set and player map
+    use std::collections::{HashMap, HashSet};
+
+    let mut user_ids_set: HashSet<u32> = HashSet::new();
+    let mut players_map: HashMap<u32, (QueuedPlayer, i64)> = HashMap::new();
+
+    // Add longest waiting users (we already have full data)
+    for (player, timestamp) in longest_waiting {
+        user_ids_set.insert(player.user_id);
+        players_map.insert(player.user_id, (player, timestamp));
+    }
+
+    // Collect user IDs from MMR batches that we don't already have
+    let mut user_ids_to_fetch: Vec<u32> = Vec::new();
+    for user_id in lowest_mmr_ids.into_iter().chain(highest_mmr_ids.into_iter()) {
+        if user_ids_set.insert(user_id) {
+            user_ids_to_fetch.push(user_id);
+        }
+    }
+
+    // Step 3: Batch fetch full data for users from MMR batches
+    if !user_ids_to_fetch.is_empty() {
+        let user_statuses = matchmaking_manager.batch_get_user_status(&user_ids_to_fetch).await?;
+        for (user_id, status) in user_statuses {
+            let player = QueuedPlayer {
+                user_id,
+                mmr: status.mmr,
+                username: status.username,
+            };
+            players_map.insert(user_id, (player, status.request_time));
+        }
+    }
+
+    if players_map.is_empty() {
+        return Ok(0);
+    }
+
+    // Step 4: Calculate time-weighted ranks
+    let avg_mmr: f64 = players_map.values()
+        .map(|(p, _)| p.mmr as f64)
+        .sum::<f64>() / players_map.len() as f64;
+
+    let mut ranked_players: Vec<RankedPlayer> = players_map.into_iter()
+        .map(|(_, (player, timestamp))| {
+            let wait_time_ms = now - timestamp;
+            let wait_seconds = (wait_time_ms as f64) / 1000.0;
+
+            // Time weighting: 0s = 0%, 30s = 50%, 60s+ = 100%
+            let weight = (wait_seconds / 60.0).min(1.0);
+            let time_weighted_rank = (player.mmr as f64) + (avg_mmr - (player.mmr as f64)) * weight;
+
+            RankedPlayer {
+                player,
+                wait_time_ms,
+                time_weighted_rank,
+            }
+        })
+        .collect();
+
+    // Step 5: Sort by time-weighted rank
+    ranked_players.sort_by(|a, b| {
+        a.time_weighted_rank.partial_cmp(&b.time_weighted_rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Step 6: Create as many games as possible
+    let mut games_created = 0;
+
+    // Determine player requirements for this game type
+    let (min_players, max_players_for_game) = match &game_type {
+        GameType::FreeForAll { max_players } => {
+            (MIN_PLAYERS.min(*max_players as usize), *max_players as usize)
+        }
+        GameType::TeamMatch { per_team } => {
+            let total_max = per_team * 2;
+            (MIN_PLAYERS.min(total_max as usize), total_max as usize)
+        }
+        GameType::Solo => {
+            (1, 1)
+        }
+        GameType::Custom { .. } => {
+            (MIN_PLAYERS, MAX_PLAYERS)
+        }
+    };
+
+    // Create games from the sorted list
+    let mut available_players = ranked_players;
+
+    while available_players.len() >= min_players {
+        // Take next batch of players for a game
+        let players_for_game: Vec<QueuedPlayer> = available_players.iter()
+            .take(max_players_for_game)
+            .map(|rp| rp.player.clone())
+            .collect();
+
+        if players_for_game.len() < min_players {
+            break;
+        }
+
+        // Create the game
+        match create_single_game(
+            matchmaking_manager,
+            pubsub,
+            &game_type,
+            &queue_mode,
+            players_for_game,
+            now,
+        ).await {
+            Ok(game_id) => {
+                games_created += 1;
+                info!(game_id, "Created game {} from batch", games_created);
+
+                // Remove matched players from available pool
+                available_players.drain(0..max_players_for_game.min(available_players.len()));
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create game from batch");
+                break;
+            }
+        }
+    }
+
+    Ok(games_created)
+}
+
+/// Create a single game from a specific set of players (helper function)
+async fn create_single_game(
+    matchmaking_manager: &mut MatchmakingManager,
+    pubsub: &mut PubSubManager,
+    game_type: &GameType,
+    queue_mode: &common::QueueMode,
+    matched_players: Vec<QueuedPlayer>,
+    created_at: i64,
+) -> Result<u32> {
+    let user_ids: Vec<u32> = matched_players.iter()
+        .map(|p| p.user_id)
+        .collect();
+
+    // Generate game ID
+    let game_id = matchmaking_manager.generate_game_id().await?;
+    let partition_id = game_id % PARTITION_COUNT;
+
+    // Create game state
+    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
+
+    let (width, height) = match game_type {
+        GameType::TeamMatch { .. } => (60, 40),
+        _ => (40, 40),
+    };
+
+    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
+    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
+
+    // Add players to the game state
+    for player in &matched_players {
+        game_state.add_player(player.user_id, Some(player.username.clone()))?;
+    }
+
+    game_state.spawn_initial_food();
+
+    // Store active match information
+    let match_info = ActiveMatch {
+        players: matched_players.clone(),
+        game_type: game_type.clone(),
+        status: MatchStatus::Waiting,
+        partition_id,
+        created_at,
+    };
+    matchmaking_manager.store_active_match(game_id, match_info).await?;
+
+    // Send match notifications
+    let redis_keys = crate::redis_keys::RedisKeys::new();
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+    if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+        if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
+            for user_id in &user_ids {
+                let channel = redis_keys.matchmaking_notification_channel(*user_id);
+                let notification = serde_json::json!({
+                    "type": "MatchFound",
+                    "game_id": game_id,
+                    "partition_id": partition_id
+                });
+
+                let _: Result<i32, _> = redis::cmd("PUBLISH")
+                    .arg(&channel)
+                    .arg(notification.to_string())
+                    .query_async(&mut conn).await;
+            }
+        }
+    }
+
+    // Remove players from queue
+    matchmaking_manager.remove_players_from_queue(game_type, queue_mode, &user_ids).await?;
+
+    // Publish game events
+    let event = StreamEvent::GameCreated {
+        game_id,
+        game_state: game_state.clone(),
+    };
+
+    pubsub.publish_snapshot(partition_id, game_id, &game_state).await
+        .context("Failed to publish initial game snapshot")?;
+
+    let serialized = serde_json::to_vec(&event)
+        .context("Failed to serialize GameCreated event")?;
+    pubsub.publish_command(partition_id, &serialized).await
+        .context("Failed to publish GameCreated event")?;
+
+    let avg_mmr = matched_players.iter()
+        .map(|p| p.mmr)
+        .sum::<i32>() / matched_players.len() as i32;
+
+    info!(
+        game_id,
+        player_count = matched_players.len(),
+        avg_mmr,
+        "Batch match created"
+    );
+
+    Ok(game_id)
 }
 
 /// Create an adaptive match

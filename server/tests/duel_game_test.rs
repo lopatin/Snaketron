@@ -38,11 +38,13 @@ async fn test_duel_game() -> Result<()> {
     println!("Clients authenticated");
     
     // Queue for match - TeamMatch with 1 per team (duel mode)
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::TeamMatch { per_team: 1 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::TeamMatch { per_team: 1 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::TeamMatch { per_team: 1 } 
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::TeamMatch { per_team: 1 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     println!("Clients queued for duel mode");

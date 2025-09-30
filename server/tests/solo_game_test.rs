@@ -34,8 +34,9 @@ async fn test_solo_game() -> Result<()> {
     println!("Client authenticated");
     
     // Queue for a solo match (max_players: 1)
-    client.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 1 } 
+    client.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 1 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     println!("Client queued for solo game");

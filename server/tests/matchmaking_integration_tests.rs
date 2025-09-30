@@ -51,13 +51,15 @@ async fn test_simple_two_player_match() -> Result<()> {
     println!("Clients authenticated. User IDs: {:?}", env.user_ids());
     
     // Queue for match with just 2 players max
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     println!("Client 1 queued for match");
-    
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     println!("Client 2 queued for match");
     
@@ -128,12 +130,14 @@ async fn test_basic_matchmaking() -> Result<()> {
     client2.authenticate(env.user_ids()[1]).await?;
     
     // Queue for match
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
-    
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Both should receive MatchFound
@@ -160,8 +164,9 @@ async fn test_leave_queue() -> Result<()> {
     client.authenticate(env.user_ids()[0]).await?;
     
     // Queue and immediately leave
-    client.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -197,8 +202,9 @@ async fn test_team_matchmaking() -> Result<()> {
     
     // All queue for match
     for client in &mut clients {
-        client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 4 } 
+        client.send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 4 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
     }
     
@@ -254,8 +260,9 @@ async fn test_concurrent_matchmaking() -> Result<()> {
     
     // Queue all clients for match
     for (i, client) in clients.iter_mut().enumerate() {
-        client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
+        client.send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
         println!("Client {} queued for match", i);
     }
@@ -318,12 +325,14 @@ async fn test_disconnect_during_queue() -> Result<()> {
     client2.authenticate(env.user_ids()[1]).await?;
     
     // Both queue
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 3 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 3 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
-    
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 3 } 
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 3 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Client1 disconnects while in queue
@@ -372,12 +381,14 @@ async fn test_rejoin_active_game() -> Result<()> {
     client2.authenticate(env.user_ids()[1]).await?;
     
     // Get matched
-    client1.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
-    
-    client2.send_message(WSMessage::QueueForMatch { 
-        game_type: GameType::FreeForAll { max_players: 2 } 
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Quickmatch,
     }).await?;
     
     // Both get matched and auto-joined (wait_for_match now waits for the snapshot)
@@ -493,8 +504,9 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     // Queue clients in pairs to ensure proper MMR-based matching
     // Queue first pair (lowest MMR)
     for i in 0..2 {
-        clients[i].send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
+        clients[i].send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
         println!("Client {} (MMR {}) queued", i, match i {
             0 => 1400, 1 => 1420, _ => 0
@@ -506,8 +518,9 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     
     // Queue second pair (medium MMR)
     for i in 2..4 {
-        clients[i].send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
+        clients[i].send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
         println!("Client {} (MMR {}) queued", i, match i {
             2 => 1480, 3 => 1500, _ => 0
@@ -519,8 +532,9 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     
     // Queue third pair (highest MMR)
     for i in 4..6 {
-        clients[i].send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
+        clients[i].send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
         println!("Client {} (MMR {}) queued", i, match i {
             4 => 1580, 5 => 1600, _ => 0
@@ -606,8 +620,9 @@ async fn test_matchmaking_load() -> Result<()> {
     // Queue all clients with a small delay between each to avoid overwhelming the system
     println!("Queuing all {} clients...", USER_COUNT);
     for (i, client) in clients.iter_mut().enumerate() {
-        client.send_message(WSMessage::QueueForMatch { 
-            game_type: GameType::FreeForAll { max_players: 2 } 
+        client.send_message(WSMessage::QueueForMatch {
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: ::common::QueueMode::Quickmatch,
         }).await?;
         println!("Client {} queued", i);
         // Small delay to avoid overwhelming the matchmaking system
