@@ -252,7 +252,20 @@ export const useGameEngine = ({
 
       if (engineRef.current) {
         console.log('Processing server event:', fullEventMessage);
+
+        // // DEBUG: Log XPAwarded events specifically
+        // if (fullEventMessage.event && 'XPAwarded' in fullEventMessage.event) {
+        //   console.log('🎯 Received XPAwarded event:', fullEventMessage.event.XPAwarded);
+        // }
+
         engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
+
+        // DEBUG: Log state after processing XPAwarded
+        // if (fullEventMessage.event && 'XPAwarded' in fullEventMessage.event) {
+        //   const committedState = JSON.parse(engineRef.current.getCommittedStateJson());
+        //   console.log('🎯 After processing XPAwarded, committed state player_xp:', committedState.player_xp);
+        // }
+
         console.log('Current game status:', engineRef.current.getCommittedStateJson());
       } else {
         console.error('Game engine not initialized, cannot process server event:', fullEventMessage);

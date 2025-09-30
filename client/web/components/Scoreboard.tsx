@@ -240,22 +240,33 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUs
     });
   };
   
-  // Calculate game stats (XP, enemy food eaten)
+  // Calculate game stats (XP from server, enemy food eaten)
   const calculateGameStats = () => {
     const stats = getSnakeStats();
     const currentPlayer = stats.find(s => s.isCurrentPlayer);
-    
+
     if (!currentPlayer) return { xpGained: 0, foodEaten: 0, enemyFoodEaten: 0 };
-    
-    // Calculate XP (base on performance)
-    let xpGained = 10; // Base XP for playing
-    if (currentPlayer.isWinner) xpGained += 50; // Bonus for winning
-    xpGained += currentPlayer.foodEaten * 5; // 5 XP per food
-    
+
+    // DEBUG: Log what we're checking
+    // console.log('=== XP Debug ===');
+    // console.log('currentPlayer.userId:', currentPlayer.userId);
+    // console.log('gameState:', gameState);
+    // console.log('gameState?.player_xp:', gameState?.player_xp);
+    // console.log('Type of player_xp:', typeof gameState?.player_xp);
+    // console.log('Keys in player_xp:', gameState?.player_xp ? Object.keys(gameState.player_xp) : 'undefined');
+
+    // Get actual XP from server (player_xp map uses user_id as key)
+    const xpGained = currentPlayer.userId && gameState?.player_xp
+      ? (gameState.player_xp[currentPlayer.userId] || 0)
+      : 0;
+
+    // console.log('Calculated xpGained:', xpGained);
+    // console.log('================');
+
     // Calculate enemy food eaten (in multiplayer, count kills as "enemy food")
     // For now, we'll estimate based on whether enemies died
     const enemyFoodEaten = stats.filter(s => !s.isCurrentPlayer && !s.snake.is_alive).length;
-    
+
     return {
       xpGained,
       foodEaten: currentPlayer.foodEaten,

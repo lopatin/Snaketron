@@ -1080,14 +1080,7 @@ impl GameState {
                                 .find(|(_, s)| s.team_id == Some(winning_team_id))
                                 .map(|(idx, _)| idx as u32);
 
-                            self.apply_event(
-                                GameEvent::StatusUpdated {
-                                    status: GameStatus::Complete { winning_snake_id }
-                                },
-                                Some(&mut out)
-                            );
-
-                            // Calculate and emit XP for all players
+                            // Calculate and emit XP for all players BEFORE Complete status
                             let mut player_xp_awards = HashMap::new();
                             for (user_id, player) in &self.players {
                                 let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
@@ -1101,6 +1094,13 @@ impl GameState {
 
                             self.apply_event(
                                 GameEvent::XPAwarded { player_xp: player_xp_awards },
+                                Some(&mut out)
+                            );
+
+                            self.apply_event(
+                                GameEvent::StatusUpdated {
+                                    status: GameStatus::Complete { winning_snake_id }
+                                },
                                 Some(&mut out)
                             );
                         } else {
@@ -1273,14 +1273,8 @@ impl GameState {
                 } else {
                     // Non-team games: end normally
                     let winning_snake_id = alive_snakes.first().copied();
-                    self.apply_event(
-                        GameEvent::StatusUpdated {
-                            status: GameStatus::Complete { winning_snake_id }
-                        },
-                        Some(&mut out)
-                    );
 
-                    // Calculate and emit XP for all players
+                    // Calculate and emit XP for all players BEFORE Complete status
                     let mut player_xp_awards = HashMap::new();
                     for (user_id, player) in &self.players {
                         let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
@@ -1293,6 +1287,13 @@ impl GameState {
 
                     self.apply_event(
                         GameEvent::XPAwarded { player_xp: player_xp_awards },
+                        Some(&mut out)
+                    );
+
+                    self.apply_event(
+                        GameEvent::StatusUpdated {
+                            status: GameStatus::Complete { winning_snake_id }
+                        },
                         Some(&mut out)
                     );
                 }
@@ -1483,7 +1484,9 @@ impl GameState {
             }
 
             GameEvent::XPAwarded { player_xp } => {
+                eprintln!("APPLYING XPAwarded event: {:?}", player_xp);
                 self.player_xp = player_xp;
+                eprintln!("GameState.player_xp after applying: {:?}", self.player_xp);
             }
         }
 

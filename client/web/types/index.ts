@@ -74,6 +74,9 @@ export interface GameState {
   rounds_to_win: number;                     // 1 for quick match, 2 for competitive
   round_start_times: number[];              // Start time of each round (ms timestamps)
   is_transitioning: boolean;                // True during round transitions
+
+  // XP tracking (only present after game completion)
+  player_xp?: Record<number, number>;       // user_id -> xp_gained
 }
 
 export type GameStatus = 
