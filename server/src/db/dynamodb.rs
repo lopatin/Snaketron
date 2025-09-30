@@ -9,7 +9,6 @@ use aws_sdk_dynamodb::Client;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, info, warn};
 
 use super::models::*;
@@ -18,8 +17,6 @@ use super::Database;
 pub struct DynamoDatabase {
     client: Client,
     table_prefix: String,
-    // Simple ID generation for demo - in production use DynamoDB atomic counters or UUIDs
-    next_id: AtomicI32,
 }
 
 impl DynamoDatabase {
@@ -35,7 +32,6 @@ impl DynamoDatabase {
         let db = Self {
             client,
             table_prefix,
-            next_id: AtomicI32::new(1000),
         };
         
         // Ensure all required tables exist
@@ -263,8 +259,49 @@ impl DynamoDatabase {
         Ok(())
     }
     
-    fn generate_id(&self) -> i32 {
-        self.next_id.fetch_add(1, Ordering::SeqCst)
+    async fn generate_id_for_entity(&self, entity_type: &str) -> Result<i32> {
+        // Use DynamoDB atomic counter to generate unique IDs
+        // Counter is stored with pk="COUNTER" and sk=entity_type (e.g., "USER", "SERVER", "GAME", "LOBBY")
+        let response = self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s("COUNTER"))
+            .key("sk", Self::av_s(entity_type))
+            .update_expression("ADD #counter :increment")
+            .expression_attribute_names("#counter", "counter")
+            .expression_attribute_values(":increment", Self::av_n(1))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await
+            .context(format!("Failed to generate ID for {}", entity_type))?;
+
+        // Extract the new counter value
+        let counter = response.attributes
+            .and_then(|attrs| Self::extract_number(&attrs, "counter"))
+            .ok_or_else(|| anyhow!("Failed to extract counter value"))?;
+
+        // If this is the first time (counter was 1), initialize it to 1000
+        // This ensures we start at 1000 like the old in-memory counter
+        let final_id = if counter == 1 {
+            // Set counter to 1000
+            self.client
+                .update_item()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s("COUNTER"))
+                .key("sk", Self::av_s(entity_type))
+                .update_expression("SET #counter = :init_value")
+                .expression_attribute_names("#counter", "counter")
+                .expression_attribute_values(":init_value", Self::av_n(1000))
+                .send()
+                .await
+                .context(format!("Failed to initialize counter for {}", entity_type))?;
+            1000
+        } else {
+            counter
+        };
+
+        debug!("Generated ID {} for entity type {}", final_id, entity_type);
+        Ok(final_id)
     }
     
     fn av_s(s: impl Into<String>) -> AttributeValue {
@@ -298,7 +335,7 @@ impl DynamoDatabase {
 impl Database for DynamoDatabase {
     // Server operations
     async fn register_server(&self, grpc_address: &str, region: &str) -> Result<i32> {
-        let server_id = self.generate_id();
+        let server_id = self.generate_id_for_entity("SERVER").await?;
         let now = Utc::now();
         
         let mut item = HashMap::new();
@@ -426,7 +463,7 @@ impl Database for DynamoDatabase {
     
     // User operations
     async fn create_user(&self, username: &str, password_hash: &str, mmr: i32) -> Result<User> {
-        let user_id = self.generate_id();
+        let user_id = self.generate_id_for_entity("USER").await?;
         let now = Utc::now();
         
         // First, try to create username entry (for uniqueness)
@@ -617,7 +654,7 @@ impl Database for DynamoDatabase {
         is_private: bool,
         game_code: Option<&str>,
     ) -> Result<i32> {
-        let game_id = self.generate_id();
+        let game_id = self.generate_id_for_entity("GAME").await?;
         let now = Utc::now();
         
         // If game code provided, register it first
@@ -810,7 +847,7 @@ impl Database for DynamoDatabase {
         host_user_id: i32,
         settings: &JsonValue,
     ) -> Result<i32> {
-        let lobby_id = self.generate_id();
+        let lobby_id = self.generate_id_for_entity("LOBBY").await?;
         let now = Utc::now();
         let expires_at = now + chrono::Duration::hours(1);
         
