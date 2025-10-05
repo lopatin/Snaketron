@@ -52,7 +52,7 @@ export const ConnectionIndicator = ({ className = '', isConnected = false }) => 
   <div
     className={`w-2 h-2 rounded-full ${className}`}
     style={{
-      backgroundColor: isConnected ? '#22c55e' : '#9ca3af'
+      backgroundColor: isConnected ? '#22c55e' : '#d1d5db'
     }}
   />
 );

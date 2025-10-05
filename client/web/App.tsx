@@ -30,12 +30,10 @@ function Header() {
 
   // Dummy region data - replace with real data from backend later
   const [regions] = useState<Region[]>([
-    { id: 'us-east', name: 'US East', userCount: 1247, ping: 23, isConnected: true },
-    { id: 'us-west', name: 'US West', userCount: 892, ping: 67, isConnected: false },
+    { id: 'us', name: 'US', userCount: 1247, ping: 23, isConnected: true },
     { id: 'europe', name: 'Europe', userCount: 2341, ping: 112, isConnected: false },
-    { id: 'asia', name: 'Asia', userCount: 1567, ping: 156, isConnected: false },
   ]);
-  const [currentRegionId, setCurrentRegionId] = useState('us-east');
+  const [currentRegionId, setCurrentRegionId] = useState('us');
 
   const handleRegionChange = (regionId: string) => {
     setCurrentRegionId(regionId);

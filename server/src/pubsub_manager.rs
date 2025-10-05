@@ -155,7 +155,7 @@ impl PubSubManager {
         let request_channel = self.redis_keys.snapshot_requests(partition_id);
         
         // Create channels for receiving messages
-        let (event_tx, event_rx) = mpsc::channel(1000);
+        let (event_tx, event_rx) = mpsc::channel(100);
         let (command_tx, command_rx) = mpsc::channel(100);
         let (request_tx, request_rx) = mpsc::channel(100);
         
@@ -217,19 +217,45 @@ async fn handle_partition_subscription(
         .context("Failed to subscribe to request channel")?;
     
     info!("Subscribed to partition channels: {}, {} and {}", event_channel, command_channel, request_channel);
-    
+
+    let mut message_count = 0u64;
+    let mut event_count = 0u64;
+    let mut command_count = 0u64;
+    let mut request_count = 0u64;
+    let mut last_heartbeat = tokio::time::Instant::now();
+
     // Process messages
     loop {
-        let msg = pubsub.on_message().next().await.unwrap();
+        let msg = match pubsub.on_message().next().await {
+            Some(msg) => msg,
+            None => {
+                error!("PubSub stream ended unexpectedly for channels: {}, {}, {}",
+                    event_channel, command_channel, request_channel);
+                break;
+            }
+        };
+
         match msg.get_channel_name() {
             name if name == event_channel => {
                 let payload: Vec<u8> = msg.get_payload()
                     .context("Failed to get event payload")?;
                 match serde_json::from_slice::<GameEventMessage>(&payload) {
                     Ok(event) => {
-                        if event_tx.send(event).await.is_err() {
-                            warn!("Event receiver dropped, stopping subscription");
-                            break;
+                        event_count += 1;
+                        if let Err(e) = event_tx.try_send(event.clone()) {
+                            match e {
+                                mpsc::error::TrySendError::Full(_) => {
+                                    warn!("Event channel full (capacity 100), blocking send for game {}", event.game_id);
+                                    if event_tx.send(event).await.is_err() {
+                                        error!("Event receiver dropped while blocked on full channel, stopping subscription");
+                                        break;
+                                    }
+                                }
+                                mpsc::error::TrySendError::Closed(_) => {
+                                    warn!("Event receiver dropped, stopping subscription");
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -240,9 +266,21 @@ async fn handle_partition_subscription(
             name if name == command_channel => {
                 let payload: Vec<u8> = msg.get_payload()
                     .context("Failed to get command payload")?;
-                if command_tx.send(payload).await.is_err() {
-                    warn!("Command receiver dropped, stopping subscription");
-                    break;
+                command_count += 1;
+                if let Err(e) = command_tx.try_send(payload.clone()) {
+                    match e {
+                        mpsc::error::TrySendError::Full(_) => {
+                            warn!("Command channel full (capacity 100), blocking send");
+                            if command_tx.send(payload).await.is_err() {
+                                error!("Command receiver dropped while blocked on full channel, stopping subscription");
+                                break;
+                            }
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            warn!("Command receiver dropped, stopping subscription");
+                            break;
+                        }
+                    }
                 }
             }
             name if name == request_channel => {
@@ -250,9 +288,21 @@ async fn handle_partition_subscription(
                     .context("Failed to get request payload")?;
                 match serde_json::from_slice::<SnapshotRequest>(&payload) {
                     Ok(request) => {
-                        if request_tx.send(request).await.is_err() {
-                            warn!("Request receiver dropped, stopping subscription");
-                            break;
+                        request_count += 1;
+                        if let Err(e) = request_tx.try_send(request.clone()) {
+                            match e {
+                                mpsc::error::TrySendError::Full(_) => {
+                                    warn!("Request channel full (capacity 100), blocking send");
+                                    if request_tx.send(request).await.is_err() {
+                                        error!("Request receiver dropped while blocked on full channel, stopping subscription");
+                                        break;
+                                    }
+                                }
+                                mpsc::error::TrySendError::Closed(_) => {
+                                    warn!("Request receiver dropped, stopping subscription");
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -264,7 +314,18 @@ async fn handle_partition_subscription(
                 warn!("Received message on unexpected channel");
             }
         }
+
+        message_count += 1;
+
+        // Log heartbeat every 30 seconds
+        if last_heartbeat.elapsed().as_secs() >= 30 {
+            debug!("Subscription handler alive for channels: {}, {}, {} (total: {}, events: {}, commands: {}, requests: {})",
+                event_channel, command_channel, request_channel, message_count, event_count, command_count, request_count);
+            last_heartbeat = tokio::time::Instant::now();
+        }
     }
-    
+
+    warn!("Partition subscription handler exiting for channels: {}, {}, {}",
+        event_channel, command_channel, request_channel);
     Ok(())
 }

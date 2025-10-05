@@ -41,15 +41,23 @@ impl FilteredEventReceiver {
     /// Receive the next event that passes the filter
     pub async fn recv(&mut self) -> Result<GameEventMessage, broadcast::error::RecvError> {
         loop {
-            let event = self.inner.recv().await?;
-            
+            let event = match self.inner.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("Broadcast receiver for game {} lagged and skipped {} messages - receiver too slow!",
+                        self.game_id, skipped);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
             // Only forward events after our snapshot sequence
             if event.sequence > self.min_sequence {
-                debug!("Forwarding event for game {} with sequence {} (min_sequence: {})", 
+                debug!("Forwarding event for game {} with sequence {} (min_sequence: {})",
                     self.game_id, event.sequence, self.min_sequence);
                 return Ok(event);
             } else {
-                debug!("Filtering out stale event for game {} with sequence {} (min_sequence: {})", 
+                debug!("Filtering out stale event for game {} with sequence {} (min_sequence: {})",
                     self.game_id, event.sequence, self.min_sequence);
                 // Continue to next event
             }
@@ -130,8 +138,17 @@ impl PartitionReplica {
         {
             let broadcasters = self.game_event_broadcasters.read().await;
             if let Some(sender) = broadcasters.get(&game_id) {
-                // Ignore send errors (means no receivers)
-                let _ = sender.send(event_msg);
+                match sender.send(event_msg.clone()) {
+                    Ok(receiver_count) => {
+                        if receiver_count == 0 {
+                            debug!("No receivers for game {} broadcast", game_id);
+                        }
+                    }
+                    Err(_) => {
+                        // This shouldn't happen with broadcast channels, but log if it does
+                        warn!("Failed to broadcast event for game {} - channel may be closed", game_id);
+                    }
+                }
             }
         }
         
@@ -145,12 +162,20 @@ impl PartitionReplica {
         
         // Subscribe to the partition
         let mut pubsub = self.pubsub.lock().await;
-        let mut subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
-        
+        let subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
+
         // Request initial snapshots for this partition
         pubsub.request_partition_snapshots(self.partition_id).await?;
         drop(pubsub); // Release lock
-        
+
+        // Destructure subscription so each receiver can be borrowed independently in select!
+        let crate::pubsub_manager::PartitionSubscription {
+            partition_id: _,
+            mut event_receiver,
+            mut command_receiver,
+            mut snapshot_request_receiver,
+        } = subscription;
+
         // Mark as ready immediately (no catch-up needed with PubSub)
         self.status.write().await.is_ready = true;
 
@@ -158,17 +183,38 @@ impl PartitionReplica {
         loop {
             tokio::select! {
                 biased;
-                
+
                 _ = self.cancellation_token.cancelled() => {
                     info!("Replication worker for partition {} shutting down", self.partition_id);
                     break;
                 }
-                
+
                 // Process events from partition subscription
-                Some(event) = subscription.recv_event() => {
-                    if let Err(e) = self.process_event(event).await {
-                        error!("Failed to process event in partition {}: {}", self.partition_id, e);
+                event = event_receiver.recv() => {
+                    match event {
+                        Some(event) => {
+                            if let Err(e) = self.process_event(event).await {
+                                error!("Failed to process event in partition {}: {}", self.partition_id, e);
+                            }
+                        }
+                        None => {
+                            error!("Partition {} subscription closed unexpectedly, replication worker exiting",
+                                self.partition_id);
+                            break;
+                        }
                     }
+                }
+
+                // Drain commands (processed by game executor, not used here)
+                Some(_) = command_receiver.recv() => {
+                    // Commands are handled by the game executor, we just drain them
+                    // to prevent the channel from filling up and blocking the PubSub handler
+                }
+
+                // Drain snapshot requests (processed by game executor, not used here)
+                Some(_) = snapshot_request_receiver.recv() => {
+                    // Snapshot requests are handled by the game executor, we just drain them
+                    // to prevent the channel from filling up and blocking the PubSub handler
                 }
             }
         }

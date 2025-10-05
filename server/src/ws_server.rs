@@ -459,7 +459,21 @@ async fn subscribe_to_game_events(
         event: GameEvent::Snapshot { game_state: game_state.clone() },
     };
     let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
-    let _ = ws_tx.send(Message::Text(json.into())).await;
+    if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
+        match e {
+            mpsc::error::TrySendError::Full(msg) => {
+                warn!("WebSocket send channel full (capacity 1024) for game {}, blocking send", game_id);
+                if ws_tx.send(msg).await.is_err() {
+                    error!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                    return;
+                }
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                return;
+            }
+        }
+    }
 
     while let Ok(event_msg) = rx.recv().await {
         // Check if the game has ended
@@ -468,14 +482,37 @@ async fn subscribe_to_game_events(
                 info!("Game {} completed, stopping event subscription", game_id);
                 // Send the final event before breaking
                 let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
-                let _ = ws_tx.send(Message::Text(json.into())).await;
+                if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
+                    match e {
+                        mpsc::error::TrySendError::Full(msg) => {
+                            warn!("WebSocket send channel full on game complete for game {}, blocking send", game_id);
+                            let _ = ws_tx.send(msg).await;
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            debug!("WebSocket send channel closed on game complete for game {}", game_id);
+                        }
+                    }
+                }
                 break;
             }
         }
 
         let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
-        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-            break;
+        let msg = Message::Text(json.into());
+        if let Err(e) = ws_tx.try_send(msg.clone()) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    warn!("WebSocket send channel full for game {}, blocking send", game_id);
+                    if ws_tx.send(msg).await.is_err() {
+                        debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                        break;
+                    }
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                    break;
+                }
+            }
         }
     }
 }

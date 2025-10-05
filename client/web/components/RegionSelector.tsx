@@ -45,6 +45,12 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
         className="text-sm text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors flex items-center gap-2"
       >
         {currentRegion?.name || 'Select Region'}
+        {currentRegion && (
+          <div className="flex items-center gap-1" style={{ letterSpacing: '0' }}>
+            <UserIcon className="w-3 h-3 text-gray-500" />
+            <span className="tabular-nums">{currentRegion.userCount}</span>
+          </div>
+        )}
         <svg
           className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`}
           fill="none"
@@ -67,20 +73,22 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
           }}
         >
           {regions.map((region, index) => (
-            <div key={region.id}>
+            <div
+              key={region.id}
+              style={{
+                boxShadow: index < regions.length - 1 ? 'inset 0 -0.5px 0 0 rgba(0, 0, 0, 0.1)' : 'none'
+              }}
+            >
               <button
                 onClick={() => handleRegionSelect(region.id)}
-                className="w-full px-4 py-2 flex items-center gap-3 hover:bg-gray-50 transition-colors text-left cursor-pointer"
-                style={{
-                  borderBottom: index < regions.length - 1 ? '0.5px solid rgba(0, 0, 0, 0.1)' : 'none'
-                }}
+                className="group w-full px-4 py-2 flex items-center gap-3 text-left cursor-pointer"
               >
                 {/* Connection Indicator */}
                 <ConnectionIndicator isConnected={region.isConnected} className="flex-shrink-0" />
 
                 {/* Region Name */}
                 <div className="flex-1">
-                  <div className="text-sm font-bold text-black-70 uppercase tracking-1">
+                  <div className="text-sm font-bold text-black-70 uppercase tracking-1 group-hover:text-black transition-colors">
                     {region.name}
                   </div>
                 </div>
