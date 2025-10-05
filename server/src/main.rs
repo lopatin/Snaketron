@@ -7,6 +7,7 @@ use server::ws_server::TestJwtVerifier;
 use server::api::jwt::{JwtManager, ProductionJwtVerifier};
 use server::http_server::run_http_server;
 use server::db::{Database, dynamodb::DynamoDatabase};
+use server::region_cache::RegionCache;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,6 +37,13 @@ async fn main() -> Result<()> {
             .context("Failed to initialize DynamoDB client")?
     );
     info!("DynamoDB client initialized");
+
+    // Create RegionCache for dynamic region discovery
+    let aws_config = aws_config::load_from_env().await;
+    let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
+    let table_prefix = env::var("DYNAMODB_TABLE_PREFIX")
+        .unwrap_or_else(|_| "snaketron".to_string());
+    let region_cache = Arc::new(RegionCache::new(dynamodb_client, table_prefix));
 
     let region = env::var("SNAKETRON_REGION")
         .context("SNAKETRON_REGION environment variable is required")?;
@@ -91,12 +99,22 @@ async fn main() -> Result<()> {
         .context("SNAKETRON_REDIS_URL environment variable is required")?;
     info!("Redis leader election enabled at {}", redis_url);
 
+    // Calculate origin and WebSocket URL for client connections
+    let origin = env::var("SNAKETRON_ORIGIN").unwrap_or_else(|_| {
+        format!("http://localhost:{}", http_port)
+    });
+    let ws_url = env::var("SNAKETRON_WS_URL").unwrap_or_else(|_| {
+        format!("ws://localhost:{}/ws", http_port)
+    });
+
     // Create server configuration
     let config = GameServerConfig {
         db: db.clone(),
         http_addr: http_addr.clone(),
         grpc_addr,
         region: region.clone(),
+        origin: origin.clone(),
+        ws_url: ws_url.clone(),
         jwt_verifier: jwt_verifier.clone(),
         replay_dir,
         redis_url: redis_url.clone(),
@@ -110,6 +128,12 @@ async fn main() -> Result<()> {
         info!("gRPC server listening on: {}", grpc_addr);
     }
 
+    // Start region cache refresh task
+    let region_cache_clone = region_cache.clone();
+    let cache_cancellation_token = game_server.cancellation_token().clone();
+    region_cache_clone.spawn_refresh_task(cache_cancellation_token);
+    info!("Region cache refresh task started");
+
     // Start the unified HTTP server (API + WebSocket)
     let http_db = db.clone();
     let http_jwt_verifier = jwt_verifier.clone();
@@ -120,6 +144,7 @@ async fn main() -> Result<()> {
     let http_cancellation_token = game_server.cancellation_token().clone();
     let http_server_id = game_server.id();
     let http_region = region;
+    let http_region_cache = region_cache.clone();
     let http_handle = tokio::spawn(async move {
         if let Err(e) = run_http_server(
             &http_addr,
@@ -131,6 +156,7 @@ async fn main() -> Result<()> {
             http_cancellation_token,
             http_server_id,
             http_region,
+            http_region_cache,
         ).await {
             tracing::error!("HTTP server error: {}", e);
         }

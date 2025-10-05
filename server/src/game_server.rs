@@ -34,6 +34,10 @@ pub struct GameServerConfig {
     pub grpc_addr: String,
     /// Region identifier for the server
     pub region: String,
+    /// HTTP origin for client connections (e.g., "http://localhost:8080")
+    pub origin: String,
+    /// WebSocket URL for client connections (e.g., "ws://localhost:8080/ws")
+    pub ws_url: String,
     /// JWT verifier for authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
     /// Optional directory for saving game replays
@@ -88,6 +92,8 @@ impl GameServer {
             http_addr,
             grpc_addr,
             region,
+            origin,
+            ws_url,
             jwt_verifier,
             replay_dir,
             redis_url,
@@ -95,7 +101,7 @@ impl GameServer {
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
-        let server_id = db.register_server(&grpc_addr, &region).await
+        let server_id = db.register_server(&grpc_addr, &region, &origin, &ws_url).await
             .context("Failed to register server")? as u64;
         info!("Server registered with ID: {}", server_id);
 
@@ -352,9 +358,11 @@ pub async fn start_test_server_with_grpc(
 
     let config = GameServerConfig {
         db,
-        http_addr,
+        http_addr: http_addr.clone(),
         grpc_addr,
         region: "test-region".to_string(),
+        origin: format!("http://{}", http_addr),
+        ws_url: format!("ws://{}/ws", http_addr),
         jwt_verifier,
         replay_dir,
         redis_url: "redis://127.0.0.1:6379/1".to_string(),

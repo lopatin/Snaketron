@@ -19,6 +19,7 @@ use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 use crate::replication::ReplicationManager;
+use crate::region_cache::RegionCache;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -43,6 +44,8 @@ pub struct HttpServerState {
     pub server_id: u64,
     /// Region name for Redis metrics
     pub region: String,
+    /// Region cache for dynamic region discovery
+    pub region_cache: Arc<RegionCache>,
 }
 
 /// Run the combined HTTP server with both API and WebSocket endpoints
@@ -56,6 +59,7 @@ pub async fn run_http_server(
     cancellation_token: tokio_util::sync::CancellationToken,
     server_id: u64,
     region: String,
+    region_cache: Arc<RegionCache>,
 ) -> Result<()> {
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     let connection_count = Arc::new(AtomicUsize::new(0));
@@ -71,6 +75,7 @@ pub async fn run_http_server(
         connection_count: connection_count.clone(),
         server_id,
         region: region.clone(),
+        region_cache,
     };
 
     // Start background task to update user count in Redis every 5 seconds

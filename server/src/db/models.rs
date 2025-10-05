@@ -8,6 +8,8 @@ pub struct Server {
     pub grpc_address: String,
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub region: String,
+    pub origin: String,      // HTTP origin e.g., "http://localhost:8080"
+    pub ws_url: String,      // WebSocket URL e.g., "ws://localhost:8080/ws"
     pub created_at: DateTime<Utc>,
     pub status: String,
     pub current_game_count: i32,

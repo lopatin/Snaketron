@@ -984,11 +984,11 @@ async fn process_ws_message(
 
 
 
-pub async fn register_server(db: &Arc<dyn Database>, grpc_address: &str, region: &str) -> Result<u64> {
+pub async fn register_server(db: &Arc<dyn Database>, grpc_address: &str, region: &str, origin: &str, ws_url: &str) -> Result<u64> {
     info!("Registering server instance");
 
     // Insert a new record and return the generated ID
-    let id = db.register_server(grpc_address, region)
+    let id = db.register_server(grpc_address, region, origin, ws_url)
         .await
         .context("Failed to register server in database")?;
 

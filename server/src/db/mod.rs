@@ -13,7 +13,7 @@ use models::*;
 #[async_trait]
 pub trait Database: Send + Sync {
     // Server operations
-    async fn register_server(&self, grpc_address: &str, region: &str) -> Result<i32>;
+    async fn register_server(&self, grpc_address: &str, region: &str, origin: &str, ws_url: &str) -> Result<i32>;
     async fn update_server_heartbeat(&self, server_id: i32) -> Result<()>;
     async fn update_server_status(&self, server_id: i32, status: &str) -> Result<()>;
     async fn get_server_for_load_balancing(&self, region: &str) -> Result<i32>;

@@ -21,49 +21,11 @@ pub struct HealthResponse {
 }
 
 /// List all available regions with connection metadata
-pub async fn list_regions() -> Json<Vec<RegionMetadata>> {
-    // TODO: In production, read from environment variables or config
-    // For now, return hard-coded regions based on build mode
-
-    let regions = if cfg!(debug_assertions) {
-        // Development mode: localhost with different ports
-        vec![
-            RegionMetadata {
-                id: "us".to_string(),
-                name: "US".to_string(),
-                origin: "http://localhost:8080".to_string(),
-                ws_url: "ws://localhost:8080/ws".to_string(),
-            },
-            RegionMetadata {
-                id: "europe".to_string(),
-                name: "Europe".to_string(),
-                origin: "http://localhost:8081".to_string(),
-                ws_url: "ws://localhost:8081/ws".to_string(),
-            },
-        ]
-    } else {
-        // Production mode: read from environment or use defaults
-        let us_origin = std::env::var("SNAKETRON_US_ORIGIN")
-            .unwrap_or_else(|_| "https://use1.snaketron.io".to_string());
-        let eu_origin = std::env::var("SNAKETRON_EU_ORIGIN")
-            .unwrap_or_else(|_| "https://euw1.snaketron.io".to_string());
-
-        vec![
-            RegionMetadata {
-                id: "us".to_string(),
-                name: "US".to_string(),
-                origin: us_origin.clone(),
-                ws_url: us_origin.replace("https://", "wss://").replace("http://", "ws://") + "/ws",
-            },
-            RegionMetadata {
-                id: "europe".to_string(),
-                name: "Europe".to_string(),
-                origin: eu_origin.clone(),
-                ws_url: eu_origin.replace("https://", "wss://").replace("http://", "ws://") + "/ws",
-            },
-        ]
-    };
-
+/// Regions are dynamically discovered from DynamoDB by scanning for active servers
+pub async fn list_regions(
+    State(state): State<HttpServerState>,
+) -> Json<Vec<RegionMetadata>> {
+    let regions = state.region_cache.get_regions().await;
     Json(regions)
 }
 

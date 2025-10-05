@@ -334,10 +334,10 @@ impl DynamoDatabase {
 #[async_trait]
 impl Database for DynamoDatabase {
     // Server operations
-    async fn register_server(&self, grpc_address: &str, region: &str) -> Result<i32> {
+    async fn register_server(&self, grpc_address: &str, region: &str, origin: &str, ws_url: &str) -> Result<i32> {
         let server_id = self.generate_id_for_entity("SERVER").await?;
         let now = Utc::now();
-        
+
         let mut item = HashMap::new();
         item.insert("pk".to_string(), Self::av_s(format!("SERVER#{}", server_id)));
         item.insert("sk".to_string(), Self::av_s("META"));
@@ -348,6 +348,8 @@ impl Database for DynamoDatabase {
         item.insert("id".to_string(), Self::av_n(server_id));
         item.insert("grpcAddress".to_string(), Self::av_s(grpc_address));
         item.insert("region".to_string(), Self::av_s(region));
+        item.insert("origin".to_string(), Self::av_s(origin));
+        item.insert("wsUrl".to_string(), Self::av_s(ws_url));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("status".to_string(), Self::av_s("active"));
         item.insert("currentGameCount".to_string(), Self::av_n(0));
@@ -367,19 +369,20 @@ impl Database for DynamoDatabase {
     
     async fn update_server_heartbeat(&self, server_id: i32) -> Result<()> {
         let now = Utc::now();
-        
+
         self.client
             .update_item()
             .table_name(self.main_table())
             .key("pk", Self::av_s(format!("SERVER#{}", server_id)))
             .key("sk", Self::av_s("META"))
-            .update_expression("SET lastHeartbeat = :now, gsi2sk = :gsi2sk")
+            .update_expression("SET lastHeartbeat = :now, gsi1sk = :gsi1sk, gsi2sk = :gsi2sk")
             .expression_attribute_values(":now", Self::av_s(now.to_rfc3339()))
+            .expression_attribute_values(":gsi1sk", Self::av_s(now.to_rfc3339()))
             .expression_attribute_values(":gsi2sk", Self::av_s(format!("{}#SERVER#{}", now.to_rfc3339(), server_id)))
             .send()
             .await
             .context("Failed to update server heartbeat")?;
-        
+
         debug!("Updated heartbeat for server {}", server_id);
         Ok(())
     }
