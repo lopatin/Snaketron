@@ -17,7 +17,7 @@ import { LatencyProvider } from './contexts/LatencyContext';
 import { LatencySettings } from './components/LatencySettings';
 import { RegionSelector } from './components/RegionSelector';
 import { useGameWebSocket } from './hooks/useGameWebSocket';
-import { Region } from './types';
+import { useRegions } from './hooks/useRegions';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -27,19 +27,25 @@ function Header() {
   const navigate = useNavigate();
   const dropdownRef = useRef<HTMLDivElement>(null);
   const { isHeaderVisible } = useUI();
+  const { connectToRegion, isConnected, onMessage } = useWebSocket();
 
-  // Dummy region data - replace with real data from backend later
-  const [regions] = useState<Region[]>([
-    { id: 'us', name: 'US', userCount: 1247, ping: 23, isConnected: true },
-    { id: 'europe', name: 'Europe', userCount: 2341, ping: 112, isConnected: false },
-  ]);
-  const [currentRegionId, setCurrentRegionId] = useState('us');
+  // Use regions hook for live data
+  const { regions, selectedRegion, selectRegion, isLoading } = useRegions({
+    isWebSocketConnected: isConnected,
+    onMessage,
+  });
 
   const handleRegionChange = (regionId: string) => {
-    setCurrentRegionId(regionId);
-    // TODO: Implement actual region switching logic
-    console.log('Region changed to:', regionId);
+    selectRegion(regionId);
   };
+
+  // Connect to selected region when it changes
+  useEffect(() => {
+    if (selectedRegion) {
+      console.log('Connecting to region:', selectedRegion.name, selectedRegion.wsUrl);
+      connectToRegion(selectedRegion.wsUrl);
+    }
+  }, [selectedRegion?.id, connectToRegion]);
   
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -92,11 +98,13 @@ function Header() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
             </button>
-            <RegionSelector
-              regions={regions}
-              currentRegionId={currentRegionId}
-              onRegionChange={handleRegionChange}
-            />
+            {!isLoading && selectedRegion && (
+              <RegionSelector
+                regions={regions}
+                currentRegionId={selectedRegion.id}
+                onRegionChange={handleRegionChange}
+              />
+            )}
             {user && (
               <div className="relative" ref={dropdownRef}>
                 <button 
@@ -237,34 +245,27 @@ function Home() {
 }
 
 function AppContent() {
-  const { connect, sendMessage, isConnected } = useWebSocket();
-  const { user, getToken, loading } = useAuth();
-  const [wsConnected, setWsConnected] = useState(false);
+  const { sendMessage, isConnected } = useWebSocket();
+  const { user, getToken } = useAuth();
   const tokenSentRef = useRef<boolean>(false);
-  
+
+  // Send authentication token when WebSocket connects
   useEffect(() => {
-    // Connect to WebSocket server - use environment variable if set, otherwise localhost for development
-    const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8080/ws';
-    // Send authentication token when connection is established
-    connect(wsUrl, () => {
-      console.log('WebSocket connected, checking for auth token...');
-      setWsConnected(true);
+    if (isConnected && !tokenSentRef.current) {
       const token = getToken();
-      if (token && !tokenSentRef.current) {
+      if (token) {
         console.log('Sending authentication token on connection');
         sendMessage({ Token: token });
         tokenSentRef.current = true;
-      } else if (token) {
-        console.log('Token already sent for this connection');
       } else {
         console.log('No auth token found');
       }
-    });
-  }, [connect, getToken, sendMessage]);
-  
+    }
+  }, [isConnected, getToken, sendMessage]);
+
   // Also send token when user logs in after WebSocket is already connected
   useEffect(() => {
-    if (wsConnected && user && !tokenSentRef.current) {
+    if (isConnected && user && !tokenSentRef.current) {
       const token = getToken();
       if (token) {
         console.log('User logged in, sending token to existing WebSocket connection');
@@ -272,13 +273,12 @@ function AppContent() {
         tokenSentRef.current = true;
       }
     }
-  }, [wsConnected, user, getToken, sendMessage]);
+  }, [isConnected, user, getToken, sendMessage]);
 
   // Reset token sent flag when WebSocket disconnects
   useEffect(() => {
     if (!isConnected) {
       tokenSentRef.current = false;
-      setWsConnected(false);
       console.log('WebSocket disconnected, resetting token sent flag');
     }
   }, [isConnected]);

@@ -54,7 +54,7 @@ services:
       # Server configuration
       SNAKETRON_HTTP_PORT: 8080
       SNAKETRON_GRPC_PORT: 50051
-      SNAKETRON_REGION: local
+      SNAKETRON_REGION: us
       SNAKETRON_ENV: dev
       # Logging
       RUST_LOG: info,server=debug

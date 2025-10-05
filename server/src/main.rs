@@ -37,7 +37,8 @@ async fn main() -> Result<()> {
     );
     info!("DynamoDB client initialized");
 
-    let region = env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
+    let region = env::var("SNAKETRON_REGION")
+        .context("SNAKETRON_REGION environment variable is required")?;
 
     // Server configuration
     let http_port = env::var("SNAKETRON_HTTP_PORT")
@@ -95,7 +96,7 @@ async fn main() -> Result<()> {
         db: db.clone(),
         http_addr: http_addr.clone(),
         grpc_addr,
-        region,
+        region: region.clone(),
         jwt_verifier: jwt_verifier.clone(),
         replay_dir,
         redis_url: redis_url.clone(),
@@ -117,6 +118,8 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
         .clone();
     let http_cancellation_token = game_server.cancellation_token().clone();
+    let http_server_id = game_server.id();
+    let http_region = region;
     let http_handle = tokio::spawn(async move {
         if let Err(e) = run_http_server(
             &http_addr,
@@ -126,6 +129,8 @@ async fn main() -> Result<()> {
             http_redis_url,
             http_replication_manager,
             http_cancellation_token,
+            http_server_id,
+            http_region,
         ).await {
             tracing::error!("HTTP server error: {}", e);
         }

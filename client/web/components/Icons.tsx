@@ -57,9 +57,10 @@ export const ConnectionIndicator = ({ className = '', isConnected = false }) => 
   />
 );
 
-export const NetworkIcon = ({ className = '' }) => (
+export const NetworkIcon = ({ className = '', style = {} }: { className?: string; style?: React.CSSProperties }) => (
   <svg
     className={className}
+    style={style}
     fill="none"
     viewBox="0 0 24 24"
     stroke="currentColor"

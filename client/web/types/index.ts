@@ -20,6 +20,8 @@ export interface WebSocketContextType {
   sendMessage: (message: any) => void;
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
+  connectToRegion: (wsUrl: string) => void;
+  currentRegionUrl: string | null;
   latencyMs: number;
 }
 
@@ -283,9 +285,25 @@ export type ArenaRotation = 0 | 90 | 180 | 270;
 export interface Region {
   id: string;
   name: string;
+  origin: string;        // HTTP origin e.g., "https://use1.snaketron.io" or "http://localhost:8080"
+  wsUrl: string;         // WebSocket URL e.g., "wss://use1.snaketron.io/ws"
   userCount: number;
   ping: number | null;
   isConnected: boolean;
+}
+
+// Region metadata from backend API
+export interface RegionMetadata {
+  id: string;
+  name: string;
+  origin: string;
+  ws_url: string;  // Backend uses snake_case
+}
+
+// localStorage schema for region preference
+export interface RegionPreference {
+  regionId: string;
+  timestamp: number;
 }
 
 export interface RegionSelectorProps {

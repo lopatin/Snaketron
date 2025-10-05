@@ -44,6 +44,9 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
         onClick={() => setIsOpen(!isOpen)}
         className="text-sm text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors flex items-center gap-2"
       >
+        {currentRegion && (
+          <ConnectionIndicator isConnected={currentRegion.isConnected} className="flex-shrink-0" />
+        )}
         {currentRegion?.name || 'Select Region'}
         {currentRegion && (
           <div className="flex items-center gap-1" style={{ letterSpacing: '0' }}>

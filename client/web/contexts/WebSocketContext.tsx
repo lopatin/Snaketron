@@ -32,6 +32,7 @@ export const useWebSocket = (): WebSocketContextType => {
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number>(0);
+  const [currentRegionUrl, setCurrentRegionUrl] = useState<string | null>(null);
   const ws = useRef<WebSocket | null>(null);
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
@@ -54,9 +55,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     try {
       ws.current = new WebSocket(url);
+      setCurrentRegionUrl(url);
 
       ws.current.onopen = () => {
-        console.log('WebSocket connected');
+        console.log('WebSocket connected to:', url);
         setIsConnected(true);
         if (reconnectTimeout.current) {
           clearTimeout(reconnectTimeout.current);
@@ -185,6 +187,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
+  const connectToRegion = useCallback((wsUrl: string) => {
+    console.log('Switching to region:', wsUrl);
+
+    // Disconnect existing connection
+    if (ws.current) {
+      console.log('Closing existing WebSocket connection');
+      ws.current.close();
+      ws.current = null;
+    }
+
+    // Clear any pending reconnection
+    if (reconnectTimeout.current) {
+      clearTimeout(reconnectTimeout.current);
+      reconnectTimeout.current = null;
+    }
+
+    // Connect to new region
+    // Note: We need to get the auth token and send it on connection
+    // This is handled by the onConnectCallback in App.tsx
+    connect(wsUrl, onConnectCallback.current || undefined);
+  }, [connect]);
+
   const sendMessage = useCallback((message: any) => {
     const doSend = () => {
       if (ws.current?.readyState === WebSocket.OPEN) {
@@ -231,6 +255,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     sendMessage,
     onMessage,
     connect,
+    connectToRegion,
+    currentRegionUrl,
     latencyMs,
   };
 

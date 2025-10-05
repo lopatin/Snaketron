@@ -66,13 +66,17 @@ pub enum WSMessage {
     // Solo game responses
     SoloGameCreated { game_id: u32 },
     // High availability messages
-    ServerShutdown { 
+    ServerShutdown {
         reason: String,
         grace_period_seconds: u32,
     },
     AuthorityTransfer {
         game_id: u32,
         new_server_url: String,
+    },
+    // Region user count updates
+    UserCountUpdate {
+        region_counts: std::collections::HashMap<String, u32>,
     },
 }
 
@@ -257,6 +261,15 @@ async fn handle_websocket_connection(
                 error!("Failed to send message to WebSocket: {}", e);
                 break;
             }
+        }
+    });
+
+    // Spawn task to subscribe to user count updates and forward to client
+    let ws_tx_for_counts = ws_tx.clone();
+    let redis_url_for_counts = redis_url.clone();
+    let _user_count_task = tokio::spawn(async move {
+        if let Err(e) = subscribe_to_user_count_updates(redis_url_for_counts, ws_tx_for_counts).await {
+            error!("User count subscription task failed: {}", e);
         }
     });
 
@@ -982,6 +995,67 @@ pub async fn register_server(db: &Arc<dyn Database>, grpc_address: &str, region:
     let id_u64 = id as u64;
     info!(id = id_u64, "Server registered with ID: {}", id_u64);
     Ok(id_u64)
+}
+
+/// Subscribe to user count updates from Redis and forward to WebSocket client
+async fn subscribe_to_user_count_updates(
+    redis_url: String,
+    ws_tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    use redis::aio::Connection;
+
+    // Create Redis client for pub/sub
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client for user count subscription")?;
+
+    let mut pubsub_conn = client.get_async_pubsub().await
+        .context("Failed to create Redis pub/sub connection")?;
+
+    // Subscribe to user count updates channel
+    pubsub_conn.subscribe("user_count_updates").await
+        .context("Failed to subscribe to user_count_updates channel")?;
+
+    info!("Subscribed to user count updates");
+
+    // Listen for messages
+    let mut pubsub_stream = pubsub_conn.on_message();
+
+    while let Some(msg) = pubsub_stream.next().await {
+        let payload: String = match msg.get_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to get payload from user count update: {}", e);
+                continue;
+            }
+        };
+
+        // Parse the region counts
+        let region_counts: std::collections::HashMap<String, u32> = match serde_json::from_str(&payload) {
+            Ok(counts) => counts,
+            Err(e) => {
+                warn!("Failed to parse user count update: {}", e);
+                continue;
+            }
+        };
+
+        // Create WebSocket message
+        let ws_message = WSMessage::UserCountUpdate { region_counts };
+        let json_msg = match serde_json::to_string(&ws_message) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize user count update: {}", e);
+                continue;
+            }
+        };
+
+        // Send to WebSocket client
+        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+            debug!("WebSocket channel closed, stopping user count subscription");
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn discover_peers(db: &Arc<dyn Database>, region: &str) -> Result<Vec<(u64, String)>> {
