@@ -15,7 +15,9 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider, useUI } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { LatencySettings } from './components/LatencySettings';
+import { RegionSelector } from './components/RegionSelector';
 import { useGameWebSocket } from './hooks/useGameWebSocket';
+import { Region } from './types';
 
 function Header() {
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -25,6 +27,21 @@ function Header() {
   const navigate = useNavigate();
   const dropdownRef = useRef<HTMLDivElement>(null);
   const { isHeaderVisible } = useUI();
+
+  // Dummy region data - replace with real data from backend later
+  const [regions] = useState<Region[]>([
+    { id: 'us-east', name: 'US East', userCount: 1247, ping: 23, isConnected: true },
+    { id: 'us-west', name: 'US West', userCount: 892, ping: 67, isConnected: false },
+    { id: 'europe', name: 'Europe', userCount: 2341, ping: 112, isConnected: false },
+    { id: 'asia', name: 'Asia', userCount: 1567, ping: 156, isConnected: false },
+  ]);
+  const [currentRegionId, setCurrentRegionId] = useState('us-east');
+
+  const handleRegionChange = (regionId: string) => {
+    setCurrentRegionId(regionId);
+    // TODO: Implement actual region switching logic
+    console.log('Region changed to:', regionId);
+  };
   
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -77,12 +94,11 @@ function Header() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
             </button>
-            <select className="text-sm text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors">
-              <option>US East</option>
-              <option>US West</option>
-              <option>Europe</option>
-              <option>Asia</option>
-            </select>
+            <RegionSelector
+              regions={regions}
+              currentRegionId={currentRegionId}
+              onRegionChange={handleRegionChange}
+            />
             {user && (
               <div className="relative" ref={dropdownRef}>
                 <button 

@@ -189,13 +189,29 @@
   .auth-message p {
     animation: fadeIn 0.15s ease-out;
   }
-  
+
   @keyframes fadeIn {
     from {
       opacity: 0;
     }
     to {
       opacity: 1;
+    }
+  }
+
+  /* Region dropdown animation */
+  .region-dropdown {
+    animation: slideDown 0.15s ease-out;
+  }
+
+  @keyframes slideDown {
+    from {
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
     }
   }
 }

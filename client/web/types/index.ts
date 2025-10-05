@@ -278,3 +278,18 @@ export interface UIGameSettings {
 
 // Arena rotation angles (in degrees)
 export type ArenaRotation = 0 | 90 | 180 | 270;
+
+// Region Types
+export interface Region {
+  id: string;
+  name: string;
+  userCount: number;
+  ping: number | null;
+  isConnected: boolean;
+}
+
+export interface RegionSelectorProps {
+  regions: Region[];
+  currentRegionId: string;
+  onRegionChange: (regionId: string) => void;
+}
