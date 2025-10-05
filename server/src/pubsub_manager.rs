@@ -155,9 +155,9 @@ impl PubSubManager {
         let request_channel = self.redis_keys.snapshot_requests(partition_id);
         
         // Create channels for receiving messages
-        let (event_tx, event_rx) = mpsc::channel(100);
-        let (command_tx, command_rx) = mpsc::channel(100);
-        let (request_tx, request_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(2000);
+        let (command_tx, command_rx) = mpsc::channel(2000);
+        let (request_tx, request_rx) = mpsc::channel(2000);
         
         // Spawn task to handle PubSub connection
         let redis_url = self.redis_url.clone();
