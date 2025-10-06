@@ -10,6 +10,7 @@ import JoinGameModal from './components/JoinGameModal';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
+import NewsAndLeaderboard from './components/NewsAndLeaderboard';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider, useUI } from './contexts/UIContext';
@@ -202,31 +203,31 @@ function Home() {
         <div className="flex gap-4">
           {/* Column 1: Quick Match */}
           <div className="-skew-x-[10deg]">
-            <button 
+            <button
               data-testid="quick-play-button"
               onClick={() => navigate('/game-modes/quick-play')}
               className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center rounded-lg flex items-center justify-center main-menu-button">
               <span className="skew-x-[10deg]">QUICK MATCH</span>
             </button>
           </div>
-          
+
           {/* Column 2: Competitive */}
           <div className="-skew-x-[10deg]">
-            <button 
+            <button
               onClick={() => navigate('/game-modes/competitive')}
               className="h-[110px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center rounded-lg flex items-center justify-center main-menu-button">
               <span className="skew-x-[10deg]">COMPETITIVE</span>
             </button>
           </div>
-          
+
           {/* Column 3: Solo & Custom Game */}
           <div className="-skew-x-[10deg] flex flex-col gap-[18px]">
-            <button 
+            <button
               onClick={handleSoloClick}
               className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center rounded-lg flex items-center justify-center main-menu-button">
               <span className="skew-x-[10deg]">SOLO</span>
             </button>
-            <button 
+            <button
               data-testid="custom-game-button"
               onClick={() => navigate('/custom')}
               className="h-[45px] w-[240px] bg-white text-black-70 text-18 font-black italic uppercase tracking-1 cursor-pointer text-center rounded-lg flex items-center justify-center main-menu-button"
@@ -236,10 +237,8 @@ function Home() {
           </div>
         </div>
       </div>
-      
-      <main className="flex-1 flex justify-center items-center text-center p-5">
-        <GameCanvas />
-      </main>
+
+      <NewsAndLeaderboard />
     </>
   );
 }
