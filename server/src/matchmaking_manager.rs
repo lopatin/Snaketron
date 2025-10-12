@@ -138,10 +138,11 @@ impl MatchmakingManager {
         pipe.atomic();
 
         // Add to lobby queue sorted set (score = timestamp for FIFO)
-        pipe.zadd(&lobby_queue_key, lobby_json, timestamp);
+        pipe.zadd(&lobby_queue_key, &lobby_json, timestamp);
 
         // Add to MMR index (score = average MMR for range queries)
-        pipe.zadd(&lobby_mmr_key, lobby_id.to_string(), avg_mmr);
+        // Store full lobby JSON to enable efficient retrieval by MMR
+        pipe.zadd(&lobby_mmr_key, &lobby_json, avg_mmr);
 
         // Execute transaction with retries
         let mut attempts = 0;
@@ -366,22 +367,81 @@ impl MatchmakingManager {
         Ok(removed_count)
     }
     
-    /// Get all lobbies in queue for a game type (limited to 100)
+    /// Get strategic subset of lobbies in queue for a game type
+    /// Fetches up to 2,000 unique lobbies distributed across:
+    /// - 500 longest waiting (by timestamp)
+    /// - 500 highest MMR
+    /// - 500 lowest MMR
+    /// - 500 mid-range MMR
     pub async fn get_queued_lobbies(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<QueuedLobby>> {
+        use std::collections::HashSet;
+
         let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, queue_mode);
+        let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(game_type, queue_mode);
 
-        // Limit to 100 lobbies to prevent excessive memory usage
-        const MAX_LOBBY_FETCH: isize = 99; // 0-indexed, so 99 = 100 items
-        let members: Vec<String> = self.conn.zrange(&lobby_queue_key, 0, MAX_LOBBY_FETCH).await?;
-        let mut lobbies = Vec::new();
+        const SUBSET_SIZE: isize = 499; // 0-indexed, so 499 = 500 items
 
-        for member_json in members {
-            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                lobbies.push(lobby);
+        // 1. Fetch 500 longest waiting (oldest timestamps first)
+        let longest_waiting: Vec<String> = self.conn.zrange(&lobby_queue_key, 0, SUBSET_SIZE).await?;
+
+        // 2. Fetch 500 highest MMR (reverse order from MMR index)
+        let highest_mmr: Vec<String> = self.conn.zrevrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
+
+        // 3. Fetch 500 lowest MMR (from MMR index)
+        let lowest_mmr: Vec<String> = self.conn.zrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
+
+        // 4. Fetch 500 mid-range MMR
+        let mid_range: Vec<String> = {
+            // Get total count
+            let total: isize = self.conn.zcard(&lobby_mmr_key).await?;
+
+            if total <= SUBSET_SIZE + 1 {
+                // Not enough lobbies for a distinct mid-range, return empty
+                Vec::new()
+            } else {
+                // Calculate middle range
+                let mid_start = (total / 2) - (SUBSET_SIZE / 2);
+                let mid_end = mid_start + SUBSET_SIZE;
+
+                self.conn.zrange(&lobby_mmr_key, mid_start, mid_end).await?
             }
+        };
+
+        // Deduplicate and collect unique lobbies
+        let mut seen_lobby_ids = HashSet::new();
+        let mut unique_lobbies = Vec::new();
+
+        // Helper to process lobby JSON and add if unique
+        let mut process_lobby = |member_json: &str| {
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json) {
+                if seen_lobby_ids.insert(lobby.lobby_id) {
+                    unique_lobbies.push(lobby);
+                }
+            }
+        };
+
+        // Process all subsets
+        for member_json in longest_waiting.iter() {
+            process_lobby(member_json);
+        }
+        for member_json in highest_mmr.iter() {
+            process_lobby(member_json);
+        }
+        for member_json in lowest_mmr.iter() {
+            process_lobby(member_json);
+        }
+        for member_json in mid_range.iter() {
+            process_lobby(member_json);
         }
 
-        Ok(lobbies)
+        info!(
+            "Fetched {} unique lobbies from strategic sampling (game_type: {:?}, queue_mode: {:?})",
+            unique_lobbies.len(),
+            game_type,
+            queue_mode
+        );
+
+        Ok(unique_lobbies)
     }
 
     /// Remove a lobby from the matchmaking queue
@@ -398,8 +458,9 @@ impl MatchmakingManager {
         for (member_json, _score) in members {
             if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
                 if lobby.lobby_id == lobby_id {
+                    // Remove from both sorted sets using the same lobby JSON
                     pipe.zrem(&lobby_queue_key, &member_json);
-                    pipe.zrem(&lobby_mmr_key, lobby_id.to_string());
+                    pipe.zrem(&lobby_mmr_key, &member_json);
                     break;
                 }
             }
