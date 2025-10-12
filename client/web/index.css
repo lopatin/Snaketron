@@ -22,33 +22,12 @@
 
 /* Custom styles for effects that can't be achieved with Tailwind utilities */
 
-/* Base body styles with dot pattern background */
+/* Base body styles */
 @layer base {
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
     position: relative;
-  }
-  
-  /* Dot pattern on pseudo-element for transition effect */
-  body::before {
-    content: '';
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-image: radial-gradient(circle, rgba(0, 0, 0, 0.3) 1px, transparent 1px);
-    background-size: 15px 15px;
-    background-position: 0 0;
-    pointer-events: none;
-    z-index: -1;
-    opacity: 1;
-    transition: opacity 0.2s ease-out;
-  }
-  
-  /* Hide background dots when in game view with fade transition */
-  body.hide-background-dots::before {
-    opacity: 0;
+    background-color: white;
   }
 }
 
@@ -95,13 +74,10 @@
     text-underline-offset: 6px;
   }
 
-  /* Reusable panel with double-line border */
+  /* Reusable panel - simple styling without double border */
   .panel {
     @apply bg-white rounded-lg;
-    border: 3px solid white;
-    box-shadow: 
-      inset 0 0 0 0.5px rgba(0, 0, 0, 0.7),  /* Inner black shadow */
-      .5px .5px 0 1.5px rgba(0, 0, 0, 0.7);
+    border: 2px solid rgba(0, 0, 0, 0.1);
   }
 
   /* Panel with no top border, only bottom corners rounded */
@@ -213,5 +189,20 @@
       opacity: 1;
       transform: translateY(0);
     }
+  }
+
+  /* Sidebar styles with double border on right (rotated header pattern) */
+  .sidebar {
+    @apply flex flex-col;
+    /* Create double border on right side - two distinct black lines */
+    border-right: 2px solid white;  /* White space between the lines */
+    box-shadow:
+      inset -0.5px 0 0 0 rgba(0, 0, 0, 0.8),     /* Inner line (left side of border) */
+      2px 0 0 0 rgba(0, 0, 0, 0.8);              /* Outer line (right side of border) */
+  }
+
+  /* Hide background dots on home page */
+  .home-page::before {
+    display: none;
   }
 }

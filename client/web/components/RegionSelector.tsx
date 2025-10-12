@@ -69,10 +69,8 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
         <div
           className="absolute right-0 mt-2 bg-white rounded-lg z-50 region-dropdown"
           style={{
-            minWidth: '320px',
-            border: '3px solid white',
-            boxShadow: 'inset 0 0 0 0.5px rgba(0, 0, 0, 0.7), .5px .5px 0 1.5px rgba(0, 0, 0, 0.7)',
-            background: 'linear-gradient(to bottom, #ffffff, #fafafa)'
+            minWidth: '240px',
+            border: '2px solid rgba(0, 0, 0, 0.2)'
           }}
         >
           {regions.map((region, index) => (
@@ -90,14 +88,14 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
                 <ConnectionIndicator isConnected={region.isConnected} className="flex-shrink-0" />
 
                 {/* Region Name */}
-                <div className="flex-1">
+                <div className="flex-1 min-w-0">
                   <div className="text-sm font-bold text-black-70 uppercase tracking-1 group-hover:text-black transition-colors">
                     {region.name}
                   </div>
                 </div>
 
                 {/* User Count - Fixed width for alignment */}
-                <div className="flex items-center gap-1.5" style={{ width: '60px' }}>
+                <div className="flex items-center gap-1.5" style={{ width: '50px' }}>
                   <UserIcon className="w-3.5 h-3.5 text-gray-500" />
                   <span className="text-sm font-bold text-gray-700 tabular-nums">
                     {region.userCount}

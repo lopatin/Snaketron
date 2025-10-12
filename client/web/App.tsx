@@ -11,6 +11,7 @@ import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import NewsAndLeaderboard from './components/NewsAndLeaderboard';
+import { NewHome } from './components/NewHome';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider, useUI } from './contexts/UIContext';
@@ -284,9 +285,8 @@ function AppContent() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header />
       <AnimatedRoutes>
-        <Route path="/" element={<Home />} />
+        <Route path="/" element={<NewHome />} />
         <Route path="/auth" element={<Auth />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
         <Route path="/custom" element={<CustomGameCreator />} />
