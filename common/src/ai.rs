@@ -1,4 +1,4 @@
-use crate::{Direction, GameState, Position, Snake};
+use crate::{Direction, GameState, Position};
 use std::collections::{HashSet, VecDeque};
 
 /// Determines if a user_id represents an AI player

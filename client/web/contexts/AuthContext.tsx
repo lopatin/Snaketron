@@ -64,6 +64,15 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   }, []);
 
+  const createGuest = useCallback(async (nickname: string) => {
+    try {
+      const data = await api.createGuest(nickname);
+      setUser({ ...data.user, isGuest: true });
+    } catch (err) {
+      throw err;
+    }
+  }, []);
+
   const logout = useCallback(() => {
     api.setAuthToken(null);
     setUser(null);
@@ -79,6 +88,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     loading,
     login,
     register,
+    createGuest,
     logout,
     getToken,
   };

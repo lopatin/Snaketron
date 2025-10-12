@@ -20,6 +20,7 @@ use crate::api::regions;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 use crate::replication::ReplicationManager;
 use crate::region_cache::RegionCache;
+use crate::lobby_manager::LobbyManager;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -46,6 +47,8 @@ pub struct HttpServerState {
     pub region: String,
     /// Region cache for dynamic region discovery
     pub region_cache: Arc<RegionCache>,
+    /// Lobby manager for pre-game grouping
+    pub lobby_manager: Arc<LobbyManager>,
 }
 
 /// Run the combined HTTP server with both API and WebSocket endpoints
@@ -64,6 +67,9 @@ pub async fn run_http_server(
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     let connection_count = Arc::new(AtomicUsize::new(0));
 
+    // Create lobby manager
+    let lobby_manager = Arc::new(LobbyManager::new(redis_url.clone(), db.clone()));
+
     // Create state for both API and WebSocket handlers
     let state = HttpServerState {
         db: db.clone(),
@@ -76,6 +82,7 @@ pub async fn run_http_server(
         server_id,
         region: region.clone(),
         region_cache,
+        lobby_manager,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -128,6 +135,7 @@ pub async fn run_http_server(
         .route("/api/health", get(regions::health_check_json))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/guest", post(auth::create_guest))
         .route("/api/auth/check-username",
             post(auth::check_username)
                 .layer(middleware::from_fn_with_state(
@@ -184,6 +192,8 @@ async fn websocket_handler(
             state.redis_url,
             state.replication_manager,
             state.cancellation_token,
+            state.lobby_manager,
+            state.region,
         ).await;
 
         // Decrement connection count when connection closes

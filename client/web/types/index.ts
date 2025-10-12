@@ -3,6 +3,7 @@ export interface User {
   id: number;
   username: string;
   token?: string;
+  isGuest?: boolean;
 }
 
 export interface AuthContextType {
@@ -10,8 +11,24 @@ export interface AuthContextType {
   loading: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string | null) => Promise<void>;
+  createGuest: (nickname: string) => Promise<void>;
   logout: () => void;
   getToken: () => string | null;
+}
+
+// Lobby Types
+export interface Lobby {
+  id: number;
+  code: string;
+  hostUserId: number;
+  region: string;
+}
+
+export interface LobbyMember {
+  user_id: number;
+  username: string;
+  joined_at: number;
+  is_host: boolean;
 }
 
 // WebSocket Types
@@ -23,6 +40,15 @@ export interface WebSocketContextType {
   connectToRegion: (wsUrl: string) => void;
   currentRegionUrl: string | null;
   latencyMs: number;
+
+  // Lobby state
+  currentLobby: Lobby | null;
+  lobbyMembers: LobbyMember[];
+
+  // Lobby methods
+  createLobby: () => Promise<void>;
+  joinLobby: (lobbyCode: string) => Promise<void>;
+  leaveLobby: () => Promise<void>;
 }
 
 // Latency Settings Types
@@ -188,6 +214,11 @@ export interface ApiResponse<T> {
 }
 
 export interface LoginResponse {
+  token: string;
+  user: User;
+}
+
+export interface CreateGuestResponse {
   token: string;
   user: User;
 }

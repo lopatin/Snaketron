@@ -13,6 +13,8 @@ pub struct Claims {
     pub username: String,   // Username
     pub exp: i64,          // Expiration time
     pub iat: i64,          // Issued at
+    #[serde(default)]
+    pub is_guest: bool,    // Whether this is a guest user
 }
 
 pub struct JwtManager {
@@ -39,6 +41,10 @@ impl JwtManager {
     }
 
     pub fn generate_token(&self, user_id: i32, username: &str) -> Result<String> {
+        self.generate_token_with_guest(user_id, username, false)
+    }
+
+    pub fn generate_token_with_guest(&self, user_id: i32, username: &str, is_guest: bool) -> Result<String> {
         let now = Utc::now();
         let exp = now + Duration::hours(24); // Token expires in 24 hours
 
@@ -47,6 +53,7 @@ impl JwtManager {
             username: username.to_string(),
             exp: exp.timestamp(),
             iat: now.timestamp(),
+            is_guest,
         };
 
         let header = Header::new(self.algorithm);

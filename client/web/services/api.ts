@@ -1,4 +1,4 @@
-import { User, LoginResponse, CheckUsernameResponse } from '../types';
+import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse } from '../types';
 
 interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
@@ -70,6 +70,15 @@ class API {
     const data = await this.request<LoginResponse>('/auth/register', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
+    });
+    this.setAuthToken(data.token);
+    return data;
+  }
+
+  async createGuest(nickname: string): Promise<CreateGuestResponse> {
+    const data = await this.request<CreateGuestResponse>('/auth/guest', {
+      method: 'POST',
+      body: JSON.stringify({ nickname }),
     });
     this.setAuthToken(data.token);
     return data;

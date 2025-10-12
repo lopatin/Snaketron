@@ -4,7 +4,6 @@ use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use crate::{Direction, Player, Position, Snake, DEFAULT_CUSTOM_GAME_TICK_MS, DEFAULT_FOOD_TARGET, DEFAULT_TICK_INTERVAL_MS};
 use crate::util::PseudoRandom;
-use log::debug;
 
 const DEFAULT_SNAKE_LENGTH: usize = 4;
 
@@ -806,7 +805,7 @@ impl GameState {
                     // eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
                     out.extend(events);
                 }
-                Err(e) => {
+                Err(_e) => {
                     // debug!("tick_forward: exec_command failed with error: {:?}", e);
                     // eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
                 }
@@ -974,7 +973,7 @@ impl GameState {
 
             if let GameType::TeamMatch { .. } = &self.game_type {
                 // Check all snakes to see which teams have reached the endzone
-                for (snake_id, snake) in self.iter_snakes() {
+                for (_snake_id, snake) in self.iter_snakes() {
                     if snake.is_alive {
                         if let Some(team_id) = snake.team_id {
                             if self.arena.has_reached_goal(snake, team_id) {

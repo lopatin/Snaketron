@@ -55,6 +55,25 @@ pub struct CheckUsernameResponse {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateGuestRequest {
+    pub nickname: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateGuestResponse {
+    pub token: String,
+    pub user: GuestUserInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuestUserInfo {
+    pub id: i32,
+    pub username: String,
+    pub mmr: i32,
+    pub is_guest: bool,
+}
+
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
 
@@ -275,4 +294,49 @@ pub async fn check_username(
         available,
         errors,
     }))
+}
+
+pub async fn create_guest(
+    State(state): State<AuthState>,
+    Json(req): Json<CreateGuestRequest>,
+) -> Result<Response, AppError> {
+    // Validate nickname (same rules as username but no uniqueness check)
+    let nickname_errors = validate_username(&req.nickname);
+    if !nickname_errors.is_empty() {
+        return Err(anyhow::anyhow!("Invalid nickname: {}", nickname_errors.join(", ")).into());
+    }
+
+    // Generate a unique guest token (UUID-based)
+    let guest_token = uuid::Uuid::new_v4().to_string();
+
+    // Create guest user (starting MMR of 1000)
+    let user = state.db.create_guest_user(&req.nickname, &guest_token, 1000).await?;
+
+    let user_info = GuestUserInfo {
+        id: user.id,
+        username: user.username.clone(),
+        mmr: user.mmr,
+        is_guest: true,
+    };
+
+    // Generate JWT token (includes guest flag)
+    let token = state.jwt_manager.generate_token_with_guest(user_info.id, &user_info.username, true)?;
+
+    info!("Guest user created successfully: {} (id: {})", user_info.username, user_info.id);
+
+    // Build response with cache-control headers
+    let mut response = Json(CreateGuestResponse {
+        token,
+        user: user_info,
+    }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache")
+    );
+
+    Ok(response)
 }

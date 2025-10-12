@@ -4,6 +4,8 @@ import { Sidebar } from './Sidebar';
 import { MobileHeader } from './MobileHeader';
 import { GameStartForm } from './GameStartForm';
 import { LobbyChat } from './LobbyChat';
+import { InviteFriendsModal } from './InviteFriendsModal';
+import JoinGameModal from './JoinGameModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
@@ -33,18 +35,24 @@ const DUMMY_CHAT_MESSAGES = [
   }
 ];
 
-// Dummy lobby users for UI design
-const DUMMY_LOBBY_USERS = ['CurrentUser', 'Player1', 'SnakeKing'];
-
 export const NewHome: React.FC = () => {
   const navigate = useNavigate();
-  const { user, login, register } = useAuth();
-  const { connectToRegion, isConnected, onMessage } = useWebSocket();
+  const { user, login, register, createGuest } = useAuth();
+  const {
+    connectToRegion,
+    isConnected,
+    onMessage,
+    currentLobby,
+    lobbyMembers,
+    createLobby,
+    leaveLobby,
+  } = useWebSocket();
   const { createGame, currentGameId } = useGameWebSocket();
   const [isMobile, setIsMobile] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [chatMessages, setChatMessages] = useState(DUMMY_CHAT_MESSAGES);
-  const [lobbyUsers] = useState(DUMMY_LOBBY_USERS);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [showJoinModal, setShowJoinModal] = useState(false);
 
   // Use regions hook for live data
   const { regions, selectedRegion, selectRegion, isLoading: regionsLoading } = useRegions({
@@ -88,12 +96,12 @@ export const NewHome: React.FC = () => {
   ) => {
     setIsLoading(true);
     try {
-      // If not logged in, register/login first
+      // If not logged in, create guest user
       if (!user) {
         try {
-          await register(nickname, null);
+          await createGuest(nickname);
         } catch (error) {
-          console.error('Registration failed:', error);
+          console.error('Guest creation failed:', error);
           setIsLoading(false);
           return;
         }
@@ -145,9 +153,40 @@ export const NewHome: React.FC = () => {
     setChatMessages([...chatMessages, newMessage]);
   };
 
-  const handleInvite = () => {
-    // TODO: Implement invite functionality
-    console.log('Invite friends clicked');
+  const handleInvite = async () => {
+    try {
+      // If not logged in, create guest user first
+      if (!user) {
+        console.log('Creating guest user for lobby...');
+        // For now, require nickname input - this will be handled by modal later
+        return;
+      }
+
+      // If lobby doesn't exist yet, create it
+      if (!currentLobby) {
+        await createLobby();
+        console.log('Lobby created successfully');
+      }
+
+      // Show the invite modal
+      setShowInviteModal(true);
+    } catch (error) {
+      console.error('Failed to create lobby:', error);
+    }
+  };
+
+  const handleLeaveLobby = async () => {
+    try {
+      await leaveLobby();
+      console.log('Left lobby successfully');
+    } catch (error) {
+      console.error('Failed to leave lobby:', error);
+    }
+  };
+
+  const handleStartGameFromLobby = () => {
+    // TODO: Queue lobby for matchmaking
+    console.log('Start game from lobby - TODO: implement matchmaking');
   };
 
   const handleLoginClick = () => {
@@ -155,8 +194,9 @@ export const NewHome: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen flex home-page">
-      {!isMobile && !regionsLoading && selectedRegion ? (
+    <>
+      <div className="min-h-screen flex home-page">
+        {!isMobile && !regionsLoading && selectedRegion ? (
         /* Desktop/Tablet: Sidebar Layout */
         <>
           <div className="w-80 flex-shrink-0">
@@ -164,9 +204,14 @@ export const NewHome: React.FC = () => {
               regions={regions}
               currentRegionId={selectedRegion.id}
               onRegionChange={handleRegionChange}
-              lobbyUsers={lobbyUsers}
-              currentUsername={user?.username}
+              lobbyMembers={lobbyMembers}
+              lobbyCode={currentLobby?.code || null}
+              currentUserId={user?.id}
+              isHost={currentLobby ? currentLobby.hostUserId === user?.id : false}
               onInvite={handleInvite}
+              onLeaveLobby={handleLeaveLobby}
+              onStartGame={handleStartGameFromLobby}
+              onJoinGame={() => setShowJoinModal(true)}
             />
           </div>
           <div className="flex-1 flex flex-col relative">
@@ -213,7 +258,7 @@ export const NewHome: React.FC = () => {
             onRegionChange={handleRegionChange}
             currentUsername={user?.username}
             onLoginClick={handleLoginClick}
-            lobbyUsers={lobbyUsers}
+            lobbyUsers={lobbyMembers.map(m => m.username)}
             onInvite={handleInvite}
           />
 
@@ -243,6 +288,20 @@ export const NewHome: React.FC = () => {
           </div>
         </div>
       )}
-    </div>
+      </div>
+
+      {/* Invite Friends Modal */}
+      <InviteFriendsModal
+        isOpen={showInviteModal}
+        onClose={() => setShowInviteModal(false)}
+        lobbyCode={currentLobby?.code || null}
+      />
+
+      {/* Join Game Modal */}
+      <JoinGameModal
+        isOpen={showJoinModal}
+        onClose={() => setShowJoinModal(false)}
+      />
+    </>
   );
 };

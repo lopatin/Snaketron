@@ -24,6 +24,8 @@ pub struct User {
     pub mmr: i32,
     pub xp: i32,
     pub created_at: DateTime<Utc>,
+    pub is_guest: bool,
+    pub guest_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,17 @@ pub struct CustomGameLobby {
 
 // Type alias for consistency
 pub type CustomLobby = CustomGameLobby;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lobby {
+    pub id: i32,
+    pub lobby_code: String,
+    pub host_user_id: i32,
+    pub region: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub state: String, // waiting | queued | matched
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameSpectator {

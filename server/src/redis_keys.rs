@@ -84,7 +84,32 @@ impl RedisKeys {
     pub fn matchmaking_notification_channel(&self, user_id: u32) -> String {
         format!("matchmaking:notification:{}", user_id)
     }
-    
+
+    /// Lobby queue for a specific game type and queue mode
+    pub fn matchmaking_lobby_queue(&self, game_type: &GameType, queue_mode: &common::QueueMode) -> String {
+        let hash = Self::hash_game_type(game_type);
+        let mode_str = match queue_mode {
+            common::QueueMode::Quickmatch => "quick",
+            common::QueueMode::Competitive => "comp",
+        };
+        format!("matchmaking:lobby:queue:{}:{}", mode_str, hash)
+    }
+
+    /// Lobby MMR index for a game type and queue mode
+    pub fn matchmaking_lobby_mmr_index(&self, game_type: &GameType, queue_mode: &common::QueueMode) -> String {
+        let hash = Self::hash_game_type(game_type);
+        let mode_str = match queue_mode {
+            common::QueueMode::Quickmatch => "quick",
+            common::QueueMode::Competitive => "comp",
+        };
+        format!("matchmaking:lobby:mmr:{}:{}", mode_str, hash)
+    }
+
+    /// Lobby notification channel for all members of a lobby
+    pub fn matchmaking_lobby_notification_channel(&self, lobby_id: i32) -> String {
+        format!("matchmaking:lobby:notification:{}", lobby_id)
+    }
+
     // === PubSub Channels ===
     
     /// Partition events channel

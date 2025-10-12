@@ -1,24 +1,34 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { RegionSelector } from './RegionSelector';
-import { Region } from '../types';
+import { Region, LobbyMember } from '../types';
 
 interface SidebarProps {
   regions: Region[];
   currentRegionId: string;
   onRegionChange: (regionId: string) => void;
-  lobbyUsers: string[];
-  currentUsername?: string;
+  lobbyMembers: LobbyMember[];
+  lobbyCode: string | null;
+  currentUserId?: number;
+  isHost: boolean;
   onInvite?: () => void;
+  onLeaveLobby?: () => void;
+  onStartGame?: () => void;
+  onJoinGame?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
   regions,
   currentRegionId,
   onRegionChange,
-  lobbyUsers,
-  currentUsername,
-  onInvite
+  lobbyMembers,
+  lobbyCode,
+  currentUserId,
+  isHost,
+  onInvite,
+  onLeaveLobby,
+  onStartGame,
+  onJoinGame
 }) => {
   return (
     <aside className="sidebar h-screen flex flex-col">
@@ -41,12 +51,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           Leaderboards
         </a>
-        <Link
-          to="/join-game"
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            onJoinGame?.();
+          }}
           className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity"
         >
           Join Game
-        </Link>
+        </a>
       </nav>
 
       {/* Region Selector */}
@@ -61,34 +75,54 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Lobby Info */}
       <div className="pr-8 mb-8">
         <div className="flex flex-col items-end">
+          {lobbyMembers.length > 0 && (
+            <>
+              {/* Lobby Title */}
+              <h3 className="text-xs font-black uppercase tracking-1 text-black-70 mb-3 text-right">
+                Lobby
+              </h3>
 
-          {lobbyUsers.length === 0 || (lobbyUsers.length === 1 && lobbyUsers[0] === currentUsername) ? null  : (
-              <>
-                <h3 className="text-xs font-black uppercase tracking-1 text-black-70 mb-3 text-right">
-                  Lobby
-                </h3>
-                <div className="space-y-2 flex flex-col items-end mb-6">
-                  {lobbyUsers.map((username, index) => (
-                    <div
-                      key={index}
-                      className="text-sm text-black-70 flex items-center gap-2"
-                    >
-                      <span className={username === currentUsername ? 'font-bold' : ''}>
-                        {username}
-                      </span>
-                      <div className="w-2 h-2 rounded-full bg-green-500" />
-                    </div>
-                  ))}
-                </div>
-              </>
+              {/* Lobby Members */}
+              <div className="space-y-2 flex flex-col items-end mb-6">
+                {lobbyMembers.map((member) => (
+                  <div
+                    key={`${member.user_id}-${member.joined_at}`}
+                    className="text-sm text-black-70 flex items-center gap-2"
+                  >
+                    <span className={member.user_id === currentUserId ? 'font-bold' : ''}>
+                      {member.username}
+                    </span>
+                    {member.is_host && <span className="text-xs">(Host)</span>}
+                    <div className="w-2 h-2 rounded-full bg-green-500" />
+                  </div>
+                ))}
+              </div>
+
+              {/* Lobby Actions */}
+              <div className="mb-4 flex flex-col gap-2 items-end">
+                {onLeaveLobby && (
+                  <button
+                    onClick={onLeaveLobby}
+                    className="px-4 py-2 text-xs border border-black-70 rounded font-bold uppercase bg-white text-black-70 hover:bg-gray-50 transition-colors cursor-pointer"
+                    style={{ letterSpacing: '1px' }}
+                  >
+                    Leave Lobby
+                  </button>
+                )}
+              </div>
+            </>
           )}
-          <button
+
+          {/* Always show Invite Friends button */}
+          {onInvite && (
+            <button
               onClick={onInvite}
               className="px-4 py-2 text-xs border border-black-70 rounded font-bold uppercase bg-white text-black-70 hover:bg-gray-50 transition-colors cursor-pointer"
               style={{ letterSpacing: '1px' }}
-          >
-            Invite Friends
-          </button>
+            >
+              Invite Friends
+            </button>
+          )}
         </div>
       </div>
       </div>

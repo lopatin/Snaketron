@@ -2,7 +2,7 @@ use anyhow::{Result, Context};
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use chrono::Utc;
 use common::{GameType, GameState};
 
@@ -123,6 +123,44 @@ pub async fn run_matchmaking_loop(
                 }
                 Err(e) => {
                     error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Batch matchmaking error");
+                }
+            }
+
+            // Try lobby-based matchmaking for quickmatch
+            match create_lobby_matches(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
+                Ok(games_count) if games_count > 0 => {
+                    total_games_created += games_count;
+                    info!(
+                        game_type = ?game_type,
+                        queue_mode = "quickmatch",
+                        games_count,
+                        "Created quickmatch games via lobby matchmaking"
+                    );
+                }
+                Ok(_) => {
+                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable lobby matches found");
+                }
+                Err(e) => {
+                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Lobby matchmaking error");
+                }
+            }
+
+            // Try lobby-based matchmaking for competitive
+            match create_lobby_matches(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
+                Ok(games_count) if games_count > 0 => {
+                    total_games_created += games_count;
+                    info!(
+                        game_type = ?game_type,
+                        queue_mode = "competitive",
+                        games_count,
+                        "Created competitive games via lobby matchmaking"
+                    );
+                }
+                Ok(_) => {
+                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable lobby matches found");
+                }
+                Err(e) => {
+                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Lobby matchmaking error");
                 }
             }
         }
@@ -380,6 +418,94 @@ async fn create_single_game(
     );
 
     Ok(game_id)
+}
+
+/// Create matches from lobbies in the queue
+async fn create_lobby_matches(
+    matchmaking_manager: &mut MatchmakingManager,
+    pubsub: &mut PubSubManager,
+    game_type: GameType,
+    queue_mode: common::QueueMode,
+) -> Result<usize> {
+    // Get all queued lobbies for this game type and queue mode
+    let lobbies = matchmaking_manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+
+    if lobbies.is_empty() {
+        return Ok(0);
+    }
+
+    let mut games_created = 0;
+
+    // For now, each lobby creates its own game
+    // In the future, we could match lobbies together
+    for lobby in lobbies {
+        // Convert lobby members to QueuedPlayers
+        let players: Vec<QueuedPlayer> = lobby.members.iter().map(|m| QueuedPlayer {
+            user_id: m.user_id as u32,
+            mmr: 1000, // We'll use the lobby's avg_mmr instead
+            username: m.username.clone(),
+        }).collect();
+
+        if players.is_empty() {
+            warn!("Empty lobby {} in queue, skipping", lobby.lobby_id);
+            continue;
+        }
+
+        let now = Utc::now().timestamp_millis();
+
+        // Create the game for this lobby
+        match create_single_game(
+            matchmaking_manager,
+            pubsub,
+            &game_type,
+            &queue_mode,
+            players.clone(),
+            now,
+        ).await {
+            Ok(game_id) => {
+                games_created += 1;
+                info!("Created game {} for lobby {} with {} members",
+                    game_id, lobby.lobby_id, players.len());
+
+                // Remove lobby from queue
+                if let Err(e) = matchmaking_manager.remove_lobby_from_queue(
+                    &game_type,
+                    &queue_mode,
+                    lobby.lobby_id,
+                ).await {
+                    error!("Failed to remove lobby {} from queue: {}", lobby.lobby_id, e);
+                }
+
+                // Publish match notification to lobby channel
+                let redis_keys = crate::redis_keys::RedisKeys::new();
+                let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+                if let Ok(client) = redis::Client::open(redis_url.as_str()) {
+                    if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
+                        let channel = redis_keys.matchmaking_lobby_notification_channel(lobby.lobby_id);
+                        let notification = serde_json::json!({
+                            "type": "MatchFound",
+                            "game_id": game_id,
+                            "partition_id": game_id % PARTITION_COUNT
+                        });
+
+                        let _: Result<i32, _> = redis::cmd("PUBLISH")
+                            .arg(&channel)
+                            .arg(notification.to_string())
+                            .query_async(&mut conn).await;
+
+                        info!("Published match notification to lobby {}", lobby.lobby_id);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to create game for lobby {}: {}", lobby.lobby_id, e);
+            }
+        }
+    }
+
+    Ok(games_created)
 }
 
 /// Create an adaptive match

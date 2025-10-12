@@ -18,9 +18,11 @@ pub trait Database: Send + Sync {
     async fn update_server_status(&self, server_id: i32, status: &str) -> Result<()>;
     async fn get_server_for_load_balancing(&self, region: &str) -> Result<i32>;
     async fn get_active_servers(&self, region: &str) -> Result<Vec<(i32, String)>>;
-    
+    async fn get_region_ws_url(&self, region: &str) -> Result<Option<String>>;
+
     // User operations
     async fn create_user(&self, username: &str, password_hash: &str, mmr: i32) -> Result<User>;
+    async fn create_guest_user(&self, nickname: &str, guest_token: &str, mmr: i32) -> Result<User>;
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;
@@ -52,7 +54,13 @@ pub trait Database: Send + Sync {
     async fn update_custom_lobby_game_id(&self, lobby_id: i32, game_id: i32) -> Result<()>;
     async fn get_custom_lobby_host(&self, game_id: i32) -> Result<Option<i32>>;
     async fn get_custom_lobby_by_code(&self, game_code: &str) -> Result<Option<CustomLobby>>;
-    
+
+    // Lobby operations
+    async fn create_lobby(&self, host_user_id: i32, region: &str) -> Result<Lobby>;
+    async fn get_lobby_by_id(&self, lobby_id: i32) -> Result<Option<Lobby>>;
+    async fn get_lobby_by_code(&self, lobby_code: &str) -> Result<Option<Lobby>>;
+    async fn update_lobby_state(&self, lobby_id: i32, state: &str) -> Result<()>;
+
     // Spectator operations
     async fn add_spectator_to_game(&self, game_id: i32, user_id: i32) -> Result<()>;
 }

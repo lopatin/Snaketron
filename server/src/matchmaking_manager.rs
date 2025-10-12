@@ -19,6 +19,14 @@ pub struct QueuedPlayer {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct QueuedLobby {
+    pub lobby_id: i32,
+    pub lobby_code: String,
+    pub members: Vec<crate::lobby_manager::LobbyMember>,
+    pub avg_mmr: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserQueueStatus {
     pub game_type: GameType,
     pub queue_mode: common::QueueMode,
@@ -152,7 +160,65 @@ impl MatchmakingManager {
         info!("Added user {} to matchmaking queue for {:?}", user_id, game_type);
         Ok(())
     }
-    
+
+    /// Add a lobby to the matchmaking queue
+    pub async fn add_lobby_to_queue(
+        &mut self,
+        lobby_id: i32,
+        lobby_code: &str,
+        members: Vec<crate::lobby_manager::LobbyMember>,
+        avg_mmr: i32,
+        game_type: GameType,
+        queue_mode: common::QueueMode,
+    ) -> Result<()> {
+        let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(&game_type, &queue_mode);
+        let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+
+        let lobby = QueuedLobby {
+            lobby_id,
+            lobby_code: lobby_code.to_string(),
+            members,
+            avg_mmr,
+        };
+
+        let lobby_json = serde_json::to_string(&lobby)?;
+        let timestamp = Utc::now().timestamp_millis();
+
+        // Start a transaction
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // Add to lobby queue sorted set (score = timestamp for FIFO)
+        pipe.zadd(&lobby_queue_key, lobby_json, timestamp);
+
+        // Add to MMR index (score = average MMR for range queries)
+        pipe.zadd(&lobby_mmr_key, lobby_id.to_string(), avg_mmr);
+
+        // Execute transaction with retries
+        let mut attempts = 0;
+        let mut delay = self.retry_delay;
+
+        loop {
+            attempts += 1;
+            match pipe.clone().query_async(&mut self.conn).await {
+                Ok(()) => break,
+                Err(e) if attempts < self.max_retries => {
+                    warn!("Failed to add lobby to queue (attempt {}/{}): {}", attempts, self.max_retries, e);
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    error!("Failed to add lobby to queue after {} attempts", self.max_retries);
+                    return Err(anyhow!("Failed to add lobby to queue: {}", e));
+                }
+            }
+        }
+
+        info!("Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
+            lobby_id, game_type, lobby.members.len(), avg_mmr);
+        Ok(())
+    }
+
     /// Renew a player's position in queue (update timestamp to prevent expiration)
     pub async fn renew_queue_position(&mut self, user_id: u32) -> Result<bool> {
         let user_key = self.redis_keys.matchmaking_user_status(user_id);
@@ -367,6 +433,51 @@ impl MatchmakingManager {
         }
 
         Ok(players)
+    }
+
+    /// Get all lobbies in queue for a game type (limited to 100)
+    pub async fn get_queued_lobbies(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<QueuedLobby>> {
+        let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, queue_mode);
+
+        // Limit to 100 lobbies to prevent excessive memory usage
+        const MAX_LOBBY_FETCH: isize = 99; // 0-indexed, so 99 = 100 items
+        let members: Vec<String> = self.conn.zrange(&lobby_queue_key, 0, MAX_LOBBY_FETCH).await?;
+        let mut lobbies = Vec::new();
+
+        for member_json in members {
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
+                lobbies.push(lobby);
+            }
+        }
+
+        Ok(lobbies)
+    }
+
+    /// Remove a lobby from the matchmaking queue
+    pub async fn remove_lobby_from_queue(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, lobby_id: i32) -> Result<()> {
+        let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, queue_mode);
+        let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(game_type, queue_mode);
+
+        // Get all lobby members to find the one to remove
+        let members: Vec<(String, f64)> = self.conn.zrange_withscores(&lobby_queue_key, 0, -1).await?;
+
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        for (member_json, _score) in members {
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
+                if lobby.lobby_id == lobby_id {
+                    pipe.zrem(&lobby_queue_key, &member_json);
+                    pipe.zrem(&lobby_mmr_key, lobby_id.to_string());
+                    break;
+                }
+            }
+        }
+
+        let _: () = pipe.query_async(&mut self.conn).await?;
+
+        info!("Removed lobby {} from matchmaking queue", lobby_id);
+        Ok(())
     }
 
     /// Get the longest waiting users (up to 5000) with their queue timestamps

@@ -33,7 +33,7 @@ impl GameEngine {
     
     pub fn new_with_seed_and_type(game_id: u32, start_ms: i64, rng_seed: u64, game_type: GameType) -> Self {
         // Extract dimensions and tick duration from custom settings if available
-        let (width, height, tick_duration_ms) = match &game_type {
+        let (width, height, _tick_duration_ms) = match &game_type {
             GameType::Custom { settings } => (
                 settings.arena_width,
                 settings.arena_height,
@@ -122,7 +122,7 @@ impl GameEngine {
         self.committed_state.apply_event(event_message.event.clone(), None);
 
         // Also schedule in predicted state if it exists
-        if let GameEvent::CommandScheduled { command_message } = &event_message.event {
+        if let GameEvent::CommandScheduled { command_message: _ } = &event_message.event {
             if let Some(predicted_state) = &mut self.predicted_state {
                 predicted_state.apply_event(event_message.event.clone(), None);
             }
