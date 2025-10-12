@@ -24,6 +24,9 @@ pub struct QueuedLobby {
     pub lobby_code: String,
     pub members: Vec<crate::lobby_manager::LobbyMember>,
     pub avg_mmr: i32,
+    pub game_type: GameType,
+    pub queue_mode: common::QueueMode,
+    pub queued_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -174,15 +177,19 @@ impl MatchmakingManager {
         let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(&game_type, &queue_mode);
         let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(&game_type, &queue_mode);
 
+        let timestamp = Utc::now().timestamp_millis();
+
         let lobby = QueuedLobby {
             lobby_id,
             lobby_code: lobby_code.to_string(),
             members,
             avg_mmr,
+            game_type: game_type.clone(),
+            queue_mode: queue_mode.clone(),
+            queued_at: timestamp,
         };
 
         let lobby_json = serde_json::to_string(&lobby)?;
-        let timestamp = Utc::now().timestamp_millis();
 
         // Start a transaction
         let mut pipe = redis::pipe();

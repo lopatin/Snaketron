@@ -280,6 +280,9 @@ async fn handle_websocket_connection(
     // Will be used to track Redis pub/sub subscription for lobby updates
     let mut lobby_update_handle: Option<JoinHandle<()>> = None;
 
+    // Will be used to track Redis pub/sub subscription for lobby match notifications
+    let mut lobby_match_handle: Option<JoinHandle<()>> = None;
+
     // Spawn task to forward messages from channel to WebSocket
     let ws_tx_clone = ws_tx.clone();
     let forward_task = tokio::spawn(async move {
@@ -445,6 +448,57 @@ async fn handle_websocket_connection(
                                                             error!("Lobby update subscription failed: {}", e);
                                                         }
                                                     }));
+
+                                                    // Subscribe to lobby match notifications
+                                                    if let Some(handle) = lobby_match_handle.take() {
+                                                        handle.abort();
+                                                    }
+
+                                                    let ws_tx_clone = ws_tx.clone();
+                                                    let redis_url_clone = redis_url.clone();
+                                                    let replication_manager_clone = replication_manager.clone();
+
+                                                    lobby_match_handle = Some(tokio::spawn(async move {
+                                                        let redis_keys = crate::redis_keys::RedisKeys::new();
+                                                        let channel = redis_keys.matchmaking_lobby_notification_channel(lobby_id);
+                                                        info!("Member subscribing to lobby match notifications on channel: {}", channel);
+
+                                                        if let Ok(client) = redis::Client::open(redis_url_clone.as_ref()) {
+                                                            if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                                                                if pubsub.subscribe(&channel).await.is_ok() {
+                                                                    info!("Successfully subscribed to lobby match notifications for lobby {}", lobby_id);
+
+                                                                    let mut pubsub_stream = pubsub.on_message();
+                                                                    if let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
+                                                                        if let Ok(payload) = msg.get_payload::<String>() {
+                                                                            // Parse the notification
+                                                                            if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
+                                                                                if let Some(game_id) = notification["game_id"].as_u64() {
+                                                                                    info!("Lobby {} member matched to game {}, waiting for game to be available", lobby_id, game_id);
+
+                                                                                    // Wait for the game to become available in the replication manager
+                                                                                    match replication_manager_clone.wait_for_game(game_id as u32, 10).await {
+                                                                                        Ok(_game_state) => {
+                                                                                            info!("Game {} is now available, sending JoinGame message to lobby {} member", game_id, lobby_id);
+                                                                                            // Send JoinGame message to this client
+                                                                                            let join_msg = WSMessage::JoinGame(game_id as u32);
+                                                                                            let json_msg = serde_json::to_string(&join_msg).unwrap();
+                                                                                            let _ = ws_tx_clone.send(Message::Text(json_msg.into())).await;
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            error!("Failed to wait for game {} to become available: {}", game_id, e);
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    error!("Failed to subscribe to lobby channel {} for lobby {}", channel, lobby_id);
+                                                                }
+                                                            }
+                                                        }
+                                                    }));
                                                 }
                                             }
 
@@ -453,6 +507,10 @@ async fn handle_websocket_connection(
                                                 if let Some(handle) = lobby_update_handle.take() {
                                                     handle.abort();
                                                     debug!("Aborted lobby update subscription");
+                                                }
+                                                if let Some(handle) = lobby_match_handle.take() {
+                                                    handle.abort();
+                                                    debug!("Aborted lobby match notification subscription");
                                                 }
                                             }
 
@@ -495,6 +553,9 @@ async fn handle_websocket_connection(
         handle.abort();
     }
     if let Some(handle) = lobby_update_handle {
+        handle.abort();
+    }
+    if let Some(handle) = lobby_match_handle {
         handle.abort();
     }
     forward_task.abort();
@@ -1303,6 +1364,21 @@ async fn process_ws_message(
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                }
+                WSMessage::JoinGame(game_id) => {
+                    info!("User {} ({}) joining game {} from lobby {}",
+                          metadata.username, metadata.user_id, game_id, lobby_id);
+
+                    // Leave the lobby before joining game
+                    if let Err(e) = lobby_manager.leave_lobby(lobby_id, metadata.user_id, &ws_id).await {
+                        error!("Failed to leave lobby on game join: {}", e);
+                    }
+
+                    // Transition to InGame state
+                    Ok(ConnectionState::InGame {
+                        metadata,
+                        game_id,
+                    })
                 }
                 _ => {
                     warn!("Unexpected message in lobby state: {:?}", ws_message);

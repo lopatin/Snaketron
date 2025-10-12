@@ -1,0 +1,1126 @@
+warning: virtual workspace defaulting to `resolver = "1"` despite one or more workspace members being on edition 2024 which implies `resolver = "3"`
+note: to keep the current resolver, specify `workspace.resolver = "1"` in the workspace root's manifest
+note: to use the edition 2024 resolver, specify `workspace.resolver = "3"` in the workspace root's manifest
+note: for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions
+warning: unused imports: `DateTime` and `Utc`
+ --> server/src/game_server.rs:4:14
+  |
+4 | use chrono::{DateTime, Utc};
+  |              ^^^^^^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `debug`
+ --> server/src/game_server.rs:7:41
+  |
+7 | use tracing::{info, error, warn, trace, debug};
+  |                                         ^^^^^
+
+warning: unused imports: `StreamEvent`, `grpc_server::run_game_relay_server`, and `replay::ReplayListener`
+  --> server/src/game_server.rs:11:40
+   |
+11 |     game_executor::{run_game_executor, StreamEvent},
+   |                                        ^^^^^^^^^^^
+12 |     grpc_server::run_game_relay_server,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+13 |     matchmaking::run_matchmaking_loop,
+14 |     replay::ReplayListener,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ws_server::discover_peers`
+  --> server/src/game_server.rs:21:5
+   |
+21 | use crate::ws_server::discover_peers;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `redis::aio::ConnectionManager`
+  --> server/src/game_server.rs:23:5
+   |
+23 | use redis::aio::ConnectionManager;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `redis::AsyncCommands`
+  --> server/src/game_server.rs:24:5
+   |
+24 | use redis::AsyncCommands;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> server/src/grpc_server.rs:7:5
+  |
+7 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `TcpListener` and `TcpStream`
+ --> server/src/ws_server.rs:3:18
+  |
+3 | use tokio::net::{TcpListener, TcpStream};
+  |                  ^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `chrono::Utc`
+ --> server/src/ws_server.rs:6:5
+  |
+6 | use chrono::Utc;
+  |     ^^^^^^^^^^^
+
+warning: unused import: `futures_util::future::join_all`
+ --> server/src/ws_server.rs:8:5
+  |
+8 | use futures_util::future::join_all;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Stream`
+ --> server/src/ws_server.rs:9:29
+  |
+9 | use futures_util::{SinkExt, Stream};
+  |                             ^^^^^^
+
+warning: unused imports: `RwLock`, `broadcast`, and `oneshot`
+  --> server/src/ws_server.rs:11:19
+   |
+11 | use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
+   |                   ^^^^^^^^^  ^^^^^^^               ^^^^^^
+
+warning: unused import: `sleep`
+  --> server/src/ws_server.rs:14:26
+   |
+14 | use tokio::time::{Sleep, sleep};
+   |                          ^^^^^
+
+warning: unused import: `tokio_tungstenite::WebSocketStream`
+  --> server/src/ws_server.rs:16:5
+   |
+16 | use tokio_tungstenite::WebSocketStream;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `AsyncWriteExt`
+  --> server/src/ws_server.rs:20:31
+   |
+20 | use tokio::io::{AsyncReadExt, AsyncWriteExt};
+   |                               ^^^^^^^^^^^^^
+
+warning: unused import: `redis::aio::Connection`
+    --> server/src/ws_server.rs:1446:9
+     |
+1446 |     use redis::aio::Connection;
+     |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `tracing::info`
+ --> server/src/replay/recorder.rs:6:5
+  |
+6 | use tracing::info;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `tokio::sync::broadcast`
+ --> server/src/replay/listener.rs:2:5
+  |
+2 | use tokio::sync::broadcast;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Path`
+ --> server/src/replay/directory.rs:1:17
+  |
+1 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+
+warning: unused import: `anyhow`
+ --> server/src/cluster_singleton.rs:1:14
+  |
+1 | use anyhow::{anyhow, Result, Context};
+  |              ^^^^^^
+
+warning: unused import: `oneshot`
+ --> server/src/pubsub_manager.rs:4:33
+  |
+4 | use tokio::sync::{RwLock, mpsc, oneshot};
+  |                                 ^^^^^^^
+
+warning: unused import: `PubSub`
+ --> server/src/pubsub_manager.rs:7:37
+  |
+7 | use redis::aio::{ConnectionManager, PubSub};
+  |                                     ^^^^^^
+
+warning: unused import: `PubSub`
+ --> server/src/ws_matchmaking.rs:4:37
+  |
+4 | use redis::aio::{ConnectionManager, PubSub};
+  |                                     ^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> server/src/db/mod.rs:8:5
+  |
+8 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `common::GameType`
+  --> server/src/db/mod.rs:10:5
+   |
+10 | use common::GameType;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated struct `redis::aio::Connection`: aio::Connection is deprecated. Use aio::MultiplexedConnection instead.
+    --> server/src/ws_server.rs:1446:21
+     |
+1446 |     use redis::aio::Connection;
+     |                     ^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `game_id`
+   --> server/src/game_executor.rs:333:26
+    |
+333 |                     for (game_id, (_, snap_tx)) in game_channels.iter() {
+    |                          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_game_id`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `jwt_verifier`
+  --> server/src/game_server.rs:97:13
+   |
+97 |             jwt_verifier,
+   |             ^^^^^^^^^^^^ help: try ignoring the field: `jwt_verifier: _`
+
+warning: unused variable: `replay_dir`
+  --> server/src/game_server.rs:98:13
+   |
+98 |             replay_dir,
+   |             ^^^^^^^^^^ help: try ignoring the field: `replay_dir: _`
+
+warning: unused variable: `redis_conn`
+   --> server/src/game_server.rs:124:13
+    |
+124 |         let redis_conn = redis_utils::create_connection_manager(client)
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_redis_conn`
+
+warning: unused variable: `queue_mode`
+   --> server/src/matchmaking.rs:702:5
+    |
+702 |     queue_mode: &common::QueueMode,
+    |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_queue_mode`
+
+warning: unused variable: `ws_tx_clone`
+   --> server/src/ws_server.rs:284:9
+    |
+284 |     let ws_tx_clone = ws_tx.clone();
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ws_tx_clone`
+
+warning: unused variable: `frame`
+   --> server/src/ws_server.rs:363:63
+    |
+363 | ...                   axum::extract::ws::Message::Close(frame) => {
+    |                                                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_frame`
+
+warning: unused variable: `partition_id`
+    --> server/src/ws_server.rs:1658:9
+     |
+1658 |     let partition_id = game_id_u32 % PARTITION_COUNT;
+     |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_partition_id`
+
+warning: unused variable: `partition_id`
+    --> server/src/ws_server.rs:1729:9
+     |
+1729 |     let partition_id = game_id_u32 % PARTITION_COUNT;
+     |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_partition_id`
+
+warning: unused variable: `region`
+   --> server/src/lobby_manager.rs:257:5
+    |
+257 |     region: String,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_region`
+
+warning: unused variable: `p`
+   --> server/src/matchmaking.rs:879:15
+    |
+879 |         .map(|p| {
+    |               ^ help: if this is intentional, prefix it with an underscore: `_p`
+
+warning: unused variable: `user_ids`
+    --> server/src/matchmaking.rs:1059:9
+     |
+1059 |     let user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_user_ids`
+
+warning: unused variable: `pattern`
+  --> server/src/replay/listener.rs:95:13
+   |
+95 |         let pattern = format!("game_{}_*.replay", game_id);
+   |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pattern`
+
+warning: unused import: `AsyncReadExt`
+  --> server/src/ws_server.rs:20:17
+   |
+20 | use tokio::io::{AsyncReadExt, AsyncWriteExt};
+   |                 ^^^^^^^^^^^^
+
+warning: unused variable: `response_tx`
+  --> server/src/grpc_server.rs:43:14
+   |
+43 |         let (response_tx, response_rx) = mpsc::channel(32);
+   |              ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_response_tx`
+
+warning: unused variable: `lobby_id`
+    --> server/src/db/dynamodb.rs:1019:49
+     |
+1019 |     async fn update_custom_lobby_game_id(&self, lobby_id: i32, game_id: i32) -> Result<()> {
+     |                                                 ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_lobby_id`
+
+warning: unused variable: `game_id`
+    --> server/src/db/dynamodb.rs:1019:64
+     |
+1019 |     async fn update_custom_lobby_game_id(&self, lobby_id: i32, game_id: i32) -> Result<()> {
+     |                                                                ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_game_id`
+
+warning: unused variable: `game_id`
+    --> server/src/db/dynamodb.rs:1026:43
+     |
+1026 |     async fn get_custom_lobby_host(&self, game_id: i32) -> Result<Option<i32>> {
+     |                                           ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_game_id`
+
+warning: unused variable: `result`
+    --> server/src/db/dynamodb.rs:1035:13
+     |
+1035 |         let result = self.client
+     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_result`
+
+warning: fields `server_id` and `grpc_addr` are never read
+  --> server/src/grpc_server.rs:16:5
+   |
+15 | pub struct GameRelayService {
+   |            ---------------- fields in this struct
+16 |     server_id: String,
+   |     ^^^^^^^^^
+17 |     grpc_addr: String,
+   |     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: constant `MMR_RANGES` is never used
+  --> server/src/matchmaking.rs:19:7
+   |
+19 | const MMR_RANGES: [(i32, i32); 4] = [
+   |       ^^^^^^^^^^
+
+warning: constant `WAIT_THRESHOLDS` is never used
+  --> server/src/matchmaking.rs:27:7
+   |
+27 | const WAIT_THRESHOLDS: [i64; 4] = [5, 10, 20, 30];
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `MIN_PLAYERS_BY_WAIT` is never used
+  --> server/src/matchmaking.rs:30:7
+   |
+30 | const MIN_PLAYERS_BY_WAIT: [usize; 4] = [
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: field `wait_time_ms` is never read
+   --> server/src/matchmaking.rs:372:5
+    |
+370 | struct RankedPlayer {
+    |        ------------ field in this struct
+371 |     player: QueuedPlayer,
+372 |     wait_time_ms: i64,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `RankedPlayer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `create_match` is never used
+   --> server/src/matchmaking.rs:863:10
+    |
+863 | async fn create_match(
+    |          ^^^^^^^^^^^^
+
+warning: method `handle_game_event` is never used
+  --> server/src/replay/listener.rs:20:14
+   |
+11 | impl ReplayListener {
+   | ------------------- method in this implementation
+...
+20 |     async fn handle_game_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
+   |              ^^^^^^^^^^^^^^^^^
+
+warning: field `pubsub` is never read
+   --> server/src/replication.rs:232:5
+    |
+227 | pub struct ReplicationManager {
+    |            ------------------ field in this struct
+...
+232 |     pubsub: Arc<Mutex<PubSubManager>>,
+    |     ^^^^^^
+
+warning: field `subscriptions` is never read
+  --> server/src/pubsub_manager.rs:50:16
+   |
+46 | pub struct PubSubManager {
+   |            ------------- field in this struct
+...
+50 |     pub(crate) subscriptions: Arc<RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+   |                ^^^^^^^^^^^^^
+   |
+   = note: `PubSubManager` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: fields `matchmaking_manager` and `redis_conn` are never read
+   --> server/src/ws_matchmaking.rs:166:5
+    |
+165 | pub struct MatchmakingHandler {
+    |            ------------------ fields in this struct
+166 |     matchmaking_manager: MatchmakingManager,
+    |     ^^^^^^^^^^^^^^^^^^^
+167 |     redis_conn: ConnectionManager,
+    |     ^^^^^^^^^^
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:238:5
+    |
+238 |     async fn get_game_state(&self, game_id: u32) -> Option<GameState>;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+    = note: `#[warn(async_fn_in_trait)]` on by default
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+238 -     async fn get_game_state(&self, game_id: u32) -> Option<GameState>;
+238 +     fn get_game_state(&self, game_id: u32) -> impl std::future::Future<Output = Option<GameState>> + Send;
+    |
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:241:5
+    |
+241 |     async fn get_partition_games(&self, partition_id: u32) -> Vec<(u32, GameState)>;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+241 -     async fn get_partition_games(&self, partition_id: u32) -> Vec<(u32, GameState)>;
+241 +     fn get_partition_games(&self, partition_id: u32) -> impl std::future::Future<Output = Vec<(u32, GameState)>> + Send;
+    |
+
+warning: use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
+   --> server/src/replication.rs:244:5
+    |
+244 |     async fn is_ready(&self) -> bool;
+    |     ^^^^^
+    |
+    = note: you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
+help: you can alternatively desugar to a normal `fn` that returns `impl Future` and add any desired bounds such as `Send`, but these cannot be relaxed without a breaking API change
+    |
+244 -     async fn is_ready(&self) -> bool;
+244 +     fn is_ready(&self) -> impl std::future::Future<Output = bool> + Send;
+    |
+
+warning: `server` (lib) generated 58 warnings (run `cargo fix --lib -p server` to apply 25 suggestions)
+warning: unused import: `GameType`
+ --> server/tests/multi_server_integration_tests.rs:3:16
+  |
+3 | use ::common::{GameType, GameEvent};
+  |                ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `mock_jwt::MockJwtVerifier`
+ --> server/tests/common/mod.rs:5:9
+  |
+5 | pub use mock_jwt::MockJwtVerifier;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `server2_addr`
+   --> server/tests/multi_server_integration_tests.rs:190:9
+    |
+190 |     let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
+    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_server2_addr`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: function `wait_for_match` is never used
+   --> server/tests/multi_server_integration_tests.rs:381:10
+    |
+381 | async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
+    |          ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: associated items `new` and `with_token` are never used
+  --> server/tests/common/mock_jwt.rs:27:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+27 |     pub fn new() -> Self {
+   |            ^^^
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+
+warning: methods `send_ping`, `expect_pong`, `receive_text`, and `receive_game_event` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+...
+90 |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: methods `add_server_with_jwt`, `grpc_addr`, and `server` are never used
+   --> server/tests/common/test_environment.rs:95:18
+    |
+23  | impl TestEnvironment {
+    | -------------------- methods in this implementation
+...
+95  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+139 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+...
+146 |     pub fn server(&self, index: usize) -> Option<&GameServer> {
+    |            ^^^^^^
+
+warning: unused import: `game_server::GameServer`
+ --> server/tests/replay_test.rs:3:5
+  |
+3 |     game_server::GameServer,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `CommandId`, `Direction`, `GameCommandMessage`, `GameCommand`, `GameEventMessage`, `GameEvent`, `GameState`, `GameStatus`, and `GameType`
+ --> server/tests/replay_test.rs:5:16
+  |
+5 | use ::common::{GameCommand, GameState, GameStatus, Direction, GameEventMessage, GameEvent, CommandId, GameCommandMessage, GameType};
+  |                ^^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^
+
+warning: unused import: `test_client::TestClient`
+ --> server/tests/common/mod.rs:6:9
+  |
+6 | pub use test_client::TestClient;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `test_environment::TestEnvironment`
+ --> server/tests/common/mod.rs:7:9
+  |
+7 | pub use test_environment::TestEnvironment;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `MockJwtVerifier` is never constructed
+  --> server/tests/common/mock_jwt.rs:22:12
+   |
+22 | pub struct MockJwtVerifier {
+   |            ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: associated items `new`, `with_token`, and `accept_any` are never used
+  --> server/tests/common/mock_jwt.rs:27:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+27 |     pub fn new() -> Self {
+   |            ^^^
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+...
+40 |     pub fn accept_any() -> Self {
+   |            ^^^^^^^^^^
+
+warning: struct `TestClient` is never constructed
+  --> server/tests/common/test_client.rs:10:12
+   |
+10 | pub struct TestClient {
+   |            ^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> server/tests/common/test_client.rs:16:18
+    |
+15  | impl TestClient {
+    | --------------- associated items in this implementation
+16  |     pub async fn connect(addr: &str) -> Result<Self> {
+    |                  ^^^^^^^
+...
+24  |     pub async fn authenticate(&mut self, user_id: i32) -> Result<()> {
+    |                  ^^^^^^^^^^^^
+...
+31  |     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+...
+38  |     pub async fn send_ping(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+42  |     pub async fn expect_pong(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^^^
+...
+50  |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+54  |     pub async fn send_message(&mut self, msg: WSMessage) -> Result<()> {
+    |                  ^^^^^^^^^^^^
+...
+60  |     pub async fn receive_message(&mut self) -> Result<WSMessage> {
+    |                  ^^^^^^^^^^^^^^^
+...
+76  |     pub async fn receive_text(&mut self) -> Result<String> {
+    |                  ^^^^^^^^^^^^
+...
+90  |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+117 |     pub async fn disconnect(mut self) -> Result<()> {
+    |                  ^^^^^^^^^^
+
+warning: struct `TestEnvironment` is never constructed
+  --> server/tests/common/test_environment.rs:12:12
+   |
+12 | pub struct TestEnvironment {
+   |            ^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> server/tests/common/test_environment.rs:25:18
+    |
+23  | impl TestEnvironment {
+    | -------------------- associated items in this implementation
+24  |     /// Create a new test environment with an isolated database
+25  |     pub async fn new(test_name: &str) -> Result<Self> {
+    |                  ^^^
+...
+51  |     pub fn db(&self) -> Arc<dyn Database> {
+    |            ^^
+...
+56  |     pub async fn add_server(&mut self) -> Result<(usize, u64)> {
+    |                  ^^^^^^^^^^
+...
+61  |     pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<(usize, u64)> {
+    |                  ^^^^^^^^^^^^^^^^^^^^
+...
+95  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+111 |     pub async fn create_user(&mut self) -> Result<i32> {
+    |                  ^^^^^^^^^^^
+...
+116 |     pub async fn create_user_with_mmr(&mut self, mmr: i32) -> Result<i32> {
+    |                  ^^^^^^^^^^^^^^^^^^^^
+...
+134 |     pub fn ws_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^
+...
+139 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+...
+146 |     pub fn server(&self, index: usize) -> Option<&GameServer> {
+    |            ^^^^^^
+...
+151 |     pub fn user_ids(&self) -> &[i32] {
+    |            ^^^^^^^^
+...
+156 |     pub async fn shutdown(mut self) -> Result<()> {
+    |                  ^^^^^^^^
+
+warning: unused `Result` that must be used
+  --> server/tests/food_endzone_test.rs:46:9
+   |
+46 |         game_state.tick_forward(false);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+   = note: `#[warn(unused_must_use)]` on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+46 |         let _ = game_state.tick_forward(false);
+   |         +++++++
+
+warning: unused import: `mock_jwt::MockJwtVerifier`
+ --> server/tests/common/mod.rs:5:9
+  |
+5 | pub use mock_jwt::MockJwtVerifier;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/solo_game_test.rs:17:39
+   |
+17 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/solo_game_test.rs:8:5
+  |
+8 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new` and `with_token` are never used
+  --> server/tests/common/mock_jwt.rs:27:12
+   |
+26 | impl MockJwtVerifier {
+   | -------------------- associated items in this implementation
+27 |     pub fn new() -> Self {
+   |            ^^^
+...
+33 |     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+   |            ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: methods `send_ping`, `expect_pong`, `receive_text`, `receive_game_event`, and `disconnect` are never used
+   --> server/tests/common/test_client.rs:38:18
+    |
+15  | impl TestClient {
+    | --------------- methods in this implementation
+...
+38  |     pub async fn send_ping(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^
+...
+42  |     pub async fn expect_pong(&mut self) -> Result<()> {
+    |                  ^^^^^^^^^^^
+...
+76  |     pub async fn receive_text(&mut self) -> Result<String> {
+    |                  ^^^^^^^^^^^^
+...
+90  |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+117 |     pub async fn disconnect(mut self) -> Result<()> {
+    |                  ^^^^^^^^^^
+
+warning: unused import: `GameType`
+ --> server/tests/distributed_broker_tests.rs:3:27
+  |
+3 | use ::common::{GameEvent, GameType};
+  |                           ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `tracing::info`
+ --> server/tests/distributed_broker_tests.rs:5:5
+  |
+5 | use tracing::info;
+  |     ^^^^^^^^^^^^^
+
+warning: unused variable: `game_id`
+   --> server/tests/distributed_broker_tests.rs:194:9
+    |
+194 |     let game_id = match timeout(Duration::from_secs(5), async {
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_game_id`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: methods `send_ping`, `expect_pong`, `join_game`, `receive_message`, and `receive_text` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+60 |     pub async fn receive_message(&mut self) -> Result<WSMessage> {
+   |                  ^^^^^^^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+
+warning: methods `add_server_with_jwt`, `grpc_addr`, `server`, and `user_ids` are never used
+   --> server/tests/common/test_environment.rs:95:18
+    |
+23  | impl TestEnvironment {
+    | -------------------- methods in this implementation
+...
+95  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+139 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+...
+146 |     pub fn server(&self, index: usize) -> Option<&GameServer> {
+    |            ^^^^^^
+...
+151 |     pub fn user_ids(&self) -> &[i32] {
+    |            ^^^^^^^^
+
+warning: methods `send_ping`, `expect_pong`, `join_game`, and `receive_text` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/simple_game_test.rs:17:39
+   |
+17 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/simple_game_test.rs:8:5
+  |
+8 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `server_id`
+  --> server/tests/simple_game_test.rs:25:13
+   |
+25 |     let (_, server_id) = env.add_server().await?;
+   |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_server_id`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `server`
+   --> server/tests/simple_game_test.rs:340:17
+    |
+340 |     if let Some(server) = env.server(0) {
+    |                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_server`
+
+warning: methods `add_server_with_jwt` and `grpc_addr` are never used
+   --> server/tests/common/test_environment.rs:95:18
+    |
+23  | impl TestEnvironment {
+    | -------------------- methods in this implementation
+...
+95  |     pub async fn add_server_with_jwt(&mut self, jwt_verifier: Arc<dyn JwtVerifier>) -> Result<usize> {
+    |                  ^^^^^^^^^^^^^^^^^^^
+...
+139 |     pub fn grpc_addr(&self, index: usize) -> Option<String> {
+    |            ^^^^^^^^^
+
+warning: unused import: `super::*`
+    --> server/src/matchmaking.rs:1110:9
+     |
+1110 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `GameEventMessage`
+ --> server/tests/event_delivery_tests.rs:5:27
+  |
+5 | use ::common::{GameEvent, GameEventMessage, GameType, GameCommand, GameCommandMessage, Direction, CommandId};
+  |                           ^^^^^^^^^^^^^^^^
+
+warning: methods `send_ping`, `expect_pong`, `join_game`, `receive_text`, and `receive_game_event` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+76 |     pub async fn receive_text(&mut self) -> Result<String> {
+   |                  ^^^^^^^^^^^^
+...
+90 |     pub async fn receive_game_event(&mut self) -> Result<Option<GameEventMessage>> {
+   |                  ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/duel_game_test.rs:17:39
+   |
+17 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/duel_game_test.rs:8:5
+  |
+8 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: value assigned to `game_completed` is never read
+   --> server/tests/solo_game_play_again_test.rs:155:29
+    |
+155 | ...                   game_completed = true;
+    |                       ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` on by default
+
+warning: fields `winning_snake_id`, `score`, and `duration` are never read
+  --> server/tests/solo_game_play_again_test.rs:73:5
+   |
+72 | struct GameCompletionResult {
+   |        -------------------- fields in this struct
+73 |     winning_snake_id: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^
+74 |     score: u32,
+   |     ^^^^^
+75 |     duration: u32,
+   |     ^^^^^^^^
+   |
+   = note: `GameCompletionResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+
+warning: `server` (test "multi_server_integration_tests") generated 7 warnings (run `cargo fix --test "multi_server_integration_tests"` to apply 2 suggestions)
+warning: `server` (test "replay_test") generated 11 warnings (1 duplicate) (run `cargo fix --test "replay_test"` to apply 4 suggestions)
+warning: `server` (test "food_endzone_test") generated 1 warning
+warning: `server` (test "solo_game_test") generated 6 warnings (1 duplicate) (run `cargo fix --test "solo_game_test"` to apply 1 suggestion)
+warning: `server` (test "distributed_broker_tests") generated 7 warnings (2 duplicates) (run `cargo fix --test "distributed_broker_tests"` to apply 2 suggestions)
+warning: `server` (test "game_cleanup_tests") generated 4 warnings (3 duplicates)
+warning: `server` (test "simple_game_test") generated 8 warnings (3 duplicates)
+warning: `server` (lib test) generated 59 warnings (58 duplicates) (run `cargo fix --lib -p server --tests` to apply 1 suggestion)
+warning: `server` (test "event_delivery_tests") generated 5 warnings (3 duplicates) (run `cargo fix --test "event_delivery_tests"` to apply 1 suggestion)
+warning: `server` (test "duel_game_test") generated 6 warnings (4 duplicates)
+warning: `server` (test "solo_game_play_again_test") generated 6 warnings (4 duplicates)
+warning: methods `send_ping`, `expect_pong`, `join_game`, and `receive_message` are never used
+  --> server/tests/common/test_client.rs:38:18
+   |
+15 | impl TestClient {
+   | --------------- methods in this implementation
+...
+38 |     pub async fn send_ping(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+42 |     pub async fn expect_pong(&mut self) -> Result<()> {
+   |                  ^^^^^^^^^^^
+...
+50 |     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+   |                  ^^^^^^^^^
+...
+60 |     pub async fn receive_message(&mut self) -> Result<WSMessage> {
+   |                  ^^^^^^^^^^^^^^^
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/lobby_matchmaking_tests.rs:5:5
+  |
+5 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/lobby_matchmaking_tests.rs:16:39
+   |
+16 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `client`
+   --> server/tests/lobby_matchmaking_tests.rs:144:26
+    |
+144 | async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option<TeamId>> {
+    |                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_client`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `user_id`
+   --> server/tests/lobby_matchmaking_tests.rs:144:51
+    |
+144 | async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option<TeamId>> {
+    |                                                   ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_user_id`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:197:10
+    |
+197 |     let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:205:10
+    |
+205 |     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:281:10
+    |
+281 |     let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:289:10
+    |
+289 |     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:325:10
+    |
+325 |     let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:334:10
+    |
+334 |     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:403:10
+    |
+403 |     let (mut clients1, _) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:411:10
+    |
+411 |     let (mut clients2, _) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> server/tests/lobby_matchmaking_tests.rs:419:10
+    |
+419 |     let (mut clients3, _) = create_lobby_and_queue(
+    |          ----^^^^^^^^
+    |          |
+    |          help: remove this `mut`
+
+warning: function `get_player_team` is never used
+   --> server/tests/lobby_matchmaking_tests.rs:144:10
+    |
+144 | async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option<TeamId>> {
+    |          ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: unused import: `redis::AsyncCommands`
+ --> server/tests/matchmaking_integration_tests.rs:6:5
+  |
+6 | use redis::AsyncCommands;
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+  --> server/tests/matchmaking_integration_tests.rs:30:39
+   |
+30 |     let mut redis_conn = redis_client.get_async_connection().await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+   --> server/tests/matchmaking_integration_tests.rs:310:39
+    |
+310 |     let mut redis_conn = redis_client.get_async_connection().await?;
+    |                                       ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+   --> server/tests/matchmaking_integration_tests.rs:366:39
+    |
+366 |     let mut redis_conn = redis_client.get_async_connection().await?;
+    |                                       ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+   --> server/tests/matchmaking_integration_tests.rs:467:39
+    |
+467 |     let mut redis_conn = redis_client.get_async_connection().await?;
+    |                                       ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `redis::Client::get_async_connection`: aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead.
+   --> server/tests/matchmaking_integration_tests.rs:584:39
+    |
+584 |     let mut redis_conn = redis_client.get_async_connection().await?;
+    |                                       ^^^^^^^^^^^^^^^^^^^^
+
+warning: `server` (test "websocket_tests") generated 4 warnings (3 duplicates)
+warning: `server` (test "lobby_matchmaking_tests") generated 18 warnings (4 duplicates) (run `cargo fix --test "lobby_matchmaking_tests"` to apply 10 suggestions)
+warning: `server` (test "matchmaking_integration_tests") generated 10 warnings (4 duplicates) (run `cargo fix --test "matchmaking_integration_tests"` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running unittests src/lib.rs (target/debug/deps/server-674e77f2b3ecc252)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/server-9fdd20f6e228e952)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/distributed_broker_tests.rs (target/debug/deps/distributed_broker_tests-dbad7ff038ea5746)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/duel_game_test.rs (target/debug/deps/duel_game_test-5d21e43ad1ab2df5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/event_delivery_tests.rs (target/debug/deps/event_delivery_tests-7400e3bbbe9a78d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/food_endzone_test.rs (target/debug/deps/food_endzone_test-cf889eae3d427a38)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/game_cleanup_tests.rs (target/debug/deps/game_cleanup_tests-9327a115daa390ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lobby_matchmaking_tests.rs (target/debug/deps/lobby_matchmaking_tests-b9443b8432c3cc44)
+
+running 1 test
+test test_two_single_lobbies_create_1v1 ... Error: deadline has elapsed
+FAILED
+
+failures:
+
+failures:
+    test_two_single_lobbies_create_1v1
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 30.89s
+
+error: test failed, to rerun pass `-p server --test lobby_matchmaking_tests`

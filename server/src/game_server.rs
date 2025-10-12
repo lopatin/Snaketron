@@ -117,12 +117,14 @@ impl GameServer {
         }));
 
         // Redis connection manager
-        info!("Redis URL: {}", redis_url.as_str());
+        info!("Connecting to Redis at: {}", redis_url.as_str());
         let client = redis::Client::open(redis_url.as_str())
-            .context("Failed to connect to the cache")?;
+            .context(format!("Failed to open Redis client for URL: {}", redis_url))?;
+        info!("Redis client created, creating connection manager...");
         let redis_conn = redis_utils::create_connection_manager(client)
             .await
-            .context("Failed to create Redis connection manager")?;
+            .context(format!("Failed to create Redis connection manager for URL: {}", redis_url))?;
+        info!("Redis connection manager created successfully");
 
         // WebSocket server will be started after ReplicationManager is created
 
@@ -356,19 +358,66 @@ pub async fn start_test_server_with_grpc(
     std::fs::create_dir_all(&replay_path).ok();
     let replay_dir = Some(replay_path);
 
+    // Use environment variable if set, otherwise use default
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
     let config = GameServerConfig {
-        db,
+        db: db.clone(),
         http_addr: http_addr.clone(),
         grpc_addr,
         region: "test-region".to_string(),
         origin: format!("http://{}", http_addr),
         ws_url: format!("ws://{}/ws", http_addr),
-        jwt_verifier,
+        jwt_verifier: jwt_verifier.clone(),
         replay_dir,
-        redis_url: "redis://127.0.0.1:6379/1".to_string(),
+        redis_url: redis_url.clone(),
     };
 
-    GameServer::start(config).await
+    let game_server = GameServer::start(config).await?;
+
+    // Start the HTTP server (WebSocket + API) for tests
+    let http_db = db.clone();
+    let http_jwt_verifier = jwt_verifier;
+    let http_redis_url = redis_url;
+    let http_replication_manager = game_server.replication_manager()
+        .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
+        .clone();
+    let http_cancellation_token = game_server.cancellation_token().clone();
+    let http_server_id = game_server.id();
+
+    // Create a dummy region cache for tests
+    let aws_config = aws_config::load_from_env().await;
+    let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
+    let table_prefix = std::env::var("DYNAMODB_TABLE_PREFIX")
+        .unwrap_or_else(|_| "snaketron".to_string());
+    let region_cache = Arc::new(crate::region_cache::RegionCache::new(
+        dynamodb_client,
+        table_prefix,
+    ));
+
+    // Spawn HTTP server task
+    tokio::spawn(async move {
+        if let Err(e) = crate::http_server::run_http_server(
+            &http_addr,
+            http_db,
+            "test-jwt-secret",  // JWT secret for tests
+            http_jwt_verifier,
+            http_redis_url,
+            http_replication_manager,
+            http_cancellation_token,
+            http_server_id,
+            "test-region".to_string(),
+            region_cache,
+        ).await {
+            error!("HTTP server error in test: {}", e);
+        }
+    });
+
+    // Give the HTTP server a moment to start listening
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    Ok(game_server)
 }
 
 /// Get an available port by binding to port 0

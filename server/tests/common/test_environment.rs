@@ -24,11 +24,21 @@ impl TestEnvironment {
     /// Create a new test environment with an isolated database
     pub async fn new(test_name: &str) -> Result<Self> {
         info!("Creating test environment for: {}", test_name);
-        
+
+        // Environment variables for test dependencies are set via .cargo/config.toml
+        // Use a unique table prefix for this test to avoid collisions
+        let unique_prefix = format!("test_{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(8).collect::<String>());
+        // SAFETY: This is safe in tests because each test runs sequentially with TestEnvironment::new()
+        // being called at the start of the test before any other code accesses DYNAMODB_TABLE_PREFIX
+        unsafe {
+            std::env::set_var("DYNAMODB_TABLE_PREFIX", &unique_prefix);
+        }
+        info!("Using unique table prefix for test: {}", unique_prefix);
+
         // Create DynamoDB instance for testing
         let db = Arc::new(DynamoDatabase::new().await
             .context("Failed to create DynamoDB instance")?) as Arc<dyn Database>;
-        
+
         Ok(Self {
             db,
             servers: Vec::new(),
@@ -122,7 +132,7 @@ impl TestEnvironment {
     
     /// Get the WebSocket address for a server by index
     pub fn ws_addr(&self, index: usize) -> Option<String> {
-        self.servers.get(index).map(|s| format!("ws://{}", s.http_addr()))
+        self.servers.get(index).map(|s| format!("ws://{}/ws", s.http_addr()))
     }
     
     /// Get the gRPC address for a server by index
