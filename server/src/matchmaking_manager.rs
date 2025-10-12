@@ -27,6 +27,7 @@ pub struct QueuedLobby {
     pub game_type: GameType,
     pub queue_mode: common::QueueMode,
     pub queued_at: i64,
+    pub requesting_user_id: u32,  // Who initiated the queue request (for spectator preference)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,67 +104,6 @@ impl MatchmakingManager {
             .context("Failed to connect to Redis for matchmaking")
     }
     
-    /// Add a player to the matchmaking queue
-    pub async fn add_to_queue(&mut self, user_id: u32, username: String, mmr: i32, game_type: GameType, queue_mode: common::QueueMode) -> Result<()> {
-        let queue_key = self.redis_keys.matchmaking_queue(&game_type, &queue_mode);
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(&game_type, &queue_mode);
-        let user_key = self.redis_keys.matchmaking_user_status(user_id);
-        
-        let player = QueuedPlayer {
-            user_id,
-            mmr,
-            username: username.clone(),
-        };
-        
-        let player_json = serde_json::to_string(&player)?;
-        let timestamp = Utc::now().timestamp_millis();
-        
-        // Start a transaction
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        
-        // Add to queue sorted set (score = timestamp for FIFO)
-        pipe.zadd(&queue_key, player_json, timestamp);
-        
-        // Add to MMR index (score = MMR for range queries)
-        pipe.zadd(&mmr_key, user_id.to_string(), mmr);
-        
-        // Store user status
-        let status = UserQueueStatus {
-            game_type: game_type.clone(),
-            queue_mode: queue_mode.clone(),
-            request_time: timestamp,
-            mmr,
-            username,
-            matched_game_id: None,
-        };
-        let status_json = serde_json::to_string(&status)?;
-        pipe.hset(&user_key, "status", status_json);
-        
-        // Execute transaction with retries
-        let mut attempts = 0;
-        let mut delay = self.retry_delay;
-        
-        loop {
-            attempts += 1;
-            match pipe.clone().query_async(&mut self.conn).await {
-                Ok(()) => break,
-                Err(e) if attempts < self.max_retries => {
-                    warn!("Failed to add to queue (attempt {}/{}): {}", attempts, self.max_retries, e);
-                    sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(10));
-                }
-                Err(e) => {
-                    error!("Failed to add to queue after {} attempts", self.max_retries);
-                    return Err(anyhow!("Failed to add to queue: {}", e));
-                }
-            }
-        }
-        
-        info!("Added user {} to matchmaking queue for {:?}", user_id, game_type);
-        Ok(())
-    }
-
     /// Add a lobby to the matchmaking queue
     pub async fn add_lobby_to_queue(
         &mut self,
@@ -173,6 +113,7 @@ impl MatchmakingManager {
         avg_mmr: i32,
         game_type: GameType,
         queue_mode: common::QueueMode,
+        requesting_user_id: u32,  // Who initiated the queue request
     ) -> Result<()> {
         let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(&game_type, &queue_mode);
         let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(&game_type, &queue_mode);
@@ -187,6 +128,7 @@ impl MatchmakingManager {
             game_type: game_type.clone(),
             queue_mode: queue_mode.clone(),
             queued_at: timestamp,
+            requesting_user_id,
         };
 
         let lobby_json = serde_json::to_string(&lobby)?;
@@ -424,24 +366,6 @@ impl MatchmakingManager {
         Ok(removed_count)
     }
     
-    /// Get all players in queue for a game type (limited to 5000)
-    pub async fn get_queued_players(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<QueuedPlayer>> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
-
-        // Limit to 5000 records to prevent excessive memory usage
-        const MAX_QUEUE_FETCH: isize = 4999; // 0-indexed, so 4999 = 5000 items
-        let members: Vec<String> = self.conn.zrange(&queue_key, 0, MAX_QUEUE_FETCH).await?;
-        let mut players = Vec::new();
-
-        for member_json in members {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                players.push(player);
-            }
-        }
-
-        Ok(players)
-    }
-
     /// Get all lobbies in queue for a game type (limited to 100)
     pub async fn get_queued_lobbies(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<QueuedLobby>> {
         let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, queue_mode);
@@ -487,99 +411,6 @@ impl MatchmakingManager {
         Ok(())
     }
 
-    /// Get the longest waiting users (up to 5000) with their queue timestamps
-    pub async fn get_longest_waiting_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<(QueuedPlayer, i64)>> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
-
-        // Get oldest 5000 entries (score = timestamp)
-        const MAX_FETCH: isize = 4999; // 0-indexed, so 4999 = 5000 items
-        let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, MAX_FETCH).await?;
-
-        let mut players = Vec::new();
-        for (member_json, timestamp) in members {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                players.push((player, timestamp as i64));
-            }
-        }
-
-        Ok(players)
-    }
-
-    /// Get users with lowest MMR (up to 5000)
-    pub async fn get_lowest_mmr_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<u32>> {
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
-
-        // Get lowest 5000 MMR entries
-        const MAX_FETCH: isize = 4999;
-        let user_ids: Vec<String> = self.conn.zrange(&mmr_key, 0, MAX_FETCH).await?;
-
-        Ok(user_ids.into_iter()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect())
-    }
-
-    /// Get users with highest MMR (up to 5000)
-    pub async fn get_highest_mmr_users(&mut self, game_type: &GameType, queue_mode: &common::QueueMode) -> Result<Vec<u32>> {
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
-
-        // Get highest 5000 MMR entries (reverse range)
-        const MAX_FETCH: isize = 4999;
-        let user_ids: Vec<String> = self.conn.zrevrange(&mmr_key, 0, MAX_FETCH).await?;
-
-        Ok(user_ids.into_iter()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect())
-    }
-
-    /// Batch get user status for multiple users
-    pub async fn batch_get_user_status(&mut self, user_ids: &[u32]) -> Result<Vec<(u32, UserQueueStatus)>> {
-        if user_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Build pipeline to fetch all user statuses
-        let mut pipe = redis::pipe();
-        for user_id in user_ids {
-            let user_key = self.redis_keys.matchmaking_user_status(*user_id);
-            pipe.hget(&user_key, "status");
-        }
-
-        // Execute pipeline
-        let results: Vec<Option<String>> = pipe.query_async(&mut self.conn).await?;
-
-        // Parse results
-        let mut statuses = Vec::new();
-        for (user_id, status_json) in user_ids.iter().zip(results.into_iter()) {
-            if let Some(json) = status_json {
-                if let Ok(status) = serde_json::from_str::<UserQueueStatus>(&json) {
-                    statuses.push((*user_id, status));
-                }
-            }
-        }
-
-        Ok(statuses)
-    }
-    
-    /// Get players in MMR range (limited to 5000)
-    pub async fn get_players_in_mmr_range(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, min_mmr: i32, max_mmr: i32) -> Result<Vec<u32>> {
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
-
-        // Use ZRANGEBYSCORE with LIMIT to prevent excessive memory usage
-        let user_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-            .arg(&mmr_key)
-            .arg(min_mmr)
-            .arg(max_mmr)
-            .arg("LIMIT")
-            .arg(0)
-            .arg(5000)
-            .query_async(&mut self.conn)
-            .await?;
-
-        Ok(user_ids.into_iter()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect())
-    }
-    
     /// Store active match information
     pub async fn store_active_match(&mut self, game_id: u32, match_info: ActiveMatch) -> Result<()> {
         let matches_key = self.redis_keys.matchmaking_active_matches();
@@ -676,47 +507,4 @@ mod tests {
         }
     }
     
-    #[tokio::test]
-    async fn test_queue_operations() {
-        let redis_url = "redis://localhost:6379";
-
-        let mut manager = match MatchmakingManager::new(redis_url).await {
-            Ok(m) => m,
-            Err(_) => {
-                eprintln!("Redis not available for testing");
-                return;
-            }
-        };
-        
-        // Test add to queue
-        let user_id = 12345;
-        let username = "test_user".to_string();
-        let mmr = 1500;
-        let game_type = GameType::FreeForAll { max_players: 4 };
-        
-        // Clean up first
-        let _ = manager.remove_from_queue(user_id).await;
-        
-        // Add to queue
-        assert!(manager.add_to_queue(user_id, username.clone(), mmr, game_type.clone(), common::QueueMode::Quickmatch).await.is_ok());
-        
-        // Check status
-        let status = manager.get_queue_status(user_id).await.unwrap();
-        assert!(status.is_some());
-        let status = status.unwrap();
-        assert_eq!(status.username, username);
-        assert_eq!(status.mmr, mmr);
-        
-        // Check position
-        let position = manager.get_queue_position(user_id, &game_type, &common::QueueMode::Quickmatch).await.unwrap();
-        assert_eq!(position, Some(1));
-        
-        // Remove from queue
-        let removed_type = manager.remove_from_queue(user_id).await.unwrap();
-        assert_eq!(removed_type, Some(game_type));
-        
-        // Check status again
-        let status = manager.get_queue_status(user_id).await.unwrap();
-        assert!(status.is_none());
-    }
 }

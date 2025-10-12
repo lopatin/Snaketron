@@ -83,6 +83,29 @@ impl LobbyManager {
 
         let is_host = lobby.host_user_id == user_id;
 
+        // Write member to Redis immediately (before spawning background task)
+        // This ensures get_lobby_members() will find the member right away
+        let client = redis::Client::open(self.redis_url.as_str())
+            .context("Failed to open Redis client")?;
+        let mut conn = client.get_multiplexed_async_connection().await
+            .context("Failed to get Redis connection")?;
+
+        let key = format!("lobby:{}:member:{}:{}", lobby_id, user_id, websocket_id);
+        let value = json!({
+            "user_id": user_id,
+            "username": username,
+            "joined_at": chrono::Utc::now().timestamp_millis(),
+            "is_host": is_host,
+        });
+
+        conn.set_ex::<_, _, ()>(&key, value.to_string(), 30).await
+            .context("Failed to write initial lobby member to Redis")?;
+
+        debug!(
+            "Wrote initial lobby presence for user {} in lobby {} (websocket: {})",
+            user_id, lobby_id, websocket_id
+        );
+
         // Spawn heartbeat task
         let redis_url = self.redis_url.clone();
         let websocket_id_for_task = websocket_id.clone();
@@ -272,6 +295,24 @@ async fn heartbeat_loop(
     });
 
     let update_channel = format!("lobby:{}:updates", lobby_id);
+
+    // Write to Redis immediately (don't wait for first interval tick)
+    // This ensures get_lobby_members() will find the member right away
+    if let Err(e) = conn.set_ex::<_, _, ()>(&key, value.to_string(), 30).await {
+        warn!("Failed to write initial lobby member to Redis: {}", e);
+        return Err(e.into());
+    }
+
+    // Publish initial update
+    if let Err(e) = conn.publish::<_, _, ()>(&update_channel, "update").await {
+        warn!("Failed to publish initial lobby update: {}", e);
+    }
+
+    debug!(
+        "Initial lobby presence written for user {} in lobby {} (websocket: {})",
+        user_id, lobby_id, websocket_id
+    );
+
     let mut interval = interval(Duration::from_secs(10));
 
     loop {

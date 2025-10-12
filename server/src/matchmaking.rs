@@ -11,37 +11,24 @@ use crate::pubsub_manager::PubSubManager;
 use crate::matchmaking_manager::{MatchmakingManager, QueuedPlayer, ActiveMatch, MatchStatus};
 
 // --- Configuration Constants ---
-const MIN_PLAYERS: usize = 2;
-const MAX_PLAYERS: usize = 10;
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 
-// MMR matching ranges that expand over time
-const MMR_RANGES: [(i32, i32); 4] = [
-    (0, 100),    // 0-5 seconds: Very close skill
-    (0, 250),    // 5-10 seconds: Close skill
-    (0, 500),    // 10-20 seconds: Moderate difference
-    (0, 1000),   // 20+ seconds: Any skill level
-];
-
-// Wait time thresholds (in seconds)
-const WAIT_THRESHOLDS: [i64; 4] = [5, 10, 20, 30];
-
-// Minimum players based on wait time
-const MIN_PLAYERS_BY_WAIT: [usize; 4] = [
-    2,   // 0-5s: Accept matches quickly
-    2,   // 5-10s: Still accept quick matches
-    2,   // 10-20s: Accept any match
-    2,   // 20s+: Accept any match
-];
+/// Explicit player-level team assignment
+#[derive(Debug, Clone)]
+struct TeamAssignment {
+    lobby_id: i32,
+    member_indices: Vec<usize>,  // Which members of this lobby
+    team_id: common::TeamId,
+}
 
 /// Represents a valid combination of lobbies that can form a game
 #[derive(Debug, Clone)]
 struct MatchmakingCombination {
     lobbies: Vec<crate::matchmaking_manager::QueuedLobby>,
-    /// Team assignments: (lobby_id, team_id) pairs for lobby-level assignment
-    /// For player-level assignment (e.g., splitting a 2-player lobby in 1v1),
-    /// this will assign teams in order of members
-    team_assignments: Option<Vec<(i32, common::TeamId)>>,
+    /// Player-level team assignments (explicit about which lobby members go on which team)
+    team_assignments: Vec<TeamAssignment>,
+    /// Spectators: (lobby_id, member_indices) for players who will spectate
+    spectators: Vec<(i32, Vec<usize>)>,
     total_players: usize,
     avg_mmr: i32,
 }
@@ -50,17 +37,28 @@ impl MatchmakingCombination {
     /// Check if this combination is valid for the given game type
     fn is_valid(&self, game_type: &GameType) -> bool {
         match game_type {
-            GameType::Solo => self.total_players == 1,
-            GameType::TeamMatch { per_team: 1 } => {
-                // 1v1: need exactly 2 players
-                self.total_players == 2 && self.team_assignments.is_some()
-            }
-            GameType::TeamMatch { per_team: 2 } => {
-                // 2v2: need exactly 4 players
-                self.total_players == 4 && self.team_assignments.is_some()
+            GameType::Solo => self.total_players == 1 && self.team_assignments.is_empty(),
+            GameType::TeamMatch { per_team } => {
+                let total_needed = (per_team * 2) as usize;
+                // Check we have the right number of players
+                if self.total_players != total_needed {
+                    return false;
+                }
+                // Check we have team assignments
+                if self.team_assignments.is_empty() {
+                    return false;
+                }
+                // Verify team assignments cover all players
+                let mut assigned_count = 0;
+                for assignment in &self.team_assignments {
+                    assigned_count += assignment.member_indices.len();
+                }
+                assigned_count == total_needed
             }
             GameType::FreeForAll { max_players } => {
-                self.total_players >= 2 && self.total_players <= *max_players as usize
+                self.total_players >= 2
+                    && self.total_players <= *max_players as usize
+                    && self.team_assignments.is_empty()
             }
             _ => false,
         }
@@ -78,8 +76,7 @@ fn find_best_lobby_combination(
 
     match game_type {
         GameType::Solo => find_solo_combination(lobbies),
-        GameType::TeamMatch { per_team: 1 } => find_1v1_combination(lobbies),
-        GameType::TeamMatch { per_team: 2 } => find_2v2_combination(lobbies),
+        GameType::TeamMatch { per_team } => find_team_combination(lobbies, *per_team as usize),
         GameType::FreeForAll { max_players } => find_ffa_combination(lobbies, *max_players as usize),
         _ => None,
     }
@@ -92,101 +89,273 @@ fn find_solo_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby]) ->
         .find(|l| l.members.len() == 1)
         .map(|l| MatchmakingCombination {
             lobbies: vec![l.clone()],
-            team_assignments: None,  // Solo has no teams
+            team_assignments: Vec::new(),  // Solo has no teams
+            spectators: Vec::new(),
             total_players: 1,
             avg_mmr: l.avg_mmr,
         })
 }
 
-/// Find a 1v1 combination (2 players, 1 per team)
-fn find_1v1_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby]) -> Option<MatchmakingCombination> {
-    // Case 1: One lobby with exactly 2 players (split into teams)
-    if let Some(lobby) = lobbies.iter().find(|l| l.members.len() == 2) {
-        return Some(MatchmakingCombination {
-            lobbies: vec![lobby.clone()],
-            // Special marker: negative lobby_id means "split this lobby's players"
-            team_assignments: Some(vec![
-                (lobby.lobby_id, common::TeamId(0)),
-                (-lobby.lobby_id, common::TeamId(1)), // Negative indicates second player
-            ]),
-            total_players: 2,
-            avg_mmr: lobby.avg_mmr,
-        });
+/// Find a team combination for per_team players on each of 2 teams (generic for any x vs. x)
+fn find_team_combination(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    per_team: usize,
+) -> Option<MatchmakingCombination> {
+    let total_needed = per_team * 2;
+
+    // Priority 1: Exact matches (no spectators)
+    if let Some(combo) = find_exact_team_match(lobbies, per_team, total_needed) {
+        return Some(combo);
     }
 
-    // Case 2: Two 1-player lobbies (each on separate team)
-    let single_lobbies: Vec<_> = lobbies.iter()
-        .filter(|l| l.members.len() == 1)
-        .take(2)
-        .collect();
-
-    if single_lobbies.len() == 2 {
-        let avg_mmr = (single_lobbies[0].avg_mmr + single_lobbies[1].avg_mmr) / 2;
-        return Some(MatchmakingCombination {
-            lobbies: vec![single_lobbies[0].clone(), single_lobbies[1].clone()],
-            team_assignments: Some(vec![
-                (single_lobbies[0].lobby_id, common::TeamId(0)),
-                (single_lobbies[1].lobby_id, common::TeamId(1)),
-            ]),
-            total_players: 2,
-            avg_mmr,
-        });
-    }
-
-    None
+    // Priority 2: Matches with spectators (lobby has too many players)
+    find_team_match_with_spectators(lobbies, per_team, total_needed)
 }
 
-/// Find a 2v2 combination (4 players, 2 per team)
-fn find_2v2_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby]) -> Option<MatchmakingCombination> {
-    // Case 1: Two lobbies with 2 players each (each lobby = 1 team) - PREFERRED
-    let two_player_lobbies: Vec<_> = lobbies.iter()
-        .filter(|l| l.members.len() == 2)
-        .take(2)
-        .collect();
+/// Find exact team match using recursive backtracking
+fn find_exact_team_match(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    per_team: usize,
+    total_needed: usize,
+) -> Option<MatchmakingCombination> {
+    let mut team_a: Vec<(usize, Vec<usize>)> = Vec::new();  // (lobby_idx, member_indices)
+    let mut team_b: Vec<(usize, Vec<usize>)> = Vec::new();
 
-    if two_player_lobbies.len() == 2 {
-        let avg_mmr = (two_player_lobbies[0].avg_mmr + two_player_lobbies[1].avg_mmr) / 2;
-        return Some(MatchmakingCombination {
-            lobbies: vec![two_player_lobbies[0].clone(), two_player_lobbies[1].clone()],
-            team_assignments: Some(vec![
-                (two_player_lobbies[0].lobby_id, common::TeamId(0)),
-                (two_player_lobbies[1].lobby_id, common::TeamId(1)),
-            ]),
-            total_players: 4,
-            avg_mmr,
+    if backtrack_assign(
+        lobbies,
+        0,        // Current lobby index
+        &mut team_a,
+        &mut team_b,
+        per_team,
+        per_team,
+    ) {
+        // Convert to MatchmakingCombination
+        build_combination(lobbies, team_a, team_b, Vec::new())
+    } else {
+        None
+    }
+}
+
+/// Recursive backtracking to assign lobbies/players to teams
+fn backtrack_assign(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    lobby_idx: usize,
+    team_a: &mut Vec<(usize, Vec<usize>)>,  // (lobby_idx, member_indices)
+    team_b: &mut Vec<(usize, Vec<usize>)>,
+    remaining_a: usize,
+    remaining_b: usize,
+) -> bool {
+    // Base case: both teams filled
+    if remaining_a == 0 && remaining_b == 0 {
+        return true;
+    }
+
+    // No more lobbies and teams not filled
+    if lobby_idx >= lobbies.len() {
+        return false;
+    }
+
+    let lobby = &lobbies[lobby_idx];
+    let lobby_size = lobby.members.len();
+
+    // Option 1: Skip this lobby (try matching with other lobbies)
+    if backtrack_assign(lobbies, lobby_idx + 1, team_a, team_b, remaining_a, remaining_b) {
+        return true;
+    }
+
+    // Option 2: Assign entire lobby to Team A
+    if lobby_size <= remaining_a {
+        team_a.push((lobby_idx, (0..lobby_size).collect()));
+        if backtrack_assign(
+            lobbies,
+            lobby_idx + 1,
+            team_a,
+            team_b,
+            remaining_a - lobby_size,
+            remaining_b,
+        ) {
+            return true;
+        }
+        team_a.pop();
+    }
+
+    // Option 3: Assign entire lobby to Team B
+    if lobby_size <= remaining_b {
+        team_b.push((lobby_idx, (0..lobby_size).collect()));
+        if backtrack_assign(
+            lobbies,
+            lobby_idx + 1,
+            team_a,
+            team_b,
+            remaining_a,
+            remaining_b - lobby_size,
+        ) {
+            return true;
+        }
+        team_b.pop();
+    }
+
+    // Option 4: Split lobby between teams (only if beneficial)
+    // This is expensive, so only try if we can't fill teams otherwise
+    if lobby_size > 1 {
+        for split_point in 1..lobby_size {
+            let team_a_portion = split_point;
+            let team_b_portion = lobby_size - split_point;
+
+            if team_a_portion <= remaining_a && team_b_portion <= remaining_b {
+                team_a.push((lobby_idx, (0..split_point).collect()));
+                team_b.push((lobby_idx, (split_point..lobby_size).collect()));
+
+                if backtrack_assign(
+                    lobbies,
+                    lobby_idx + 1,
+                    team_a,
+                    team_b,
+                    remaining_a - team_a_portion,
+                    remaining_b - team_b_portion,
+                ) {
+                    return true;
+                }
+
+                team_a.pop();
+                team_b.pop();
+            }
+        }
+    }
+
+    false
+}
+
+/// Build a MatchmakingCombination from team assignments
+fn build_combination(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    team_a: Vec<(usize, Vec<usize>)>,
+    team_b: Vec<(usize, Vec<usize>)>,
+    spectators: Vec<(i32, Vec<usize>)>,
+) -> Option<MatchmakingCombination> {
+    // Collect unique lobbies that are used
+    let mut used_lobby_indices = std::collections::HashSet::new();
+    for (lobby_idx, _) in &team_a {
+        used_lobby_indices.insert(*lobby_idx);
+    }
+    for (lobby_idx, _) in &team_b {
+        used_lobby_indices.insert(*lobby_idx);
+    }
+
+    let mut used_lobbies = Vec::new();
+    for idx in used_lobby_indices {
+        used_lobbies.push(lobbies[idx].clone());
+    }
+
+    // Build team assignments
+    let mut team_assignments = Vec::new();
+    for (lobby_idx, member_indices) in team_a {
+        team_assignments.push(TeamAssignment {
+            lobby_id: lobbies[lobby_idx].lobby_id,
+            member_indices,
+            team_id: common::TeamId(0),
+        });
+    }
+    for (lobby_idx, member_indices) in team_b {
+        team_assignments.push(TeamAssignment {
+            lobby_id: lobbies[lobby_idx].lobby_id,
+            member_indices,
+            team_id: common::TeamId(1),
         });
     }
 
-    // Case 2: One lobby with exactly 4 players (split into 2 teams of 2)
-    if let Some(lobby) = lobbies.iter().find(|l| l.members.len() == 4) {
-        return Some(MatchmakingCombination {
-            lobbies: vec![lobby.clone()],
-            // Use negative IDs to indicate player indices within the lobby
-            // Format: first 2 players on Team 0, last 2 on Team 1
-            team_assignments: Some(vec![
-                (lobby.lobby_id, common::TeamId(0)),      // First 2 players
-                (-lobby.lobby_id, common::TeamId(1)),     // Last 2 players
-            ]),
-            total_players: 4,
-            avg_mmr: lobby.avg_mmr,
-        });
+    // Calculate total players and average MMR
+    let mut total_players = 0;
+    let mut total_mmr_weighted = 0;
+
+    for assignment in &team_assignments {
+        let lobby = lobbies.iter().find(|l| l.lobby_id == assignment.lobby_id)?;
+        total_players += assignment.member_indices.len();
+        total_mmr_weighted += lobby.avg_mmr * assignment.member_indices.len() as i32;
     }
 
-    // Case 3: One 3-player lobby + one 1-player lobby (3+1 on different teams)
-    let three_player = lobbies.iter().find(|l| l.members.len() == 3);
-    let one_player = lobbies.iter().find(|l| l.members.len() == 1);
+    let avg_mmr = if total_players > 0 {
+        total_mmr_weighted / total_players as i32
+    } else {
+        0
+    };
 
-    if let (Some(l3), Some(l1)) = (three_player, one_player) {
-        let avg_mmr = ((l3.avg_mmr * 3) + l1.avg_mmr) / 4;
-        return Some(MatchmakingCombination {
-            lobbies: vec![l3.clone(), l1.clone()],
-            team_assignments: Some(vec![
-                (l3.lobby_id, common::TeamId(0)),   // 3-player lobby on Team 0
-                (l1.lobby_id, common::TeamId(1)),   // 1-player lobby on Team 1
-            ]),
-            total_players: 4,
-            avg_mmr,
-        });
+    Some(MatchmakingCombination {
+        lobbies: used_lobbies,
+        team_assignments,
+        spectators,
+        total_players,
+        avg_mmr,
+    })
+}
+
+/// Find match allowing spectators (lower priority)
+fn find_team_match_with_spectators(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    per_team: usize,
+    total_needed: usize,
+) -> Option<MatchmakingCombination> {
+    // Look for a single large lobby where some players can spectate
+    for lobby in lobbies {
+        if lobby.members.len() >= total_needed {
+            // Find requesting user's index
+            let requesting_user_idx = lobby.members.iter()
+                .position(|m| m.user_id as u32 == lobby.requesting_user_id);
+
+            // Build player list: requesting user first, then others
+            let mut player_indices = Vec::new();
+
+            // Add requesting user first (if found in lobby)
+            if let Some(idx) = requesting_user_idx {
+                player_indices.push(idx);
+            }
+
+            // Add other members until we have total_needed
+            for idx in 0..lobby.members.len() {
+                if player_indices.len() >= total_needed {
+                    break;
+                }
+                if Some(idx) != requesting_user_idx {
+                    player_indices.push(idx);
+                }
+            }
+
+            // Remaining members become spectators
+            let spectator_indices: Vec<usize> = (0..lobby.members.len())
+                .filter(|idx| !player_indices.contains(idx))
+                .collect();
+
+            // Split players evenly between teams
+            let team_a_members: Vec<usize> = player_indices.iter()
+                .take(per_team)
+                .copied()
+                .collect();
+            let team_b_members: Vec<usize> = player_indices.iter()
+                .skip(per_team)
+                .copied()
+                .collect();
+
+            let team_assignments = vec![
+                TeamAssignment {
+                    lobby_id: lobby.lobby_id,
+                    member_indices: team_a_members,
+                    team_id: common::TeamId(0),
+                },
+                TeamAssignment {
+                    lobby_id: lobby.lobby_id,
+                    member_indices: team_b_members,
+                    team_id: common::TeamId(1),
+                },
+            ];
+
+            return Some(MatchmakingCombination {
+                lobbies: vec![lobby.clone()],
+                team_assignments,
+                spectators: vec![(lobby.lobby_id, spectator_indices)],
+                total_players: total_needed,
+                avg_mmr: lobby.avg_mmr,
+            });
+        }
     }
 
     None
@@ -194,48 +363,117 @@ fn find_2v2_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby]) -> 
 
 /// Find an FFA combination (2+ players up to max_players)
 fn find_ffa_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby], max_players: usize) -> Option<MatchmakingCombination> {
+    trace!(
+        max_players = max_players,
+        lobby_count = lobbies.len(),
+        "find_ffa_combination called"
+    );
+
+    // Log details of all input lobbies
+    for (idx, lobby) in lobbies.iter().enumerate() {
+        trace!(
+            idx = idx,
+            lobby_id = lobby.lobby_id,
+            members = lobby.members.len(),
+            avg_mmr = lobby.avg_mmr,
+            lobby_code = %lobby.lobby_code,
+            "Input lobby details"
+        );
+    }
+
     // Greedy approach: take lobbies until we reach max_players
     let mut selected = Vec::new();
     let mut total = 0;
     let mut total_mmr_weighted = 0;
     let mut has_incompatible_lobbies = false;
 
-    for lobby in lobbies {
-        if total + lobby.members.len() <= max_players {
+    for (idx, lobby) in lobbies.iter().enumerate() {
+        let would_exceed = total + lobby.members.len() > max_players;
+
+        if !would_exceed {
             total += lobby.members.len();
             total_mmr_weighted += lobby.avg_mmr * lobby.members.len() as i32;
             selected.push(lobby.clone());
+
+            trace!(
+                idx = idx,
+                lobby_id = lobby.lobby_id,
+                members = lobby.members.len(),
+                total_players_now = total,
+                "✓ SELECTED lobby (fits within max_players)"
+            );
         } else {
             // Found a lobby that doesn't fit - remember this
             has_incompatible_lobbies = true;
+
+            trace!(
+                idx = idx,
+                lobby_id = lobby.lobby_id,
+                members = lobby.members.len(),
+                total_players = total,
+                max_players = max_players,
+                would_total = total + lobby.members.len(),
+                "✗ SKIPPED lobby (would exceed max_players)"
+            );
         }
     }
+
+    trace!(
+        selected_count = selected.len(),
+        total_players = total,
+        has_incompatible_lobbies = has_incompatible_lobbies,
+        "After lobby selection"
+    );
 
     // Determine if we should create a match:
     // 1. Multiple lobbies combined: always match (better FFA game)
     // 2. Single lobby with incompatible lobbies remaining: match it (can't wait for them)
     // 3. Single lobby alone: don't match (wait for more lobbies to potentially combine)
-    let should_match = if selected.len() > 1 {
+    let (should_match, reason) = if selected.len() > 1 {
         // Multiple lobbies: combine them
-        true
+        (true, "Multiple lobbies - combine them")
     } else if selected.len() == 1 && has_incompatible_lobbies {
         // Single lobby but there are other lobbies that can't be combined with it
         // Match this lobby since waiting won't help
-        true
+        (true, "Single lobby with incompatible lobbies - match now")
     } else {
         // Single lobby with no other lobbies in queue: wait for more to arrive
-        false
+        (false, "Single lobby alone - wait for more")
     };
+
+    trace!(
+        should_match = should_match,
+        reason = reason,
+        total_players = total,
+        min_players = 2,
+        "Matching decision"
+    );
 
     if total >= 2 && should_match {
         let avg_mmr = total_mmr_weighted / total as i32;
+
+        info!(
+            total_players = total,
+            lobby_count = selected.len(),
+            avg_mmr = avg_mmr,
+            "✓ FFA MATCH CREATED"
+        );
+
         Some(MatchmakingCombination {
             lobbies: selected,
-            team_assignments: None,  // FFA has no teams
+            team_assignments: Vec::new(),  // FFA has no teams
+            spectators: Vec::new(),
             total_players: total,
             avg_mmr,
         })
     } else {
+        warn!(
+            total_players = total,
+            should_match = should_match,
+            reason = reason,
+            "✗ NO FFA MATCH - not enough players or shouldn't match yet"
+        );
+
         None
     }
 }
@@ -293,45 +531,6 @@ pub async fn run_matchmaking_loop(
                 error!(game_type = ?game_type, error = %e, "Failed to cleanup expired competitive queue entries");
             }
 
-            // Try to create matches for both queue modes using batch algorithm
-            // First try quickmatch
-            match create_matches_batch(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
-                Ok(games_count) if games_count > 0 => {
-                    total_games_created += games_count;
-                    info!(
-                        game_type = ?game_type,
-                        queue_mode = "quickmatch",
-                        games_count,
-                        "Created quickmatch games via batch matchmaking"
-                    );
-                }
-                Ok(_) => {
-                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable matches found");
-                }
-                Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Batch matchmaking error");
-                }
-            }
-
-            // Then try competitive
-            match create_matches_batch(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
-                Ok(games_count) if games_count > 0 => {
-                    total_games_created += games_count;
-                    info!(
-                        game_type = ?game_type,
-                        queue_mode = "competitive",
-                        games_count,
-                        "Created competitive games via batch matchmaking"
-                    );
-                }
-                Ok(_) => {
-                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable matches found");
-                }
-                Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Batch matchmaking error");
-                }
-            }
-
             // Try lobby-based matchmaking for quickmatch
             match create_lobby_matches(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
                 Ok(games_count) if games_count > 0 => {
@@ -380,250 +579,67 @@ pub async fn run_matchmaking_loop(
     Ok(())
 }
 
-/// Helper struct to hold player data with time-weighted rank
-#[derive(Debug, Clone)]
-struct RankedPlayer {
-    player: QueuedPlayer,
-    wait_time_ms: i64,
-    time_weighted_rank: f64,
+/// Calculate maximum acceptable MMR difference based on wait time
+/// Returns the maximum MMR difference that this lobby will accept for matching
+fn calculate_max_mmr_diff(wait_seconds: f64) -> f64 {
+    if wait_seconds < 10.0 {
+        // Linear interpolation from 100 to 300 over 0-10 seconds
+        100.0 + (wait_seconds / 10.0) * 200.0
+    } else if wait_seconds < 30.0 {
+        // Linear interpolation from 300 to 900 over 10-30 seconds
+        300.0 + ((wait_seconds - 10.0) / 20.0) * 600.0
+    } else {
+        // After 30 seconds, match with anyone
+        9999.0
+    }
 }
 
-/// Create multiple matches from a batch of players using time-weighted ranking
-async fn create_matches_batch(
-    matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
-    game_type: GameType,
-    queue_mode: common::QueueMode,
-) -> Result<usize> {
-    let now = Utc::now().timestamp_millis();
+/// Check if two lobbies are compatible for matching based on MMR and wait time
+fn are_lobbies_compatible(
+    lobby1: &crate::matchmaking_manager::QueuedLobby,
+    lobby2: &crate::matchmaking_manager::QueuedLobby,
+    now_ms: i64,
+) -> bool {
+    let wait1_s = ((now_ms - lobby1.queued_at) as f64) / 1000.0;
+    let wait2_s = ((now_ms - lobby2.queued_at) as f64) / 1000.0;
 
-    // Step 1: Load 3 batches from Redis
-    let longest_waiting = matchmaking_manager.get_longest_waiting_users(&game_type, &queue_mode).await?;
-    let lowest_mmr_ids = matchmaking_manager.get_lowest_mmr_users(&game_type, &queue_mode).await?;
-    let highest_mmr_ids = matchmaking_manager.get_highest_mmr_users(&game_type, &queue_mode).await?;
+    let max_diff1 = calculate_max_mmr_diff(wait1_s);
+    let max_diff2 = calculate_max_mmr_diff(wait2_s);
 
-    // Step 2: Build combined user set and player map
-    use std::collections::{HashMap, HashSet};
+    let mmr_diff = (lobby1.avg_mmr - lobby2.avg_mmr).abs() as f64;
 
-    let mut user_ids_set: HashSet<u32> = HashSet::new();
-    let mut players_map: HashMap<u32, (QueuedPlayer, i64)> = HashMap::new();
+    // Both lobbies must accept the MMR difference
+    let compatible = mmr_diff <= max_diff1 && mmr_diff <= max_diff2;
 
-    // Add longest waiting users (we already have full data)
-    for (player, timestamp) in longest_waiting {
-        user_ids_set.insert(player.user_id);
-        players_map.insert(player.user_id, (player, timestamp));
+    if !compatible {
+        trace!(
+            lobby1_id = lobby1.lobby_id,
+            lobby2_id = lobby2.lobby_id,
+            mmr1 = lobby1.avg_mmr,
+            mmr2 = lobby2.avg_mmr,
+            mmr_diff = mmr_diff,
+            max_diff1 = max_diff1,
+            max_diff2 = max_diff2,
+            "Lobbies not compatible for matching yet"
+        );
     }
 
-    // Collect user IDs from MMR batches that we don't already have
-    let mut user_ids_to_fetch: Vec<u32> = Vec::new();
-    for user_id in lowest_mmr_ids.into_iter().chain(highest_mmr_ids.into_iter()) {
-        if user_ids_set.insert(user_id) {
-            user_ids_to_fetch.push(user_id);
-        }
-    }
+    compatible
+}
 
-    // Step 3: Batch fetch full data for users from MMR batches
-    if !user_ids_to_fetch.is_empty() {
-        let user_statuses = matchmaking_manager.batch_get_user_status(&user_ids_to_fetch).await?;
-        for (user_id, status) in user_statuses {
-            let player = QueuedPlayer {
-                user_id,
-                mmr: status.mmr,
-                username: status.username,
-            };
-            players_map.insert(user_id, (player, status.request_time));
-        }
-    }
-
-    if players_map.is_empty() {
-        return Ok(0);
-    }
-
-    // Step 4: Calculate time-weighted ranks
-    let avg_mmr: f64 = players_map.values()
-        .map(|(p, _)| p.mmr as f64)
-        .sum::<f64>() / players_map.len() as f64;
-
-    let mut ranked_players: Vec<RankedPlayer> = players_map.into_iter()
-        .map(|(_, (player, timestamp))| {
-            let wait_time_ms = now - timestamp;
-            let wait_seconds = (wait_time_ms as f64) / 1000.0;
-
-            // Time weighting: 0s = 0%, 30s = 50%, 60s+ = 100%
-            let weight = (wait_seconds / 60.0).min(1.0);
-            let time_weighted_rank = (player.mmr as f64) + (avg_mmr - (player.mmr as f64)) * weight;
-
-            RankedPlayer {
-                player,
-                wait_time_ms,
-                time_weighted_rank,
-            }
+/// Filter a list of lobbies to only include those compatible with a reference lobby
+fn filter_compatible_lobbies(
+    reference_lobby: &crate::matchmaking_manager::QueuedLobby,
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    now_ms: i64,
+) -> Vec<crate::matchmaking_manager::QueuedLobby> {
+    lobbies.iter()
+        .filter(|lobby| {
+            lobby.lobby_id == reference_lobby.lobby_id ||
+            are_lobbies_compatible(reference_lobby, lobby, now_ms)
         })
-        .collect();
-
-    // Step 5: Sort by time-weighted rank
-    ranked_players.sort_by(|a, b| {
-        a.time_weighted_rank.partial_cmp(&b.time_weighted_rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Step 6: Create as many games as possible
-    let mut games_created = 0;
-
-    // Determine player requirements for this game type
-    let (min_players, max_players_for_game) = match &game_type {
-        GameType::FreeForAll { max_players } => {
-            (MIN_PLAYERS.min(*max_players as usize), *max_players as usize)
-        }
-        GameType::TeamMatch { per_team } => {
-            let total_max = per_team * 2;
-            (MIN_PLAYERS.min(total_max as usize), total_max as usize)
-        }
-        GameType::Solo => {
-            (1, 1)
-        }
-        GameType::Custom { .. } => {
-            (MIN_PLAYERS, MAX_PLAYERS)
-        }
-    };
-
-    // Create games from the sorted list
-    let mut available_players = ranked_players;
-
-    while available_players.len() >= min_players {
-        // Take next batch of players for a game
-        let players_for_game: Vec<QueuedPlayer> = available_players.iter()
-            .take(max_players_for_game)
-            .map(|rp| rp.player.clone())
-            .collect();
-
-        if players_for_game.len() < min_players {
-            break;
-        }
-
-        // Create the game
-        match create_single_game(
-            matchmaking_manager,
-            pubsub,
-            &game_type,
-            &queue_mode,
-            players_for_game,
-            now,
-        ).await {
-            Ok(game_id) => {
-                games_created += 1;
-                info!(game_id, "Created game {} from batch", games_created);
-
-                // Remove matched players from available pool
-                available_players.drain(0..max_players_for_game.min(available_players.len()));
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to create game from batch");
-                break;
-            }
-        }
-    }
-
-    Ok(games_created)
-}
-
-/// Create a single game from a specific set of players (helper function)
-async fn create_single_game(
-    matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
-    game_type: &GameType,
-    queue_mode: &common::QueueMode,
-    matched_players: Vec<QueuedPlayer>,
-    created_at: i64,
-) -> Result<u32> {
-    let user_ids: Vec<u32> = matched_players.iter()
-        .map(|p| p.user_id)
-        .collect();
-
-    // Generate game ID
-    let game_id = matchmaking_manager.generate_game_id().await?;
-    let partition_id = game_id % PARTITION_COUNT;
-
-    // Create game state
-    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
-
-    let (width, height) = match game_type {
-        GameType::TeamMatch { .. } => (60, 40),
-        _ => (40, 40),
-    };
-
-    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
-
-    // Add players to the game state
-    for player in &matched_players {
-        game_state.add_player(player.user_id, Some(player.username.clone()))?;
-    }
-
-    game_state.spawn_initial_food();
-
-    // Store active match information
-    let match_info = ActiveMatch {
-        players: matched_players.clone(),
-        game_type: game_type.clone(),
-        status: MatchStatus::Waiting,
-        partition_id,
-        created_at,
-    };
-    matchmaking_manager.store_active_match(game_id, match_info).await?;
-
-    // Send match notifications
-    let redis_keys = crate::redis_keys::RedisKeys::new();
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-
-    if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-        if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
-            for user_id in &user_ids {
-                let channel = redis_keys.matchmaking_notification_channel(*user_id);
-                let notification = serde_json::json!({
-                    "type": "MatchFound",
-                    "game_id": game_id,
-                    "partition_id": partition_id
-                });
-
-                let _: Result<i32, _> = redis::cmd("PUBLISH")
-                    .arg(&channel)
-                    .arg(notification.to_string())
-                    .query_async(&mut conn).await;
-            }
-        }
-    }
-
-    // Remove players from queue
-    matchmaking_manager.remove_players_from_queue(game_type, queue_mode, &user_ids).await?;
-
-    // Publish game events
-    let event = StreamEvent::GameCreated {
-        game_id,
-        game_state: game_state.clone(),
-    };
-
-    pubsub.publish_snapshot(partition_id, game_id, &game_state).await
-        .context("Failed to publish initial game snapshot")?;
-
-    let serialized = serde_json::to_vec(&event)
-        .context("Failed to serialize GameCreated event")?;
-    pubsub.publish_command(partition_id, &serialized).await
-        .context("Failed to publish GameCreated event")?;
-
-    let avg_mmr = matched_players.iter()
-        .map(|p| p.mmr)
-        .sum::<i32>() / matched_players.len() as i32;
-
-    info!(
-        game_id,
-        player_count = matched_players.len(),
-        avg_mmr,
-        "Batch match created"
-    );
-
-    Ok(game_id)
+        .cloned()
+        .collect()
 }
 
 /// Create matches from lobbies in the queue using advanced combination matching
@@ -640,16 +656,114 @@ async fn create_lobby_matches(
         return Ok(0);
     }
 
+    // Calculate acceptable MMR range for each lobby based on wait time
+    let now = Utc::now().timestamp_millis();
+
+    // Log wait times and acceptable MMR ranges for debugging
+    // Requirements:
+    // - 0-100 MMR difference: match immediately (0s)
+    // - ~300 MMR difference: wait 10s
+    // - 900+ MMR difference: wait 30s (max)
+    for lobby in &mut available_lobbies {
+        let wait_time_ms = now - lobby.queued_at;
+        let wait_seconds = (wait_time_ms as f64) / 1000.0;
+
+        // Calculate maximum acceptable MMR difference based on wait time
+        // 0s: 100 MMR
+        // 10s: 300 MMR
+        // 30s+: unlimited (9999)
+        let max_mmr_diff = if wait_seconds < 10.0 {
+            // Linear interpolation from 100 to 300 over 0-10 seconds
+            100.0 + (wait_seconds / 10.0) * 200.0
+        } else if wait_seconds < 30.0 {
+            // Linear interpolation from 300 to 900 over 10-30 seconds
+            300.0 + ((wait_seconds - 10.0) / 20.0) * 600.0
+        } else {
+            // After 30 seconds, match with anyone
+            9999.0
+        };
+
+        // Store the max acceptable MMR difference in the lobby (we'll use this for filtering)
+        // For now, we don't modify the lobby's MMR, we'll filter during matching
+        // Store as a "virtual" adjustment by keeping original MMR
+        trace!(
+            lobby_id = lobby.lobby_id,
+            wait_seconds = wait_seconds,
+            original_mmr = lobby.avg_mmr,
+            max_mmr_diff = max_mmr_diff,
+            "Calculated acceptable MMR range for lobby"
+        );
+    }
+
+    // Sort lobbies by wait time (longest waiting first) for priority matching
+    available_lobbies.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
+
     let mut games_created = 0;
 
     // Try to create as many games as possible from available lobbies
     while !available_lobbies.is_empty() {
-        // Find the best combination of lobbies for this game type
-        let combination = match find_best_lobby_combination(&available_lobbies, &game_type) {
-            Some(comb) => comb,
+        // Get the longest-waiting lobby (first in sorted list)
+        let priority_lobby = &available_lobbies[0];
+
+        let wait_time_s = ((now - priority_lobby.queued_at) as f64) / 1000.0;
+        let max_acceptable_mmr_diff = calculate_max_mmr_diff(wait_time_s);
+
+        info!(
+            priority_lobby_id = priority_lobby.lobby_id,
+            priority_mmr = priority_lobby.avg_mmr,
+            wait_time_s = wait_time_s,
+            max_acceptable_mmr_diff = max_acceptable_mmr_diff,
+            available_lobbies = available_lobbies.len(),
+            game_type = ?game_type,
+            "Starting match attempt for priority lobby"
+        );
+
+        // Filter lobbies to only those compatible with the priority lobby
+        let compatible_lobbies = filter_compatible_lobbies(priority_lobby, &available_lobbies, now);
+
+        info!(
+            priority_lobby_id = priority_lobby.lobby_id,
+            compatible_count = compatible_lobbies.len(),
+            total_available = available_lobbies.len(),
+            "Compatibility filtering complete"
+        );
+
+        if compatible_lobbies.is_empty() {
+            // No compatible lobbies found, wait for more time to pass
+            warn!(
+                lobby_id = priority_lobby.lobby_id,
+                mmr = priority_lobby.avg_mmr,
+                wait_time_ms = now - priority_lobby.queued_at,
+                "No compatible lobbies found for priority lobby - waiting for more time or lobbies"
+            );
+            break;
+        }
+
+        // Find the best combination of compatible lobbies for this game type
+        info!(
+            game_type = ?game_type,
+            compatible_lobbies = compatible_lobbies.len(),
+            "Calling find_best_lobby_combination"
+        );
+
+        let combination = match find_best_lobby_combination(&compatible_lobbies, &game_type) {
+            Some(comb) => {
+                info!(
+                    lobbies_in_combo = comb.lobbies.len(),
+                    total_players = comb.total_players,
+                    avg_mmr = comb.avg_mmr,
+                    "find_best_lobby_combination returned a combination"
+                );
+                comb
+            },
             None => {
-                // No valid combinations found, stop trying
-                trace!("No valid lobby combinations found for {:?}", game_type);
+                // No valid combinations found from compatible lobbies
+                // This means we need to wait longer or the game type requirements can't be met
+                warn!(
+                    game_type = ?game_type,
+                    compatible_lobbies = compatible_lobbies.len(),
+                    "No valid lobby combinations found from compatible lobbies"
+                );
                 break;
             }
         };
@@ -735,55 +849,41 @@ async fn create_game_from_lobbies(
     // Add players to game state with team assignments
     let mut all_players = Vec::new();
 
-    if let Some(team_assignments) = &combination.team_assignments {
-        // Team-based game (1v1, 2v2)
-        let mut lobby_team_map = std::collections::HashMap::new();
-        for (lobby_id, team_id) in team_assignments {
-            lobby_team_map.insert(*lobby_id, *team_id);
+    if !combination.team_assignments.is_empty() {
+        // Team-based game (1v1, 2v2, 3v3, etc.)
+        // Build a map of user_id -> team_id for quick lookup
+        use std::collections::HashMap;
+        let mut user_team_map: HashMap<u32, common::TeamId> = HashMap::new();
+
+        for assignment in &combination.team_assignments {
+            // Find the lobby that contains these members
+            let lobby = combination.lobbies.iter()
+                .find(|l| l.lobby_id == assignment.lobby_id)
+                .ok_or_else(|| anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id))?;
+
+            // Map each member index to their team
+            for &member_idx in &assignment.member_indices {
+                if let Some(member) = lobby.members.get(member_idx) {
+                    user_team_map.insert(member.user_id as u32, assignment.team_id);
+                }
+            }
         }
 
-        for lobby in &combination.lobbies {
-            // Get the team for this lobby (or its members)
-            let team_id = lobby_team_map.get(&lobby.lobby_id).copied();
+        // Add all assigned players to the game
+        for assignment in &combination.team_assignments {
+            let lobby = combination.lobbies.iter()
+                .find(|l| l.lobby_id == assignment.lobby_id)
+                .ok_or_else(|| anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id))?;
 
-            // Check if this lobby needs to be split (negative lobby_id marker)
-            let needs_split = lobby_team_map.contains_key(&(-lobby.lobby_id));
-
-            if needs_split && lobby.members.len() > 1 {
-                // Split lobby members across teams (for 1v1 with 2-player lobby, or 2v2 with 4-player lobby)
-                let split_point = lobby.members.len() / 2;
-                for (idx, member) in lobby.members.iter().enumerate() {
-                    let player_team = if idx < split_point {
-                        lobby_team_map.get(&lobby.lobby_id).copied()
-                    } else {
-                        lobby_team_map.get(&(-lobby.lobby_id)).copied()
-                    };
-
-                    // Temporarily add player without team, we'll fix this in GameState
-                    game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
-
-                    // Update the snake's team_id directly
-                    if let Some(player) = game_state.players.get(&(member.user_id as u32)) {
-                        if let Some(snake) = game_state.arena.snakes.get_mut(player.snake_id as usize) {
-                            snake.team_id = player_team;
-                        }
-                    }
-
-                    all_players.push(QueuedPlayer {
-                        user_id: member.user_id as u32,
-                        mmr: combination.avg_mmr,
-                        username: member.username.clone(),
-                    });
-                }
-            } else {
-                // All members of this lobby go on the same team
-                for member in &lobby.members {
+            for &member_idx in &assignment.member_indices {
+                if let Some(member) = lobby.members.get(member_idx) {
+                    // Add player to game state
                     game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
 
                     // Update the snake's team_id
                     if let Some(player) = game_state.players.get(&(member.user_id as u32)) {
                         if let Some(snake) = game_state.arena.snakes.get_mut(player.snake_id as usize) {
-                            snake.team_id = team_id;
+                            snake.team_id = Some(assignment.team_id);
                         }
                     }
 
@@ -872,196 +972,6 @@ async fn publish_lobby_match_notifications(
     }
 
     Ok(())
-}
-
-/// Create an adaptive match
-async fn create_match(
-    matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
-    game_type: GameType,
-    queue_mode: common::QueueMode,
-) -> Result<Option<(u32, Vec<u32>)>> {
-    // Get all queued players for this game type and queue mode
-    let queued_players = matchmaking_manager.get_queued_players(&game_type, &queue_mode).await?;
-    
-    if queued_players.is_empty() {
-        return Ok(None);
-    }
-
-    // Calculate wait time based on oldest player
-    let now = Utc::now().timestamp_millis();
-    let oldest_wait = queued_players.iter()
-        .map(|p| {
-            // We'd need to get this from the queue timestamp
-            // For now, assume they're ordered by queue time
-            0i64 // Placeholder
-        })
-        .max()
-        .unwrap_or(0);
-
-    let wait_seconds = oldest_wait / 1000;
-
-    // Determine which tier of matching to use based on wait time
-    let tier = WAIT_THRESHOLDS
-        .iter()
-        .position(|&threshold| wait_seconds < threshold)
-        .unwrap_or(WAIT_THRESHOLDS.len() - 1);
-
-    let (_min_mmr_diff, max_mmr_diff) = MMR_RANGES.get(tier).copied().unwrap_or((0, 1000));
-    let base_min_players = MIN_PLAYERS_BY_WAIT.get(tier).copied().unwrap_or(MIN_PLAYERS);
-    
-    // For game types with max_players, never require more than max_players
-    let (min_players, max_players_for_game) = match &game_type {
-        GameType::FreeForAll { max_players } => {
-            (base_min_players.min(*max_players as usize), *max_players as usize)
-        }
-        GameType::TeamMatch { per_team } => {
-            let total_max = per_team * 2; // Two teams
-            (base_min_players.min(total_max as usize), total_max as usize)
-        }
-        GameType::Solo => {
-            (1, 1) // Solo games are single player
-        }
-        GameType::Custom { .. } => {
-            (base_min_players, MAX_PLAYERS) // Custom games use default limits
-        }
-    };
-
-    // Filter by MMR if we have multiple players
-    let filtered_players = if queued_players.len() > 1 {
-        let avg_mmr: i32 = queued_players.iter()
-            .map(|p| p.mmr)
-            .sum::<i32>() / queued_players.len() as i32;
-        
-        queued_players.into_iter()
-            .filter(|p| (p.mmr - avg_mmr).abs() <= max_mmr_diff)
-            .collect()
-    } else {
-        queued_players
-    };
-
-    // Check if we have enough players
-    if filtered_players.len() < min_players {
-        return Ok(None);
-    }
-
-    // Take up to max_players_for_game players
-    let matched_players: Vec<_> = filtered_players.into_iter()
-        .take(max_players_for_game)
-        .collect();
-    
-    let user_ids: Vec<u32> = matched_players.iter()
-        .map(|p| p.user_id)
-        .collect();
-
-    // Generate game ID
-    let game_id = matchmaking_manager.generate_game_id().await?;
-    let partition_id = game_id % PARTITION_COUNT;
-
-    // Create game state
-    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
-    
-    // For TeamMatch games, add extra width for end zones
-    let (width, height) = match &game_type {
-        GameType::TeamMatch { .. } => (60, 40),  // 40 + 10 + 10 for end zones
-        _ => (40, 40),
-    };
-    
-    // Generate a random seed for the game
-    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
-    
-    // Add players to the game state
-    for player in &matched_players {
-        game_state.add_player(player.user_id, Some(player.username.clone()))?;
-    }
-    
-    // Spawn initial food items
-    game_state.spawn_initial_food();
-
-    // Store active match information in Redis
-    let match_info = ActiveMatch {
-        players: matched_players.clone(),
-        game_type: game_type.clone(),
-        status: MatchStatus::Waiting,
-        partition_id,
-        created_at: now,
-    };
-    matchmaking_manager.store_active_match(game_id, match_info).await?;
-
-    // Update each player's status with the matched game ID
-    for user_id in &user_ids {
-        // Update the user's queue status to include the matched game ID
-        // This allows the WebSocket handler to detect the match
-        let redis_keys = crate::redis_keys::RedisKeys::new();
-        let channel = redis_keys.matchmaking_notification_channel(*user_id);
-        let notification = serde_json::json!({
-            "type": "MatchFound",
-            "game_id": game_id,
-            "partition_id": partition_id
-        });
-        
-        info!("Publishing match notification to channel: {} for user {}", channel, user_id);
-        
-        // Publish notification to user's channel using Redis connection
-        let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        if let Ok(client) = redis::Client::open(redis_url.as_str()) {
-            if let Ok(mut conn) = client.get_multiplexed_tokio_connection().await {
-                match redis::cmd("PUBLISH")
-                    .arg(&channel)
-                    .arg(notification.to_string())
-                    .query_async::<i32>(&mut conn).await {
-                    Ok(subscribers) => {
-                        info!("Published match notification to {} subscribers", subscribers);
-                    }
-                    Err(e) => {
-                        error!("Failed to publish match notification: {}", e);
-                    }
-                }
-            } else {
-                error!("Failed to get Redis connection for notifications");
-            }
-        } else {
-            error!("Failed to create Redis client for notifications");
-        }
-    }
-    
-    // Remove players from queue
-    matchmaking_manager.remove_players_from_queue(&game_type, &queue_mode, &user_ids).await?;
-
-    // Publish GameCreated event to Redis stream
-    let event = StreamEvent::GameCreated {
-        game_id,
-        game_state: game_state.clone(),
-    };
-    
-    // Publish initial snapshot
-    pubsub.publish_snapshot(partition_id, game_id, &game_state).await
-        .context("Failed to publish initial game snapshot")?;
-    
-    // Send GameCreated event via partition command channel
-    let serialized = serde_json::to_vec(&event)
-        .context("Failed to serialize GameCreated event")?;
-    pubsub.publish_command(partition_id, &serialized).await
-        .context("Failed to publish GameCreated event")?;
-    
-    info!(game_id, partition_id, "Game created and published to Redis stream");
-
-    // Log match details
-    let avg_mmr = matched_players.iter()
-        .map(|p| p.mmr)
-        .sum::<i32>() / matched_players.len() as i32;
-    
-    info!(
-        game_id,
-        player_count = matched_players.len(),
-        avg_mmr,
-        mmr_range = max_mmr_diff,
-        "Redis match created"
-    );
-    
-    Ok(Some((game_id, user_ids)))
 }
 
 /// Create a match from a specific set of players (for custom games)

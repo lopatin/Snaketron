@@ -332,12 +332,6 @@ async fn test_mmr_filtering_for_lobbies() {
     // Lobby A (avg MMR 1000), Lobby B (avg MMR 2000) queue for 1v1
     // Expected: Do not match (MMR difference > threshold)
 }
-
-#[tokio::test]
-async fn test_concurrent_lobby_and_solo_matchmaking() {
-    // Mix of lobbies and solo players all queueing
-    // Expected: Both systems work independently without interference
-}
 ```
 
 ### Test File Structure
@@ -482,7 +476,6 @@ async fn create_lobby_and_queue(
 - [ ] `test_lobby_too_large_for_game_mode()`
 - [ ] `test_quickmatch_and_competitive_dont_mix()`
 - [ ] `test_mmr_filtering_for_lobbies()`
-- [ ] `test_concurrent_lobby_and_solo_matchmaking()`
 
 **Files to create**:
 - `server/tests/lobby_matchmaking_tests.rs`

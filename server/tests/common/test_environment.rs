@@ -32,6 +32,8 @@ impl TestEnvironment {
         // being called at the start of the test before any other code accesses DYNAMODB_TABLE_PREFIX
         unsafe {
             std::env::set_var("DYNAMODB_TABLE_PREFIX", &unique_prefix);
+            // Use Redis database 1 for tests (tests flush database 1, so server should use it too)
+            std::env::set_var("SNAKETRON_REDIS_URL", "redis://127.0.0.1:6379/1");
         }
         info!("Using unique table prefix for test: {}", unique_prefix);
 

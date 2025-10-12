@@ -11,22 +11,6 @@ use crate::redis_utils;
 use crate::ws_server::WSMessage;
 use common::GameType;
 
-/// Add a user to the matchmaking queue
-pub async fn add_to_matchmaking_queue(
-    matchmaking_manager: &mut MatchmakingManager,
-    user_id: u32,
-    username: String,
-    mmr: i32,
-    game_type: GameType,
-    queue_mode: common::QueueMode,
-) -> Result<()> {
-    // Add to queue
-    matchmaking_manager.add_to_queue(user_id, username, mmr, game_type.clone(), queue_mode.clone()).await?;
-    
-    info!("User {} added to matchmaking queue for game type {:?}", user_id, game_type);
-    Ok(())
-}
-
 /// Remove a user from the matchmaking queue
 pub async fn remove_from_matchmaking_queue(
     matchmaking_manager: &mut MatchmakingManager,

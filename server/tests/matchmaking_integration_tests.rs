@@ -415,7 +415,11 @@ async fn test_rejoin_active_game() -> Result<()> {
 
 // Helper functions
 async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
-    timeout(Duration::from_secs(30), async {
+    wait_for_match_with_timeout(client, Duration::from_secs(30)).await
+}
+
+async fn wait_for_match_with_timeout(client: &mut TestClient, timeout_duration: Duration) -> Result<u32> {
+    timeout(timeout_duration, async {
         // First wait for JoinGame message
         let game_id = loop {
             match client.receive_message().await? {
@@ -427,10 +431,10 @@ async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
                 }
             }
         };
-        
+
         // Send JoinGame acknowledgment
         client.send_message(WSMessage::JoinGame(game_id)).await?;
-        
+
         // Now wait for the snapshot
         loop {
             match client.receive_message().await? {
@@ -457,6 +461,266 @@ async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
             }
         }
     }).await?
+}
+
+// ============================================================================
+// MMR-BASED TIMING TESTS
+// ============================================================================
+
+/// Test that two lobbies with similar MMR (both in silver range 500-600) match instantly
+#[tokio::test]
+async fn test_same_mmr_range_matches_instantly() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut env = TestEnvironment::new("test_same_mmr_instant").await?;
+    env.add_server().await?;
+
+    // Create two users with similar MMR (both in silver range 500-600)
+    env.create_user_with_mmr(550).await?;
+    env.create_user_with_mmr(570).await?;
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+
+    // Connect both clients
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+
+    println!("Testing: Two lobbies with MMR 550 and 570 (both silver)");
+
+    // Record start time
+    let start_time = std::time::Instant::now();
+
+    // Both queue for 1v1 match
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    // Wait for both to get matched
+    let game_id1 = wait_for_match(&mut client1).await?;
+    let game_id2 = wait_for_match(&mut client2).await?;
+
+    let match_time = start_time.elapsed();
+
+    assert_eq!(game_id1, game_id2, "Both players should be in same game");
+
+    println!("Match time: {:?}", match_time);
+
+    // Should match within 5 seconds (instantly = within one matchmaking cycle which is 2s)
+    assert!(match_time.as_secs() <= 5,
+            "Same MMR range should match instantly, took {:?}", match_time);
+
+    println!("✓ Same MMR range matched in {:?} (expected: instant/~2s)", match_time);
+
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+/// Test that silver (600) and gold (900) lobbies match after ~10 seconds
+#[tokio::test]
+async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut env = TestEnvironment::new("test_silver_gold_10s").await?;
+    env.add_server().await?;
+
+    // Create silver and gold users (300 MMR difference)
+    env.create_user_with_mmr(600).await?;  // Silver
+    env.create_user_with_mmr(900).await?;  // Gold
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+
+    println!("Testing: Silver (600) vs Gold (900) - 300 MMR difference");
+
+    let start_time = std::time::Instant::now();
+
+    // Both queue for 1v1 match
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    // Wait for both to get matched
+    let game_id1 = wait_for_match(&mut client1).await?;
+    let game_id2 = wait_for_match(&mut client2).await?;
+
+    let match_time = start_time.elapsed();
+
+    assert_eq!(game_id1, game_id2, "Both players should be in same game");
+
+    println!("Match time: {:?}", match_time);
+
+    // Should match after approximately 10 seconds (allow 8-14 second range)
+    assert!(match_time.as_secs() >= 8,
+            "Silver vs Gold should wait ~10s before matching, matched too quickly at {:?}", match_time);
+    assert!(match_time.as_secs() <= 14,
+            "Silver vs Gold should match by ~10s, took too long at {:?}", match_time);
+
+    println!("✓ Silver vs Gold matched in {:?} (expected: ~10s)", match_time);
+
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+/// Test that silver (600) and diamond (1500) lobbies match after ~30 seconds (max wait)
+#[tokio::test]
+async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut env = TestEnvironment::new("test_silver_diamond_30s").await?;
+    env.add_server().await?;
+
+    // Create silver and diamond users (900 MMR difference)
+    env.create_user_with_mmr(600).await?;   // Silver
+    env.create_user_with_mmr(1500).await?;  // Diamond
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+
+    println!("Testing: Silver (600) vs Diamond (1500) - 900 MMR difference");
+
+    let start_time = std::time::Instant::now();
+
+    // Both queue for 1v1 match
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    // Wait for both to get matched
+    let game_id1 = wait_for_match(&mut client1).await?;
+    let game_id2 = wait_for_match(&mut client2).await?;
+
+    let match_time = start_time.elapsed();
+
+    assert_eq!(game_id1, game_id2, "Both players should be in same game");
+
+    println!("Match time: {:?}", match_time);
+
+    // Should match after approximately 30 seconds (allow 25-35 second range)
+    assert!(match_time.as_secs() >= 25,
+            "Silver vs Diamond should wait ~30s before matching, matched too quickly at {:?}", match_time);
+    assert!(match_time.as_secs() <= 35,
+            "Silver vs Diamond should match by ~30s (max wait time), took too long at {:?}", match_time);
+
+    println!("✓ Silver vs Diamond matched in {:?} (expected: ~30s max)", match_time);
+
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+/// Test that extreme MMR differences still match within 30 seconds (max wait time)
+#[tokio::test]
+async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut env = TestEnvironment::new("test_extreme_mmr_30s_max").await?;
+    env.add_server().await?;
+
+    // Create users with extreme MMR difference (bronze vs grandmaster)
+    env.create_user_with_mmr(300).await?;   // Bronze
+    env.create_user_with_mmr(2000).await?;  // Grandmaster
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+
+    let mut client1 = TestClient::connect(&server_addr).await?;
+    let mut client2 = TestClient::connect(&server_addr).await?;
+
+    client1.authenticate(env.user_ids()[0]).await?;
+    client2.authenticate(env.user_ids()[1]).await?;
+
+    println!("Testing: Bronze (300) vs Grandmaster (2000) - 1700 MMR difference");
+
+    let start_time = std::time::Instant::now();
+
+    // Both queue for 1v1 match
+    client1.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    client2.send_message(WSMessage::QueueForMatch {
+        game_type: GameType::FreeForAll { max_players: 2 },
+        queue_mode: ::common::QueueMode::Competitive,
+    }).await?;
+
+    // Wait for both to get matched
+    // Use a longer timeout (40s) because the matchmaking loop runs every 2 seconds
+    // and needs to wait for >= 30 seconds before matching extreme MMR differences
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(40)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(40)).await?;
+
+    let match_time = start_time.elapsed();
+
+    assert_eq!(game_id1, game_id2, "Both players should be in same game");
+
+    println!("Match time: {:?}", match_time);
+
+    // Should match within 35 seconds (30s is the max intended wait, plus matchmaking loop interval)
+    assert!(match_time.as_secs() <= 35,
+            "Even extreme MMR differences should match by 30s (max wait), took {:?}", match_time);
+
+    println!("✓ Extreme MMR difference matched in {:?} (max: 30s)", match_time);
+
+    client1.disconnect().await?;
+    client2.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

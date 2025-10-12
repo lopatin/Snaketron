@@ -22,7 +22,7 @@ use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, GameSt
 use crate::game_executor::{StreamEvent, PARTITION_COUNT};
 use crate::pubsub_manager::PubSubManager;
 use crate::matchmaking_manager::MatchmakingManager;
-use crate::ws_matchmaking::{add_to_matchmaking_queue, remove_from_matchmaking_queue};
+use crate::ws_matchmaking::remove_from_matchmaking_queue;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -773,108 +773,107 @@ async fn process_ws_message(
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
                     let mmr = user.mmr;
+                    info!("User {} has MMR: {}", metadata.user_id, mmr);
 
-                    // Add to matchmaking queue using Redis-based matchmaking
-                    let matchmaking_manager_clone = matchmaking_manager.clone(); // Clone the Arc before locking
-                    let mut matchmaking_manager_guard = matchmaking_manager.lock().await;
-                    match add_to_matchmaking_queue(
-                        &mut *matchmaking_manager_guard,
-                        metadata.user_id as u32,
-                        metadata.username.clone(),
-                        mmr,
-                        game_type,
-                        queue_mode,
-                    ).await {
-                        Ok(()) => {
-                            info!("User {} added to matchmaking queue", metadata.user_id);
-
-                            // Start listening for match notifications and renewing queue position
-                            let user_id = metadata.user_id;
-                            let ws_tx_clone = ws_tx.clone();
-                            let replication_manager_clone = replication_manager.clone();
-                            let redis_url_clone = redis_url.to_string();
-                            tokio::spawn(async move {
-                                // Spawn a task to periodically renew queue position
-                                let renewal_handle = {
-                                    let matchmaking_manager_clone2 = matchmaking_manager_clone.clone();
-                                    let user_id_copy = user_id;
-                                    tokio::spawn(async move {
-                                        let mut interval = tokio::time::interval(Duration::from_secs(30));
-                                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                                        loop {
-                                            interval.tick().await;
-                                            let mut mm_guard = matchmaking_manager_clone2.lock().await;
-                                            match mm_guard.renew_queue_position(user_id_copy as u32).await {
-                                                Ok(renewed) => {
-                                                    if renewed {
-                                                        debug!("Renewed queue position for user {}", user_id_copy);
-                                                    } else {
-                                                        // User no longer in queue, stop renewing
-                                                        break;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to renew queue position for user {}: {}", user_id_copy, e);
-                                                }
-                                            }
-                                        }
-                                    })
+                    // Auto-create a single-member lobby for this solo player (just like guest lobby creation)
+                    info!("Creating auto-lobby for user {}", metadata.user_id);
+                    match lobby_manager.create_lobby(metadata.user_id, region).await {
+                        Ok(lobby) => {
+                            info!("Auto-created lobby {} for user {}", lobby.id, metadata.user_id);
+                            // Join the newly created lobby
+                            if let Err(e) = lobby_manager.join_lobby(
+                                lobby.id,
+                                metadata.user_id,
+                                metadata.username.clone(),
+                                websocket_id.to_string(),
+                                region.to_string(),
+                            ).await {
+                                error!("Failed to join auto-created lobby: {}", e);
+                                let response = WSMessage::AccessDenied {
+                                    reason: format!("Failed to create matchmaking lobby: {}", e)
                                 };
-                                // Subscribe to match notifications
-                                let redis_keys = crate::redis_keys::RedisKeys::new();
-                                let channel = redis_keys.matchmaking_notification_channel(user_id as u32);
-                                info!("Subscribing to match notifications on channel: {}", channel);
-                                if let Ok(client) = redis::Client::open(redis_url_clone.as_ref()) {
-                                    if let Ok(mut pubsub) = client.get_async_pubsub().await {
-                                        if pubsub.subscribe(&channel).await.is_ok() {
-                                            info!("Successfully subscribed to match notifications for user {}", user_id);
-                                            // Wait for match notification in a loop
-                                            let mut pubsub_stream = pubsub.on_message();
-                                            while let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
-                                                if let Ok(payload) = msg.get_payload::<String>() {
-                                                    // Parse the notification
-                                                    if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
-                                                        if let Some(game_id) = notification["game_id"].as_u64() {
-                                                            info!("User {} matched to game {}, waiting for game to be available", user_id, game_id);
-                                                            
-                                                            // Wait for the game to become available in the replication manager
-                                                            match replication_manager_clone.wait_for_game(game_id as u32, 10).await {
-                                                                Ok(_game_state) => {
-                                                                    info!("Game {} is now available in replication manager, sending JoinGame message to user {}", game_id, user_id);
-                                                                    // Send JoinGame message to client
-                                                                    let join_msg = WSMessage::JoinGame(game_id as u32);
-                                                                    let json_msg = serde_json::to_string(&join_msg).unwrap();
-                                                                    if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_ok() {
-                                                                        info!("JoinGame message sent to user {}", user_id);
-                                                                        // Cancel the renewal task
-                                                                        renewal_handle.abort();
-                                                                        // Exit after sending the match notification
-                                                                        break;
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    error!("Failed to wait for game {} to become available: {}", game_id, e);
-                                                                    // Continue listening for other notifications
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            error!("Failed to subscribe to channel {} for user {}", channel, user_id);
-                                        }
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                return Ok(ConnectionState::Authenticated { metadata });
+                            }
+
+                            // Fetch lobby members (should be just this user)
+                            let members = match lobby_manager.get_lobby_members(lobby.id).await {
+                                Ok(m) => {
+                                    info!(
+                                        lobby_id = lobby.id,
+                                        member_count = m.len(),
+                                        "Fetched lobby members for auto-created lobby"
+                                    );
+                                    for (idx, member) in m.iter().enumerate() {
+                                        info!(
+                                            idx = idx,
+                                            user_id = member.user_id,
+                                            username = %member.username,
+                                            "Lobby member"
+                                        );
                                     }
+                                    m
+                                },
+                                Err(e) => {
+                                    error!("Failed to get lobby members: {}", e);
+                                    return Ok(ConnectionState::Authenticated { metadata });
                                 }
-                            });
+                            };
+
+                            // Update lobby state to "queued"
+                            if let Err(e) = lobby_manager.update_lobby_state(lobby.id, "queued").await {
+                                error!("Failed to update lobby state: {}", e);
+                                let response = WSMessage::AccessDenied {
+                                    reason: format!("Failed to queue lobby: {}", e)
+                                };
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                return Ok(ConnectionState::Authenticated { metadata });
+                            }
+
+                            // Add the auto-created lobby to matchmaking queue
+                            let mut mm_guard = matchmaking_manager.lock().await;
+                            if let Err(e) = mm_guard.add_lobby_to_queue(
+                                lobby.id,
+                                &lobby.lobby_code,
+                                members.clone(),
+                                mmr,
+                                game_type.clone(),
+                                queue_mode.clone(),
+                                metadata.user_id as u32,  // Solo player is the requesting user
+                            ).await {
+                                error!("Failed to add lobby to matchmaking queue: {}", e);
+                                let response = WSMessage::AccessDenied {
+                                    reason: format!("Failed to queue for match: {}", e)
+                                };
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                // Revert lobby state
+                                let _ = lobby_manager.update_lobby_state(lobby.id, "waiting").await;
+                                return Ok(ConnectionState::Authenticated { metadata });
+                            }
+                            drop(mm_guard);
+
+                            info!("Auto-created lobby {} for solo player {} and added to matchmaking queue", lobby.id, metadata.user_id);
+
+                            // Transition to InLobby state - lobby match notifications will be handled automatically
+                            Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id: lobby.id,
+                                websocket_id: websocket_id.to_string(),
+                            })
                         }
                         Err(e) => {
-                            error!("Failed to add user to matchmaking queue: {}", e);
+                            error!("Failed to create lobby: {}", e);
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to create matchmaking lobby: {}", e)
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            Ok(ConnectionState::Authenticated { metadata })
                         }
                     }
-
-                    Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::JoinGame(game_id) => {
                     info!("User {} ({}) joining game {}", metadata.username, metadata.user_id, game_id);
@@ -1254,6 +1253,7 @@ async fn process_ws_message(
                                         avg_mmr,
                                         game_type.clone(),
                                         queue_mode.clone(),
+                                        metadata.user_id as u32,  // Host is the requesting user
                                     ).await {
                                         error!("Failed to add lobby to matchmaking queue: {}", e);
                                         let response = WSMessage::AccessDenied {
