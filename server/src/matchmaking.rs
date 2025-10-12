@@ -504,6 +504,7 @@ pub async fn run_matchmaking_loop(
         // For now, we'll check a few common game types
         // In production, we'd maintain a set of active game types
         let game_types = vec![
+            GameType::Solo, 
             GameType::FreeForAll { max_players: 2 },
             GameType::FreeForAll { max_players: 3 },
             GameType::FreeForAll { max_players: 4 },
@@ -792,16 +793,14 @@ async fn create_lobby_matches(
                     combination.avg_mmr
                 );
 
-                // Remove matched lobbies from available pool and queue
+                // Remove matched lobbies from available pool and ALL queues they were in
                 for lobby in &combination.lobbies {
                     available_lobbies.retain(|l| l.lobby_id != lobby.lobby_id);
 
-                    if let Err(e) = matchmaking_manager.remove_lobby_from_queue(
-                        &game_type,
-                        &queue_mode,
-                        lobby.lobby_id,
-                    ).await {
-                        error!("Failed to remove lobby {} from queue: {}", lobby.lobby_id, e);
+                    // Use remove_lobby_from_all_queues to ensure lobby is removed from
+                    // all game type queues it was registered for (prevents double-matching)
+                    if let Err(e) = matchmaking_manager.remove_lobby_from_all_queues(lobby).await {
+                        error!("Failed to remove lobby {} from all queues: {}", lobby.lobby_id, e);
                     }
                 }
 

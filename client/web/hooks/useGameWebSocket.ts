@@ -14,7 +14,8 @@ interface UseGameWebSocketReturn {
   createCustomGame: (settings: Partial<CustomGameSettings>) => void;
   createGame: (gameType: string) => void;
   createSoloGame: () => void;
-  queueForMatch: (gameType: GameType) => void;
+  queueForMatch: (gameType: GameType, queueMode?: 'Quickmatch' | 'Competitive') => void;
+  queueForMatchMulti: (gameTypes: GameType[], queueMode?: 'Quickmatch' | 'Competitive') => void;
   joinCustomGame: (gameCode: string) => void;
   joinGame: (gameId: string, gameCode?: string | null) => void;
   leaveGame: () => void;
@@ -234,6 +235,14 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     });
   }, [sendMessage]);
 
+  const queueForMatchMulti = useCallback((gameTypes: GameType[], queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
+    console.log('Queueing for match with multiple game types:', gameTypes, 'mode:', queueMode);
+    setIsQueued(true);
+    sendMessage({
+      QueueForMatchMulti: { game_types: gameTypes, queue_mode: queueMode }
+    });
+  }, [sendMessage]);
+
   const leaveGame = useCallback(() => {
     console.log('Sending LeaveGame message (initial state issue):');
     sendMessage('LeaveGame');
@@ -275,6 +284,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     createGame,
     createSoloGame,
     queueForMatch,
+    queueForMatchMulti,
     joinCustomGame,
     joinGame,
     leaveGame,

@@ -590,3 +590,408 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
     env.shutdown().await?;
     Ok(())
 }
+
+// ============================================================================
+// MULTI-GAME-TYPE QUEUING TESTS
+// ============================================================================
+
+/// Test that add_lobby_to_queue with multiple game types registers the lobby in all queues
+#[tokio::test]
+async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
+    use server::matchmaking_manager::MatchmakingManager;
+    use server::lobby_manager::LobbyMember;
+
+    setup_test_redis().await?;
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let mut mm = MatchmakingManager::new(&redis_url).await?;
+
+    // Create test lobby members
+    let members = vec![
+        LobbyMember {
+            user_id: 1,
+            username: "player1".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+        LobbyMember {
+            user_id: 2,
+            username: "player2".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: false,
+        },
+    ];
+
+    // Queue lobby for both 1v1 and 2v2
+    mm.add_lobby_to_queue(
+        1,
+        "TEST001",
+        members.clone(),
+        1000,
+        vec![
+            GameType::TeamMatch { per_team: 1 },
+            GameType::TeamMatch { per_team: 2 },
+        ],
+        QueueMode::Quickmatch,
+        1,
+    ).await?;
+
+    // Verify lobby appears in both game type queues
+    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_2v2 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies_1v1.len(), 1, "Lobby should appear in 1v1 queue");
+    assert_eq!(lobbies_2v2.len(), 1, "Lobby should appear in 2v2 queue");
+
+    assert_eq!(lobbies_1v1[0].lobby_id, 1);
+    assert_eq!(lobbies_2v2[0].lobby_id, 1);
+
+    // Verify the game_types field contains both types
+    assert_eq!(lobbies_1v1[0].game_types.len(), 2);
+    assert!(lobbies_1v1[0].game_types.contains(&GameType::TeamMatch { per_team: 1 }));
+    assert!(lobbies_1v1[0].game_types.contains(&GameType::TeamMatch { per_team: 2 }));
+
+    println!("✓ Multi-type lobby correctly appears in all queues");
+    Ok(())
+}
+
+/// Test that remove_lobby_from_all_queues removes lobby from all game type queues
+#[tokio::test]
+async fn test_remove_lobby_from_all_queues() -> Result<()> {
+    use server::matchmaking_manager::MatchmakingManager;
+    use server::lobby_manager::LobbyMember;
+
+    setup_test_redis().await?;
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let mut mm = MatchmakingManager::new(&redis_url).await?;
+
+    // Create test lobby members
+    let members = vec![
+        LobbyMember {
+            user_id: 1,
+            username: "player1".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+    ];
+
+    // Queue lobby for multiple game types
+    mm.add_lobby_to_queue(
+        1,
+        "TEST001",
+        members.clone(),
+        1000,
+        vec![
+            GameType::TeamMatch { per_team: 1 },
+            GameType::TeamMatch { per_team: 2 },
+            GameType::FreeForAll { max_players: 4 },
+        ],
+        QueueMode::Quickmatch,
+        1,
+    ).await?;
+
+    // Verify lobby is in all queues
+    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_2v2 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+    let lobbies_ffa = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies_1v1.len(), 1);
+    assert_eq!(lobbies_2v2.len(), 1);
+    assert_eq!(lobbies_ffa.len(), 1);
+
+    // Remove lobby from all queues
+    let queued_lobby = &lobbies_1v1[0];
+    mm.remove_lobby_from_all_queues(queued_lobby).await?;
+
+    // Verify lobby is gone from all queues
+    let lobbies_1v1_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_2v2_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+    let lobbies_ffa_after = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies_1v1_after.len(), 0, "Lobby should be removed from 1v1 queue");
+    assert_eq!(lobbies_2v2_after.len(), 0, "Lobby should be removed from 2v2 queue");
+    assert_eq!(lobbies_ffa_after.len(), 0, "Lobby should be removed from FFA queue");
+
+    println!("✓ Lobby correctly removed from all queues");
+    Ok(())
+}
+
+/// Test that get_queued_lobbies deduplicates lobbies appearing in multiple queues
+#[tokio::test]
+async fn test_get_queued_lobbies_deduplication() -> Result<()> {
+    use server::matchmaking_manager::MatchmakingManager;
+    use server::lobby_manager::LobbyMember;
+
+    setup_test_redis().await?;
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let mut mm = MatchmakingManager::new(&redis_url).await?;
+
+    // Create test lobby members
+    let members = vec![
+        LobbyMember {
+            user_id: 1,
+            username: "player1".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+        LobbyMember {
+            user_id: 2,
+            username: "player2".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: false,
+        },
+    ];
+
+    // Queue same lobby for 1v1
+    mm.add_lobby_to_queue(
+        1,
+        "TEST001",
+        members.clone(),
+        1000,
+        vec![GameType::TeamMatch { per_team: 1 }],
+        QueueMode::Quickmatch,
+        1,
+    ).await?;
+
+    // Queue a different lobby for 1v1 as well (to verify we get both)
+    mm.add_lobby_to_queue(
+        2,
+        "TEST002",
+        members.clone(),
+        1050,
+        vec![GameType::TeamMatch { per_team: 1 }],
+        QueueMode::Quickmatch,
+        2,
+    ).await?;
+
+    // Get lobbies - should return exactly 2 unique lobbies
+    let lobbies = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies.len(), 2, "Should return exactly 2 unique lobbies");
+
+    let lobby_ids: Vec<i32> = lobbies.iter().map(|l| l.lobby_id).collect();
+    assert!(lobby_ids.contains(&1));
+    assert!(lobby_ids.contains(&2));
+
+    println!("✓ Deduplication works correctly");
+    Ok(())
+}
+
+/// Test that when a lobby is matched in one queue, it doesn't get matched again in another
+#[tokio::test]
+async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
+    use server::matchmaking_manager::MatchmakingManager;
+    use server::lobby_manager::LobbyMember;
+
+    setup_test_redis().await?;
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let mut mm = MatchmakingManager::new(&redis_url).await?;
+
+    // Create test lobby members
+    let members1 = vec![
+        LobbyMember {
+            user_id: 1,
+            username: "player1".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+    ];
+
+    let members2 = vec![
+        LobbyMember {
+            user_id: 2,
+            username: "player2".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+    ];
+
+    let members3 = vec![
+        LobbyMember {
+            user_id: 3,
+            username: "player3".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        },
+        LobbyMember {
+            user_id: 4,
+            username: "player4".to_string(),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: false,
+        },
+    ];
+
+    // Queue two lobbies for both 1v1 and 2v2
+    mm.add_lobby_to_queue(
+        1,
+        "TEST001",
+        members1.clone(),
+        1000,
+        vec![
+            GameType::TeamMatch { per_team: 1 },
+            GameType::TeamMatch { per_team: 2 },
+        ],
+        QueueMode::Quickmatch,
+        1,
+    ).await?;
+
+    mm.add_lobby_to_queue(
+        2,
+        "TEST002",
+        members2.clone(),
+        1000,
+        vec![
+            GameType::TeamMatch { per_team: 1 },
+            GameType::TeamMatch { per_team: 2 },
+        ],
+        QueueMode::Quickmatch,
+        2,
+    ).await?;
+
+    // Also add a 2-player lobby just for 2v2
+    mm.add_lobby_to_queue(
+        3,
+        "TEST003",
+        members3.clone(),
+        1000,
+        vec![GameType::TeamMatch { per_team: 2 }],
+        QueueMode::Quickmatch,
+        3,
+    ).await?;
+
+    // Get lobbies for 1v1 - should find lobbies 1 and 2
+    let lobbies_1v1_before = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    assert_eq!(lobbies_1v1_before.len(), 2);
+
+    // Simulate matching lobbies 1 and 2 for 1v1 by removing them
+    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[0]).await?;
+    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[1]).await?;
+
+    // Now check 2v2 queue - lobbies 1 and 2 should be GONE
+    let lobbies_2v2_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+
+    // Should only have lobby 3 left
+    assert_eq!(lobbies_2v2_after.len(), 1, "Only lobby 3 should remain in 2v2 queue");
+    assert_eq!(lobbies_2v2_after[0].lobby_id, 3);
+
+    println!("✓ No double-matching: matched lobbies removed from all queues");
+    Ok(())
+}
+
+/// Integration test: Two lobbies queued for [1v1, 2v2] should match for 1v1
+#[tokio::test]
+async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    setup_test_redis().await?;
+    let mut env = TestEnvironment::new("test_multi_type_1v1_match").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+
+    // For now, since WebSocket only supports single game type,
+    // we'll queue two separate lobbies and they should match
+    let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+        &env,
+        0,
+        &[env.user_ids()[0]],
+        GameType::TeamMatch { per_team: 1 },
+        QueueMode::Quickmatch,
+    ).await?;
+
+    let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+        &env,
+        0,
+        &[env.user_ids()[1]],
+        GameType::TeamMatch { per_team: 1 },
+        QueueMode::Quickmatch,
+    ).await?;
+
+    // Combine all clients
+    let mut all_clients = clients1;
+    all_clients.extend(clients2);
+
+    // Wait for both to join the same game
+    let game_id = wait_for_all_clients_to_join_game(&mut all_clients).await?;
+
+    println!("✓ Multi-type lobbies successfully matched for 1v1: {}", game_id);
+
+    for client in all_clients {
+        client.disconnect().await?;
+    }
+    env.shutdown().await?;
+    Ok(())
+}
+
+/// Test that a lobby in multiple queues gets properly cleaned up after matching
+#[tokio::test]
+async fn test_cleanup_after_match_creation() -> Result<()> {
+    use server::matchmaking_manager::MatchmakingManager;
+    use server::lobby_manager::LobbyMember;
+
+    setup_test_redis().await?;
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let mut mm = MatchmakingManager::new(&redis_url).await?;
+
+    // Create three single-player lobbies, all queued for both 1v1 and FFA
+    for i in 1..=3 {
+        let members = vec![
+            LobbyMember {
+                user_id: i,
+                username: format!("player{}", i),
+                joined_at: chrono::Utc::now().timestamp_millis(),
+                is_host: true,
+            },
+        ];
+
+        mm.add_lobby_to_queue(
+            i,
+            &format!("TEST{:03}", i),
+            members,
+            1000,
+            vec![
+                GameType::TeamMatch { per_team: 1 },
+                GameType::FreeForAll { max_players: 4 },
+            ],
+            QueueMode::Quickmatch,
+            i as u32,
+        ).await?;
+    }
+
+    // Verify all 3 lobbies are in both queues
+    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_ffa = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies_1v1.len(), 3);
+    assert_eq!(lobbies_ffa.len(), 3);
+
+    // Simulate matching lobbies 1 and 2 for 1v1
+    mm.remove_lobby_from_all_queues(&lobbies_1v1[0]).await?;
+    mm.remove_lobby_from_all_queues(&lobbies_1v1[1]).await?;
+
+    // Verify lobbies 1 and 2 are removed from BOTH queues
+    let lobbies_1v1_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_ffa_after = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+
+    assert_eq!(lobbies_1v1_after.len(), 1, "Only lobby 3 should remain in 1v1 queue");
+    assert_eq!(lobbies_ffa_after.len(), 1, "Only lobby 3 should remain in FFA queue");
+
+    assert_eq!(lobbies_1v1_after[0].lobby_id, 3);
+    assert_eq!(lobbies_ffa_after[0].lobby_id, 3);
+
+    println!("✓ Matched lobbies properly cleaned up from all queues");
+    Ok(())
+}

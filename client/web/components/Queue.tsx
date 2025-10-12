@@ -2,33 +2,38 @@ import React, { useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import LoadingScreen from './LoadingScreen';
+import { GameType } from '../types';
 
 export default function Queue() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { queueForMatch, createSoloGame, currentGameId } = useGameWebSocket();
+  const { queueForMatch, queueForMatchMulti, currentGameId } = useGameWebSocket();
 
   useEffect(() => {
-    // Get the game type from navigation state
-    const state = location.state as { gameType?: any; autoQueue?: boolean } | null;
-    
-    if (!state || !state.autoQueue || !state.gameType) {
-      // If no state, navigate back to home
+    // Get the game type(s) from navigation state
+    const state = location.state as {
+      gameType?: GameType;
+      gameTypes?: GameType[];
+      autoQueue?: boolean
+    } | null;
+
+    if (!state || !state.autoQueue) {
+      // If no state or not auto-queueing, navigate back to home
       navigate('/');
       return;
     }
 
-    const gameType = state.gameType;
-
-    // Queue for the appropriate game type
-    if (gameType === 'Solo' || 
-        (typeof gameType === 'object' && 'Custom' in gameType && 
-         gameType.Custom?.settings?.game_mode === 'Solo')) {
-      createSoloGame();
-    } else if (typeof gameType === 'object') {
-      queueForMatch(gameType);
+    // Handle multiple game types
+    if (state.gameTypes && state.gameTypes.length > 0) {
+      queueForMatchMulti(state.gameTypes);
+    } else if (state.gameType) {
+      // Handle single game type (backward compatibility)
+      queueForMatch(state.gameType);
+    } else {
+      // No game type provided, navigate back
+      navigate('/');
     }
-  }, [location.state, navigate, queueForMatch, createSoloGame]);
+  }, [location.state, navigate, queueForMatch, queueForMatchMulti]);
 
   // When a game is found, we'll automatically navigate (handled by useGameWebSocket)
   useEffect(() => {

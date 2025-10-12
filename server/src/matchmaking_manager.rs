@@ -24,7 +24,7 @@ pub struct QueuedLobby {
     pub lobby_code: String,
     pub members: Vec<crate::lobby_manager::LobbyMember>,
     pub avg_mmr: i32,
-    pub game_type: GameType,
+    pub game_types: Vec<GameType>,  // Lobbies can queue for multiple game types
     pub queue_mode: common::QueueMode,
     pub queued_at: i64,
     pub requesting_user_id: u32,  // Who initiated the queue request (for spectator preference)
@@ -104,19 +104,20 @@ impl MatchmakingManager {
             .context("Failed to connect to Redis for matchmaking")
     }
     
-    /// Add a lobby to the matchmaking queue
+    /// Add a lobby to the matchmaking queue for multiple game types
     pub async fn add_lobby_to_queue(
         &mut self,
         lobby_id: i32,
         lobby_code: &str,
         members: Vec<crate::lobby_manager::LobbyMember>,
         avg_mmr: i32,
-        game_type: GameType,
+        game_types: Vec<GameType>,  // Can queue for multiple game types
         queue_mode: common::QueueMode,
         requesting_user_id: u32,  // Who initiated the queue request
     ) -> Result<()> {
-        let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(&game_type, &queue_mode);
-        let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+        if game_types.is_empty() {
+            return Err(anyhow!("Must specify at least one game type"));
+        }
 
         let timestamp = Utc::now().timestamp_millis();
 
@@ -125,7 +126,7 @@ impl MatchmakingManager {
             lobby_code: lobby_code.to_string(),
             members,
             avg_mmr,
-            game_type: game_type.clone(),
+            game_types: game_types.clone(),
             queue_mode: queue_mode.clone(),
             queued_at: timestamp,
             requesting_user_id,
@@ -133,16 +134,22 @@ impl MatchmakingManager {
 
         let lobby_json = serde_json::to_string(&lobby)?;
 
-        // Start a transaction
+        // Start a transaction to add lobby to all game type queues
         let mut pipe = redis::pipe();
         pipe.atomic();
 
-        // Add to lobby queue sorted set (score = timestamp for FIFO)
-        pipe.zadd(&lobby_queue_key, &lobby_json, timestamp);
+        // Add to each game type's queue
+        for game_type in &game_types {
+            let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, &queue_mode);
+            let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(game_type, &queue_mode);
 
-        // Add to MMR index (score = average MMR for range queries)
-        // Store full lobby JSON to enable efficient retrieval by MMR
-        pipe.zadd(&lobby_mmr_key, &lobby_json, avg_mmr);
+            // Add to lobby queue sorted set (score = timestamp for FIFO)
+            pipe.zadd(&lobby_queue_key, &lobby_json, timestamp);
+
+            // Add to MMR index (score = average MMR for range queries)
+            // Store full lobby JSON to enable efficient retrieval by MMR
+            pipe.zadd(&lobby_mmr_key, &lobby_json, avg_mmr);
+        }
 
         // Execute transaction with retries
         let mut attempts = 0;
@@ -165,7 +172,7 @@ impl MatchmakingManager {
         }
 
         info!("Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
-            lobby_id, game_type, lobby.members.len(), avg_mmr);
+            lobby_id, game_types, lobby.members.len(), avg_mmr);
         Ok(())
     }
 
@@ -444,7 +451,7 @@ impl MatchmakingManager {
         Ok(unique_lobbies)
     }
 
-    /// Remove a lobby from the matchmaking queue
+    /// Remove a lobby from the matchmaking queue for a single game type
     pub async fn remove_lobby_from_queue(&mut self, game_type: &GameType, queue_mode: &common::QueueMode, lobby_id: i32) -> Result<()> {
         let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, queue_mode);
         let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(game_type, queue_mode);
@@ -468,7 +475,45 @@ impl MatchmakingManager {
 
         let _: () = pipe.query_async(&mut self.conn).await?;
 
-        info!("Removed lobby {} from matchmaking queue", lobby_id);
+        info!("Removed lobby {} from matchmaking queue for game type {:?}", lobby_id, game_type);
+        Ok(())
+    }
+
+    /// Remove a lobby from all matchmaking queues it was queued for
+    /// This is used when a lobby is matched to prevent it from being matched again
+    pub async fn remove_lobby_from_all_queues(&mut self, lobby: &QueuedLobby) -> Result<()> {
+        // Build a single atomic transaction to remove from all queues
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // For each game type the lobby was queued for, remove it from that queue
+        for game_type in &lobby.game_types {
+            let lobby_queue_key = self.redis_keys.matchmaking_lobby_queue(game_type, &lobby.queue_mode);
+            let lobby_mmr_key = self.redis_keys.matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
+
+            // We need to find the exact JSON string to remove
+            // Since the lobby JSON is stored in Redis, we'll fetch and match
+            let members: Vec<String> = self.conn.zrange(&lobby_queue_key, 0, -1).await?;
+
+            for member_json in members {
+                if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
+                    if queued_lobby.lobby_id == lobby.lobby_id {
+                        // Remove from both sorted sets using the same lobby JSON
+                        pipe.zrem(&lobby_queue_key, &member_json);
+                        pipe.zrem(&lobby_mmr_key, &member_json);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Execute the transaction
+        let _: () = pipe.query_async(&mut self.conn).await?;
+
+        info!(
+            "Removed lobby {} from all matchmaking queues (was queued for {:?})",
+            lobby.lobby_id, lobby.game_types
+        );
         Ok(())
     }
 

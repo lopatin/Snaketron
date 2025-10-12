@@ -4,27 +4,27 @@ import { useAuth } from '../contexts/AuthContext';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { api } from '../services/api';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
-import { UsernameStatus, GameModeId } from '../types';
+import { UsernameStatus, GameModeId, GameType } from '../types';
 
 const GAME_MODES = {
   'quick-play': {
     title: 'QUICK MATCH',
     modes: [
-      { id: 'duel', name: 'DUEL', description: '1v1 battle' },
-      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Up to 8 player brawl' }
+      { id: 'duel', name: 'DUEL', description: '1v1 battle', gameType: { TeamMatch: { per_team: 1 } } as GameType },
+      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Up to 8 player brawl', gameType: { FreeForAll: { max_players: 8 } } as GameType }
     ]
   },
   'competitive': {
     title: 'COMPETITIVE',
     modes: [
-      { id: 'ranked-duel', name: 'RANKED DUEL', description: 'Competitive 1v1' },
-      { id: 'ranked-team', name: 'RANKED TEAM', description: 'Team battles' }
+      { id: 'ranked-duel', name: 'RANKED DUEL', description: 'Competitive 1v1', gameType: { TeamMatch: { per_team: 1 } } as GameType },
+      { id: 'ranked-team', name: 'RANKED TEAM', description: 'Team battles', gameType: { TeamMatch: { per_team: 2 } } as GameType }
     ]
   },
   'solo': {
     title: 'SOLO',
     modes: [
-      { id: 'solo', name: 'SINGLE PLAYER', description: 'Practice your skills' }
+      { id: 'solo', name: 'SINGLE PLAYER', description: 'Practice your skills', gameType: 'Solo' as GameType }
     ]
   }
 };
@@ -42,7 +42,8 @@ function GameModeSelector() {
   const [checkingUsername, setCheckingUsername] = useState(false);
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>(null);
   const [requiresPassword, setRequiresPassword] = useState(false);
-  
+  const [selectedModes, setSelectedModes] = useState<Set<string>>(new Set());
+
   const debouncedUsername = useDebouncedValue(username, 500);
 
   const gameModeConfig = category ? GAME_MODES[category as keyof typeof GAME_MODES] : undefined;
@@ -91,7 +92,20 @@ function GameModeSelector() {
     }
   }, [debouncedUsername]);
 
-  const handleGameModeClick = async (modeId: string) => {
+  const handleGameModeClick = (modeId: string) => {
+    // Toggle selection
+    setSelectedModes((prev) => {
+      const newSelection = new Set(prev);
+      if (newSelection.has(modeId)) {
+        newSelection.delete(modeId);
+      } else {
+        newSelection.add(modeId);
+      }
+      return newSelection;
+    });
+  };
+
+  const handleStartQueue = async () => {
     if (!username || username.length < 3) {
       setAuthError('Please enter a username (at least 3 characters)');
       return;
@@ -99,6 +113,11 @@ function GameModeSelector() {
 
     if (!isConnected) {
       setAuthError('Not connected to game server');
+      return;
+    }
+
+    if (selectedModes.size === 0) {
+      setAuthError('Please select at least one game mode');
       return;
     }
 
@@ -110,7 +129,7 @@ function GameModeSelector() {
       if (!user) {
         // Check if username exists
         const checkData = await api.checkUsername(username);
-        
+
         if (!checkData.available && checkData.requiresPassword && !password) {
           setAuthError('This username requires a password');
           setIsAuthenticating(false);
@@ -123,46 +142,40 @@ function GameModeSelector() {
         } else {
           await register(username, password || null);
         }
-        
+
         // Save username for next time
         localStorage.setItem('savedUsername', username);
-        
+
         // Wait a bit for the JWT token to be sent to WebSocket
         await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      // Now create or queue for the game
-      console.log('Starting game with modeId:', modeId);
-      
-      if (modeId === 'duel') {
-        // Navigate to queue screen for duel match (1v1)
-        navigate('/queue', { 
-          state: { 
-            gameType: { TeamMatch: { per_team: 1 } },
-            autoQueue: true 
-          } 
-        });
-      } else if (modeId === 'free-for-all') {
-        // Navigate to queue screen for free-for-all
-        navigate('/queue', { 
-          state: { 
-            gameType: { FreeForAll: { max_players: 8 } },
-            autoQueue: true 
-          } 
-        });
-      } else if (modeId === 'solo') {
-        // Create solo game
-        createGame(modeId);
-        console.log('Waiting for SoloGameCreated message...');
-      } else {
-        // For other modes, use the existing createGame
-        createGame(modeId);
-        if (!modeId.startsWith('solo-')) {
-          navigate('/custom');
+      // Get game types for selected modes
+      const gameTypes: GameType[] = [];
+      if (gameModeConfig) {
+        for (const modeId of selectedModes) {
+          const mode = gameModeConfig.modes.find(m => m.id === modeId);
+          if (mode) {
+            gameTypes.push(mode.gameType);
+          }
         }
       }
+
+      // Handle solo mode separately (direct game creation)
+      if (selectedModes.has('solo')) {
+        createGame('solo');
+        console.log('Waiting for SoloGameCreated message...');
+      } else if (gameTypes.length > 0) {
+        // Navigate to queue screen with multiple game types
+        navigate('/queue', {
+          state: {
+            gameTypes: gameTypes,
+            autoQueue: true
+          }
+        });
+      }
     } catch (error) {
-      setAuthError((error as Error).message || 'Failed to start game');
+      setAuthError((error as Error).message || 'Failed to start queue');
     } finally {
       setIsAuthenticating(false);
     }
@@ -227,29 +240,44 @@ function GameModeSelector() {
           {/* Game Modes */}
           <div className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {gameModeConfig.modes.map((mode: { id: string; name: string; description: string }) => (
-                <button
-                  key={mode.id}
-                  onClick={() => handleGameModeClick(mode.id)}
-                  disabled={isAuthenticating || (!user && (!username || username.length < 3))}
-                  className={`p-6 text-left border-2 rounded-lg transition-all ${
-                    user || (username && username.length >= 3)
-                      ? 'border-black-70 hover:bg-gray-50 cursor-pointer'
-                      : 'border-gray-300 bg-gray-50 cursor-not-allowed opacity-50'
-                  }`}
-                >
-                  <h3 className="font-black italic uppercase tracking-1 text-lg mb-1">
-                    {mode.name}
-                  </h3>
-                  <p className="text-sm text-gray-600">{mode.description}</p>
-                </button>
-              ))}
+              {gameModeConfig.modes.map((mode: { id: string; name: string; description: string }) => {
+                const isSelected = selectedModes.has(mode.id);
+                const isEnabled = user || (username && username.length >= 3);
+                return (
+                  <button
+                    key={mode.id}
+                    onClick={() => handleGameModeClick(mode.id)}
+                    disabled={isAuthenticating || !isEnabled}
+                    className={`p-6 text-left border-2 rounded-lg transition-all relative ${
+                      isSelected
+                        ? 'border-black bg-gray-100'
+                        : isEnabled
+                        ? 'border-black-70 hover:bg-gray-50 cursor-pointer'
+                        : 'border-gray-300 bg-gray-50 cursor-not-allowed opacity-50'
+                    }`}
+                  >
+                    {isSelected && (
+                      <div className="absolute top-2 right-2 text-black text-xl">✓</div>
+                    )}
+                    <h3 className="font-black italic uppercase tracking-1 text-lg mb-1">
+                      {mode.name}
+                    </h3>
+                    <p className="text-sm text-gray-600">{mode.description}</p>
+                  </button>
+                );
+              })}
             </div>
-            {/*{!user && !username && (*/}
-            {/*  <p className="text-sm text-gray-600 text-center mt-4">*/}
-            {/*    Enter a username to continue*/}
-            {/*  </p>*/}
-            {/*)}*/}
+
+            {/* Start Queue Button */}
+            {selectedModes.size > 0 && (
+              <button
+                onClick={handleStartQueue}
+                disabled={isAuthenticating || (!user && (!username || username.length < 3))}
+                className="w-full mt-4 px-6 py-4 bg-black text-white font-black italic uppercase tracking-1 rounded-lg hover:bg-gray-800 transition-all disabled:bg-gray-400 disabled:cursor-not-allowed"
+              >
+                {isAuthenticating ? 'Starting...' : `Start Queue (${selectedModes.size} mode${selectedModes.size > 1 ? 's' : ''})`}
+              </button>
+            )}
           </div>
 
           {/* Back Button */}

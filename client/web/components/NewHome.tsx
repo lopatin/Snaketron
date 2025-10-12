@@ -90,7 +90,7 @@ export const NewHome: React.FC = () => {
   };
 
   const handleStartGame = async (
-    gameMode: 'duel' | '2v2' | 'solo' | 'ffa',
+    gameModes: Array<'duel' | '2v2' | 'solo' | 'ffa'>,
     nickname: string,
     isCompetitive: boolean
   ) => {
@@ -110,31 +110,26 @@ export const NewHome: React.FC = () => {
       // Wait for auth to propagate
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Start game based on mode
-      if (gameMode === 'solo') {
-        createGame('solo');
-      } else if (gameMode === 'duel') {
-        navigate('/queue', {
-          state: {
-            gameType: { TeamMatch: { per_team: 1 } },
-            autoQueue: true
-          }
-        });
-      } else if (gameMode === 'ffa') {
-        navigate('/queue', {
-          state: {
-            gameType: { FreeForAll: { max_players: 8 } },
-            autoQueue: true
-          }
-        });
-      } else if (gameMode === '2v2') {
-        navigate('/queue', {
-          state: {
-            gameType: { TeamMatch: { per_team: 2 } },
-            autoQueue: true
-          }
-        });
-      }
+      // Convert game modes to GameType format
+      const gameTypes = gameModes.map(mode => {
+        if (mode === 'duel') {
+          return { TeamMatch: { per_team: 1 } };
+        } else if (mode === '2v2') {
+          return { TeamMatch: { per_team: 2 } };
+        } else if (mode === 'ffa') {
+          return { FreeForAll: { max_players: 8 } };
+        } else {
+          return 'Solo';
+        }
+      });
+
+      // Navigate to queue with all selected game types
+      navigate('/queue', {
+        state: {
+          gameTypes: gameTypes,
+          autoQueue: true
+        }
+      });
     } catch (error) {
       console.error('Failed to start game:', error);
     } finally {

@@ -186,6 +186,13 @@ export interface QueueForMatchMessage {
   };
 }
 
+export interface QueueForMatchMultiMessage {
+  QueueForMatchMulti: {
+    game_types: GameType[];
+    queue_mode: QueueMode;
+  };
+}
+
 export type CreateSoloGameMessage = 'CreateSoloGame';
 
 export interface GameCommandMessage {
@@ -196,11 +203,12 @@ export interface TokenMessage {
   Token: string;
 }
 
-export type WebSocketMessage = 
+export type WebSocketMessage =
   | CreateCustomGameMessage
   | JoinCustomGameMessage
   | JoinGameMessage
   | QueueForMatchMessage
+  | QueueForMatchMultiMessage
   | CreateSoloGameMessage
   | GameCommandMessage
   | TokenMessage
