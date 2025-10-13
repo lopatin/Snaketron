@@ -47,22 +47,40 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   const login = useCallback(async (username: string, password: string) => {
     try {
+      // If currently logged in as a guest, clear the guest session first
+      if (user?.isGuest) {
+        console.log('Logging out guest user before full login');
+        api.setAuthToken(null);
+        setUser(null);
+        // Wait a brief moment for state to settle
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
       const data = await api.login(username, password);
       setUser(data.user);
     } catch (err) {
       throw err;
     }
-  }, []);
+  }, [user]);
 
   const register = useCallback(async (username: string, password: string | null) => {
     try {
+      // If currently logged in as a guest, clear the guest session first
+      if (user?.isGuest) {
+        console.log('Logging out guest user before registration');
+        api.setAuthToken(null);
+        setUser(null);
+        // Wait a brief moment for state to settle
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
       // Support guest registration (no password)
       const data = await api.register(username, password || '');
       setUser(data.user);
     } catch (err) {
       throw err;
     }
-  }, []);
+  }, [user]);
 
   const createGuest = useCallback(async (nickname: string) => {
     try {

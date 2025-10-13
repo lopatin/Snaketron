@@ -37,6 +37,7 @@ export interface WebSocketContextType {
   sendMessage: (message: any) => void;
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
+  disconnect: () => void;
   connectToRegion: (wsUrl: string) => void;
   currentRegionUrl: string | null;
   latencyMs: number;

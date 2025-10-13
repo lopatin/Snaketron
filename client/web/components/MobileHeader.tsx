@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { RegionSelector } from './RegionSelector';
-import { Region } from '../types';
+import { Region, User } from '../types';
 
 interface MobileHeaderProps {
   regions: Region[];
   currentRegionId: string;
   onRegionChange: (regionId: string) => void;
-  currentUsername?: string;
+  currentUser?: User | null;
   onLoginClick: () => void;
   lobbyUsers: string[];
   onInvite?: () => void;
@@ -17,7 +17,7 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
   regions,
   currentRegionId,
   onRegionChange,
-  currentUsername,
+  currentUser,
   onLoginClick,
   lobbyUsers,
   onInvite
@@ -45,9 +45,9 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
           </Link>
 
           {/* User/Login */}
-          {currentUsername ? (
+          {currentUser && !currentUser.isGuest ? (
             <span className="text-sm text-black-70 font-bold uppercase">
-              {currentUsername}
+              {currentUser.username}
             </span>
           ) : (
             <button
@@ -119,7 +119,7 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
                 <h3 className="text-xs font-black uppercase tracking-1 text-black-70 mb-3 text-right">
                   Lobby
                 </h3>
-                {lobbyUsers.length === 0 || (lobbyUsers.length === 1 && lobbyUsers[0] === currentUsername) ? (
+                {lobbyUsers.length === 0 || (lobbyUsers.length === 1 && lobbyUsers[0] === currentUser?.username) ? (
                   <button
                     onClick={onInvite}
                     className="px-4 py-2 text-xs border border-black-70 rounded font-bold uppercase bg-white text-black-70 hover:bg-gray-50 transition-colors cursor-pointer"
@@ -134,7 +134,7 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
                         key={index}
                         className="text-sm text-black-70 flex items-center gap-2"
                       >
-                        <span className={username === currentUsername ? 'font-bold' : ''}>
+                        <span className={username === currentUser?.username ? 'font-bold' : ''}>
                           {username}
                         </span>
                         <div className="w-2 h-2 rounded-full bg-green-500" />

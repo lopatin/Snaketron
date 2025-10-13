@@ -16,9 +16,26 @@ import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 
 function AppContent() {
-  const { sendMessage, isConnected } = useWebSocket();
+  const { sendMessage, isConnected, disconnect } = useWebSocket();
   const { user, getToken } = useAuth();
   const tokenSentRef = useRef<boolean>(false);
+  const previousUserRef = useRef<typeof user>(null);
+
+  // Detect guest-to-full-user transition and reconnect WebSocket
+  useEffect(() => {
+    const wasGuest = previousUserRef.current?.isGuest;
+    const isNowFullUser = user && !user.isGuest;
+
+    if (wasGuest && isNowFullUser) {
+      console.log('Guest transitioned to full user, reconnecting WebSocket');
+      // Disconnect existing WebSocket to force reconnection with new token
+      disconnect();
+      tokenSentRef.current = false;
+    }
+
+    // Update previous user reference
+    previousUserRef.current = user;
+  }, [user, disconnect]);
 
   // Send authentication token when WebSocket connects
   useEffect(() => {

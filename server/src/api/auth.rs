@@ -12,6 +12,7 @@ use tracing::{error, info};
 use crate::db::Database;
 
 use super::jwt::JwtManager;
+use super::middleware::AuthUser;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -42,6 +43,8 @@ pub struct UserInfo {
     pub id: i32,
     pub username: String,
     pub mmr: i32,
+    #[serde(rename = "isGuest")]
+    pub is_guest: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +74,7 @@ pub struct GuestUserInfo {
     pub id: i32,
     pub username: String,
     pub mmr: i32,
+    #[serde(rename = "isGuest")]
     pub is_guest: bool,
 }
 
@@ -171,6 +175,7 @@ pub async fn register(
         id: user.id,
         username: user.username,
         mmr: user.mmr,
+        is_guest: false,
     };
 
     // Generate JWT token
@@ -215,6 +220,7 @@ pub async fn login(
         id: user.id,
         username: user.username,
         mmr: user.mmr,
+        is_guest: false,
     };
 
     // Generate JWT token
@@ -241,15 +247,16 @@ pub async fn login(
 
 pub async fn get_current_user(
     State(state): State<AuthState>,
-    Extension(user_id): Extension<i32>, // This will be extracted from JWT by middleware
+    Extension(auth_user): Extension<AuthUser>, // Extract AuthUser from JWT by middleware
 ) -> Result<Response, AppError> {
-    let user = state.db.get_user_by_id(user_id).await?
+    let user = state.db.get_user_by_id(auth_user.user_id).await?
         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
     let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
+        is_guest: auth_user.is_guest,
     };
 
     // Build response with cache-control headers to prevent caching

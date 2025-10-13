@@ -10,6 +10,13 @@ use std::sync::Arc;
 
 use super::jwt::JwtManager;
 
+/// Authenticated user information extracted from JWT token
+#[derive(Clone, Debug)]
+pub struct AuthUser {
+    pub user_id: i32,
+    pub is_guest: bool,
+}
+
 pub async fn auth_middleware(
     State(jwt_manager): State<Arc<JwtManager>>,
     mut request: Request,
@@ -37,8 +44,12 @@ pub async fn auth_middleware(
         Ok(claims) => {
             // Parse user_id from claims
             if let Ok(user_id) = claims.sub.parse::<i32>() {
-                // Insert user_id into request extensions
-                request.extensions_mut().insert(user_id);
+                // Insert AuthUser (with both user_id and is_guest) into request extensions
+                let auth_user = AuthUser {
+                    user_id,
+                    is_guest: claims.is_guest,
+                };
+                request.extensions_mut().insert(auth_user);
                 Ok(next.run(request).await)
             } else {
                 Ok((

@@ -26,13 +26,16 @@ function Auth() {
   const debouncedUsername = useDebouncedValue(username, 500);
   const action = searchParams.get('action');
 
-  // Load saved username on mount
+  // Load saved username on mount, or use guest username if available
   useEffect(() => {
     const savedUsername = localStorage.getItem('savedUsername');
     if (savedUsername) {
       setUsername(savedUsername);
+    } else if (user?.isGuest && user.username) {
+      // Pre-fill with guest username to make conversion easier
+      setUsername(user.username);
     }
-  }, []);
+  }, [user]);
   
   // Check username availability when it changes
   useEffect(() => {
@@ -127,11 +130,11 @@ function Auth() {
     setAuthError(null);
 
     try {
-      // First, authenticate the user if not already authenticated
-      if (!user) {
+      // First, authenticate the user if not already authenticated (or if they're a guest)
+      if (!user || user.isGuest) {
         // Check if username exists
         const checkData = await api.checkUsername(username);
-        
+
         if (!checkData.available && checkData.requiresPassword && !password) {
           setAuthError('This username requires a password');
           setIsAuthenticating(false);
@@ -144,10 +147,10 @@ function Auth() {
         } else {
           await register(username, password || null);
         }
-        
+
         // Save username for next time
         localStorage.setItem('savedUsername', username);
-        
+
         // Wait a bit for the JWT token to be sent to WebSocket
         await new Promise(resolve => setTimeout(resolve, 500));
       }
@@ -189,9 +192,10 @@ function Auth() {
     }
   };
 
-  // If already authenticated on mount, perform the action
+  // If already authenticated as a full user on mount, perform the action
+  // Guests should see the login form to convert to full accounts
   useEffect(() => {
-    if (user && !isProcessingAction && !waitingForGameId) {
+    if (user && !user.isGuest && !isProcessingAction && !waitingForGameId) {
       handleSubmit();
     }
   }, [user]);
@@ -209,10 +213,22 @@ function Auth() {
     <div className="flex-1 p-8">
       <div className="max-w-md mx-auto">
         <h1 className="panel-heading mb-6">{getTitle()}</h1>
-        
+
         <div className="panel p-6">
-          {!user ? (
+          {!user || user.isGuest ? (
             <>
+              {/* Guest Indicator */}
+              {user?.isGuest && (
+                <div className="mb-4 p-3 bg-blue-50 border-2 border-blue-200 rounded">
+                  <p className="text-sm text-blue-800">
+                    Currently playing as guest: <strong>{user.username}</strong>
+                  </p>
+                  <p className="text-xs text-blue-600 mt-1">
+                    Log in to access more features such as competitive play.
+                  </p>
+                </div>
+              )}
+
               {/* Username Input */}
               <div className="space-y-2">
                 <input

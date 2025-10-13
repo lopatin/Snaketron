@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 
 type GameMode = 'duel' | '2v2' | 'solo' | 'ffa';
 
@@ -6,22 +7,37 @@ interface GameStartFormProps {
   onStartGame: (gameModes: GameMode[], nickname: string, isCompetitive: boolean) => void;
   currentUsername?: string;
   isLoading?: boolean;
+  isAuthenticated?: boolean;
 }
 
 export const GameStartForm: React.FC<GameStartFormProps> = ({
   onStartGame,
   currentUsername,
-  isLoading = false
+  isLoading = false,
+  isAuthenticated = false
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
+  const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
   const [selectedModes, setSelectedModes] = useState<Set<GameMode>>(new Set(['duel']));
   const [isCompetitive, setIsCompetitive] = useState(false);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
+
+  // Debounce nickname validation to avoid showing errors while typing
+  const debouncedNickname = useDebouncedValue(nickname, 500);
+  const showNicknameError = debouncedNickname.length > 0 && debouncedNickname.length < 3;
 
   // Auto-focus on nickname field when component mounts
   useEffect(() => {
     nicknameInputRef.current?.focus();
   }, []);
+
+  // Sync nickname with currentUsername when it changes (for guest users)
+  useEffect(() => {
+    if (currentUsername && !nickname && !hasAutoSetNickname) {
+      setHasAutoSetNickname(true);
+      setNickname(currentUsername);
+    }
+  }, [currentUsername, nickname, hasAutoSetNickname]);
 
   const gameModes: Array<{ id: GameMode; label: string }> = [
     { id: 'duel', label: 'DUEL' },
@@ -60,21 +76,33 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
       <div className="p-8">
         {/* Nickname Input */}
-        <div className="mb-8">
+        <div className="mb-8 relative">
           <input
             ref={nicknameInputRef}
             type="text"
             value={nickname}
             onChange={(e) => setNickname(e.target.value)}
             placeholder="Nickname"
-            className="w-full px-4 py-3 text-base border-2 border-gray-300 rounded-lg focus:outline-none focus:border-blue-500 transition-colors"
-            disabled={isLoading}
+            className={`w-full px-4 py-3 text-base border-2 rounded-lg transition-colors ${
+              isAuthenticated
+                ? 'border-gray-300 bg-white cursor-default'
+                : 'border-gray-300 focus:outline-none focus:border-blue-500'
+            }`}
+            disabled={isLoading || isAuthenticated}
             minLength={3}
             required
+            readOnly={isAuthenticated}
           />
-          {nickname.length > 0 && nickname.length < 3 && (
-            <p className="text-xs text-red-600 mt-1">Nickname must be at least 3 characters</p>
-          )}
+          {/* Error message with absolute positioning and fade animation */}
+          <div className={`
+            absolute left-0 right-0 top-[calc(100%+4px)]
+            transition-opacity duration-200
+            ${showNicknameError ? 'opacity-100' : 'opacity-0 pointer-events-none'}
+          `}>
+            <p className="text-[11px] text-red-600">
+              Nickname must be at least 3 characters
+            </p>
+          </div>
         </div>
 
         {/* Game Mode Selector */}

@@ -396,6 +396,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     sendMessage,
     onMessage,
     connect,
+    disconnect,
     connectToRegion,
     currentRegionUrl,
     latencyMs,
