@@ -757,13 +757,27 @@ impl GameState {
                 } else {
                     (0, self.arena.width as i16 - 1)
                 };
-                
-                let x_range = (x_max - x_min + 1) as u16;
-                let position = Position {
-                    x: x_min + (rng.next_u16() % x_range) as i16,
-                    y: (rng.next_u16() % self.arena.height) as i16,
-                };
-                
+
+                // Calculate center and standard deviation for normal distribution
+                let x_center = (x_min + x_max) as f32 / 2.0;
+                let y_center = (self.arena.height as f32) / 2.0;
+
+                // Use std_dev = range/6 so 99.7% of values fall within bounds (3-sigma rule)
+                let x_range = (x_max - x_min + 1) as f32;
+                let y_range = self.arena.height as f32;
+                let x_std_dev = x_range / 6.0;
+                let y_std_dev = y_range / 6.0;
+
+                // Generate normally distributed position centered in the arena
+                let x_normal = rng.next_normal(x_center, x_std_dev);
+                let y_normal = rng.next_normal(y_center, y_std_dev);
+
+                // Clamp to ensure within bounds
+                let x = (x_normal.round() as i16).clamp(x_min, x_max);
+                let y = (y_normal.round() as i16).clamp(0, self.arena.height as i16 - 1);
+
+                let position = Position { x, y };
+
                 // Check if position is valid (not occupied by food or snake)
                 if !self.arena.food.contains(&position) &&
                     !self.arena.snakes.iter().any(|s| s.is_alive && s.contains_point(&position, false)) {
@@ -883,11 +897,25 @@ impl GameState {
                     (0, self.arena.width as i16 - 1)
                 };
 
-                let x_range = (x_max - x_min + 1) as u16;
-                let position = Position {
-                    x: x_min + (rng.next_u16() % x_range) as i16,
-                    y: (rng.next_u16() % self.arena.height) as i16,
-                };
+                // Calculate center and standard deviation for normal distribution
+                let x_center = (x_min + x_max) as f32 / 2.0;
+                let y_center = (self.arena.height as f32) / 2.0;
+
+                // Use std_dev = range/6 so 99.7% of values fall within bounds (3-sigma rule)
+                let x_range = (x_max - x_min + 1) as f32;
+                let y_range = self.arena.height as f32;
+                let x_std_dev = x_range / 6.0;
+                let y_std_dev = y_range / 6.0;
+
+                // Generate normally distributed position centered in the arena
+                let x_normal = rng.next_normal(x_center, x_std_dev);
+                let y_normal = rng.next_normal(y_center, y_std_dev);
+
+                // Clamp to ensure within bounds
+                let x = (x_normal.round() as i16).clamp(x_min, x_max);
+                let y = (y_normal.round() as i16).clamp(0, self.arena.height as i16 - 1);
+
+                let position = Position { x, y };
 
                 if !self.arena.food.contains(&position) &&
                     !self.arena.snakes.iter().any(|s| s.is_alive && s.contains_point(&position, false)) {
@@ -1391,7 +1419,7 @@ impl GameState {
                 let removed = self.remove_food(&position);
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     if removed {
-                        snake.food += 1;
+                        snake.food += 2;  // Each food now adds 2 segments instead of 1
                     }
                 }
             }
