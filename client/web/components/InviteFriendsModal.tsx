@@ -48,14 +48,14 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     <div
       className="fixed inset-0 flex items-center justify-center p-4 z-50"
       onClick={onClose}
-      style={{ backgroundColor: 'rgba(255, 255, 255, 0.7)' }}
+      style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)' }}
     >
       <div
         className="bg-white rounded-lg p-8 w-full max-w-lg"
         onClick={(e) => e.stopPropagation()}
         style={{
-          border: '2px solid rgba(0, 0, 0, 0.2)',
-          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
+          border: '2px solid rgba(0, 0, 0, 0.65)',
+          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.2)'
         }}
       >
         <div className="text-center mb-6">
