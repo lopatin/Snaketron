@@ -26,13 +26,13 @@ services:
       - snaketron-network
 
   redis:
-    image: redis:7-alpine
-    container_name: snaketron-redis
+    image: valkey/valkey:latest
+    container_name: snaketron-valkey
     ports:
       - "6379:6379"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -85,4 +85,4 @@ networks:
     driver: bridge
 
 volumes:
-  redis-data:
+  valkey-data:

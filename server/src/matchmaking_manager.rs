@@ -441,7 +441,7 @@ impl MatchmakingManager {
             process_lobby(member_json);
         }
 
-        info!(
+        debug!(
             "Fetched {} unique lobbies from strategic sampling (game_type: {:?}, queue_mode: {:?})",
             unique_lobbies.len(),
             game_type,
