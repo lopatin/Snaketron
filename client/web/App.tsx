@@ -9,6 +9,7 @@ import Queue from './components/Queue';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
+import LobbyInvitePage from './components/LobbyInvitePage';
 import { NewHome } from './components/NewHome';
 import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -78,6 +79,7 @@ function AppContent() {
         <Route path="/auth" element={<Auth />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
         <Route path="/custom" element={<CustomGameCreator />} />
+        <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />
         <Route path="/game/:gameCode" element={
           <ProtectedRoute>
             <GameLobby />

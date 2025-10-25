@@ -1,26 +1,23 @@
 # CODEX.md
 
-This file guides ChatGPT/Codex when working on the SnakeTron repository. The intent is to mirror the context provided to Claude while highlighting the conventions and tooling expectations for this environment.
+This file guides ChatGPT/Codex when working on the Snaketron repository. The intent is to mirror the context provided to Claude while highlighting the conventions and tooling expectations for this environment.
 
 ## Architecture Snapshot
 - **common/**: Shared Rust crate containing the game engine (`GameEngine`, `GameState`, `Snake`, `Arena`). Compiles to both native code and WASM for client-side prediction with server authority.
-- **server/**: Tokio-based authoritative server exposing WebSocket endpoints for players and gRPC for intra-cluster communication. Relies on Redis for coordination and PostgreSQL for persistence. Designed for horizontal scaling where the WebSocket host and game loop host can differ.
+- **server/**: Tokio-based authoritative server exposing WebSocket endpoints for players and Redis/Valkey for intra-cluster communication. Relies on Valkey for coordination and DynamoDB for persistence. Designed for horizontal scaling where the WebSocket host and game loop host can differ.
 - **client/**: Rust-to-WASM core plus a React/TypeScript frontend. Uses canvas rendering and consumes WASM bindings.
 - **_old/**: Legacy code; ignore for all tasks.
 
 Key architectural decisions:
 - Service discovery and health: servers self-register in the DB and emit heartbeats.
-- Real-time links: WebSocket for clients; gRPC streaming for server-to-server messaging.
-- Cluster coordination: Redis-backed singleton management for matchmaking and load distribution.
+- Real-time links: WebSocket for clients; Valkey pub/sub for server-to-server.
+- Cluster coordination: Valkey-backed singleton management for matchmaking and load distribution.
 - Game logic parity: the `common` crate ensures server and client stay in sync.
-- Database schema: tables for servers, users, games, and matchmaking with performance-focused indexing.
 - Containerization: Docker workflows for both development and production (AWS Fargate target).
 
 ## Working Agreements
 - Respect the compressed snake representation in `common/src/snake.rs::step_forward`. Straight snakes of length *n* store only head, turns, tail.
-- When editing migrations, update the existing V1 migration rather than adding new files. Restart/clear the DB container before tests if needed.
 - Never touch `_old/`.
-- Assume Postgres, Redis, and other infra components are accessed via Docker unless the task explicitly states otherwise.
 
 ## Recommended Commands
 ### Docker
