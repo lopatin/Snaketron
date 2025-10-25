@@ -2,6 +2,12 @@ import React, { createContext, useContext, useState, useEffect, useRef, useCallb
 import { WebSocketContextType, Lobby, LobbyMember } from '../types';
 import { clockSync } from '../utils/clockSync';
 import { useLatency } from './LatencyContext';
+import {
+  detectBestRegion,
+  fetchRegionMetadata,
+  loadRegionPreference,
+  saveRegionPreference,
+} from '../utils/regionPreference';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -42,6 +48,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const pingTimeout = useRef<NodeJS.Timeout | null>(null);
   const pingSentTime = useRef<number | null>(null);
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
+  const isInitializingRef = useRef(false);
   const { settings: latencySettings } = useLatency();
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
@@ -127,36 +134,55 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         // Apply artificial receive delay if enabled
         const processMessage = () => {
           try {
-            const message = JSON.parse(event.data);
-            console.log('WebSocket message received:', message);
+            const rawMessage = JSON.parse(event.data);
+            console.log('WebSocket message received:', rawMessage);
 
-          // Handle Pong response for latency measurement
-          if (message === 'Pong' && pingSentTime.current !== null) {
-            const latency = Math.round((Date.now() - pingSentTime.current) / 2);
-            setLatencyMs(latency);
-            console.log('WebSocket latency:', latency, 'ms');
-            pingSentTime.current = null;
-          } else if (message.ClockSyncResponse) {
-            // Handle clock sync response
-            const { client_time, server_time } = message.ClockSyncResponse;
-            const t1 = syncRequestTimes.current.get(client_time);
-            if (t1) {
-              syncRequestTimes.current.delete(client_time);
-              const t3 = Date.now();
-              clockSync.processSyncResponse(t1, server_time, t3);
-              // Update latency with clock sync RTT as well
-              const rtt = t3 - t1;
-              setLatencyMs(Math.round(rtt / 2));
+            // Handle Pong response for latency measurement
+            if (rawMessage === 'Pong' && pingSentTime.current !== null) {
+              const latency = Math.round((Date.now() - pingSentTime.current) / 2);
+              setLatencyMs(latency);
+              console.log('WebSocket latency:', latency, 'ms');
+              pingSentTime.current = null;
+              return;
             }
-          } else {
-            // Extract message type from enum-style format
-            const messageType = Object.keys(message)[0];
-            const messageData = message[messageType];
 
-            // Call registered handlers for this message type
-            const handlers = messageHandlers.current.get(messageType) || [];
-            handlers.forEach((handler: MessageHandler) => handler({type: messageType, data: messageData}));
-          }
+            // Handle clock sync response payloads
+            if (rawMessage?.ClockSyncResponse) {
+              const { client_time, server_time } = rawMessage.ClockSyncResponse;
+              const t1 = syncRequestTimes.current.get(client_time);
+              if (t1) {
+                syncRequestTimes.current.delete(client_time);
+                const t3 = Date.now();
+                clockSync.processSyncResponse(t1, server_time, t3);
+                // Update latency with clock sync RTT as well
+                const rtt = t3 - t1;
+                setLatencyMs(Math.round(rtt / 2));
+              }
+              return;
+            }
+
+            let messageType: string | null = null;
+            let messageData: any = undefined;
+
+            if (typeof rawMessage === 'string') {
+              messageType = rawMessage;
+              messageData = null;
+            } else if (rawMessage && typeof rawMessage === 'object') {
+              const keys = Object.keys(rawMessage);
+              if (keys.length === 1) {
+                messageType = keys[0];
+                messageData = rawMessage[messageType];
+              }
+            }
+
+            if (!messageType) {
+              console.warn('Unexpected WebSocket message shape', rawMessage);
+              return;
+            }
+
+            const resolvedType = messageType as string;
+            const handlers = messageHandlers.current.get(resolvedType) || [];
+            handlers.forEach((handler: MessageHandler) => handler({ type: resolvedType, data: messageData }));
           } catch (error) {
             console.error('Failed to parse WebSocket message:', error);
           }
@@ -189,7 +215,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
-  const connectToRegion = useCallback((wsUrl: string) => {
+  const connectToRegion = useCallback((wsUrl: string, options?: { regionId?: string; origin?: string }) => {
     console.log('Switching to region:', wsUrl);
 
     // Disconnect existing connection
@@ -203,6 +229,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (reconnectTimeout.current) {
       clearTimeout(reconnectTimeout.current);
       reconnectTimeout.current = null;
+    }
+
+    if (options?.regionId) {
+      saveRegionPreference({
+        regionId: options.regionId,
+        wsUrl,
+        origin: options.origin,
+        timestamp: Date.now(),
+      });
     }
 
     // Connect to new region
@@ -244,6 +279,80 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
     };
   }, []);
+
+  // Auto-connect to the preferred or closest region on mount
+  useEffect(() => {
+    let cancelled = false;
+
+    const ensureConnected = async () => {
+      if (typeof window === 'undefined') {
+        return;
+      }
+
+      if (ws.current && (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      if (isInitializingRef.current) {
+        return;
+      }
+
+      isInitializingRef.current = true;
+
+      try {
+        const storedPreference = loadRegionPreference();
+        if (storedPreference?.regionId) {
+          if (storedPreference.wsUrl) {
+            if (!cancelled) {
+              connectToRegion(storedPreference.wsUrl, {
+                regionId: storedPreference.regionId,
+                origin: storedPreference.origin,
+              });
+            }
+            return;
+          }
+
+          try {
+            const metadata = await fetchRegionMetadata();
+            const matched = metadata.find(region => region.id === storedPreference.regionId);
+            if (matched && !cancelled) {
+              const repairedPreference = {
+                regionId: matched.id,
+                wsUrl: matched.ws_url,
+                origin: matched.origin,
+                timestamp: Date.now(),
+              };
+              saveRegionPreference(repairedPreference);
+              connectToRegion(repairedPreference.wsUrl, {
+                regionId: repairedPreference.regionId,
+                origin: repairedPreference.origin,
+              });
+              return;
+            }
+          } catch (error) {
+            console.error('Failed to repair legacy region preference:', error);
+          }
+        }
+
+        const detected = await detectBestRegion();
+        if (detected && !cancelled) {
+          saveRegionPreference(detected.preference);
+          connectToRegion(detected.preference.wsUrl!, {
+            regionId: detected.preference.regionId,
+            origin: detected.preference.origin,
+          });
+        }
+      } finally {
+        isInitializingRef.current = false;
+      }
+    };
+
+    ensureConnected();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connectToRegion]);
 
   // Lobby methods
   const createLobby = useCallback(async () => {
@@ -316,7 +425,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         cleanupMismatch();
 
         // Reconnect to the correct region
-        connectToRegion(ws_url);
+        connectToRegion(ws_url, { regionId: target_region });
 
         // After reconnecting, retry joining
         // This will be handled by the onConnect callback

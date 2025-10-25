@@ -38,7 +38,7 @@ export interface WebSocketContextType {
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
   disconnect: () => void;
-  connectToRegion: (wsUrl: string) => void;
+  connectToRegion: (wsUrl: string, options?: { regionId?: string; origin?: string }) => void;
   currentRegionUrl: string | null;
   latencyMs: number;
 
@@ -343,6 +343,8 @@ export interface RegionMetadata {
 // localStorage schema for region preference
 export interface RegionPreference {
   regionId: string;
+  wsUrl?: string;
+  origin?: string;
   timestamp: number;
 }
 

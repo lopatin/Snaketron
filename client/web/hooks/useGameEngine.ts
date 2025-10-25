@@ -220,7 +220,7 @@ export const useGameEngine = ({
   }, [playerId, onCommandReady]);
 
   // Process server event for reconciliation
-  const processServerEvent = useCallback((eventMessage: any) => {
+  const processServerEvent = useCallback(async (eventMessage: any) => {
     try {
       // Check if it's just an event or a full event message
       let fullEventMessage = eventMessage;
@@ -238,6 +238,29 @@ export const useGameEngine = ({
       }
       
       const event = fullEventMessage.event || fullEventMessage;
+
+      // Ensure WASM runtime is ready before using the game client
+      if (typeof window !== 'undefined') {
+        if (!window.wasm || !window.wasm.GameClient) {
+          if (window.wasmReady) {
+            try {
+              await window.wasmReady;
+            } catch (initError) {
+              console.error('WASM initialization failed, cannot process server event:', initError);
+              return;
+            }
+          }
+        }
+
+        if (!window.wasm || !window.wasm.GameClient) {
+          console.warn('WASM runtime unavailable, skipping server event processing');
+          return;
+        }
+      } else {
+        console.warn('Window object is not available; skipping server event');
+        return;
+      }
+
       if (event.Snapshot && event.Snapshot.game_state) {
         // Initialize the game engine
         if (!engineRef.current) {
