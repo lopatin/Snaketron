@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { WebSocketContextType, Lobby, LobbyMember } from '../types';
+import { WebSocketContextType, Lobby, LobbyMember, ChatMessage, ChatScope } from '../types';
 import { clockSync } from '../utils/clockSync';
 import { useLatency } from './LatencyContext';
 import {
@@ -28,6 +28,7 @@ declare global {
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
 const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
+const MAX_CHAT_HISTORY = 200;
 
 interface StoredLobbyInfo {
   code: string;
@@ -48,6 +49,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [currentRegionUrl, setCurrentRegionUrl] = useState<string | null>(null);
   const [currentLobby, setCurrentLobby] = useState<Lobby | null>(null);
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
+  const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
+  const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
   const ws = useRef<WebSocket | null>(null);
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
@@ -59,6 +62,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
   const hasLoadedStoredLobbyRef = useRef(false);
   const restoreInProgressRef = useRef(false);
+  const lobbyChatLobbyIdRef = useRef<number | null>(null);
+  const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
 
   useEffect(() => {
@@ -337,6 +342,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       doSend();
     }
   }, [latencySettings]);
+
+  const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    console.log(`Sending ${scope} chat message`, trimmed);
+    sendMessage({ Chat: trimmed });
+  }, [sendMessage]);
 
   const onMessage = useCallback((messageType: string, handler: MessageHandler) => {
     if (!messageHandlers.current.has(messageType)) {
@@ -634,6 +649,139 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
   }, [onMessage, sendMessage, clearPersistedLobby]);
 
+  useEffect(() => {
+    const cleanup = onMessage('LobbyChatMessage', (message: any) => {
+      const payload = message?.data ?? message?.LobbyChatMessage ?? message;
+      if (!payload || typeof payload.message !== 'string') {
+        return;
+      }
+
+      const lobbyId =
+        typeof payload.lobby_id === 'number'
+          ? payload.lobby_id
+          : typeof payload.lobby_id === 'string'
+            ? parseInt(payload.lobby_id, 10)
+            : undefined;
+      const timestampMs =
+        typeof payload.timestamp_ms === 'number'
+          ? payload.timestamp_ms
+          : Date.now();
+      const rawUsername =
+        typeof payload.username === 'string' && payload.username.trim()
+          ? payload.username.trim()
+          : null;
+      const rawUserId =
+        typeof payload.user_id === 'number'
+          ? payload.user_id
+          : typeof payload.user_id === 'string'
+            ? parseInt(payload.user_id, 10)
+            : null;
+      const messageId =
+        typeof payload.message_id === 'string'
+          ? payload.message_id
+          : `${lobbyId ?? 'lobby'}-${timestampMs}-${Math.random().toString(36).slice(2, 8)}`;
+
+      const normalized: ChatMessage = {
+        id: messageId,
+        scope: 'lobby',
+        lobbyId,
+        gameId: undefined,
+        userId: Number.isFinite(rawUserId as number) ? (rawUserId as number) : null,
+        username: rawUsername,
+        message: payload.message,
+        type: rawUsername ? 'user' : 'system',
+        timestamp: new Date(timestampMs),
+      };
+
+      setLobbyChatMessages((previous) => {
+        const isNewLobby = typeof lobbyId === 'number' && lobbyChatLobbyIdRef.current !== lobbyId;
+        if (isNewLobby) {
+          lobbyChatLobbyIdRef.current = lobbyId;
+        }
+        const base = isNewLobby ? [] : previous;
+        const next = [...base, normalized];
+        if (next.length > MAX_CHAT_HISTORY) {
+          return next.slice(next.length - MAX_CHAT_HISTORY);
+        }
+        return next;
+      });
+    });
+
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('LobbyChatHistory', (message: any) => {
+      const payload = message?.data ?? message?.LobbyChatHistory ?? message;
+      if (!payload) {
+        return;
+      }
+
+      const lobbyIdRaw = payload.lobby_id;
+      const lobbyId =
+        typeof lobbyIdRaw === 'number'
+          ? lobbyIdRaw
+          : typeof lobbyIdRaw === 'string'
+            ? parseInt(lobbyIdRaw, 10)
+            : undefined;
+      const messagesArray = Array.isArray(payload.messages) ? payload.messages : [];
+
+      const normalized = messagesArray
+        .map((entry: any) => {
+          if (!entry || typeof entry.message !== 'string') {
+            return null;
+          }
+
+          const timestampMs =
+            typeof entry.timestamp_ms === 'number' ? entry.timestamp_ms : Date.now();
+          const rawUsername =
+            typeof entry.username === 'string' && entry.username.trim()
+              ? entry.username.trim()
+              : null;
+          const rawUserId =
+            typeof entry.user_id === 'number'
+              ? entry.user_id
+              : typeof entry.user_id === 'string'
+                ? parseInt(entry.user_id, 10)
+                : null;
+          const messageId =
+            typeof entry.message_id === 'string'
+              ? entry.message_id
+              : `${lobbyId ?? 'lobby'}-${timestampMs}-${Math.random().toString(36).slice(2, 8)}`;
+
+          const chatMessage: ChatMessage = {
+            id: messageId,
+            scope: 'lobby' as const,
+            lobbyId,
+            gameId: undefined,
+            userId: Number.isFinite(rawUserId as number) ? (rawUserId as number) : null,
+            username: rawUsername,
+            message: entry.message,
+            type: rawUsername ? 'user' : 'system',
+            timestamp: new Date(timestampMs),
+          };
+          return chatMessage;
+        })
+        .filter((entry): entry is ChatMessage => entry !== null)
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+      if (typeof lobbyId === 'number' && Number.isFinite(lobbyId)) {
+        lobbyChatLobbyIdRef.current = lobbyId;
+      } else {
+        lobbyChatLobbyIdRef.current = null;
+      }
+
+      setLobbyChatMessages(() => {
+        if (normalized.length > MAX_CHAT_HISTORY) {
+          return normalized.slice(normalized.length - MAX_CHAT_HISTORY);
+        }
+        return normalized;
+      });
+    });
+
+    return cleanup;
+  }, [onMessage]);
+
   // Handle lobby updates
   useEffect(() => {
     const cleanup = onMessage('LobbyUpdate', (message: any) => {
@@ -653,6 +801,226 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     return cleanup;
   }, [onMessage, currentLobby]);
+
+  useEffect(() => {
+    const lobbyId = currentLobby?.id ?? null;
+
+    if (lobbyId === null) {
+      lobbyChatLobbyIdRef.current = null;
+      setLobbyChatMessages([]);
+      return;
+    }
+
+    if (lobbyChatLobbyIdRef.current !== lobbyId) {
+      lobbyChatLobbyIdRef.current = lobbyId;
+      setLobbyChatMessages([]);
+    }
+  }, [currentLobby]);
+
+  useEffect(() => {
+    const cleanup = onMessage('GameChatHistory', (message: any) => {
+      const payload = message?.data ?? message?.GameChatHistory ?? message;
+      if (!payload) {
+        return;
+      }
+
+      const gameIdRaw = payload.game_id;
+      const gameId =
+        typeof gameIdRaw === 'number'
+          ? gameIdRaw
+          : typeof gameIdRaw === 'string'
+            ? parseInt(gameIdRaw, 10)
+            : undefined;
+      const messagesArray = Array.isArray(payload.messages) ? payload.messages : [];
+
+      const normalized = messagesArray
+        .map((entry: any) => {
+          if (!entry || typeof entry.message !== 'string') {
+            return null;
+          }
+
+          const timestampMs =
+            typeof entry.timestamp_ms === 'number' ? entry.timestamp_ms : Date.now();
+          const rawUsername =
+            typeof entry.username === 'string' && entry.username.trim()
+              ? entry.username.trim()
+              : null;
+          const rawUserId =
+            typeof entry.user_id === 'number'
+              ? entry.user_id
+              : typeof entry.user_id === 'string'
+                ? parseInt(entry.user_id, 10)
+                : null;
+          const messageId =
+            typeof entry.message_id === 'string'
+              ? entry.message_id
+              : `${gameId ?? 'game'}-${timestampMs}-${Math.random().toString(36).slice(2, 8)}`;
+
+          const chatMessage: ChatMessage = {
+            id: messageId,
+            scope: 'game' as const,
+            lobbyId: undefined,
+            gameId,
+            userId: Number.isFinite(rawUserId as number) ? (rawUserId as number) : null,
+            username: rawUsername,
+            message: entry.message,
+            type: rawUsername ? 'user' : 'system',
+            timestamp: new Date(timestampMs),
+          };
+          return chatMessage;
+        })
+        .filter((entry): entry is ChatMessage => entry !== null)
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+      if (typeof gameId === 'number' && Number.isFinite(gameId)) {
+        gameChatIdRef.current = gameId;
+      } else {
+        gameChatIdRef.current = null;
+      }
+
+      setGameChatMessages(() => {
+        if (normalized.length > MAX_CHAT_HISTORY) {
+          return normalized.slice(normalized.length - MAX_CHAT_HISTORY);
+        }
+        return normalized;
+      });
+    });
+
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('GameChatMessage', (message: any) => {
+      const payload = message?.data ?? message?.GameChatMessage ?? message;
+      if (!payload || typeof payload.message !== 'string') {
+        return;
+      }
+
+      const gameId =
+        typeof payload.game_id === 'number'
+          ? payload.game_id
+          : typeof payload.game_id === 'string'
+            ? parseInt(payload.game_id, 10)
+            : undefined;
+      const timestampMs =
+        typeof payload.timestamp_ms === 'number'
+          ? payload.timestamp_ms
+          : Date.now();
+      const rawUsername =
+        typeof payload.username === 'string' && payload.username.trim()
+          ? payload.username.trim()
+          : null;
+      const rawUserId =
+        typeof payload.user_id === 'number'
+          ? payload.user_id
+          : typeof payload.user_id === 'string'
+            ? parseInt(payload.user_id, 10)
+            : null;
+      const messageId =
+        typeof payload.message_id === 'string'
+          ? payload.message_id
+          : `${gameId ?? 'game'}-${timestampMs}-${Math.random().toString(36).slice(2, 8)}`;
+
+      const normalized: ChatMessage = {
+        id: messageId,
+        scope: 'game',
+        lobbyId: undefined,
+        gameId,
+        userId: Number.isFinite(rawUserId as number) ? (rawUserId as number) : null,
+        username: rawUsername,
+        message: payload.message,
+        type: rawUsername ? 'user' : 'system',
+        timestamp: new Date(timestampMs),
+      };
+
+      setGameChatMessages((previous) => {
+        const isNewGame = typeof gameId === 'number' && gameChatIdRef.current !== gameId;
+        if (isNewGame) {
+          gameChatIdRef.current = gameId;
+        }
+        const base = isNewGame ? [] : previous;
+        const next = [...base, normalized];
+        if (next.length > MAX_CHAT_HISTORY) {
+          return next.slice(next.length - MAX_CHAT_HISTORY);
+        }
+        return next;
+      });
+    });
+
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const resetGameChat = (gameId: number | null) => {
+      if (typeof gameId === 'number' && Number.isFinite(gameId)) {
+        gameChatIdRef.current = gameId;
+      } else {
+        gameChatIdRef.current = null;
+      }
+      setGameChatMessages([]);
+    };
+
+    const extractGameId = (raw: any): number | null => {
+      if (raw === null || raw === undefined) {
+        return null;
+      }
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return raw;
+      }
+      if (typeof raw === 'string' && raw.trim()) {
+        const parsed = parseInt(raw, 10);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+      if (typeof raw === 'object') {
+        if (typeof raw.game_id === 'number') {
+          return raw.game_id;
+        }
+        if (typeof raw.game_id === 'string') {
+          const parsed = parseInt(raw.game_id, 10);
+          return Number.isFinite(parsed) ? parsed : null;
+        }
+        if ('JoinGame' in raw) {
+          return extractGameId((raw as any).JoinGame);
+        }
+        if ('data' in raw) {
+          return extractGameId((raw as any).data);
+        }
+      }
+      return null;
+    };
+
+    const cleanupJoin = onMessage('JoinGame', (message: any) => {
+      const payload = message?.data ?? message?.JoinGame ?? message;
+      resetGameChat(extractGameId(payload));
+    });
+
+    const cleanupCustomCreated = onMessage('CustomGameCreated', (message: any) => {
+      const payload = message?.data ?? message?.CustomGameCreated ?? message;
+      resetGameChat(extractGameId(payload));
+    });
+
+    const cleanupCustomJoined = onMessage('CustomGameJoined', (message: any) => {
+      const payload = message?.data ?? message?.CustomGameJoined ?? message;
+      resetGameChat(extractGameId(payload));
+    });
+
+    const cleanupSoloCreated = onMessage('SoloGameCreated', (message: any) => {
+      const payload = message?.data ?? message?.SoloGameCreated ?? message;
+      resetGameChat(extractGameId(payload));
+    });
+
+    const cleanupSpectator = onMessage('SpectatorJoined', () => {
+      setGameChatMessages([]);
+    });
+
+    return () => {
+      cleanupJoin();
+      cleanupCustomCreated();
+      cleanupCustomJoined();
+      cleanupSoloCreated();
+      cleanupSpectator();
+    };
+  }, [onMessage]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -741,9 +1109,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     latencyMs,
     currentLobby,
     lobbyMembers,
+    lobbyChatMessages,
+    gameChatMessages,
     createLobby,
     joinLobby,
     leaveLobby,
+    sendChatMessage,
   };
 
   // Expose context for testing

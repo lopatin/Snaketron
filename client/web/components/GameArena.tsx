@@ -8,6 +8,7 @@ import { GameState, CanvasRef, ArenaRotation } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
+import { LobbyChat as ChatPanel } from './LobbyChat';
 
 export default function GameArena() {
   const { gameId } = useParams();
@@ -34,7 +35,7 @@ export default function GameArena() {
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
-  const { latencyMs } = useWebSocket();
+  const { latencyMs, gameChatMessages, sendChatMessage } = useWebSocket();
   
   // Early return if auth is not ready - before useGameEngine
   if (authLoading || !user) {
@@ -419,6 +420,13 @@ export default function GameArena() {
       } 
     });
   };
+
+  const handleSendGameChat = useCallback((message: string) => {
+    if (!connected) {
+      return;
+    }
+    sendChatMessage('game', message);
+  }, [connected, sendChatMessage]);
   
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
@@ -487,6 +495,15 @@ export default function GameArena() {
         </div>
 
       </>
+      <ChatPanel
+        title="Game Chat"
+        messages={gameChatMessages}
+        onSendMessage={handleSendGameChat}
+        currentUsername={user?.username}
+        isActive={connected}
+        inactiveMessage="Game chat unavailable"
+        initialExpanded={true}
+      />
     </div>
   );
 }

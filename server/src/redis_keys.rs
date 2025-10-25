@@ -137,6 +137,26 @@ impl RedisKeys {
         format!("snaketron:commands:partition:{}", partition_id)
     }
 
+    /// Lobby chat channel
+    pub fn lobby_chat_channel(&self, lobby_id: i32) -> String {
+        format!("lobby:{}:chat", lobby_id)
+    }
+
+    /// Lobby chat history key
+    pub fn lobby_chat_history_key(&self, lobby_id: i32) -> String {
+        format!("lobby:{}:chat:history", lobby_id)
+    }
+
+    /// Game chat channel
+    pub fn game_chat_channel(&self, game_id: u32) -> String {
+        format!("game:{}:chat", game_id)
+    }
+
+    /// Game chat history key
+    pub fn game_chat_history_key(&self, game_id: u32) -> String {
+        format!("game:{}:chat:history", game_id)
+    }
+
     /// Snapshot requests channel
     pub fn snapshot_requests(&self, partition_id: u32) -> String {
         format!("snaketron:snapshot-requests:partition:{}", partition_id)

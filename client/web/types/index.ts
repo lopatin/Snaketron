@@ -32,6 +32,20 @@ export interface LobbyMember {
   is_host: boolean;
 }
 
+export type ChatScope = 'lobby' | 'game';
+
+export interface ChatMessage {
+  id: string;
+  scope: ChatScope;
+  lobbyId?: number;
+  gameId?: number;
+  userId: number | null;
+  username: string | null;
+  message: string;
+  type: 'user' | 'system';
+  timestamp: Date;
+}
+
 // WebSocket Types
 export interface WebSocketContextType {
   isConnected: boolean;
@@ -46,11 +60,14 @@ export interface WebSocketContextType {
   // Lobby state
   currentLobby: Lobby | null;
   lobbyMembers: LobbyMember[];
+  lobbyChatMessages: ChatMessage[];
+  gameChatMessages: ChatMessage[];
 
   // Lobby methods
   createLobby: () => Promise<void>;
   joinLobby: (lobbyCode: string) => Promise<void>;
   leaveLobby: () => Promise<void>;
+  sendChatMessage: (scope: ChatScope, message: string) => void;
 }
 
 // Latency Settings Types

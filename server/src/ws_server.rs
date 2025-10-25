@@ -3,6 +3,7 @@ use crate::db::Database;
 use crate::game_executor::{PARTITION_COUNT, StreamEvent};
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
+use crate::redis_keys::RedisKeys;
 use crate::ws_matchmaking::remove_from_matchmaking_queue;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -12,6 +13,7 @@ use common::{
 };
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,6 +38,30 @@ pub enum WSMessage {
     GameCommand(GameCommandMessage),
     GameEvent(GameEventMessage),
     Chat(String),
+    LobbyChatMessage {
+        lobby_id: u32,
+        message_id: String,
+        user_id: i32,
+        username: String,
+        message: String,
+        timestamp_ms: i64,
+    },
+    GameChatMessage {
+        game_id: u32,
+        message_id: String,
+        user_id: i32,
+        username: String,
+        message: String,
+        timestamp_ms: i64,
+    },
+    LobbyChatHistory {
+        lobby_id: u32,
+        messages: Vec<LobbyChatBroadcast>,
+    },
+    GameChatHistory {
+        game_id: u32,
+        messages: Vec<GameChatBroadcast>,
+    },
     Shutdown,
     Ping,
     Pong,
@@ -162,6 +188,29 @@ pub struct PlayerMetadata {
     pub username: String,
     pub token: String,
     pub is_guest: bool,
+}
+
+const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
+const CHAT_HISTORY_LIMIT: usize = 200;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LobbyChatBroadcast {
+    lobby_id: i32,
+    message_id: String,
+    user_id: i32,
+    username: String,
+    message: String,
+    timestamp_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct GameChatBroadcast {
+    game_id: u32,
+    message_id: String,
+    user_id: i32,
+    username: String,
+    message: String,
+    timestamp_ms: i64,
 }
 
 async fn handle_guest_nickname_update(
@@ -397,6 +446,12 @@ async fn handle_websocket_connection(
     // Will be used to track Redis pub/sub subscription for lobby match notifications
     let mut lobby_match_handle: Option<JoinHandle<()>> = None;
 
+    // Will be used to track lobby chat subscription
+    let mut lobby_chat_handle: Option<JoinHandle<()>> = None;
+
+    // Will be used to track game chat subscription
+    let mut game_chat_handle: Option<JoinHandle<()>> = None;
+
     // Spawn task to forward messages from channel to WebSocket
     let ws_tx_clone = ws_tx.clone();
     let forward_task = tokio::spawn(async move {
@@ -512,14 +567,18 @@ async fn handle_websocket_connection(
                                             let entering_game = matches!(&new_state, ConnectionState::InGame { .. }) && !was_in_game;
                                             let entering_lobby = matches!(&new_state, ConnectionState::InLobby { .. }) && !was_in_lobby;
                                             let leaving_lobby = was_in_lobby && !matches!(&new_state, ConnectionState::InLobby { .. });
-                                            debug!("State transitioned to: entering_game: {}, entering_lobby: {}, leaving_lobby: {}",
-                                                entering_game, entering_lobby, leaving_lobby);
+                                            let leaving_game = was_in_game && !matches!(&new_state, ConnectionState::InGame { .. });
+                                            debug!("State transitioned to: entering_game: {}, entering_lobby: {}, leaving_lobby: {}, leaving_game: {}",
+                                                entering_game, entering_lobby, leaving_lobby, leaving_game);
 
                                             // Handle state transitions
                                             if entering_game {
                                                 if let ConnectionState::InGame { game_id, metadata, .. } = &new_state {
                                                     // Subscribe to game events if entering a game
                                                     if let Some(handle) = game_event_handle.take() {
+                                                        handle.abort();
+                                                    }
+                                                    if let Some(handle) = game_chat_handle.take() {
                                                         handle.abort();
                                                     }
 
@@ -538,6 +597,56 @@ async fn handle_websocket_connection(
                                                             db_clone,
                                                         ).await;
                                                     }));
+
+                                                    let ws_tx_clone = ws_tx.clone();
+                                                    let redis_url_clone = redis_url.clone();
+
+                                                    game_chat_handle = Some(tokio::spawn(async move {
+                                                        if let Err(e) = subscribe_to_game_chat(
+                                                            game_id,
+                                                            redis_url_clone,
+                                                            ws_tx_clone,
+                                                        )
+                                                        .await
+                                                        {
+                                                            error!("Game chat subscription failed: {}", e);
+                                                        }
+                                                    }));
+
+                                                    match load_game_chat_history(&redis_url, game_id).await {
+                                                        Ok(history) if !history.is_empty() => {
+                                                            let history_message = WSMessage::GameChatHistory {
+                                                                game_id,
+                                                                messages: history,
+                                                            };
+                                                            match serde_json::to_string(&history_message) {
+                                                                Ok(json) => {
+                                                                    if let Err(e) = ws_tx
+                                                                        .send(Message::Text(json.into()))
+                                                                        .await
+                                                                    {
+                                                                        debug!(
+                                                                            "Failed to send initial game chat history for game {}: {}",
+                                                                            game_id, e
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!(
+                                                                        "Failed to serialize game chat history for game {}: {}",
+                                                                        game_id, e
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Failed to load game chat history for game {}: {}",
+                                                                game_id, e
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
 
@@ -546,6 +655,9 @@ async fn handle_websocket_connection(
                                                 if let ConnectionState::InLobby { lobby_id, .. } = &new_state {
                                                     // Subscribe to lobby updates if entering a lobby
                                                     if let Some(handle) = lobby_update_handle.take() {
+                                                        handle.abort();
+                                                    }
+                                                    if let Some(handle) = lobby_chat_handle.take() {
                                                         handle.abort();
                                                     }
 
@@ -615,6 +727,57 @@ async fn handle_websocket_connection(
                                                             }
                                                         }
                                                     }));
+
+                                                    // Subscribe to lobby chat
+                                                    let ws_tx_clone = ws_tx.clone();
+                                                    let redis_url_clone = redis_url.clone();
+
+                                                    lobby_chat_handle = Some(tokio::spawn(async move {
+                                                        if let Err(e) = subscribe_to_lobby_chat(
+                                                            lobby_id,
+                                                            redis_url_clone,
+                                                            ws_tx_clone,
+                                                        )
+                                                        .await
+                                                        {
+                                                            error!("Lobby chat subscription failed: {}", e);
+                                                        }
+                                                    }));
+
+                                                    match load_lobby_chat_history(&redis_url, lobby_id).await {
+                                                        Ok(history) if !history.is_empty() => {
+                                                            let history_message = WSMessage::LobbyChatHistory {
+                                                                lobby_id: lobby_id as u32,
+                                                                messages: history,
+                                                            };
+                                                            match serde_json::to_string(&history_message) {
+                                                                Ok(json) => {
+                                                                    if let Err(e) = ws_tx
+                                                                        .send(Message::Text(json.into()))
+                                                                        .await
+                                                                    {
+                                                                        debug!(
+                                                                            "Failed to send initial lobby chat history for lobby {}: {}",
+                                                                            lobby_id, e
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!(
+                                                                        "Failed to serialize lobby chat history for lobby {}: {}",
+                                                                        lobby_id, e
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Failed to load lobby chat history for lobby {}: {}",
+                                                                lobby_id, e
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
 
@@ -627,6 +790,21 @@ async fn handle_websocket_connection(
                                                 if let Some(handle) = lobby_match_handle.take() {
                                                     handle.abort();
                                                     debug!("Aborted lobby match notification subscription");
+                                                }
+                                                if let Some(handle) = lobby_chat_handle.take() {
+                                                    handle.abort();
+                                                    debug!("Aborted lobby chat subscription");
+                                                }
+                                            }
+
+                                            if leaving_game {
+                                                if let Some(handle) = game_event_handle.take() {
+                                                    handle.abort();
+                                                    debug!("Aborted game event subscription");
+                                                }
+                                                if let Some(handle) = game_chat_handle.take() {
+                                                    handle.abort();
+                                                    debug!("Aborted game chat subscription");
                                                 }
                                             }
 
@@ -683,10 +861,139 @@ async fn handle_websocket_connection(
     if let Some(handle) = lobby_match_handle {
         handle.abort();
     }
+    if let Some(handle) = lobby_chat_handle {
+        handle.abort();
+    }
+    if let Some(handle) = game_chat_handle {
+        handle.abort();
+    }
     forward_task.abort();
 
     info!("WebSocket connection closed");
     Ok(())
+}
+
+async fn publish_lobby_chat_message(redis_url: &str, payload: LobbyChatBroadcast) -> Result<()> {
+    let client = redis::Client::open(redis_url)
+        .context("Failed to open Redis client for lobby chat publish")?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("Failed to get Redis connection for lobby chat publish")?;
+
+    let redis_keys = RedisKeys::new();
+    let channel = redis_keys.lobby_chat_channel(payload.lobby_id);
+    let history_key = redis_keys.lobby_chat_history_key(payload.lobby_id);
+    let serialized =
+        serde_json::to_string(&payload).context("Failed to serialize lobby chat payload")?;
+
+    conn.publish::<_, _, ()>(&channel, serialized.clone())
+        .await
+        .context("Failed to publish lobby chat message")?;
+
+    let _: i64 = conn
+        .rpush(&history_key, serialized.clone())
+        .await
+        .context("Failed to append lobby chat history")?;
+    let start: isize = -(CHAT_HISTORY_LIMIT as isize);
+    let _: () = conn
+        .ltrim(&history_key, start, -1)
+        .await
+        .context("Failed to trim lobby chat history")?;
+    Ok(())
+}
+
+async fn publish_game_chat_message(redis_url: &str, payload: GameChatBroadcast) -> Result<()> {
+    let client = redis::Client::open(redis_url)
+        .context("Failed to open Redis client for game chat publish")?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("Failed to get Redis connection for game chat publish")?;
+
+    let redis_keys = RedisKeys::new();
+    let channel = redis_keys.game_chat_channel(payload.game_id);
+    let history_key = redis_keys.game_chat_history_key(payload.game_id);
+    let serialized =
+        serde_json::to_string(&payload).context("Failed to serialize game chat payload")?;
+
+    conn.publish::<_, _, ()>(&channel, serialized.clone())
+        .await
+        .context("Failed to publish game chat message")?;
+
+    let _: i64 = conn
+        .rpush(&history_key, serialized.clone())
+        .await
+        .context("Failed to append game chat history")?;
+    let start: isize = -(CHAT_HISTORY_LIMIT as isize);
+    let _: () = conn
+        .ltrim(&history_key, start, -1)
+        .await
+        .context("Failed to trim game chat history")?;
+    Ok(())
+}
+
+async fn load_lobby_chat_history(
+    redis_url: &str,
+    lobby_id: i32,
+) -> Result<Vec<LobbyChatBroadcast>> {
+    let client = redis::Client::open(redis_url)
+        .context("Failed to open Redis client for lobby chat history")?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("Failed to get Redis connection for lobby chat history")?;
+
+    let key = RedisKeys::new().lobby_chat_history_key(lobby_id);
+    let entries: Vec<String> = conn
+        .lrange(&key, 0, -1)
+        .await
+        .context("Failed to load lobby chat history")?;
+
+    let mut messages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match serde_json::from_str::<LobbyChatBroadcast>(&entry) {
+            Ok(chat) => messages.push(chat),
+            Err(e) => {
+                warn!(
+                    "Failed to deserialize lobby chat history entry for lobby {}: {}",
+                    lobby_id, e
+                );
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+async fn load_game_chat_history(redis_url: &str, game_id: u32) -> Result<Vec<GameChatBroadcast>> {
+    let client = redis::Client::open(redis_url)
+        .context("Failed to open Redis client for game chat history")?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("Failed to get Redis connection for game chat history")?;
+
+    let key = RedisKeys::new().game_chat_history_key(game_id);
+    let entries: Vec<String> = conn
+        .lrange(&key, 0, -1)
+        .await
+        .context("Failed to load game chat history")?;
+
+    let mut messages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match serde_json::from_str::<GameChatBroadcast>(&entry) {
+            Ok(chat) => messages.push(chat),
+            Err(e) => {
+                warn!(
+                    "Failed to deserialize game chat history entry for game {}: {}",
+                    game_id, e
+                );
+            }
+        }
+    }
+
+    Ok(messages)
 }
 
 // Helper function to subscribe to game events
@@ -848,6 +1155,142 @@ async fn subscribe_to_game_events(
             }
         }
     }
+}
+
+async fn subscribe_to_game_chat(
+    game_id: u32,
+    redis_url: String,
+    ws_tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    info!("Subscribing to game {} chat", game_id);
+
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client for game chat subscription")?;
+    let mut pubsub_conn = client
+        .get_async_pubsub()
+        .await
+        .context("Failed to create Redis pub/sub connection for game chat")?;
+
+    let channel = RedisKeys::new().game_chat_channel(game_id);
+    pubsub_conn
+        .subscribe(&channel)
+        .await
+        .context("Failed to subscribe to game chat channel")?;
+
+    let mut stream = pubsub_conn.on_message();
+    while let Some(msg) = stream.next().await {
+        let payload: String = match msg.get_payload() {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("Failed to read payload from game chat message: {}", e);
+                continue;
+            }
+        };
+
+        let chat_payload: GameChatBroadcast = match serde_json::from_str(&payload) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("Failed to deserialize game chat payload: {}", e);
+                continue;
+            }
+        };
+
+        let ws_message = WSMessage::GameChatMessage {
+            game_id: chat_payload.game_id,
+            message_id: chat_payload.message_id.clone(),
+            user_id: chat_payload.user_id,
+            username: chat_payload.username.clone(),
+            message: chat_payload.message.clone(),
+            timestamp_ms: chat_payload.timestamp_ms,
+        };
+
+        let json_msg = match serde_json::to_string(&ws_message) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize game chat message: {}", e);
+                continue;
+            }
+        };
+
+        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+            debug!(
+                "WebSocket channel closed while forwarding game {} chat, stopping subscription",
+                game_id
+            );
+            break;
+        }
+    }
+
+    info!("Stopped subscribing to game {} chat", game_id);
+    Ok(())
+}
+
+async fn subscribe_to_lobby_chat(
+    lobby_id: i32,
+    redis_url: String,
+    ws_tx: mpsc::Sender<Message>,
+) -> Result<()> {
+    info!("Subscribing to lobby {} chat", lobby_id);
+
+    let client = redis::Client::open(redis_url.as_str())
+        .context("Failed to create Redis client for lobby chat subscription")?;
+    let mut pubsub_conn = client
+        .get_async_pubsub()
+        .await
+        .context("Failed to create Redis pub/sub connection for lobby chat")?;
+
+    let channel = RedisKeys::new().lobby_chat_channel(lobby_id);
+    pubsub_conn
+        .subscribe(&channel)
+        .await
+        .context("Failed to subscribe to lobby chat channel")?;
+
+    let mut stream = pubsub_conn.on_message();
+    while let Some(msg) = stream.next().await {
+        let payload: String = match msg.get_payload() {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("Failed to read payload from lobby chat message: {}", e);
+                continue;
+            }
+        };
+
+        let chat_payload: LobbyChatBroadcast = match serde_json::from_str(&payload) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("Failed to deserialize lobby chat payload: {}", e);
+                continue;
+            }
+        };
+
+        let ws_message = WSMessage::LobbyChatMessage {
+            lobby_id: chat_payload.lobby_id as u32,
+            message_id: chat_payload.message_id.clone(),
+            user_id: chat_payload.user_id,
+            username: chat_payload.username.clone(),
+            message: chat_payload.message.clone(),
+            timestamp_ms: chat_payload.timestamp_ms,
+        };
+
+        let json_msg = match serde_json::to_string(&ws_message) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize lobby chat message: {}", e);
+                continue;
+            }
+        };
+
+        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+            debug!(
+                "WebSocket channel closed while forwarding lobby {} chat, stopping subscription",
+                lobby_id
+            );
+            break;
+        }
+    }
+
+    info!("Stopped subscribing to lobby {} chat", lobby_id);
+    Ok(())
 }
 
 async fn process_ws_message(
@@ -1541,6 +1984,14 @@ async fn process_ws_message(
                         }
                     }
                 }
+                WSMessage::Chat(_) => {
+                    let response = WSMessage::AccessDenied {
+                        reason: "Chat is only available in a lobby or game".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated { metadata })
+                }
                 _ => {
                     warn!(
                         "Unexpected message in authenticated state: {:?}",
@@ -1598,6 +2049,59 @@ async fn process_ws_message(
 
                     // Transition back to authenticated state
                     Ok(ConnectionState::Authenticated { metadata })
+                }
+                WSMessage::Chat(message) => {
+                    let trimmed = message.trim();
+                    if trimmed.is_empty() {
+                        return Ok(ConnectionState::InLobby {
+                            metadata,
+                            lobby_id,
+                            websocket_id: ws_id,
+                        });
+                    }
+
+                    if trimmed.chars().count() > MAX_CHAT_MESSAGE_LENGTH {
+                        let response = WSMessage::AccessDenied {
+                            reason: format!(
+                                "Chat messages must be {} characters or fewer",
+                                MAX_CHAT_MESSAGE_LENGTH
+                            ),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::InLobby {
+                            metadata,
+                            lobby_id,
+                            websocket_id: ws_id,
+                        });
+                    }
+
+                    let payload = LobbyChatBroadcast {
+                        lobby_id,
+                        message_id: uuid::Uuid::new_v4().to_string(),
+                        user_id: metadata.user_id,
+                        username: metadata.username.clone(),
+                        message: trimmed.to_string(),
+                        timestamp_ms: Utc::now().timestamp_millis(),
+                    };
+
+                    if let Err(e) = publish_lobby_chat_message(redis_url, payload).await {
+                        error!(
+                            "Failed to publish lobby {} chat message for user {}: {}",
+                            lobby_id, metadata.user_id, e
+                        );
+                        let response = WSMessage::AccessDenied {
+                            reason: "Failed to send chat message".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                    }
+
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
                 }
                 WSMessage::QueueForMatch {
                     game_type,
@@ -2227,6 +2731,47 @@ async fn process_ws_message(
                             metadata.user_id, game_id, e
                         );
                     }
+                    Ok(ConnectionState::InGame { metadata, game_id })
+                }
+                WSMessage::Chat(message) => {
+                    let trimmed = message.trim();
+                    if trimmed.is_empty() {
+                        return Ok(ConnectionState::InGame { metadata, game_id });
+                    }
+
+                    if trimmed.chars().count() > MAX_CHAT_MESSAGE_LENGTH {
+                        let response = WSMessage::AccessDenied {
+                            reason: format!(
+                                "Chat messages must be {} characters or fewer",
+                                MAX_CHAT_MESSAGE_LENGTH
+                            ),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::InGame { metadata, game_id });
+                    }
+
+                    let payload = GameChatBroadcast {
+                        game_id,
+                        message_id: uuid::Uuid::new_v4().to_string(),
+                        user_id: metadata.user_id,
+                        username: metadata.username.clone(),
+                        message: trimmed.to_string(),
+                        timestamp_ms: Utc::now().timestamp_millis(),
+                    };
+
+                    if let Err(e) = publish_game_chat_message(redis_url, payload).await {
+                        error!(
+                            "Failed to publish game {} chat message for user {}: {}",
+                            game_id, metadata.user_id, e
+                        );
+                        let response = WSMessage::AccessDenied {
+                            reason: "Failed to send chat message".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                    }
+
                     Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::GameCommand(command_message) => {

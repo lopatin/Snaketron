@@ -11,30 +11,6 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 
-// Dummy chat messages for UI design
-const DUMMY_CHAT_MESSAGES = [
-  {
-    id: '1',
-    type: 'system' as const,
-    message: 'User3 joined the lobby',
-    timestamp: new Date(Date.now() - 120000)
-  },
-  {
-    id: '2',
-    type: 'user' as const,
-    username: 'Player1',
-    message: 'Hey everyone! Ready to play?',
-    timestamp: new Date(Date.now() - 60000)
-  },
-  {
-    id: '3',
-    type: 'user' as const,
-    username: 'SnakeKing',
-    message: 'Let\'s do this!',
-    timestamp: new Date(Date.now() - 30000)
-  }
-];
-
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
 export const NewHome: React.FC = () => {
@@ -49,11 +25,12 @@ export const NewHome: React.FC = () => {
     lobbyMembers,
     createLobby,
     leaveLobby,
+    lobbyChatMessages,
+    sendChatMessage,
   } = useWebSocket();
   const { createGame, currentGameId } = useGameWebSocket();
   const [isMobile, setIsMobile] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [chatMessages, setChatMessages] = useState(DUMMY_CHAT_MESSAGES);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
@@ -173,14 +150,7 @@ export const NewHome: React.FC = () => {
   };
 
   const handleSendMessage = (message: string) => {
-    const newMessage = {
-      id: Date.now().toString(),
-      type: 'user' as const,
-      username: user?.username || 'Guest',
-      message,
-      timestamp: new Date()
-    };
-    setChatMessages([...chatMessages, newMessage]);
+    sendChatMessage('lobby', message);
   };
 
   const handleInvite = async () => {
@@ -307,9 +277,12 @@ export const NewHome: React.FC = () => {
 
         {/* Bottom Right: Lobby Chat */}
         <LobbyChat
-          messages={chatMessages}
+          title="Lobby Chat"
+          messages={lobbyChatMessages}
           onSendMessage={handleSendMessage}
           currentUsername={user?.username}
+          isActive={Boolean(currentLobby)}
+          inactiveMessage="Join or create a lobby to chat"
           initialExpanded={true}
         />
       </div>
@@ -341,9 +314,12 @@ export const NewHome: React.FC = () => {
 
       {/* Bottom Right: Lobby Chat - Hidden in mobile */}
       <LobbyChat
-        messages={chatMessages}
+        title="Lobby Chat"
+        messages={lobbyChatMessages}
         onSendMessage={handleSendMessage}
         currentUsername={user?.username}
+        isActive={Boolean(currentLobby)}
+        inactiveMessage="Join or create a lobby to chat"
         initialExpanded={false}
       />
     </div>
