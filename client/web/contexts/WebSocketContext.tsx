@@ -27,6 +27,13 @@ declare global {
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
+const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
+
+interface StoredLobbyInfo {
+  code: string;
+  id?: number;
+}
+
 export const useWebSocket = (): WebSocketContextType => {
   const context = useContext(WebSocketContext);
   if (!context) {
@@ -49,7 +56,74 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const pingSentTime = useRef<number | null>(null);
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
   const isInitializingRef = useRef(false);
+  const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
+  const hasLoadedStoredLobbyRef = useRef(false);
+  const restoreInProgressRef = useRef(false);
   const { settings: latencySettings } = useLatency();
+
+  useEffect(() => {
+    if (hasLoadedStoredLobbyRef.current) {
+      return;
+    }
+
+    if (typeof window === 'undefined') {
+      hasLoadedStoredLobbyRef.current = true;
+      return;
+    }
+
+    try {
+      const raw = window.localStorage.getItem(LOBBY_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.code === 'string' && parsed.code.trim()) {
+          storedLobbyRef.current = {
+            code: parsed.code.toUpperCase(),
+            id: typeof parsed.id === 'number' ? parsed.id : undefined,
+          };
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load stored lobby info, clearing persisted data', error);
+      try {
+        window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+      } catch {
+        // Ignore removal errors
+      }
+    } finally {
+      hasLoadedStoredLobbyRef.current = true;
+    }
+  }, []);
+
+  const persistLobby = useCallback((lobby: { id: number; code: string }) => {
+    storedLobbyRef.current = { id: lobby.id, code: lobby.code.toUpperCase() };
+
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(
+        LOBBY_STORAGE_KEY,
+        JSON.stringify({ id: lobby.id, code: lobby.code.toUpperCase() })
+      );
+    } catch (error) {
+      console.warn('Failed to persist lobby info', error);
+    }
+  }, []);
+
+  const clearPersistedLobby = useCallback(() => {
+    storedLobbyRef.current = null;
+
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+    } catch (error) {
+      console.warn('Failed to clear stored lobby info', error);
+    }
+  }, []);
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
@@ -362,16 +436,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
 
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
       // Set up one-time handler for LobbyCreated message
       const cleanup = onMessage('LobbyCreated', (message: any) => {
+        if (settled) {
+          return;
+        }
+
         const { lobby_id, lobby_code } = message.data;
+        const normalizedCode = lobby_code.toUpperCase();
         setCurrentLobby({
           id: lobby_id,
-          code: lobby_code,
+          code: normalizedCode,
           hostUserId: 0, // Will be set by LobbyUpdate
           region: '', // Will be set by LobbyUpdate
         });
+        persistLobby({ id: lobby_id, code: normalizedCode });
         cleanup();
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        settled = true;
         resolve();
       });
 
@@ -379,50 +466,88 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       sendMessage('CreateLobby');
 
       // Timeout after 5 seconds
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
         reject(new Error('Timeout waiting for lobby creation'));
       }, 5000);
     });
-  }, [onMessage, sendMessage]);
+  }, [onMessage, sendMessage, persistLobby]);
 
   const joinLobby = useCallback(async (lobbyCode: string) => {
+    const normalizedCode = lobbyCode.toUpperCase();
     return new Promise<void>((resolve, reject) => {
       if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
         reject(new Error('WebSocket not connected'));
         return;
       }
 
-      // Set up handlers for possible responses
-      const cleanupJoined = onMessage('JoinedLobby', (message: any) => {
-        const { lobby_id } = message.data;
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanupHandlers = () => {
+        cleanupJoined();
+        cleanupDenied();
+        cleanupMismatch();
+        cleanupUpdate();
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      };
+
+      const handleSuccess = (lobbyId: number, hostUserId?: number) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         setCurrentLobby({
-          id: lobby_id,
-          code: lobbyCode,
-          hostUserId: 0, // Will be set by LobbyUpdate
+          id: lobbyId,
+          code: normalizedCode,
+          hostUserId: hostUserId ?? 0, // Will be refined by future LobbyUpdate messages
           region: '', // Will be set by LobbyUpdate
         });
-        cleanupJoined();
-        cleanupDenied();
-        cleanupMismatch();
+        persistLobby({ id: lobbyId, code: normalizedCode });
+        cleanupHandlers();
         resolve();
+      };
+
+      // Set up handlers for possible responses
+      let cleanupJoined = () => {};
+      let cleanupDenied = () => {};
+      let cleanupMismatch = () => {};
+      let cleanupUpdate = () => {};
+
+      cleanupJoined = onMessage('JoinedLobby', (message: any) => {
+        if (settled) {
+          return;
+        }
+        const { lobby_id } = message.data;
+        handleSuccess(lobby_id);
       });
 
-      const cleanupDenied = onMessage('AccessDenied', (message: any) => {
-        cleanupJoined();
-        cleanupDenied();
-        cleanupMismatch();
+      cleanupDenied = onMessage('AccessDenied', (message: any) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupHandlers();
         reject(new Error(message.data.reason || 'Access denied'));
       });
 
-      const cleanupMismatch = onMessage('LobbyRegionMismatch', (message: any) => {
+      cleanupMismatch = onMessage('LobbyRegionMismatch', (message: any) => {
         const { target_region, ws_url, lobby_code: code } = message.data;
         console.log(`Lobby is in region ${target_region}, reconnecting to ${ws_url}`);
 
-        // Clean up handlers
-        cleanupJoined();
-        cleanupDenied();
-        cleanupMismatch();
+        if (settled) {
+          return;
+        }
+
+        // Clean up handlers before reconnecting
+        cleanupHandlers();
 
         // Reconnect to the correct region
         connectToRegion(ws_url, { regionId: target_region });
@@ -434,18 +559,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }, 1000);
       });
 
+      cleanupUpdate = onMessage('LobbyUpdate', (message: any) => {
+        if (settled) {
+          return;
+        }
+        const { lobby_id, host_user_id } = message.data;
+        handleSuccess(lobby_id, host_user_id);
+      });
+
       // Send JoinLobbyByCode message
-      sendMessage({ JoinLobbyByCode: { lobby_code: lobbyCode } });
+      sendMessage({ JoinLobbyByCode: { lobby_code: normalizedCode } });
 
       // Timeout after 5 seconds
-      setTimeout(() => {
-        cleanupJoined();
-        cleanupDenied();
-        cleanupMismatch();
+      timeoutId = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupHandlers();
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
     });
-  }, [onMessage, sendMessage, connectToRegion]);
+  }, [onMessage, sendMessage, connectToRegion, persistLobby]);
 
   const leaveLobby = useCallback(async () => {
     return new Promise<void>((resolve, reject) => {
@@ -454,11 +589,22 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
 
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
       // Set up one-time handler for LeftLobby message
       const cleanup = onMessage('LeftLobby', () => {
+        if (settled) {
+          return;
+        }
         setCurrentLobby(null);
         setLobbyMembers([]);
+        clearPersistedLobby();
         cleanup();
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        settled = true;
         resolve();
       });
 
@@ -466,12 +612,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       sendMessage('LeaveLobby');
 
       // Timeout after 5 seconds
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         cleanup();
         reject(new Error('Timeout waiting to leave lobby'));
       }, 5000);
     });
-  }, [onMessage, sendMessage]);
+  }, [onMessage, sendMessage, clearPersistedLobby]);
 
   // Handle lobby updates
   useEffect(() => {
@@ -499,6 +649,75 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       disconnect();
     };
   }, [disconnect]);
+
+  useEffect(() => {
+    if (!hasLoadedStoredLobbyRef.current) {
+      return;
+    }
+
+    if (!isConnected) {
+      return;
+    }
+
+    if (currentLobby) {
+      return;
+    }
+
+    if (!storedLobbyRef.current || !storedLobbyRef.current.code) {
+      return;
+    }
+
+    if (restoreInProgressRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+    restoreInProgressRef.current = true;
+
+    const attemptRestore = async () => {
+      const { code } = storedLobbyRef.current!;
+      const maxAttempts = 3;
+
+      for (let attempt = 0; attempt < maxAttempts && !cancelled; attempt += 1) {
+        try {
+          console.log(`Attempting to restore lobby ${code} (attempt ${attempt + 1})`);
+          await joinLobby(code);
+          return;
+        } catch (error) {
+          if (cancelled) {
+            return;
+          }
+
+          const message =
+            error instanceof Error ? error.message : String(error ?? 'unknown error');
+          const normalizedMessage = message.toLowerCase();
+
+          if (normalizedMessage.includes('access denied') || normalizedMessage.includes('not found')) {
+            console.warn('Stored lobby is no longer valid, clearing persisted lobby info');
+            clearPersistedLobby();
+            return;
+          }
+
+          if (attempt < maxAttempts - 1) {
+            const delayMs = 1000 * (attempt + 1);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+          }
+        }
+      }
+    };
+
+    attemptRestore()
+      .catch(error => {
+        console.error('Failed to restore lobby from storage:', error);
+      })
+      .finally(() => {
+        restoreInProgressRef.current = false;
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isConnected, currentLobby, joinLobby, clearPersistedLobby]);
 
   const value: WebSocketContextType = {
     isConnected,

@@ -438,7 +438,7 @@ export default function GameArena() {
         <div className="flex-1 flex flex-col items-center justify-center p-4" style={{ paddingTop: '120px', paddingBottom: '40px' }}>
           {/* Game Canvas */}
           <div
-            className={`panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
+            className={`panel game-arena-panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
               isArenaVisible ? 'opacity-100' : 'opacity-0'
             }`}
             ref={containerRef}

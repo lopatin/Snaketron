@@ -80,6 +80,14 @@
     border: 2px solid rgba(0, 0, 0, 0.1);
   }
 
+  /* Game arena panel with restored double border treatment */
+  .panel.game-arena-panel {
+    border: 3px solid white;
+    box-shadow:
+      inset 0 0 0 0.75px rgba(0, 0, 0, 0.8),  /* Inner black line */
+      0 0 0 1.5px rgba(0, 0, 0, 0.8);         /* Outer black line */
+  }
+
   /* Panel with no top border, only bottom corners rounded */
   .panel-top-open {
     @apply bg-white;
