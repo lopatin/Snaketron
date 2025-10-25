@@ -11,7 +11,8 @@ export interface AuthContextType {
   loading: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string | null) => Promise<void>;
-  createGuest: (nickname: string) => Promise<void>;
+  createGuest: (nickname: string) => Promise<{ user: User; token: string }>;
+  updateGuestNickname: (nickname: string) => void;
   logout: () => void;
   getToken: () => string | null;
 }

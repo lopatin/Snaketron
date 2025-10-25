@@ -99,7 +99,10 @@ impl RegionCache {
         *cache = regions.clone();
 
         info!("Region cache refreshed: {} regions found", regions.len());
-        debug!("Available regions: {:?}", regions.keys().collect::<Vec<_>>());
+        debug!(
+            "Available regions: {:?}",
+            regions.keys().collect::<Vec<_>>()
+        );
 
         Ok(())
     }

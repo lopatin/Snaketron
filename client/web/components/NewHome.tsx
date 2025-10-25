@@ -35,9 +35,11 @@ const DUMMY_CHAT_MESSAGES = [
   }
 ];
 
+const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
+
 export const NewHome: React.FC = () => {
   const navigate = useNavigate();
-  const { user, login, register, createGuest, logout } = useAuth();
+  const { user, login, register, createGuest, logout, updateGuestNickname } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -54,6 +56,7 @@ export const NewHome: React.FC = () => {
   const [chatMessages, setChatMessages] = useState(DUMMY_CHAT_MESSAGES);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
+  const [isCreatingInvite, setIsCreatingInvite] = useState(false);
 
   // Use regions hook for live data
   const {
@@ -101,6 +104,21 @@ export const NewHome: React.FC = () => {
       navigate(`/play/${currentGameId}`);
     }
   }, [currentGameId, navigate]);
+
+  useEffect(() => {
+    const cleanup = onMessage('NicknameUpdated', (message: any) => {
+      const updatedName = message.data?.username;
+      if (!updatedName) {
+        return;
+      }
+      if (!user || !user.isGuest) {
+        return;
+      }
+      updateGuestNickname(updatedName);
+    });
+
+    return cleanup;
+  }, [onMessage, updateGuestNickname, user]);
 
   const handleRegionChange = (regionId: string) => {
     selectRegion(regionId);
@@ -166,24 +184,33 @@ export const NewHome: React.FC = () => {
   };
 
   const handleInvite = async () => {
+    if (isCreatingInvite) {
+      return;
+    }
+
+    setIsCreatingInvite(true);
     try {
-      // If not logged in, create guest user first
       if (!user) {
-        console.log('Creating guest user for lobby...');
-        // For now, require nickname input - this will be handled by modal later
-        return;
+        try {
+          await createGuest(generateGuestNickname());
+        } catch (error) {
+          console.error('Guest creation failed for lobby invite:', error);
+          return;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      // If lobby doesn't exist yet, create it
       if (!currentLobby) {
         await createLobby();
         console.log('Lobby created successfully');
       }
 
-      // Show the invite modal
       setShowInviteModal(true);
     } catch (error) {
       console.error('Failed to create lobby:', error);
+    } finally {
+      setIsCreatingInvite(false);
     }
   };
 
@@ -217,6 +244,7 @@ export const NewHome: React.FC = () => {
           currentUserId={user?.id}
           isHost={currentLobby ? currentLobby.hostUserId === user?.id : false}
           onInvite={handleInvite}
+          isInviteDisabled={isCreatingInvite}
           onLeaveLobby={handleLeaveLobby}
           onStartGame={handleStartGameFromLobby}
           onJoinGame={() => setShowJoinModal(true)}
@@ -298,6 +326,7 @@ export const NewHome: React.FC = () => {
         onLoginClick={handleLoginClick}
         lobbyUsers={lobbyMembers.map(m => m.username)}
         onInvite={handleInvite}
+        isInviteDisabled={isCreatingInvite}
       />
 
       {/* Center: Game Start Form */}

@@ -85,9 +85,31 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const createGuest = useCallback(async (nickname: string) => {
     try {
       const data = await api.createGuest(nickname);
-      setUser({ ...data.user, isGuest: true });
+      const guestUser: User = { ...data.user, isGuest: true };
+      setUser(guestUser);
+      try {
+        localStorage.setItem('savedUsername', guestUser.username);
+      } catch {
+        // ignore storage errors
+      }
+      return { user: guestUser, token: data.token };
     } catch (err) {
       throw err;
+    }
+  }, []);
+
+  const updateGuestNickname = useCallback((nickname: string) => {
+    setUser(prev => {
+      if (!prev) {
+        return prev;
+      }
+      return { ...prev, username: nickname };
+    });
+
+    try {
+      localStorage.setItem('savedUsername', nickname);
+    } catch {
+      // ignore storage errors
     }
   }, []);
 
@@ -107,6 +129,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     login,
     register,
     createGuest,
+    updateGuestNickname,
     logout,
     getToken,
   };

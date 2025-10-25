@@ -1,14 +1,14 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use common::{GameState, GameType};
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
-use chrono::Utc;
-use common::{GameType, GameState};
 
-use crate::game_executor::{StreamEvent, PARTITION_COUNT};
+use crate::game_executor::{PARTITION_COUNT, StreamEvent};
+use crate::matchmaking_manager::{ActiveMatch, MatchStatus, MatchmakingManager, QueuedPlayer};
 use crate::pubsub_manager::PubSubManager;
-use crate::matchmaking_manager::{MatchmakingManager, QueuedPlayer, ActiveMatch, MatchStatus};
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
@@ -17,7 +17,7 @@ const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 #[derive(Debug, Clone)]
 struct TeamAssignment {
     lobby_id: i32,
-    member_indices: Vec<usize>,  // Which members of this lobby
+    member_indices: Vec<usize>, // Which members of this lobby
     team_id: common::TeamId,
 }
 
@@ -77,19 +77,24 @@ fn find_best_lobby_combination(
     match game_type {
         GameType::Solo => find_solo_combination(lobbies),
         GameType::TeamMatch { per_team } => find_team_combination(lobbies, *per_team as usize),
-        GameType::FreeForAll { max_players } => find_ffa_combination(lobbies, *max_players as usize),
+        GameType::FreeForAll { max_players } => {
+            find_ffa_combination(lobbies, *max_players as usize)
+        }
         _ => None,
     }
 }
 
 /// Find a solo game combination (1 player)
-fn find_solo_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby]) -> Option<MatchmakingCombination> {
+fn find_solo_combination(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+) -> Option<MatchmakingCombination> {
     // Solo: any single-player lobby
-    lobbies.iter()
+    lobbies
+        .iter()
         .find(|l| l.members.len() == 1)
         .map(|l| MatchmakingCombination {
             lobbies: vec![l.clone()],
-            team_assignments: Vec::new(),  // Solo has no teams
+            team_assignments: Vec::new(), // Solo has no teams
             spectators: Vec::new(),
             total_players: 1,
             avg_mmr: l.avg_mmr,
@@ -118,12 +123,12 @@ fn find_exact_team_match(
     per_team: usize,
     total_needed: usize,
 ) -> Option<MatchmakingCombination> {
-    let mut team_a: Vec<(usize, Vec<usize>)> = Vec::new();  // (lobby_idx, member_indices)
+    let mut team_a: Vec<(usize, Vec<usize>)> = Vec::new(); // (lobby_idx, member_indices)
     let mut team_b: Vec<(usize, Vec<usize>)> = Vec::new();
 
     if backtrack_assign(
         lobbies,
-        0,        // Current lobby index
+        0, // Current lobby index
         &mut team_a,
         &mut team_b,
         per_team,
@@ -140,7 +145,7 @@ fn find_exact_team_match(
 fn backtrack_assign(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     lobby_idx: usize,
-    team_a: &mut Vec<(usize, Vec<usize>)>,  // (lobby_idx, member_indices)
+    team_a: &mut Vec<(usize, Vec<usize>)>, // (lobby_idx, member_indices)
     team_b: &mut Vec<(usize, Vec<usize>)>,
     remaining_a: usize,
     remaining_b: usize,
@@ -159,7 +164,14 @@ fn backtrack_assign(
     let lobby_size = lobby.members.len();
 
     // Option 1: Skip this lobby (try matching with other lobbies)
-    if backtrack_assign(lobbies, lobby_idx + 1, team_a, team_b, remaining_a, remaining_b) {
+    if backtrack_assign(
+        lobbies,
+        lobby_idx + 1,
+        team_a,
+        team_b,
+        remaining_a,
+        remaining_b,
+    ) {
         return true;
     }
 
@@ -299,7 +311,9 @@ fn find_team_match_with_spectators(
     for lobby in lobbies {
         if lobby.members.len() >= total_needed {
             // Find requesting user's index
-            let requesting_user_idx = lobby.members.iter()
+            let requesting_user_idx = lobby
+                .members
+                .iter()
                 .position(|m| m.user_id as u32 == lobby.requesting_user_id);
 
             // Build player list: requesting user first, then others
@@ -326,14 +340,10 @@ fn find_team_match_with_spectators(
                 .collect();
 
             // Split players evenly between teams
-            let team_a_members: Vec<usize> = player_indices.iter()
-                .take(per_team)
-                .copied()
-                .collect();
-            let team_b_members: Vec<usize> = player_indices.iter()
-                .skip(per_team)
-                .copied()
-                .collect();
+            let team_a_members: Vec<usize> =
+                player_indices.iter().take(per_team).copied().collect();
+            let team_b_members: Vec<usize> =
+                player_indices.iter().skip(per_team).copied().collect();
 
             let team_assignments = vec![
                 TeamAssignment {
@@ -362,7 +372,10 @@ fn find_team_match_with_spectators(
 }
 
 /// Find an FFA combination (2+ players up to max_players)
-fn find_ffa_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby], max_players: usize) -> Option<MatchmakingCombination> {
+fn find_ffa_combination(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    max_players: usize,
+) -> Option<MatchmakingCombination> {
     trace!(
         max_players = max_players,
         lobby_count = lobbies.len(),
@@ -461,7 +474,7 @@ fn find_ffa_combination(lobbies: &[crate::matchmaking_manager::QueuedLobby], max
 
         Some(MatchmakingCombination {
             lobbies: selected,
-            team_assignments: Vec::new(),  // FFA has no teams
+            team_assignments: Vec::new(), // FFA has no teams
             spectators: Vec::new(),
             total_players: total,
             avg_mmr,
@@ -504,7 +517,7 @@ pub async fn run_matchmaking_loop(
         // For now, we'll check a few common game types
         // In production, we'd maintain a set of active game types
         let game_types = vec![
-            GameType::Solo, 
+            GameType::Solo,
             GameType::FreeForAll { max_players: 2 },
             GameType::FreeForAll { max_players: 3 },
             GameType::FreeForAll { max_players: 4 },
@@ -523,17 +536,38 @@ pub async fn run_matchmaking_loop(
             const MAX_QUEUE_AGE_SECONDS: i64 = 300;
 
             // Clean up quickmatch queue
-            if let Err(e) = matchmaking_manager.cleanup_expired_entries(game_type, &common::QueueMode::Quickmatch, MAX_QUEUE_AGE_SECONDS).await {
+            if let Err(e) = matchmaking_manager
+                .cleanup_expired_entries(
+                    game_type,
+                    &common::QueueMode::Quickmatch,
+                    MAX_QUEUE_AGE_SECONDS,
+                )
+                .await
+            {
                 error!(game_type = ?game_type, error = %e, "Failed to cleanup expired quickmatch queue entries");
             }
 
             // Clean up competitive queue
-            if let Err(e) = matchmaking_manager.cleanup_expired_entries(game_type, &common::QueueMode::Competitive, MAX_QUEUE_AGE_SECONDS).await {
+            if let Err(e) = matchmaking_manager
+                .cleanup_expired_entries(
+                    game_type,
+                    &common::QueueMode::Competitive,
+                    MAX_QUEUE_AGE_SECONDS,
+                )
+                .await
+            {
                 error!(game_type = ?game_type, error = %e, "Failed to cleanup expired competitive queue entries");
             }
 
             // Try lobby-based matchmaking for quickmatch
-            match create_lobby_matches(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Quickmatch).await {
+            match create_lobby_matches(
+                &mut matchmaking_manager,
+                &mut pubsub,
+                game_type.clone(),
+                common::QueueMode::Quickmatch,
+            )
+            .await
+            {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -552,7 +586,14 @@ pub async fn run_matchmaking_loop(
             }
 
             // Try lobby-based matchmaking for competitive
-            match create_lobby_matches(&mut matchmaking_manager, &mut pubsub, game_type.clone(), common::QueueMode::Competitive).await {
+            match create_lobby_matches(
+                &mut matchmaking_manager,
+                &mut pubsub,
+                game_type.clone(),
+                common::QueueMode::Competitive,
+            )
+            .await
+            {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -634,10 +675,11 @@ fn filter_compatible_lobbies(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     now_ms: i64,
 ) -> Vec<crate::matchmaking_manager::QueuedLobby> {
-    lobbies.iter()
+    lobbies
+        .iter()
         .filter(|lobby| {
-            lobby.lobby_id == reference_lobby.lobby_id ||
-            are_lobbies_compatible(reference_lobby, lobby, now_ms)
+            lobby.lobby_id == reference_lobby.lobby_id
+                || are_lobbies_compatible(reference_lobby, lobby, now_ms)
         })
         .cloned()
         .collect()
@@ -651,7 +693,9 @@ async fn create_lobby_matches(
     queue_mode: common::QueueMode,
 ) -> Result<usize> {
     // Get all queued lobbies for this game type and queue mode
-    let mut available_lobbies = matchmaking_manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+    let mut available_lobbies = matchmaking_manager
+        .get_queued_lobbies(&game_type, &queue_mode)
+        .await?;
 
     if available_lobbies.is_empty() {
         return Ok(0);
@@ -756,7 +800,7 @@ async fn create_lobby_matches(
                     "find_best_lobby_combination returned a combination"
                 );
                 comb
-            },
+            }
             None => {
                 // No valid combinations found from compatible lobbies
                 // This means we need to wait longer or the game type requirements can't be met
@@ -782,7 +826,9 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        ).await {
+        )
+        .await
+        {
             Ok(game_id) => {
                 games_created += 1;
                 info!(
@@ -799,16 +845,21 @@ async fn create_lobby_matches(
 
                     // Use remove_lobby_from_all_queues to ensure lobby is removed from
                     // all game type queues it was registered for (prevents double-matching)
-                    if let Err(e) = matchmaking_manager.remove_lobby_from_all_queues(lobby).await {
-                        error!("Failed to remove lobby {} from all queues: {}", lobby.lobby_id, e);
+                    if let Err(e) = matchmaking_manager
+                        .remove_lobby_from_all_queues(lobby)
+                        .await
+                    {
+                        error!(
+                            "Failed to remove lobby {} from all queues: {}",
+                            lobby.lobby_id, e
+                        );
                     }
                 }
 
                 // Publish match notifications to all lobby members
-                if let Err(e) = publish_lobby_match_notifications(
-                    &combination.lobbies,
-                    game_id,
-                ).await {
+                if let Err(e) =
+                    publish_lobby_match_notifications(&combination.lobbies, game_id).await
+                {
                     error!("Failed to publish match notifications: {}", e);
                 }
             }
@@ -856,9 +907,13 @@ async fn create_game_from_lobbies(
 
         for assignment in &combination.team_assignments {
             // Find the lobby that contains these members
-            let lobby = combination.lobbies.iter()
+            let lobby = combination
+                .lobbies
+                .iter()
                 .find(|l| l.lobby_id == assignment.lobby_id)
-                .ok_or_else(|| anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id)
+                })?;
 
             // Map each member index to their team
             for &member_idx in &assignment.member_indices {
@@ -870,9 +925,13 @@ async fn create_game_from_lobbies(
 
         // Add all assigned players to the game
         for assignment in &combination.team_assignments {
-            let lobby = combination.lobbies.iter()
+            let lobby = combination
+                .lobbies
+                .iter()
                 .find(|l| l.lobby_id == assignment.lobby_id)
-                .ok_or_else(|| anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id)
+                })?;
 
             for &member_idx in &assignment.member_indices {
                 if let Some(member) = lobby.members.get(member_idx) {
@@ -881,7 +940,9 @@ async fn create_game_from_lobbies(
 
                     // Update the snake's team_id
                     if let Some(player) = game_state.players.get(&(member.user_id as u32)) {
-                        if let Some(snake) = game_state.arena.snakes.get_mut(player.snake_id as usize) {
+                        if let Some(snake) =
+                            game_state.arena.snakes.get_mut(player.snake_id as usize)
+                        {
                             snake.team_id = Some(assignment.team_id);
                         }
                     }
@@ -919,7 +980,9 @@ async fn create_game_from_lobbies(
         partition_id,
         created_at: Utc::now().timestamp_millis(),
     };
-    matchmaking_manager.store_active_match(game_id, match_info).await?;
+    matchmaking_manager
+        .store_active_match(game_id, match_info)
+        .await?;
 
     // Publish game events
     let event = StreamEvent::GameCreated {
@@ -927,12 +990,15 @@ async fn create_game_from_lobbies(
         game_state: game_state.clone(),
     };
 
-    pubsub.publish_snapshot(partition_id, game_id, &game_state).await
+    pubsub
+        .publish_snapshot(partition_id, game_id, &game_state)
+        .await
         .context("Failed to publish initial game snapshot")?;
 
-    let serialized = serde_json::to_vec(&event)
-        .context("Failed to serialize GameCreated event")?;
-    pubsub.publish_command(partition_id, &serialized).await
+    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
+    pubsub
+        .publish_command(partition_id, &serialized)
+        .await
         .context("Failed to publish GameCreated event")?;
 
     Ok(game_id)
@@ -947,9 +1013,10 @@ async fn publish_lobby_match_notifications(
     let redis_url = std::env::var("SNAKETRON_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to open Redis client")?;
-    let mut conn = client.get_multiplexed_tokio_connection().await
+    let client = redis::Client::open(redis_url.as_str()).context("Failed to open Redis client")?;
+    let mut conn = client
+        .get_multiplexed_tokio_connection()
+        .await
         .context("Failed to get Redis connection")?;
 
     let partition_id = game_id % PARTITION_COUNT;
@@ -965,9 +1032,13 @@ async fn publish_lobby_match_notifications(
         let _: Result<i32, _> = redis::cmd("PUBLISH")
             .arg(&channel)
             .arg(notification.to_string())
-            .query_async(&mut conn).await;
+            .query_async(&mut conn)
+            .await;
 
-        info!("Published match notification to lobby {} (code: {})", lobby.lobby_id, lobby.lobby_code);
+        info!(
+            "Published match notification to lobby {} (code: {})",
+            lobby.lobby_id, lobby.lobby_code
+        );
     }
 
     Ok(())
@@ -981,7 +1052,7 @@ pub async fn create_custom_match(
     game_type: GameType,
 ) -> Result<u32> {
     let user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
-    
+
     // Generate game ID
     let game_id = matchmaking_manager.generate_game_id().await?;
     let partition_id = game_id % PARTITION_COUNT;
@@ -992,15 +1063,15 @@ pub async fn create_custom_match(
         GameType::TeamMatch { .. } => (60, 40),
         _ => (40, 40),
     };
-    
+
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
     let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
-    
+
     // Add players
     for player in &players {
         game_state.add_player(player.user_id, Some(player.username.clone()))?;
     }
-    
+
     game_state.spawn_initial_food();
 
     // Store active match
@@ -1011,28 +1082,37 @@ pub async fn create_custom_match(
         partition_id,
         created_at: Utc::now().timestamp_millis(),
     };
-    matchmaking_manager.store_active_match(game_id, match_info).await?;
+    matchmaking_manager
+        .store_active_match(game_id, match_info)
+        .await?;
 
     // Publish events
     let event = StreamEvent::GameCreated {
         game_id,
         game_state: game_state.clone(),
     };
-    
-    pubsub.publish_snapshot(partition_id, game_id, &game_state).await?;
-    
+
+    pubsub
+        .publish_snapshot(partition_id, game_id, &game_state)
+        .await?;
+
     let serialized = serde_json::to_vec(&event)?;
     pubsub.publish_command(partition_id, &serialized).await?;
-    
-    info!(game_id, partition_id, player_count = players.len(), "Custom match created");
-    
+
+    info!(
+        game_id,
+        partition_id,
+        player_count = players.len(),
+        "Custom match created"
+    );
+
     Ok(game_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_match_creation_logic() {
         // Test the match creation logic

@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 use std::fs;
-use anyhow::{Result, Context};
+use std::path::{Path, PathBuf};
 
 /// Get the standard replay directory path
 pub fn get_replay_directory() -> PathBuf {
@@ -28,16 +28,16 @@ pub fn cleanup_old_replays(days: u64) -> Result<usize> {
     if !dir.exists() {
         return Ok(0);
     }
-    
+
     let mut removed = 0;
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(days * 24 * 60 * 60))
         .context("Invalid duration")?;
-    
+
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.extension().and_then(|s| s.to_str()) == Some("replay") {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
@@ -49,6 +49,6 @@ pub fn cleanup_old_replays(days: u64) -> Result<usize> {
             }
         }
     }
-    
+
     Ok(removed)
 }

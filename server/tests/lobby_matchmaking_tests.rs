@@ -1,11 +1,11 @@
+use ::common::{GameEvent, GameType, QueueMode, TeamId};
 use anyhow::Result;
-use server::ws_server::WSMessage;
-use ::common::{GameType, GameEvent, QueueMode, TeamId};
-use tokio::time::{timeout, Duration};
 use redis::AsyncCommands;
+use server::ws_server::WSMessage;
+use tokio::time::{Duration, timeout};
 
 mod common;
-use self::common::{TestEnvironment, TestClient};
+use self::common::{TestClient, TestEnvironment};
 
 // Helper function to clean Redis state before tests
 async fn setup_test_redis() -> Result<()> {
@@ -46,18 +46,26 @@ async fn create_lobby_and_queue(
     let (lobby_id, lobby_code) = timeout(Duration::from_secs(5), async {
         loop {
             match clients[0].receive_message().await? {
-                WSMessage::LobbyCreated { lobby_id, lobby_code } => {
+                WSMessage::LobbyCreated {
+                    lobby_id,
+                    lobby_code,
+                } => {
                     return Ok::<(u32, String), anyhow::Error>((lobby_id, lobby_code));
                 }
                 _ => {}
             }
         }
-    }).await??;
+    })
+    .await??;
 
     // Other clients join the lobby using the captured lobby_code
     if clients.len() > 1 {
         for client in clients.iter_mut().skip(1) {
-            client.send_message(WSMessage::JoinLobbyByCode { lobby_code: lobby_code.clone() }).await?;
+            client
+                .send_message(WSMessage::JoinLobbyByCode {
+                    lobby_code: lobby_code.clone(),
+                })
+                .await?;
 
             // Wait for JoinedLobby confirmation
             timeout(Duration::from_secs(5), async {
@@ -69,23 +77,24 @@ async fn create_lobby_and_queue(
                         _ => {}
                     }
                 }
-            }).await??;
+            })
+            .await??;
         }
     }
 
     // Host queues for match
-    clients[0].send_message(WSMessage::QueueForMatch {
-        game_type,
-        queue_mode,
-    }).await?;
+    clients[0]
+        .send_message(WSMessage::QueueForMatch {
+            game_type,
+            queue_mode,
+        })
+        .await?;
 
     Ok((clients, lobby_id))
 }
 
 // Helper to wait for all clients to receive JoinGame and snapshot
-async fn wait_for_all_clients_to_join_game(
-    clients: &mut [TestClient],
-) -> Result<u32> {
+async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result<u32> {
     let mut game_id = None;
 
     for client in clients.iter_mut() {
@@ -114,10 +123,14 @@ async fn wait_for_all_clients_to_join_game(
                     _ => {}
                 }
             }
-        }).await??;
+        })
+        .await??;
 
         if let Some(expected_game_id) = game_id {
-            assert_eq!(client_game_id, expected_game_id, "All clients should join the same game");
+            assert_eq!(
+                client_game_id, expected_game_id,
+                "All clients should join the same game"
+            );
         } else {
             game_id = Some(client_game_id);
         }
@@ -156,7 +169,8 @@ async fn test_two_player_lobby_creates_1v1_with_split_teams() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Wait for game to be created
     let game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
@@ -188,7 +202,8 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
         &[env.user_ids()[0]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
         &env,
@@ -196,7 +211,8 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
         &[env.user_ids()[1]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -227,7 +243,8 @@ async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
         &[env.user_ids()[0]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Should NOT receive a match (timeout expected)
     let result = timeout(Duration::from_secs(5), async {
@@ -239,9 +256,13 @@ async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
                 _ => {}
             }
         }
-    }).await;
+    })
+    .await;
 
-    assert!(result.is_err(), "Single lobby should NOT be matched for 1v1");
+    assert!(
+        result.is_err(),
+        "Single lobby should NOT be matched for 1v1"
+    );
 
     println!("Single lobby correctly waiting for opponent");
 
@@ -272,7 +293,8 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1]],
         GameType::TeamMatch { per_team: 2 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
         &env,
@@ -280,7 +302,8 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
         &[env.user_ids()[2], env.user_ids()[3]],
         GameType::TeamMatch { per_team: 2 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -316,7 +339,8 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
         GameType::TeamMatch { per_team: 2 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Create 1-player lobby
     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
@@ -325,7 +349,8 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
         &[env.user_ids()[3]],
         GameType::TeamMatch { per_team: 2 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -355,10 +380,16 @@ async fn test_four_player_lobby_creates_2v2() -> Result<()> {
     let (mut clients, _lobby_id) = create_lobby_and_queue(
         &env,
         0,
-        &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2], env.user_ids()[3]],
+        &[
+            env.user_ids()[0],
+            env.user_ids()[1],
+            env.user_ids()[2],
+            env.user_ids()[3],
+        ],
         GameType::TeamMatch { per_team: 2 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Wait for game to be created
     let game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
@@ -394,7 +425,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1]],
         GameType::FreeForAll { max_players: 6 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients2, _) = create_lobby_and_queue(
         &env,
@@ -402,7 +434,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[2]],
         GameType::FreeForAll { max_players: 6 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients3, _) = create_lobby_and_queue(
         &env,
@@ -410,7 +443,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[3], env.user_ids()[4]],
         GameType::FreeForAll { max_players: 6 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -420,7 +454,10 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     // Wait for all to join the game
     let game_id = wait_for_all_clients_to_join_game(&mut all_clients).await?;
 
-    println!("FFA game created from multiple lobbies: {} (5 total players)", game_id);
+    println!(
+        "FFA game created from multiple lobbies: {} (5 total players)",
+        game_id
+    );
 
     for client in all_clients {
         client.disconnect().await?;
@@ -445,7 +482,8 @@ async fn test_ffa_respects_max_players() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients2, _) = create_lobby_and_queue(
         &env,
@@ -453,10 +491,15 @@ async fn test_ffa_respects_max_players() -> Result<()> {
         &[env.user_ids()[3], env.user_ids()[4], env.user_ids()[5]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Only the first lobby should get matched (can't fit both)
-    let result1 = timeout(Duration::from_secs(10), wait_for_all_clients_to_join_game(&mut clients1)).await;
+    let result1 = timeout(
+        Duration::from_secs(10),
+        wait_for_all_clients_to_join_game(&mut clients1),
+    )
+    .await;
 
     // Second lobby should timeout (not matched)
     let result2 = timeout(Duration::from_secs(3), async {
@@ -468,10 +511,14 @@ async fn test_ffa_respects_max_players() -> Result<()> {
                 _ => {}
             }
         }
-    }).await;
+    })
+    .await;
 
     assert!(result1.is_ok(), "First lobby should be matched");
-    assert!(result2.is_err(), "Second lobby should NOT be matched (exceeds max_players)");
+    assert!(
+        result2.is_err(),
+        "Second lobby should NOT be matched (exceeds max_players)"
+    );
 
     println!("FFA correctly respects max_players limit");
 
@@ -498,7 +545,8 @@ async fn test_ffa_minimum_players() -> Result<()> {
         &[env.user_ids()[0]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Should NOT receive a match (needs at least 2 players for FFA)
     let result = timeout(Duration::from_secs(5), async {
@@ -510,9 +558,13 @@ async fn test_ffa_minimum_players() -> Result<()> {
                 _ => {}
             }
         }
-    }).await;
+    })
+    .await;
 
-    assert!(result.is_err(), "Single player should NOT be matched for FFA");
+    assert!(
+        result.is_err(),
+        "Single player should NOT be matched for FFA"
+    );
 
     println!("FFA correctly requires minimum 2 players");
 
@@ -542,7 +594,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
         &[env.user_ids()[0]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Another lobby in Competitive
     let (mut clients2, _) = create_lobby_and_queue(
@@ -551,7 +604,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
         &[env.user_ids()[1]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Competitive,
-    ).await?;
+    )
+    .await?;
 
     // Neither should get matched together
     let result1 = timeout(Duration::from_secs(5), async {
@@ -563,7 +617,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
                 _ => {}
             }
         }
-    }).await;
+    })
+    .await;
 
     let result2 = timeout(Duration::from_secs(5), async {
         loop {
@@ -574,10 +629,13 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
                 _ => {}
             }
         }
-    }).await;
+    })
+    .await;
 
-    assert!(result1.is_err() && result2.is_err(),
-            "Quickmatch and Competitive lobbies should NOT match together");
+    assert!(
+        result1.is_err() && result2.is_err(),
+        "Quickmatch and Competitive lobbies should NOT match together"
+    );
 
     println!("Queue modes correctly separated");
 
@@ -598,8 +656,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
 /// Test that add_lobby_to_queue with multiple game types registers the lobby in all queues
 #[tokio::test]
 async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
-    use server::matchmaking_manager::MatchmakingManager;
     use server::lobby_manager::LobbyMember;
+    use server::matchmaking_manager::MatchmakingManager;
 
     setup_test_redis().await?;
 
@@ -636,11 +694,16 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
         ],
         QueueMode::Quickmatch,
         1,
-    ).await?;
+    )
+    .await?;
 
     // Verify lobby appears in both game type queues
-    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
-    let lobbies_2v2 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1 = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_2v2 = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch)
+        .await?;
 
     assert_eq!(lobbies_1v1.len(), 1, "Lobby should appear in 1v1 queue");
     assert_eq!(lobbies_2v2.len(), 1, "Lobby should appear in 2v2 queue");
@@ -650,8 +713,16 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
 
     // Verify the game_types field contains both types
     assert_eq!(lobbies_1v1[0].game_types.len(), 2);
-    assert!(lobbies_1v1[0].game_types.contains(&GameType::TeamMatch { per_team: 1 }));
-    assert!(lobbies_1v1[0].game_types.contains(&GameType::TeamMatch { per_team: 2 }));
+    assert!(
+        lobbies_1v1[0]
+            .game_types
+            .contains(&GameType::TeamMatch { per_team: 1 })
+    );
+    assert!(
+        lobbies_1v1[0]
+            .game_types
+            .contains(&GameType::TeamMatch { per_team: 2 })
+    );
 
     println!("✓ Multi-type lobby correctly appears in all queues");
     Ok(())
@@ -660,8 +731,8 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
 /// Test that remove_lobby_from_all_queues removes lobby from all game type queues
 #[tokio::test]
 async fn test_remove_lobby_from_all_queues() -> Result<()> {
-    use server::matchmaking_manager::MatchmakingManager;
     use server::lobby_manager::LobbyMember;
+    use server::matchmaking_manager::MatchmakingManager;
 
     setup_test_redis().await?;
 
@@ -671,14 +742,12 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
     let mut mm = MatchmakingManager::new(&redis_url).await?;
 
     // Create test lobby members
-    let members = vec![
-        LobbyMember {
-            user_id: 1,
-            username: "player1".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
-        },
-    ];
+    let members = vec![LobbyMember {
+        user_id: 1,
+        username: "player1".to_string(),
+        joined_at: chrono::Utc::now().timestamp_millis(),
+        is_host: true,
+    }];
 
     // Queue lobby for multiple game types
     mm.add_lobby_to_queue(
@@ -693,12 +762,22 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
         ],
         QueueMode::Quickmatch,
         1,
-    ).await?;
+    )
+    .await?;
 
     // Verify lobby is in all queues
-    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
-    let lobbies_2v2 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
-    let lobbies_ffa = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1 = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_2v2 = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_ffa = mm
+        .get_queued_lobbies(
+            &GameType::FreeForAll { max_players: 4 },
+            &QueueMode::Quickmatch,
+        )
+        .await?;
 
     assert_eq!(lobbies_1v1.len(), 1);
     assert_eq!(lobbies_2v2.len(), 1);
@@ -709,13 +788,34 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
     mm.remove_lobby_from_all_queues(queued_lobby).await?;
 
     // Verify lobby is gone from all queues
-    let lobbies_1v1_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
-    let lobbies_2v2_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
-    let lobbies_ffa_after = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1_after = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_2v2_after = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_ffa_after = mm
+        .get_queued_lobbies(
+            &GameType::FreeForAll { max_players: 4 },
+            &QueueMode::Quickmatch,
+        )
+        .await?;
 
-    assert_eq!(lobbies_1v1_after.len(), 0, "Lobby should be removed from 1v1 queue");
-    assert_eq!(lobbies_2v2_after.len(), 0, "Lobby should be removed from 2v2 queue");
-    assert_eq!(lobbies_ffa_after.len(), 0, "Lobby should be removed from FFA queue");
+    assert_eq!(
+        lobbies_1v1_after.len(),
+        0,
+        "Lobby should be removed from 1v1 queue"
+    );
+    assert_eq!(
+        lobbies_2v2_after.len(),
+        0,
+        "Lobby should be removed from 2v2 queue"
+    );
+    assert_eq!(
+        lobbies_ffa_after.len(),
+        0,
+        "Lobby should be removed from FFA queue"
+    );
 
     println!("✓ Lobby correctly removed from all queues");
     Ok(())
@@ -724,8 +824,8 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
 /// Test that get_queued_lobbies deduplicates lobbies appearing in multiple queues
 #[tokio::test]
 async fn test_get_queued_lobbies_deduplication() -> Result<()> {
-    use server::matchmaking_manager::MatchmakingManager;
     use server::lobby_manager::LobbyMember;
+    use server::matchmaking_manager::MatchmakingManager;
 
     setup_test_redis().await?;
 
@@ -759,7 +859,8 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
         vec![GameType::TeamMatch { per_team: 1 }],
         QueueMode::Quickmatch,
         1,
-    ).await?;
+    )
+    .await?;
 
     // Queue a different lobby for 1v1 as well (to verify we get both)
     mm.add_lobby_to_queue(
@@ -770,10 +871,13 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
         vec![GameType::TeamMatch { per_team: 1 }],
         QueueMode::Quickmatch,
         2,
-    ).await?;
+    )
+    .await?;
 
     // Get lobbies - should return exactly 2 unique lobbies
-    let lobbies = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
 
     assert_eq!(lobbies.len(), 2, "Should return exactly 2 unique lobbies");
 
@@ -788,8 +892,8 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
 /// Test that when a lobby is matched in one queue, it doesn't get matched again in another
 #[tokio::test]
 async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
-    use server::matchmaking_manager::MatchmakingManager;
     use server::lobby_manager::LobbyMember;
+    use server::matchmaking_manager::MatchmakingManager;
 
     setup_test_redis().await?;
 
@@ -799,23 +903,19 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
     let mut mm = MatchmakingManager::new(&redis_url).await?;
 
     // Create test lobby members
-    let members1 = vec![
-        LobbyMember {
-            user_id: 1,
-            username: "player1".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
-        },
-    ];
+    let members1 = vec![LobbyMember {
+        user_id: 1,
+        username: "player1".to_string(),
+        joined_at: chrono::Utc::now().timestamp_millis(),
+        is_host: true,
+    }];
 
-    let members2 = vec![
-        LobbyMember {
-            user_id: 2,
-            username: "player2".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
-        },
-    ];
+    let members2 = vec![LobbyMember {
+        user_id: 2,
+        username: "player2".to_string(),
+        joined_at: chrono::Utc::now().timestamp_millis(),
+        is_host: true,
+    }];
 
     let members3 = vec![
         LobbyMember {
@@ -844,7 +944,8 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
         ],
         QueueMode::Quickmatch,
         1,
-    ).await?;
+    )
+    .await?;
 
     mm.add_lobby_to_queue(
         2,
@@ -857,7 +958,8 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
         ],
         QueueMode::Quickmatch,
         2,
-    ).await?;
+    )
+    .await?;
 
     // Also add a 2-player lobby just for 2v2
     mm.add_lobby_to_queue(
@@ -868,21 +970,32 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
         vec![GameType::TeamMatch { per_team: 2 }],
         QueueMode::Quickmatch,
         3,
-    ).await?;
+    )
+    .await?;
 
     // Get lobbies for 1v1 - should find lobbies 1 and 2
-    let lobbies_1v1_before = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1_before = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
     assert_eq!(lobbies_1v1_before.len(), 2);
 
     // Simulate matching lobbies 1 and 2 for 1v1 by removing them
-    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[0]).await?;
-    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[1]).await?;
+    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[0])
+        .await?;
+    mm.remove_lobby_from_all_queues(&lobbies_1v1_before[1])
+        .await?;
 
     // Now check 2v2 queue - lobbies 1 and 2 should be GONE
-    let lobbies_2v2_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch).await?;
+    let lobbies_2v2_after = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 2 }, &QueueMode::Quickmatch)
+        .await?;
 
     // Should only have lobby 3 left
-    assert_eq!(lobbies_2v2_after.len(), 1, "Only lobby 3 should remain in 2v2 queue");
+    assert_eq!(
+        lobbies_2v2_after.len(),
+        1,
+        "Only lobby 3 should remain in 2v2 queue"
+    );
     assert_eq!(lobbies_2v2_after[0].lobby_id, 3);
 
     println!("✓ No double-matching: matched lobbies removed from all queues");
@@ -907,7 +1020,8 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
         &[env.user_ids()[0]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let (mut clients2, _lobby_id2) = create_lobby_and_queue(
         &env,
@@ -915,7 +1029,8 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
         &[env.user_ids()[1]],
         GameType::TeamMatch { per_team: 1 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -924,7 +1039,10 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
     // Wait for both to join the same game
     let game_id = wait_for_all_clients_to_join_game(&mut all_clients).await?;
 
-    println!("✓ Multi-type lobbies successfully matched for 1v1: {}", game_id);
+    println!(
+        "✓ Multi-type lobbies successfully matched for 1v1: {}",
+        game_id
+    );
 
     for client in all_clients {
         client.disconnect().await?;
@@ -936,8 +1054,8 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
 /// Test that a lobby in multiple queues gets properly cleaned up after matching
 #[tokio::test]
 async fn test_cleanup_after_match_creation() -> Result<()> {
-    use server::matchmaking_manager::MatchmakingManager;
     use server::lobby_manager::LobbyMember;
+    use server::matchmaking_manager::MatchmakingManager;
 
     setup_test_redis().await?;
 
@@ -948,14 +1066,12 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
 
     // Create three single-player lobbies, all queued for both 1v1 and FFA
     for i in 1..=3 {
-        let members = vec![
-            LobbyMember {
-                user_id: i,
-                username: format!("player{}", i),
-                joined_at: chrono::Utc::now().timestamp_millis(),
-                is_host: true,
-            },
-        ];
+        let members = vec![LobbyMember {
+            user_id: i,
+            username: format!("player{}", i),
+            joined_at: chrono::Utc::now().timestamp_millis(),
+            is_host: true,
+        }];
 
         mm.add_lobby_to_queue(
             i,
@@ -968,12 +1084,20 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
             ],
             QueueMode::Quickmatch,
             i as u32,
-        ).await?;
+        )
+        .await?;
     }
 
     // Verify all 3 lobbies are in both queues
-    let lobbies_1v1 = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
-    let lobbies_ffa = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1 = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_ffa = mm
+        .get_queued_lobbies(
+            &GameType::FreeForAll { max_players: 4 },
+            &QueueMode::Quickmatch,
+        )
+        .await?;
 
     assert_eq!(lobbies_1v1.len(), 3);
     assert_eq!(lobbies_ffa.len(), 3);
@@ -983,11 +1107,26 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
     mm.remove_lobby_from_all_queues(&lobbies_1v1[1]).await?;
 
     // Verify lobbies 1 and 2 are removed from BOTH queues
-    let lobbies_1v1_after = mm.get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch).await?;
-    let lobbies_ffa_after = mm.get_queued_lobbies(&GameType::FreeForAll { max_players: 4 }, &QueueMode::Quickmatch).await?;
+    let lobbies_1v1_after = mm
+        .get_queued_lobbies(&GameType::TeamMatch { per_team: 1 }, &QueueMode::Quickmatch)
+        .await?;
+    let lobbies_ffa_after = mm
+        .get_queued_lobbies(
+            &GameType::FreeForAll { max_players: 4 },
+            &QueueMode::Quickmatch,
+        )
+        .await?;
 
-    assert_eq!(lobbies_1v1_after.len(), 1, "Only lobby 3 should remain in 1v1 queue");
-    assert_eq!(lobbies_ffa_after.len(), 1, "Only lobby 3 should remain in FFA queue");
+    assert_eq!(
+        lobbies_1v1_after.len(),
+        1,
+        "Only lobby 3 should remain in 1v1 queue"
+    );
+    assert_eq!(
+        lobbies_ffa_after.len(),
+        1,
+        "Only lobby 3 should remain in FFA queue"
+    );
 
     assert_eq!(lobbies_1v1_after[0].lobby_id, 3);
     assert_eq!(lobbies_ffa_after[0].lobby_id, 3);

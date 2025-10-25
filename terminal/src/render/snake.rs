@@ -1,4 +1,4 @@
-use common::{Snake, Position};
+use common::{Position, Snake};
 
 pub struct SnakeRenderer;
 
@@ -8,18 +8,18 @@ impl SnakeRenderer {
         if snake.body.len() < 2 {
             return snake.body.clone();
         }
-        
+
         let mut positions = Vec::new();
-        
+
         // Process each segment between consecutive body points
         for (i, window) in snake.body.windows(2).enumerate() {
             let start = &window[0];
             let end = &window[1];
-            
+
             // For the first segment, always include the start point
             // For subsequent segments, skip the start point (it's already added as the end of previous segment)
             let skip_start = i > 0;
-            
+
             // Generate all positions between start and end
             if start.x == end.x {
                 // Vertical segment
@@ -60,7 +60,7 @@ impl SnakeRenderer {
                 positions.push(*end);
             }
         }
-        
+
         positions
     }
 }

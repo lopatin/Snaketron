@@ -1,5 +1,5 @@
-pub mod snake;
-pub mod types;
-pub mod traits;
-pub mod standard_renderer;
 pub mod arena;
+pub mod snake;
+pub mod standard_renderer;
+pub mod traits;
+pub mod types;

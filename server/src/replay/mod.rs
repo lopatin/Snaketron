@@ -1,19 +1,19 @@
-use std::path::PathBuf;
-use std::time::SystemTime;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
-use serde::{Serialize, Deserialize};
-use anyhow::{Result, Context};
 
-use common::{GameState, GameEventMessage, GameStatus};
+use common::{GameEventMessage, GameState, GameStatus};
 
-mod recorder;
-mod listener;
 pub mod directory;
+mod listener;
+mod recorder;
 
-pub use recorder::GameReplayRecorder;
 pub use listener::ReplayListener;
+pub use recorder::GameReplayRecorder;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedEvent {

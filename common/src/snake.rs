@@ -1,6 +1,6 @@
-use anyhow::{Result, Context};
-use serde::{Deserialize, Serialize};
 use crate::TeamId;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
 pub enum Direction {
@@ -15,10 +15,10 @@ impl Direction {
     pub fn is_opposite(&self, other: &Direction) -> bool {
         matches!(
             (self, other),
-            (Direction::Up, Direction::Down) |
-            (Direction::Down, Direction::Up) |
-            (Direction::Left, Direction::Right) |
-            (Direction::Right, Direction::Left)
+            (Direction::Up, Direction::Down)
+                | (Direction::Down, Direction::Up)
+                | (Direction::Left, Direction::Right)
+                | (Direction::Right, Direction::Left)
         )
     }
 }
@@ -31,8 +31,8 @@ pub struct Position {
 
 impl Position {
     pub fn is_between(&self, p1: &Position, p2: &Position) -> bool {
-        (self.x >= p1.x && self.x <= p2.x || self.x <= p1.x && self.x >= p2.x) &&
-        (self.y >= p1.y && self.y <= p2.y || self.y <= p1.y && self.y >= p2.y)
+        (self.x >= p1.x && self.x <= p2.x || self.x <= p1.x && self.x >= p2.x)
+            && (self.y >= p1.y && self.y <= p2.y || self.y <= p1.y && self.y >= p2.y)
     }
 }
 
@@ -54,7 +54,6 @@ pub struct Snake {
 }
 
 impl Snake {
-
     pub fn head(&self) -> Result<&Position> {
         self.body.get(0).context("Snake has no head")
     }
@@ -77,7 +76,10 @@ impl Snake {
         };
 
         // New head position
-        let p0 = Position { x: new_head_x, y: new_head_y };
+        let p0 = Position {
+            x: new_head_x,
+            y: new_head_y,
+        };
         let p1 = self.body[0];
         let p2 = self.body[1];
 
@@ -124,7 +126,7 @@ impl Snake {
             self.iter_body().any(|(p1, p2)| point.is_between(p1, p2))
         }
     }
-    
+
     pub fn is_head(&self, point: &Position) -> bool {
         if let Some(head) = self.body.first() {
             *head == *point
@@ -133,16 +135,16 @@ impl Snake {
         }
     }
 
-    pub fn iter_body(&self) -> impl Iterator<Item=(&Position, &Position)> {
+    pub fn iter_body(&self) -> impl Iterator<Item = (&Position, &Position)> {
         self.body.iter().zip(self.body.iter().skip(1))
     }
-    
+
     /// Calculate the actual length of the snake (number of grid cells it occupies)
     pub fn length(&self) -> usize {
         if self.body.len() < 2 {
             return self.body.len();
         }
-        
+
         let mut length = 0;
         for (p1, p2) in self.iter_body() {
             // Calculate Manhattan distance between consecutive points
@@ -152,4 +154,3 @@ impl Snake {
         length + 1 // Add 1 for the head
     }
 }
-

@@ -1,4 +1,4 @@
-use common::{Arena, Snake, Position, Direction};
+use common::{Arena, Direction, Position, Snake};
 use terminal::render::{
     arena::ArenaRenderer,
     standard_renderer::StandardRenderer,
@@ -11,17 +11,15 @@ fn test_2x1_rendering() {
     let mut arena = Arena {
         width: 10,
         height: 10,
-        snakes: vec![
-            Snake {
-                body: vec![
-                    Position { x: 5, y: 5 },  // head
-                    Position { x: 4, y: 5 },  // turn/tail
-                ],
-                direction: Direction::Right,
-                is_alive: true,
-                food: 0,
-            }
-        ],
+        snakes: vec![Snake {
+            body: vec![
+                Position { x: 5, y: 5 }, // head
+                Position { x: 4, y: 5 }, // turn/tail
+            ],
+            direction: Direction::Right,
+            is_alive: true,
+            food: 0,
+        }],
         food: vec![Position { x: 7, y: 7 }],
     };
 
@@ -29,14 +27,16 @@ fn test_2x1_rendering() {
     let char_dims = CharDimensions::new(2, 1);
     let renderer = StandardRenderer::new(char_dims);
     let arena_renderer = ArenaRenderer::new(renderer);
-    let config = RenderConfig { chars_per_point: char_dims };
+    let config = RenderConfig {
+        chars_per_point: char_dims,
+    };
 
     // Render the arena
     let char_grid = arena_renderer.render(&arena, &config);
     let lines = char_grid.into_lines();
 
     // Verify dimensions
-    assert_eq!(lines.len(), 10);  // height remains same
+    assert_eq!(lines.len(), 10); // height remains same
     assert_eq!(lines[0].len(), 20); // width doubled (10 * 2)
 
     // Verify snake head is rendered (at position 5,5 -> chars 10,11 at row 5)
@@ -58,17 +58,12 @@ fn test_1x1_rendering() {
     let arena = Arena {
         width: 5,
         height: 5,
-        snakes: vec![
-            Snake {
-                body: vec![
-                    Position { x: 2, y: 2 },
-                    Position { x: 1, y: 2 },
-                ],
-                direction: Direction::Right,
-                is_alive: true,
-                food: 0,
-            }
-        ],
+        snakes: vec![Snake {
+            body: vec![Position { x: 2, y: 2 }, Position { x: 1, y: 2 }],
+            direction: Direction::Right,
+            is_alive: true,
+            food: 0,
+        }],
         food: vec![Position { x: 3, y: 3 }],
     };
 
@@ -76,7 +71,9 @@ fn test_1x1_rendering() {
     let char_dims = CharDimensions::new(1, 1);
     let renderer = StandardRenderer::new(char_dims);
     let arena_renderer = ArenaRenderer::new(renderer);
-    let config = RenderConfig { chars_per_point: char_dims };
+    let config = RenderConfig {
+        chars_per_point: char_dims,
+    };
 
     // Render the arena
     let char_grid = arena_renderer.render(&arena, &config);
@@ -109,13 +106,15 @@ fn test_custom_dimensions() {
     let char_dims = CharDimensions::new(3, 2);
     let renderer = StandardRenderer::new(char_dims);
     let arena_renderer = ArenaRenderer::new(renderer);
-    let config = RenderConfig { chars_per_point: char_dims };
+    let config = RenderConfig {
+        chars_per_point: char_dims,
+    };
 
     let char_grid = arena_renderer.render(&arena, &config);
     let lines = char_grid.into_lines();
 
     // Verify dimensions
-    assert_eq!(lines.len(), 6);  // 3 * 2
+    assert_eq!(lines.len(), 6); // 3 * 2
     assert_eq!(lines[0].len(), 9); // 3 * 3
 
     // Food should be rendered with checkerboard pattern at position (1,1)

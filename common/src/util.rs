@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 
 // Simple pseudorandom number generator using xorshift algorithm
@@ -13,7 +12,7 @@ impl PseudoRandom {
         let state = if seed == 0 { 0x1234567890abcdef } else { seed };
         PseudoRandom { state }
     }
-    
+
     pub fn next_u32(&mut self) -> u32 {
         // xorshift64 algorithm
         self.state ^= self.state << 13;
@@ -21,11 +20,11 @@ impl PseudoRandom {
         self.state ^= self.state << 5;
         (self.state >> 32) as u32
     }
-    
+
     pub fn next_u16(&mut self) -> u16 {
         self.next_u32() as u16
     }
-    
+
     pub fn next_u64(&mut self) -> u64 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 17;
@@ -37,7 +36,7 @@ impl PseudoRandom {
     pub fn next_f32(&mut self) -> f32 {
         // Use upper 24 bits of next_u32 for better distribution
         let value = (self.next_u32() >> 8) as f32;
-        value / 16777216.0  // 2^24
+        value / 16777216.0 // 2^24
     }
 
     /// Generate a normally distributed random value using Box-Muller transform
@@ -54,4 +53,3 @@ impl PseudoRandom {
         mean + z0 * std_dev
     }
 }
-

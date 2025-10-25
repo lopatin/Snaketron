@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Extension, Json, State},
-    http::{StatusCode, header, HeaderValue},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{DEFAULT_COST, hash, verify};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -84,7 +84,7 @@ pub struct AppError(anyhow::Error);
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         error!("API error: {:?}", self.0);
-        
+
         let (status, message) = match self.0.to_string().as_str() {
             msg if msg.contains("Username already exists") => {
                 (StatusCode::CONFLICT, "Username already exists")
@@ -92,9 +92,7 @@ impl IntoResponse for AppError {
             msg if msg.contains("Invalid username or password") => {
                 (StatusCode::UNAUTHORIZED, "Invalid username or password")
             }
-            msg if msg.contains("User not found") => {
-                (StatusCode::NOT_FOUND, "User not found")
-            }
+            msg if msg.contains("User not found") => (StatusCode::NOT_FOUND, "User not found"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
@@ -118,29 +116,34 @@ where
 /// Validates username format
 /// - Must be 3-20 characters long
 /// - Can only contain alphanumeric characters, underscores, and hyphens
-fn validate_username(username: &str) -> Vec<String> {
+pub fn validate_username(username: &str) -> Vec<String> {
     let mut errors = Vec::new();
-    
+
     if username.len() < 3 {
         errors.push("Username must be at least 3 characters long".to_string());
     }
-    
+
     if username.len() > 20 {
         errors.push("Username must be at most 20 characters long".to_string());
     }
-    
-    if !username.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        errors.push("Username can only contain letters, numbers, underscores, and hyphens".to_string());
+
+    if !username
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        errors.push(
+            "Username can only contain letters, numbers, underscores, and hyphens".to_string(),
+        );
     }
-    
+
     if username.starts_with('_') || username.starts_with('-') {
         errors.push("Username cannot start with underscore or hyphen".to_string());
     }
-    
+
     if username.ends_with('_') || username.ends_with('-') {
         errors.push("Username cannot end with underscore or hyphen".to_string());
     }
-    
+
     errors
 }
 
@@ -165,11 +168,13 @@ pub async fn register(
     }
 
     // Hash password
-    let password_hash = hash(&req.password, DEFAULT_COST)
-        .context("Failed to hash password")?;
+    let password_hash = hash(&req.password, DEFAULT_COST).context("Failed to hash password")?;
 
     // Create user
-    let user = state.db.create_user(&req.username, &password_hash, 1000).await?;
+    let user = state
+        .db
+        .create_user(&req.username, &password_hash, 1000)
+        .await?;
 
     let user_info = UserInfo {
         id: user.id,
@@ -179,7 +184,9 @@ pub async fn register(
     };
 
     // Generate JWT token
-    let token = state.jwt_manager.generate_token(user_info.id, &user_info.username)?;
+    let token = state
+        .jwt_manager
+        .generate_token(user_info.id, &user_info.username)?;
 
     info!("User registered successfully: {}", user_info.username);
 
@@ -187,15 +194,15 @@ pub async fn register(
     let mut response = Json(AuthResponse {
         token,
         user: user_info,
-    }).into_response();
+    })
+    .into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache")
-    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
 
     Ok(response)
 }
@@ -205,12 +212,15 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     // Find user by username
-    let user = state.db.get_user_by_username(&req.username).await?
+    let user = state
+        .db
+        .get_user_by_username(&req.username)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Invalid username or password"))?;
 
     // Verify password
-    let is_valid = verify(&req.password, &user.password_hash)
-        .context("Failed to verify password")?;
+    let is_valid =
+        verify(&req.password, &user.password_hash).context("Failed to verify password")?;
 
     if !is_valid {
         return Err(anyhow::anyhow!("Invalid username or password").into());
@@ -224,7 +234,9 @@ pub async fn login(
     };
 
     // Generate JWT token
-    let token = state.jwt_manager.generate_token(user_info.id, &user_info.username)?;
+    let token = state
+        .jwt_manager
+        .generate_token(user_info.id, &user_info.username)?;
 
     info!("User logged in successfully: {}", user_info.username);
 
@@ -232,15 +244,15 @@ pub async fn login(
     let mut response = Json(AuthResponse {
         token,
         user: user_info,
-    }).into_response();
+    })
+    .into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache")
-    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
 
     Ok(response)
 }
@@ -249,7 +261,10 @@ pub async fn get_current_user(
     State(state): State<AuthState>,
     Extension(auth_user): Extension<AuthUser>, // Extract AuthUser from JWT by middleware
 ) -> Result<Response, AppError> {
-    let user = state.db.get_user_by_id(auth_user.user_id).await?
+    let user = state
+        .db
+        .get_user_by_id(auth_user.user_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
     let user_info = UserInfo {
@@ -263,16 +278,14 @@ pub async fn get_current_user(
     let mut response = Json(user_info).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache")
-    );
-    response.headers_mut().insert(
-        header::EXPIRES,
-        HeaderValue::from_static("0")
-    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert(header::EXPIRES, HeaderValue::from_static("0"));
 
     Ok(response)
 }
@@ -283,7 +296,7 @@ pub async fn check_username(
 ) -> Result<Json<CheckUsernameResponse>, AppError> {
     // Validate username format
     let mut errors = validate_username(&req.username);
-    
+
     // If format is valid, check if username exists in database
     if errors.is_empty() {
         let existing_user = state.db.get_user_by_username(&req.username).await?;
@@ -291,16 +304,15 @@ pub async fn check_username(
             errors.push("Username is already taken".to_string());
         }
     }
-    
+
     let available = errors.is_empty();
-    
-    info!("Username availability check for '{}': available={}, errors={:?}", 
-          req.username, available, errors);
-    
-    Ok(Json(CheckUsernameResponse {
-        available,
-        errors,
-    }))
+
+    info!(
+        "Username availability check for '{}': available={}, errors={:?}",
+        req.username, available, errors
+    );
+
+    Ok(Json(CheckUsernameResponse { available, errors }))
 }
 
 pub async fn create_guest(
@@ -317,7 +329,10 @@ pub async fn create_guest(
     let guest_token = uuid::Uuid::new_v4().to_string();
 
     // Create guest user (starting MMR of 1000)
-    let user = state.db.create_guest_user(&req.nickname, &guest_token, 1000).await?;
+    let user = state
+        .db
+        .create_guest_user(&req.nickname, &guest_token, 1000)
+        .await?;
 
     let user_info = GuestUserInfo {
         id: user.id,
@@ -327,23 +342,29 @@ pub async fn create_guest(
     };
 
     // Generate JWT token (includes guest flag)
-    let token = state.jwt_manager.generate_token_with_guest(user_info.id, &user_info.username, true)?;
+    let token =
+        state
+            .jwt_manager
+            .generate_token_with_guest(user_info.id, &user_info.username, true)?;
 
-    info!("Guest user created successfully: {} (id: {})", user_info.username, user_info.id);
+    info!(
+        "Guest user created successfully: {} (id: {})",
+        user_info.username, user_info.id
+    );
 
     // Build response with cache-control headers
     let mut response = Json(CreateGuestResponse {
         token,
         user: user_info,
-    }).into_response();
+    })
+    .into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate, private")
+        HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache")
-    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
 
     Ok(response)
 }

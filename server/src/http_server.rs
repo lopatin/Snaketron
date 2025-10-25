@@ -1,26 +1,26 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::{ws::WebSocketUpgrade, State},
+    Router,
+    extract::{State, ws::WebSocketUpgrade},
     middleware,
     response::IntoResponse,
     routing::{get, post},
-    Router,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
-use crate::db::Database;
 use crate::api::auth::{self, AuthState};
 use crate::api::jwt::JwtManager;
 use crate::api::middleware::auth_middleware;
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
-use crate::ws_server::{JwtVerifier, handle_websocket};
-use crate::replication::ReplicationManager;
-use crate::region_cache::RegionCache;
+use crate::db::Database;
 use crate::lobby_manager::LobbyManager;
+use crate::region_cache::RegionCache;
+use crate::replication::ReplicationManager;
+use crate::ws_server::{JwtVerifier, handle_websocket};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -95,10 +95,7 @@ pub async fn run_http_server(
     );
 
     // Start background task to broadcast user counts to WebSocket clients every 5 seconds
-    spawn_user_count_broadcaster(
-        redis_url.clone(),
-        cancellation_token.clone(),
-    );
+    spawn_user_count_broadcaster(redis_url.clone(), cancellation_token.clone());
 
     // Create auth state for API routes
     let auth_state = AuthState {
@@ -136,12 +133,12 @@ pub async fn run_http_server(
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/guest", post(auth::create_guest))
-        .route("/api/auth/check-username",
-            post(auth::check_username)
-                .layer(middleware::from_fn_with_state(
-                    username_check_limiter,
-                    rate_limit_middleware,
-                ))
+        .route(
+            "/api/auth/check-username",
+            post(auth::check_username).layer(middleware::from_fn_with_state(
+                username_check_limiter,
+                rate_limit_middleware,
+            )),
         )
         .merge(protected_routes)
         .merge(region_routes)
@@ -194,7 +191,8 @@ async fn websocket_handler(
             state.cancellation_token,
             state.lobby_manager,
             state.region,
-        ).await;
+        )
+        .await;
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -247,24 +245,25 @@ async fn update_redis_metrics(
 ) -> Result<()> {
     use redis::AsyncCommands;
 
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for metrics")?;
+    let client =
+        redis::Client::open(redis_url).context("Failed to open Redis client for metrics")?;
 
-    let mut conn = client.get_multiplexed_async_connection().await
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
         .context("Failed to get Redis connection for metrics")?;
 
     // Set user count with 10-second TTL (auto-cleanup for dead servers)
-    let _: () = conn.set_ex(
-        format!("server:{}:user_count", server_id),
-        count,
-        10,
-    ).await.context("Failed to set user count in Redis")?;
+    let _: () = conn
+        .set_ex(format!("server:{}:user_count", server_id), count, 10)
+        .await
+        .context("Failed to set user count in Redis")?;
 
     // Set region (no TTL, persistent)
-    let _: () = conn.set(
-        format!("server:{}:region", server_id),
-        region,
-    ).await.context("Failed to set region in Redis")?;
+    let _: () = conn
+        .set(format!("server:{}:region", server_id), region)
+        .await
+        .context("Failed to set region in Redis")?;
 
     Ok(())
 }
@@ -299,10 +298,12 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
     use std::collections::HashMap;
 
     // Create Redis client
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for broadcasting")?;
+    let client =
+        redis::Client::open(redis_url).context("Failed to open Redis client for broadcasting")?;
 
-    let mut conn = client.get_multiplexed_async_connection().await
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
         .context("Failed to get Redis connection for broadcasting")?;
 
     // Query all server user count keys
@@ -316,11 +317,7 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
 
     for key in server_keys {
         // Get user count for this server
-        let count: u32 = match redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-        {
+        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
             Ok(count) => count,
             Err(e) => {
                 tracing::warn!("Failed to get user count for {}: {}", key, e);
@@ -353,10 +350,12 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
     }
 
     // Serialize and publish to Redis channel
-    let message = serde_json::to_string(&region_counts)
-        .context("Failed to serialize user counts")?;
+    let message =
+        serde_json::to_string(&region_counts).context("Failed to serialize user counts")?;
 
-    let _: () = conn.publish("user_count_updates", message).await
+    let _: () = conn
+        .publish("user_count_updates", message)
+        .await
         .context("Failed to publish user counts")?;
 
     tracing::trace!("Broadcasted user counts: {:?}", region_counts);

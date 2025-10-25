@@ -1,4 +1,4 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::error;
@@ -22,9 +22,7 @@ pub struct HealthResponse {
 
 /// List all available regions with connection metadata
 /// Regions are dynamically discovered from DynamoDB by scanning for active servers
-pub async fn list_regions(
-    State(state): State<HttpServerState>,
-) -> Json<Vec<RegionMetadata>> {
+pub async fn list_regions(State(state): State<HttpServerState>) -> Json<Vec<RegionMetadata>> {
     let regions = state.region_cache.get_regions().await;
     Json(regions)
 }
@@ -35,9 +33,7 @@ pub async fn list_regions(
 /// Redis schema:
 /// - Key: server:{server_id}:user_count -> Value: <count>
 /// - Key: server:{server_id}:region -> Value: <region_id>
-pub async fn get_user_counts(
-    State(state): State<HttpServerState>,
-) -> Json<HashMap<String, u32>> {
+pub async fn get_user_counts(State(state): State<HttpServerState>) -> Json<HashMap<String, u32>> {
     // Create Redis client
     let redis_client = match redis::Client::open(state.redis_url.as_str()) {
         Ok(client) => client,
@@ -72,11 +68,7 @@ pub async fn get_user_counts(
 
     for key in server_keys {
         // Get user count for this server
-        let count: u32 = match redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-        {
+        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
             Ok(count) => count,
             Err(e) => {
                 error!("Failed to get user count for {}: {}", key, e);

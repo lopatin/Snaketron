@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use std::{
     collections::HashMap,
@@ -26,7 +26,7 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Creates a new rate limiter
-    /// 
+    ///
     /// # Arguments
     /// * `max_requests` - Maximum number of requests allowed per window
     /// * `window` - Time window for rate limiting
@@ -42,13 +42,13 @@ impl RateLimiter {
     pub async fn check_request(&self, ip: String) -> bool {
         let mut requests = self.requests.lock().await;
         let now = Instant::now();
-        
+
         // Get or create request history for this IP
         let request_times = requests.entry(ip.clone()).or_insert_with(Vec::new);
-        
+
         // Remove old requests outside the window
         request_times.retain(|&time| now.duration_since(time) < self.window);
-        
+
         // Check if we're under the limit
         if request_times.len() < self.max_requests {
             request_times.push(now);
@@ -63,7 +63,7 @@ impl RateLimiter {
     pub async fn cleanup(&self) {
         let mut requests = self.requests.lock().await;
         let now = Instant::now();
-        
+
         // Remove IPs that haven't made requests recently
         requests.retain(|_, times| {
             times.retain(|&time| now.duration_since(time) < self.window);
@@ -83,14 +83,14 @@ fn get_client_ip(headers: &HeaderMap) -> String {
             }
         }
     }
-    
+
     // Try to get IP from X-Real-IP header
     if let Some(real_ip) = headers.get("x-real-ip") {
         if let Ok(value) = real_ip.to_str() {
             return value.to_string();
         }
     }
-    
+
     // Default to a placeholder if we can't determine the IP
     // In production, you might want to use the actual socket address
     "unknown".to_string()
@@ -104,23 +104,24 @@ pub async fn rate_limit_middleware(
 ) -> Response {
     let headers = request.headers().clone();
     let ip = get_client_ip(&headers);
-    
+
     if !limiter.check_request(ip).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
                 "error": "Too many requests. Please try again later."
             })),
-        ).into_response();
+        )
+            .into_response();
     }
-    
+
     next.run(request).await
 }
 
 /// Creates a rate limiting layer for specific routes
 pub fn rate_limit_layer(max_requests: usize, window_seconds: u64) -> RateLimiter {
     let limiter = RateLimiter::new(max_requests, Duration::from_secs(window_seconds));
-    
+
     // Spawn a cleanup task that runs periodically
     let cleanup_limiter = limiter.clone();
     tokio::spawn(async move {
@@ -130,6 +131,6 @@ pub fn rate_limit_layer(max_requests: usize, window_seconds: u64) -> RateLimiter
             cleanup_limiter.cleanup().await;
         }
     });
-    
+
     limiter
 }

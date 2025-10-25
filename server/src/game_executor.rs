@@ -1,15 +1,18 @@
-use anyhow::{Result, Context};
+use crate::db::Database;
+use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotRequest};
+use crate::xp_persistence;
+use anyhow::{Context, Result};
+use common::{
+    EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
+    GameState, GameStatus,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, error, warn, debug};
-use common::{GameEngine, GameEvent, GameEventMessage, GameStatus, GameCommandMessage, GameState, EXECUTOR_POLL_INTERVAL_MS};
-use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
-use std::collections::HashMap;
-use crate::pubsub_manager::{PubSubManager, SnapshotRequest, PartitionSubscription};
-use crate::db::Database;
-use crate::xp_persistence;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 pub const PARTITION_COUNT: u32 = 10;
 pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks (1 second at 100ms tick rate)
@@ -17,19 +20,19 @@ pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks 
 /// Events that can be sent through PubSub
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
-    GameCreated { 
-        game_id: u32, 
-        game_state: GameState 
+    GameCreated {
+        game_id: u32,
+        game_state: GameState,
     },
-    GameCommandSubmitted { 
-        game_id: u32, 
-        user_id: u32, 
-        command: GameCommandMessage 
+    GameCommandSubmitted {
+        game_id: u32,
+        user_id: u32,
+        command: GameCommandMessage,
     },
     GameEvent(GameEventMessage),
-    StatusUpdated { 
-        game_id: u32, 
-        status: GameStatus 
+    StatusUpdated {
+        game_id: u32,
+        status: GameStatus,
     },
 }
 
@@ -46,54 +49,61 @@ async fn run_game(
 ) {
     info!("run_game called for game {}", game_id);
     let partition_id = game_id % PARTITION_COUNT;
-    
+
     // Create the game engine from the provided game state
     let _start_ms = chrono::Utc::now().timestamp_millis();
-    
+
     // If the game is in Stopped status, start it before creating the engine
     let mut initial_state = game_state;
     if matches!(initial_state.status, GameStatus::Stopped) {
         info!("Game {} is in Stopped status, starting it", game_id);
         initial_state.status = GameStatus::Started { server_id };
-        
+
         // Emit status update event
         let status_event = GameEventMessage {
             game_id,
             tick: initial_state.tick,
             sequence: initial_state.event_sequence + 1,
             user_id: None,
-            event: GameEvent::StatusUpdated { 
-                status: GameStatus::Started { server_id }
+            event: GameEvent::StatusUpdated {
+                status: GameStatus::Started { server_id },
             },
         };
-        
+
         if let Err(e) = pubsub.publish_event(partition_id, &status_event).await {
             error!("Failed to publish game started status: {}", e);
         }
     }
-    
+
     let mut engine = GameEngine::new_from_state(game_id, initial_state);
-    info!("Created game engine for game {} with status: {:?}", game_id, engine.get_committed_state().status);
+    info!(
+        "Created game engine for game {} with status: {:?}",
+        game_id,
+        engine.get_committed_state().status
+    );
 
     // Publish initial snapshot
-    if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &engine.get_committed_state()).await {
+    if let Err(e) = pubsub
+        .publish_snapshot(partition_id, game_id, &engine.get_committed_state())
+        .await
+    {
         error!("Failed to publish initial snapshot: {}", e);
     }
 
     let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    
+
     let mut last_snapshot_tick = 0u32;
-    
+
     loop {
         tokio::select! {
             biased;
-            
+
             _ = cancellation_token.cancelled() => {
                 info!("Game loop for game {} shutting down", game_id);
                 break;
             }
-            
+
             // Handle snapshot requests
             Some(request) = snapshot_request_receiver.recv() => {
                 debug!("Received snapshot request for partition {}", request.partition_id);
@@ -105,12 +115,12 @@ async fn run_game(
                     }
                 }
             }
-            
+
             // Process commands from the channel
             Some(command) = command_receiver.recv() => {
-                debug!("Processing command for game {}. Command: {:?}", 
+                debug!("Processing command for game {}. Command: {:?}",
                     game_id, command);
-                
+
                 // Process the command through the game engine
                 match engine.process_command(command) {
                     Ok(scheduled_command) => {
@@ -124,7 +134,7 @@ async fn run_game(
                             user_id: None,
                             event,
                         };
-                        
+
                         // Publish event via PubSub
                         if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
                             warn!("Failed to publish command scheduled event: {}", e);
@@ -135,7 +145,7 @@ async fn run_game(
                     }
                 }
             }
-            
+
             _ = interval.tick() => {
                 // Run game ticks
                 let now_ms = chrono::Utc::now().timestamp_millis();
@@ -149,13 +159,13 @@ async fn run_game(
                                 user_id: None,
                                 event: event.clone(),
                             };
-                            
+
                             // Publish event via PubSub
                             if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
                                 warn!("Failed to publish game event: {}", e);
                             }
                         }
-                        
+
                         // Publish periodic snapshots
                         let current_tick = engine.current_tick();
                         if current_tick >= last_snapshot_tick + SNAPSHOT_INTERVAL_TICKS {
@@ -165,7 +175,7 @@ async fn run_game(
                             }
                             last_snapshot_tick = current_tick;
                         }
-                        
+
                         // Check if game has completed
                         let game_state = engine.get_committed_state();
                         if matches!(game_state.status, GameStatus::Complete { .. }) {
@@ -208,18 +218,25 @@ pub async fn publish_to_stream(
             let partition_id = event_msg.game_id % PARTITION_COUNT;
             pubsub.publish_event(partition_id, event_msg).await?;
         }
-        StreamEvent::GameCreated { game_id, game_state } => {
+        StreamEvent::GameCreated {
+            game_id,
+            game_state,
+        } => {
             let partition_id = game_id % PARTITION_COUNT;
             // Publish initial snapshot when game is created
-            pubsub.publish_snapshot(partition_id, *game_id, game_state).await?;
-            
+            pubsub
+                .publish_snapshot(partition_id, *game_id, game_state)
+                .await?;
+
             // Also publish a GameCreated event
             let event_msg = GameEventMessage {
                 game_id: *game_id,
                 tick: 0,
                 sequence: 0,
                 user_id: None,
-                event: GameEvent::Snapshot { game_state: game_state.clone() },
+                event: GameEvent::Snapshot {
+                    game_state: game_state.clone(),
+                },
             };
             pubsub.publish_event(partition_id, &event_msg).await?;
         }
@@ -231,11 +248,17 @@ pub async fn publish_to_stream(
                 tick: 0,
                 sequence: 0,
                 user_id: None,
-                event: GameEvent::StatusUpdated { status: status.clone() },
+                event: GameEvent::StatusUpdated {
+                    status: status.clone(),
+                },
             };
             pubsub.publish_event(partition_id, &event_msg).await?;
         }
-        StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
+        StreamEvent::GameCommandSubmitted {
+            game_id,
+            user_id: _,
+            command,
+        } => {
             let partition_id = game_id % PARTITION_COUNT;
             // Commands are sent directly to the game via channel, not through PubSub
             // This is handled differently now
@@ -243,7 +266,7 @@ pub async fn publish_to_stream(
             pubsub.publish_command(partition_id, &serialized).await?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -256,52 +279,85 @@ pub async fn run_game_executor(
     _replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
-    info!("Starting game executor for server {} partition {}", server_id, partition_id);
+    info!(
+        "Starting game executor for server {} partition {}",
+        server_id, partition_id
+    );
 
     // Create PubSub manager
-    let mut pubsub = PubSubManager::new(&redis_url).await
+    let mut pubsub = PubSubManager::new(&redis_url)
+        .await
         .context("Failed to create PubSub manager")?;
-    
+
     // Subscribe to partition commands and snapshot requests
-    let partition_sub = pubsub.subscribe_to_partition(partition_id).await
+    let partition_sub = pubsub
+        .subscribe_to_partition(partition_id)
+        .await
         .context("Failed to subscribe to partition")?;
-    
-    let PartitionSubscription { 
+
+    let PartitionSubscription {
         partition_id: _,
         mut event_receiver,
         mut command_receiver,
-        mut snapshot_request_receiver
+        mut snapshot_request_receiver,
     } = partition_sub;
-    
+
     // Track game channels
-    let mut game_channels: HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)> = HashMap::new();
-    
+    let mut game_channels: HashMap<
+        u32,
+        (
+            mpsc::Sender<GameCommandMessage>,
+            mpsc::Sender<SnapshotRequest>,
+        ),
+    > = HashMap::new();
+
     let try_start_game = |game_id: u32,
                           game_state: GameState,
                           pubsub: PubSubManager,
                           db: Arc<dyn Database>,
                           cancellation_token: CancellationToken,
-                          game_channels: &mut HashMap<u32, (mpsc::Sender<GameCommandMessage>, mpsc::Sender<SnapshotRequest>)>| {
+                          game_channels: &mut HashMap<
+        u32,
+        (
+            mpsc::Sender<GameCommandMessage>,
+            mpsc::Sender<SnapshotRequest>,
+        ),
+    >| {
         if game_id % PARTITION_COUNT != partition_id {
-            debug!("Game {} belongs to partition {}, not partition {}", game_id, game_id % PARTITION_COUNT, partition_id);
+            debug!(
+                "Game {} belongs to partition {}, not partition {}",
+                game_id,
+                game_id % PARTITION_COUNT,
+                partition_id
+            );
             return;
         }
-        
+
         if game_channels.contains_key(&game_id) {
             debug!("Game {} is already running", game_id);
             return;
         }
-        
+
         info!("Partition {} will start game {}", partition_id, game_id);
-        
+
         // Create channels for this game
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
         let (snap_tx, snap_rx) = mpsc::channel(10);
         game_channels.insert(game_id, (cmd_tx, snap_tx));
-        
+
         tokio::spawn(async move {
             // Run the game loop
-            run_game(server_id, game_id, game_state, pubsub, cmd_rx, snap_rx, db, cancellation_token).await;
+            run_game(
+                server_id,
+                game_id,
+                game_state,
+                pubsub,
+                cmd_rx,
+                snap_rx,
+                db,
+                cancellation_token,
+            )
+            .await;
             info!("Game {} has ended", game_id);
         });
     };
@@ -309,13 +365,13 @@ pub async fn run_game_executor(
     loop {
         tokio::select! {
             biased;
-            
+
             _ = cancellation_token.cancelled() => {
                 info!("Game executor service shutting down");
                 break;
             }
-            
-            // Process events from partition channel  
+
+            // Process events from partition channel
             Some(event) = event_receiver.recv() => {
                 // Events flow through to replication manager automatically via PubSub
                 // The replication manager is subscribed to the same partition channel
@@ -324,7 +380,7 @@ pub async fn run_game_executor(
                     debug!("Received snapshot event for game {} on partition {}", event.game_id, partition_id);
                 }
             }
-            
+
             // Process snapshot requests
             Some(request) = snapshot_request_receiver.recv() => {
                 debug!("Received snapshot request for partition {}", request.partition_id);
@@ -335,7 +391,7 @@ pub async fn run_game_executor(
                     }
                 }
             }
-            
+
             // Process commands from PubSub
             Some(command_data) = command_receiver.recv() => {
                 // Deserialize and process the command

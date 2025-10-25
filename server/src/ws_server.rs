@@ -1,28 +1,32 @@
-use std::pin::Pin;
-use tracing::{debug, error, info, warn};
-use tokio::net::{TcpListener, TcpStream};
-use anyhow::{Context, Result};
+use crate::api::auth::validate_username;
 use crate::db::Database;
+use crate::game_executor::{PARTITION_COUNT, StreamEvent};
+use crate::matchmaking_manager::MatchmakingManager;
+use crate::pubsub_manager::PubSubManager;
+use crate::ws_matchmaking::remove_from_matchmaking_queue;
+use anyhow::{Context, Result};
 use chrono::Utc;
-use std::time::Duration;
+use common::{
+    DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameEvent, GameEventMessage, GameState,
+    GameStatus,
+};
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, mpsc, Mutex, RwLock};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Sleep, sleep};
 use tokio_stream::StreamExt;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use tungstenite::Utf8Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use common::{GameCommandMessage, GameEvent, GameEventMessage, GameStatus, GameState, DEFAULT_TICK_INTERVAL_MS};
-use crate::game_executor::{StreamEvent, PARTITION_COUNT};
-use crate::pubsub_manager::PubSubManager;
-use crate::matchmaking_manager::MatchmakingManager;
-use crate::ws_matchmaking::remove_from_matchmaking_queue;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
@@ -36,39 +40,72 @@ pub enum WSMessage {
     Ping,
     Pong,
     // Clock synchronization messages
-    ClockSyncRequest { client_time: i64 },
-    ClockSyncResponse { client_time: i64, server_time: i64 },
+    ClockSyncRequest {
+        client_time: i64,
+    },
+    ClockSyncResponse {
+        client_time: i64,
+        server_time: i64,
+    },
     // Matchmaking messages
     QueueForMatch {
         game_type: common::GameType,
-        queue_mode: common::QueueMode,  // Quickmatch or Competitive
+        queue_mode: common::QueueMode, // Quickmatch or Competitive
     },
     QueueForMatchMulti {
         game_types: Vec<common::GameType>,
-        queue_mode: common::QueueMode,  // Quickmatch or Competitive
+        queue_mode: common::QueueMode, // Quickmatch or Competitive
     },
     LeaveQueue,
     // Real-time matchmaking updates
-    MatchFound { game_id: u32 },
-    QueueUpdate { position: u32, estimated_wait_seconds: u32 },
+    MatchFound {
+        game_id: u32,
+    },
+    QueueUpdate {
+        position: u32,
+        estimated_wait_seconds: u32,
+    },
     QueueLeft,
+    UpdateNickname {
+        nickname: String,
+    },
     // Custom game messages
-    CreateCustomGame { settings: common::CustomGameSettings },
-    JoinCustomGame { game_code: String },
-    UpdateCustomGameSettings { settings: common::CustomGameSettings },
+    CreateCustomGame {
+        settings: common::CustomGameSettings,
+    },
+    JoinCustomGame {
+        game_code: String,
+    },
+    UpdateCustomGameSettings {
+        settings: common::CustomGameSettings,
+    },
     StartCustomGame,
-    SpectateGame { game_id: u32, game_code: Option<String> },
+    SpectateGame {
+        game_id: u32,
+        game_code: Option<String>,
+    },
     // Solo game messages
     CreateSoloGame,
     // Custom game responses
-    CustomGameCreated { game_id: u32, game_code: String },
-    CustomGameJoined { game_id: u32 },
-    CustomGameSettingsUpdated { settings: common::CustomGameSettings },
+    CustomGameCreated {
+        game_id: u32,
+        game_code: String,
+    },
+    CustomGameJoined {
+        game_id: u32,
+    },
+    CustomGameSettingsUpdated {
+        settings: common::CustomGameSettings,
+    },
     CustomGameStarting,
     SpectatorJoined,
-    AccessDenied { reason: String },
+    AccessDenied {
+        reason: String,
+    },
     // Solo game responses
-    SoloGameCreated { game_id: u32 },
+    SoloGameCreated {
+        game_id: u32,
+    },
     // High availability messages
     ServerShutdown {
         reason: String,
@@ -106,11 +143,16 @@ pub enum WSMessage {
         ws_url: String,
         lobby_code: String,
     },
+    NicknameUpdated {
+        username: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserToken {
     pub user_id: i32,
+    pub username: String,
+    pub is_guest: bool,
 }
 
 // Player metadata to store additional user information
@@ -119,6 +161,65 @@ pub struct PlayerMetadata {
     pub user_id: i32,
     pub username: String,
     pub token: String,
+    pub is_guest: bool,
+}
+
+async fn handle_guest_nickname_update(
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    metadata: &mut PlayerMetadata,
+    ws_tx: &mpsc::Sender<Message>,
+    nickname: String,
+) -> Result<()> {
+    let trimmed = nickname.trim().to_string();
+
+    if trimmed == metadata.username {
+        let response = WSMessage::NicknameUpdated {
+            username: metadata.username.clone(),
+        };
+        let json_msg = serde_json::to_string(&response)?;
+        ws_tx.send(Message::Text(json_msg.into())).await?;
+        return Ok(());
+    }
+
+    let validation_errors = validate_username(&trimmed);
+    if !validation_errors.is_empty() {
+        let response = WSMessage::AccessDenied {
+            reason: format!("Invalid nickname: {}", validation_errors.join(", ")),
+        };
+        let json_msg = serde_json::to_string(&response)?;
+        ws_tx.send(Message::Text(json_msg.into())).await?;
+        return Ok(());
+    }
+
+    if !metadata.is_guest {
+        let response = WSMessage::AccessDenied {
+            reason: "Only guest users can change their nickname".to_string(),
+        };
+        let json_msg = serde_json::to_string(&response)?;
+        ws_tx.send(Message::Text(json_msg.into())).await?;
+        return Ok(());
+    }
+
+    db.update_guest_username(metadata.user_id, &trimmed).await?;
+
+    if let Err(e) = lobby_manager
+        .update_member_username(metadata.user_id, &trimmed)
+        .await
+    {
+        warn!(
+            "Failed to refresh lobby membership for user {} after nickname change: {}",
+            metadata.user_id, e
+        );
+    }
+
+    metadata.username = trimmed.clone();
+
+    let response = WSMessage::NicknameUpdated { username: trimmed };
+    let json_msg = serde_json::to_string(&response)?;
+    ws_tx.send(Message::Text(json_msg.into())).await?;
+
+    Ok(())
 }
 
 // JWT verification trait for dependency injection
@@ -126,7 +227,6 @@ pub struct PlayerMetadata {
 pub trait JwtVerifier: Send + Sync {
     async fn verify(&self, token: &str) -> Result<UserToken>;
 }
-
 
 // Test implementation that accepts any token and creates users as needed
 pub struct TestJwtVerifier {
@@ -145,29 +245,37 @@ impl JwtVerifier for TestJwtVerifier {
         // In test mode, accept any token and create user if needed
         // Extract username from token or use default
         let username = if token.starts_with("test-token-") {
-            format!("test_user_{}", token.strip_prefix("test-token-").unwrap_or("default"))
+            format!(
+                "test_user_{}",
+                token.strip_prefix("test-token-").unwrap_or("default")
+            )
         } else {
             "test_user_default".to_string()
         };
-        
+
         // Try to find existing user first
         let existing_user = self.db.get_user_by_username(&username).await?;
-        
+
         let user_id = match existing_user {
             Some(user) => user.id,
             None => {
                 // Create new test user
-                let new_user = self.db.create_user(&username, "test_password_hash", 1000).await?;
+                let new_user = self
+                    .db
+                    .create_user(&username, "test_password_hash", 1000)
+                    .await?;
                 info!("Created test user {} with ID {}", username, new_user.id);
                 new_user.id
             }
         };
-        
-        Ok(UserToken { user_id })
+
+        Ok(UserToken {
+            user_id,
+            username: username.clone(),
+            is_guest: false,
+        })
     }
 }
-
-
 
 // Connection state machine
 enum ConnectionState {
@@ -243,7 +351,9 @@ pub async fn handle_websocket(
         redis_url,
         lobby_manager,
         region,
-    ).await {
+    )
+    .await
+    {
         error!("WebSocket connection error: {}", e);
     }
 }
@@ -303,7 +413,7 @@ async fn handle_websocket_connection(
                         reason: f.reason.to_string().into(),
                     });
                     axum::extract::ws::Message::Close(close)
-                },
+                }
                 _ => continue,
             };
 
@@ -318,7 +428,9 @@ async fn handle_websocket_connection(
     let ws_tx_for_counts = ws_tx.clone();
     let redis_url_for_counts = redis_url.clone();
     let _user_count_task = tokio::spawn(async move {
-        if let Err(e) = subscribe_to_user_count_updates(redis_url_for_counts, ws_tx_for_counts).await {
+        if let Err(e) =
+            subscribe_to_user_count_updates(redis_url_for_counts, ws_tx_for_counts).await
+        {
             error!("User count subscription task failed: {}", e);
         }
     });
@@ -545,9 +657,18 @@ async fn handle_websocket_connection(
 
     // Cleanup
     // Leave lobby if still in one
-    if let ConnectionState::InLobby { lobby_id, metadata, .. } = &state {
-        info!("Cleaning up lobby {} for user {} on disconnect", lobby_id, metadata.user_id);
-        if let Err(e) = lobby_manager.leave_lobby(*lobby_id, metadata.user_id, &websocket_id).await {
+    if let ConnectionState::InLobby {
+        lobby_id, metadata, ..
+    } = &state
+    {
+        info!(
+            "Cleaning up lobby {} for user {} on disconnect",
+            lobby_id, metadata.user_id
+        );
+        if let Err(e) = lobby_manager
+            .leave_lobby(*lobby_id, metadata.user_id, &websocket_id)
+            .await
+        {
             error!("Failed to leave lobby on disconnect: {}", e);
         }
     }
@@ -576,13 +697,19 @@ async fn subscribe_to_game_events(
     replication_manager: Arc<crate::replication::ReplicationManager>,
     db: Arc<dyn Database>,
 ) {
-    info!("Subscribing to game {} events for user {}", game_id, user_id);
+    info!(
+        "Subscribing to game {} events for user {}",
+        game_id, user_id
+    );
 
     let (game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
         Ok(result) => result,
         Err(e) => {
             // If failed to get from memory, try to get from database
-            info!("Failed to subscribe to game {} from memory, checking database: {}", game_id, e);
+            info!(
+                "Failed to subscribe to game {} from memory, checking database: {}",
+                game_id, e
+            );
 
             match db.get_game_by_id(game_id as i32).await {
                 Ok(Some(game)) => {
@@ -596,9 +723,13 @@ async fn subscribe_to_game_events(
                                     tick: game_state.tick,
                                     sequence: 0,
                                     user_id: Some(user_id),
-                                    event: GameEvent::Snapshot { game_state: game_state.clone() },
+                                    event: GameEvent::Snapshot {
+                                        game_state: game_state.clone(),
+                                    },
                                 };
-                                let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
+                                let json =
+                                    serde_json::to_string(&WSMessage::GameEvent(snapshot_event))
+                                        .unwrap();
                                 let _ = ws_tx.send(Message::Text(json.into())).await;
 
                                 // Return early - we can't subscribe to future events without memory state
@@ -625,27 +756,38 @@ async fn subscribe_to_game_events(
             }
         }
     };
-    
+
     // Send the snapshot
     let snapshot_event = GameEventMessage {
         game_id,
         tick: game_state.tick,
         sequence: 0,
         user_id: Some(user_id),
-        event: GameEvent::Snapshot { game_state: game_state.clone() },
+        event: GameEvent::Snapshot {
+            game_state: game_state.clone(),
+        },
     };
     let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
     if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
         match e {
             mpsc::error::TrySendError::Full(msg) => {
-                warn!("WebSocket send channel full (capacity 1024) for game {}, blocking send", game_id);
+                warn!(
+                    "WebSocket send channel full (capacity 1024) for game {}, blocking send",
+                    game_id
+                );
                 if ws_tx.send(msg).await.is_err() {
-                    error!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                    error!(
+                        "WebSocket send channel closed for game {}, stopping event subscription",
+                        game_id
+                    );
                     return;
                 }
             }
             mpsc::error::TrySendError::Closed(_) => {
-                debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                debug!(
+                    "WebSocket send channel closed for game {}, stopping event subscription",
+                    game_id
+                );
                 return;
             }
         }
@@ -661,11 +803,17 @@ async fn subscribe_to_game_events(
                 if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
                     match e {
                         mpsc::error::TrySendError::Full(msg) => {
-                            warn!("WebSocket send channel full on game complete for game {}, blocking send", game_id);
+                            warn!(
+                                "WebSocket send channel full on game complete for game {}, blocking send",
+                                game_id
+                            );
                             let _ = ws_tx.send(msg).await;
                         }
                         mpsc::error::TrySendError::Closed(_) => {
-                            debug!("WebSocket send channel closed on game complete for game {}", game_id);
+                            debug!(
+                                "WebSocket send channel closed on game complete for game {}",
+                                game_id
+                            );
                         }
                     }
                 }
@@ -678,21 +826,29 @@ async fn subscribe_to_game_events(
         if let Err(e) = ws_tx.try_send(msg.clone()) {
             match e {
                 mpsc::error::TrySendError::Full(_) => {
-                    warn!("WebSocket send channel full for game {}, blocking send", game_id);
+                    warn!(
+                        "WebSocket send channel full for game {}, blocking send",
+                        game_id
+                    );
                     if ws_tx.send(msg).await.is_err() {
-                        debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                        debug!(
+                            "WebSocket send channel closed for game {}, stopping event subscription",
+                            game_id
+                        );
                         break;
                     }
                 }
                 mpsc::error::TrySendError::Closed(_) => {
-                    debug!("WebSocket send channel closed for game {}, stopping event subscription", game_id);
+                    debug!(
+                        "WebSocket send channel closed for game {}, stopping event subscription",
+                        game_id
+                    );
                     break;
                 }
             }
         }
     }
 }
-
 
 async fn process_ws_message(
     state: ConnectionState,
@@ -715,14 +871,17 @@ async fn process_ws_message(
         ConnectionState::InLobby { lobby_id, .. } => {
             debug!("Processing message in InLobby({})", lobby_id);
             "InLobby"
-        },
+        }
         ConnectionState::InGame { game_id, .. } => {
             debug!("Processing message in InGame({})", game_id);
             "InGame"
-        },
+        }
         ConnectionState::ShuttingDown { .. } => "ShuttingDown",
     };
-    debug!("Processing message: {:?} in state: {}", ws_message, state_str);
+    debug!(
+        "Processing message: {:?} in state: {}",
+        ws_message, state_str
+    );
 
     match state {
         ConnectionState::Unauthenticated => {
@@ -731,22 +890,27 @@ async fn process_ws_message(
                     info!("Received jwt token: {}", jwt_token);
                     match jwt_verifier.verify(&jwt_token).await {
                         Ok(user_token) => {
-                            info!("Token verified successfully, user_id: {}", user_token.user_id);
-                            
-                            // Fetch username from database
-                            let user = db.get_user_by_id(user_token.user_id)
+                            info!(
+                                "Token verified successfully, user_id: {}",
+                                user_token.user_id
+                            );
+
+                            let user = db
+                                .get_user_by_id(user_token.user_id)
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-                            let username = user.username;
-                            
-                            // Create player metadata
+
                             let metadata = PlayerMetadata {
                                 user_id: user_token.user_id,
-                                username,
+                                username: user.username.clone(),
                                 token: jwt_token.clone(),
+                                is_guest: user.is_guest,
                             };
-                            
-                            info!("User authenticated: {} (id: {})", metadata.username, metadata.user_id);
+
+                            info!(
+                                "User authenticated: {} (id: {})",
+                                metadata.username, metadata.user_id
+                            );
                             Ok(ConnectionState::Authenticated { metadata })
                         }
                         Err(e) => {
@@ -769,11 +933,36 @@ async fn process_ws_message(
         }
         ConnectionState::Authenticated { metadata } => {
             match ws_message {
-                WSMessage::QueueForMatch { game_type, queue_mode } => {
-                    info!("User {} ({}) queuing for match type: {:?}, mode: {:?}", metadata.username, metadata.user_id, game_type, queue_mode);
+                WSMessage::UpdateNickname { nickname } => {
+                    let mut metadata = metadata;
+                    if let Err(e) = handle_guest_nickname_update(
+                        &db,
+                        lobby_manager,
+                        &mut metadata,
+                        &ws_tx,
+                        nickname,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to update guest nickname for user {}: {}",
+                            metadata.user_id, e
+                        );
+                    }
+                    Ok(ConnectionState::Authenticated { metadata })
+                }
+                WSMessage::QueueForMatch {
+                    game_type,
+                    queue_mode,
+                } => {
+                    info!(
+                        "User {} ({}) queuing for match type: {:?}, mode: {:?}",
+                        metadata.username, metadata.user_id, game_type, queue_mode
+                    );
 
                     // Fetch user's MMR from database
-                    let user = db.get_user_by_id(metadata.user_id)
+                    let user = db
+                        .get_user_by_id(metadata.user_id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
                     let mmr = user.mmr;
@@ -783,18 +972,24 @@ async fn process_ws_message(
                     info!("Creating auto-lobby for user {}", metadata.user_id);
                     match lobby_manager.create_lobby(metadata.user_id, region).await {
                         Ok(lobby) => {
-                            info!("Auto-created lobby {} for user {}", lobby.id, metadata.user_id);
+                            info!(
+                                "Auto-created lobby {} for user {}",
+                                lobby.id, metadata.user_id
+                            );
                             // Join the newly created lobby
-                            if let Err(e) = lobby_manager.join_lobby(
-                                lobby.id,
-                                metadata.user_id,
-                                metadata.username.clone(),
-                                websocket_id.to_string(),
-                                region.to_string(),
-                            ).await {
+                            if let Err(e) = lobby_manager
+                                .join_lobby(
+                                    lobby.id,
+                                    metadata.user_id,
+                                    metadata.username.clone(),
+                                    websocket_id.to_string(),
+                                    region.to_string(),
+                                )
+                                .await
+                            {
                                 error!("Failed to join auto-created lobby: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to create matchmaking lobby: {}", e)
+                                    reason: format!("Failed to create matchmaking lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -818,7 +1013,7 @@ async fn process_ws_message(
                                         );
                                     }
                                     m
-                                },
+                                }
                                 Err(e) => {
                                     error!("Failed to get lobby members: {}", e);
                                     return Ok(ConnectionState::Authenticated { metadata });
@@ -826,10 +1021,12 @@ async fn process_ws_message(
                             };
 
                             // Update lobby state to "queued"
-                            if let Err(e) = lobby_manager.update_lobby_state(lobby.id, "queued").await {
+                            if let Err(e) =
+                                lobby_manager.update_lobby_state(lobby.id, "queued").await
+                            {
                                 error!("Failed to update lobby state: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue lobby: {}", e)
+                                    reason: format!("Failed to queue lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -838,18 +1035,21 @@ async fn process_ws_message(
 
                             // Add the auto-created lobby to matchmaking queue
                             let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard.add_lobby_to_queue(
-                                lobby.id,
-                                &lobby.lobby_code,
-                                members.clone(),
-                                mmr,
-                                vec![game_type.clone()],
-                                queue_mode.clone(),
-                                metadata.user_id as u32,  // Solo player is the requesting user
-                            ).await {
+                            if let Err(e) = mm_guard
+                                .add_lobby_to_queue(
+                                    lobby.id,
+                                    &lobby.lobby_code,
+                                    members.clone(),
+                                    mmr,
+                                    vec![game_type.clone()],
+                                    queue_mode.clone(),
+                                    metadata.user_id as u32, // Solo player is the requesting user
+                                )
+                                .await
+                            {
                                 error!("Failed to add lobby to matchmaking queue: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e)
+                                    reason: format!("Failed to queue for match: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -859,7 +1059,10 @@ async fn process_ws_message(
                             }
                             drop(mm_guard);
 
-                            info!("Auto-created lobby {} for solo player {} and added to matchmaking queue", lobby.id, metadata.user_id);
+                            info!(
+                                "Auto-created lobby {} for solo player {} and added to matchmaking queue",
+                                lobby.id, metadata.user_id
+                            );
 
                             // Transition to InLobby state - lobby match notifications will be handled automatically
                             Ok(ConnectionState::InLobby {
@@ -871,7 +1074,7 @@ async fn process_ws_message(
                         Err(e) => {
                             error!("Failed to create lobby: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e)
+                                reason: format!("Failed to create matchmaking lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -879,11 +1082,18 @@ async fn process_ws_message(
                         }
                     }
                 }
-                WSMessage::QueueForMatchMulti { game_types, queue_mode } => {
-                    info!("User {} ({}) queuing for multiple match types: {:?}, mode: {:?}", metadata.username, metadata.user_id, game_types, queue_mode);
+                WSMessage::QueueForMatchMulti {
+                    game_types,
+                    queue_mode,
+                } => {
+                    info!(
+                        "User {} ({}) queuing for multiple match types: {:?}, mode: {:?}",
+                        metadata.username, metadata.user_id, game_types, queue_mode
+                    );
 
                     // Fetch user's MMR from database
-                    let user = db.get_user_by_id(metadata.user_id)
+                    let user = db
+                        .get_user_by_id(metadata.user_id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
                     let mmr = user.mmr;
@@ -893,18 +1103,24 @@ async fn process_ws_message(
                     info!("Creating auto-lobby for user {}", metadata.user_id);
                     match lobby_manager.create_lobby(metadata.user_id, region).await {
                         Ok(lobby) => {
-                            info!("Auto-created lobby {} for user {}", lobby.id, metadata.user_id);
+                            info!(
+                                "Auto-created lobby {} for user {}",
+                                lobby.id, metadata.user_id
+                            );
                             // Join the newly created lobby
-                            if let Err(e) = lobby_manager.join_lobby(
-                                lobby.id,
-                                metadata.user_id,
-                                metadata.username.clone(),
-                                websocket_id.to_string(),
-                                region.to_string(),
-                            ).await {
+                            if let Err(e) = lobby_manager
+                                .join_lobby(
+                                    lobby.id,
+                                    metadata.user_id,
+                                    metadata.username.clone(),
+                                    websocket_id.to_string(),
+                                    region.to_string(),
+                                )
+                                .await
+                            {
                                 error!("Failed to join auto-created lobby: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to create matchmaking lobby: {}", e)
+                                    reason: format!("Failed to create matchmaking lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -928,7 +1144,7 @@ async fn process_ws_message(
                                         );
                                     }
                                     m
-                                },
+                                }
                                 Err(e) => {
                                     error!("Failed to get lobby members: {}", e);
                                     return Ok(ConnectionState::Authenticated { metadata });
@@ -936,10 +1152,12 @@ async fn process_ws_message(
                             };
 
                             // Update lobby state to "queued"
-                            if let Err(e) = lobby_manager.update_lobby_state(lobby.id, "queued").await {
+                            if let Err(e) =
+                                lobby_manager.update_lobby_state(lobby.id, "queued").await
+                            {
                                 error!("Failed to update lobby state: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue lobby: {}", e)
+                                    reason: format!("Failed to queue lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -948,18 +1166,21 @@ async fn process_ws_message(
 
                             // Add the auto-created lobby to matchmaking queue with multiple game types
                             let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard.add_lobby_to_queue(
-                                lobby.id,
-                                &lobby.lobby_code,
-                                members.clone(),
-                                mmr,
-                                game_types,  // Use game_types directly instead of wrapping
-                                queue_mode.clone(),
-                                metadata.user_id as u32,  // Solo player is the requesting user
-                            ).await {
+                            if let Err(e) = mm_guard
+                                .add_lobby_to_queue(
+                                    lobby.id,
+                                    &lobby.lobby_code,
+                                    members.clone(),
+                                    mmr,
+                                    game_types, // Use game_types directly instead of wrapping
+                                    queue_mode.clone(),
+                                    metadata.user_id as u32, // Solo player is the requesting user
+                                )
+                                .await
+                            {
                                 error!("Failed to add lobby to matchmaking queue: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e)
+                                    reason: format!("Failed to queue for match: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -969,7 +1190,10 @@ async fn process_ws_message(
                             }
                             drop(mm_guard);
 
-                            info!("Auto-created lobby {} for solo player {} and added to matchmaking queue for multiple game types", lobby.id, metadata.user_id);
+                            info!(
+                                "Auto-created lobby {} for solo player {} and added to matchmaking queue for multiple game types",
+                                lobby.id, metadata.user_id
+                            );
 
                             // Transition to InLobby state - lobby match notifications will be handled automatically
                             Ok(ConnectionState::InLobby {
@@ -981,7 +1205,7 @@ async fn process_ws_message(
                         Err(e) => {
                             error!("Failed to create lobby: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e)
+                                reason: format!("Failed to create matchmaking lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -990,25 +1214,30 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::JoinGame(game_id) => {
-                    info!("User {} ({}) joining game {}", metadata.username, metadata.user_id, game_id);
-                    
+                    info!(
+                        "User {} ({}) joining game {}",
+                        metadata.username, metadata.user_id, game_id
+                    );
+
                     // Transition to InGame state
                     // TODO: Validate that the user can join.
                     //  Most games will be joinable except for private custom games.
-                    Ok(ConnectionState::InGame {
-                        metadata,
-                        game_id,
-                    })
+                    Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::LeaveQueue => {
-                    info!("User {} ({}) leaving matchmaking queue", metadata.username, metadata.user_id);
+                    info!(
+                        "User {} ({}) leaving matchmaking queue",
+                        metadata.username, metadata.user_id
+                    );
 
                     // Remove from matchmaking queue using Redis-based matchmaking
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
                     match remove_from_matchmaking_queue(
                         &mut *matchmaking_manager,
                         metadata.user_id as u32,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             info!("User {} removed from matchmaking queue", metadata.user_id);
                         }
@@ -1028,36 +1257,50 @@ async fn process_ws_message(
                 WSMessage::ClockSyncRequest { client_time } => {
                     // Respond with server time for clock synchronization
                     let server_time = chrono::Utc::now().timestamp_millis();
-                    let response = WSMessage::ClockSyncResponse { client_time, server_time };
+                    let response = WSMessage::ClockSyncResponse {
+                        client_time,
+                        server_time,
+                    };
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::GameEvent(event_msg) => {
                     // Forward game events to the client
-                    warn!("Received game event in authenticated state: {:?}", event_msg);
+                    warn!(
+                        "Received game event in authenticated state: {:?}",
+                        event_msg
+                    );
                     Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::CreateCustomGame { settings } => {
-                    info!("User {} ({}) creating custom game", metadata.username, metadata.user_id);
-                    
-                    match create_custom_game(db, pubsub, metadata.user_id, metadata.username.clone(), settings).await {
+                    info!(
+                        "User {} ({}) creating custom game",
+                        metadata.username, metadata.user_id
+                    );
+
+                    match create_custom_game(
+                        db,
+                        pubsub,
+                        metadata.user_id,
+                        metadata.username.clone(),
+                        settings,
+                    )
+                    .await
+                    {
                         Ok((game_id, game_code)) => {
                             // Send success response
                             let response = WSMessage::CustomGameCreated { game_id, game_code };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            
+
                             // Transition to in-game state
-                            Ok(ConnectionState::InGame { 
-                                metadata,
-                                game_id,
-                            })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
                             error!("Failed to create custom game: {}", e);
-                            let response = WSMessage::AccessDenied { 
-                                reason: format!("Failed to create game: {}", e) 
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to create game: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1066,25 +1309,25 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::JoinCustomGame { game_code } => {
-                    info!("User {} ({}) joining custom game with code: {}", metadata.username, metadata.user_id, game_code);
-                    
+                    info!(
+                        "User {} ({}) joining custom game with code: {}",
+                        metadata.username, metadata.user_id, game_code
+                    );
+
                     match join_custom_game(db, metadata.user_id, &game_code).await {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::CustomGameJoined { game_id };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            
+
                             // Transition to in-game state
-                            Ok(ConnectionState::InGame { 
-                                metadata,
-                                game_id,
-                            })
+                            Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
                             error!("Failed to join custom game: {}", e);
-                            let response = WSMessage::AccessDenied { 
-                                reason: format!("Failed to join game: {}", e) 
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to join game: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1093,25 +1336,28 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::SpectateGame { game_id, game_code } => {
-                    info!("User {} ({}) attempting to spectate game {}", metadata.username, metadata.user_id, game_id);
-                    
+                    info!(
+                        "User {} ({}) attempting to spectate game {}",
+                        metadata.username, metadata.user_id, game_id
+                    );
+
                     match spectate_game(db, metadata.user_id, game_id, game_code.as_deref()).await {
                         Ok(actual_game_id) => {
                             // Send success response
                             let response = WSMessage::SpectatorJoined;
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            
+
                             // Transition to in-game state as spectator
-                            Ok(ConnectionState::InGame { 
+                            Ok(ConnectionState::InGame {
                                 metadata,
                                 game_id: actual_game_id,
                             })
                         }
                         Err(e) => {
                             error!("Failed to spectate game: {}", e);
-                            let response = WSMessage::AccessDenied { 
-                                reason: format!("Failed to spectate game: {}", e) 
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to spectate game: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1120,9 +1366,14 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::CreateSoloGame => {
-                    info!("User {} ({}) creating solo game", metadata.username, metadata.user_id);
+                    info!(
+                        "User {} ({}) creating solo game",
+                        metadata.username, metadata.user_id
+                    );
 
-                    match create_solo_game(db, pubsub, metadata.user_id, metadata.username.clone()).await {
+                    match create_solo_game(db, pubsub, metadata.user_id, metadata.username.clone())
+                        .await
+                    {
                         Ok(game_id) => {
                             // Send success response
                             let response = WSMessage::SoloGameCreated { game_id };
@@ -1134,7 +1385,7 @@ async fn process_ws_message(
                         Err(e) => {
                             error!("Failed to create solo game: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create solo game: {}", e)
+                                reason: format!("Failed to create solo game: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1143,21 +1394,27 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::CreateLobby => {
-                    info!("User {} ({}) creating lobby in region {}", metadata.username, metadata.user_id, region);
+                    info!(
+                        "User {} ({}) creating lobby in region {}",
+                        metadata.username, metadata.user_id, region
+                    );
 
                     match lobby_manager.create_lobby(metadata.user_id, region).await {
                         Ok(lobby) => {
                             // Join the lobby
-                            if let Err(e) = lobby_manager.join_lobby(
-                                lobby.id,
-                                metadata.user_id,
-                                metadata.username.clone(),
-                                websocket_id.to_string(),
-                                region.to_string(),
-                            ).await {
+                            if let Err(e) = lobby_manager
+                                .join_lobby(
+                                    lobby.id,
+                                    metadata.user_id,
+                                    metadata.username.clone(),
+                                    websocket_id.to_string(),
+                                    region.to_string(),
+                                )
+                                .await
+                            {
                                 error!("Failed to join newly created lobby: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to join lobby: {}", e)
+                                    reason: format!("Failed to join lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1182,7 +1439,7 @@ async fn process_ws_message(
                         Err(e) => {
                             error!("Failed to create lobby: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create lobby: {}", e)
+                                reason: format!("Failed to create lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1191,20 +1448,29 @@ async fn process_ws_message(
                     }
                 }
                 WSMessage::JoinLobbyByCode { lobby_code } => {
-                    info!("User {} ({}) joining lobby with code: {}", metadata.username, metadata.user_id, lobby_code);
+                    info!(
+                        "User {} ({}) joining lobby with code: {}",
+                        metadata.username, metadata.user_id, lobby_code
+                    );
 
                     match lobby_manager.get_lobby_by_code(&lobby_code).await {
                         Ok(Some(lobby)) => {
                             // Check region match
                             if lobby.region != region {
-                                warn!("Lobby {} is in region {}, user is in region {}", lobby.id, lobby.region, region);
+                                warn!(
+                                    "Lobby {} is in region {}, user is in region {}",
+                                    lobby.id, lobby.region, region
+                                );
 
                                 // Get WebSocket URL for the target region from database
                                 let ws_url = match db.get_region_ws_url(&lobby.region).await? {
                                     Some(url) => url,
                                     None => {
                                         let response = WSMessage::AccessDenied {
-                                            reason: format!("No servers available in region {}", lobby.region)
+                                            reason: format!(
+                                                "No servers available in region {}",
+                                                lobby.region
+                                            ),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1223,16 +1489,19 @@ async fn process_ws_message(
                             }
 
                             // Join the lobby
-                            if let Err(e) = lobby_manager.join_lobby(
-                                lobby.id,
-                                metadata.user_id,
-                                metadata.username.clone(),
-                                websocket_id.to_string(),
-                                region.to_string(),
-                            ).await {
+                            if let Err(e) = lobby_manager
+                                .join_lobby(
+                                    lobby.id,
+                                    metadata.user_id,
+                                    metadata.username.clone(),
+                                    websocket_id.to_string(),
+                                    region.to_string(),
+                                )
+                                .await
+                            {
                                 error!("Failed to join lobby: {}", e);
                                 let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to join lobby: {}", e)
+                                    reason: format!("Failed to join lobby: {}", e),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1255,7 +1524,7 @@ async fn process_ws_message(
                         }
                         Ok(None) => {
                             let response = WSMessage::AccessDenied {
-                                reason: "Lobby not found".to_string()
+                                reason: "Lobby not found".to_string(),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1264,7 +1533,7 @@ async fn process_ws_message(
                         Err(e) => {
                             error!("Failed to get lobby by code: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to find lobby: {}", e)
+                                reason: format!("Failed to find lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1273,17 +1542,52 @@ async fn process_ws_message(
                     }
                 }
                 _ => {
-                    warn!("Unexpected message in authenticated state: {:?}", ws_message);
+                    warn!(
+                        "Unexpected message in authenticated state: {:?}",
+                        ws_message
+                    );
                     Ok(ConnectionState::Authenticated { metadata })
                 }
             }
         }
-        ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id } => {
+        ConnectionState::InLobby {
+            metadata,
+            lobby_id,
+            websocket_id: ws_id,
+        } => {
             match ws_message {
+                WSMessage::UpdateNickname { nickname } => {
+                    let mut metadata = metadata;
+                    if let Err(e) = handle_guest_nickname_update(
+                        &db,
+                        lobby_manager,
+                        &mut metadata,
+                        &ws_tx,
+                        nickname,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to update guest nickname for user {} in lobby {}: {}",
+                            metadata.user_id, lobby_id, e
+                        );
+                    }
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
+                }
                 WSMessage::LeaveLobby => {
-                    info!("User {} ({}) leaving lobby {}", metadata.username, metadata.user_id, lobby_id);
+                    info!(
+                        "User {} ({}) leaving lobby {}",
+                        metadata.username, metadata.user_id, lobby_id
+                    );
 
-                    if let Err(e) = lobby_manager.leave_lobby(lobby_id, metadata.user_id, &ws_id).await {
+                    if let Err(e) = lobby_manager
+                        .leave_lobby(lobby_id, metadata.user_id, &ws_id)
+                        .await
+                    {
                         error!("Failed to leave lobby: {}", e);
                     }
 
@@ -1295,7 +1599,10 @@ async fn process_ws_message(
                     // Transition back to authenticated state
                     Ok(ConnectionState::Authenticated { metadata })
                 }
-                WSMessage::QueueForMatch { game_type, queue_mode } => {
+                WSMessage::QueueForMatch {
+                    game_type,
+                    queue_mode,
+                } => {
                     info!("Lobby {} queuing for match", lobby_id);
 
                     // Get lobby to verify host
@@ -1304,11 +1611,16 @@ async fn process_ws_message(
                             // Only host can queue the lobby
                             if lobby.host_user_id != metadata.user_id {
                                 let response = WSMessage::AccessDenied {
-                                    reason: "Only the lobby host can queue for matchmaking".to_string()
+                                    reason: "Only the lobby host can queue for matchmaking"
+                                        .to_string(),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                return Ok(ConnectionState::InLobby {
+                                    metadata,
+                                    lobby_id,
+                                    websocket_id: ws_id,
+                                });
                             }
 
                             // Get all lobby members
@@ -1316,11 +1628,15 @@ async fn process_ws_message(
                                 Ok(members) => {
                                     if members.is_empty() {
                                         let response = WSMessage::AccessDenied {
-                                            reason: "Cannot queue empty lobby".to_string()
+                                            reason: "Cannot queue empty lobby".to_string(),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
 
                                     // Fetch MMR for all members and calculate average
@@ -1333,10 +1649,16 @@ async fn process_ws_message(
                                                 member_count += 1;
                                             }
                                             Ok(None) => {
-                                                warn!("User {} not found in database", member.user_id);
+                                                warn!(
+                                                    "User {} not found in database",
+                                                    member.user_id
+                                                );
                                             }
                                             Err(e) => {
-                                                error!("Failed to fetch user {}: {}", member.user_id, e);
+                                                error!(
+                                                    "Failed to fetch user {}: {}",
+                                                    member.user_id, e
+                                                );
                                             }
                                         }
                                     }
@@ -1348,41 +1670,60 @@ async fn process_ws_message(
                                     };
 
                                     // Update lobby state to "queued"
-                                    if let Err(e) = lobby_manager.update_lobby_state(lobby_id, "queued").await {
+                                    if let Err(e) =
+                                        lobby_manager.update_lobby_state(lobby_id, "queued").await
+                                    {
                                         error!("Failed to update lobby state: {}", e);
                                         let response = WSMessage::AccessDenied {
-                                            reason: format!("Failed to queue lobby: {}", e)
+                                            reason: format!("Failed to queue lobby: {}", e),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
 
                                     // Add lobby to matchmaking queue
                                     let mut mm_guard = matchmaking_manager.lock().await;
-                                    if let Err(e) = mm_guard.add_lobby_to_queue(
-                                        lobby_id,
-                                        &lobby.lobby_code,
-                                        members.clone(),
-                                        avg_mmr,
-                                        vec![game_type.clone()],
-                                        queue_mode.clone(),
-                                        metadata.user_id as u32,  // Host is the requesting user
-                                    ).await {
+                                    if let Err(e) = mm_guard
+                                        .add_lobby_to_queue(
+                                            lobby_id,
+                                            &lobby.lobby_code,
+                                            members.clone(),
+                                            avg_mmr,
+                                            vec![game_type.clone()],
+                                            queue_mode.clone(),
+                                            metadata.user_id as u32, // Host is the requesting user
+                                        )
+                                        .await
+                                    {
                                         error!("Failed to add lobby to matchmaking queue: {}", e);
                                         let response = WSMessage::AccessDenied {
-                                            reason: format!("Failed to queue lobby: {}", e)
+                                            reason: format!("Failed to queue lobby: {}", e),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
                                         // Revert lobby state
-                                        let _ = lobby_manager.update_lobby_state(lobby_id, "waiting").await;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        let _ = lobby_manager
+                                            .update_lobby_state(lobby_id, "waiting")
+                                            .await;
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
                                     drop(mm_guard);
 
-                                    info!("Lobby {} added to matchmaking queue with {} members and avg MMR {}",
-                                        lobby_id, members.len(), avg_mmr);
+                                    info!(
+                                        "Lobby {} added to matchmaking queue with {} members and avg MMR {}",
+                                        lobby_id,
+                                        members.len(),
+                                        avg_mmr
+                                    );
 
                                     // Subscribe to lobby match notifications
                                     let lobby_id_for_task = lobby_id;
@@ -1393,33 +1734,86 @@ async fn process_ws_message(
                                     tokio::spawn(async move {
                                         // Subscribe to lobby match notifications
                                         let redis_keys = crate::redis_keys::RedisKeys::new();
-                                        let channel = redis_keys.matchmaking_lobby_notification_channel(lobby_id_for_task);
-                                        info!("Subscribing to lobby match notifications on channel: {}", channel);
+                                        let channel = redis_keys
+                                            .matchmaking_lobby_notification_channel(
+                                                lobby_id_for_task,
+                                            );
+                                        info!(
+                                            "Subscribing to lobby match notifications on channel: {}",
+                                            channel
+                                        );
 
-                                        if let Ok(client) = redis::Client::open(redis_url_clone.as_ref()) {
-                                            if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                                        if let Ok(client) =
+                                            redis::Client::open(redis_url_clone.as_ref())
+                                        {
+                                            if let Ok(mut pubsub) = client.get_async_pubsub().await
+                                            {
                                                 if pubsub.subscribe(&channel).await.is_ok() {
-                                                    info!("Successfully subscribed to lobby match notifications for lobby {}", lobby_id_for_task);
+                                                    info!(
+                                                        "Successfully subscribed to lobby match notifications for lobby {}",
+                                                        lobby_id_for_task
+                                                    );
 
                                                     let mut pubsub_stream = pubsub.on_message();
-                                                    if let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
-                                                        if let Ok(payload) = msg.get_payload::<String>() {
+                                                    if let Some(msg) =
+                                                        futures_util::StreamExt::next(
+                                                            &mut pubsub_stream,
+                                                        )
+                                                        .await
+                                                    {
+                                                        if let Ok(payload) =
+                                                            msg.get_payload::<String>()
+                                                        {
                                                             // Parse the notification
-                                                            if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
-                                                                if let Some(game_id) = notification["game_id"].as_u64() {
-                                                                    info!("Lobby {} matched to game {}, waiting for game to be available", lobby_id_for_task, game_id);
+                                                            if let Ok(notification) =
+                                                                serde_json::from_str::<
+                                                                    serde_json::Value,
+                                                                >(
+                                                                    &payload
+                                                                )
+                                                            {
+                                                                if let Some(game_id) =
+                                                                    notification["game_id"].as_u64()
+                                                                {
+                                                                    info!(
+                                                                        "Lobby {} matched to game {}, waiting for game to be available",
+                                                                        lobby_id_for_task, game_id
+                                                                    );
 
                                                                     // Wait for the game to become available in the replication manager
-                                                                    match replication_manager_clone.wait_for_game(game_id as u32, 10).await {
+                                                                    match replication_manager_clone
+                                                                        .wait_for_game(
+                                                                            game_id as u32,
+                                                                            10,
+                                                                        )
+                                                                        .await
+                                                                    {
                                                                         Ok(_game_state) => {
-                                                                            info!("Game {} is now available, sending JoinGame message to lobby {}", game_id, lobby_id_for_task);
+                                                                            info!(
+                                                                                "Game {} is now available, sending JoinGame message to lobby {}",
+                                                                                game_id,
+                                                                                lobby_id_for_task
+                                                                            );
                                                                             // Send JoinGame message to client
-                                                                            let join_msg = WSMessage::JoinGame(game_id as u32);
+                                                                            let join_msg =
+                                                                                WSMessage::JoinGame(
+                                                                                    game_id as u32,
+                                                                                );
                                                                             let json_msg = serde_json::to_string(&join_msg).unwrap();
-                                                                            let _ = ws_tx_clone.send(Message::Text(json_msg.into())).await;
+                                                                            let _ = ws_tx_clone
+                                                                                .send(
+                                                                                    Message::Text(
+                                                                                        json_msg
+                                                                                            .into(),
+                                                                                    ),
+                                                                                )
+                                                                                .await;
                                                                         }
                                                                         Err(e) => {
-                                                                            error!("Failed to wait for game {} to become available: {}", game_id, e);
+                                                                            error!(
+                                                                                "Failed to wait for game {} to become available: {}",
+                                                                                game_id, e
+                                                                            );
                                                                         }
                                                                     }
                                                                 }
@@ -1427,45 +1821,67 @@ async fn process_ws_message(
                                                         }
                                                     }
                                                 } else {
-                                                    error!("Failed to subscribe to lobby channel {} for lobby {}", channel, lobby_id_for_task);
+                                                    error!(
+                                                        "Failed to subscribe to lobby channel {} for lobby {}",
+                                                        channel, lobby_id_for_task
+                                                    );
                                                 }
                                             }
                                         }
                                     });
 
-                                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                                    Ok(ConnectionState::InLobby {
+                                        metadata,
+                                        lobby_id,
+                                        websocket_id: ws_id,
+                                    })
                                 }
                                 Err(e) => {
                                     error!("Failed to get lobby members: {}", e);
                                     let response = WSMessage::AccessDenied {
-                                        reason: format!("Failed to get lobby members: {}", e)
+                                        reason: format!("Failed to get lobby members: {}", e),
                                     };
                                     let json_msg = serde_json::to_string(&response)?;
                                     ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                                    Ok(ConnectionState::InLobby {
+                                        metadata,
+                                        lobby_id,
+                                        websocket_id: ws_id,
+                                    })
                                 }
                             }
                         }
                         Ok(None) => {
                             let response = WSMessage::AccessDenied {
-                                reason: "Lobby not found".to_string()
+                                reason: "Lobby not found".to_string(),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                            Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            })
                         }
                         Err(e) => {
                             error!("Failed to get lobby: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to get lobby: {}", e)
+                                reason: format!("Failed to get lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                            Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            })
                         }
                     }
                 }
-                WSMessage::QueueForMatchMulti { game_types, queue_mode } => {
+                WSMessage::QueueForMatchMulti {
+                    game_types,
+                    queue_mode,
+                } => {
                     info!("Lobby {} queuing for multiple match types", lobby_id);
 
                     // Get lobby to verify host
@@ -1474,11 +1890,16 @@ async fn process_ws_message(
                             // Only host can queue the lobby
                             if lobby.host_user_id != metadata.user_id {
                                 let response = WSMessage::AccessDenied {
-                                    reason: "Only the lobby host can queue for matchmaking".to_string()
+                                    reason: "Only the lobby host can queue for matchmaking"
+                                        .to_string(),
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                return Ok(ConnectionState::InLobby {
+                                    metadata,
+                                    lobby_id,
+                                    websocket_id: ws_id,
+                                });
                             }
 
                             // Get all lobby members
@@ -1486,11 +1907,15 @@ async fn process_ws_message(
                                 Ok(members) => {
                                     if members.is_empty() {
                                         let response = WSMessage::AccessDenied {
-                                            reason: "Cannot queue empty lobby".to_string()
+                                            reason: "Cannot queue empty lobby".to_string(),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
 
                                     // Fetch MMR for all members and calculate average
@@ -1503,10 +1928,16 @@ async fn process_ws_message(
                                                 member_count += 1;
                                             }
                                             Ok(None) => {
-                                                warn!("User {} not found in database", member.user_id);
+                                                warn!(
+                                                    "User {} not found in database",
+                                                    member.user_id
+                                                );
                                             }
                                             Err(e) => {
-                                                error!("Failed to fetch user {}: {}", member.user_id, e);
+                                                error!(
+                                                    "Failed to fetch user {}: {}",
+                                                    member.user_id, e
+                                                );
                                             }
                                         }
                                     }
@@ -1518,41 +1949,60 @@ async fn process_ws_message(
                                     };
 
                                     // Update lobby state to "queued"
-                                    if let Err(e) = lobby_manager.update_lobby_state(lobby_id, "queued").await {
+                                    if let Err(e) =
+                                        lobby_manager.update_lobby_state(lobby_id, "queued").await
+                                    {
                                         error!("Failed to update lobby state: {}", e);
                                         let response = WSMessage::AccessDenied {
-                                            reason: format!("Failed to queue lobby: {}", e)
+                                            reason: format!("Failed to queue lobby: {}", e),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
 
                                     // Add lobby to matchmaking queue with multiple game types
                                     let mut mm_guard = matchmaking_manager.lock().await;
-                                    if let Err(e) = mm_guard.add_lobby_to_queue(
-                                        lobby_id,
-                                        &lobby.lobby_code,
-                                        members.clone(),
-                                        avg_mmr,
-                                        game_types,  // Use game_types directly instead of wrapping
-                                        queue_mode.clone(),
-                                        metadata.user_id as u32,  // Host is the requesting user
-                                    ).await {
+                                    if let Err(e) = mm_guard
+                                        .add_lobby_to_queue(
+                                            lobby_id,
+                                            &lobby.lobby_code,
+                                            members.clone(),
+                                            avg_mmr,
+                                            game_types, // Use game_types directly instead of wrapping
+                                            queue_mode.clone(),
+                                            metadata.user_id as u32, // Host is the requesting user
+                                        )
+                                        .await
+                                    {
                                         error!("Failed to add lobby to matchmaking queue: {}", e);
                                         let response = WSMessage::AccessDenied {
-                                            reason: format!("Failed to queue lobby: {}", e)
+                                            reason: format!("Failed to queue lobby: {}", e),
                                         };
                                         let json_msg = serde_json::to_string(&response)?;
                                         ws_tx.send(Message::Text(json_msg.into())).await?;
                                         // Revert lobby state
-                                        let _ = lobby_manager.update_lobby_state(lobby_id, "waiting").await;
-                                        return Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id });
+                                        let _ = lobby_manager
+                                            .update_lobby_state(lobby_id, "waiting")
+                                            .await;
+                                        return Ok(ConnectionState::InLobby {
+                                            metadata,
+                                            lobby_id,
+                                            websocket_id: ws_id,
+                                        });
                                     }
                                     drop(mm_guard);
 
-                                    info!("Lobby {} added to matchmaking queue for multiple game types with {} members and avg MMR {}",
-                                        lobby_id, members.len(), avg_mmr);
+                                    info!(
+                                        "Lobby {} added to matchmaking queue for multiple game types with {} members and avg MMR {}",
+                                        lobby_id,
+                                        members.len(),
+                                        avg_mmr
+                                    );
 
                                     // Subscribe to lobby match notifications
                                     let lobby_id_for_task = lobby_id;
@@ -1563,33 +2013,86 @@ async fn process_ws_message(
                                     tokio::spawn(async move {
                                         // Subscribe to lobby match notifications
                                         let redis_keys = crate::redis_keys::RedisKeys::new();
-                                        let channel = redis_keys.matchmaking_lobby_notification_channel(lobby_id_for_task);
-                                        info!("Subscribing to lobby match notifications on channel: {}", channel);
+                                        let channel = redis_keys
+                                            .matchmaking_lobby_notification_channel(
+                                                lobby_id_for_task,
+                                            );
+                                        info!(
+                                            "Subscribing to lobby match notifications on channel: {}",
+                                            channel
+                                        );
 
-                                        if let Ok(client) = redis::Client::open(redis_url_clone.as_ref()) {
-                                            if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                                        if let Ok(client) =
+                                            redis::Client::open(redis_url_clone.as_ref())
+                                        {
+                                            if let Ok(mut pubsub) = client.get_async_pubsub().await
+                                            {
                                                 if pubsub.subscribe(&channel).await.is_ok() {
-                                                    info!("Successfully subscribed to lobby match notifications for lobby {}", lobby_id_for_task);
+                                                    info!(
+                                                        "Successfully subscribed to lobby match notifications for lobby {}",
+                                                        lobby_id_for_task
+                                                    );
 
                                                     let mut pubsub_stream = pubsub.on_message();
-                                                    if let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
-                                                        if let Ok(payload) = msg.get_payload::<String>() {
+                                                    if let Some(msg) =
+                                                        futures_util::StreamExt::next(
+                                                            &mut pubsub_stream,
+                                                        )
+                                                        .await
+                                                    {
+                                                        if let Ok(payload) =
+                                                            msg.get_payload::<String>()
+                                                        {
                                                             // Parse the notification
-                                                            if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
-                                                                if let Some(game_id) = notification["game_id"].as_u64() {
-                                                                    info!("Lobby {} matched to game {}, waiting for game to be available", lobby_id_for_task, game_id);
+                                                            if let Ok(notification) =
+                                                                serde_json::from_str::<
+                                                                    serde_json::Value,
+                                                                >(
+                                                                    &payload
+                                                                )
+                                                            {
+                                                                if let Some(game_id) =
+                                                                    notification["game_id"].as_u64()
+                                                                {
+                                                                    info!(
+                                                                        "Lobby {} matched to game {}, waiting for game to be available",
+                                                                        lobby_id_for_task, game_id
+                                                                    );
 
                                                                     // Wait for the game to become available in the replication manager
-                                                                    match replication_manager_clone.wait_for_game(game_id as u32, 10).await {
+                                                                    match replication_manager_clone
+                                                                        .wait_for_game(
+                                                                            game_id as u32,
+                                                                            10,
+                                                                        )
+                                                                        .await
+                                                                    {
                                                                         Ok(_game_state) => {
-                                                                            info!("Game {} is now available, sending JoinGame message to lobby {}", game_id, lobby_id_for_task);
+                                                                            info!(
+                                                                                "Game {} is now available, sending JoinGame message to lobby {}",
+                                                                                game_id,
+                                                                                lobby_id_for_task
+                                                                            );
                                                                             // Send JoinGame message to client
-                                                                            let join_msg = WSMessage::JoinGame(game_id as u32);
+                                                                            let join_msg =
+                                                                                WSMessage::JoinGame(
+                                                                                    game_id as u32,
+                                                                                );
                                                                             let json_msg = serde_json::to_string(&join_msg).unwrap();
-                                                                            let _ = ws_tx_clone.send(Message::Text(json_msg.into())).await;
+                                                                            let _ = ws_tx_clone
+                                                                                .send(
+                                                                                    Message::Text(
+                                                                                        json_msg
+                                                                                            .into(),
+                                                                                    ),
+                                                                                )
+                                                                                .await;
                                                                         }
                                                                         Err(e) => {
-                                                                            error!("Failed to wait for game {} to become available: {}", game_id, e);
+                                                                            error!(
+                                                                                "Failed to wait for game {} to become available: {}",
+                                                                                game_id, e
+                                                                            );
                                                                         }
                                                                     }
                                                                 }
@@ -1597,41 +2100,60 @@ async fn process_ws_message(
                                                         }
                                                     }
                                                 } else {
-                                                    error!("Failed to subscribe to lobby channel {} for lobby {}", channel, lobby_id_for_task);
+                                                    error!(
+                                                        "Failed to subscribe to lobby channel {} for lobby {}",
+                                                        channel, lobby_id_for_task
+                                                    );
                                                 }
                                             }
                                         }
                                     });
 
-                                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                                    Ok(ConnectionState::InLobby {
+                                        metadata,
+                                        lobby_id,
+                                        websocket_id: ws_id,
+                                    })
                                 }
                                 Err(e) => {
                                     error!("Failed to get lobby members: {}", e);
                                     let response = WSMessage::AccessDenied {
-                                        reason: format!("Failed to get lobby members: {}", e)
+                                        reason: format!("Failed to get lobby members: {}", e),
                                     };
                                     let json_msg = serde_json::to_string(&response)?;
                                     ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                                    Ok(ConnectionState::InLobby {
+                                        metadata,
+                                        lobby_id,
+                                        websocket_id: ws_id,
+                                    })
                                 }
                             }
                         }
                         Ok(None) => {
                             let response = WSMessage::AccessDenied {
-                                reason: "Lobby not found".to_string()
+                                reason: "Lobby not found".to_string(),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                            Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            })
                         }
                         Err(e) => {
                             error!("Failed to get lobby: {}", e);
                             let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to get lobby: {}", e)
+                                reason: format!("Failed to get lobby: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                            Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            })
                         }
                     }
                 }
@@ -1639,55 +2161,93 @@ async fn process_ws_message(
                     // Respond with Pong
                     let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
                     ws_tx.send(pong_msg).await?;
-                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
                 }
                 WSMessage::ClockSyncRequest { client_time } => {
                     // Respond with server time for clock synchronization
                     let server_time = chrono::Utc::now().timestamp_millis();
-                    let response = WSMessage::ClockSyncResponse { client_time, server_time };
+                    let response = WSMessage::ClockSyncResponse {
+                        client_time,
+                        server_time,
+                    };
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
-                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
                 }
                 WSMessage::JoinGame(game_id) => {
-                    info!("User {} ({}) joining game {} from lobby {}",
-                          metadata.username, metadata.user_id, game_id, lobby_id);
+                    info!(
+                        "User {} ({}) joining game {} from lobby {}",
+                        metadata.username, metadata.user_id, game_id, lobby_id
+                    );
 
                     // Leave the lobby before joining game
-                    if let Err(e) = lobby_manager.leave_lobby(lobby_id, metadata.user_id, &ws_id).await {
+                    if let Err(e) = lobby_manager
+                        .leave_lobby(lobby_id, metadata.user_id, &ws_id)
+                        .await
+                    {
                         error!("Failed to leave lobby on game join: {}", e);
                     }
 
                     // Transition to InGame state
-                    Ok(ConnectionState::InGame {
-                        metadata,
-                        game_id,
-                    })
+                    Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 _ => {
                     warn!("Unexpected message in lobby state: {:?}", ws_message);
-                    Ok(ConnectionState::InLobby { metadata, lobby_id, websocket_id: ws_id })
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
                 }
             }
         }
         ConnectionState::InGame { metadata, game_id } => {
             match ws_message {
+                WSMessage::UpdateNickname { nickname } => {
+                    let mut metadata = metadata;
+                    if let Err(e) = handle_guest_nickname_update(
+                        &db,
+                        lobby_manager,
+                        &mut metadata,
+                        &ws_tx,
+                        nickname,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to update guest nickname for user {} while in game {}: {}",
+                            metadata.user_id, game_id, e
+                        );
+                    }
+                    Ok(ConnectionState::InGame { metadata, game_id })
+                }
                 WSMessage::GameCommand(command_message) => {
                     // Submit command via PubSub
                     let partition_id = game_id % PARTITION_COUNT;
-                    
+
                     let event = StreamEvent::GameCommandSubmitted {
                         game_id,
                         user_id: metadata.user_id as u32,
                         command: command_message,
                     };
-                    
+
                     // Send command via PubSub
-                    let serialized = serde_json::to_vec(&event)
-                        .context("Failed to serialize command")?;
+                    let serialized =
+                        serde_json::to_vec(&event).context("Failed to serialize command")?;
                     match pubsub.publish_command(partition_id, &serialized).await {
                         Ok(_) => {
-                            debug!("Successfully submitted game command via PubSub: {:?}", event);
+                            debug!(
+                                "Successfully submitted game command via PubSub: {:?}",
+                                event
+                            );
                             Ok(ConnectionState::InGame { metadata, game_id })
                         }
                         Err(e) => {
@@ -1706,49 +2266,63 @@ async fn process_ws_message(
                 WSMessage::ClockSyncRequest { client_time } => {
                     // Respond with server time for clock synchronization
                     let server_time = chrono::Utc::now().timestamp_millis();
-                    let response = WSMessage::ClockSyncResponse { client_time, server_time };
+                    let response = WSMessage::ClockSyncResponse {
+                        client_time,
+                        server_time,
+                    };
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::InGame { metadata, game_id })
                 }
                 WSMessage::LeaveGame => {
-                    info!("User {} ({}) leaving game {}", metadata.username, metadata.user_id, game_id);
+                    info!(
+                        "User {} ({}) leaving game {}",
+                        metadata.username, metadata.user_id, game_id
+                    );
                     // Transition back to authenticated state
                     Ok(ConnectionState::Authenticated { metadata })
                 }
                 WSMessage::StartCustomGame => {
-                    info!("User {} ({}) starting custom game {}", metadata.username, metadata.user_id, game_id);
-                    
+                    info!(
+                        "User {} ({}) starting custom game {}",
+                        metadata.username, metadata.user_id, game_id
+                    );
+
                     // Check if user is the host
                     let is_host = check_game_host(db, game_id, metadata.user_id).await?;
                     if !is_host {
-                        let response = WSMessage::AccessDenied { 
-                            reason: "Only the host can start the game".to_string() 
+                        let response = WSMessage::AccessDenied {
+                            reason: "Only the host can start the game".to_string(),
                         };
                         let json_msg = serde_json::to_string(&response)?;
                         ws_tx.send(Message::Text(json_msg.into())).await?;
                         return Ok(ConnectionState::InGame { metadata, game_id });
                     }
-                    
+
                     // Get server ID from database
-                    let server_id = db.get_server_for_load_balancing("default")
-                        .await?;
-                    
+                    let server_id = db.get_server_for_load_balancing("default").await?;
+
                     // Start the game by publishing StatusUpdated event via PubSub
                     let _partition_id = game_id % PARTITION_COUNT;
-                    
-                    let _status_event = StreamEvent::StatusUpdated { 
+
+                    let _status_event = StreamEvent::StatusUpdated {
                         game_id,
-                        status: GameStatus::Started { server_id: server_id as u64 },
+                        status: GameStatus::Started {
+                            server_id: server_id as u64,
+                        },
                     };
-                    
+
                     // Publish game started event via PubSub
                     let event_msg = GameEventMessage {
                         game_id,
                         tick: 0,
                         sequence: 0,
                         user_id: None,
-                        event: GameEvent::StatusUpdated { status: GameStatus::Started { server_id: server_id as u64 } },
+                        event: GameEvent::StatusUpdated {
+                            status: GameStatus::Started {
+                                server_id: server_id as u64,
+                            },
+                        },
                     };
                     let partition_id = game_id % crate::game_executor::PARTITION_COUNT;
                     match pubsub.publish_event(partition_id, &event_msg).await {
@@ -1760,8 +2334,8 @@ async fn process_ws_message(
                         }
                         Err(e) => {
                             error!("Failed to start game: {}", e);
-                            let response = WSMessage::AccessDenied { 
-                                reason: format!("Failed to start game: {}", e) 
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to start game: {}", e),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -1782,14 +2356,18 @@ async fn process_ws_message(
     }
 }
 
-
-
-
-pub async fn register_server(db: &Arc<dyn Database>, grpc_address: &str, region: &str, origin: &str, ws_url: &str) -> Result<u64> {
+pub async fn register_server(
+    db: &Arc<dyn Database>,
+    grpc_address: &str,
+    region: &str,
+    origin: &str,
+    ws_url: &str,
+) -> Result<u64> {
     info!("Registering server instance");
 
     // Insert a new record and return the generated ID
-    let id = db.register_server(grpc_address, region, origin, ws_url)
+    let id = db
+        .register_server(grpc_address, region, origin, ws_url)
         .await
         .context("Failed to register server in database")?;
 
@@ -1809,11 +2387,15 @@ async fn subscribe_to_user_count_updates(
     let client = redis::Client::open(redis_url.as_str())
         .context("Failed to create Redis client for user count subscription")?;
 
-    let mut pubsub_conn = client.get_async_pubsub().await
+    let mut pubsub_conn = client
+        .get_async_pubsub()
+        .await
         .context("Failed to create Redis pub/sub connection")?;
 
     // Subscribe to user count updates channel
-    pubsub_conn.subscribe("user_count_updates").await
+    pubsub_conn
+        .subscribe("user_count_updates")
+        .await
         .context("Failed to subscribe to user_count_updates channel")?;
 
     info!("Subscribed to user count updates");
@@ -1831,13 +2413,14 @@ async fn subscribe_to_user_count_updates(
         };
 
         // Parse the region counts
-        let region_counts: std::collections::HashMap<String, u32> = match serde_json::from_str(&payload) {
-            Ok(counts) => counts,
-            Err(e) => {
-                warn!("Failed to parse user count update: {}", e);
-                continue;
-            }
-        };
+        let region_counts: std::collections::HashMap<String, u32> =
+            match serde_json::from_str(&payload) {
+                Ok(counts) => counts,
+                Err(e) => {
+                    warn!("Failed to parse user count update: {}", e);
+                    continue;
+                }
+            };
 
         // Create WebSocket message
         let ws_message = WSMessage::UserCountUpdate { region_counts };
@@ -1872,12 +2455,16 @@ async fn subscribe_to_lobby_updates(
     let client = redis::Client::open(redis_url.as_str())
         .context("Failed to create Redis client for lobby subscription")?;
 
-    let mut pubsub_conn = client.get_async_pubsub().await
+    let mut pubsub_conn = client
+        .get_async_pubsub()
+        .await
         .context("Failed to create Redis pub/sub connection")?;
 
     // Subscribe to lobby update channel
     let channel = format!("lobby:{}:updates", lobby_id);
-    pubsub_conn.subscribe(&channel).await
+    pubsub_conn
+        .subscribe(&channel)
+        .await
         .context("Failed to subscribe to lobby updates channel")?;
 
     info!("Subscribed to lobby updates for lobby {}", lobby_id);
@@ -1933,19 +2520,26 @@ async fn subscribe_to_lobby_updates(
 
 pub async fn discover_peers(db: &Arc<dyn Database>, region: &str) -> Result<Vec<(u64, String)>> {
     info!("Discovering peers in region: {}", region);
-    
+
     // Query to find all servers in the specified region
-    let servers = db.get_active_servers(region)
+    let servers = db
+        .get_active_servers(region)
         .await
         .context("Failed to fetch server records")?;
-    
+
     if servers.is_empty() {
         warn!("No servers found in region: {}", region);
         return Ok(vec![]);
     }
-    
-    info!("Found {} servers in region {}: {:?}", servers.len(), region, servers);
-    Ok(servers.into_iter()
+
+    info!(
+        "Found {} servers in region {}: {:?}",
+        servers.len(),
+        region,
+        servers
+    );
+    Ok(servers
+        .into_iter()
         .map(|(id, address)| (id as u64, address))
         .collect())
 }
@@ -1955,7 +2549,7 @@ fn generate_game_code() -> String {
     use rand::{Rng, thread_rng};
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = thread_rng();
-    
+
     (0..8)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());
@@ -1972,29 +2566,31 @@ async fn create_custom_game(
     settings: common::CustomGameSettings,
 ) -> Result<(u32, String)> {
     let game_code = generate_game_code();
-    
+
     // Get current server ID from database
     let server_id = db.get_server_for_load_balancing("default").await?;
-    
+
     // Create lobby entry
-    let lobby_id = db.create_custom_lobby(
-        &game_code,
-        user_id,
-        &serde_json::to_value(&settings)?,
-    ).await?;
-    
+    let lobby_id = db
+        .create_custom_lobby(&game_code, user_id, &serde_json::to_value(&settings)?)
+        .await?;
+
     // Create game entry
-    let game_id = db.create_game(
-        server_id,
-        &serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?,
-        "custom",
-        settings.is_private,
-        Some(&game_code),
-    ).await?;
-    
+    let game_id = db
+        .create_game(
+            server_id,
+            &serde_json::to_value(&common::GameType::Custom {
+                settings: settings.clone(),
+            })?,
+            "custom",
+            settings.is_private,
+            Some(&game_code),
+        )
+        .await?;
+
     // Update lobby with game_id
     db.update_custom_lobby_game_id(lobby_id, game_id).await?;
-    
+
     // Create game state
     let start_ms = chrono::Utc::now().timestamp_millis();
     let mut game_state = common::GameState::new(
@@ -2006,33 +2602,36 @@ async fn create_custom_game(
     );
     game_state.game_code = Some(game_code.clone());
     game_state.host_user_id = Some(user_id as u32);
-    
+
     // Add the host as the first player
     game_state.add_player(user_id as u32, Some(username))?;
-    
+
     // Spawn initial food items
     game_state.spawn_initial_food();
-    
+
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
-    
+
     let event = StreamEvent::GameCreated {
         game_id: game_id_u32,
         game_state: game_state.clone(),
     };
-    
+
     // Publish initial snapshot when game is created
     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+    pubsub
+        .publish_snapshot(partition_id, game_id_u32, &game_state)
+        .await
         .context("Failed to publish initial game snapshot")?;
-    
+
     // Also send GameCreated event via partition command channel
-    let serialized = serde_json::to_vec(&event)
-        .context("Failed to serialize GameCreated event")?;
-    pubsub.publish_command(partition_id, &serialized).await
+    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
+    pubsub
+        .publish_command(partition_id, &serialized)
+        .await
         .context("Failed to publish GameCreated event")?;
-    
+
     Ok((game_id as u32, game_code))
 }
 
@@ -2045,127 +2644,135 @@ async fn create_solo_game(
     // Get current server ID from database - use the region from environment or default
     let region = std::env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
     let server_id = db.get_server_for_load_balancing(&region).await?;
-    
+
     // Create game settings for solo game
     let settings = common::CustomGameSettings {
         arena_width: 40,
         arena_height: 40,
         tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
         food_spawn_rate: 3.0,
-        max_players: 1,  // Solo game
+        max_players: 1, // Solo game
         game_mode: common::GameMode::Solo,
         is_private: true,
         allow_spectators: false,
         snake_start_length: 4,
     };
-    
+
     // Create game entry
-    let game_id = db.create_game(
-        server_id,
-        &serde_json::to_value(&common::GameType::Custom { settings: settings.clone() })?,
-        "solo",
-        true,  // Solo games are private
-        None,  // No game code for solo games
-    ).await?;
-    
+    let game_id = db
+        .create_game(
+            server_id,
+            &serde_json::to_value(&common::GameType::Custom {
+                settings: settings.clone(),
+            })?,
+            "solo",
+            true, // Solo games are private
+            None, // No game code for solo games
+        )
+        .await?;
+
     // Create game state with one player
     let start_ms = chrono::Utc::now().timestamp_millis();
     let mut game_state = common::GameState::new(
         settings.arena_width,
         settings.arena_height,
-        common::GameType::Custom { settings: settings.clone() },
+        common::GameType::Custom {
+            settings: settings.clone(),
+        },
         Some(rand::random::<u64>()),
         start_ms,
     );
-    
+
     // Add the player (only one player for solo mode)
     game_state.add_player(user_id as u32, Some(username))?;
-    
+
     // Spawn initial food items
     game_state.spawn_initial_food();
 
     // Publish GameCreated event to Redis stream
     let game_id_u32 = game_id as u32;
     let partition_id = game_id_u32 % PARTITION_COUNT;
-    
+
     let event = StreamEvent::GameCreated {
         game_id: game_id_u32,
         game_state: game_state.clone(),
     };
-    
+
     // Publish initial snapshot when game is created
     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-    pubsub.publish_snapshot(partition_id, game_id_u32, &game_state).await
+    pubsub
+        .publish_snapshot(partition_id, game_id_u32, &game_state)
+        .await
         .context("Failed to publish initial game snapshot")?;
-    
+
     // Also send GameCreated event via partition command channel
-    let serialized = serde_json::to_vec(&event)
-        .context("Failed to serialize GameCreated event")?;
-    pubsub.publish_command(partition_id, &serialized).await
+    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
+    pubsub
+        .publish_command(partition_id, &serialized)
+        .await
         .context("Failed to publish GameCreated event")?;
-    
+
     // Start the game immediately (no waiting in solo mode)
-    let status_event = StreamEvent::StatusUpdated { 
+    let status_event = StreamEvent::StatusUpdated {
         game_id: game_id as u32,
-        status: GameStatus::Started { server_id: server_id as u64 },
+        status: GameStatus::Started {
+            server_id: server_id as u64,
+        },
     };
-    
-    let status_serialized = serde_json::to_vec(&status_event)
-        .context("Failed to serialize StatusUpdated event")?;
-    pubsub.publish_command(partition_id, &status_serialized).await
+
+    let status_serialized =
+        serde_json::to_vec(&status_event).context("Failed to serialize StatusUpdated event")?;
+    pubsub
+        .publish_command(partition_id, &status_serialized)
+        .await
         .context("Failed to publish StatusUpdated event")?;
-    
+
     Ok(game_id as u32)
 }
 
-async fn join_custom_game(
-    db: &Arc<dyn Database>,
-    user_id: i32,
-    game_code: &str,
-) -> Result<u32> {
+async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str) -> Result<u32> {
     // Find the game by code
-    let game = db.get_game_by_code(game_code).await?
+    let game = db
+        .get_game_by_code(game_code)
+        .await?
         .context("Game not found or already started")?;
-    
+
     // Check that game is waiting
     if game.status != "waiting" {
         return Err(anyhow::anyhow!("Game already started"));
     }
-    
+
     let game_id = game.id;
-    
+
     // Check if game is full
     let player_count = db.get_player_count(game_id).await?;
-    
+
     // Get max players from game settings
-    let max_players = game.game_type
+    let max_players = game
+        .game_type
         .get("settings")
         .and_then(|s| s.get("max_players"))
         .and_then(|v| v.as_i64())
         .unwrap_or(4) as i64;
-    
+
     if player_count >= max_players {
         return Err(anyhow::anyhow!("Game is full"));
     }
-    
+
     // For now, we need to handle player joining differently since GameState
     // only allows adding players on tick 0. We'll need to implement a proper
     // lobby system or modify the game engine to support late joins.
-    
+
     // Add player to the game
     db.add_player_to_game(game_id, user_id, 0).await?;
-    
+
     // TODO: Implement proper player joining through Redis events when game hasn't started yet
     warn!("Player joining for custom games needs proper implementation");
-    
+
     Ok(game_id as u32)
 }
 
-async fn check_game_host(
-    db: &Arc<dyn Database>,
-    game_id: u32,
-    user_id: i32,
-) -> Result<bool> {
+async fn check_game_host(db: &Arc<dyn Database>, game_id: u32, user_id: i32) -> Result<bool> {
     let host_user_id = db.get_custom_lobby_host(game_id as i32).await?;
     Ok(host_user_id == Some(user_id))
 }
@@ -2178,19 +2785,22 @@ async fn spectate_game(
 ) -> Result<u32> {
     // If game_code is provided, look up game by code
     let actual_game_id = if let Some(code) = game_code {
-        let game = db.get_game_by_code(code).await?
+        let game = db
+            .get_game_by_code(code)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("Invalid game code"))?;
-        
+
         // Check if spectators are allowed for private games
         if game.is_private {
             let lobby = db.get_custom_lobby_by_code(code).await?;
-            
+
             if let Some(lobby) = lobby {
-                let allow_spectators = lobby.settings
+                let allow_spectators = lobby
+                    .settings
                     .get("allow_spectators")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                
+
                 if !allow_spectators {
                     return Err(anyhow::anyhow!("Spectators are not allowed for this game"));
                 }
@@ -2203,18 +2813,21 @@ async fn spectate_game(
     } else {
         // Direct game_id access - check if game exists and is public
         let game = db.get_game_by_id(game_id as i32).await?;
-        
+
         match game {
             Some(g) if !g.is_private => game_id, // Public game, allow spectating
             Some(_) => return Err(anyhow::anyhow!("Cannot spectate private game without code")),
             None => return Err(anyhow::anyhow!("Game not found")),
         }
     };
-    
+
     // Add spectator to the game
-    db.add_spectator_to_game(actual_game_id as i32, user_id).await?;
-    
-    info!("User {} joined as spectator for game {}", user_id, actual_game_id);
+    db.add_spectator_to_game(actual_game_id as i32, user_id)
+        .await?;
+
+    info!(
+        "User {} joined as spectator for game {}",
+        user_id, actual_game_id
+    );
     Ok(actual_game_id)
 }
-

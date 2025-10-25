@@ -15,6 +15,7 @@ interface SidebarProps {
   onLeaveLobby?: () => void;
   onStartGame?: () => void;
   onJoinGame?: () => void;
+  isInviteDisabled?: boolean;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -28,7 +29,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onInvite,
   onLeaveLobby,
   onStartGame,
-  onJoinGame
+  onJoinGame,
+  isInviteDisabled = false
 }) => {
   return (
     <aside className="sidebar h-screen flex flex-col">
@@ -117,7 +119,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {onInvite && (
             <button
               onClick={onInvite}
-              className="px-4 py-2 text-xs border border-black-70 rounded font-bold uppercase bg-white text-black-70 hover:bg-gray-50 transition-colors cursor-pointer"
+              disabled={isInviteDisabled}
+              className="px-4 py-2 text-xs border border-black-70 rounded font-bold uppercase bg-white text-black-70 hover:bg-gray-50 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               style={{ letterSpacing: '1px' }}
             >
               Invite Friends

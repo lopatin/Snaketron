@@ -1,28 +1,28 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, error, warn, trace, debug};
+use tracing::{debug, error, info, trace, warn};
 
+use crate::game_executor::PARTITION_COUNT;
+use crate::ws_server::discover_peers;
 use crate::{
-    ws_server::JwtVerifier,
-    game_executor::{run_game_executor, StreamEvent},
+    cluster_singleton::ClusterSingleton,
+    db::Database,
+    game_executor::{StreamEvent, run_game_executor},
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
-    replay::ReplayListener,
-    cluster_singleton::ClusterSingleton,
-    replication::ReplicationManager,
     redis_keys::RedisKeys,
     redis_utils,
-    db::Database,
+    replay::ReplayListener,
+    replication::ReplicationManager,
+    ws_server::JwtVerifier,
 };
-use crate::ws_server::discover_peers;
-use std::path::PathBuf;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use crate::game_executor::PARTITION_COUNT;
+use redis::aio::ConnectionManager;
+use std::path::PathBuf;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -71,12 +71,12 @@ impl GameServer {
     pub fn http_addr(&self) -> &str {
         &self.http_addr
     }
-    
+
     /// Get the server ID
     pub fn id(&self) -> u64 {
         self.server_id
     }
-    
+
     /// Get the gRPC server address (if enabled)
     pub fn grpc_addr(&self) -> Option<&str> {
         if self.grpc_addr.is_empty() {
@@ -101,7 +101,9 @@ impl GameServer {
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
-        let server_id = db.register_server(&grpc_addr, &region, &origin, &ws_url).await
+        let server_id = db
+            .register_server(&grpc_addr, &region, &origin, &ws_url)
+            .await
             .context("Failed to register server")? as u64;
         info!("Server registered with ID: {}", server_id);
 
@@ -118,12 +120,17 @@ impl GameServer {
 
         // Redis connection manager
         info!("Connecting to Redis at: {}", redis_url.as_str());
-        let client = redis::Client::open(redis_url.as_str())
-            .context(format!("Failed to open Redis client for URL: {}", redis_url))?;
+        let client = redis::Client::open(redis_url.as_str()).context(format!(
+            "Failed to open Redis client for URL: {}",
+            redis_url
+        ))?;
         info!("Redis client created, creating connection manager...");
         let redis_conn = redis_utils::create_connection_manager(client)
             .await
-            .context(format!("Failed to create Redis connection manager for URL: {}", redis_url))?;
+            .context(format!(
+                "Failed to create Redis connection manager for URL: {}",
+                redis_url
+            ))?;
         info!("Redis connection manager created successfully");
 
         // WebSocket server will be started after ReplicationManager is created
@@ -134,14 +141,15 @@ impl GameServer {
         let match_token = cancellation_token.clone();
         handles.push(tokio::spawn(async move {
             // Create matchmaking manager and pubsub for matchmaking
-            let matchmaking_manager = match crate::matchmaking_manager::MatchmakingManager::new(&match_redis_url).await {
-                Ok(mgr) => mgr,
-                Err(e) => {
-                    error!("Failed to create matchmaking manager: {}", e);
-                    return;
-                }
-            };
-            
+            let matchmaking_manager =
+                match crate::matchmaking_manager::MatchmakingManager::new(&match_redis_url).await {
+                    Ok(mgr) => mgr,
+                    Err(e) => {
+                        error!("Failed to create matchmaking manager: {}", e);
+                        return;
+                    }
+                };
+
             let pubsub = match crate::pubsub_manager::PubSubManager::new(&match_redis_url).await {
                 Ok(ps) => ps,
                 Err(e) => {
@@ -149,12 +157,8 @@ impl GameServer {
                     return;
                 }
             };
-            
-            if let Err(e) = run_matchmaking_loop(
-                matchmaking_manager,
-                pubsub,
-                match_token,
-            ).await {
+
+            if let Err(e) = run_matchmaking_loop(matchmaking_manager, pubsub, match_token).await {
                 error!("Matchmaking loop error: {}", e);
             }
         }));
@@ -167,14 +171,19 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
-            ).await.context("Failed to create replication manager")?
+            )
+            .await
+            .context("Failed to create replication manager")?,
         );
-        
+
         // Wait for replication to be ready
         let replication_start = std::time::Instant::now();
         loop {
             if replication_manager.is_ready().await {
-                info!("Replication manager is ready after {:?}", replication_start.elapsed());
+                info!(
+                    "Replication manager is ready after {:?}",
+                    replication_start.elapsed()
+                );
                 break;
             }
             if replication_start.elapsed() > Duration::from_secs(30) {
@@ -182,7 +191,7 @@ impl GameServer {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        
+
         // Note: HTTP server will be started separately in main.rs
         // This is because it needs both the replication manager and JWT verifier
         info!("HTTP server will be started externally at {}", http_addr);
@@ -198,22 +207,30 @@ impl GameServer {
             let exec_replication_manager = replication_manager.clone();
 
             handles.push(tokio::spawn(async move {
-                info!("Starting cluster singleton for game executor partition {}", partition_id);
-                
+                info!(
+                    "Starting cluster singleton for game executor partition {}",
+                    partition_id
+                );
+
                 let singleton = match ClusterSingleton::new(
                     &exec_redis_url,
                     server_id,
                     RedisKeys::new().partition_executor_lease(partition_id),
                     Duration::from_secs(1),
                     exec_token.clone(),
-                ).await {
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("Failed to create cluster singleton for partition {}: {}", partition_id, e);
+                        error!(
+                            "Failed to create cluster singleton for partition {}: {}",
+                            partition_id, e
+                        );
                         return;
                     }
                 };
-                
+
                 // Service that runs the game executor for this partition
                 let service = move |token: CancellationToken| {
                     let redis_url_clone = exec_redis_url.clone();
@@ -229,16 +246,25 @@ impl GameServer {
                             db_clone,
                             replication_manager_clone,
                             token,
-                        ).await {
-                            error!("Game executor service error for partition {}: {}", partition_id, e);
+                        )
+                        .await
+                        {
+                            error!(
+                                "Game executor service error for partition {}: {}",
+                                partition_id, e
+                            );
                         }
 
                         Ok::<(), anyhow::Error>(())
-                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
                 };
-                
+
                 if let Err(e) = singleton.run(service).await {
-                    error!("Cluster singleton error for game executor partition {}: {}", partition_id, e);
+                    error!(
+                        "Cluster singleton error for game executor partition {}: {}",
+                        partition_id, e
+                    );
                 }
             }));
         }
@@ -263,7 +289,7 @@ impl GameServer {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         info!("Game server {} started successfully", server_id);
-        
+
         Ok(Self {
             server_id,
             http_addr,
@@ -285,7 +311,7 @@ impl GameServer {
     // pub fn replay_listener(&self) -> Option<&Arc<ReplayListener>> {
     //     self.replay_listener.as_ref()
     // }
-    
+
     /// Get the replication manager
     pub fn replication_manager(&self) -> Option<&Arc<ReplicationManager>> {
         self.replication_manager.as_ref()
@@ -298,14 +324,18 @@ impl GameServer {
 
     /// Shutdown the server gracefully
     pub async fn shutdown(mut self) -> Result<()> {
-        info!("Starting graceful shutdown of game server {}", self.server_id);
-        
+        info!(
+            "Starting graceful shutdown of game server {}",
+            self.server_id
+        );
+
         // Step 1: Stop accepting new games
         info!("Updating server status to 'draining'");
-        self.db.update_server_status(self.server_id as i32, "draining")
+        self.db
+            .update_server_status(self.server_id as i32, "draining")
             .await
             .context("Failed to update server status")?;
-        
+
         // Signal all services to stop
         info!("Stopping all services");
         self.cancellation_token.cancel();
@@ -313,14 +343,15 @@ impl GameServer {
         // Step 5: Wait for all services to complete
         while let Some(handle) = self.handles.pop() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => error!("Service panicked during shutdown: {:?}", e),
                 Err(_) => error!("Service shutdown timed out"),
             }
         }
 
         // Update server status to offline
-        self.db.update_server_status(self.server_id as i32, "offline")
+        self.db
+            .update_server_status(self.server_id as i32, "offline")
             .await
             .context("Failed to update server status to offline")?;
 
@@ -344,7 +375,6 @@ pub async fn start_test_server_with_grpc(
     jwt_verifier: Arc<dyn JwtVerifier>,
     _enable_grpc: bool,
 ) -> Result<GameServer> {
-
     // Get available ports
     let http_port = get_available_port();
     let http_addr = format!("127.0.0.1:{}", http_port);
@@ -380,7 +410,8 @@ pub async fn start_test_server_with_grpc(
     let http_db = db.clone();
     let http_jwt_verifier = jwt_verifier;
     let http_redis_url = redis_url;
-    let http_replication_manager = game_server.replication_manager()
+    let http_replication_manager = game_server
+        .replication_manager()
         .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
         .clone();
     let http_cancellation_token = game_server.cancellation_token().clone();
@@ -389,8 +420,8 @@ pub async fn start_test_server_with_grpc(
     // Create a dummy region cache for tests
     let aws_config = aws_config::load_from_env().await;
     let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
-    let table_prefix = std::env::var("DYNAMODB_TABLE_PREFIX")
-        .unwrap_or_else(|_| "snaketron".to_string());
+    let table_prefix =
+        std::env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
     let region_cache = Arc::new(crate::region_cache::RegionCache::new(
         dynamodb_client,
         table_prefix,
@@ -401,7 +432,7 @@ pub async fn start_test_server_with_grpc(
         if let Err(e) = crate::http_server::run_http_server(
             &http_addr,
             http_db,
-            "test-jwt-secret",  // JWT secret for tests
+            "test-jwt-secret", // JWT secret for tests
             http_jwt_verifier,
             http_redis_url,
             http_replication_manager,
@@ -409,7 +440,9 @@ pub async fn start_test_server_with_grpc(
             http_server_id,
             "test-region".to_string(),
             region_cache,
-        ).await {
+        )
+        .await
+        {
             error!("HTTP server error in test: {}", e);
         }
     });
@@ -433,7 +466,7 @@ pub fn get_available_port() -> u16 {
 pub async fn run_heartbeat_loop(
     db: Arc<dyn Database>,
     server_id: u64,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     info!(?server_id, "Starting heartbeat loop");

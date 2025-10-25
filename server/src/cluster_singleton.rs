@@ -1,27 +1,27 @@
-use anyhow::{anyhow, Result, Context};
+use crate::redis_utils;
+use anyhow::{Context, Result, anyhow};
+use common::CLUSTER_RENEWAL_INTERVAL_MS;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
-use crate::redis_utils;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::{interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn, error, debug};
-use rand::{Rng, SeedableRng};
-use common::CLUSTER_RENEWAL_INTERVAL_MS;
-use rand::rngs::StdRng;
+use tracing::{debug, error, info, warn};
 
 /// A cluster singleton ensures that only one instance of a service runs across the entire cluster
 /// It uses Redis-based leader election internally to manage exclusivity
-/// 
+///
 /// This can be used for various patterns:
 /// - Global singleton services (e.g., a single matchmaking service for the entire region)
 /// - Partitioned singletons (e.g., one game executor per partition, with automatic failover)
-/// 
+///
 /// The lease_key parameter determines the scope of the singleton - different keys create
 /// independent singletons that can coexist on the same cluster.
-/// 
+///
 /// The cancellation_token passed to the constructor represents the server shutdown signal.
 /// When this token is cancelled, the cluster singleton will:
 /// 1. Stop trying to acquire/maintain leadership
@@ -52,11 +52,14 @@ impl ClusterSingleton {
                 Some(client)
             }
             Err(e) => {
-                warn!("Failed to connect to Redis initially: {}. Will retry during leader election.", e);
+                warn!(
+                    "Failed to connect to Redis initially: {}. Will retry during leader election.",
+                    e
+                );
                 None
             }
         };
-        
+
         Ok(Self {
             redis_url: redis_url.to_string(),
             redis_client,
@@ -67,10 +70,9 @@ impl ClusterSingleton {
             cancellation_token,
         })
     }
-    
+
     async fn create_connection(redis_url: &str) -> Result<ConnectionManager> {
-        let client = redis::Client::open(redis_url)
-            .context("Failed to create Redis client")?;
+        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
 
         let redis_client = redis_utils::create_connection_manager(client)
             .await
@@ -78,7 +80,7 @@ impl ClusterSingleton {
 
         Ok(redis_client)
     }
-    
+
     async fn ensure_connection(&mut self) -> Result<()> {
         if self.redis_client.is_none() {
             debug!("Attempting to reconnect to Redis...");
@@ -99,39 +101,48 @@ impl ClusterSingleton {
 
     /// Runs the provided service as a cluster singleton
     /// The service will only run on one node at a time across the cluster
-    /// 
+    ///
     /// The service function receives a CancellationToken that will be canceled when:
     /// - The server is shutting down (parent token cancelled)
     /// - This instance loses leadership
-    /// 
+    ///
     /// The service should monitor this token and shut down gracefully when canceled.
-    pub async fn run(mut self, user_service: impl Fn(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>) -> Result<()> {
-        info!("Starting cluster singleton for server_id={}", self.server_id);
-        
+    pub async fn run(
+        mut self,
+        user_service: impl Fn(
+            CancellationToken,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+    ) -> Result<()> {
+        info!(
+            "Starting cluster singleton for server_id={}",
+            self.server_id
+        );
+
         let mut renew_interval = interval(Duration::from_millis(CLUSTER_RENEWAL_INTERVAL_MS));
         renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
+
         // Add a health check interval to detect connection issues proactively
         let mut health_check_interval = interval(Duration::from_secs(5));
         health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
+
         let mut service_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut service_token: Option<CancellationToken> = None;
         let mut rng = StdRng::from_entropy();
-        
+
         // Create the initial claim sleep
         let claim_duration_ms = rng.gen_range(500..=1500);
         let mut claim_sleep = Box::pin(sleep(Duration::from_millis(claim_duration_ms)));
-        
+
         loop {
             tokio::select! {
                 _ = self.cancellation_token.cancelled() => {
                     info!("Cluster singleton shutdown received");
                     self.is_leader.store(false, Ordering::Release);
-                    
+
                     // Gracefully shut down the service if running
                     self.stop_service(&mut service_token, &mut service_handle).await;
-                    
+
                     break;
                 }
                 _ = &mut claim_sleep => {
@@ -141,7 +152,7 @@ impl ClusterSingleton {
                             Ok(true) => {
                                 info!("Became leader for server_id={}", self.server_id);
                                 self.is_leader.store(true, Ordering::Release);
-                                
+
                                 // Start the user service
                                 if service_handle.is_none() {
                                     // Create a child cancellation token for this service instance
@@ -161,7 +172,7 @@ impl ClusterSingleton {
                             }
                         }
                     }
-                    
+
                     // Reset claim sleep with a new random duration
                     let claim_duration_ms = rng.gen_range(500..=1500);
                     claim_sleep = Box::pin(sleep(Duration::from_millis(claim_duration_ms)));
@@ -177,14 +188,14 @@ impl ClusterSingleton {
                             Ok(false) => {
                                 warn!("Lost leadership - failed to renew lease");
                                 self.is_leader.store(false, Ordering::Release);
-                                
+
                                 // Stop the user service
                                 self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                             Err(e) => {
                                 error!("Error renewing lease: {}", e);
                                 self.is_leader.store(false, Ordering::Release);
-                                
+
                                 // Stop the user service on error
                                 self.stop_service(&mut service_token, &mut service_handle).await;
                             }
@@ -199,10 +210,10 @@ impl ClusterSingleton {
                             // Try a simple PING command with timeout
                             let ping_timeout = Duration::from_secs(1);
                             let ping_result: Result<Result<String, _>, _> = timeout(
-                                ping_timeout, 
+                                ping_timeout,
                                 redis::cmd("PING").query_async(client)
                             ).await;
-                            
+
                             match ping_result {
                                 Ok(Ok(_)) => {
                                     // Connection is healthy
@@ -216,12 +227,12 @@ impl ClusterSingleton {
                                     self.redis_client = None;
                                 }
                             }
-                            
+
                             // If connection was lost and we were the leader, step down
                             if self.redis_client.is_none() && self.is_leader() {
                                 warn!("Lost Redis connection while being leader. Stepping down.");
                                 self.is_leader.store(false, Ordering::Release);
-                                
+
                                 self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                         }
@@ -229,14 +240,14 @@ impl ClusterSingleton {
                 }
             }
         }
-        
+
         Ok(())
     }
 
     async fn try_acquire_lease(&mut self) -> Result<bool> {
         // Ensure we have a connection
         self.ensure_connection().await?;
-        
+
         if let Some(ref mut client) = self.redis_client {
             let result: Result<Option<String>, _> = client
                 .set_options(
@@ -244,14 +255,17 @@ impl ClusterSingleton {
                     self.server_id.to_string(),
                     redis::SetOptions::default()
                         .conditional_set(redis::ExistenceCheck::NX)
-                        .with_expiration(redis::SetExpiry::PX(self.lease_duration_ms))
+                        .with_expiration(redis::SetExpiry::PX(self.lease_duration_ms)),
                 )
                 .await;
             match result {
                 Ok(result) => Ok(result.is_some()),
                 Err(e) => {
                     // Connection might be broken, invalidate it
-                    error!("Failed to execute SET NX command: {}. Invalidating connection.", e);
+                    error!(
+                        "Failed to execute SET NX command: {}. Invalidating connection.",
+                        e
+                    );
                     self.redis_client = None;
                     Err(anyhow::anyhow!("Redis connection error: {}", e))
                 }
@@ -264,7 +278,7 @@ impl ClusterSingleton {
     async fn renew_lease(&mut self) -> Result<bool> {
         // Ensure we have a connection
         self.ensure_connection().await?;
-        
+
         if let Some(ref mut client) = self.redis_client {
             // Lua script to atomically check ownership and renew lease
             let lua_script = r#"
@@ -274,7 +288,7 @@ impl ClusterSingleton {
                     return 0
                 end
             "#;
-            
+
             let script = Script::new(lua_script);
             let result: Result<i32, _> = script
                 .key(&self.lease_key)
@@ -286,7 +300,10 @@ impl ClusterSingleton {
                 Ok(result) => Ok(result == 1),
                 Err(e) => {
                     // Connection might be broken, invalidate it
-                    error!("Failed to execute lease renewal script: {}. Invalidating connection.", e);
+                    error!(
+                        "Failed to execute lease renewal script: {}. Invalidating connection.",
+                        e
+                    );
                     self.redis_client = None;
                     Err(anyhow::anyhow!("Redis connection error: {}", e))
                 }
@@ -300,7 +317,7 @@ impl ClusterSingleton {
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::Acquire)
     }
-    
+
     /// Gracefully stops the running service
     async fn stop_service(
         &self,
@@ -312,7 +329,7 @@ impl ClusterSingleton {
             debug!("Cancelling service token");
             token.cancel();
         }
-        
+
         // Then wait for the service to finish gracefully
         if let Some(handle) = service_handle.take() {
             debug!("Waiting for service to shut down gracefully");

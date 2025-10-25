@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
+use serde_json::{Value as JsonValue, json};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -26,6 +26,7 @@ pub struct LobbyJoinHandle {
     pub lobby_id: i32,
     pub user_id: i32,
     pub websocket_id: String,
+    pub username: Arc<RwLock<String>>,
 }
 
 impl Drop for LobbyJoinHandle {
@@ -78,27 +79,29 @@ impl LobbyManager {
         region: String,
     ) -> Result<()> {
         // Get lobby to verify it exists and get host info
-        let lobby = self.get_lobby(lobby_id).await?
+        let lobby = self
+            .get_lobby(lobby_id)
+            .await?
             .ok_or_else(|| anyhow!("Lobby {} not found", lobby_id))?;
 
         let is_host = lobby.host_user_id == user_id;
+        let joined_at = chrono::Utc::now().timestamp_millis();
+        let username_state = Arc::new(RwLock::new(username.clone()));
 
         // Write member to Redis immediately (before spawning background task)
         // This ensures get_lobby_members() will find the member right away
-        let client = redis::Client::open(self.redis_url.as_str())
-            .context("Failed to open Redis client")?;
-        let mut conn = client.get_multiplexed_async_connection().await
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
             .context("Failed to get Redis connection")?;
 
         let key = format!("lobby:{}:member:{}:{}", lobby_id, user_id, websocket_id);
-        let value = json!({
-            "user_id": user_id,
-            "username": username,
-            "joined_at": chrono::Utc::now().timestamp_millis(),
-            "is_host": is_host,
-        });
+        let value = build_member_value(user_id, &username, joined_at, is_host);
 
-        conn.set_ex::<_, _, ()>(&key, value.to_string(), 30).await
+        conn.set_ex::<_, _, ()>(&key, value, 30)
+            .await
             .context("Failed to write initial lobby member to Redis")?;
 
         debug!(
@@ -111,17 +114,21 @@ impl LobbyManager {
         let websocket_id_for_task = websocket_id.clone();
         let websocket_id_for_handle = websocket_id.clone();
         let websocket_id_for_map = websocket_id.clone();
+        let username_for_task = username_state.clone();
 
         let task = tokio::spawn(async move {
             if let Err(e) = heartbeat_loop(
                 redis_url,
                 lobby_id,
                 user_id,
-                username,
+                username_for_task,
                 websocket_id_for_task,
                 region,
                 is_host,
-            ).await {
+                joined_at,
+            )
+            .await
+            {
                 error!(
                     "Heartbeat loop failed for user {} in lobby {}: {}",
                     user_id, lobby_id, e
@@ -135,6 +142,7 @@ impl LobbyManager {
             lobby_id,
             user_id,
             websocket_id: websocket_id_for_handle,
+            username: username_state.clone(),
         };
 
         let mut joins = self.active_joins.write().await;
@@ -149,26 +157,70 @@ impl LobbyManager {
     }
 
     /// Stop heartbeat and remove from Redis
-    pub async fn leave_lobby(
-        &self,
-        lobby_id: i32,
-        user_id: i32,
-        websocket_id: &str,
-    ) -> Result<()> {
+    pub async fn leave_lobby(&self, lobby_id: i32, user_id: i32, websocket_id: &str) -> Result<()> {
         // Remove the join handle (this will abort the heartbeat task via Drop)
         let mut joins = self.active_joins.write().await;
         let key = (lobby_id, user_id, websocket_id.to_string());
+        let was_present = joins.remove(&key).is_some();
+        drop(joins);
 
-        if joins.remove(&key).is_some() {
+        if was_present {
             info!(
                 "User {} left lobby {} (websocket: {})",
                 user_id, lobby_id, websocket_id
             );
+        }
 
-            // Immediately remove from Redis
-            let redis_key = format!("lobby:{}:member:{}:{}", lobby_id, user_id, websocket_id);
-            if let Err(e) = self.remove_from_redis(&redis_key).await {
-                warn!("Failed to remove lobby member from Redis: {}", e);
+        // Immediately remove from Redis
+        let redis_key = format!("lobby:{}:member:{}:{}", lobby_id, user_id, websocket_id);
+        if let Err(e) = self.remove_from_redis(&redis_key).await {
+            warn!("Failed to remove lobby member from Redis: {}", e);
+        }
+
+        if let Err(e) = self.publish_lobby_update(lobby_id).await {
+            warn!("Failed to publish lobby update after leave: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Update the username for a lobby member across active connections and Redis state
+    pub async fn update_member_username(&self, user_id: i32, new_username: &str) -> Result<()> {
+        let mut affected_lobbies = HashSet::new();
+
+        {
+            let mut joins = self.active_joins.write().await;
+            for ((lobby_id, join_user_id, _), handle) in joins.iter_mut() {
+                if *join_user_id == user_id {
+                    {
+                        let mut username = handle.username.write().await;
+                        *username = new_username.to_string();
+                    }
+                    affected_lobbies.insert(*lobby_id);
+                }
+            }
+        }
+
+        if affected_lobbies.is_empty() {
+            return Ok(());
+        }
+
+        for lobby_id in affected_lobbies {
+            if let Err(e) = self
+                .update_member_username_in_redis(lobby_id, user_id, new_username)
+                .await
+            {
+                warn!(
+                    "Failed to update Redis entry for user {} in lobby {}: {}",
+                    user_id, lobby_id, e
+                );
+            }
+
+            if let Err(e) = self.publish_lobby_update(lobby_id).await {
+                warn!(
+                    "Failed to publish lobby update after nickname change for lobby {}: {}",
+                    lobby_id, e
+                );
             }
         }
 
@@ -177,10 +229,12 @@ impl LobbyManager {
 
     /// Get all active members of a lobby from Redis
     pub async fn get_lobby_members(&self, lobby_id: i32) -> Result<Vec<LobbyMember>> {
-        let client = redis::Client::open(self.redis_url.as_str())
-            .context("Failed to open Redis client")?;
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
 
-        let mut conn = client.get_multiplexed_async_connection().await
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
             .context("Failed to get Redis connection")?;
 
         // Get all keys matching the pattern
@@ -239,30 +293,102 @@ impl LobbyManager {
 
     /// Helper to remove a key from Redis
     async fn remove_from_redis(&self, key: &str) -> Result<()> {
-        let client = redis::Client::open(self.redis_url.as_str())
-            .context("Failed to open Redis client")?;
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
 
-        let mut conn = client.get_multiplexed_async_connection().await
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
             .context("Failed to get Redis connection")?;
 
-        let _: () = conn.del(key).await
-            .context("Failed to delete Redis key")?;
+        let _: () = conn.del(key).await.context("Failed to delete Redis key")?;
+
+        Ok(())
+    }
+
+    async fn update_member_username_in_redis(
+        &self,
+        lobby_id: i32,
+        user_id: i32,
+        username: &str,
+    ) -> Result<()> {
+        let client = redis::Client::open(self.redis_url.as_str())
+            .context("Failed to open Redis client for username update")?;
+
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("Failed to get Redis connection for username update")?;
+
+        let pattern = format!("lobby:{}:member:{}:*", lobby_id, user_id);
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut conn)
+            .await
+            .context("Failed to query lobby member keys for username update")?;
+
+        for key in keys {
+            let value: String = match conn.get(&key).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to fetch lobby member value for key {}: {}", key, e);
+                    continue;
+                }
+            };
+
+            let mut payload: JsonValue = match serde_json::from_str(&value) {
+                Ok(json) => json,
+                Err(e) => {
+                    warn!("Failed to parse lobby member JSON for key {}: {}", key, e);
+                    continue;
+                }
+            };
+
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "username".to_string(),
+                    JsonValue::String(username.to_string()),
+                );
+            }
+
+            let serialized = match serde_json::to_string(&payload) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "Failed to serialize updated lobby member payload for key {}: {}",
+                        key, e
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = conn.set_ex::<_, _, ()>(&key, serialized, 30).await {
+                warn!(
+                    "Failed to write updated lobby member for key {}: {}",
+                    key, e
+                );
+            }
+        }
 
         Ok(())
     }
 
     /// Publish a lobby update to the lobby's Redis pub/sub channel
     pub async fn publish_lobby_update(&self, lobby_id: i32) -> Result<()> {
-        let client = redis::Client::open(self.redis_url.as_str())
-            .context("Failed to open Redis client")?;
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
 
-        let mut conn = client.get_multiplexed_async_connection().await
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
             .context("Failed to get Redis connection")?;
 
         let channel = format!("lobby:{}:updates", lobby_id);
 
         // Publish a simple update notification
-        let _: () = conn.publish(&channel, "update").await
+        let _: () = conn
+            .publish(&channel, "update")
+            .await
             .context("Failed to publish lobby update")?;
 
         debug!("Published update notification to lobby {}", lobby_id);
@@ -275,30 +401,31 @@ async fn heartbeat_loop(
     redis_url: String,
     lobby_id: i32,
     user_id: i32,
-    username: String,
+    username_state: Arc<RwLock<String>>,
     websocket_id: String,
     region: String,
     is_host: bool,
+    joined_at: i64,
 ) -> Result<()> {
     let client = redis::Client::open(redis_url.as_str())
         .context("Failed to open Redis client for heartbeat")?;
 
-    let mut conn = client.get_multiplexed_async_connection().await
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
         .context("Failed to get Redis connection for heartbeat")?;
 
     let key = format!("lobby:{}:member:{}:{}", lobby_id, user_id, websocket_id);
-    let value = json!({
-        "user_id": user_id,
-        "username": username,
-        "joined_at": chrono::Utc::now().timestamp_millis(),
-        "is_host": is_host,
-    });
+    let value = {
+        let username = username_state.read().await.clone();
+        build_member_value(user_id, &username, joined_at, is_host)
+    };
 
     let update_channel = format!("lobby:{}:updates", lobby_id);
 
     // Write to Redis immediately (don't wait for first interval tick)
     // This ensures get_lobby_members() will find the member right away
-    if let Err(e) = conn.set_ex::<_, _, ()>(&key, value.to_string(), 30).await {
+    if let Err(e) = conn.set_ex::<_, _, ()>(&key, value, 30).await {
         warn!("Failed to write initial lobby member to Redis: {}", e);
         return Err(e.into());
     }
@@ -319,7 +446,12 @@ async fn heartbeat_loop(
         interval.tick().await;
 
         // Set key with 30-second TTL
-        match conn.set_ex::<_, _, ()>(&key, value.to_string(), 30).await {
+        let refreshed_value = {
+            let username = username_state.read().await.clone();
+            build_member_value(user_id, &username, joined_at, is_host)
+        };
+
+        match conn.set_ex::<_, _, ()>(&key, refreshed_value, 30).await {
             Ok(_) => {
                 debug!(
                     "Refreshed lobby presence for user {} in lobby {} (websocket: {})",
@@ -339,4 +471,14 @@ async fn heartbeat_loop(
     }
 
     Ok(())
+}
+
+fn build_member_value(user_id: i32, username: &str, joined_at: i64, is_host: bool) -> String {
+    json!({
+        "user_id": user_id,
+        "username": username,
+        "joined_at": joined_at,
+        "is_host": is_host,
+    })
+    .to_string()
 }

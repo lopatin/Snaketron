@@ -1,13 +1,13 @@
-use std::env;
 use anyhow::{Context, Result};
-use tracing::info;
-use std::sync::Arc;
-use server::game_server::{GameServer, GameServerConfig};
-use server::ws_server::TestJwtVerifier;
 use server::api::jwt::{JwtManager, ProductionJwtVerifier};
-use server::http_server::run_http_server;
 use server::db::{Database, dynamodb::DynamoDatabase};
+use server::game_server::{GameServer, GameServerConfig};
+use server::http_server::run_http_server;
 use server::region_cache::RegionCache;
+use server::ws_server::TestJwtVerifier;
+use std::env;
+use std::sync::Arc;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,11 +20,11 @@ async fn main() -> Result<()> {
 
     // Initialize tracing with environment filter and log compatibility
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    
+
     // Set up tracing subscriber with log compatibility
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
-    
+
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
@@ -34,15 +34,15 @@ async fn main() -> Result<()> {
     let db: Arc<dyn Database> = Arc::new(
         DynamoDatabase::new()
             .await
-            .context("Failed to initialize DynamoDB client")?
+            .context("Failed to initialize DynamoDB client")?,
     );
     info!("DynamoDB client initialized");
 
     // Create RegionCache for dynamic region discovery
     let aws_config = aws_config::load_from_env().await;
     let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
-    let table_prefix = env::var("DYNAMODB_TABLE_PREFIX")
-        .unwrap_or_else(|_| "snaketron".to_string());
+    let table_prefix =
+        env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
     let region_cache = Arc::new(RegionCache::new(dynamodb_client, table_prefix));
 
     let region = env::var("SNAKETRON_REGION")
@@ -53,18 +53,17 @@ async fn main() -> Result<()> {
         .or_else(|_| env::var("SNAKETRON_WS_PORT")) // Fallback to old WS_PORT for compatibility
         .unwrap_or_else(|_| "8080".to_string());
     let http_addr = format!("0.0.0.0:{}", http_port);
-    
+
     let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
     // Get JWT secret from environment or use a default for development
-    let jwt_secret = env::var("SNAKETRON_JWT_SECRET")
-        .unwrap_or_else(|_| {
-            tracing::warn!("SNAKETRON_JWT_SECRET not set, using default secret (NOT FOR PRODUCTION!)");
-            "your-secret-key-change-this-in-production".to_string()
-        });
+    let jwt_secret = env::var("SNAKETRON_JWT_SECRET").unwrap_or_else(|_| {
+        tracing::warn!("SNAKETRON_JWT_SECRET not set, using default secret (NOT FOR PRODUCTION!)");
+        "your-secret-key-change-this-in-production".to_string()
+    });
 
     // Create JWT verifier - use test mode if SNAKETRON_TEST_MODE is set
-    let jwt_verifier: Arc<dyn server::ws_server::JwtVerifier> = 
+    let jwt_verifier: Arc<dyn server::ws_server::JwtVerifier> =
         if env::var("SNAKETRON_TEST_MODE").unwrap_or_default() == "true" {
             info!("Running in TEST MODE - JWT verification disabled");
             Arc::new(TestJwtVerifier::new(db.clone()))
@@ -86,7 +85,10 @@ async fn main() -> Result<()> {
                 Some(path)
             }
             Err(e) => {
-                tracing::warn!("Failed to create replay directory: {}. Replay recording disabled.", e);
+                tracing::warn!(
+                    "Failed to create replay directory: {}. Replay recording disabled.",
+                    e
+                );
                 None
             }
         }
@@ -100,12 +102,10 @@ async fn main() -> Result<()> {
     info!("Redis leader election enabled at {}", redis_url);
 
     // Calculate origin and WebSocket URL for client connections
-    let origin = env::var("SNAKETRON_ORIGIN").unwrap_or_else(|_| {
-        format!("http://localhost:{}", http_port)
-    });
-    let ws_url = env::var("SNAKETRON_WS_URL").unwrap_or_else(|_| {
-        format!("ws://localhost:{}/ws", http_port)
-    });
+    let origin =
+        env::var("SNAKETRON_ORIGIN").unwrap_or_else(|_| format!("http://localhost:{}", http_port));
+    let ws_url =
+        env::var("SNAKETRON_WS_URL").unwrap_or_else(|_| format!("ws://localhost:{}/ws", http_port));
 
     // Create server configuration
     let config = GameServerConfig {
@@ -123,7 +123,10 @@ async fn main() -> Result<()> {
     // Start the game server
     let game_server = GameServer::start(config).await?;
     info!("Server {} started successfully", game_server.id());
-    info!("HTTP server (API + WebSocket) will listen on: {}", game_server.http_addr());
+    info!(
+        "HTTP server (API + WebSocket) will listen on: {}",
+        game_server.http_addr()
+    );
     if let Some(grpc_addr) = game_server.grpc_addr() {
         info!("gRPC server listening on: {}", grpc_addr);
     }
@@ -138,7 +141,8 @@ async fn main() -> Result<()> {
     let http_db = db.clone();
     let http_jwt_verifier = jwt_verifier.clone();
     let http_redis_url = redis_url.clone();
-    let http_replication_manager = game_server.replication_manager()
+    let http_replication_manager = game_server
+        .replication_manager()
         .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
         .clone();
     let http_cancellation_token = game_server.cancellation_token().clone();
@@ -157,7 +161,9 @@ async fn main() -> Result<()> {
             http_server_id,
             http_region,
             http_region_cache,
-        ).await {
+        )
+        .await
+        {
             tracing::error!("HTTP server error: {}", e);
         }
     });
@@ -167,12 +173,11 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
 
     info!("Received shutdown signal. Shutting down gracefully...");
-    
+
     // Shutdown servers
     http_handle.abort();
     game_server.shutdown().await?;
-    
+
     info!("Server shut down successfully");
     Ok(())
 }
-

@@ -1,8 +1,8 @@
 use super::*;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::fs;
 use std::io::Write;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use tracing::info;
 
 pub struct GameReplayRecorder {
@@ -58,10 +58,11 @@ impl GameReplayRecorder {
 
     pub async fn save(&self) -> Result<PathBuf> {
         // Ensure output directory exists
-        fs::create_dir_all(&self.output_dir)
-            .context("Failed to create replay output directory")?;
+        fs::create_dir_all(&self.output_dir).context("Failed to create replay output directory")?;
 
-        let initial_state = self.initial_state.clone()
+        let initial_state = self
+            .initial_state
+            .clone()
             .context("Cannot save replay without initial state")?;
 
         let replay = GameReplay {
@@ -79,28 +80,27 @@ impl GameReplayRecorder {
             .as_secs();
         let filename = format!("game_{}_{}.replay", self.game_id, timestamp);
         let filepath = self.output_dir.join(&filename);
-        
+
         // Save as newline-delimited JSON, compressed with gzip
-        let file = fs::File::create(&filepath)
-            .context("Failed to create replay file")?;
+        let file = fs::File::create(&filepath).context("Failed to create replay file")?;
         let mut encoder = GzEncoder::new(file, Compression::default());
-        
+
         // Write metadata as first line
         let metadata_json = serde_json::to_string(&replay.metadata)?;
         writeln!(encoder, "{}", metadata_json)?;
-        
+
         // Write initial state as second line
         let initial_state_json = serde_json::to_string(&replay.initial_state)?;
         writeln!(encoder, "{}", initial_state_json)?;
-        
+
         // Write each event as a separate line
         for event in &replay.events {
             let event_json = serde_json::to_string(event)?;
             writeln!(encoder, "{}", event_json)?;
         }
-        
+
         encoder.finish()?;
-        
+
         tracing::info!("Saved replay for game {} to {:?}", self.game_id, filepath);
         Ok(filepath)
     }

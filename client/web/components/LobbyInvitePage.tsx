@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
+import { User } from '../types';
 
 const generateGuestNickname = (lobbyCode: string) => {
   const codeSegment = lobbyCode.slice(0, 4).replace(/[^A-Z0-9]/g, '');
@@ -13,15 +14,44 @@ const LobbyInvitePage: React.FC = () => {
   const { lobbyCode: rawCode } = useParams<{ lobbyCode: string }>();
   const lobbyCode = (rawCode ?? '').toUpperCase();
   const navigate = useNavigate();
-  const { user, createGuest, loading: authLoading } = useAuth();
-  const { isConnected, joinLobby } = useWebSocket();
+  const { user, createGuest, loading: authLoading, getToken } = useAuth();
+  const { isConnected, joinLobby, sendMessage } = useWebSocket();
 
   const inFlightRef = useRef(false);
   const hasSucceededRef = useRef(false);
+  const latestUserRef = useRef<User | null>(user);
 
   const [statusMessage, setStatusMessage] = useState('Preparing to join lobby…');
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    latestUserRef.current = user;
+  }, [user]);
+
+  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const ensureAuthenticatedSession = useCallback(async () => {
+    let activeUser = latestUserRef.current;
+    let resolvedToken: string | null = getToken();
+
+    if (!activeUser) {
+      setStatusMessage('Creating guest profile…');
+      const { user: guestUser, token } = await createGuest(generateGuestNickname(lobbyCode));
+      latestUserRef.current = guestUser;
+      activeUser = guestUser;
+      resolvedToken = token;
+    }
+
+    setStatusMessage('Authenticating session…');
+    const token = resolvedToken ?? getToken();
+    if (!token) {
+      throw new Error('Missing authentication token');
+    }
+
+    sendMessage({ Token: token });
+    await delay(50);
+  }, [createGuest, getToken, lobbyCode, sendMessage]);
 
   useEffect(() => {
     if (hasSucceededRef.current) {
@@ -55,10 +85,7 @@ const LobbyInvitePage: React.FC = () => {
       setError(null);
 
       try {
-        if (!user) {
-          setStatusMessage('Creating guest profile…');
-          await createGuest(generateGuestNickname(lobbyCode));
-        }
+        await ensureAuthenticatedSession();
 
         if (cancelled) {
           return;
@@ -110,7 +137,7 @@ const LobbyInvitePage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [attempt, lobbyCode, authLoading, isConnected, user, createGuest, joinLobby, navigate]);
+  }, [attempt, lobbyCode, authLoading, isConnected, ensureAuthenticatedSession, joinLobby, navigate]);
 
   const handleRetry = () => {
     if (!lobbyCode) {

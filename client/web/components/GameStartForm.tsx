@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { useAuth } from '../contexts/AuthContext';
+import { useWebSocket } from '../contexts/WebSocketContext';
 
 type GameMode = 'duel' | '2v2' | 'solo' | 'ffa';
 
@@ -21,6 +23,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   const [selectedModes, setSelectedModes] = useState<Set<GameMode>>(new Set(['duel']));
   const [isCompetitive, setIsCompetitive] = useState(false);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
+  const lastSubmittedNicknameRef = useRef<string | null>(null);
+  const { user } = useAuth();
+  const { sendMessage } = useWebSocket();
+  const prevUsernameRef = useRef<string | null>(null);
 
   // Debounce nickname validation to avoid showing errors while typing
   const debouncedNickname = useDebouncedValue(nickname, 500);
@@ -33,11 +39,44 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   // Sync nickname with currentUsername when it changes (for guest users)
   useEffect(() => {
-    if (currentUsername && !nickname && !hasAutoSetNickname) {
-      setHasAutoSetNickname(true);
-      setNickname(currentUsername);
+    if (!currentUsername) {
+      return;
     }
-  }, [currentUsername, nickname, hasAutoSetNickname]);
+
+    if (!hasAutoSetNickname) {
+      setHasAutoSetNickname(true);
+    }
+
+    if (prevUsernameRef.current !== currentUsername) {
+      setNickname(currentUsername);
+      lastSubmittedNicknameRef.current = currentUsername;
+      prevUsernameRef.current = currentUsername;
+    }
+  }, [currentUsername, hasAutoSetNickname]);
+
+  useEffect(() => {
+    if (!user || !user.isGuest) {
+      lastSubmittedNicknameRef.current = null;
+      return;
+    }
+
+    const nextNickname = debouncedNickname.trim();
+    if (nextNickname.length < 3) {
+      return;
+    }
+
+    if (nextNickname === user.username) {
+      lastSubmittedNicknameRef.current = nextNickname;
+      return;
+    }
+
+    if (lastSubmittedNicknameRef.current === nextNickname) {
+      return;
+    }
+
+    sendMessage({ UpdateNickname: { nickname: nextNickname } });
+    lastSubmittedNicknameRef.current = nextNickname;
+  }, [debouncedNickname, user, sendMessage]);
 
   const gameModes: Array<{ id: GameMode; label: string }> = [
     { id: 'duel', label: 'DUEL' },

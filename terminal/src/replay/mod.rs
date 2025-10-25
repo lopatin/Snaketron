@@ -1,10 +1,10 @@
-pub mod reader;
 pub mod player;
+pub mod reader;
 
-use common::{GameState, GameEventMessage, GameStatus};
+use common::{GameEventMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInfo {

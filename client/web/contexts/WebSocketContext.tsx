@@ -487,12 +487,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      let retryIntervalId: ReturnType<typeof setInterval> | null = null;
 
       const cleanupHandlers = () => {
         cleanupJoined();
         cleanupDenied();
         cleanupMismatch();
         cleanupUpdate();
+        if (retryIntervalId) {
+          clearInterval(retryIntervalId);
+          retryIntervalId = null;
+        }
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
@@ -567,9 +572,6 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         handleSuccess(lobby_id, host_user_id);
       });
 
-      // Send JoinLobbyByCode message
-      sendMessage({ JoinLobbyByCode: { lobby_code: normalizedCode } });
-
       // Timeout after 5 seconds
       timeoutId = setTimeout(() => {
         if (settled) {
@@ -579,6 +581,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         cleanupHandlers();
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
+
+      const sendJoinRequest = () => {
+        if (!settled) {
+          sendMessage({ JoinLobbyByCode: { lobby_code: normalizedCode } });
+        }
+      };
+
+      sendJoinRequest();
+      retryIntervalId = setInterval(sendJoinRequest, 300);
     });
   }, [onMessage, sendMessage, connectToRegion, persistLobby]);
 

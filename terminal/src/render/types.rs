@@ -13,7 +13,10 @@ pub struct CharDimensions {
 
 impl CharDimensions {
     pub fn new(horizontal: usize, vertical: usize) -> Self {
-        Self { horizontal, vertical }
+        Self {
+            horizontal,
+            vertical,
+        }
     }
 }
 
@@ -44,7 +47,9 @@ impl CharGrid {
         let start_x = x * self.char_dims.horizontal;
         let start_y = y * self.char_dims.vertical;
 
-        for (dy, (char_row, style_row)) in pattern.chars.iter().zip(pattern.styles.iter()).enumerate() {
+        for (dy, (char_row, style_row)) in
+            pattern.chars.iter().zip(pattern.styles.iter()).enumerate()
+        {
             for (dx, (&ch, &style)) in char_row.iter().zip(style_row.iter()).enumerate() {
                 if let Some(grid_row) = self.grid.get_mut(start_y + dy) {
                     if let Some(cell) = grid_row.get_mut(start_x + dx) {

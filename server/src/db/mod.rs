@@ -13,7 +13,13 @@ use models::*;
 #[async_trait]
 pub trait Database: Send + Sync {
     // Server operations
-    async fn register_server(&self, grpc_address: &str, region: &str, origin: &str, ws_url: &str) -> Result<i32>;
+    async fn register_server(
+        &self,
+        grpc_address: &str,
+        region: &str,
+        origin: &str,
+        ws_url: &str,
+    ) -> Result<i32>;
     async fn update_server_heartbeat(&self, server_id: i32) -> Result<()>;
     async fn update_server_status(&self, server_id: i32, status: &str) -> Result<()>;
     async fn get_server_for_load_balancing(&self, region: &str) -> Result<i32>;
@@ -26,7 +32,8 @@ pub trait Database: Send + Sync {
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;
-    async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>;  // Returns new total XP
+    async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
+    async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
 
     // Game operations
     async fn create_game(
@@ -43,7 +50,7 @@ pub trait Database: Send + Sync {
     async fn add_player_to_game(&self, game_id: i32, user_id: i32, team_id: i32) -> Result<()>;
     async fn get_game_players(&self, game_id: i32) -> Result<Vec<GamePlayer>>;
     async fn get_player_count(&self, game_id: i32) -> Result<i64>;
-    
+
     // Custom lobby operations
     async fn create_custom_lobby(
         &self,
