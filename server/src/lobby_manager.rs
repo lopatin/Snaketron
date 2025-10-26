@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, json};
+use serde_json::{self, Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,6 +27,22 @@ pub struct LobbyJoinHandle {
     pub user_id: i32,
     pub websocket_id: String,
     pub username: Arc<RwLock<String>>,
+}
+
+/// Host-selected matchmaking preferences for a lobby
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LobbyPreferences {
+    pub selected_modes: Vec<String>,
+    pub competitive: bool,
+}
+
+impl Default for LobbyPreferences {
+    fn default() -> Self {
+        Self {
+            selected_modes: vec!["duel".to_string()],
+            competitive: false,
+        }
+    }
 }
 
 impl Drop for LobbyJoinHandle {
@@ -65,6 +81,16 @@ impl LobbyManager {
             "Created lobby {} with code '{}' for user {} in region {}",
             lobby.id, lobby.lobby_code, host_user_id, region
         );
+
+        if let Err(e) = self
+            .set_lobby_preferences(lobby.id, &LobbyPreferences::default())
+            .await
+        {
+            warn!(
+                "Failed to initialize preferences for lobby {}: {}",
+                lobby.id, e
+            );
+        }
         Ok(lobby)
     }
 
@@ -286,9 +312,83 @@ impl LobbyManager {
         self.db.get_lobby_by_code(lobby_code).await
     }
 
+    /// Persist host-selected matchmaking preferences for the lobby
+    pub async fn set_lobby_preferences(
+        &self,
+        lobby_id: i32,
+        preferences: &LobbyPreferences,
+    ) -> Result<()> {
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
+
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("Failed to get Redis connection")?;
+
+        let key = format!("lobby:{}:preferences", lobby_id);
+        let payload =
+            serde_json::to_string(preferences).context("Failed to serialize lobby preferences")?;
+
+        conn.set::<_, _, ()>(&key, payload)
+            .await
+            .context("Failed to store lobby preferences")?;
+
+        // Broadcast the update so connected clients refresh
+        if let Err(e) = self.publish_lobby_update(lobby_id).await {
+            warn!(
+                "Failed to publish lobby update after preferences change for lobby {}: {}",
+                lobby_id, e
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve matchmaking preferences for the lobby, falling back to defaults
+    pub async fn get_lobby_preferences(&self, lobby_id: i32) -> Result<LobbyPreferences> {
+        let client =
+            redis::Client::open(self.redis_url.as_str()).context("Failed to open Redis client")?;
+
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("Failed to get Redis connection")?;
+
+        let key = format!("lobby:{}:preferences", lobby_id);
+        let raw: Option<String> = conn
+            .get(&key)
+            .await
+            .context("Failed to load lobby preferences")?;
+
+        if let Some(json) = raw {
+            match serde_json::from_str::<LobbyPreferences>(&json) {
+                Ok(preferences) => Ok(preferences),
+                Err(e) => {
+                    warn!(
+                        "Failed to parse lobby preferences for lobby {}: {}",
+                        lobby_id, e
+                    );
+                    Ok(LobbyPreferences::default())
+                }
+            }
+        } else {
+            Ok(LobbyPreferences::default())
+        }
+    }
+
     /// Update lobby state in DynamoDB
     pub async fn update_lobby_state(&self, lobby_id: i32, state: &str) -> Result<()> {
-        self.db.update_lobby_state(lobby_id, state).await
+        self.db.update_lobby_state(lobby_id, state).await?;
+
+        if let Err(e) = self.publish_lobby_update(lobby_id).await {
+            warn!(
+                "Failed to publish lobby update after state change for lobby {}: {}",
+                lobby_id, e
+            );
+        }
+
+        Ok(())
     }
 
     /// Helper to remove a key from Redis

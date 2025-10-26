@@ -113,6 +113,11 @@ fn find_team_combination(
         return Some(combo);
     }
 
+    // Priority 2: Single lobby can be split exactly across both teams
+    if let Some(combo) = find_single_lobby_split(lobbies, per_team, total_needed) {
+        return Some(combo);
+    }
+
     // Priority 2: Matches with spectators (lobby has too many players)
     find_team_match_with_spectators(lobbies, per_team, total_needed)
 }
@@ -299,6 +304,76 @@ fn build_combination(
         total_players,
         avg_mmr,
     })
+}
+
+/// Try to build a combination by splitting a single lobby evenly across both teams
+fn find_single_lobby_split(
+    lobbies: &[crate::matchmaking_manager::QueuedLobby],
+    per_team: usize,
+    total_needed: usize,
+) -> Option<MatchmakingCombination> {
+    for lobby in lobbies {
+        if lobby.members.len() != total_needed {
+            continue;
+        }
+
+        let host_index = lobby
+            .members
+            .iter()
+            .position(|m| m.user_id as u32 == lobby.requesting_user_id);
+
+        let mut player_indices = Vec::with_capacity(total_needed);
+
+        if let Some(idx) = host_index {
+            player_indices.push(idx);
+        }
+
+        for idx in 0..lobby.members.len() {
+            if player_indices.len() >= total_needed {
+                break;
+            }
+            if Some(idx) != host_index {
+                player_indices.push(idx);
+            }
+        }
+
+        if player_indices.len() < total_needed {
+            continue;
+        }
+
+        let team_a_members: Vec<usize> = player_indices.iter().take(per_team).copied().collect();
+        let team_b_members: Vec<usize> = player_indices
+            .iter()
+            .skip(per_team)
+            .take(per_team)
+            .copied()
+            .collect();
+
+        if team_a_members.len() < per_team || team_b_members.len() < per_team {
+            continue;
+        }
+
+        return Some(MatchmakingCombination {
+            lobbies: vec![lobby.clone()],
+            team_assignments: vec![
+                TeamAssignment {
+                    lobby_id: lobby.lobby_id,
+                    member_indices: team_a_members,
+                    team_id: common::TeamId(0),
+                },
+                TeamAssignment {
+                    lobby_id: lobby.lobby_id,
+                    member_indices: team_b_members,
+                    team_id: common::TeamId(1),
+                },
+            ],
+            spectators: Vec::new(),
+            total_players: total_needed,
+            avg_mmr: lobby.avg_mmr,
+        });
+    }
+
+    None
 }
 
 /// Find match allowing spectators (lower priority)
@@ -1112,10 +1187,61 @@ pub async fn create_custom_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lobby_manager::LobbyMember;
+    use crate::matchmaking_manager::QueuedLobby;
+    use common::{QueueMode, TeamId};
 
     #[tokio::test]
     async fn test_match_creation_logic() {
         // Test the match creation logic
         // This would require mocking Redis and PubSub
+    }
+
+    #[test]
+    fn duo_lobby_splits_into_duel() {
+        let lobby = QueuedLobby {
+            lobby_id: 42,
+            lobby_code: "ABC123".to_string(),
+            members: vec![
+                LobbyMember {
+                    user_id: 10,
+                    username: "player_one".to_string(),
+                    joined_at: 100,
+                    is_host: true,
+                },
+                LobbyMember {
+                    user_id: 11,
+                    username: "player_two".to_string(),
+                    joined_at: 200,
+                    is_host: false,
+                },
+            ],
+            avg_mmr: 1200,
+            game_types: vec![GameType::TeamMatch { per_team: 1 }],
+            queue_mode: QueueMode::Quickmatch,
+            queued_at: 0,
+            requesting_user_id: 10,
+        };
+
+        let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 1 })
+            .expect("expected to find a duel combination for a two-player lobby");
+
+        assert_eq!(combo.total_players, 2);
+        assert_eq!(combo.lobbies.len(), 1);
+        assert_eq!(combo.team_assignments.len(), 2);
+
+        let mut team_a_indices = Vec::new();
+        let mut team_b_indices = Vec::new();
+
+        for assignment in &combo.team_assignments {
+            if assignment.team_id == TeamId(0) {
+                team_a_indices = assignment.member_indices.clone();
+            } else if assignment.team_id == TeamId(1) {
+                team_b_indices = assignment.member_indices.clone();
+            }
+        }
+
+        assert_eq!(team_a_indices, vec![0]);
+        assert_eq!(team_b_indices, vec![1]);
     }
 }

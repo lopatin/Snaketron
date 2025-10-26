@@ -1,5 +1,14 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { WebSocketContextType, Lobby, LobbyMember, ChatMessage, ChatScope } from '../types';
+import {
+  WebSocketContextType,
+  Lobby,
+  LobbyMember,
+  ChatMessage,
+  ChatScope,
+  LobbyPreferences,
+  LobbyGameMode,
+  LobbyState,
+} from '../types';
 import { clockSync } from '../utils/clockSync';
 import { useLatency } from './LatencyContext';
 import {
@@ -29,6 +38,47 @@ const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
 const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
 const MAX_CHAT_HISTORY = 200;
+const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
+const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
+
+const DEFAULT_LOBBY_PREFERENCES: LobbyPreferences = {
+  selectedModes: ['duel'],
+  competitive: false,
+};
+
+const normalizeLobbyPreferences = (payload: any): LobbyPreferences => {
+  if (!payload || typeof payload !== 'object') {
+    return DEFAULT_LOBBY_PREFERENCES;
+  }
+
+  const rawModes = Array.isArray(payload.selected_modes ?? payload.selectedModes)
+    ? payload.selected_modes ?? payload.selectedModes
+    : [];
+
+  const normalized = new Set<LobbyGameMode>();
+  for (const value of rawModes) {
+    if (typeof value !== 'string') {
+      continue;
+    }
+    const lower = value.trim().toLowerCase();
+    if (VALID_LOBBY_MODES.includes(lower as LobbyGameMode)) {
+      normalized.add(lower as LobbyGameMode);
+    }
+  }
+
+  const ordered: LobbyGameMode[] = [];
+  for (const mode of VALID_LOBBY_MODES) {
+    if (normalized.has(mode)) {
+      ordered.push(mode);
+    }
+  }
+
+  const hasSelection = ordered.length > 0;
+  return {
+    selectedModes: hasSelection ? ordered : DEFAULT_LOBBY_PREFERENCES.selectedModes,
+    competitive: Boolean(payload.competitive),
+  };
+};
 
 interface StoredLobbyInfo {
   code: string;
@@ -51,6 +101,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
+  const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences>(DEFAULT_LOBBY_PREFERENCES);
+  const currentLobbyRef = useRef<Lobby | null>(null);
   const ws = useRef<WebSocket | null>(null);
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
@@ -462,12 +514,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
         const { lobby_id, lobby_code } = message.data;
         const normalizedCode = lobby_code.toUpperCase();
-        setCurrentLobby({
+        const newLobby: Lobby = {
           id: lobby_id,
           code: normalizedCode,
           hostUserId: 0, // Will be set by LobbyUpdate
           region: '', // Will be set by LobbyUpdate
-        });
+          state: 'waiting',
+        };
+        currentLobbyRef.current = newLobby;
+        setCurrentLobby(newLobby);
+        setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         persistLobby({ id: lobby_id, code: normalizedCode });
         cleanup();
         if (timeoutId) {
@@ -524,12 +580,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           return;
         }
         settled = true;
-        setCurrentLobby({
+        const joinedLobby: Lobby = {
           id: lobbyId,
           code: normalizedCode,
           hostUserId: hostUserId ?? 0, // Will be refined by future LobbyUpdate messages
           region: '', // Will be set by LobbyUpdate
-        });
+          state: 'waiting',
+        };
+        currentLobbyRef.current = joinedLobby;
+        setCurrentLobby(joinedLobby);
+        setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         persistLobby({ id: lobbyId, code: normalizedCode });
         cleanupHandlers();
         resolve();
@@ -624,7 +684,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           return;
         }
         setCurrentLobby(null);
+        currentLobbyRef.current = null;
         setLobbyMembers([]);
+        setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         clearPersistedLobby();
         cleanup();
         if (timeoutId) {
@@ -648,6 +710,24 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }, 5000);
     });
   }, [onMessage, sendMessage, clearPersistedLobby]);
+
+  const updateLobbyPreferences = useCallback(
+    (preferences: LobbyPreferences) => {
+      setLobbyPreferences(preferences);
+
+      if (!currentLobbyRef.current) {
+        return;
+      }
+
+      sendMessage({
+        UpdateLobbyPreferences: {
+          selected_modes: preferences.selectedModes,
+          competitive: preferences.competitive,
+        },
+      });
+    },
+    [sendMessage],
+  );
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatMessage', (message: any) => {
@@ -785,22 +865,52 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   // Handle lobby updates
   useEffect(() => {
     const cleanup = onMessage('LobbyUpdate', (message: any) => {
-      const { lobby_id, members, host_user_id } = message.data;
+      const payload = message?.data ?? message?.LobbyUpdate ?? message;
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
 
-      // Update lobby members
+      const lobbyId =
+        typeof payload.lobby_id === 'number'
+          ? payload.lobby_id
+          : typeof payload.lobby_id === 'string'
+            ? parseInt(payload.lobby_id, 10)
+            : NaN;
+
+      if (!Number.isFinite(lobbyId)) {
+        return;
+      }
+
+      const members = Array.isArray(payload.members) ? payload.members : [];
       setLobbyMembers(members);
 
-      // Update current lobby with host info
-      if (currentLobby && currentLobby.id === lobby_id) {
-        setCurrentLobby({
-          ...currentLobby,
-          hostUserId: host_user_id,
-        });
-      }
+      const hostUserId =
+        typeof payload.host_user_id === 'number' ? payload.host_user_id : 0;
+      const rawState =
+        typeof payload.state === 'string' ? payload.state.trim().toLowerCase() : '';
+      const lobbyState: LobbyState = VALID_LOBBY_STATES.includes(rawState as LobbyState)
+        ? (rawState as LobbyState)
+        : 'waiting';
+
+      setLobbyPreferences(normalizeLobbyPreferences(payload.preferences));
+
+      setCurrentLobby((previous) => {
+        if (!previous || previous.id !== lobbyId) {
+          return previous;
+        }
+
+        const updatedLobby: Lobby = {
+          ...previous,
+          hostUserId,
+          state: lobbyState,
+        };
+        currentLobbyRef.current = updatedLobby;
+        return updatedLobby;
+      });
     });
 
     return cleanup;
-  }, [onMessage, currentLobby]);
+  }, [onMessage]);
 
   useEffect(() => {
     const lobbyId = currentLobby?.id ?? null;
@@ -808,6 +918,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (lobbyId === null) {
       lobbyChatLobbyIdRef.current = null;
       setLobbyChatMessages([]);
+      setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
       return;
     }
 
@@ -1111,10 +1222,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     lobbyMembers,
     lobbyChatMessages,
     gameChatMessages,
+    lobbyPreferences,
     createLobby,
     joinLobby,
     leaveLobby,
     sendChatMessage,
+    updateLobbyPreferences,
   };
 
   // Expose context for testing

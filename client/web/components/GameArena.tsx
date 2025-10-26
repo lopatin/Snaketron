@@ -36,14 +36,9 @@ export default function GameArena() {
 
   const { user, loading: authLoading } = useAuth();
   const { latencyMs, gameChatMessages, sendChatMessage } = useWebSocket();
-  
-  // Early return if auth is not ready - before useGameEngine
-  if (authLoading || !user) {
-    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
-  }
-  
-  // Use game engine for client-side prediction
-  // Now user.id is guaranteed to exist
+  const playerId = user?.id ?? 0;
+
+  // Use game engine for client-side prediction (call unconditionally to keep hook order stable)
   const {
     gameEngine,
     gameState,
@@ -55,10 +50,15 @@ export default function GameArena() {
     stopEngine
   } = useGameEngine({
     gameId,
-    playerId: user.id,
+    playerId,
     onCommandReady: sendGameCommand,
     latencyMs
   });
+
+  // Show auth/loading screen once hooks above have been registered
+  if (authLoading || !user) {
+    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
+  }
   
   const [gameOver, setGameOver] = useState(false);
   const [showGameOverPanel, setShowGameOverPanel] = useState(false);

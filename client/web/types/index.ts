@@ -23,6 +23,7 @@ export interface Lobby {
   code: string;
   hostUserId: number;
   region: string;
+  state: LobbyState;
 }
 
 export interface LobbyMember {
@@ -46,6 +47,14 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
+export type LobbyState = 'waiting' | 'queued' | 'matched';
+export type LobbyGameMode = 'duel' | '2v2' | 'solo' | 'ffa';
+
+export interface LobbyPreferences {
+  selectedModes: LobbyGameMode[];
+  competitive: boolean;
+}
+
 // WebSocket Types
 export interface WebSocketContextType {
   isConnected: boolean;
@@ -62,12 +71,14 @@ export interface WebSocketContextType {
   lobbyMembers: LobbyMember[];
   lobbyChatMessages: ChatMessage[];
   gameChatMessages: ChatMessage[];
+  lobbyPreferences: LobbyPreferences;
 
   // Lobby methods
   createLobby: () => Promise<void>;
   joinLobby: (lobbyCode: string) => Promise<void>;
   leaveLobby: () => Promise<void>;
   sendChatMessage: (scope: ChatScope, message: string) => void;
+  updateLobbyPreferences: (preferences: LobbyPreferences) => void;
 }
 
 // Latency Settings Types

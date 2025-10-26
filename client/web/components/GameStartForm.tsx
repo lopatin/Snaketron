@@ -2,31 +2,41 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-
-type GameMode = 'duel' | '2v2' | 'solo' | 'ffa';
+import { LobbyPreferences, LobbyGameMode } from '../types';
 
 interface GameStartFormProps {
-  onStartGame: (gameModes: GameMode[], nickname: string, isCompetitive: boolean) => void;
+  onStartGame: (gameModes: LobbyGameMode[], nickname: string, isCompetitive: boolean) => void;
   currentUsername?: string;
   isLoading?: boolean;
   isAuthenticated?: boolean;
+  isHost?: boolean;
+  isLobbyQueued?: boolean;
+  lobbyPreferences: LobbyPreferences;
+  onPreferencesChange?: (preferences: LobbyPreferences) => void;
 }
 
 export const GameStartForm: React.FC<GameStartFormProps> = ({
   onStartGame,
   currentUsername,
   isLoading = false,
-  isAuthenticated = false
+  isAuthenticated = false,
+  isHost = true,
+  isLobbyQueued = false,
+  lobbyPreferences,
+  onPreferencesChange,
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
-  const [selectedModes, setSelectedModes] = useState<Set<GameMode>>(new Set(['duel']));
-  const [isCompetitive, setIsCompetitive] = useState(false);
+  const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode>>(
+    () => new Set(lobbyPreferences.selectedModes)
+  );
+  const [isCompetitive, setIsCompetitive] = useState(lobbyPreferences.competitive);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
   const lastSubmittedNicknameRef = useRef<string | null>(null);
   const { user } = useAuth();
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
+  const canEdit = isHost && !isLobbyQueued;
 
   // Debounce nickname validation to avoid showing errors while typing
   const debouncedNickname = useDebouncedValue(nickname, 500);
@@ -36,6 +46,29 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   useEffect(() => {
     nicknameInputRef.current?.focus();
   }, []);
+
+  // Keep local selection state in sync with lobby-wide preferences
+  useEffect(() => {
+    const nextModes = new Set<LobbyGameMode>(lobbyPreferences.selectedModes);
+    let modesChanged = nextModes.size !== selectedModes.size;
+
+    if (!modesChanged) {
+      for (const mode of nextModes) {
+        if (!selectedModes.has(mode)) {
+          modesChanged = true;
+          break;
+        }
+      }
+    }
+
+    if (modesChanged) {
+      setSelectedModes(nextModes);
+    }
+
+    if (lobbyPreferences.competitive !== isCompetitive) {
+      setIsCompetitive(lobbyPreferences.competitive);
+    }
+  }, [lobbyPreferences, selectedModes, isCompetitive]);
 
   // Sync nickname with currentUsername when it changes (for guest users)
   useEffect(() => {
@@ -78,33 +111,55 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     lastSubmittedNicknameRef.current = nextNickname;
   }, [debouncedNickname, user, sendMessage]);
 
-  const gameModes: Array<{ id: GameMode; label: string }> = [
+  const gameModes: Array<{ id: LobbyGameMode; label: string }> = [
     { id: 'duel', label: 'DUEL' },
     { id: '2v2', label: '2V2' },
     { id: 'solo', label: 'SOLO' },
     { id: 'ffa', label: 'FFA' }
   ];
 
-  const toggleMode = (mode: GameMode) => {
-    setSelectedModes((prev) => {
-      const newSelection = new Set(prev);
-      if (newSelection.has(mode)) {
-        newSelection.delete(mode);
-      } else {
-        newSelection.add(mode);
+  const toggleMode = (mode: LobbyGameMode) => {
+    if (!canEdit) {
+      return;
+    }
+
+    const nextSelection = new Set(selectedModes);
+    if (nextSelection.has(mode)) {
+      if (nextSelection.size === 1) {
+        return;
       }
-      return newSelection;
+      nextSelection.delete(mode);
+    } else {
+      nextSelection.add(mode);
+    }
+
+    setSelectedModes(nextSelection);
+    onPreferencesChange?.({
+      selectedModes: Array.from(nextSelection),
+      competitive: isCompetitive,
     });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isHost || isLobbyQueued) {
+      return;
+    }
+
     if (selectedModes.size > 0 && nickname.trim().length >= 3) {
       onStartGame(Array.from(selectedModes), nickname.trim(), isCompetitive);
     }
   };
 
   const isFormValid = selectedModes.size > 0 && nickname.trim().length >= 3;
+  const startButtonDisabled = !isHost || isLobbyQueued || !isFormValid || isLoading;
+  const startButtonLabel = isLobbyQueued
+    ? 'Finding Match...'
+    : !isHost
+      ? 'Waiting for Host'
+      : isLoading
+        ? 'Starting...'
+        : 'Start Game';
 
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
@@ -154,7 +209,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                   key={mode.id}
                   type="button"
                   onClick={() => toggleMode(mode.id)}
-                  disabled={isLoading}
+                  disabled={!canEdit || isLoading}
                   className={`
                     relative py-4 px-4 rounded-lg font-black italic uppercase tracking-1 text-base
                     transition-all border-2
@@ -162,7 +217,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                       ? 'border-blue-500 bg-blue-50 text-black-70'
                       : 'border-gray-300 bg-white text-black-70 hover:border-gray-400'
                     }
-                    ${isLoading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
+                    ${isLoading || !canEdit ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
                   `}
                 >
                   {/* Checkbox indicator */}
@@ -192,13 +247,25 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
         {/* Competitive Checkbox */}
         <div className="mb-8">
-          <label className="flex items-center gap-3 cursor-pointer group">
+          <label
+            className={`flex items-center gap-3 ${canEdit ? 'cursor-pointer' : 'cursor-not-allowed'} group`}
+          >
             <div className="relative">
               <input
                 type="checkbox"
                 checked={isCompetitive}
-                onChange={(e) => setIsCompetitive(e.target.checked)}
-                disabled={isLoading}
+                onChange={(e) => {
+                  if (!canEdit) {
+                    return;
+                  }
+                  const nextCompetitive = e.target.checked;
+                  setIsCompetitive(nextCompetitive);
+                  onPreferencesChange?.({
+                    selectedModes: Array.from(selectedModes),
+                    competitive: nextCompetitive,
+                  });
+                }}
+                disabled={!canEdit || isLoading}
                 className="sr-only"
               />
               <div
@@ -208,7 +275,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                     ? 'bg-blue-500 border-blue-500'
                     : 'bg-white border-gray-300'
                   }
-                  ${isLoading ? 'opacity-50' : 'group-hover:border-gray-400'}
+                  ${isLoading || !canEdit ? 'opacity-50' : 'group-hover:border-gray-400'}
                 `}
               >
                 {isCompetitive && (
@@ -237,17 +304,17 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
         {/* Start Game Button */}
         <button
           type="submit"
-          disabled={!isFormValid || isLoading}
+          disabled={startButtonDisabled}
           className={`
             w-full py-4 rounded-lg font-black italic uppercase tracking-1 text-lg
             transition-all border-2
-            ${isFormValid && !isLoading
-              ? 'bg-white border-black-70 text-black-70 hover:bg-gray-50 cursor-pointer'
-              : 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
+            ${startButtonDisabled
+              ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
+              : 'bg-white border-black-70 text-black-70 hover:bg-gray-50 cursor-pointer'
             }
           `}
         >
-          {isLoading ? 'Starting...' :  'Start Game'}
+          {startButtonLabel}
         </button>
       </div>
     </form>

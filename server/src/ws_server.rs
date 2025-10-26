@@ -163,6 +163,12 @@ pub enum WSMessage {
         lobby_id: u32,
         members: Vec<crate::lobby_manager::LobbyMember>,
         host_user_id: i32,
+        state: String,
+        preferences: crate::lobby_manager::LobbyPreferences,
+    },
+    UpdateLobbyPreferences {
+        selected_modes: Vec<String>,
+        competitive: bool,
     },
     LobbyRegionMismatch {
         target_region: String,
@@ -1394,6 +1400,14 @@ async fn process_ws_message(
                     }
                     Ok(ConnectionState::Authenticated { metadata })
                 }
+                WSMessage::UpdateLobbyPreferences { .. } => {
+                    let response = WSMessage::AccessDenied {
+                        reason: "Join a lobby before changing game settings".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated { metadata })
+                }
                 WSMessage::QueueForMatch {
                     game_type,
                     queue_mode,
@@ -2092,6 +2106,115 @@ async fn process_ws_message(
                         );
                         let response = WSMessage::AccessDenied {
                             reason: "Failed to send chat message".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                    }
+
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
+                }
+                WSMessage::UpdateLobbyPreferences {
+                    selected_modes,
+                    competitive,
+                } => {
+                    const VALID_MODES: [&str; 4] = ["duel", "2v2", "solo", "ffa"];
+
+                    let lobby = match lobby_manager.get_lobby(lobby_id).await {
+                        Ok(Some(lobby)) => lobby,
+                        Ok(None) => {
+                            let response = WSMessage::AccessDenied {
+                                reason: "Lobby not found".to_string(),
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            return Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to load lobby {}: {}", lobby_id, e);
+                            let response = WSMessage::AccessDenied {
+                                reason: "Failed to update lobby preferences".to_string(),
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            return Ok(ConnectionState::InLobby {
+                                metadata,
+                                lobby_id,
+                                websocket_id: ws_id,
+                            });
+                        }
+                    };
+
+                    if lobby.host_user_id != metadata.user_id {
+                        let response = WSMessage::AccessDenied {
+                            reason: "Only the lobby host can change game settings".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::InLobby {
+                            metadata,
+                            lobby_id,
+                            websocket_id: ws_id,
+                        });
+                    }
+
+                    let mut normalized: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for mode in selected_modes {
+                        let value = mode.trim().to_lowercase();
+                        if VALID_MODES.contains(&value.as_str()) {
+                            normalized.insert(value);
+                        } else {
+                            warn!(
+                                "Ignoring invalid lobby mode '{}' provided by host {}",
+                                mode, metadata.user_id
+                            );
+                        }
+                    }
+
+                    if normalized.is_empty() {
+                        let response = WSMessage::AccessDenied {
+                            reason: "Select at least one valid game mode before starting"
+                                .to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::InLobby {
+                            metadata,
+                            lobby_id,
+                            websocket_id: ws_id,
+                        });
+                    }
+
+                    let mut ordered = Vec::new();
+                    for candidate in VALID_MODES {
+                        if normalized.remove(candidate) {
+                            ordered.push(candidate.to_string());
+                        }
+                    }
+
+                    let preferences = crate::lobby_manager::LobbyPreferences {
+                        selected_modes: ordered,
+                        competitive,
+                    };
+
+                    if let Err(e) = lobby_manager
+                        .set_lobby_preferences(lobby_id, &preferences)
+                        .await
+                    {
+                        error!(
+                            "Failed to update lobby {} preferences for host {}: {}",
+                            lobby_id, metadata.user_id, e
+                        );
+                        let response = WSMessage::AccessDenied {
+                            reason: "Failed to update lobby preferences".to_string(),
                         };
                         let json_msg = serde_json::to_string(&response)?;
                         ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -3024,11 +3147,25 @@ async fn subscribe_to_lobby_updates(
                 // Get the lobby info for host_user_id
                 match lobby_manager.get_lobby(lobby_id).await {
                     Ok(Some(lobby)) => {
+                        let preferences = match lobby_manager.get_lobby_preferences(lobby_id).await
+                        {
+                            Ok(prefs) => prefs,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load lobby preferences for lobby {}: {}",
+                                    lobby_id, e
+                                );
+                                crate::lobby_manager::LobbyPreferences::default()
+                            }
+                        };
+
                         // Send lobby update to client
                         let ws_message = WSMessage::LobbyUpdate {
                             lobby_id: lobby_id as u32,
                             members,
                             host_user_id: lobby.host_user_id,
+                            state: lobby.state.clone(),
+                            preferences,
                         };
 
                         let json_msg = match serde_json::to_string(&ws_message) {

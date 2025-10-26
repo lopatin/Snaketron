@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { useWebSocket } from '../contexts/WebSocketContext';
 import LoadingScreen from './LoadingScreen';
 import { GameType } from '../types';
 
@@ -8,18 +9,25 @@ export default function Queue() {
   const location = useLocation();
   const navigate = useNavigate();
   const { queueForMatch, queueForMatchMulti, currentGameId } = useGameWebSocket();
+  const { currentLobby } = useWebSocket();
+
+  const state = location.state as {
+    gameType?: GameType;
+    gameTypes?: GameType[];
+    autoQueue?: boolean;
+    viewLobbyQueue?: boolean;
+  } | null;
+
+  const isViewOnlyQueue = Boolean(state?.viewLobbyQueue);
+  const shouldAutoQueue = Boolean(state?.autoQueue);
 
   useEffect(() => {
-    // Get the game type(s) from navigation state
-    const state = location.state as {
-      gameType?: GameType;
-      gameTypes?: GameType[];
-      autoQueue?: boolean
-    } | null;
-
-    if (!state || !state.autoQueue) {
-      // If no state or not auto-queueing, navigate back to home
+    if (!state || (!shouldAutoQueue && !isViewOnlyQueue)) {
       navigate('/');
+      return;
+    }
+
+    if (!shouldAutoQueue) {
       return;
     }
 
@@ -33,7 +41,7 @@ export default function Queue() {
       // No game type provided, navigate back
       navigate('/');
     }
-  }, [location.state, navigate, queueForMatch, queueForMatchMulti]);
+  }, [state, shouldAutoQueue, isViewOnlyQueue, navigate, queueForMatch, queueForMatchMulti]);
 
   // When a game is found, we'll automatically navigate (handled by useGameWebSocket)
   useEffect(() => {
@@ -43,11 +51,21 @@ export default function Queue() {
     }
   }, [currentGameId]);
 
+  useEffect(() => {
+    if (!isViewOnlyQueue) {
+      return;
+    }
+
+    if (!currentLobby || currentLobby.state !== 'queued') {
+      navigate('/');
+    }
+  }, [currentLobby?.state, isViewOnlyQueue, navigate]);
+
   return (
     <LoadingScreen
       message="Finding Match..."
       submessage="Please wait while we find opponents"
-      showCancelButton={true}
+      showCancelButton={!isViewOnlyQueue}
     />
   );
 }

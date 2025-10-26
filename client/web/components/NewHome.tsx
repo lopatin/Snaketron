@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { MobileHeader } from './MobileHeader';
@@ -10,6 +10,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
+import { LobbyGameMode, LobbyState } from '../types';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -27,6 +28,8 @@ export const NewHome: React.FC = () => {
     leaveLobby,
     lobbyChatMessages,
     sendChatMessage,
+    lobbyPreferences,
+    updateLobbyPreferences,
   } = useWebSocket();
   const { createGame, currentGameId } = useGameWebSocket();
   const [isMobile, setIsMobile] = useState(false);
@@ -47,6 +50,10 @@ export const NewHome: React.FC = () => {
     onMessage,
   });
   const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
+  const isCurrentLobbyHost = currentLobby ? currentLobby.hostUserId === user?.id : false;
+  const isGameFormHost = !currentLobby || isCurrentLobbyHost;
+  const isLobbyQueued = currentLobby?.state === 'queued';
+  const previousLobbyStateRef = useRef<LobbyState | null>(currentLobby?.state ?? null);
 
   // Check if mobile on mount and resize
   useEffect(() => {
@@ -83,6 +90,25 @@ export const NewHome: React.FC = () => {
   }, [currentGameId, navigate]);
 
   useEffect(() => {
+    const nextState = currentLobby?.state ?? null;
+    const previousState = previousLobbyStateRef.current;
+
+    if (nextState === previousState) {
+      return;
+    }
+
+    previousLobbyStateRef.current = nextState;
+
+    if (nextState === 'queued' && !isCurrentLobbyHost) {
+      navigate('/queue', {
+        state: {
+          viewLobbyQueue: true,
+        },
+      });
+    }
+  }, [currentLobby?.state, isCurrentLobbyHost, navigate]);
+
+  useEffect(() => {
     const cleanup = onMessage('NicknameUpdated', (message: any) => {
       const updatedName = message.data?.username;
       if (!updatedName) {
@@ -102,10 +128,14 @@ export const NewHome: React.FC = () => {
   };
 
   const handleStartGame = async (
-    gameModes: Array<'duel' | '2v2' | 'solo' | 'ffa'>,
+    gameModes: LobbyGameMode[],
     nickname: string,
     isCompetitive: boolean
   ) => {
+    if (isLobbyQueued || !isGameFormHost) {
+      return;
+    }
+
     setIsLoading(true);
     try {
       // If not logged in, create guest user
@@ -114,13 +144,24 @@ export const NewHome: React.FC = () => {
           await createGuest(nickname);
         } catch (error) {
           console.error('Guest creation failed:', error);
-          setIsLoading(false);
           return;
         }
       }
 
       // Wait for auth to propagate
       await new Promise(resolve => setTimeout(resolve, 500));
+
+      if (!currentLobby) {
+        await createLobby();
+      }
+
+      updateLobbyPreferences({
+        selectedModes: gameModes,
+        competitive: isCompetitive,
+      });
+
+      // Give the WebSocket a moment to broadcast lobby preferences before queuing
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       // Convert game modes to GameType format
       const gameTypes = gameModes.map(mode => {
@@ -138,9 +179,9 @@ export const NewHome: React.FC = () => {
       // Navigate to queue with all selected game types
       navigate('/queue', {
         state: {
-          gameTypes: gameTypes,
-          autoQueue: true
-        }
+          gameTypes,
+          autoQueue: true,
+        },
       });
     } catch (error) {
       console.error('Failed to start game:', error);
@@ -212,7 +253,7 @@ export const NewHome: React.FC = () => {
           lobbyMembers={lobbyMembers}
           lobbyCode={currentLobby?.code || null}
           currentUserId={user?.id}
-          isHost={currentLobby ? currentLobby.hostUserId === user?.id : false}
+          isHost={isCurrentLobbyHost}
           onInvite={handleInvite}
           isInviteDisabled={isCreatingInvite}
           onLeaveLobby={handleLeaveLobby}
@@ -272,6 +313,10 @@ export const NewHome: React.FC = () => {
             currentUsername={user?.username}
             isLoading={isLoading}
             isAuthenticated={user !== null && !user.isGuest}
+            isHost={isGameFormHost}
+            isLobbyQueued={isLobbyQueued}
+            lobbyPreferences={lobbyPreferences}
+            onPreferencesChange={updateLobbyPreferences}
           />
         </div>
 
@@ -309,6 +354,10 @@ export const NewHome: React.FC = () => {
           currentUsername={user?.username}
           isLoading={isLoading}
           isAuthenticated={user !== null && !user.isGuest}
+          isHost={isGameFormHost}
+          isLobbyQueued={isLobbyQueued}
+          lobbyPreferences={lobbyPreferences}
+          onPreferencesChange={updateLobbyPreferences}
         />
       </div>
 
