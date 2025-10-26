@@ -16,6 +16,7 @@ interface UseGameWebSocketReturn {
   createSoloGame: () => void;
   queueForMatch: (gameType: GameType, queueMode?: 'Quickmatch' | 'Competitive') => void;
   queueForMatchMulti: (gameTypes: GameType[], queueMode?: 'Quickmatch' | 'Competitive') => void;
+  leaveQueue: () => void;
   joinCustomGame: (gameCode: string) => void;
   joinGame: (gameId: string, gameCode?: string | null) => void;
   leaveGame: () => void;
@@ -172,6 +173,13 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       })
     );
 
+    unsubscribers.push(
+      onMessage('QueueLeft', () => {
+        console.log('Received QueueLeft message from server, clearing queue state');
+        setIsQueued(false);
+      })
+    );
+
     // Cleanup
     return () => {
       console.log('Cleaning up game WebSocket listeners (initial state issue)');
@@ -243,6 +251,12 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     });
   }, [sendMessage]);
 
+  const leaveQueue = useCallback(() => {
+    console.log('Sending LeaveQueue message');
+    sendMessage('LeaveQueue');
+    setIsQueued(false);
+  }, [sendMessage]);
+
   const leaveGame = useCallback(() => {
     console.log('Sending LeaveGame message (initial state issue):');
     sendMessage('LeaveGame');
@@ -285,6 +299,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     createSoloGame,
     queueForMatch,
     queueForMatchMulti,
+    leaveQueue,
     joinCustomGame,
     joinGame,
     leaveGame,

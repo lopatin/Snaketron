@@ -31,7 +31,7 @@ export const NewHome: React.FC = () => {
     lobbyPreferences,
     updateLobbyPreferences,
   } = useWebSocket();
-  const { createGame, currentGameId } = useGameWebSocket();
+  const { createGame, currentGameId, leaveQueue } = useGameWebSocket();
   const [isMobile, setIsMobile] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -54,6 +54,8 @@ export const NewHome: React.FC = () => {
   const isGameFormHost = !currentLobby || isCurrentLobbyHost;
   const isLobbyQueued = currentLobby?.state === 'queued';
   const previousLobbyStateRef = useRef<LobbyState | null>(currentLobby?.state ?? null);
+  const queueNavigationInProgressRef = useRef(false);
+  const queueCancelAttemptedRef = useRef(false);
 
   // Check if mobile on mount and resize
   useEffect(() => {
@@ -177,6 +179,7 @@ export const NewHome: React.FC = () => {
       });
 
       // Navigate to queue with all selected game types
+      queueNavigationInProgressRef.current = true;
       navigate('/queue', {
         state: {
           gameTypes,
@@ -224,6 +227,20 @@ export const NewHome: React.FC = () => {
       setIsCreatingInvite(false);
     }
   };
+
+  useEffect(() => {
+    if (!currentLobby || currentLobby.state !== 'queued' || !isGameFormHost) {
+      queueCancelAttemptedRef.current = false;
+      return;
+    }
+
+    if (queueNavigationInProgressRef.current || queueCancelAttemptedRef.current) {
+      return;
+    }
+
+    leaveQueue();
+    queueCancelAttemptedRef.current = true;
+  }, [currentLobby?.state, isGameFormHost, leaveQueue]);
 
   const handleLeaveLobby = async () => {
     try {

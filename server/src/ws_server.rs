@@ -2064,6 +2064,96 @@ async fn process_ws_message(
                     // Transition back to authenticated state
                     Ok(ConnectionState::Authenticated { metadata })
                 }
+                WSMessage::LeaveQueue => {
+                    info!(
+                        "User {} ({}) requested to leave matchmaking queue for lobby {}",
+                        metadata.username, metadata.user_id, lobby_id
+                    );
+
+                    // Ensure only the lobby host can cancel matchmaking
+                    let is_host = match lobby_manager.get_lobby(lobby_id).await {
+                        Ok(Some(lobby)) => {
+                            if lobby.host_user_id != metadata.user_id {
+                                let response = WSMessage::AccessDenied {
+                                    reason: "Only the lobby host can cancel matchmaking".to_string(),
+                                };
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                "Lobby {} not found while processing LeaveQueue from user {}",
+                                lobby_id, metadata.user_id
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to load lobby {} while processing LeaveQueue: {}",
+                                lobby_id, e
+                            );
+                            false
+                        }
+                    };
+
+                    if !is_host {
+                        return Ok(ConnectionState::InLobby {
+                            metadata,
+                            lobby_id,
+                            websocket_id: ws_id,
+                        });
+                    }
+
+                    // Remove lobby from matchmaking queues
+                    let mut matchmaking_manager = matchmaking_manager.lock().await;
+                    match matchmaking_manager
+                        .remove_lobby_from_all_queues_by_id(lobby_id)
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                "Lobby {} removed from matchmaking queues at host request",
+                                lobby_id
+                            );
+                        }
+                        Ok(false) => {
+                            info!(
+                                "Lobby {} was not present in matchmaking queues when host requested cancellation",
+                                lobby_id
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to remove lobby {} from matchmaking queues: {}",
+                                lobby_id, e
+                            );
+                        }
+                    }
+                    drop(matchmaking_manager);
+
+                    // Update lobby state back to waiting
+                    if let Err(e) = lobby_manager.update_lobby_state(lobby_id, "waiting").await {
+                        error!(
+                            "Failed to update lobby {} state to waiting after cancellation: {}",
+                            lobby_id, e
+                        );
+                    }
+
+                    // Notify the client so the UI can clear queued state immediately
+                    let response = WSMessage::QueueLeft;
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+
+                    Ok(ConnectionState::InLobby {
+                        metadata,
+                        lobby_id,
+                        websocket_id: ws_id,
+                    })
+                }
                 WSMessage::Chat(message) => {
                     let trimmed = message.trim();
                     if trimmed.is_empty() {
@@ -2814,6 +2904,13 @@ async fn process_ws_message(
                         "User {} ({}) joining game {} from lobby {}",
                         metadata.username, metadata.user_id, game_id, lobby_id
                     );
+
+                    if let Err(e) = lobby_manager.update_lobby_state(lobby_id, "waiting").await {
+                        error!(
+                            "Failed to reset lobby {} state before game join: {}",
+                            lobby_id, e
+                        );
+                    }
 
                     // Leave the lobby before joining game
                     if let Err(e) = lobby_manager

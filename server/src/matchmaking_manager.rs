@@ -536,6 +536,52 @@ impl MatchmakingManager {
         Ok(())
     }
 
+    /// Locate a queued lobby by ID across all matchmaking queues
+    pub async fn get_queued_lobby_by_id(&mut self, lobby_id: i32) -> Result<Option<QueuedLobby>> {
+        let mut cursor: u64 = 0;
+
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("matchmaking:lobby:queue:*")
+                .arg("COUNT")
+                .arg(50)
+                .query_async(&mut self.conn)
+                .await?;
+
+            for key in keys {
+                let member_entries: Vec<String> = self.conn.zrange(&key, 0, -1).await?;
+
+                for member_json in member_entries {
+                    if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
+                        if lobby.lobby_id == lobby_id {
+                            return Ok(Some(lobby));
+                        }
+                    }
+                }
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+
+            cursor = next_cursor;
+        }
+
+        Ok(None)
+    }
+
+    /// Remove a lobby from every queue it is present in, returning whether a lobby was removed
+    pub async fn remove_lobby_from_all_queues_by_id(&mut self, lobby_id: i32) -> Result<bool> {
+        if let Some(lobby) = self.get_queued_lobby_by_id(lobby_id).await? {
+            self.remove_lobby_from_all_queues(&lobby).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Remove a lobby from all matchmaking queues it was queued for
     /// This is used when a lobby is matched to prevent it from being matched again
     pub async fn remove_lobby_from_all_queues(&mut self, lobby: &QueuedLobby) -> Result<()> {

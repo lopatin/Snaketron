@@ -55,11 +55,6 @@ export default function GameArena() {
     latencyMs
   });
 
-  // Show auth/loading screen once hooks above have been registered
-  if (authLoading || !user) {
-    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
-  }
-  
   const [gameOver, setGameOver] = useState(false);
   const [showGameOverPanel, setShowGameOverPanel] = useState(false);
   const [cellSize, setCellSize] = useState(15);
@@ -317,7 +312,7 @@ export default function GameArena() {
               // debugger; // Enter debugger when non-adjacent movement is detected
             }
           }
-          
+
           // Update last head position
           lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
         }
@@ -382,6 +377,13 @@ export default function GameArena() {
     
     return () => clearInterval(intervalId);
   }, [gameState, forceUpdate]);
+
+  const handleSendGameChat = useCallback((message: string) => {
+    if (!connected) {
+      return;
+    }
+    sendChatMessage('game', message);
+  }, [connected, sendChatMessage]);
   
   // Show loading screen while waiting for game state
   if (!gameState) {
@@ -421,12 +423,11 @@ export default function GameArena() {
     });
   };
 
-  const handleSendGameChat = useCallback((message: string) => {
-    if (!connected) {
-      return;
-    }
-    sendChatMessage('game', message);
-  }, [connected, sendChatMessage]);
+  const showAuthLoading = authLoading || !user;
+
+  if (showAuthLoading) {
+    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
+  }
   
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden">
