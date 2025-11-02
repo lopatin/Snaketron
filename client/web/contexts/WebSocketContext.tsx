@@ -659,7 +659,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
       const sendJoinRequest = () => {
         if (!settled) {
-          sendMessage({ JoinLobbyByCode: { lobby_code: normalizedCode } });
+          sendMessage({ JoinLobby: { lobby_code: normalizedCode } });
         }
       };
 

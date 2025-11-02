@@ -64,9 +64,6 @@ impl DynamoDatabase {
         // Create game codes table
         self.create_game_codes_table_if_not_exists().await?;
 
-        // Create lobby codes table
-        self.create_lobby_codes_table_if_not_exists().await?;
-
         Ok(())
     }
 
@@ -299,57 +296,6 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    async fn create_lobby_codes_table_if_not_exists(&self) -> Result<()> {
-        let table_name = format!("{}-lobby-codes", self.table_prefix);
-
-        // Check if table exists
-        match self
-            .client
-            .describe_table()
-            .table_name(&table_name)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                debug!("Table {} already exists", table_name);
-                return Ok(());
-            }
-            Err(e) => {
-                // Any error in describe_table likely means the table doesn't exist
-                debug!(
-                    "Table {} does not exist (error: {}), creating it",
-                    table_name, e
-                );
-                // Table doesn't exist, proceed to create it
-            }
-        }
-
-        info!("Creating DynamoDB table: {}", table_name);
-
-        let lobby_code_attr = AttributeDefinition::builder()
-            .attribute_name("lobbyCode")
-            .attribute_type(ScalarAttributeType::S)
-            .build()?;
-
-        let lobby_code_key = KeySchemaElement::builder()
-            .attribute_name("lobbyCode")
-            .key_type(KeyType::Hash)
-            .build()?;
-
-        self.client
-            .create_table()
-            .table_name(&table_name)
-            .attribute_definitions(lobby_code_attr)
-            .key_schema(lobby_code_key)
-            .billing_mode(BillingMode::PayPerRequest)
-            .send()
-            .await
-            .context("Failed to create lobby codes table")?;
-
-        info!("Created DynamoDB table: {}", table_name);
-        Ok(())
-    }
-
     async fn generate_id_for_entity(&self, entity_type: &str) -> Result<i32> {
         // Use DynamoDB atomic counter to generate unique IDs
         // Counter is stored with pk="COUNTER" and sk=entity_type (e.g., "USER", "SERVER", "GAME", "LOBBY")
@@ -431,18 +377,6 @@ impl DynamoDatabase {
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .ok_or_else(|| anyhow!("Missing or invalid datetime for key: {}", key))
-    }
-
-    fn generate_lobby_code() -> String {
-        use rand::Rng;
-        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Exclude confusing chars
-        let mut rng = rand::thread_rng();
-        (0..8)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
-            .collect()
     }
 }
 
@@ -1152,137 +1086,6 @@ impl Database for DynamoDatabase {
         // For simplified implementation, return None
         warn!("get_custom_lobby_by_code: simplified implementation - returning None");
         Ok(None)
-    }
-
-    // Lobby operations
-    async fn create_lobby(&self, host_user_id: i32, region: &str) -> Result<Lobby> {
-        let lobby_id = self.generate_id_for_entity("LOBBY").await?;
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::hours(1);
-
-        // Generate 8-character lobby code (uppercase alphanumeric)
-        let lobby_code = Self::generate_lobby_code();
-
-        // Store in main table
-        let mut item = HashMap::new();
-        item.insert("pk".to_string(), Self::av_s(format!("LOBBY#{}", lobby_id)));
-        item.insert("sk".to_string(), Self::av_s("META"));
-        item.insert("id".to_string(), Self::av_n(lobby_id));
-        item.insert("lobbyCode".to_string(), Self::av_s(&lobby_code));
-        item.insert("hostUserId".to_string(), Self::av_n(host_user_id));
-        item.insert("region".to_string(), Self::av_s(region));
-        item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
-        item.insert("expiresAt".to_string(), Self::av_s(expires_at.to_rfc3339()));
-        item.insert("state".to_string(), Self::av_s("waiting"));
-        item.insert("ttl".to_string(), Self::av_n(expires_at.timestamp()));
-
-        self.client
-            .put_item()
-            .table_name(self.main_table())
-            .set_item(Some(item))
-            .send()
-            .await
-            .context("Failed to create lobby")?;
-
-        // Store lobby code mapping in lobby-codes table
-        let mut code_item = HashMap::new();
-        code_item.insert("lobbyCode".to_string(), Self::av_s(&lobby_code));
-        code_item.insert("lobbyId".to_string(), Self::av_n(lobby_id));
-        code_item.insert("region".to_string(), Self::av_s(region));
-
-        self.client
-            .put_item()
-            .table_name(format!("{}-lobby-codes", self.table_prefix))
-            .set_item(Some(code_item))
-            .send()
-            .await
-            .context("Failed to store lobby code mapping")?;
-
-        info!(
-            "Created lobby {} with code '{}' in region {}",
-            lobby_id, lobby_code, region
-        );
-
-        Ok(Lobby {
-            id: lobby_id,
-            lobby_code,
-            host_user_id,
-            region: region.to_string(),
-            created_at: now,
-            expires_at,
-            state: "waiting".to_string(),
-        })
-    }
-
-    async fn get_lobby_by_id(&self, lobby_id: i32) -> Result<Option<Lobby>> {
-        let result = self
-            .client
-            .get_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("LOBBY#{}", lobby_id)))
-            .key("sk", Self::av_s("META"))
-            .send()
-            .await?;
-
-        let item = match result.item {
-            Some(item) => item,
-            None => return Ok(None),
-        };
-
-        let lobby = Lobby {
-            id: Self::extract_number(&item, "id").ok_or_else(|| anyhow::anyhow!("Missing id"))?,
-            lobby_code: Self::extract_string(&item, "lobbyCode")
-                .ok_or_else(|| anyhow::anyhow!("Missing lobbyCode"))?,
-            host_user_id: Self::extract_number(&item, "hostUserId")
-                .ok_or_else(|| anyhow::anyhow!("Missing hostUserId"))?,
-            region: Self::extract_string(&item, "region")
-                .ok_or_else(|| anyhow::anyhow!("Missing region"))?,
-            created_at: Self::extract_datetime(&item, "createdAt")?,
-            expires_at: Self::extract_datetime(&item, "expiresAt")?,
-            state: Self::extract_string(&item, "state")
-                .ok_or_else(|| anyhow::anyhow!("Missing state"))?,
-        };
-
-        Ok(Some(lobby))
-    }
-
-    async fn get_lobby_by_code(&self, lobby_code: &str) -> Result<Option<Lobby>> {
-        // First, look up lobby ID from lobby-codes table
-        let result = self
-            .client
-            .get_item()
-            .table_name(format!("{}-lobby-codes", self.table_prefix))
-            .key("lobbyCode", Self::av_s(lobby_code))
-            .send()
-            .await?;
-
-        let item = match result.item {
-            Some(item) => item,
-            None => return Ok(None),
-        };
-
-        let lobby_id = Self::extract_number(&item, "lobbyId")
-            .ok_or_else(|| anyhow::anyhow!("Missing lobbyId"))?;
-
-        // Now get the full lobby data
-        self.get_lobby_by_id(lobby_id).await
-    }
-
-    async fn update_lobby_state(&self, lobby_id: i32, state: &str) -> Result<()> {
-        self.client
-            .update_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("LOBBY#{}", lobby_id)))
-            .key("sk", Self::av_s("META"))
-            .update_expression("SET #state = :state")
-            .expression_attribute_names("#state", "state")
-            .expression_attribute_values(":state", Self::av_s(state))
-            .send()
-            .await
-            .context("Failed to update lobby state")?;
-
-        info!("Updated lobby {} state to {}", lobby_id, state);
-        Ok(())
     }
 
     // Spectator operations

@@ -20,7 +20,6 @@ pub struct QueuedPlayer {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueuedLobby {
-    pub lobby_id: i32,
     pub lobby_code: String,
     pub members: Vec<crate::lobby_manager::LobbyMember>,
     pub avg_mmr: i32,
@@ -107,7 +106,6 @@ impl MatchmakingManager {
     /// Add a lobby to the matchmaking queue for multiple game types
     pub async fn add_lobby_to_queue(
         &mut self,
-        lobby_id: i32,
         lobby_code: &str,
         members: Vec<crate::lobby_manager::LobbyMember>,
         avg_mmr: i32,
@@ -122,7 +120,6 @@ impl MatchmakingManager {
         let timestamp = Utc::now().timestamp_millis();
 
         let lobby = QueuedLobby {
-            lobby_id,
             lobby_code: lobby_code.to_string(),
             members,
             avg_mmr,
@@ -183,7 +180,7 @@ impl MatchmakingManager {
 
         info!(
             "Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
-            lobby_id,
+            lobby_code,
             game_types,
             lobby.members.len(),
             avg_mmr
@@ -459,13 +456,13 @@ impl MatchmakingManager {
         };
 
         // Deduplicate and collect unique lobbies
-        let mut seen_lobby_ids = HashSet::new();
+        let mut seen_lobby_codes = HashSet::new();
         let mut unique_lobbies = Vec::new();
 
         // Helper to process lobby JSON and add if unique
         let mut process_lobby = |member_json: &str| {
             if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json) {
-                if seen_lobby_ids.insert(lobby.lobby_id) {
+                if seen_lobby_codes.insert(lobby.lobby_code.clone()) {
                     unique_lobbies.push(lobby);
                 }
             }
@@ -485,12 +482,12 @@ impl MatchmakingManager {
             process_lobby(member_json);
         }
 
-        debug!(
-            "Fetched {} unique lobbies from strategic sampling (game_type: {:?}, queue_mode: {:?})",
-            unique_lobbies.len(),
-            game_type,
-            queue_mode
-        );
+        // debug!(
+        //     "Fetched {} unique lobbies from strategic sampling (game_type: {:?}, queue_mode: {:?})",
+        //     unique_lobbies.len(),
+        //     game_type,
+        //     queue_mode
+        // );
 
         Ok(unique_lobbies)
     }
@@ -500,7 +497,7 @@ impl MatchmakingManager {
         &mut self,
         game_type: &GameType,
         queue_mode: &common::QueueMode,
-        lobby_id: i32,
+        lobby_code: &str,
     ) -> Result<()> {
         let lobby_queue_key = self
             .redis_keys
@@ -518,7 +515,7 @@ impl MatchmakingManager {
 
         for (member_json, _score) in members {
             if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                if lobby.lobby_id == lobby_id {
+                if lobby.lobby_code == lobby_code {
                     // Remove from both sorted sets using the same lobby JSON
                     pipe.zrem(&lobby_queue_key, &member_json);
                     pipe.zrem(&lobby_mmr_key, &member_json);
@@ -531,13 +528,13 @@ impl MatchmakingManager {
 
         info!(
             "Removed lobby {} from matchmaking queue for game type {:?}",
-            lobby_id, game_type
+            lobby_code, game_type
         );
         Ok(())
     }
 
-    /// Locate a queued lobby by ID across all matchmaking queues
-    pub async fn get_queued_lobby_by_id(&mut self, lobby_id: i32) -> Result<Option<QueuedLobby>> {
+    /// Locate a queued lobby by code across all matchmaking queues
+    pub async fn get_queued_lobby_by_code(&mut self, lobby_code: &str) -> Result<Option<QueuedLobby>> {
         let mut cursor: u64 = 0;
 
         loop {
@@ -555,7 +552,7 @@ impl MatchmakingManager {
 
                 for member_json in member_entries {
                     if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                        if lobby.lobby_id == lobby_id {
+                        if lobby.lobby_code == lobby_code {
                             return Ok(Some(lobby));
                         }
                     }
@@ -573,8 +570,8 @@ impl MatchmakingManager {
     }
 
     /// Remove a lobby from every queue it is present in, returning whether a lobby was removed
-    pub async fn remove_lobby_from_all_queues_by_id(&mut self, lobby_id: i32) -> Result<bool> {
-        if let Some(lobby) = self.get_queued_lobby_by_id(lobby_id).await? {
+    pub async fn remove_lobby_from_all_queues_by_code(&mut self, lobby_code: &str) -> Result<bool> {
+        if let Some(lobby) = self.get_queued_lobby_by_code(lobby_code).await? {
             self.remove_lobby_from_all_queues(&lobby).await?;
             return Ok(true);
         }
@@ -604,7 +601,7 @@ impl MatchmakingManager {
 
             for member_json in members {
                 if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                    if queued_lobby.lobby_id == lobby.lobby_id {
+                    if queued_lobby.lobby_code == lobby.lobby_code {
                         // Remove from both sorted sets using the same lobby JSON
                         pipe.zrem(&lobby_queue_key, &member_json);
                         pipe.zrem(&lobby_mmr_key, &member_json);
@@ -619,7 +616,7 @@ impl MatchmakingManager {
 
         info!(
             "Removed lobby {} from all matchmaking queues (was queued for {:?})",
-            lobby.lobby_id, lobby.game_types
+            lobby.lobby_code, lobby.game_types
         );
         Ok(())
     }

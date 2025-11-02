@@ -31,11 +31,12 @@ export default function GameArena() {
     lastGameEvent,
     leaveGame,
     queueForMatch,
-    createSoloGame
+    createSoloGame,
+    requeueLobby
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
-  const { latencyMs, gameChatMessages, sendChatMessage } = useWebSocket();
+  const { latencyMs, gameChatMessages, sendChatMessage, currentLobby } = useWebSocket();
   const playerId = user?.id ?? 0;
 
   // Use game engine for client-side prediction (call unconditionally to keep hook order stable)
@@ -158,9 +159,9 @@ export default function GameArena() {
       setGameOver(true);
       stopEngine(); // Stop the engine when game ends
       setShowGameOverPanel(true);
-      // debugger;
-      // Show game over panel after a short delay
-      // setTimeout(() => setShowGameOverPanel(true), 500);
+
+      // Note: Users remain in InGame state on this route after game ends.
+      // They must explicitly click "Menu" to leave or wait for host to "Play Again"
     }
   }, [gameState, user?.id, gameOver, isGameComplete, stopEngine]);
 
@@ -404,23 +405,39 @@ export default function GameArena() {
   
   // Handle back to menu
   const handleBackToMenu = () => {
+    // Leave the game first, then navigate
+    leaveGame();
     navigate('/');
   };
   
+  // Determine if user is in a lobby and is the host
+  const isInLobby = currentLobby !== null;
+  const isHost = currentLobby !== null && currentLobby.hostUserId === user?.id;
+
   // Handle play again
   const handlePlayAgain = () => {
     if (!gameState) return;
-    
-    const gameType = gameState.game_type;
-    
-    // Navigate away to trigger unmount and natural cleanup
-    // Pass the game type as state so we know what to queue for
-    navigate('/queue', { 
-      state: { 
-        gameType,
-        autoQueue: true 
-      } 
-    });
+
+    // If in a lobby, host can requeue the lobby
+    if (isInLobby) {
+      if (isHost) {
+        console.log('Host requesting requeue for lobby', currentLobby?.id);
+        requeueLobby();
+      } else {
+        console.log('Guest cannot requeue lobby, waiting for host');
+        // Guests can't initiate requeue, button should be disabled
+      }
+    } else {
+      // Not in a lobby (shouldn't happen with new architecture, but keep as fallback)
+      console.warn('Play Again without lobby - this shouldn\'t happen');
+      const gameType = gameState.game_type;
+      navigate('/queue', {
+        state: {
+          gameType,
+          autoQueue: true
+        }
+      });
+    }
   };
 
   const showAuthLoading = authLoading || !user;
@@ -441,6 +458,8 @@ export default function GameArena() {
           showGameOver={showGameOverPanel}
           onBackToMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
+          isHost={isHost}
+          isInLobby={isInLobby}
         />
 
         {/* Game Arena Container */}

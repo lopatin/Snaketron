@@ -23,6 +23,8 @@ use crate::replication::ReplicationManager;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use redis::Client;
+use crate::redis_utils::create_connection_manager;
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
 #[derive(Clone)]
@@ -66,9 +68,21 @@ pub async fn run_http_server(
 ) -> Result<()> {
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     let connection_count = Arc::new(AtomicUsize::new(0));
+    
+    let redis_keys = crate::redis_keys::RedisKeys::new();
+    let redis_client = Client::open(redis_url).context("Failed to create Redis client")?;
+    let redis = create_connection_manager(redis_client).await?;
+    
+    let user_cache = Arc::new(crate::user_cache::UserCache::new(
+        redis.clone(),
+        redis_keys,
+        db.clone(),
+    ));
 
-    // Create lobby manager
-    let lobby_manager = Arc::new(LobbyManager::new(redis_url.clone(), db.clone()));
+    let lobby_manager = Arc::new(LobbyManager::new(
+        redis.clone(), 
+        db.clone()
+    ));
 
     // Create state for both API and WebSocket handlers
     let state = HttpServerState {
@@ -191,8 +205,7 @@ async fn websocket_handler(
             state.cancellation_token,
             state.lobby_manager,
             state.region,
-        )
-        .await;
+        ).await;
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;

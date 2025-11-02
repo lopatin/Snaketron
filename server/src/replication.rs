@@ -24,6 +24,7 @@ pub struct ReplicationStatus {
 /// A wrapper around broadcast::Receiver that filters out events before a certain sequence number
 pub struct FilteredEventReceiver {
     inner: broadcast::Receiver<GameEventMessage>,
+    sender: Arc<broadcast::Sender<GameEventMessage>>,
     min_sequence: u64,
     game_id: u32,
 }
@@ -32,11 +33,13 @@ impl FilteredEventReceiver {
     /// Create a new FilteredEventReceiver
     pub fn new(
         inner: broadcast::Receiver<GameEventMessage>,
+        sender: Arc<broadcast::Sender<GameEventMessage>>,
         min_sequence: u64,
         game_id: u32,
     ) -> Self {
         Self {
             inner,
+            sender,
             min_sequence,
             game_id,
         }
@@ -254,7 +257,7 @@ pub struct ReplicationManager {
     workers: Vec<tokio::task::JoinHandle<Result<()>>>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
-    statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
+    statuses: Arc<RwLock<HashMap<u32, RwLock<ReplicationStatus>>>>,
     pubsub: Arc<Mutex<PubSubManager>>,
 }
 
@@ -304,26 +307,29 @@ impl ReplicationManager {
             .await
             .context("Game not available in replication manager")?;
 
-        // Get or create broadcast channel for this game
-        let receiver = {
+        // Get or create broadcast channel for this game. Acquires lock.
+        {
             let mut broadcasters = self.game_event_broadcasters.write().await;
-            let sender = broadcasters.entry(game_id).or_insert_with(|| {
-                let (tx, _) = broadcast::channel(1028);
-                tx
-            });
+            let sender = broadcasters
+                .entry(game_id)
+                .or_insert_with(|| {
+                    let (tx, _) = broadcast::channel(1028);
+                    tx
+                });
 
-            sender.subscribe()
-        };
+            let receiver = sender.subscribe();
 
-        // Create filtered receiver
-        let snapshot_sequence = game_state.event_sequence;
-        let filtered_receiver = FilteredEventReceiver {
-            inner: receiver,
-            min_sequence: snapshot_sequence,
-            game_id,
-        };
+            // Create filtered receiver
+            let snapshot_sequence = game_state.event_sequence;
+            let filtered_receiver = FilteredEventReceiver {
+                inner: receiver,
+                sender: sender.clone(),
+                min_sequence: snapshot_sequence,
+                game_id,
+            };
 
-        Ok((game_state, filtered_receiver))
+            Ok((game_state, filtered_receiver))
+        }
     }
 
     /// Get a game state, always ready with PubSub

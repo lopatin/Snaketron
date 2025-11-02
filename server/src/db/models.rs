@@ -68,13 +68,11 @@ pub struct CustomGameLobby {
 pub type CustomLobby = CustomGameLobby;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lobby {
-    pub id: i32,
-    pub lobby_code: String,
+pub struct LobbyMetadata {
+    pub lobby_code: String, // Primary identifier, format: {REGION_CODE}-{HASH} (e.g., USE1-A3B2C4D5)
     pub host_user_id: i32,
     pub region: String,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
     pub state: String, // waiting | queued | matched
 }
 

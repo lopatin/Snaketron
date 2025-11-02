@@ -182,7 +182,7 @@ impl LobbyManager {
     pub async fn get_lobby(&self, lobby_id: u32) -> Result<Option<Lobby>>
 
     /// Get lobby by code from DynamoDB
-    pub async fn get_lobby_by_code(&self, lobby_code: &str)
+    pub async fn get_lobby(&self, lobby_code: &str)
         -> Result<Option<Lobby>>
 
     /// Check if lobby is in a different region
@@ -271,7 +271,7 @@ pub enum WSMessage {
         lobby_id: u32,
         lobby_code: String
     },
-    JoinLobbyByCode {
+    JoinLobby {
         lobby_code: String
     },
     JoinedLobby {
@@ -520,7 +520,7 @@ pub async fn check_lobby_region(
 
 2. **WebSocket Handler** (`server/src/ws_server.rs`):
 ```rust
-WSMessage::JoinLobbyByCode { lobby_code } => {
+WSMessage::JoinLobby { lobby_code } => {
     // Check region
     if let Some(redirect) = lobby_manager.check_lobby_region(...).await? {
         // Send redirect message
@@ -553,7 +553,7 @@ useEffect(() => {
       // After connection, retry join
       newWs.addEventListener('open', () => {
         newWs.send(JSON.stringify({
-          type: 'JoinLobbyByCode',
+          type: 'JoinLobby',
           lobby_code: msg.lobbyCode
         }));
       });
@@ -595,7 +595,7 @@ useEffect(() => {
 - `server/src/ws_server.rs` - Integrate LobbyManager ✅
   - Added InLobby connection state ✅
   - Implemented CreateLobby handler ✅
-  - Implemented JoinLobbyByCode handler ✅
+  - Implemented JoinLobby handler ✅
   - Implemented LeaveLobby handler ✅
   - Added lobby update subscriptions via Redis pub/sub ✅
   - Periodic LobbyUpdate broadcasts (every 10s) ✅

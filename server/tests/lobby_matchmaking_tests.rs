@@ -62,7 +62,7 @@ async fn create_lobby_and_queue(
     if clients.len() > 1 {
         for client in clients.iter_mut().skip(1) {
             client
-                .send_message(WSMessage::JoinLobbyByCode {
+                .send_message(WSMessage::JoinLobby {
                     lobby_code: lobby_code.clone(),
                 })
                 .await?;
@@ -671,14 +671,10 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
         LobbyMember {
             user_id: 1,
             username: "player1".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
         },
         LobbyMember {
             user_id: 2,
             username: "player2".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: false,
         },
     ];
 
@@ -745,8 +741,6 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
     let members = vec![LobbyMember {
         user_id: 1,
         username: "player1".to_string(),
-        joined_at: chrono::Utc::now().timestamp_millis(),
-        is_host: true,
     }];
 
     // Queue lobby for multiple game types
@@ -839,14 +833,10 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
         LobbyMember {
             user_id: 1,
             username: "player1".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
         },
         LobbyMember {
             user_id: 2,
             username: "player2".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: false,
         },
     ];
 
@@ -906,29 +896,21 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
     let members1 = vec![LobbyMember {
         user_id: 1,
         username: "player1".to_string(),
-        joined_at: chrono::Utc::now().timestamp_millis(),
-        is_host: true,
     }];
 
     let members2 = vec![LobbyMember {
         user_id: 2,
         username: "player2".to_string(),
-        joined_at: chrono::Utc::now().timestamp_millis(),
-        is_host: true,
     }];
 
     let members3 = vec![
         LobbyMember {
             user_id: 3,
             username: "player3".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
         },
         LobbyMember {
             user_id: 4,
             username: "player4".to_string(),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: false,
         },
     ];
 
@@ -1069,8 +1051,6 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
         let members = vec![LobbyMember {
             user_id: i,
             username: format!("player{}", i),
-            joined_at: chrono::Utc::now().timestamp_millis(),
-            is_host: true,
         }];
 
         mm.add_lobby_to_queue(

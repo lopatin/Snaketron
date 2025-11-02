@@ -62,12 +62,6 @@ pub trait Database: Send + Sync {
     async fn get_custom_lobby_host(&self, game_id: i32) -> Result<Option<i32>>;
     async fn get_custom_lobby_by_code(&self, game_code: &str) -> Result<Option<CustomLobby>>;
 
-    // Lobby operations
-    async fn create_lobby(&self, host_user_id: i32, region: &str) -> Result<Lobby>;
-    async fn get_lobby_by_id(&self, lobby_id: i32) -> Result<Option<Lobby>>;
-    async fn get_lobby_by_code(&self, lobby_code: &str) -> Result<Option<Lobby>>;
-    async fn update_lobby_state(&self, lobby_id: i32, state: &str) -> Result<()>;
-
     // Spectator operations
     async fn add_spectator_to_game(&self, game_id: i32, user_id: i32) -> Result<()>;
 }

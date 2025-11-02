@@ -16,7 +16,7 @@ const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 /// Explicit player-level team assignment
 #[derive(Debug, Clone)]
 struct TeamAssignment {
-    lobby_id: i32,
+    lobby_code: String,
     member_indices: Vec<usize>, // Which members of this lobby
     team_id: common::TeamId,
 }
@@ -28,7 +28,7 @@ struct MatchmakingCombination {
     /// Player-level team assignments (explicit about which lobby members go on which team)
     team_assignments: Vec<TeamAssignment>,
     /// Spectators: (lobby_id, member_indices) for players who will spectate
-    spectators: Vec<(i32, Vec<usize>)>,
+    spectators: Vec<(String, Vec<usize>)>,
     total_players: usize,
     avg_mmr: i32,
 }
@@ -248,7 +248,7 @@ fn build_combination(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     team_a: Vec<(usize, Vec<usize>)>,
     team_b: Vec<(usize, Vec<usize>)>,
-    spectators: Vec<(i32, Vec<usize>)>,
+    spectators: Vec<(String, Vec<usize>)>,
 ) -> Option<MatchmakingCombination> {
     // Collect unique lobbies that are used
     let mut used_lobby_indices = std::collections::HashSet::new();
@@ -268,14 +268,14 @@ fn build_combination(
     let mut team_assignments = Vec::new();
     for (lobby_idx, member_indices) in team_a {
         team_assignments.push(TeamAssignment {
-            lobby_id: lobbies[lobby_idx].lobby_id,
+            lobby_code: lobbies[lobby_idx].lobby_code.clone(),
             member_indices,
             team_id: common::TeamId(0),
         });
     }
     for (lobby_idx, member_indices) in team_b {
         team_assignments.push(TeamAssignment {
-            lobby_id: lobbies[lobby_idx].lobby_id,
+            lobby_code: lobbies[lobby_idx].lobby_code.clone(),
             member_indices,
             team_id: common::TeamId(1),
         });
@@ -286,7 +286,7 @@ fn build_combination(
     let mut total_mmr_weighted = 0;
 
     for assignment in &team_assignments {
-        let lobby = lobbies.iter().find(|l| l.lobby_id == assignment.lobby_id)?;
+        let lobby = lobbies.iter().find(|l| l.lobby_code == assignment.lobby_code)?;
         total_players += assignment.member_indices.len();
         total_mmr_weighted += lobby.avg_mmr * assignment.member_indices.len() as i32;
     }
@@ -357,12 +357,12 @@ fn find_single_lobby_split(
             lobbies: vec![lobby.clone()],
             team_assignments: vec![
                 TeamAssignment {
-                    lobby_id: lobby.lobby_id,
+                    lobby_code: lobby.lobby_code.clone(),
                     member_indices: team_a_members,
                     team_id: common::TeamId(0),
                 },
                 TeamAssignment {
-                    lobby_id: lobby.lobby_id,
+                    lobby_code: lobby.lobby_code.clone(),
                     member_indices: team_b_members,
                     team_id: common::TeamId(1),
                 },
@@ -422,12 +422,12 @@ fn find_team_match_with_spectators(
 
             let team_assignments = vec![
                 TeamAssignment {
-                    lobby_id: lobby.lobby_id,
+                    lobby_code: lobby.lobby_code.clone(),
                     member_indices: team_a_members,
                     team_id: common::TeamId(0),
                 },
                 TeamAssignment {
-                    lobby_id: lobby.lobby_id,
+                    lobby_code: lobby.lobby_code.clone(),
                     member_indices: team_b_members,
                     team_id: common::TeamId(1),
                 },
@@ -436,7 +436,7 @@ fn find_team_match_with_spectators(
             return Some(MatchmakingCombination {
                 lobbies: vec![lobby.clone()],
                 team_assignments,
-                spectators: vec![(lobby.lobby_id, spectator_indices)],
+                spectators: vec![(lobby.lobby_code.clone(), spectator_indices)],
                 total_players: total_needed,
                 avg_mmr: lobby.avg_mmr,
             });
@@ -461,7 +461,7 @@ fn find_ffa_combination(
     for (idx, lobby) in lobbies.iter().enumerate() {
         trace!(
             idx = idx,
-            lobby_id = lobby.lobby_id,
+            lobby_id = lobby.lobby_code,
             members = lobby.members.len(),
             avg_mmr = lobby.avg_mmr,
             lobby_code = %lobby.lobby_code,
@@ -485,7 +485,7 @@ fn find_ffa_combination(
 
             trace!(
                 idx = idx,
-                lobby_id = lobby.lobby_id,
+                lobby_id = lobby.lobby_code,
                 members = lobby.members.len(),
                 total_players_now = total,
                 "✓ SELECTED lobby (fits within max_players)"
@@ -496,7 +496,7 @@ fn find_ffa_combination(
 
             trace!(
                 idx = idx,
-                lobby_id = lobby.lobby_id,
+                lobby_id = lobby.lobby_code,
                 members = lobby.members.len(),
                 total_players = total,
                 max_players = max_players,
@@ -730,8 +730,8 @@ fn are_lobbies_compatible(
 
     if !compatible {
         trace!(
-            lobby1_id = lobby1.lobby_id,
-            lobby2_id = lobby2.lobby_id,
+            lobby1_id = lobby1.lobby_code,
+            lobby2_id = lobby2.lobby_code,
             mmr1 = lobby1.avg_mmr,
             mmr2 = lobby2.avg_mmr,
             mmr_diff = mmr_diff,
@@ -753,7 +753,7 @@ fn filter_compatible_lobbies(
     lobbies
         .iter()
         .filter(|lobby| {
-            lobby.lobby_id == reference_lobby.lobby_id
+            lobby.lobby_code == reference_lobby.lobby_code
                 || are_lobbies_compatible(reference_lobby, lobby, now_ms)
         })
         .cloned()
@@ -807,7 +807,7 @@ async fn create_lobby_matches(
         // For now, we don't modify the lobby's MMR, we'll filter during matching
         // Store as a "virtual" adjustment by keeping original MMR
         trace!(
-            lobby_id = lobby.lobby_id,
+            lobby_id = lobby.lobby_code,
             wait_seconds = wait_seconds,
             original_mmr = lobby.avg_mmr,
             max_mmr_diff = max_mmr_diff,
@@ -829,7 +829,7 @@ async fn create_lobby_matches(
         let max_acceptable_mmr_diff = calculate_max_mmr_diff(wait_time_s);
 
         info!(
-            priority_lobby_id = priority_lobby.lobby_id,
+            priority_lobby_id = priority_lobby.lobby_code,
             priority_mmr = priority_lobby.avg_mmr,
             wait_time_s = wait_time_s,
             max_acceptable_mmr_diff = max_acceptable_mmr_diff,
@@ -842,7 +842,7 @@ async fn create_lobby_matches(
         let compatible_lobbies = filter_compatible_lobbies(priority_lobby, &available_lobbies, now);
 
         info!(
-            priority_lobby_id = priority_lobby.lobby_id,
+            priority_lobby_id = priority_lobby.lobby_code,
             compatible_count = compatible_lobbies.len(),
             total_available = available_lobbies.len(),
             "Compatibility filtering complete"
@@ -851,7 +851,7 @@ async fn create_lobby_matches(
         if compatible_lobbies.is_empty() {
             // No compatible lobbies found, wait for more time to pass
             warn!(
-                lobby_id = priority_lobby.lobby_id,
+                lobby_id = priority_lobby.lobby_code,
                 mmr = priority_lobby.avg_mmr,
                 wait_time_ms = now - priority_lobby.queued_at,
                 "No compatible lobbies found for priority lobby - waiting for more time or lobbies"
@@ -916,7 +916,7 @@ async fn create_lobby_matches(
 
                 // Remove matched lobbies from available pool and ALL queues they were in
                 for lobby in &combination.lobbies {
-                    available_lobbies.retain(|l| l.lobby_id != lobby.lobby_id);
+                    available_lobbies.retain(|l| l.lobby_code != lobby.lobby_code);
 
                     // Use remove_lobby_from_all_queues to ensure lobby is removed from
                     // all game type queues it was registered for (prevents double-matching)
@@ -926,7 +926,7 @@ async fn create_lobby_matches(
                     {
                         error!(
                             "Failed to remove lobby {} from all queues: {}",
-                            lobby.lobby_id, e
+                            lobby.lobby_code, e
                         );
                     }
                 }
@@ -985,9 +985,9 @@ async fn create_game_from_lobbies(
             let lobby = combination
                 .lobbies
                 .iter()
-                .find(|l| l.lobby_id == assignment.lobby_id)
+                .find(|l| l.lobby_code == assignment.lobby_code)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id)
+                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_code)
                 })?;
 
             // Map each member index to their team
@@ -1003,9 +1003,9 @@ async fn create_game_from_lobbies(
             let lobby = combination
                 .lobbies
                 .iter()
-                .find(|l| l.lobby_id == assignment.lobby_id)
+                .find(|l| l.lobby_code == assignment.lobby_code)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_id)
+                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_code)
                 })?;
 
             for &member_idx in &assignment.member_indices {
@@ -1097,7 +1097,7 @@ async fn publish_lobby_match_notifications(
     let partition_id = game_id % PARTITION_COUNT;
 
     for lobby in lobbies {
-        let channel = redis_keys.matchmaking_lobby_notification_channel(lobby.lobby_id);
+        let channel = redis_keys.matchmaking_lobby_notification_channel(&lobby.lobby_code);
         let notification = serde_json::json!({
             "type": "MatchFound",
             "game_id": game_id,
@@ -1112,7 +1112,7 @@ async fn publish_lobby_match_notifications(
 
         info!(
             "Published match notification to lobby {} (code: {})",
-            lobby.lobby_id, lobby.lobby_code
+            lobby.lobby_code, lobby.lobby_code
         );
     }
 
@@ -1206,14 +1206,10 @@ mod tests {
                 LobbyMember {
                     user_id: 10,
                     username: "player_one".to_string(),
-                    joined_at: 100,
-                    is_host: true,
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
-                    joined_at: 200,
-                    is_host: false,
                 },
             ],
             avg_mmr: 1200,

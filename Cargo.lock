@@ -2810,6 +2810,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "gethostname",
+ "indexmap 2.9.0",
  "jsonwebtoken",
  "once_cell",
  "prost",

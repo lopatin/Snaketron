@@ -8,6 +8,8 @@ interface ScoreboardProps {
   showGameOver?: boolean;
   onBackToMenu?: () => void;
   onPlayAgain?: () => void;
+  isHost?: boolean;
+  isInLobby?: boolean;
 }
 
 // Snake colors matching render.rs
@@ -18,7 +20,15 @@ const SNAKE_COLORS = [
   '#f7b731', // Yellow/gold
 ];
 
-const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUserId, onBackToMenu, onPlayAgain }) => {
+const Scoreboard: React.FC<ScoreboardProps> = ({
+  gameState,
+  isVisible,
+  currentUserId,
+  onBackToMenu,
+  onPlayAgain,
+  isHost = false,
+  isInLobby = false
+}) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [logoHovered, setLogoHovered] = useState(false);
   const [gameOverExpanded, setGameOverExpanded] = useState(false);
@@ -541,10 +551,16 @@ const Scoreboard: React.FC<ScoreboardProps> = ({ gameState, isVisible, currentUs
               </button>
               <button
                 onClick={onPlayAgain}
-                className="px-3 py-1 text-xs border border-green-700 rounded font-semibold uppercase bg-green-600 text-white transition-all cursor-pointer"
-                style={{ 
+                disabled={isInLobby && !isHost}
+                className={`px-3 py-1 text-xs border rounded font-semibold uppercase transition-all ${
+                  isInLobby && !isHost
+                    ? 'border-gray-400 bg-gray-300 text-gray-500 cursor-not-allowed'
+                    : 'border-green-700 bg-green-600 text-white hover:bg-green-700 cursor-pointer'
+                }`}
+                style={{
                   letterSpacing: '0.5px',
                 }}
+                title={isInLobby && !isHost ? 'Waiting for host to start next game' : 'Play again with your lobby'}
               >
                 Play Again
               </button>
