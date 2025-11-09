@@ -101,25 +101,25 @@ impl TestEnvironment {
     }
 
     /// Add a server with custom JWT verifier
-    pub async fn add_server_with_jwt(
-        &mut self,
-        jwt_verifier: Arc<dyn JwtVerifier>,
-    ) -> Result<usize> {
-        let server = start_test_server(self.db(), jwt_verifier)
-            .await
-            .context("Failed to start server")?;
-
-        let index = self.servers.len();
-        info!(
-            "Started server {} with ID {} on {}",
-            index,
-            server.id(),
-            server.http_addr()
-        );
-
-        self.servers.push(server);
-        Ok(index)
-    }
+    // pub async fn add_server_with_jwt(
+    //     &mut self,
+    //     jwt_verifier: Arc<dyn JwtVerifier>,
+    // ) -> Result<usize> {
+    //     let server = start_test_server(self.db(), jwt_verifier)
+    //         .await
+    //         .context("Failed to start server")?;
+    // 
+    //     let index = self.servers.len();
+    //     info!(
+    //         "Started server {} with ID {} on {}",
+    //         index,
+    //         server.id(),
+    //         server.http_addr()
+    //     );
+    // 
+    //     self.servers.push(server);
+    //     Ok(index)
+    // }
 
     /// Create a test user in the database
     pub async fn create_user(&mut self) -> Result<i32> {

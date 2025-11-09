@@ -1,20 +1,16 @@
 use anyhow::{Context, Result};
-use redis::{
-    Client,
-    aio::{ConnectionManager, ConnectionManagerConfig},
-};
+use redis::{Client, PushInfo};
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use std::time::Duration;
 
 /// Creates a ConnectionManager with standardized configuration for the application.
-///
-/// Configuration:
-/// - Connection timeout: 30 seconds
-/// - Response timeout: 30 seconds
-/// - Retries: 10 attempts with exponential backoff
-/// - Backoff delays: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped), 60s, 60s, 60s
-/// - Maximum delay between retries: 60 seconds (1 minute)
-pub async fn create_connection_manager(client: Client) -> Result<ConnectionManager> {
+pub async fn create_connection_manager(
+    client: Client, 
+    pubsub_tx: tokio::sync::broadcast::Sender<PushInfo>,
+) -> Result<ConnectionManager> {
     let config = ConnectionManagerConfig::new()
+        .set_push_sender(pubsub_tx)
+        .set_automatic_resubscription()
         .set_connection_timeout(Duration::from_secs(30))
         .set_response_timeout(Duration::from_secs(30))
         .set_number_of_retries(10)

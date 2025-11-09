@@ -7,7 +7,11 @@ use server::region_cache::RegionCache;
 use server::ws_server::TestJwtVerifier;
 use std::env;
 use std::sync::Arc;
+use redis::Client;
+use tokio::sync::broadcast::Receiver;
 use tracing::info;
+use server::pubsub_manager::PubSubManager;
+use server::redis_utils::create_connection_manager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,12 +42,9 @@ async fn main() -> Result<()> {
     );
     info!("DynamoDB client initialized");
 
-    // Create RegionCache for dynamic region discovery
-    let aws_config = aws_config::load_from_env().await;
-    let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
-    let table_prefix =
-        env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
-    let region_cache = Arc::new(RegionCache::new(dynamodb_client, table_prefix));
+    // Get Redis URL from environment
+    let redis_url = env::var("SNAKETRON_REDIS_URL")
+        .context("SNAKETRON_REDIS_URL environment variable is required")?;
 
     let region = env::var("SNAKETRON_REGION")
         .context("SNAKETRON_REGION environment variable is required")?;
@@ -53,8 +54,6 @@ async fn main() -> Result<()> {
         .or_else(|_| env::var("SNAKETRON_WS_PORT")) // Fallback to old WS_PORT for compatibility
         .unwrap_or_else(|_| "8080".to_string());
     let http_addr = format!("0.0.0.0:{}", http_port);
-
-    let grpc_addr = env::var("SNAKETRON_GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
 
     // Get JWT secret from environment or use a default for development
     let jwt_secret = env::var("SNAKETRON_JWT_SECRET").unwrap_or_else(|_| {
@@ -71,6 +70,8 @@ async fn main() -> Result<()> {
             let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
             Arc::new(ProductionJwtVerifier::new(jwt_manager))
         };
+    
+    let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
 
     // Set up replay directory - use environment variable or default to centralized location
     let replay_dir = if let Ok(custom_dir) = env::var("SNAKETRON_REPLAY_DIR") {
@@ -94,18 +95,14 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Raft peers are now discovered automatically from the database
-
-    // Get Redis URL from environment (required)
-    let redis_url = env::var("SNAKETRON_REDIS_URL")
-        .context("SNAKETRON_REDIS_URL environment variable is required")?;
-    info!("Redis leader election enabled at {}", redis_url);
-
     // Calculate origin and WebSocket URL for client connections
     let origin =
         env::var("SNAKETRON_ORIGIN").unwrap_or_else(|_| format!("http://localhost:{}", http_port));
     let ws_url =
         env::var("SNAKETRON_WS_URL").unwrap_or_else(|_| format!("ws://localhost:{}/ws", http_port));
+
+    // gRPC is currently not used, but the config expects it
+    let grpc_addr = String::new();
 
     // Create server configuration
     let config = GameServerConfig {
@@ -115,67 +112,18 @@ async fn main() -> Result<()> {
         region: region.clone(),
         origin: origin.clone(),
         ws_url: ws_url.clone(),
-        jwt_verifier: jwt_verifier.clone(),
+        jwt_manager,
+        jwt_verifier,
         replay_dir,
         redis_url: redis_url.clone(),
     };
 
-    // Start the game server
     let game_server = GameServer::start(config).await?;
-    info!("Server {} started successfully", game_server.id());
-    info!(
-        "HTTP server (API + WebSocket) will listen on: {}",
-        game_server.http_addr()
-    );
-    if let Some(grpc_addr) = game_server.grpc_addr() {
-        info!("gRPC server listening on: {}", grpc_addr);
-    }
 
-    // Start region cache refresh task
-    let region_cache_clone = region_cache.clone();
-    let cache_cancellation_token = game_server.cancellation_token().clone();
-    region_cache_clone.spawn_refresh_task(cache_cancellation_token);
-    info!("Region cache refresh task started");
-
-    // Start the unified HTTP server (API + WebSocket)
-    let http_db = db.clone();
-    let http_jwt_verifier = jwt_verifier.clone();
-    let http_redis_url = redis_url.clone();
-    let http_replication_manager = game_server
-        .replication_manager()
-        .ok_or_else(|| anyhow::anyhow!("No replication manager available"))?
-        .clone();
-    let http_cancellation_token = game_server.cancellation_token().clone();
-    let http_server_id = game_server.id();
-    let http_region = region;
-    let http_region_cache = region_cache.clone();
-    let http_handle = tokio::spawn(async move {
-        if let Err(e) = run_http_server(
-            &http_addr,
-            http_db,
-            &jwt_secret,
-            http_jwt_verifier,
-            http_redis_url,
-            http_replication_manager,
-            http_cancellation_token,
-            http_server_id,
-            http_region,
-            http_region_cache,
-        )
-        .await
-        {
-            tracing::error!("HTTP server error: {}", e);
-        }
-    });
-
-    // Wait for shutdown signal
     info!("Server started. Waiting for shutdown signal (Ctrl+C)...");
     tokio::signal::ctrl_c().await?;
 
     info!("Received shutdown signal. Shutting down gracefully...");
-
-    // Shutdown servers
-    http_handle.abort();
     game_server.shutdown().await?;
 
     info!("Server shut down successfully");

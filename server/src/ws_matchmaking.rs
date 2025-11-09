@@ -58,8 +58,7 @@ pub async fn subscribe_to_match_notifications(
         .await
         .context("Failed to create PubSub connection")?;
 
-    let redis_keys = RedisKeys::new();
-    let channel = redis_keys.matchmaking_notification_channel(user_id);
+    let channel = RedisKeys::matchmaking_notification_channel(user_id);
     pubsub
         .subscribe(&channel)
         .await
@@ -98,8 +97,7 @@ pub async fn publish_match_notification(
     user_id: u32,
     notification: MatchNotification,
 ) -> Result<()> {
-    let redis_keys = RedisKeys::new();
-    let channel = redis_keys.matchmaking_notification_channel(user_id);
+    let channel = RedisKeys::matchmaking_notification_channel(user_id);
     let payload = serde_json::to_string(&notification)?;
 
     let _: () = redis_conn.publish(&channel, payload).await?;
@@ -166,10 +164,11 @@ impl MatchmakingHandler {
         redis_url: &str,
         ws_tx: mpsc::Sender<WSMessage>,
     ) -> Result<(Self, mpsc::Sender<MatchNotification>)> {
-        let matchmaking_manager = MatchmakingManager::new(redis_url).await?;
-
         let client = Client::open(redis_url)?;
-        let redis_conn = redis_utils::create_connection_manager(client.clone()).await?;
+        let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
+        let redis_conn = redis_utils::create_connection_manager(client.clone(), pubsub_tx).await?;
+
+        let matchmaking_manager = MatchmakingManager::new(redis_conn.clone())?;
 
         let (notification_tx, notification_rx) = mpsc::channel(32);
 

@@ -69,6 +69,12 @@ pub struct Lobby {
     preferences: LobbyPreferences,
 }
 
+impl Lobby {
+    pub fn lobby_code(&self) -> &str {
+        &self.lobby_code
+    }
+}
+
 /// Handle for a lobby join that manages the heartbeat task
 pub struct LobbyJoinHandle {
     heartbeat_task: JoinHandle<()>,
@@ -557,11 +563,12 @@ impl LobbyManager {
     }
 
     /// Update lobby state in Redis
-    pub async fn update_lobby_state(&mut self, lobby_code: &str, state: &str) -> Result<()> {
+    pub async fn update_lobby_state(&self, lobby_code: &str, state: &str) -> Result<()> {
         use redis::AsyncCommands;
         let metadata_key = RedisKeys::lobby_metadata(lobby_code);
 
-        self.redis
+        let mut redis = self.redis.clone();
+        redis
             .hset::<_, _, _, ()>(&metadata_key, "state", state)
             .await
             .context("Failed to update lobby state in Redis")?;
@@ -583,7 +590,6 @@ impl LobbyManager {
         let _: () = self.redis.del(key).await.context("Failed to delete Redis key")?;
         Ok(())
     }
-
 
     /// Map AWS region to 4-character code
     fn region_to_code(region: &str) -> String {

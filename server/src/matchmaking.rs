@@ -953,7 +953,7 @@ async fn create_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
     pubsub: &mut PubSubManager,
     game_type: &GameType,
-    queue_mode: &common::QueueMode,
+    _queue_mode: &common::QueueMode,
     combination: &MatchmakingCombination,
 ) -> Result<u32> {
     // Generate game ID
@@ -1084,7 +1084,6 @@ async fn publish_lobby_match_notifications(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     game_id: u32,
 ) -> Result<()> {
-    let redis_keys = crate::redis_keys::RedisKeys::new();
     let redis_url = std::env::var("SNAKETRON_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
@@ -1097,7 +1096,7 @@ async fn publish_lobby_match_notifications(
     let partition_id = game_id % PARTITION_COUNT;
 
     for lobby in lobbies {
-        let channel = redis_keys.matchmaking_lobby_notification_channel(&lobby.lobby_code);
+        let channel = crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby.lobby_code);
         let notification = serde_json::json!({
             "type": "MatchFound",
             "game_id": game_id,
@@ -1126,7 +1125,7 @@ pub async fn create_custom_match(
     players: Vec<QueuedPlayer>,
     game_type: GameType,
 ) -> Result<u32> {
-    let user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
+    let _user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
 
     // Generate game ID
     let game_id = matchmaking_manager.generate_game_id().await?;
@@ -1200,16 +1199,17 @@ mod tests {
     #[test]
     fn duo_lobby_splits_into_duel() {
         let lobby = QueuedLobby {
-            lobby_id: 42,
             lobby_code: "ABC123".to_string(),
             members: vec![
                 LobbyMember {
                     user_id: 10,
                     username: "player_one".to_string(),
+                    ts: 123.0
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
+                    ts: 124.0
                 },
             ],
             avg_mmr: 1200,

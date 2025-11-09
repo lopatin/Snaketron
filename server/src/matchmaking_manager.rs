@@ -1,10 +1,9 @@
 use crate::redis_keys::RedisKeys;
-use crate::redis_utils;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use common::GameType;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -73,34 +72,19 @@ pub enum MatchNotification {
 /// Redis-based matchmaking manager
 #[derive(Clone)]
 pub struct MatchmakingManager {
-    conn: ConnectionManager,
-    redis_keys: RedisKeys,
+    redis: ConnectionManager,
     max_retries: u32,
     retry_delay: Duration,
 }
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
-    pub async fn new(redis_url: &str) -> Result<Self> {
-        let client =
-            Client::open(redis_url).context("Failed to create Redis client for matchmaking")?;
-
-        let conn = Self::connect_with_retry(&client, 3).await?;
-
+    pub fn new(redis: ConnectionManager) -> Result<Self> {
         Ok(Self {
-            conn,
-            redis_keys: RedisKeys::new(),
+            redis,
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
         })
-    }
-
-    /// Connect to Redis with retry logic
-    async fn connect_with_retry(client: &Client, _max_attempts: u32) -> Result<ConnectionManager> {
-        // Use the standardized connection manager with built-in retry logic
-        redis_utils::create_connection_manager(client.clone())
-            .await
-            .context("Failed to connect to Redis for matchmaking")
     }
 
     /// Add a lobby to the matchmaking queue for multiple game types
@@ -137,12 +121,8 @@ impl MatchmakingManager {
 
         // Add to each game type's queue
         for game_type in &game_types {
-            let lobby_queue_key = self
-                .redis_keys
-                .matchmaking_lobby_queue(game_type, &queue_mode);
-            let lobby_mmr_key = self
-                .redis_keys
-                .matchmaking_lobby_mmr_index(game_type, &queue_mode);
+            let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &queue_mode);
+            let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &queue_mode);
 
             // Add to lobby queue sorted set (score = timestamp for FIFO)
             pipe.zadd(&lobby_queue_key, &lobby_json, timestamp);
@@ -158,7 +138,7 @@ impl MatchmakingManager {
 
         loop {
             attempts += 1;
-            match pipe.clone().query_async(&mut self.conn).await {
+            match pipe.clone().query_async(&mut self.redis).await {
                 Ok(()) => break,
                 Err(e) if attempts < self.max_retries => {
                     warn!(
@@ -190,20 +170,18 @@ impl MatchmakingManager {
 
     /// Renew a player's position in queue (update timestamp to prevent expiration)
     pub async fn renew_queue_position(&mut self, user_id: u32) -> Result<bool> {
-        let user_key = self.redis_keys.matchmaking_user_status(user_id);
+        let user_key = RedisKeys::matchmaking_user_status(user_id);
 
         // Get user status to find their game type
-        let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
+        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
 
         if let Some(json) = status_json {
             let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = self
-                .redis_keys
-                .matchmaking_queue(&status.game_type, &status.queue_mode);
+            let queue_key = RedisKeys::matchmaking_queue(&status.game_type, &status.queue_mode);
 
             // Find the player's entry in the queue
             let members: Vec<(String, f64)> =
-                self.conn.zrange_withscores(&queue_key, 0, -1).await?;
+                self.redis.zrange_withscores(&queue_key, 0, -1).await?;
 
             for (member_json, _old_score) in members {
                 if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
@@ -211,7 +189,7 @@ impl MatchmakingManager {
                         // Update timestamp to current time
                         let new_timestamp = Utc::now().timestamp_millis();
                         let _: () = self
-                            .conn
+                            .redis
                             .zadd(&queue_key, &member_json, new_timestamp)
                             .await?;
 
@@ -227,23 +205,19 @@ impl MatchmakingManager {
 
     /// Remove a player from the matchmaking queue
     pub async fn remove_from_queue(&mut self, user_id: u32) -> Result<Option<GameType>> {
-        let user_key = self.redis_keys.matchmaking_user_status(user_id);
+        let user_key = RedisKeys::matchmaking_user_status(user_id);
 
         // Get user status to find their game type
-        let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
+        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
 
         if let Some(json) = status_json {
             let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = self
-                .redis_keys
-                .matchmaking_queue(&status.game_type, &status.queue_mode);
-            let mmr_key = self
-                .redis_keys
-                .matchmaking_mmr_index(&status.game_type, &status.queue_mode);
+            let queue_key = RedisKeys::matchmaking_queue(&status.game_type, &status.queue_mode);
+            let mmr_key = RedisKeys::matchmaking_mmr_index(&status.game_type, &status.queue_mode);
 
             // Find and remove the player from queue
             let members: Vec<(String, f64)> =
-                self.conn.zrange_withscores(&queue_key, 0, -1).await?;
+                self.redis.zrange_withscores(&queue_key, 0, -1).await?;
 
             for (member_json, _score) in members {
                 if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
@@ -255,7 +229,7 @@ impl MatchmakingManager {
                         pipe.zrem(&mmr_key, user_id.to_string());
                         pipe.del(&user_key);
 
-                        let _: () = pipe.query_async(&mut self.conn).await?;
+                        let _: () = pipe.query_async(&mut self.redis).await?;
 
                         info!("Removed user {} from matchmaking queue", user_id);
                         return Ok(Some(status.game_type));
@@ -269,9 +243,9 @@ impl MatchmakingManager {
 
     /// Check if a user is in queue and get their status
     pub async fn get_queue_status(&mut self, user_id: u32) -> Result<Option<UserQueueStatus>> {
-        let user_key = self.redis_keys.matchmaking_user_status(user_id);
+        let user_key = RedisKeys::matchmaking_user_status(user_id);
 
-        let status_json: Option<String> = self.conn.hget(&user_key, "status").await?;
+        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
 
         match status_json {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
@@ -286,10 +260,10 @@ impl MatchmakingManager {
         game_type: &GameType,
         queue_mode: &common::QueueMode,
     ) -> Result<Option<usize>> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
+        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
 
         // Get all queued players
-        let members: Vec<String> = self.conn.zrange(&queue_key, 0, -1).await?;
+        let members: Vec<String> = self.redis.zrange(&queue_key, 0, -1).await?;
 
         for (position, member_json) in members.iter().enumerate() {
             if let Ok(player) = serde_json::from_str::<QueuedPlayer>(member_json) {
@@ -304,8 +278,8 @@ impl MatchmakingManager {
 
     /// Generate a new game ID atomically
     pub async fn generate_game_id(&mut self) -> Result<u32> {
-        let counter_key = self.redis_keys.game_id_counter();
-        let id: u32 = self.conn.incr(&counter_key, 1).await?;
+        let counter_key = RedisKeys::game_id_counter();
+        let id: u32 = self.redis.incr(&counter_key, 1).await?;
         Ok(id)
     }
 
@@ -315,19 +289,14 @@ impl MatchmakingManager {
         let test_key = "redis:health:check";
         let test_value = "OK";
 
-        let _: () = self.conn.set_ex(test_key, test_value, 10).await?;
-        let result: Option<String> = self.conn.get(test_key).await?;
+        let _: () = self.redis.set_ex(test_key, test_value, 10).await?;
+        let result: Option<String> = self.redis.get(test_key).await?;
 
         if result.as_deref() == Some(test_value) {
             Ok(())
         } else {
             Err(anyhow!("Health check failed: unexpected response"))
         }
-    }
-
-    /// Get connection for pubsub operations
-    pub fn connection(&self) -> ConnectionManager {
-        self.conn.clone()
     }
 
     /// Clean up expired queue entries (maintenance task)
@@ -339,8 +308,8 @@ impl MatchmakingManager {
         max_age_seconds: i64,
     ) -> Result<usize> {
         let cutoff_time = Utc::now().timestamp_millis() - (max_age_seconds * 1000);
-        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
+        let mmr_key = RedisKeys::matchmaking_mmr_index(game_type, queue_mode);
 
         let mut removed_count = 0;
         let mut offset = 0;
@@ -350,7 +319,7 @@ impl MatchmakingManager {
             // Get a batch of queued players with their timestamps
             // Since the sorted set is ordered by timestamp, older entries come first
             let members: Vec<(String, f64)> = self
-                .conn
+                .redis
                 .zrange_withscores(&queue_key, offset, offset + BATCH_SIZE - 1)
                 .await?;
 
@@ -370,7 +339,7 @@ impl MatchmakingManager {
                         // Remove from queue and MMR index
                         pipe.zrem(&queue_key, &member_json);
                         pipe.zrem(&mmr_key, player.user_id.to_string());
-                        pipe.del(self.redis_keys.matchmaking_user_status(player.user_id));
+                        pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
                         batch_removed += 1;
 
                         // This is a warning because websockets should really be renewing
@@ -385,7 +354,7 @@ impl MatchmakingManager {
             }
 
             if batch_removed > 0 {
-                let _: () = pipe.query_async(&mut self.conn).await?;
+                let _: () = pipe.query_async(&mut self.redis).await?;
                 removed_count += batch_removed;
             }
 
@@ -419,29 +388,25 @@ impl MatchmakingManager {
     ) -> Result<Vec<QueuedLobby>> {
         use std::collections::HashSet;
 
-        let lobby_queue_key = self
-            .redis_keys
-            .matchmaking_lobby_queue(game_type, queue_mode);
-        let lobby_mmr_key = self
-            .redis_keys
-            .matchmaking_lobby_mmr_index(game_type, queue_mode);
+        let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
+        let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
 
         const SUBSET_SIZE: isize = 499; // 0-indexed, so 499 = 500 items
 
         // 1. Fetch 500 longest waiting (oldest timestamps first)
         let longest_waiting: Vec<String> =
-            self.conn.zrange(&lobby_queue_key, 0, SUBSET_SIZE).await?;
+            self.redis.zrange(&lobby_queue_key, 0, SUBSET_SIZE).await?;
 
         // 2. Fetch 500 highest MMR (reverse order from MMR index)
-        let highest_mmr: Vec<String> = self.conn.zrevrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
+        let highest_mmr: Vec<String> = self.redis.zrevrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
 
         // 3. Fetch 500 lowest MMR (from MMR index)
-        let lowest_mmr: Vec<String> = self.conn.zrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
+        let lowest_mmr: Vec<String> = self.redis.zrange(&lobby_mmr_key, 0, SUBSET_SIZE).await?;
 
         // 4. Fetch 500 mid-range MMR
         let mid_range: Vec<String> = {
             // Get total count
-            let total: isize = self.conn.zcard(&lobby_mmr_key).await?;
+            let total: isize = self.redis.zcard(&lobby_mmr_key).await?;
 
             if total <= SUBSET_SIZE + 1 {
                 // Not enough lobbies for a distinct mid-range, return empty
@@ -451,7 +416,7 @@ impl MatchmakingManager {
                 let mid_start = (total / 2) - (SUBSET_SIZE / 2);
                 let mid_end = mid_start + SUBSET_SIZE;
 
-                self.conn.zrange(&lobby_mmr_key, mid_start, mid_end).await?
+                self.redis.zrange(&lobby_mmr_key, mid_start, mid_end).await?
             }
         };
 
@@ -499,16 +464,12 @@ impl MatchmakingManager {
         queue_mode: &common::QueueMode,
         lobby_code: &str,
     ) -> Result<()> {
-        let lobby_queue_key = self
-            .redis_keys
-            .matchmaking_lobby_queue(game_type, queue_mode);
-        let lobby_mmr_key = self
-            .redis_keys
-            .matchmaking_lobby_mmr_index(game_type, queue_mode);
+        let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
+        let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
 
         // Get all lobby members to find the one to remove
         let members: Vec<(String, f64)> =
-            self.conn.zrange_withscores(&lobby_queue_key, 0, -1).await?;
+            self.redis.zrange_withscores(&lobby_queue_key, 0, -1).await?;
 
         let mut pipe = redis::pipe();
         pipe.atomic();
@@ -524,7 +485,7 @@ impl MatchmakingManager {
             }
         }
 
-        let _: () = pipe.query_async(&mut self.conn).await?;
+        let _: () = pipe.query_async(&mut self.redis).await?;
 
         info!(
             "Removed lobby {} from matchmaking queue for game type {:?}",
@@ -544,11 +505,11 @@ impl MatchmakingManager {
                 .arg("matchmaking:lobby:queue:*")
                 .arg("COUNT")
                 .arg(50)
-                .query_async(&mut self.conn)
+                .query_async(&mut self.redis)
                 .await?;
 
             for key in keys {
-                let member_entries: Vec<String> = self.conn.zrange(&key, 0, -1).await?;
+                let member_entries: Vec<String> = self.redis.zrange(&key, 0, -1).await?;
 
                 for member_json in member_entries {
                     if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
@@ -588,16 +549,12 @@ impl MatchmakingManager {
 
         // For each game type the lobby was queued for, remove it from that queue
         for game_type in &lobby.game_types {
-            let lobby_queue_key = self
-                .redis_keys
-                .matchmaking_lobby_queue(game_type, &lobby.queue_mode);
-            let lobby_mmr_key = self
-                .redis_keys
-                .matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
+            let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode);
+            let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
 
             // We need to find the exact JSON string to remove
             // Since the lobby JSON is stored in Redis, we'll fetch and match
-            let members: Vec<String> = self.conn.zrange(&lobby_queue_key, 0, -1).await?;
+            let members: Vec<String> = self.redis.zrange(&lobby_queue_key, 0, -1).await?;
 
             for member_json in members {
                 if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
@@ -612,7 +569,7 @@ impl MatchmakingManager {
         }
 
         // Execute the transaction
-        let _: () = pipe.query_async(&mut self.conn).await?;
+        let _: () = pipe.query_async(&mut self.redis).await?;
 
         info!(
             "Removed lobby {} from all matchmaking queues (was queued for {:?})",
@@ -627,11 +584,11 @@ impl MatchmakingManager {
         game_id: u32,
         match_info: ActiveMatch,
     ) -> Result<()> {
-        let matches_key = self.redis_keys.matchmaking_active_matches();
+        let matches_key = RedisKeys::matchmaking_active_matches();
         let match_json = serde_json::to_string(&match_info)?;
 
         let _: () = self
-            .conn
+            .redis
             .hset(&matches_key, game_id.to_string(), match_json)
             .await?;
 
@@ -640,9 +597,9 @@ impl MatchmakingManager {
 
     /// Get active match information
     pub async fn get_active_match(&mut self, game_id: u32) -> Result<Option<ActiveMatch>> {
-        let matches_key = self.redis_keys.matchmaking_active_matches();
+        let matches_key = RedisKeys::matchmaking_active_matches();
 
-        let match_json: Option<String> = self.conn.hget(&matches_key, game_id.to_string()).await?;
+        let match_json: Option<String> = self.redis.hget(&matches_key, game_id.to_string()).await?;
 
         match match_json {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
@@ -657,11 +614,11 @@ impl MatchmakingManager {
         queue_mode: &common::QueueMode,
         user_ids: &[u32],
     ) -> Result<()> {
-        let queue_key = self.redis_keys.matchmaking_queue(game_type, queue_mode);
-        let mmr_key = self.redis_keys.matchmaking_mmr_index(game_type, queue_mode);
+        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
+        let mmr_key = RedisKeys::matchmaking_mmr_index(game_type, queue_mode);
 
         // Get all members to find which ones to remove
-        let members: Vec<(String, f64)> = self.conn.zrange_withscores(&queue_key, 0, -1).await?;
+        let members: Vec<(String, f64)> = self.redis.zrange_withscores(&queue_key, 0, -1).await?;
 
         let mut pipe = redis::pipe();
         pipe.atomic();
@@ -671,63 +628,52 @@ impl MatchmakingManager {
                 if user_ids.contains(&player.user_id) {
                     pipe.zrem(&queue_key, &member_json);
                     pipe.zrem(&mmr_key, player.user_id.to_string());
-                    pipe.del(self.redis_keys.matchmaking_user_status(player.user_id));
+                    pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
                 }
             }
         }
 
-        let _: () = pipe.query_async(&mut self.conn).await?;
+        let _: () = pipe.query_async(&mut self.redis).await?;
 
         Ok(())
-    }
-}
-
-/// Connection pool for Redis matchmaking
-pub struct MatchmakingPool {
-    managers: Vec<MatchmakingManager>,
-    current: std::sync::atomic::AtomicUsize,
-}
-
-impl MatchmakingPool {
-    /// Create a new connection pool
-    pub async fn new(redis_url: &str, pool_size: usize) -> Result<Self> {
-        let mut managers = Vec::with_capacity(pool_size);
-
-        for _ in 0..pool_size {
-            managers.push(MatchmakingManager::new(redis_url).await?);
-        }
-
-        Ok(Self {
-            managers,
-            current: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    /// Get a connection from the pool (round-robin)
-    pub fn get(&self) -> &MatchmakingManager {
-        let idx = self
-            .current
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.managers.len();
-        &self.managers[idx]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redis::Client;
+    use crate::redis_utils;
 
     #[tokio::test]
     async fn test_redis_connection() {
         // This test requires Redis to be running
         let redis_url = "redis://localhost:6379";
 
-        match MatchmakingManager::new(redis_url).await {
+        let client = match Client::open(redis_url) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to create Redis client: {}", e);
+                return;
+            }
+        };
+
+        let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(100);
+
+        let conn = match redis_utils::create_connection_manager(client, pubsub_tx).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Redis not available for testing: {}", e);
+                return;
+            }
+        };
+
+        match MatchmakingManager::new(conn) {
             Ok(mut manager) => {
                 assert!(manager.health_check().await.is_ok());
             }
             Err(e) => {
-                eprintln!("Redis not available for testing: {}", e);
+                eprintln!("Failed to create MatchmakingManager: {}", e);
             }
         }
     }

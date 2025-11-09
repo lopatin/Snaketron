@@ -21,9 +21,11 @@ use crate::lobby_manager::LobbyManager;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
 use crate::ws_server::{JwtVerifier, handle_websocket};
+use crate::user_cache::UserCache;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use redis::Client;
+use redis::aio::ConnectionManager;
+use redis::{Client, AsyncCommands};
 use crate::redis_utils::create_connection_manager;
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
@@ -35,8 +37,14 @@ pub struct HttpServerState {
     pub jwt_manager: Arc<JwtManager>,
     /// JWT verifier for WebSocket authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
-    /// Redis URL for pubsub and matchmaking
+    /// Cloneable Redis connection manager
+    pub redis: ConnectionManager,
+    /// Redis URL for creating new connections
     pub redis_url: String,
+    /// PubSub manager for Redis pub/sub operations
+    pub pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
+    /// Matchmaking manager for queue operations
+    pub matchmaking_manager: Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
     /// Replication manager for game state
     pub replication_manager: Arc<ReplicationManager>,
     /// Cancellation token for graceful shutdown
@@ -51,45 +59,39 @@ pub struct HttpServerState {
     pub region_cache: Arc<RegionCache>,
     /// Lobby manager for pre-game grouping
     pub lobby_manager: Arc<LobbyManager>,
+    /// User cache for quick user lookups
+    pub user_cache: UserCache,
 }
 
 /// Run the combined HTTP server with both API and WebSocket endpoints
 pub async fn run_http_server(
     addr: &str,
     db: Arc<dyn Database>,
-    jwt_secret: &str,
+    jwt_manager: Arc<JwtManager>,
     jwt_verifier: Arc<dyn JwtVerifier>,
+    redis: ConnectionManager,
     redis_url: String,
+    pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
+    matchmaking_manager: Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
     replication_manager: Arc<ReplicationManager>,
     cancellation_token: tokio_util::sync::CancellationToken,
     server_id: u64,
     region: String,
     region_cache: Arc<RegionCache>,
+    lobby_manager: Arc<LobbyManager>,
 ) -> Result<()> {
-    let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
     let connection_count = Arc::new(AtomicUsize::new(0));
-    
-    let redis_keys = crate::redis_keys::RedisKeys::new();
-    let redis_client = Client::open(redis_url).context("Failed to create Redis client")?;
-    let redis = create_connection_manager(redis_client).await?;
-    
-    let user_cache = Arc::new(crate::user_cache::UserCache::new(
-        redis.clone(),
-        redis_keys,
-        db.clone(),
-    ));
-
-    let lobby_manager = Arc::new(LobbyManager::new(
-        redis.clone(), 
-        db.clone()
-    ));
+    let user_cache = UserCache::new(redis.clone(), db.clone());
 
     // Create state for both API and WebSocket handlers
     let state = HttpServerState {
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         jwt_verifier,
-        redis_url: redis_url.clone(),
+        redis: redis.clone(),
+        redis_url,
+        pubsub_manager,
+        matchmaking_manager,
         replication_manager,
         cancellation_token: cancellation_token.clone(),
         connection_count: connection_count.clone(),
@@ -97,19 +99,20 @@ pub async fn run_http_server(
         region: region.clone(),
         region_cache,
         lobby_manager,
+        user_cache
     };
 
     // Start background task to update user count in Redis every 5 seconds
     spawn_metrics_updater(
-        redis_url.clone(),
+        redis.clone(),
         server_id,
-        region,
+        region.clone(),
         connection_count,
         cancellation_token.clone(),
     );
 
     // Start background task to broadcast user counts to WebSocket clients every 5 seconds
-    spawn_user_count_broadcaster(redis_url.clone(), cancellation_token.clone());
+    spawn_user_count_broadcaster(redis.clone(), cancellation_token.clone());
 
     // Create auth state for API routes
     let auth_state = AuthState {
@@ -130,7 +133,7 @@ pub async fn run_http_server(
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
         .layer(middleware::from_fn_with_state(
-            jwt_manager.clone(),
+            jwt_manager,
             auth_middleware,
         ))
         .with_state(auth_state.clone());
@@ -199,8 +202,12 @@ async fn websocket_handler(
         handle_websocket(
             socket,
             state.db,
+            state.user_cache,
             state.jwt_verifier,
+            state.redis,
             state.redis_url,
+            state.pubsub_manager,
+            state.matchmaking_manager,
             state.replication_manager,
             state.cancellation_token,
             state.lobby_manager,
@@ -220,7 +227,7 @@ async fn health_check() -> &'static str {
 
 /// Background task to update Redis metrics every 5 seconds
 fn spawn_metrics_updater(
-    redis_url: String,
+    redis: ConnectionManager,
     server_id: u64,
     region: String,
     connection_count: Arc<AtomicUsize>,
@@ -238,7 +245,7 @@ fn spawn_metrics_updater(
                 _ = interval.tick() => {
                     let count = connection_count.load(Ordering::Relaxed);
 
-                    if let Err(e) = update_redis_metrics(&redis_url, server_id, &region, count).await {
+                    if let Err(e) = update_redis_metrics(redis.clone(), server_id, &region, count).await {
                         tracing::error!("Failed to update Redis metrics: {}", e);
                     } else {
                         tracing::trace!("Updated Redis metrics: server_id={}, region={}, count={}", server_id, region, count);
@@ -251,29 +258,21 @@ fn spawn_metrics_updater(
 
 /// Update server metrics in Redis
 async fn update_redis_metrics(
-    redis_url: &str,
+    mut redis: ConnectionManager,
     server_id: u64,
     region: &str,
     count: usize,
 ) -> Result<()> {
-    use redis::AsyncCommands;
-
-    let client =
-        redis::Client::open(redis_url).context("Failed to open Redis client for metrics")?;
-
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for metrics")?;
-
+    // let mut redis = redis;
+    
     // Set user count with 10-second TTL (auto-cleanup for dead servers)
-    let _: () = conn
+    let _: () = redis
         .set_ex(format!("server:{}:user_count", server_id), count, 10)
         .await
         .context("Failed to set user count in Redis")?;
 
     // Set region (no TTL, persistent)
-    let _: () = conn
+    let _: () = redis
         .set(format!("server:{}:region", server_id), region)
         .await
         .context("Failed to set region in Redis")?;
@@ -283,7 +282,7 @@ async fn update_redis_metrics(
 
 /// Background task to broadcast user count updates every 5 seconds
 fn spawn_user_count_broadcaster(
-    redis_url: String,
+    redis: ConnectionManager,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -296,7 +295,7 @@ fn spawn_user_count_broadcaster(
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Err(e) = broadcast_user_counts(&redis_url).await {
+                    if let Err(e) = broadcast_user_counts(redis.clone()).await {
                         tracing::error!("Failed to broadcast user counts: {}", e);
                     }
                 }
@@ -306,23 +305,14 @@ fn spawn_user_count_broadcaster(
 }
 
 /// Aggregate user counts from Redis and broadcast to all WebSocket clients
-async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
+async fn broadcast_user_counts(mut redis: ConnectionManager) -> Result<()> {
     use redis::AsyncCommands;
     use std::collections::HashMap;
-
-    // Create Redis client
-    let client =
-        redis::Client::open(redis_url).context("Failed to open Redis client for broadcasting")?;
-
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for broadcasting")?;
 
     // Query all server user count keys
     let server_keys: Vec<String> = redis::cmd("KEYS")
         .arg("server:*:user_count")
-        .query_async(&mut conn)
+        .query_async(&mut redis)
         .await
         .context("Failed to query server keys")?;
 
@@ -330,7 +320,7 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
 
     for key in server_keys {
         // Get user count for this server
-        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
+        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut redis).await {
             Ok(count) => count,
             Err(e) => {
                 tracing::warn!("Failed to get user count for {}: {}", key, e);
@@ -351,7 +341,7 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
         let region_key = format!("server:{}:region", server_id);
         let region: String = match redis::cmd("GET")
             .arg(&region_key)
-            .query_async(&mut conn)
+            .query_async(&mut redis)
             .await
         {
             Ok(region) => region,
@@ -366,7 +356,7 @@ async fn broadcast_user_counts(redis_url: &str) -> Result<()> {
     let message =
         serde_json::to_string(&region_counts).context("Failed to serialize user counts")?;
 
-    let _: () = conn
+    let _: () = redis
         .publish("user_count_updates", message)
         .await
         .context("Failed to publish user counts")?;

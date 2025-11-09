@@ -1,5 +1,5 @@
 use crate::game_executor::PARTITION_COUNT;
-use crate::pubsub_manager::PubSubManager;
+use crate::pubsub_manager::{PartitionSubscription, PubSubManager};
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState};
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ pub struct ReplicationStatus {
 /// A wrapper around broadcast::Receiver that filters out events before a certain sequence number
 pub struct FilteredEventReceiver {
     inner: broadcast::Receiver<GameEventMessage>,
-    sender: Arc<broadcast::Sender<GameEventMessage>>,
+    // sender: Arc<broadcast::Sender<GameEventMessage>>,
     min_sequence: u64,
     game_id: u32,
 }
@@ -39,7 +39,7 @@ impl FilteredEventReceiver {
     ) -> Self {
         Self {
             inner,
-            sender,
+            // sender,
             min_sequence,
             game_id,
         }
@@ -192,13 +192,11 @@ impl PartitionReplica {
         let subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
 
         // Request initial snapshots for this partition
-        pubsub
-            .request_partition_snapshots(self.partition_id)
-            .await?;
+        pubsub.request_partition_snapshots(self.partition_id).await?;
         drop(pubsub); // Release lock
 
         // Destructure subscription so each receiver can be borrowed independently in select!
-        let crate::pubsub_manager::PartitionSubscription {
+        let PartitionSubscription {
             partition_id: _,
             mut event_receiver,
             mut command_receiver,
@@ -257,7 +255,7 @@ pub struct ReplicationManager {
     workers: Vec<tokio::task::JoinHandle<Result<()>>>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
-    statuses: Arc<RwLock<HashMap<u32, RwLock<ReplicationStatus>>>>,
+    statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
     pubsub: Arc<Mutex<PubSubManager>>,
 }
 
@@ -323,7 +321,7 @@ impl ReplicationManager {
             let snapshot_sequence = game_state.event_sequence;
             let filtered_receiver = FilteredEventReceiver {
                 inner: receiver,
-                sender: sender.clone(),
+                // sender: sender.clone(),
                 min_sequence: snapshot_sequence,
                 game_id,
             };
@@ -392,8 +390,17 @@ impl ReplicationManager {
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
 
+        // Create Redis client and connection manager
+        let redis_client = redis::Client::open(redis_url)?;
+        let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
+        let redis = crate::redis_utils::create_connection_manager(redis_client, pubsub_tx.clone()).await?;
+
         // Create PubSub manager
-        let pubsub = Arc::new(Mutex::new(PubSubManager::new(redis_url).await?));
+        let pubsub = Arc::new(Mutex::new(PubSubManager::new(
+            redis,
+            pubsub_tx,
+            cancellation_token.clone(),
+        )));
 
         for partition_id in partitions {
             // Create worker

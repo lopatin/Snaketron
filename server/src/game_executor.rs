@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use redis::aio::ConnectionManager;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -274,7 +275,8 @@ pub async fn publish_to_stream(
 pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
-    redis_url: String,
+    redis: ConnectionManager,
+    mut pubsub_manager: PubSubManager,
     db: Arc<dyn Database>,
     _replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
@@ -285,12 +287,12 @@ pub async fn run_game_executor(
     );
 
     // Create PubSub manager
-    let mut pubsub = PubSubManager::new(&redis_url)
-        .await
-        .context("Failed to create PubSub manager")?;
+    // let mut pubsub = PubSubManager::new(&redis_url)
+    //     .await
+    //     .context("Failed to create PubSub manager")?;
 
     // Subscribe to partition commands and snapshot requests
-    let partition_sub = pubsub
+    let partition_sub = pubsub_manager
         .subscribe_to_partition(partition_id)
         .await
         .context("Failed to subscribe to partition")?;
@@ -400,7 +402,7 @@ pub async fn run_game_executor(
                         match event {
                             StreamEvent::GameCreated { game_id, game_state } => {
                                 info!("Received GameCreated event for game {}", game_id);
-                                let pubsub_clone = pubsub.clone();
+                                let pubsub_clone = pubsub_manager.clone();
                                 let db_clone = db.clone();
                                 let cancellation_token_clone = cancellation_token.clone();
                                 try_start_game(

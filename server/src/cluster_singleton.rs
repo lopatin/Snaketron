@@ -1,10 +1,9 @@
-use crate::redis_utils;
 use anyhow::{Context, Result, anyhow};
 use common::CLUSTER_RENEWAL_INTERVAL_MS;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Script};
+use redis::{AsyncCommands, ExistenceCheck, RedisResult, Script, ScriptInvocation, SetExpiry, SetOptions, TypedCommands};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,8 +27,7 @@ use tracing::{debug, error, info, warn};
 /// 2. Gracefully shut down any running service (via a child cancellation token)
 /// 3. Exit the run_as_singleton loop
 pub struct ClusterSingleton {
-    redis_url: String,
-    redis_client: Option<ConnectionManager>,
+    redis: ConnectionManager,
     server_id: u64,
     lease_key: String,
     lease_duration_ms: u64,
@@ -38,65 +36,21 @@ pub struct ClusterSingleton {
 }
 
 impl ClusterSingleton {
-    pub async fn new(
-        redis_url: &str,
+    pub fn new(
+        redis: ConnectionManager,
         server_id: u64,
         lease_key: String,
         lease_duration: Duration,
         cancellation_token: CancellationToken,
-    ) -> Result<Self> {
-        // Try to establish an initial connection but don't fail if Redis is down
-        let redis_client = match Self::create_connection(redis_url).await {
-            Ok(client) => {
-                info!("Successfully connected to Redis for cluster singleton");
-                Some(client)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to connect to Redis initially: {}. Will retry during leader election.",
-                    e
-                );
-                None
-            }
-        };
-
-        Ok(Self {
-            redis_url: redis_url.to_string(),
-            redis_client,
+    ) -> Self {
+        Self {
+            redis,
             server_id,
             lease_key,
             lease_duration_ms: lease_duration.as_millis() as u64,
             is_leader: Arc::new(AtomicBool::new(false)),
             cancellation_token,
-        })
-    }
-
-    async fn create_connection(redis_url: &str) -> Result<ConnectionManager> {
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
-
-        let redis_client = redis_utils::create_connection_manager(client)
-            .await
-            .context("Failed to create Redis connection manager")?;
-
-        Ok(redis_client)
-    }
-
-    async fn ensure_connection(&mut self) -> Result<()> {
-        if self.redis_client.is_none() {
-            debug!("Attempting to reconnect to Redis...");
-            match Self::create_connection(&self.redis_url).await {
-                Ok(client) => {
-                    info!("Successfully reconnected to Redis");
-                    self.redis_client = Some(client);
-                }
-                Err(e) => {
-                    // Log the error but don't block - we'll retry on next operation
-                    debug!("Failed to reconnect to Redis: {}. Will retry later.", e);
-                    return Err(e);
-                }
-            }
         }
-        Ok(())
     }
 
     /// Runs the provided service as a cluster singleton
@@ -109,10 +63,8 @@ impl ClusterSingleton {
     /// The service should monitor this token and shut down gracefully when canceled.
     pub async fn run(
         mut self,
-        user_service: impl Fn(
-            CancellationToken,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+        user_service: impl Fn(CancellationToken) 
+            -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>,
     ) -> Result<()> {
         info!(
             "Starting cluster singleton for server_id={}",
@@ -203,36 +155,19 @@ impl ClusterSingleton {
                     }
                 }
                 _ = health_check_interval.tick() => {
-                    // debug!("Performing Redis health check for server_id={}", self.server_id);
-                    // Periodic health check to ensure connection is still valid
-                    if self.redis_client.is_some() {
-                        if let Some(ref mut client) = self.redis_client {
-                            // Try a simple PING command with timeout
-                            let ping_timeout = Duration::from_secs(1);
-                            let ping_result: Result<Result<String, _>, _> = timeout(
-                                ping_timeout,
-                                redis::cmd("PING").query_async(client)
-                            ).await;
+                    let ping_timeout = Duration::from_secs(1);
+                    let ping_result = timeout(ping_timeout, self.redis.ping::<String>()).await
+                        .map_err(|_| anyhow!("Redis PING timed out after {:?}", ping_timeout))?;
 
-                            match ping_result {
-                                Ok(Ok(_)) => {
-                                    // Connection is healthy
-                                }
-                                Ok(Err(e)) => {
-                                    error!("Redis health check failed: {}. Invalidating connection.", e);
-                                    self.redis_client = None;
-                                }
-                                Err(_) => {
-                                    error!("Redis health check timed out. Invalidating connection.");
-                                    self.redis_client = None;
-                                }
-                            }
-
-                            // If connection was lost and we were the leader, step down
-                            if self.redis_client.is_none() && self.is_leader() {
-                                warn!("Lost Redis connection while being leader. Stepping down.");
+                    match ping_result {
+                        Ok(rsp) => if rsp != "PONG" {
+                            warn!("Unexpected PING response from Redis: {}", rsp);
+                        }
+                        Err(e) => {
+                            error!("Redis PING failed: {}", e);
+                            if self.is_leader() {
+                                error!("Lost Redis connection while being leader. Stepping down.");
                                 self.is_leader.store(false, Ordering::Release);
-
                                 self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                         }
@@ -244,73 +179,40 @@ impl ClusterSingleton {
         Ok(())
     }
 
-    async fn try_acquire_lease(&mut self) -> Result<bool> {
-        // Ensure we have a connection
-        self.ensure_connection().await?;
+    async fn try_acquire_lease(&mut self) -> RedisResult<bool> {
+        let acquired: bool = self.redis
+            .set_options(
+                &self.lease_key,
+                self.server_id.to_string(),
+                SetOptions::default()
+                    .conditional_set(ExistenceCheck::NX)
+                    .with_expiration(SetExpiry::PX(self.lease_duration_ms)),
+            )
+            .await?;
 
-        if let Some(ref mut client) = self.redis_client {
-            let result: Result<Option<String>, _> = client
-                .set_options(
-                    &self.lease_key,
-                    self.server_id.to_string(),
-                    redis::SetOptions::default()
-                        .conditional_set(redis::ExistenceCheck::NX)
-                        .with_expiration(redis::SetExpiry::PX(self.lease_duration_ms)),
-                )
-                .await;
-            match result {
-                Ok(result) => Ok(result.is_some()),
-                Err(e) => {
-                    // Connection might be broken, invalidate it
-                    error!(
-                        "Failed to execute SET NX command: {}. Invalidating connection.",
-                        e
-                    );
-                    self.redis_client = None;
-                    Err(anyhow::anyhow!("Redis connection error: {}", e))
-                }
-            }
-        } else {
-            Err(anyhow::anyhow!("No Redis connection available"))
-        }
+        Ok(acquired)
     }
-
+    
     async fn renew_lease(&mut self) -> Result<bool> {
-        // Ensure we have a connection
-        self.ensure_connection().await?;
+        // Lua script to atomically check ownership and renew lease
+        let lua_script = r#"
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("pexpire", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+        "#;
+        
+        let script = Script::new(lua_script);
 
-        if let Some(ref mut client) = self.redis_client {
-            // Lua script to atomically check ownership and renew lease
-            let lua_script = r#"
-                if redis.call("get", KEYS[1]) == ARGV[1] then
-                    return redis.call("pexpire", KEYS[1], ARGV[2])
-                else
-                    return 0
-                end
-            "#;
-
-            let script = Script::new(lua_script);
-            let result: Result<i32, _> = script
-                .key(&self.lease_key)
-                .arg(self.server_id.to_string())
-                .arg(self.lease_duration_ms)
-                .invoke_async(client)
-                .await;
-            match result {
-                Ok(result) => Ok(result == 1),
-                Err(e) => {
-                    // Connection might be broken, invalidate it
-                    error!(
-                        "Failed to execute lease renewal script: {}. Invalidating connection.",
-                        e
-                    );
-                    self.redis_client = None;
-                    Err(anyhow::anyhow!("Redis connection error: {}", e))
-                }
-            }
-        } else {
-            Err(anyhow::anyhow!("No Redis connection available"))
-        }
+        let result = self.redis
+            .invoke_script::<i32>(script
+                .key(self.lease_key.clone())
+                .arg(self.server_id.to_string()) 
+                .arg(self.lease_duration_ms))
+            .await?;
+        
+        Ok(result == 1)
     }
 
     /// Returns true if this instance is currently the leader (i.e., running as the singleton)
