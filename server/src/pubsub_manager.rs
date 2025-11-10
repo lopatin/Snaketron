@@ -1,17 +1,18 @@
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils;
-use anyhow::{Context, Result};
-use common::{GameEvent, GameEventMessage, GameState};
-use futures_util::StreamExt;
+use anyhow::{anyhow, Context, Result};
+use common::{GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus};
+use futures_util::{Stream, StreamExt};
 use redis::aio::{ConnectionManager, PubSub};
 use redis::{AsyncCommands, Client, PushInfo, PushKind, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use serde::de::DeserializeOwned;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use crate::game_executor::StreamEvent;
 
 pub struct ChannelReceiver {
     inner: tokio::sync::broadcast::Receiver<PushInfo>,
@@ -42,13 +43,17 @@ impl ChannelReceiver
                 continue;
             }
 
+            let payload_str = String::from_utf8(payload.clone())
+                .context("Failed to parse payload as UTF-8")?;
+
             let msg = serde_json::from_slice::<T>(payload)
-                .with_context(|| format!("Failed to deserialize message from channel {}", channel))?;
+                .map_err(|e| anyhow!("Failed to deserialize message from channel {}: {}", channel, e))?;
 
             return Ok(msg);
         }
     }
 }
+
 
 /// Snapshot request message for a partition
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,7 +66,7 @@ pub struct SnapshotRequest {
 pub struct PartitionSubscription {
     pub partition_id: u32,
     pub event_receiver: mpsc::Receiver<GameEventMessage>,
-    pub command_receiver: mpsc::Receiver<Vec<u8>>,
+    pub command_receiver: mpsc::Receiver<StreamEvent>,
     pub snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
 }
 
@@ -70,7 +75,7 @@ impl PartitionSubscription {
         self.event_receiver.recv().await
     }
 
-    pub async fn recv_command(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv_command(&mut self) -> Option<StreamEvent> {
         self.command_receiver.recv().await
     }
 
@@ -249,11 +254,12 @@ impl PubSubManager {
     }
 
     /// Publish a command to a partition
-    pub async fn publish_command(&self, partition_id: u32, command: &[u8]) -> Result<()> {
+    pub async fn publish_command(&self, partition_id: u32, command: &StreamEvent) -> Result<()> {
+        let json = serde_json::to_string(&command).context("Failed to serialize command")?;
         let channel = RedisKeys::partition_commands(partition_id);
         let mut redis = self.redis.clone();
         let _: () = redis
-            .publish(&channel, command)
+            .publish(&channel, json)
             .await
             .context("Failed to publish command")?;
         Ok(())
@@ -318,7 +324,7 @@ impl PubSubManager {
         command_channel: String,
         request_channel: String,
         event_tx: mpsc::Sender<GameEventMessage>,
-        command_tx: mpsc::Sender<Vec<u8>>,
+        command_tx: mpsc::Sender<StreamEvent>,
         request_tx: mpsc::Sender<SnapshotRequest>,
     ) -> Result<()> {
         // Spawn all three channel handlers

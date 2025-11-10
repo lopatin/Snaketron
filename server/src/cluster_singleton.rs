@@ -204,6 +204,8 @@ impl ClusterSingleton {
         "#;
         
         let script = Script::new(lua_script);
+        
+        let _: String = self.redis.load_script(&script).await?;
 
         let result = self.redis
             .invoke_script::<i32>(script

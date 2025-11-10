@@ -13,7 +13,7 @@ use crate::ws_server::discover_peers;
 use crate::{
     cluster_singleton::ClusterSingleton,
     db::Database,
-    game_executor::{StreamEvent, run_game_executor},
+    game_executor::run_game_executor,
     grpc_server::run_game_relay_server,
     matchmaking::run_matchmaking_loop,
     redis_keys::RedisKeys,
@@ -30,6 +30,7 @@ use crate::http_server::run_http_server;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
+use crate::game_executor::StreamEvent;
 use crate::redis_utils::create_connection_manager;
 use crate::region_cache::RegionCache;
 
@@ -424,8 +425,16 @@ pub async fn start_test_server_with_grpc(
     let replay_dir = Some(replay_path);
 
     // Use environment variable if set, otherwise use default
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
+    // Note: protocol=resp3 is required for push notifications support
+    let mut redis_url = std::env::var("SNAKETRON_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+    // Ensure RESP3 protocol is enabled for push notifications
+    if !redis_url.contains("protocol=resp3") && !redis_url.contains("protocol=3") {
+        let separator = if redis_url.contains('?') { "&" } else { "?" };
+        redis_url = format!("{}{}protocol=resp3", redis_url, separator);
+    }
+    info!("Using Redis URL: {}", redis_url);
 
     let jwt_manager_arc = Arc::new(jwt_manager);
 

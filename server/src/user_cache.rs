@@ -5,6 +5,7 @@ use redis::aio::ConnectionManager;
 use crate::db::Database;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use tracing::{error, info};
 use crate::db::models::{LobbyMetadata, User};
 use crate::redis_keys::RedisKeys;
 
@@ -39,12 +40,16 @@ impl UserCache {
     pub async fn get_all(&self, user_ids: &[u32]) -> Result<Vec<Option<User>>> {
         let mut results = HashMap::new();
         let mut missing_ids = Vec::new();
+        
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
         // First try to get from Redis
         let mut redis = self.redis.clone();
         let keys: Vec<String> = user_ids.iter().map(|&id| RedisKeys::user(id)).collect();
         let user_jsons: Vec<Option<String>> = redis.mget(keys).await
-            .context("Failed to mget users from Redis")?;
+            .map_err(|e| anyhow!("Failed to mget user jsons from Redis: {}", e))?;
 
         for (i, user_json_opt) in user_jsons.into_iter().enumerate() {
             if let Some(user_json) = user_json_opt {

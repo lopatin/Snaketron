@@ -4,8 +4,12 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use std::time::Duration;
 
 /// Creates a ConnectionManager with standardized configuration for the application.
+///
+/// Note: The client must be created with a Redis URL that includes `protocol=resp3`
+/// parameter to enable RESP3 protocol, which is required for push notifications.
+/// Example: `redis://127.0.0.1:6379?protocol=resp3`
 pub async fn create_connection_manager(
-    client: Client, 
+    client: Client,
     pubsub_tx: tokio::sync::broadcast::Sender<PushInfo>,
 ) -> Result<ConnectionManager> {
     let config = ConnectionManagerConfig::new()

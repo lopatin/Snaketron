@@ -6,9 +6,10 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
-use crate::game_executor::{PARTITION_COUNT, StreamEvent};
+use crate::game_executor::PARTITION_COUNT;
 use crate::matchmaking_manager::{ActiveMatch, MatchStatus, MatchmakingManager, QueuedPlayer};
 use crate::pubsub_manager::PubSubManager;
+use crate::game_executor::StreamEvent;
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
@@ -901,9 +902,7 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        )
-        .await
-        {
+        ).await {
             Ok(game_id) => {
                 games_created += 1;
                 info!(
@@ -1011,6 +1010,7 @@ async fn create_game_from_lobbies(
             for &member_idx in &assignment.member_indices {
                 if let Some(member) = lobby.members.get(member_idx) {
                     // Add player to game state
+                    error!("Adding player {} to team {:?}", member.user_id, assignment.team_id);
                     game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
 
                     // Update the snake's team_id
@@ -1070,9 +1070,8 @@ async fn create_game_from_lobbies(
         .await
         .context("Failed to publish initial game snapshot")?;
 
-    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
     pubsub
-        .publish_command(partition_id, &serialized)
+        .publish_command(partition_id, &event)
         .await
         .context("Failed to publish GameCreated event")?;
 
@@ -1170,8 +1169,7 @@ pub async fn create_custom_match(
         .publish_snapshot(partition_id, game_id, &game_state)
         .await?;
 
-    let serialized = serde_json::to_vec(&event)?;
-    pubsub.publish_command(partition_id, &serialized).await?;
+    pubsub.publish_command(partition_id, &event).await?;
 
     info!(
         game_id,

@@ -3,8 +3,8 @@ use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotReques
 use crate::xp_persistence;
 use anyhow::{Context, Result};
 use common::{
-    EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
-    GameState, GameStatus,
+    GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState,
+    GameStatus, EXECUTOR_POLL_INTERVAL_MS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +18,6 @@ use tracing::{debug, error, info, warn};
 pub const PARTITION_COUNT: u32 = 10;
 pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks (1 second at 100ms tick rate)
 
-/// Events that can be sent through PubSub
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
     GameCreated {
@@ -30,7 +29,7 @@ pub enum StreamEvent {
         user_id: u32,
         command: GameCommandMessage,
     },
-    GameEvent(GameEventMessage),
+    // GameEvent(GameEventMessage),
     StatusUpdated {
         game_id: u32,
         status: GameStatus,
@@ -207,70 +206,6 @@ async fn run_game(
     }
 }
 
-/// Helper function to publish events via PubSub (for backward compatibility)
-pub async fn publish_to_stream(
-    pubsub: &mut PubSubManager,
-    _partition_id: u32,
-    event: &StreamEvent,
-) -> Result<()> {
-    // Convert StreamEvent to appropriate PubSub message
-    match event {
-        StreamEvent::GameEvent(event_msg) => {
-            let partition_id = event_msg.game_id % PARTITION_COUNT;
-            pubsub.publish_event(partition_id, event_msg).await?;
-        }
-        StreamEvent::GameCreated {
-            game_id,
-            game_state,
-        } => {
-            let partition_id = game_id % PARTITION_COUNT;
-            // Publish initial snapshot when game is created
-            pubsub
-                .publish_snapshot(partition_id, *game_id, game_state)
-                .await?;
-
-            // Also publish a GameCreated event
-            let event_msg = GameEventMessage {
-                game_id: *game_id,
-                tick: 0,
-                sequence: 0,
-                user_id: None,
-                event: GameEvent::Snapshot {
-                    game_state: game_state.clone(),
-                },
-            };
-            pubsub.publish_event(partition_id, &event_msg).await?;
-        }
-        StreamEvent::StatusUpdated { game_id, status } => {
-            let partition_id = game_id % PARTITION_COUNT;
-            // Publish status update as an event
-            let event_msg = GameEventMessage {
-                game_id: *game_id,
-                tick: 0,
-                sequence: 0,
-                user_id: None,
-                event: GameEvent::StatusUpdated {
-                    status: status.clone(),
-                },
-            };
-            pubsub.publish_event(partition_id, &event_msg).await?;
-        }
-        StreamEvent::GameCommandSubmitted {
-            game_id,
-            user_id: _,
-            command,
-        } => {
-            let partition_id = game_id % PARTITION_COUNT;
-            // Commands are sent directly to the game via channel, not through PubSub
-            // This is handled differently now
-            let serialized = serde_json::to_vec(command)?;
-            pubsub.publish_command(partition_id, &serialized).await?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Run the game executor service for a specific partition
 pub async fn run_game_executor(
     server_id: u64,
@@ -396,53 +331,45 @@ pub async fn run_game_executor(
 
             // Process commands from PubSub
             Some(command_data) = command_receiver.recv() => {
-                // Deserialize and process the command
-                match serde_json::from_slice::<StreamEvent>(&command_data) {
-                    Ok(event) => {
-                        match event {
-                            StreamEvent::GameCreated { game_id, game_state } => {
-                                info!("Received GameCreated event for game {}", game_id);
-                                let pubsub_clone = pubsub_manager.clone();
-                                let db_clone = db.clone();
-                                let cancellation_token_clone = cancellation_token.clone();
-                                try_start_game(
-                                    game_id,
-                                    game_state,
-                                    pubsub_clone,
-                                    db_clone,
-                                    cancellation_token_clone,
-                                    &mut game_channels
-                                );
+                match command_data {
+                    StreamEvent::GameCreated { game_id, game_state } => {
+                        info!("Received GameCreated event for game {}", game_id);
+                        let pubsub_clone = pubsub_manager.clone();
+                        let db_clone = db.clone();
+                        let cancellation_token_clone = cancellation_token.clone();
+                        try_start_game(
+                            game_id,
+                            game_state,
+                            pubsub_clone,
+                            db_clone,
+                            cancellation_token_clone,
+                            &mut game_channels
+                        );
+                    }
+                    StreamEvent::StatusUpdated { game_id, status } => {
+                        match status {
+                            GameStatus::Complete { .. } => {
+                                // Game completed, remove channels
+                                game_channels.remove(&game_id);
+                                info!("Game {} completed", game_id);
                             }
-                            StreamEvent::StatusUpdated { game_id, status } => {
-                                match status {
-                                    GameStatus::Complete { .. } => {
-                                        // Game completed, remove channels
-                                        game_channels.remove(&game_id);
-                                        info!("Game {} completed", game_id);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
-                                // Route command to the appropriate game
-                                if let Some((cmd_tx, _)) = game_channels.get(&game_id) {
-                                    if let Err(e) = cmd_tx.send(command).await {
-                                        warn!("Failed to send command to game {}: {}", game_id, e);
-                                        // The game might have ended, remove from channels
-                                        game_channels.remove(&game_id);
-                                    }
-                                } else {
-                                    debug!("Received command for inactive game {}", game_id);
-                                }
-                            }
-                            _ => {
-                                debug!("Received other event in partition executor: {:?}", event);
-                            }
+                            _ => {}
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to deserialize command: {}", e);
+                    StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
+                        // Route command to the appropriate game
+                        if let Some((cmd_tx, _)) = game_channels.get(&game_id) {
+                            if let Err(e) = cmd_tx.send(command).await {
+                                warn!("Failed to send command to game {}: {}", game_id, e);
+                                // The game might have ended, remove from channels
+                                game_channels.remove(&game_id);
+                            }
+                        } else {
+                            debug!("Received command for inactive game {}", game_id);
+                        }
+                    }
+                    _ => {
+                        debug!("Received other event in partition executor: {:?}", command_data);
                     }
                 }
             }

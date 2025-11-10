@@ -1,6 +1,7 @@
 use super::mock_jwt::MockJwtVerifier;
 use anyhow::{Context, Result};
 use server::{
+    api::jwt::JwtManager,
     db::{Database, dynamodb::DynamoDatabase},
     game_server::{GameServer, start_test_server, start_test_server_with_grpc},
     ws_server::JwtVerifier,
@@ -41,7 +42,8 @@ impl TestEnvironment {
         unsafe {
             std::env::set_var("DYNAMODB_TABLE_PREFIX", &unique_prefix);
             // Use Redis database 1 for tests (tests flush database 1, so server should use it too)
-            std::env::set_var("SNAKETRON_REDIS_URL", "redis://127.0.0.1:6379/1");
+            // protocol=resp3 is required for push notifications and ConnectionManager with push_sender
+            std::env::set_var("SNAKETRON_REDIS_URL", "redis://127.0.0.1:6379/1?protocol=resp3");
         }
         info!("Using unique table prefix for test: {}", unique_prefix);
 
@@ -72,9 +74,10 @@ impl TestEnvironment {
 
     /// Add a server to this test environment with optional gRPC
     pub async fn add_server_with_grpc(&mut self, enable_grpc: bool) -> Result<(usize, u64)> {
+        let jwt_manager = JwtManager::new("test_secret_key_for_testing");
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
 
-        let server = start_test_server_with_grpc(self.db(), jwt_verifier, enable_grpc)
+        let server = start_test_server_with_grpc(self.db(), jwt_manager, jwt_verifier, enable_grpc)
             .await
             .context("Failed to start server")?;
 

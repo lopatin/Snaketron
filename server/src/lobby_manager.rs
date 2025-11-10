@@ -507,7 +507,7 @@ impl LobbyManager {
         let mut redis = self.redis.clone();
         let key = RedisKeys::lobby_preferences(lobby_code);
         let raw: Option<String> = redis
-            .get(&key)
+            .get(key)
             .await
             .context("Failed to load lobby preferences")?;
 

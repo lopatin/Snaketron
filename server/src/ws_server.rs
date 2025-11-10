@@ -1,7 +1,8 @@
 use std::future;
 use crate::api::auth::validate_username;
 use crate::db::Database;
-use crate::game_executor::{PARTITION_COUNT, StreamEvent};
+use crate::game_executor::PARTITION_COUNT;
+use crate::game_executor::StreamEvent;
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
@@ -10,8 +11,8 @@ use crate::lobby_manager;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::{
-    DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameEvent, GameEventMessage, GameState,
-    GameStatus,
+    GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus,
+    DEFAULT_TICK_INTERVAL_MS,
 };
 use futures_util::future::join_all;
 use futures_util::{SinkExt, Stream};
@@ -23,9 +24,9 @@ use std::time::Duration;
 use redis::aio::ConnectionManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{Sleep, sleep};
+use tokio::time::{sleep, Sleep};
 use tokio_stream::StreamExt;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -1771,45 +1772,49 @@ async fn process_ws_message(
                     );
                     Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
                 }
+
+                // TODO: Drop support for custom games
                 WSMessage::CreateCustomGame { settings } => {
                     info!(
                         "User {} ({}) creating custom game",
                         metadata.username, metadata.user_id
                     );
 
-                    match create_custom_game(
-                        db,
-                        &pubsub_manager,
-                        metadata.user_id,
-                        metadata.username.clone(),
-                        settings,
-                    )
-                    .await
-                    {
-                        Ok((game_id, game_code)) => {
-                            // Send success response
-                            let response = WSMessage::CustomGameCreated { game_id, game_code };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
 
-                            // Transition to in-game state
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                game_id: Some(game_id),
-                                lobby_handle: None,
-                                websocket_id: websocket_id.to_string(), // Custom games don't use lobbies
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to create custom game: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create game: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
-                        }
-                    }
+                    // match create_custom_game(
+                    //     db,
+                    //     &pubsub_manager,
+                    //     metadata.user_id,
+                    //     metadata.username.clone(),
+                    //     settings,
+                    // )
+                    // .await
+                    // {
+                    //     Ok((game_id, game_code)) => {
+                    //         // Send success response
+                    //         let response = WSMessage::CustomGameCreated { game_id, game_code };
+                    //         let json_msg = serde_json::to_string(&response)?;
+                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
+                    //
+                    //         // Transition to in-game state
+                    //         Ok(ConnectionState::Authenticated {
+                    //             metadata,
+                    //             game_id: Some(game_id),
+                    //             lobby_handle: None,
+                    //             websocket_id: websocket_id.to_string(), // Custom games don't use lobbies
+                    //         })
+                    //     }
+                    //     Err(e) => {
+                    //         error!("Failed to create custom game: {}", e);
+                    //         let response = WSMessage::AccessDenied {
+                    //             reason: format!("Failed to create game: {}", e),
+                    //         };
+                    //         let json_msg = serde_json::to_string(&response)?;
+                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
+                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
+                    //     }
+                    // }
                 }
                 WSMessage::JoinCustomGame { game_code } => {
                     info!(
@@ -1875,33 +1880,37 @@ async fn process_ws_message(
                         }
                     }
                 }
+
+                // TODO: Solo games should be started like any other game via matchmaking, not specially handled
                 WSMessage::CreateSoloGame => {
                     info!(
                         "User {} ({}) creating solo game",
                         metadata.username, metadata.user_id
                     );
 
-                    match create_solo_game(db, &pubsub_manager, metadata.user_id, metadata.username.clone())
-                        .await
-                    {
-                        Ok(created_game_id) => {
-                            // Send success response
-                            let response = WSMessage::SoloGameCreated { game_id: created_game_id };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
 
-                            Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id: Some(created_game_id), websocket_id })
-                        }
-                        Err(e) => {
-                            error!("Failed to create solo game: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create solo game: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
-                        }
-                    }
+                    // match create_solo_game(db, &pubsub_manager, metadata.user_id, metadata.username.clone())
+                    //     .await
+                    // {
+                    //     Ok(created_game_id) => {
+                    //         // Send success response
+                    //         let response = WSMessage::SoloGameCreated { game_id: created_game_id };
+                    //         let json_msg = serde_json::to_string(&response)?;
+                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
+                    //
+                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id: Some(created_game_id), websocket_id })
+                    //     }
+                    //     Err(e) => {
+                    //         error!("Failed to create solo game: {}", e);
+                    //         let response = WSMessage::AccessDenied {
+                    //             reason: format!("Failed to create solo game: {}", e),
+                    //         };
+                    //         let json_msg = serde_json::to_string(&response)?;
+                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
+                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
+                    //     }
+                    // }
                 }
                 WSMessage::CreateLobby => {
                     info!(
@@ -2064,6 +2073,34 @@ async fn process_ws_message(
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
                     Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
+                }
+                WSMessage::GameCommand(command_message) => {
+                    if let Some(game_id) = game_id {
+                        // Submit command via PubSub
+                        let partition_id = game_id % PARTITION_COUNT;
+
+                        let event = StreamEvent::GameCommandSubmitted {
+                            game_id,
+                            user_id: metadata.user_id as u32,
+                            command: command_message,
+                        };
+
+                        // Send command via PubSub
+                        match pubsub_manager.publish_command(partition_id, &event).await {
+                            Ok(_) => {
+                                debug!("Successfully submitted game command via PubSub: {:?}", event);
+                                Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id: Some(game_id), websocket_id } )
+                            }
+                            Err(e) => {
+                                error!("Failed to submit command via PubSub: {}", e);
+                                Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id: Some(game_id), websocket_id } )
+                            }
+                        }
+                    } else {
+                        warn!("Received GameCommand there is no game id in websocket state: {:?}", command_message);
+                        Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
+                    }
+
                 }
                 _ => {
                     warn!(
@@ -2306,177 +2343,177 @@ fn generate_game_code() -> String {
         .collect()
 }
 
-async fn create_custom_game(
-    db: &Arc<dyn Database>,
-    pubsub_manager: &Arc<PubSubManager>,
-    user_id: i32,
-    username: String,
-    settings: common::CustomGameSettings,
-) -> Result<(u32, String)> {
-    let game_code = generate_game_code();
+// async fn create_custom_game(
+//     db: &Arc<dyn Database>,
+//     pubsub_manager: &Arc<PubSubManager>,
+//     user_id: i32,
+//     username: String,
+//     settings: common::CustomGameSettings,
+// ) -> Result<(u32, String)> {
+//     let game_code = generate_game_code();
+//
+//     // Get current server ID from database
+//     let server_id = db.get_server_for_load_balancing("default").await?;
+//
+//     // Create lobby entry
+//     let lobby_id = db
+//         .create_custom_lobby(&game_code, user_id, &serde_json::to_value(&settings)?)
+//         .await?;
+//
+//     // Create game entry
+//     let game_id = db
+//         .create_game(
+//             server_id,
+//             &serde_json::to_value(&common::GameType::Custom {
+//                 settings: settings.clone(),
+//             })?,
+//             "custom",
+//             settings.is_private,
+//             Some(&game_code),
+//         )
+//         .await?;
+//
+//     // Update lobby with game_id
+//     db.update_custom_lobby_game_id(lobby_id, game_id).await?;
+//
+//     // Create game state
+//     let start_ms = chrono::Utc::now().timestamp_millis();
+//     let mut game_state = common::GameState::new(
+//         settings.arena_width,
+//         settings.arena_height,
+//         common::GameType::Custom { settings },
+//         Some(rand::random::<u64>()),
+//         start_ms,
+//     );
+//     game_state.game_code = Some(game_code.clone());
+//     game_state.host_user_id = Some(user_id as u32);
+//
+//     // Add the host as the first player
+//     game_state.add_player(user_id as u32, Some(username))?;
+//
+//     // Spawn initial food items
+//     game_state.spawn_initial_food();
+//
+//     // Publish GameCreated event to Redis stream
+//     let game_id_u32 = game_id as u32;
+//     let partition_id = game_id_u32 % PARTITION_COUNT;
+//
+//     let event = StreamEvent::GameCreated {
+//         game_id: game_id_u32,
+//         game_state: game_state.clone(),
+//     };
+//
+//     // Publish initial snapshot when game is created
+//     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
+//     pubsub_manager
+//         .publish_snapshot(partition_id, game_id_u32, &game_state)
+//         .await
+//         .context("Failed to publish initial game snapshot")?;
+//
+//     // Also send GameCreated event via partition command channel
+//     let serialized = serde_json::to_string(&event).context("Failed to serialize GameCreated event")?;
+//     pubsub_manager
+//         .publish_command(partition_id, serialized)
+//         .await
+//         .context("Failed to publish GameCreated event")?;
+//
+//     Ok((game_id as u32, game_code))
+// }
 
-    // Get current server ID from database
-    let server_id = db.get_server_for_load_balancing("default").await?;
-
-    // Create lobby entry
-    let lobby_id = db
-        .create_custom_lobby(&game_code, user_id, &serde_json::to_value(&settings)?)
-        .await?;
-
-    // Create game entry
-    let game_id = db
-        .create_game(
-            server_id,
-            &serde_json::to_value(&common::GameType::Custom {
-                settings: settings.clone(),
-            })?,
-            "custom",
-            settings.is_private,
-            Some(&game_code),
-        )
-        .await?;
-
-    // Update lobby with game_id
-    db.update_custom_lobby_game_id(lobby_id, game_id).await?;
-
-    // Create game state
-    let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut game_state = common::GameState::new(
-        settings.arena_width,
-        settings.arena_height,
-        common::GameType::Custom { settings },
-        Some(rand::random::<u64>()),
-        start_ms,
-    );
-    game_state.game_code = Some(game_code.clone());
-    game_state.host_user_id = Some(user_id as u32);
-
-    // Add the host as the first player
-    game_state.add_player(user_id as u32, Some(username))?;
-
-    // Spawn initial food items
-    game_state.spawn_initial_food();
-
-    // Publish GameCreated event to Redis stream
-    let game_id_u32 = game_id as u32;
-    let partition_id = game_id_u32 % PARTITION_COUNT;
-
-    let event = StreamEvent::GameCreated {
-        game_id: game_id_u32,
-        game_state: game_state.clone(),
-    };
-
-    // Publish initial snapshot when game is created
-    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-    pubsub_manager
-        .publish_snapshot(partition_id, game_id_u32, &game_state)
-        .await
-        .context("Failed to publish initial game snapshot")?;
-
-    // Also send GameCreated event via partition command channel
-    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
-    pubsub_manager
-        .publish_command(partition_id, &serialized)
-        .await
-        .context("Failed to publish GameCreated event")?;
-
-    Ok((game_id as u32, game_code))
-}
-
-async fn create_solo_game(
-    db: &Arc<dyn Database>,
-    pubsub_manager: &Arc<PubSubManager>,
-    user_id: i32,
-    username: String,
-) -> Result<u32> {
-    // Get current server ID from database - use the region from environment or default
-    let region = std::env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
-    let server_id = db.get_server_for_load_balancing(&region).await?;
-
-    // Create game settings for solo game
-    let settings = common::CustomGameSettings {
-        arena_width: 40,
-        arena_height: 40,
-        tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
-        food_spawn_rate: 3.0,
-        max_players: 1, // Solo game
-        game_mode: common::GameMode::Solo,
-        is_private: true,
-        allow_spectators: false,
-        snake_start_length: 4,
-    };
-
-    // Create game entry
-    let game_id = db
-        .create_game(
-            server_id,
-            &serde_json::to_value(&common::GameType::Custom {
-                settings: settings.clone(),
-            })?,
-            "solo",
-            true, // Solo games are private
-            None, // No game code for solo games
-        )
-        .await?;
-
-    // Create game state with one player
-    let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut game_state = common::GameState::new(
-        settings.arena_width,
-        settings.arena_height,
-        common::GameType::Custom {
-            settings: settings.clone(),
-        },
-        Some(rand::random::<u64>()),
-        start_ms,
-    );
-
-    // Add the player (only one player for solo mode)
-    game_state.add_player(user_id as u32, Some(username))?;
-
-    // Spawn initial food items
-    game_state.spawn_initial_food();
-
-    // Publish GameCreated event to Redis stream
-    let game_id_u32 = game_id as u32;
-    let partition_id = game_id_u32 % PARTITION_COUNT;
-
-    let event = StreamEvent::GameCreated {
-        game_id: game_id_u32,
-        game_state: game_state.clone(),
-    };
-
-    // Publish initial snapshot when game is created
-    let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-    pubsub_manager
-        .publish_snapshot(partition_id, game_id_u32, &game_state)
-        .await
-        .context("Failed to publish initial game snapshot")?;
-
-    // Also send GameCreated event via partition command channel
-    let serialized = serde_json::to_vec(&event).context("Failed to serialize GameCreated event")?;
-    pubsub_manager
-        .publish_command(partition_id, &serialized)
-        .await
-        .context("Failed to publish GameCreated event")?;
-
-    // Start the game immediately (no waiting in solo mode)
-    let status_event = StreamEvent::StatusUpdated {
-        game_id: game_id as u32,
-        status: GameStatus::Started {
-            server_id: server_id as u64,
-        },
-    };
-
-    let status_serialized =
-        serde_json::to_vec(&status_event).context("Failed to serialize StatusUpdated event")?;
-    pubsub_manager
-        .publish_command(partition_id, &status_serialized)
-        .await
-        .context("Failed to publish StatusUpdated event")?;
-
-    Ok(game_id as u32)
-}
+// async fn create_solo_game(
+//     db: &Arc<dyn Database>,
+//     pubsub_manager: &Arc<PubSubManager>,
+//     user_id: i32,
+//     username: String,
+// ) -> Result<u32> {
+//     // Get current server ID from database - use the region from environment or default
+//     let region = std::env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
+//     let server_id = db.get_server_for_load_balancing(&region).await?;
+//
+//     // Create game settings for solo game
+//     let settings = common::CustomGameSettings {
+//         arena_width: 40,
+//         arena_height: 40,
+//         tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
+//         food_spawn_rate: 3.0,
+//         max_players: 1, // Solo game
+//         game_mode: common::GameMode::Solo,
+//         is_private: true,
+//         allow_spectators: false,
+//         snake_start_length: 4,
+//     };
+//
+//     // Create game entry
+//     let game_id = db
+//         .create_game(
+//             server_id,
+//             &serde_json::to_value(&common::GameType::Custom {
+//                 settings: settings.clone(),
+//             })?,
+//             "solo",
+//             true, // Solo games are private
+//             None, // No game code for solo games
+//         )
+//         .await?;
+//
+//     // Create game state with one player
+//     let start_ms = chrono::Utc::now().timestamp_millis();
+//     let mut game_state = common::GameState::new(
+//         settings.arena_width,
+//         settings.arena_height,
+//         common::GameType::Custom {
+//             settings: settings.clone(),
+//         },
+//         Some(rand::random::<u64>()),
+//         start_ms,
+//     );
+//
+//     // Add the player (only one player for solo mode)
+//     game_state.add_player(user_id as u32, Some(username))?;
+//
+//     // Spawn initial food items
+//     game_state.spawn_initial_food();
+//
+//     // Publish GameCreated event to Redis stream
+//     let game_id_u32 = game_id as u32;
+//     let partition_id = game_id_u32 % PARTITION_COUNT;
+//
+//     let event = StreamEvent::GameCreated {
+//         game_id: game_id_u32,
+//         game_state: game_state.clone(),
+//     };
+//
+//     // Publish initial snapshot when game is created
+//     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
+//     pubsub_manager
+//         .publish_snapshot(partition_id, game_id_u32, &game_state)
+//         .await
+//         .context("Failed to publish initial game snapshot")?;
+//
+//     // Also send GameCreated event via partition command channel
+//     let serialized = serde_json::to_string(&event).context("Failed to serialize GameCreated event")?;
+//     pubsub_manager
+//         .publish_command(partition_id, serialized)
+//         .await
+//         .context("Failed to publish GameCreated event")?;
+//
+//     // Start the game immediately (no waiting in solo mode)
+//     let status_event = StreamEvent::StatusUpdated {
+//         game_id: game_id as u32,
+//         status: GameStatus::Started {
+//             server_id: server_id as u64,
+//         },
+//     };
+//
+//     let status_serialized =
+//         serde_json::to_string(&status_event).context("Failed to serialize StatusUpdated event")?;
+//     pubsub_manager
+//         .publish_command(partition_id, status_serialized)
+//         .await
+//         .context("Failed to publish StatusUpdated event")?;
+//
+//     Ok(game_id as u32)
+// }
 
 async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str) -> Result<u32> {
     // Find the game by code
