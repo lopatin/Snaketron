@@ -192,7 +192,9 @@ impl PartitionReplica {
         let subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
 
         // Request initial snapshots for this partition
-        pubsub.request_partition_snapshots(self.partition_id).await?;
+        pubsub
+            .request_partition_snapshots(self.partition_id)
+            .await?;
         drop(pubsub); // Release lock
 
         // Destructure subscription so each receiver can be borrowed independently in select!
@@ -308,12 +310,10 @@ impl ReplicationManager {
         // Get or create broadcast channel for this game. Acquires lock.
         {
             let mut broadcasters = self.game_event_broadcasters.write().await;
-            let sender = broadcasters
-                .entry(game_id)
-                .or_insert_with(|| {
-                    let (tx, _) = broadcast::channel(1028);
-                    tx
-                });
+            let sender = broadcasters.entry(game_id).or_insert_with(|| {
+                let (tx, _) = broadcast::channel(1028);
+                tx
+            });
 
             let receiver = sender.subscribe();
 
@@ -393,7 +393,8 @@ impl ReplicationManager {
         // Create Redis client and connection manager
         let redis_client = redis::Client::open(redis_url)?;
         let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
-        let redis = crate::redis_utils::create_connection_manager(redis_client, pubsub_tx.clone()).await?;
+        let redis =
+            crate::redis_utils::create_connection_manager(redis_client, pubsub_tx.clone()).await?;
 
         // Create PubSub manager
         let pubsub = Arc::new(Mutex::new(PubSubManager::new(

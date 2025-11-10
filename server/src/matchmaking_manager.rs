@@ -2,8 +2,8 @@ use crate::redis_keys::RedisKeys;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use common::GameType;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -416,7 +416,9 @@ impl MatchmakingManager {
                 let mid_start = (total / 2) - (SUBSET_SIZE / 2);
                 let mid_end = mid_start + SUBSET_SIZE;
 
-                self.redis.zrange(&lobby_mmr_key, mid_start, mid_end).await?
+                self.redis
+                    .zrange(&lobby_mmr_key, mid_start, mid_end)
+                    .await?
             }
         };
 
@@ -468,8 +470,10 @@ impl MatchmakingManager {
         let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
 
         // Get all lobby members to find the one to remove
-        let members: Vec<(String, f64)> =
-            self.redis.zrange_withscores(&lobby_queue_key, 0, -1).await?;
+        let members: Vec<(String, f64)> = self
+            .redis
+            .zrange_withscores(&lobby_queue_key, 0, -1)
+            .await?;
 
         let mut pipe = redis::pipe();
         pipe.atomic();
@@ -495,7 +499,10 @@ impl MatchmakingManager {
     }
 
     /// Locate a queued lobby by code across all matchmaking queues
-    pub async fn get_queued_lobby_by_code(&mut self, lobby_code: &str) -> Result<Option<QueuedLobby>> {
+    pub async fn get_queued_lobby_by_code(
+        &mut self,
+        lobby_code: &str,
+    ) -> Result<Option<QueuedLobby>> {
         let mut cursor: u64 = 0;
 
         loop {
@@ -550,7 +557,8 @@ impl MatchmakingManager {
         // For each game type the lobby was queued for, remove it from that queue
         for game_type in &lobby.game_types {
             let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode);
-            let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
+            let lobby_mmr_key =
+                RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
 
             // We need to find the exact JSON string to remove
             // Since the lobby JSON is stored in Redis, we'll fetch and match
@@ -642,8 +650,8 @@ impl MatchmakingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redis::Client;
     use crate::redis_utils;
+    use redis::Client;
 
     #[tokio::test]
     async fn test_redis_connection() {

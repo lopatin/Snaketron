@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
+use redis::Client;
 use server::api::jwt::{JwtManager, ProductionJwtVerifier};
 use server::db::{Database, dynamodb::DynamoDatabase};
 use server::game_server::{GameServer, GameServerConfig};
 use server::http_server::run_http_server;
+use server::pubsub_manager::PubSubManager;
+use server::redis_utils::create_connection_manager;
 use server::region_cache::RegionCache;
 use server::ws_server::TestJwtVerifier;
 use std::env;
 use std::sync::Arc;
-use redis::Client;
 use tokio::sync::broadcast::Receiver;
 use tracing::info;
-use server::pubsub_manager::PubSubManager;
-use server::redis_utils::create_connection_manager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
             let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
             Arc::new(ProductionJwtVerifier::new(jwt_manager))
         };
-    
+
     let jwt_manager = Arc::new(JwtManager::new(&jwt_secret));
 
     // Set up replay directory - use environment variable or default to centralized location

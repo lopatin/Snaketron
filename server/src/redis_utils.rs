@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use redis::{Client, PushInfo};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::{Client, PushInfo};
 use std::time::Duration;
 
 /// Creates a ConnectionManager with standardized configuration for the application.

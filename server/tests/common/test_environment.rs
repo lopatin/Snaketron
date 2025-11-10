@@ -43,7 +43,10 @@ impl TestEnvironment {
             std::env::set_var("DYNAMODB_TABLE_PREFIX", &unique_prefix);
             // Use Redis database 1 for tests (tests flush database 1, so server should use it too)
             // protocol=resp3 is required for push notifications and ConnectionManager with push_sender
-            std::env::set_var("SNAKETRON_REDIS_URL", "redis://127.0.0.1:6379/1?protocol=resp3");
+            std::env::set_var(
+                "SNAKETRON_REDIS_URL",
+                "redis://127.0.0.1:6379/1?protocol=resp3",
+            );
         }
         info!("Using unique table prefix for test: {}", unique_prefix);
 
@@ -111,7 +114,7 @@ impl TestEnvironment {
     //     let server = start_test_server(self.db(), jwt_verifier)
     //         .await
     //         .context("Failed to start server")?;
-    // 
+    //
     //     let index = self.servers.len();
     //     info!(
     //         "Started server {} with ID {} on {}",
@@ -119,7 +122,7 @@ impl TestEnvironment {
     //         server.id(),
     //         server.http_addr()
     //     );
-    // 
+    //
     //     self.servers.push(server);
     //     Ok(index)
     // }

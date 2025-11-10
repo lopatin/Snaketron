@@ -3,7 +3,10 @@ use common::CLUSTER_RENEWAL_INTERVAL_MS;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, ExistenceCheck, RedisResult, Script, ScriptInvocation, SetExpiry, SetOptions, TypedCommands};
+use redis::{
+    AsyncCommands, ExistenceCheck, RedisResult, Script, ScriptInvocation, SetExpiry, SetOptions,
+    TypedCommands,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -63,8 +66,9 @@ impl ClusterSingleton {
     /// The service should monitor this token and shut down gracefully when canceled.
     pub async fn run(
         mut self,
-        user_service: impl Fn(CancellationToken) 
-            -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>,
+        user_service: impl Fn(
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>,
     ) -> Result<()> {
         info!(
             "Starting cluster singleton for server_id={}",
@@ -180,7 +184,8 @@ impl ClusterSingleton {
     }
 
     async fn try_acquire_lease(&mut self) -> RedisResult<bool> {
-        let acquired: bool = self.redis
+        let acquired: bool = self
+            .redis
             .set_options(
                 &self.lease_key,
                 self.server_id.to_string(),
@@ -192,7 +197,7 @@ impl ClusterSingleton {
 
         Ok(acquired)
     }
-    
+
     async fn renew_lease(&mut self) -> Result<bool> {
         // Lua script to atomically check ownership and renew lease
         let lua_script = r#"
@@ -202,18 +207,21 @@ impl ClusterSingleton {
                 return 0
             end
         "#;
-        
+
         let script = Script::new(lua_script);
-        
+
         let _: String = self.redis.load_script(&script).await?;
 
-        let result = self.redis
-            .invoke_script::<i32>(script
-                .key(self.lease_key.clone())
-                .arg(self.server_id.to_string()) 
-                .arg(self.lease_duration_ms))
+        let result = self
+            .redis
+            .invoke_script::<i32>(
+                script
+                    .key(self.lease_key.clone())
+                    .arg(self.server_id.to_string())
+                    .arg(self.lease_duration_ms),
+            )
             .await?;
-        
+
         Ok(result == 1)
     }
 

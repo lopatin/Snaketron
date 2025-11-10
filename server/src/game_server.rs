@@ -1,38 +1,31 @@
-use std::env;
-use std::future::Future;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::game_executor::PARTITION_COUNT;
-use crate::ws_server::discover_peers;
-use crate::{
-    cluster_singleton::ClusterSingleton,
-    db::Database,
-    game_executor::run_game_executor,
-    grpc_server::run_game_relay_server,
-    matchmaking::run_matchmaking_loop,
-    redis_keys::RedisKeys,
-    redis_utils,
-    replay::ReplayListener,
-    replication::ReplicationManager,
-    ws_server::JwtVerifier,
-};
-use redis::{AsyncCommands, Client};
-use redis::aio::ConnectionManager;
-use std::path::PathBuf;
 use crate::api::jwt::JwtManager;
+use crate::game_executor::PARTITION_COUNT;
+use crate::game_executor::StreamEvent;
 use crate::http_server::run_http_server;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
-use crate::game_executor::StreamEvent;
 use crate::redis_utils::create_connection_manager;
 use crate::region_cache::RegionCache;
+use crate::ws_server::discover_peers;
+use crate::{
+    cluster_singleton::ClusterSingleton, db::Database, game_executor::run_game_executor,
+    grpc_server::run_game_relay_server, matchmaking::run_matchmaking_loop, redis_keys::RedisKeys,
+    redis_utils, replay::ReplayListener, replication::ReplicationManager, ws_server::JwtVerifier,
+};
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Client};
+use std::path::PathBuf;
 
 /// Configuration for a game server instance
 pub struct GameServerConfig {
@@ -135,35 +128,38 @@ impl GameServer {
         let (pubsub_tx, pubsub_rx) = tokio::sync::broadcast::channel(5000);
         // Drop the default receiver to avoid filling up the channel
         drop(pubsub_rx);
-        
+
         // Create the Redis client and connection manager
-        let redis_client = Client::open(redis_url.clone()).context("Failed to create Redis client")?;
+        let redis_client =
+            Client::open(redis_url.clone()).context("Failed to create Redis client")?;
         let redis = create_connection_manager(redis_client, pubsub_tx.clone()).await?;
         info!("Redis connection manager created successfully");
-        
+
         // Create the PubsubManager
         let pubsub_manager = Arc::new(PubSubManager::new(
             redis.clone(),
             pubsub_tx.clone(),
-            cancellation_token.clone()
+            cancellation_token.clone(),
         ));
-        
+
         // Create the LobbyManager
         let lobby_manager = Arc::new(LobbyManager::new(redis.clone(), db.clone()));
-        
+
         // Create the matchmaking manager
         let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(
             MatchmakingManager::new(redis.clone())
-                .context("Failed to create matchmaking manager")?
+                .context("Failed to create matchmaking manager")?,
         ));
 
         // Create RegionCache for dynamic region discovery
         let aws_config = aws_config::load_from_env().await;
         let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
-        let table_prefix = env::var("DYNAMODB_TABLE_PREFIX")
-            .unwrap_or_else(|_| "snaketron".to_string());
+        let table_prefix =
+            env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
         let region_cache = Arc::new(RegionCache::new(dynamodb_client, table_prefix));
-        region_cache.clone().spawn_refresh_task(cancellation_token.clone());
+        region_cache
+            .clone()
+            .spawn_refresh_task(cancellation_token.clone());
         info!("Region cache refresh task started");
 
         // Start the matchmaking service
@@ -175,11 +171,7 @@ impl GameServer {
         handles.push(tokio::spawn(async move {
             let mm = match_matchmaking_manager.lock().await.clone();
             drop(match_matchmaking_manager); // Drop the lock
-            if let Err(e) = run_matchmaking_loop(
-                mm,
-                match_pubsub_manager,
-                match_token
-            ).await {
+            if let Err(e) = run_matchmaking_loop(mm, match_pubsub_manager, match_token).await {
                 error!("Matchmaking loop error: {}", e);
             }
         }));
@@ -192,8 +184,9 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
-            ).await
-                .context("Failed to create replication manager")?,
+            )
+            .await
+            .context("Failed to create replication manager")?,
         );
 
         // Wait for replication to be ready
@@ -252,7 +245,10 @@ impl GameServer {
                     let exec_replication_manager = exec_replication_manager.clone();
 
                     Box::pin(async move {
-                        info!("Game executor for partition {} is now active", partition_id_clone);
+                        info!(
+                            "Game executor for partition {} is now active",
+                            partition_id_clone
+                        );
 
                         if let Err(e) = run_game_executor(
                             server_id_clone,
@@ -262,7 +258,9 @@ impl GameServer {
                             exec_db,
                             exec_replication_manager,
                             token,
-                        ).await {
+                        )
+                        .await
+                        {
                             error!(
                                 "Game executor service error for partition {}: {}",
                                 partition_id_clone, e
@@ -318,12 +316,12 @@ impl GameServer {
                 http_region_cache,
                 http_lobby_manager,
             )
-                .await
+            .await
             {
                 error!("HTTP server error: {}", e);
             }
         });
-        
+
         handles.push(http_handle);
 
         info!("Game server {} started successfully", server_id);
@@ -336,7 +334,7 @@ impl GameServer {
             cancellation_token,
             handles,
             // replay_listener,
-            replication_manager
+            replication_manager,
         })
     }
 
@@ -345,12 +343,11 @@ impl GameServer {
         &self.db
     }
 
-
     /// Get the cancellation token
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
     }
-    
+
     /// Get the replication manager
     pub fn replication_manager(&self) -> &Arc<ReplicationManager> {
         &self.replication_manager

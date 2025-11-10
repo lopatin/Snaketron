@@ -20,13 +20,13 @@ use crate::db::Database;
 use crate::lobby_manager::LobbyManager;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
-use crate::ws_server::{JwtVerifier, handle_websocket};
 use crate::user_cache::UserCache;
+use crate::ws_server::{JwtVerifier, handle_websocket};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use redis::aio::ConnectionManager;
-use redis::{Client, AsyncCommands};
 use crate::redis_utils::create_connection_manager;
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Client};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
 #[derive(Clone)]
@@ -44,7 +44,8 @@ pub struct HttpServerState {
     /// PubSub manager for Redis pub/sub operations
     pub pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
     /// Matchmaking manager for queue operations
-    pub matchmaking_manager: Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
+    pub matchmaking_manager:
+        Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
     /// Replication manager for game state
     pub replication_manager: Arc<ReplicationManager>,
     /// Cancellation token for graceful shutdown
@@ -99,7 +100,7 @@ pub async fn run_http_server(
         region: region.clone(),
         region_cache,
         lobby_manager,
-        user_cache
+        user_cache,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -132,10 +133,7 @@ pub async fn run_http_server(
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
-        .layer(middleware::from_fn_with_state(
-            jwt_manager,
-            auth_middleware,
-        ))
+        .layer(middleware::from_fn_with_state(jwt_manager, auth_middleware))
         .with_state(auth_state.clone());
 
     // Build region routes with HttpServerState (for Redis access)
@@ -212,7 +210,8 @@ async fn websocket_handler(
             state.cancellation_token,
             state.lobby_manager,
             state.region,
-        ).await;
+        )
+        .await;
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -264,7 +263,7 @@ async fn update_redis_metrics(
     count: usize,
 ) -> Result<()> {
     // let mut redis = redis;
-    
+
     // Set user count with 10-second TTL (auto-cleanup for dead servers)
     let _: () = redis
         .set_ex(format!("server:{}:user_count", server_id), count, 10)

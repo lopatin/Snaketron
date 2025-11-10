@@ -1,19 +1,52 @@
 use ::common::{GameEvent, GameType, QueueMode, TeamId};
 use anyhow::Result;
-use redis::AsyncCommands;
-use server::ws_server::WSMessage;
-use tokio::time::{Duration, timeout};
+use chrono::Utc;
+use redis::{Client, PushInfo};
+use server::{
+    lobby_manager::LobbyMember, matchmaking_manager::MatchmakingManager,
+    redis_utils::create_connection_manager, ws_server::WSMessage,
+};
+use tokio::{
+    sync::broadcast,
+    time::{Duration, timeout},
+};
 
 mod common;
 use self::common::{TestClient, TestEnvironment};
 
+fn test_redis_url() -> String {
+    let mut url = std::env::var("SNAKETRON_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    if !url.contains("protocol=resp3") {
+        if url.contains('?') {
+            url.push_str("&protocol=resp3");
+        } else {
+            url.push_str("?protocol=resp3");
+        }
+    }
+    url
+}
+
+fn make_lobby_member<S: Into<String>>(user_id: u32, username: S) -> LobbyMember {
+    LobbyMember {
+        user_id,
+        username: username.into(),
+        ts: Utc::now().timestamp_millis() as f64,
+    }
+}
+
+async fn create_test_matchmaking_manager() -> Result<MatchmakingManager> {
+    let redis_client = Client::open(test_redis_url())?;
+    let (pubsub_tx, _rx) = broadcast::channel::<PushInfo>(128);
+    let conn = create_connection_manager(redis_client, pubsub_tx).await?;
+    MatchmakingManager::new(conn)
+}
+
 // Helper function to clean Redis state before tests
 async fn setup_test_redis() -> Result<()> {
     // Clean up Redis before starting the test
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let redis_client = redis::Client::open(redis_url)?;
-    let mut redis_conn = redis_client.get_async_connection().await?;
+    let redis_client = redis::Client::open(test_redis_url())?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
 
     // Small delay to ensure Redis is ready
@@ -28,7 +61,7 @@ async fn create_lobby_and_queue(
     user_ids: &[i32],
     game_type: GameType,
     queue_mode: QueueMode,
-) -> Result<(Vec<TestClient>, u32)> {
+) -> Result<Vec<TestClient>> {
     let server_addr = env.ws_addr(server_idx).expect("Server should exist");
 
     // Connect all clients
@@ -42,15 +75,12 @@ async fn create_lobby_and_queue(
     // First client creates lobby
     clients[0].send_message(WSMessage::CreateLobby).await?;
 
-    // Wait for LobbyCreated response and capture both lobby_id and lobby_code
-    let (lobby_id, lobby_code) = timeout(Duration::from_secs(5), async {
+    // Wait for LobbyCreated response and capture lobby_code
+    let lobby_code = timeout(Duration::from_secs(5), async {
         loop {
             match clients[0].receive_message().await? {
-                WSMessage::LobbyCreated {
-                    lobby_id,
-                    lobby_code,
-                } => {
-                    return Ok::<(u32, String), anyhow::Error>((lobby_id, lobby_code));
+                WSMessage::LobbyCreated { lobby_code } => {
+                    return Ok::<String, anyhow::Error>(lobby_code);
                 }
                 _ => {}
             }
@@ -90,7 +120,7 @@ async fn create_lobby_and_queue(
         })
         .await?;
 
-    Ok((clients, lobby_id))
+    Ok(clients)
 }
 
 // Helper to wait for all clients to receive JoinGame and snapshot
@@ -163,7 +193,7 @@ async fn test_two_player_lobby_creates_1v1_with_split_teams() -> Result<()> {
     env.create_user().await?;
     env.create_user().await?;
 
-    let (mut clients, _lobby_id) = create_lobby_and_queue(
+    let mut clients = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
@@ -196,7 +226,7 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
     env.create_user().await?;
 
     // Create two separate single-player lobbies
-    let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -205,7 +235,7 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
     )
     .await?;
 
-    let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[1]],
@@ -237,7 +267,7 @@ async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
     env.add_server().await?;
     env.create_user().await?;
 
-    let (mut clients, _lobby_id) = create_lobby_and_queue(
+    let mut clients = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -287,7 +317,7 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
     }
 
     // Create two 2-player lobbies
-    let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
@@ -296,7 +326,7 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
     )
     .await?;
 
-    let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[2], env.user_ids()[3]],
@@ -333,7 +363,7 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
     }
 
     // Create 3-player lobby
-    let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
@@ -343,7 +373,7 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
     .await?;
 
     // Create 1-player lobby
-    let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[3]],
@@ -377,7 +407,7 @@ async fn test_four_player_lobby_creates_2v2() -> Result<()> {
         env.create_user().await?;
     }
 
-    let (mut clients, _lobby_id) = create_lobby_and_queue(
+    let mut clients = create_lobby_and_queue(
         &env,
         0,
         &[
@@ -419,7 +449,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     }
 
     // Create lobbies with different sizes
-    let (mut clients1, _) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
@@ -428,7 +458,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     )
     .await?;
 
-    let (mut clients2, _) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[2]],
@@ -437,7 +467,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     )
     .await?;
 
-    let (mut clients3, _) = create_lobby_and_queue(
+    let mut clients3 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[3], env.user_ids()[4]],
@@ -476,7 +506,7 @@ async fn test_ffa_respects_max_players() -> Result<()> {
     }
 
     // Create two 3-player lobbies, but max is 4
-    let (mut clients1, _) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
@@ -485,7 +515,7 @@ async fn test_ffa_respects_max_players() -> Result<()> {
     )
     .await?;
 
-    let (mut clients2, _) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[3], env.user_ids()[4], env.user_ids()[5]],
@@ -539,7 +569,7 @@ async fn test_ffa_minimum_players() -> Result<()> {
     env.add_server().await?;
     env.create_user().await?;
 
-    let (mut clients, _) = create_lobby_and_queue(
+    let mut clients = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -588,7 +618,7 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
     env.create_user().await?;
 
     // One lobby in Quickmatch
-    let (mut clients1, _) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -598,7 +628,7 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
     .await?;
 
     // Another lobby in Competitive
-    let (mut clients2, _) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[1]],
@@ -656,31 +686,17 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
 /// Test that add_lobby_to_queue with multiple game types registers the lobby in all queues
 #[tokio::test]
 async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
-    use server::lobby_manager::LobbyMember;
-    use server::matchmaking_manager::MatchmakingManager;
-
     setup_test_redis().await?;
-
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-    let mut mm = MatchmakingManager::new(&redis_url).await?;
+    let mut mm = create_test_matchmaking_manager().await?;
 
     // Create test lobby members
     let members = vec![
-        LobbyMember {
-            user_id: 1,
-            username: "player1".to_string(),
-        },
-        LobbyMember {
-            user_id: 2,
-            username: "player2".to_string(),
-        },
+        make_lobby_member(1, "player1"),
+        make_lobby_member(2, "player2"),
     ];
 
     // Queue lobby for both 1v1 and 2v2
     mm.add_lobby_to_queue(
-        1,
         "TEST001",
         members.clone(),
         1000,
@@ -704,8 +720,8 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
     assert_eq!(lobbies_1v1.len(), 1, "Lobby should appear in 1v1 queue");
     assert_eq!(lobbies_2v2.len(), 1, "Lobby should appear in 2v2 queue");
 
-    assert_eq!(lobbies_1v1[0].lobby_id, 1);
-    assert_eq!(lobbies_2v2[0].lobby_id, 1);
+    assert_eq!(lobbies_1v1[0].lobby_code, "TEST001");
+    assert_eq!(lobbies_2v2[0].lobby_code, "TEST001");
 
     // Verify the game_types field contains both types
     assert_eq!(lobbies_1v1[0].game_types.len(), 2);
@@ -727,25 +743,14 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
 /// Test that remove_lobby_from_all_queues removes lobby from all game type queues
 #[tokio::test]
 async fn test_remove_lobby_from_all_queues() -> Result<()> {
-    use server::lobby_manager::LobbyMember;
-    use server::matchmaking_manager::MatchmakingManager;
-
     setup_test_redis().await?;
-
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-    let mut mm = MatchmakingManager::new(&redis_url).await?;
+    let mut mm = create_test_matchmaking_manager().await?;
 
     // Create test lobby members
-    let members = vec![LobbyMember {
-        user_id: 1,
-        username: "player1".to_string(),
-    }];
+    let members = vec![make_lobby_member(1, "player1")];
 
     // Queue lobby for multiple game types
     mm.add_lobby_to_queue(
-        1,
         "TEST001",
         members.clone(),
         1000,
@@ -818,31 +823,17 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
 /// Test that get_queued_lobbies deduplicates lobbies appearing in multiple queues
 #[tokio::test]
 async fn test_get_queued_lobbies_deduplication() -> Result<()> {
-    use server::lobby_manager::LobbyMember;
-    use server::matchmaking_manager::MatchmakingManager;
-
     setup_test_redis().await?;
-
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-    let mut mm = MatchmakingManager::new(&redis_url).await?;
+    let mut mm = create_test_matchmaking_manager().await?;
 
     // Create test lobby members
     let members = vec![
-        LobbyMember {
-            user_id: 1,
-            username: "player1".to_string(),
-        },
-        LobbyMember {
-            user_id: 2,
-            username: "player2".to_string(),
-        },
+        make_lobby_member(1, "player1"),
+        make_lobby_member(2, "player2"),
     ];
 
     // Queue same lobby for 1v1
     mm.add_lobby_to_queue(
-        1,
         "TEST001",
         members.clone(),
         1000,
@@ -854,7 +845,6 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
 
     // Queue a different lobby for 1v1 as well (to verify we get both)
     mm.add_lobby_to_queue(
-        2,
         "TEST002",
         members.clone(),
         1050,
@@ -871,9 +861,9 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
 
     assert_eq!(lobbies.len(), 2, "Should return exactly 2 unique lobbies");
 
-    let lobby_ids: Vec<i32> = lobbies.iter().map(|l| l.lobby_id).collect();
-    assert!(lobby_ids.contains(&1));
-    assert!(lobby_ids.contains(&2));
+    let lobby_codes: Vec<&str> = lobbies.iter().map(|l| l.lobby_code.as_str()).collect();
+    assert!(lobby_codes.contains(&"TEST001"));
+    assert!(lobby_codes.contains(&"TEST002"));
 
     println!("✓ Deduplication works correctly");
     Ok(())
@@ -882,41 +872,22 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
 /// Test that when a lobby is matched in one queue, it doesn't get matched again in another
 #[tokio::test]
 async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
-    use server::lobby_manager::LobbyMember;
-    use server::matchmaking_manager::MatchmakingManager;
-
     setup_test_redis().await?;
 
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-    let mut mm = MatchmakingManager::new(&redis_url).await?;
+    let mut mm = create_test_matchmaking_manager().await?;
 
     // Create test lobby members
-    let members1 = vec![LobbyMember {
-        user_id: 1,
-        username: "player1".to_string(),
-    }];
+    let members1 = vec![make_lobby_member(1, "player1")];
 
-    let members2 = vec![LobbyMember {
-        user_id: 2,
-        username: "player2".to_string(),
-    }];
+    let members2 = vec![make_lobby_member(2, "player2")];
 
     let members3 = vec![
-        LobbyMember {
-            user_id: 3,
-            username: "player3".to_string(),
-        },
-        LobbyMember {
-            user_id: 4,
-            username: "player4".to_string(),
-        },
+        make_lobby_member(3, "player3"),
+        make_lobby_member(4, "player4"),
     ];
 
     // Queue two lobbies for both 1v1 and 2v2
     mm.add_lobby_to_queue(
-        1,
         "TEST001",
         members1.clone(),
         1000,
@@ -930,7 +901,6 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
     .await?;
 
     mm.add_lobby_to_queue(
-        2,
         "TEST002",
         members2.clone(),
         1000,
@@ -945,7 +915,6 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
 
     // Also add a 2-player lobby just for 2v2
     mm.add_lobby_to_queue(
-        3,
         "TEST003",
         members3.clone(),
         1000,
@@ -978,7 +947,7 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
         1,
         "Only lobby 3 should remain in 2v2 queue"
     );
-    assert_eq!(lobbies_2v2_after[0].lobby_id, 3);
+    assert_eq!(lobbies_2v2_after[0].lobby_code, "TEST003");
 
     println!("✓ No double-matching: matched lobbies removed from all queues");
     Ok(())
@@ -996,7 +965,7 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
 
     // For now, since WebSocket only supports single game type,
     // we'll queue two separate lobbies and they should match
-    let (mut clients1, _lobby_id1) = create_lobby_and_queue(
+    let mut clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -1005,7 +974,7 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
     )
     .await?;
 
-    let (mut clients2, _lobby_id2) = create_lobby_and_queue(
+    let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[1]],
@@ -1036,25 +1005,14 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
 /// Test that a lobby in multiple queues gets properly cleaned up after matching
 #[tokio::test]
 async fn test_cleanup_after_match_creation() -> Result<()> {
-    use server::lobby_manager::LobbyMember;
-    use server::matchmaking_manager::MatchmakingManager;
-
     setup_test_redis().await?;
-
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
-
-    let mut mm = MatchmakingManager::new(&redis_url).await?;
+    let mut mm = create_test_matchmaking_manager().await?;
 
     // Create three single-player lobbies, all queued for both 1v1 and FFA
     for i in 1..=3 {
-        let members = vec![LobbyMember {
-            user_id: i,
-            username: format!("player{}", i),
-        }];
+        let members = vec![make_lobby_member(i, format!("player{}", i))];
 
         mm.add_lobby_to_queue(
-            i,
             &format!("TEST{:03}", i),
             members,
             1000,
@@ -1108,8 +1066,8 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
         "Only lobby 3 should remain in FFA queue"
     );
 
-    assert_eq!(lobbies_1v1_after[0].lobby_id, 3);
-    assert_eq!(lobbies_ffa_after[0].lobby_id, 3);
+    assert_eq!(lobbies_1v1_after[0].lobby_code, "TEST003");
+    assert_eq!(lobbies_ffa_after[0].lobby_code, "TEST003");
 
     println!("✓ Matched lobbies properly cleaned up from all queues");
     Ok(())

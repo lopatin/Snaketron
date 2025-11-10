@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::game_executor::PARTITION_COUNT;
+use crate::game_executor::StreamEvent;
 use crate::matchmaking_manager::{ActiveMatch, MatchStatus, MatchmakingManager, QueuedPlayer};
 use crate::pubsub_manager::PubSubManager;
-use crate::game_executor::StreamEvent;
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
@@ -287,7 +287,9 @@ fn build_combination(
     let mut total_mmr_weighted = 0;
 
     for assignment in &team_assignments {
-        let lobby = lobbies.iter().find(|l| l.lobby_code == assignment.lobby_code)?;
+        let lobby = lobbies
+            .iter()
+            .find(|l| l.lobby_code == assignment.lobby_code)?;
         total_players += assignment.member_indices.len();
         total_mmr_weighted += lobby.avg_mmr * assignment.member_indices.len() as i32;
     }
@@ -902,7 +904,9 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        ).await {
+        )
+        .await
+        {
             Ok(game_id) => {
                 games_created += 1;
                 info!(
@@ -1094,7 +1098,8 @@ async fn publish_lobby_match_notifications(
     let partition_id = game_id % PARTITION_COUNT;
 
     for lobby in lobbies {
-        let channel = crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby.lobby_code);
+        let channel =
+            crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby.lobby_code);
         let notification = serde_json::json!({
             "type": "MatchFound",
             "game_id": game_id,
@@ -1201,12 +1206,12 @@ mod tests {
                 LobbyMember {
                     user_id: 10,
                     username: "player_one".to_string(),
-                    ts: 123.0
+                    ts: 123.0,
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
-                    ts: 124.0
+                    ts: 124.0,
                 },
             ],
             avg_mmr: 1200,

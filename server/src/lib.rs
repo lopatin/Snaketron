@@ -14,10 +14,10 @@ pub mod redis_utils;
 pub mod region_cache;
 pub mod replay;
 pub mod replication;
+pub mod user_cache;
 pub mod ws_matchmaking;
 pub mod ws_server;
 pub mod xp_persistence;
-pub mod user_cache;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

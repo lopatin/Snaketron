@@ -1,13 +1,13 @@
 use anyhow::{Context, Result, anyhow, bail};
+use indexmap::IndexMap;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value as JsonValue, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex};
 use std::sync::RwLock;
-use indexmap::IndexMap;
-use redis::aio::ConnectionManager;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval};
@@ -47,11 +47,11 @@ impl std::str::FromStr for MemberValue {
         let (user_id, websocket_id) = s
             .split_once(':')
             .ok_or(anyhow!("Invalid member value format"))?;
-        
+
         let user_id: u32 = user_id
             .parse()
             .map_err(|_| anyhow!("Invalid user_id in member value"))?;
-        
+
         Ok(MemberValue {
             user_id,
             websocket_id: websocket_id.to_string(),
@@ -136,7 +136,7 @@ impl Default for LobbyPreferences {
 
 struct LobbyBroadcaster {
     tx: Sender<Lobby>,
-    receiver_count: usize
+    receiver_count: usize,
 }
 
 type LobbyBroadcasters = RwLock<HashMap<String, LobbyBroadcaster>>;
@@ -155,10 +155,7 @@ impl LobbyManager {
             redis: redis.clone(),
             db: db.clone(),
             lobby_broadcasters: RwLock::new(HashMap::new()),
-            user_cache: Arc::new(UserCache::new(
-                redis.clone(),
-                db.clone(),
-            )),
+            user_cache: Arc::new(UserCache::new(redis.clone(), db.clone())),
         }
     }
 
@@ -213,17 +210,18 @@ impl LobbyManager {
         let mut redis = self.redis.clone();
         let metadata_key = RedisKeys::lobby_metadata(&metadata.lobby_code);
 
-        redis.hset_multiple::<_, _, _, ()>(
-            &metadata_key,
-            &[
-                ("hostUserId", metadata.host_user_id.to_string()),
-                ("region", metadata.region.to_string()),
-                ("createdAt", metadata.created_at.to_rfc3339()),
-                ("state", metadata.state.to_string()),
-            ],
-        )
-        .await
-        .context("Failed to store lobby metadata")?;
+        redis
+            .hset_multiple::<_, _, _, ()>(
+                &metadata_key,
+                &[
+                    ("hostUserId", metadata.host_user_id.to_string()),
+                    ("region", metadata.region.to_string()),
+                    ("createdAt", metadata.created_at.to_rfc3339()),
+                    ("state", metadata.state.to_string()),
+                ],
+            )
+            .await
+            .context("Failed to store lobby metadata")?;
 
         Ok(())
     }
@@ -244,11 +242,11 @@ impl LobbyManager {
             self.create_lobby(user_id, &region).await?
         };
 
-        let member_value = MemberValue { 
-            user_id: user_id as u32, 
-            websocket_id: websocket_id.clone()
+        let member_value = MemberValue {
+            user_id: user_id as u32,
+            websocket_id: websocket_id.clone(),
         };
-        
+
         self.touch_lobby(&lobby.lobby_code, Some(member_value.clone()))
             .await
             .context("Failed to touch lobby on join")?;
@@ -261,13 +259,13 @@ impl LobbyManager {
             loop {
                 interval.tick().await;
                 if let Err(err) = self_for_heartbeat
-                    .touch_lobby(lobby_code_for_heartbeat.as_str(), Some(member_value.clone()))
+                    .touch_lobby(
+                        lobby_code_for_heartbeat.as_str(),
+                        Some(member_value.clone()),
+                    )
                     .await
                 {
-                    error!(
-                        "Failed to send heartbeat for user {}: {}",
-                        user_id, err
-                    );
+                    error!("Failed to send heartbeat for user {}: {}", user_id, err);
                 }
             }
         });
@@ -277,10 +275,15 @@ impl LobbyManager {
         // Subscribe to lobby updates
         let rx = {
             let broadcasters = &mut self.lobby_broadcasters.write().unwrap();
-            let broadcaster = broadcasters.entry(lobby.lobby_code.clone()).or_insert_with(|| {
-                let (tx, _) = tokio::sync::broadcast::channel(100);
-                LobbyBroadcaster { tx, receiver_count: 0 }
-            });
+            let broadcaster = broadcasters
+                .entry(lobby.lobby_code.clone())
+                .or_insert_with(|| {
+                    let (tx, _) = tokio::sync::broadcast::channel(100);
+                    LobbyBroadcaster {
+                        tx,
+                        receiver_count: 0,
+                    }
+                });
             broadcaster.receiver_count += 1;
             broadcaster.tx.subscribe()
         };
@@ -346,7 +349,7 @@ impl LobbyManager {
         if !redis
             .exists(&metadata_key)
             .await
-            .context("Failed to check lobby existence")? 
+            .context("Failed to check lobby existence")?
         {
             return Ok(None);
         }
@@ -394,7 +397,8 @@ impl LobbyManager {
             RedisKeys::lobby_chat_history_key(lobby_code),
         ];
 
-        self.redis.clone()
+        self.redis
+            .clone()
             .del::<_, ()>(keys)
             .await
             .context("Failed to delete lobby keys from Redis")?;
@@ -465,18 +469,24 @@ impl LobbyManager {
             .zrange_withscores(&members_key, 0, -1)
             .await
             .context("Failed to get lobby members from sorted set")?;
-        
-        let user_ids: Vec<u32> = members_with_scores.iter()
+
+        let user_ids: Vec<u32> = members_with_scores
+            .iter()
             .map(|(member_value, score)| {
-                member_value.splitn(2, ':')
+                member_value
+                    .splitn(2, ':')
                     .nth(0)
                     .and_then(|id_str| id_str.parse::<u32>().ok())
             })
             .flatten()
             .collect();
-        
-        let users = self.user_cache
-            .get_all(&user_ids).await?.iter().flatten() 
+
+        let users = self
+            .user_cache
+            .get_all(&user_ids)
+            .await?
+            .iter()
+            .flatten()
             .map(|u| (u.id as u32, u.username.clone()))
             .collect::<HashMap<u32, String>>();
 
@@ -484,34 +494,54 @@ impl LobbyManager {
         let mut members: BTreeMap<u32, LobbyMember> = BTreeMap::new();
 
         for (member_value, score) in members_with_scores {
-            let user_id: Option<u32> = member_value.splitn(2, ':')
+            let user_id: Option<u32> = member_value
+                .splitn(2, ':')
                 .nth(0)
                 .map(|id_str| id_str.parse::<u32>().ok())
                 .flatten();
-            
-            if let(Some(user_id)) = user_id {
+
+            if let (Some(user_id)) = user_id {
                 if let Some(user) = users.get(&user_id) {
                     let username = user.clone();
-                    
+
                     // Keep entry with highest score (most recent heartbeat)
-                    members.entry(user_id)
+                    members
+                        .entry(user_id)
                         .and_modify(|existing| {
                             if score > existing.ts {
-                                *existing = LobbyMember { user_id, username: username.clone(), ts: score, }
+                                *existing = LobbyMember {
+                                    user_id,
+                                    username: username.clone(),
+                                    ts: score,
+                                }
                             }
                         })
-                        .or_insert(LobbyMember { user_id, username: username.clone(), ts: score, });
+                        .or_insert(LobbyMember {
+                            user_id,
+                            username: username.clone(),
+                            ts: score,
+                        });
                 } else {
-                    warn!("Username not found in cache for user_id {} in lobby '{}'", user_id, lobby_code);
+                    warn!(
+                        "Username not found in cache for user_id {} in lobby '{}'",
+                        user_id, lobby_code
+                    );
                     continue;
                 }
             } else {
-                warn!("Invalid member value format in lobby '{}': {}", lobby_code, member_value);
+                warn!(
+                    "Invalid member value format in lobby '{}': {}",
+                    lobby_code, member_value
+                );
                 continue;
             }
         }
 
-        debug!("Found {} unique members in lobby '{}'", members.len(), lobby_code);
+        debug!(
+            "Found {} unique members in lobby '{}'",
+            members.len(),
+            lobby_code
+        );
         Ok(members)
     }
 
@@ -526,7 +556,8 @@ impl LobbyManager {
         let payload =
             serde_json::to_string(preferences).context("Failed to serialize lobby preferences")?;
 
-        redis.set::<_, _, ()>(&key, payload)
+        redis
+            .set::<_, _, ()>(&key, payload)
             .await
             .context("Failed to store lobby preferences")?;
 
@@ -564,39 +595,44 @@ impl LobbyManager {
             Ok(LobbyPreferences::default())
         }
     }
-    
+
     async fn touch_lobby(&self, lobby_code: &str, member: Option<MemberValue>) -> Result<()> {
         let mut redis = self.redis.clone();
         let expires_at = chrono::Utc::now().timestamp_millis() + 30000;
-        
+
         let members_key = RedisKeys::lobby_members_set(lobby_code);
 
         // Add member to sorted set with expiration timestamp as score
         if let Some(member) = member {
-            redis.zadd::<_, _, _, ()>(&members_key, member.to_string(), expires_at)
+            redis
+                .zadd::<_, _, _, ()>(&members_key, member.to_string(), expires_at)
                 .await
                 .context("Failed to add lobby member to sorted set")?;
         }
 
-        redis.expire::<_, ()>(&members_key, 30)
+        redis
+            .expire::<_, ()>(&members_key, 30)
             .await
             .context("Failed to set TTL on lobby members set")?;
 
         let metadata_key = RedisKeys::lobby_metadata(lobby_code);
-        redis.expire::<_, ()>(&metadata_key, 30)
+        redis
+            .expire::<_, ()>(&metadata_key, 30)
             .await
             .context("Failed to set TTL on lobby metadata")?;
 
         let preferences_key = RedisKeys::lobby_preferences(lobby_code);
-        redis.expire::<_, ()>(&preferences_key, 30)
+        redis
+            .expire::<_, ()>(&preferences_key, 30)
             .await
             .context("Failed to set TTL on lobby preferences")?;
 
         let chat_history_key = RedisKeys::lobby_chat_history_key(lobby_code);
-        redis.expire::<_, ()>(&chat_history_key, 30)
+        redis
+            .expire::<_, ()>(&chat_history_key, 30)
             .await
             .context("Failed to set TTL on lobby chat history")?;
-        
+
         Ok(())
     }
 
@@ -625,7 +661,11 @@ impl LobbyManager {
 
     /// Helper to remove a key from Redis
     async fn remove_from_redis(&mut self, key: &str) -> Result<()> {
-        let _: () = self.redis.del(key).await.context("Failed to delete Redis key")?;
+        let _: () = self
+            .redis
+            .del(key)
+            .await
+            .context("Failed to delete Redis key")?;
         Ok(())
     }
 
@@ -647,7 +687,12 @@ impl LobbyManager {
                     let prefix: String = parts[0].chars().take(2).collect();
                     let suffix: String = parts[1].chars().take(1).collect();
                     let number = parts.get(2).unwrap_or(&"1");
-                    format!("{}{}{}", prefix.to_uppercase(), suffix.to_uppercase(), number)
+                    format!(
+                        "{}{}{}",
+                        prefix.to_uppercase(),
+                        suffix.to_uppercase(),
+                        number
+                    )
                 } else {
                     // Fallback to first 4 characters
                     region.chars().take(4).collect::<String>().to_uppercase()
@@ -676,7 +721,11 @@ impl LobbyManager {
 
     /// Generate a unique lobby code with collision detection
     /// Retries up to max_attempts times if a collision is detected
-    async fn generate_unique_lobby_code(&self, region: &str, max_attempts: usize) -> Result<String> {
+    async fn generate_unique_lobby_code(
+        &self,
+        region: &str,
+        max_attempts: usize,
+    ) -> Result<String> {
         use redis::AsyncCommands;
         let mut redis = self.redis.clone();
 
@@ -691,7 +740,11 @@ impl LobbyManager {
                 .context("Failed to check lobby existence")?;
 
             if !exists {
-                debug!("Generated unique lobby code '{}' on attempt {}", code, attempt + 1);
+                debug!(
+                    "Generated unique lobby code '{}' on attempt {}",
+                    code,
+                    attempt + 1
+                );
                 return Ok(code);
             }
 
@@ -720,7 +773,9 @@ impl LobbyManager {
             }))
             .context("Failed to serialize lobby deletion notification")?,
         };
-        let _: () = self.redis.clone()
+        let _: () = self
+            .redis
+            .clone()
             .publish(RedisKeys::lobby_updates_channel(), payload)
             .await
             .context("Failed to publish lobby update")?;

@@ -1,26 +1,25 @@
+use crate::game_executor::StreamEvent;
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use common::{GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus};
 use futures_util::{Stream, StreamExt};
 use redis::aio::{ConnectionManager, PubSub};
 use redis::{AsyncCommands, Client, PushInfo, PushKind, Value};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::de::DeserializeOwned;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use crate::game_executor::StreamEvent;
 
 pub struct ChannelReceiver {
     inner: tokio::sync::broadcast::Receiver<PushInfo>,
     channel: String,
 }
 
-impl ChannelReceiver
-{
+impl ChannelReceiver {
     pub async fn recv<T>(&mut self) -> Result<T>
     where
         T: DeserializeOwned + Send + 'static,
@@ -36,24 +35,28 @@ impl ChannelReceiver
                 continue;
             };
 
-            let channel = String::from_utf8(ch.clone())
-                .context("Failed to parse channel name as UTF-8")?;
+            let channel =
+                String::from_utf8(ch.clone()).context("Failed to parse channel name as UTF-8")?;
 
             if channel != self.channel {
                 continue;
             }
 
-            let payload_str = String::from_utf8(payload.clone())
-                .context("Failed to parse payload as UTF-8")?;
+            let payload_str =
+                String::from_utf8(payload.clone()).context("Failed to parse payload as UTF-8")?;
 
-            let msg = serde_json::from_slice::<T>(payload)
-                .map_err(|e| anyhow!("Failed to deserialize message from channel {}: {}", channel, e))?;
+            let msg = serde_json::from_slice::<T>(payload).map_err(|e| {
+                anyhow!(
+                    "Failed to deserialize message from channel {}: {}",
+                    channel,
+                    e
+                )
+            })?;
 
             return Ok(msg);
         }
     }
 }
-
 
 /// Snapshot request message for a partition
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,13 +102,14 @@ impl PubSubManager {
         pubsub_tx: tokio::sync::broadcast::Sender<PushInfo>,
         cancellation_token: CancellationToken,
     ) -> Self {
-        Self { redis, pubsub_tx, cancellation_token }
+        Self {
+            redis,
+            pubsub_tx,
+            cancellation_token,
+        }
     }
 
-    pub async fn subscribe_to_channel(
-        &mut self,
-        channel: &str,
-    ) -> Result<ChannelReceiver> {
+    pub async fn subscribe_to_channel(&mut self, channel: &str) -> Result<ChannelReceiver> {
         // Subscribe to the redis channel
         self.redis.subscribe(channel).await?;
 
@@ -125,7 +129,8 @@ impl PubSubManager {
         let channel = RedisKeys::partition_events(partition_id);
         let data = serde_json::to_vec(event).context("Failed to serialize event")?;
 
-        let _: () = self.redis
+        let _: () = self
+            .redis
             .publish(&channel, data)
             .await
             .context("Failed to publish event")?;
@@ -168,8 +173,8 @@ impl PubSubManager {
 
         // Also store in Redis with TTL (5 minutes)
         let key = RedisKeys::game_snapshot(game_id);
-        let snapshot_data = serde_json::to_vec(snapshot)
-            .context("Failed to serialize snapshot for storage")?;
+        let snapshot_data =
+            serde_json::to_vec(snapshot).context("Failed to serialize snapshot for storage")?;
         let _: () = redis
             .set_ex(&key, snapshot_data, 300)
             .await
@@ -191,10 +196,10 @@ impl PubSubManager {
             requester_id: None,
         };
 
-        let data = serde_json::to_vec(&request)
-            .context("Failed to serialize snapshot request")?;
+        let data = serde_json::to_vec(&request).context("Failed to serialize snapshot request")?;
 
-        let _: () = self.redis
+        let _: () = self
+            .redis
             .publish(&channel, data)
             .await
             .context("Failed to publish snapshot request")?;
@@ -205,7 +210,8 @@ impl PubSubManager {
 
     /// Get stored snapshot from Redis
     pub async fn get_stored_snapshot(&mut self, game_id: u32) -> Result<Option<GameState>> {
-        let data: Option<Vec<u8>> = self.redis
+        let data: Option<Vec<u8>> = self
+            .redis
             .get(RedisKeys::game_snapshot(game_id))
             .await
             .context("Failed to get snapshot from Redis")?;
@@ -233,14 +239,17 @@ impl PubSubManager {
         // Spawn task to handle PubSub connection
         let mut self_for_subscription = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = self_for_subscription.handle_partition_subscription(
-                RedisKeys::partition_events(partition_id),
-                RedisKeys::partition_commands(partition_id),
-                RedisKeys::snapshot_requests(partition_id),
-                event_tx,
-                command_tx,
-                request_tx,
-            ).await {
+            if let Err(e) = self_for_subscription
+                .handle_partition_subscription(
+                    RedisKeys::partition_events(partition_id),
+                    RedisKeys::partition_commands(partition_id),
+                    RedisKeys::snapshot_requests(partition_id),
+                    event_tx,
+                    command_tx,
+                    request_tx,
+                )
+                .await
+            {
                 error!("Partition subscription handler failed: {}", e);
             }
         });
@@ -328,19 +337,19 @@ impl PubSubManager {
         request_tx: mpsc::Sender<SnapshotRequest>,
     ) -> Result<()> {
         // Spawn all three channel handlers
-        let events_handle = self.spawn_channel_handler(
-            event_channel, event_tx, "Events").await?;
-        let commands_handle = self.spawn_channel_handler(
-            command_channel, command_tx, "Commands").await?;
-        let requests_handle = self.spawn_channel_handler(
-            request_channel, request_tx, "Requests").await?;
+        let events_handle = self
+            .spawn_channel_handler(event_channel, event_tx, "Events")
+            .await?;
+        let commands_handle = self
+            .spawn_channel_handler(command_channel, command_tx, "Commands")
+            .await?;
+        let requests_handle = self
+            .spawn_channel_handler(request_channel, request_tx, "Requests")
+            .await?;
 
         // Wait for all tasks to complete
-        let (events_result, commands_result, requests_result) = tokio::join!(
-            events_handle,
-            commands_handle,
-            requests_handle
-        );
+        let (events_result, commands_result, requests_result) =
+            tokio::join!(events_handle, commands_handle, requests_handle);
 
         // Log task panics
         if let Err(e) = events_result {

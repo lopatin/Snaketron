@@ -5,7 +5,6 @@ use std::hash::{Hash, Hasher};
 pub struct RedisKeys;
 
 impl RedisKeys {
-
     // === Matchmaking Keys ===
 
     /// Hash a game type to a consistent identifier
@@ -22,10 +21,7 @@ impl RedisKeys {
     }
 
     /// Queue for a specific game type and queue mode
-    pub fn matchmaking_queue(
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-    ) -> String {
+    pub fn matchmaking_queue(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
         let hash = Self::hash_game_type(game_type);
         let mode_str = match queue_mode {
             common::QueueMode::Quickmatch => "quick",
@@ -45,10 +41,7 @@ impl RedisKeys {
     }
 
     /// MMR index for a game type and queue mode
-    pub fn matchmaking_mmr_index(
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-    ) -> String {
+    pub fn matchmaking_mmr_index(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
         let hash = Self::hash_game_type(game_type);
         let mode_str = match queue_mode {
             common::QueueMode::Quickmatch => "quick",
@@ -83,10 +76,7 @@ impl RedisKeys {
     }
 
     /// Lobby queue for a specific game type and queue mode
-    pub fn matchmaking_lobby_queue(
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-    ) -> String {
+    pub fn matchmaking_lobby_queue(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
         let hash = Self::hash_game_type(game_type);
         let mode_str = match queue_mode {
             common::QueueMode::Quickmatch => "quick",
@@ -112,7 +102,7 @@ impl RedisKeys {
     pub fn matchmaking_lobby_notification_channel(lobby_code: &str) -> String {
         format!("matchmaking:lobby:notification:{}", lobby_code)
     }
-    
+
     // === User Cache ===
     pub fn user(user_id: u32) -> String {
         format!("user:{}", user_id)
@@ -212,8 +202,14 @@ mod tests {
             RedisKeys::matchmaking_active_matches(),
             "matchmaking:matches:active"
         );
-        assert_eq!(RedisKeys::matchmaking_user_status(123), "matchmaking:user:123");
-        assert_eq!(RedisKeys::partition_events(0), "snaketron:events:partition:0");
+        assert_eq!(
+            RedisKeys::matchmaking_user_status(123),
+            "matchmaking:user:123"
+        );
+        assert_eq!(
+            RedisKeys::partition_events(0),
+            "snaketron:events:partition:0"
+        );
 
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };
