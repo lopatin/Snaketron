@@ -1559,9 +1559,7 @@ async fn process_ws_message(
                         &metadata,
                         &ws_tx,
                         nickname,
-                    )
-                    .await
-                    {
+                    ).await {
                         error!(
                             "Failed to update guest nickname for user {}: {}",
                             metadata.user_id, e
@@ -1591,8 +1589,7 @@ async fn process_ws_message(
                                             selected_modes,
                                             competitive,
                                         },
-                                    )
-                                    .await?;
+                                    ).await?;
                             } else {
                                 let json_msg = serde_json::to_string(&WSMessage::AccessDenied {
                                     reason: "Only the host can update lobby settings".to_string(),
@@ -2424,43 +2421,38 @@ async fn process_ws_message(
                                     region.to_string(),
                                 )
                                 .await
-                                {
-                                    Ok(handle) => handle,
-                                    Err(e) => {
-                                        let err_text = e.to_string();
-                                        let response = if err_text
-                                            .to_lowercase()
-                                            .contains("not found")
-                                        {
-                                            warn!(
-                                                "Lobby '{}' missing when user {} attempted to join",
-                                                lobby_code, metadata.user_id
-                                            );
-                                            WSMessage::AccessDenied {
-                                                reason: format!(
-                                                    "Lobby '{}' does not exist",
-                                                    lobby_code
-                                                ),
-                                            }
-                                        } else {
-                                            error!("Failed to join lobby: {}", err_text);
-                                            WSMessage::AccessDenied {
-                                                reason: format!(
-                                                    "Failed to join lobby: {}",
-                                                    err_text
-                                                ),
-                                            }
-                                        };
-                                        let json_msg = serde_json::to_string(&response)?;
-                                        ws_tx.send(Message::Text(json_msg.into())).await?;
-                                        return Ok(ConnectionState::Authenticated {
-                                            metadata,
-                                            lobby_handle: None,
-                                            game_id,
-                                            websocket_id,
-                                        });
-                                    }
-                                };
+                            {
+                                Ok(handle) => handle,
+                                Err(e) => {
+                                    let err_text = e.to_string();
+                                    let response = if err_text.to_lowercase().contains("not found")
+                                    {
+                                        warn!(
+                                            "Lobby '{}' missing when user {} attempted to join",
+                                            lobby_code, metadata.user_id
+                                        );
+                                        WSMessage::AccessDenied {
+                                            reason: format!(
+                                                "Lobby '{}' does not exist",
+                                                lobby_code
+                                            ),
+                                        }
+                                    } else {
+                                        error!("Failed to join lobby: {}", err_text);
+                                        WSMessage::AccessDenied {
+                                            reason: format!("Failed to join lobby: {}", err_text),
+                                        }
+                                    };
+                                    let json_msg = serde_json::to_string(&response)?;
+                                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                                    return Ok(ConnectionState::Authenticated {
+                                        metadata,
+                                        lobby_handle: None,
+                                        game_id,
+                                        websocket_id,
+                                    });
+                                }
+                            };
 
                             // Send success response
                             let response = WSMessage::JoinedLobby {

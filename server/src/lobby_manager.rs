@@ -1,22 +1,21 @@
 use anyhow::{Context, Result, anyhow, bail};
-use indexmap::IndexMap;
+use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Value as JsonValue, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::DerefMut;
+use serde_json::{self, json};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::db::{Database, models::LobbyMetadata};
-use crate::lobby_manager;
+use crate::lobby_manager::LeaveLobbyResult::LobbyDeleted;
+use crate::lobby_manager::LobbyEvent::{LobbyDelete, LobbyUpdate};
+use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
-use crate::redis_utils::create_connection_manager;
 use crate::user_cache::UserCache;
 
 /// Lobby member information stored in Redis
@@ -67,6 +66,12 @@ pub struct Lobby {
     pub host_user_id: i32,
     pub state: String,
     pub preferences: LobbyPreferences,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LobbyEvent {
+    LobbyUpdate { lobby: Lobby },
+    LobbyDelete { lobby_code: String, state: String },
 }
 
 impl Lobby {
@@ -147,15 +152,127 @@ pub struct LobbyManager {
     db: Arc<dyn Database>,
     lobby_broadcasters: LobbyBroadcasters,
     user_cache: Arc<UserCache>,
+    pubsub_manager: Arc<PubSubManager>,
 }
 
 impl LobbyManager {
-    pub fn new(redis: ConnectionManager, db: Arc<dyn Database>) -> Self {
+    pub fn new(
+        redis: ConnectionManager,
+        db: Arc<dyn Database>,
+        pubsub_manager: Arc<PubSubManager>,
+    ) -> Self {
         Self {
             redis: redis.clone(),
             db: db.clone(),
             lobby_broadcasters: RwLock::new(HashMap::new()),
             user_cache: Arc::new(UserCache::new(redis.clone(), db.clone())),
+            pubsub_manager,
+        }
+    }
+
+    /// Start the background task that forwards Redis lobby updates to local subscribers
+    pub fn start_lobby_update_forwarder(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.lobby_update_forwarder_loop().await;
+        });
+    }
+
+    async fn lobby_update_forwarder_loop(self: Arc<Self>) {
+        let channel = RedisKeys::lobby_updates_channel();
+
+        loop {
+            let mut pubsub_manager = (*self.pubsub_manager).clone();
+            match pubsub_manager.subscribe_to_channel(&channel).await {
+                Ok(mut receiver) => {
+                    info!(
+                        "Subscribed to lobby updates channel '{}' for local forwarding",
+                        channel
+                    );
+
+                    loop {
+                        match receiver.recv::<LobbyEvent>().await {
+                            Ok(LobbyUpdate { lobby }) => {
+                                debug!(
+                                    "Received lobby update for '{}' from Redis",
+                                    lobby.lobby_code
+                                );
+                                self.forward_lobby_to_broadcasters(lobby);
+                            }
+                            Ok(LobbyDelete { lobby_code, state }) => {
+                                debug!(
+                                    "Received lobby deletion for '{}' from Redis",
+                                    lobby_code
+                                );
+                                self.handle_lobby_deletion(&lobby_code, &state);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Lobby updates subscription error on channel '{}': {}",
+                                    channel, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to subscribe to lobby updates channel '{}': {}",
+                        channel, e
+                    );
+                }
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    fn forward_lobby_to_broadcasters(&self, lobby: Lobby) {
+        let lobby_code = lobby.lobby_code.clone();
+        let broadcasters = self.lobby_broadcasters.read().unwrap();
+        
+        debug!(
+            "Forwarding lobby update for '{}' to {} local receivers",
+            lobby_code,
+            broadcasters
+                .get(&lobby_code)
+                .map(|b| b.receiver_count)
+                .unwrap_or(0)
+        );
+
+        if let Some(broadcaster) = broadcasters.get(&lobby_code) {
+            if let Err(err) = broadcaster.tx.send(lobby) {
+                error!(
+                    "Failed to forward lobby update for '{}' to local receivers: {}",
+                    lobby_code, err
+                );
+            }
+        }
+    }
+
+    fn handle_lobby_deletion(&self, lobby_code: &str, state: &str) {
+        if state != "deleted" {
+            debug!(
+                "Ignoring unsupported lobby state message for '{}': {}",
+                lobby_code, state
+            );
+            return;
+        }
+
+        // Send a terminal update so clients can react to deletion
+        let placeholder = Lobby {
+            lobby_code: lobby_code.to_string(),
+            members: BTreeMap::new(),
+            host_user_id: 0,
+            state: state.to_string(),
+            preferences: LobbyPreferences::default(),
+        };
+        self.forward_lobby_to_broadcasters(placeholder);
+
+        let mut broadcasters = self.lobby_broadcasters.write().unwrap();
+        if broadcasters.remove(lobby_code).is_some() {
+            debug!("Removed broadcaster for deleted lobby '{}'", lobby_code);
         }
     }
 
@@ -287,7 +404,7 @@ impl LobbyManager {
             broadcaster.receiver_count += 1;
             broadcaster.tx.subscribe()
         };
-        
+
         self.publish_lobby_update(&lobby.lobby_code).await?;
 
         // Store the handle
@@ -353,8 +470,11 @@ impl LobbyManager {
             .await
             .context("Failed to check lobby existence")?
         {
+            warn!("Lobby '{}' does not exist in Redis", lobby_code);
             return Ok(None);
         }
+        
+        info!("Fetching metadata for lobby '{}'", lobby_code);
 
         // Fetch all metadata fields
         let data: HashMap<String, String> = redis
@@ -601,6 +721,11 @@ impl LobbyManager {
     async fn touch_lobby(&self, lobby_code: &str, member: Option<MemberValue>) -> Result<()> {
         let mut redis = self.redis.clone();
         let expires_at = chrono::Utc::now().timestamp_millis() + 30000;
+        
+        debug!(
+            "Touching lobby '{}' with expires_at {}",
+            lobby_code, expires_at
+        );
 
         let members_key = RedisKeys::lobby_members_set(lobby_code);
 
@@ -767,16 +892,14 @@ impl LobbyManager {
     /// Publish a lobby update to the lobby's Redis pub/sub channel
     pub async fn publish_lobby_update(&self, lobby_code: &str) -> Result<()> {
         let payload = match self.get_lobby_opt(lobby_code).await? {
-            Some(lobby) => serde_json::to_string(&lobby)
+            Some(lobby) => serde_json::to_string(&LobbyUpdate { lobby })
                 .context("Failed to serialize lobby for update notification")?,
-            None => serde_json::to_string(&json!({
-                "lobby_code": lobby_code,
-                "state": "deleted"
-            }))
-            .context("Failed to serialize lobby deletion notification")?,
+            None => serde_json::to_string(&LobbyDelete { 
+                lobby_code: lobby_code.to_string(),
+                state: "deleted".to_string(),
+            }).context("Failed to serialize lobby deletion notification")?,
         };
-        let _: () = self
-            .redis
+        let _: () = self .redis
             .clone()
             .publish(RedisKeys::lobby_updates_channel(), payload)
             .await

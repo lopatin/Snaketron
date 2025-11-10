@@ -130,12 +130,13 @@ impl GameServer {
         drop(pubsub_rx);
 
         // Ensure RESP3 protocol is enabled for push notifications
-        let redis_url = if !redis_url.contains("protocol=resp3") && !redis_url.contains("protocol=3") {
-            let separator = if redis_url.contains('?') { "&" } else { "?" };
-            format!("{}{}protocol=resp3", redis_url, separator)
-        } else {
-            redis_url
-        };
+        let redis_url =
+            if !redis_url.contains("protocol=resp3") && !redis_url.contains("protocol=3") {
+                let separator = if redis_url.contains('?') { "&" } else { "?" };
+                format!("{}{}protocol=resp3", redis_url, separator)
+            } else {
+                redis_url
+            };
         info!("Using Redis URL: {}", redis_url);
 
         // Create the Redis client and connection manager
@@ -152,7 +153,12 @@ impl GameServer {
         ));
 
         // Create the LobbyManager
-        let lobby_manager = Arc::new(LobbyManager::new(redis.clone(), db.clone()));
+        let lobby_manager = Arc::new(LobbyManager::new(
+            redis.clone(),
+            db.clone(),
+            pubsub_manager.clone(),
+        ));
+        lobby_manager.start_lobby_update_forwarder();
 
         // Create the matchmaking manager
         let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(

@@ -939,8 +939,24 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           : typeof payload.lobby_id === 'string'
             ? parseInt(payload.lobby_id, 10)
             : NaN;
+      const lobbyCode =
+        typeof payload.lobby_code === 'string' && payload.lobby_code.trim()
+          ? payload.lobby_code.trim().toUpperCase()
+          : null;
 
-      if (!Number.isFinite(lobbyId)) {
+      const currentLobbySnapshot = currentLobbyRef.current;
+      if (!currentLobbySnapshot) {
+        return;
+      }
+
+      const matchesById =
+        Number.isFinite(lobbyId) && currentLobbySnapshot.id === lobbyId;
+      const matchesByCode =
+        lobbyCode !== null &&
+        typeof currentLobbySnapshot.code === 'string' &&
+        currentLobbySnapshot.code.toUpperCase() === lobbyCode;
+
+      if (!matchesById && !matchesByCode) {
         return;
       }
 
@@ -958,7 +974,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       setLobbyPreferences(normalizeLobbyPreferences(payload.preferences));
 
       setCurrentLobby((previous) => {
-        if (!previous || previous.id !== lobbyId) {
+        if (!previous) {
+          return previous;
+        }
+
+        const previousMatchesById =
+          Number.isFinite(lobbyId) && previous.id === lobbyId;
+        const previousMatchesByCode =
+          lobbyCode !== null &&
+          typeof previous.code === 'string' &&
+          previous.code.toUpperCase() === lobbyCode;
+
+        if (!previousMatchesById && !previousMatchesByCode) {
           return previous;
         }
 
