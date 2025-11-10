@@ -87,7 +87,7 @@ pub struct LobbyJoinHandle {
 }
 
 impl LobbyJoinHandle {
-    pub async fn close(&mut self) -> Result<()> {
+    pub async fn close(&mut self) -> Result<LeaveLobbyResult> {
         self.heartbeat_task.abort();
         self.return_to_manager();
         self.lobby_manager
@@ -109,6 +109,12 @@ impl Drop for LobbyJoinHandle {
         self.heartbeat_task.abort();
         self.return_to_manager();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaveLobbyResult {
+    StillActive,
+    LobbyDeleted,
 }
 
 /// Host-selected matchmaking preferences for a lobby
@@ -398,16 +404,48 @@ impl LobbyManager {
     }
 
     /// Stop heartbeat and remove from Redis
-    pub async fn leave_lobby(&self, lobby_code: &str, user_id: i32, websocket_id: &str) -> Result<()> {
+    pub async fn leave_lobby(
+        &self,
+        lobby_code: &str,
+        user_id: i32,
+        websocket_id: &str,
+    ) -> Result<LeaveLobbyResult> {
         let mut redis = self.redis.clone();
 
-        // Remove from Redis sorted set
         let members_key = RedisKeys::lobby_members_set(lobby_code);
         let member_value = format!("{}:{}", user_id, websocket_id);
-        redis.zrem::<_, _, ()>(&members_key, &member_value).await?;
-        
-        // Publish lobby update
-        self.publish_lobby_update(lobby_code).await
+        redis
+            .zrem::<_, _, ()>(&members_key, &member_value)
+            .await
+            .context("Failed to remove lobby member from Redis")?;
+
+        // Drop any expired members before checking if the lobby is empty
+        let now = chrono::Utc::now().timestamp_millis();
+        let _: () = redis
+            .zrembyscore(&members_key, "-inf", now)
+            .await
+            .context("Failed to remove expired lobby members")?;
+
+        let remaining: i64 = redis
+            .zcard(&members_key)
+            .await
+            .context("Failed to fetch lobby member count")?;
+
+        let result = if remaining == 0 {
+            self.delete_lobby(lobby_code).await?;
+            LeaveLobbyResult::LobbyDeleted
+        } else {
+            LeaveLobbyResult::StillActive
+        };
+
+        if let Err(e) = self.publish_lobby_update(lobby_code).await {
+            warn!(
+                "Failed to publish lobby update after member leave for lobby '{}': {}",
+                lobby_code, e
+            );
+        }
+
+        Ok(result)
     }
 
     /// Get all active members of a lobby from Redis
@@ -673,11 +711,17 @@ impl LobbyManager {
 
     /// Publish a lobby update to the lobby's Redis pub/sub channel
     pub async fn publish_lobby_update(&self, lobby_code: &str) -> Result<()> {
-        let lobby = self.get_lobby(lobby_code).await?;
-        let lobby_json = serde_json::to_string(&lobby)
-            .context("Failed to serialize lobby for update notification")?;
+        let payload = match self.get_lobby_opt(lobby_code).await? {
+            Some(lobby) => serde_json::to_string(&lobby)
+                .context("Failed to serialize lobby for update notification")?,
+            None => serde_json::to_string(&json!({
+                "lobby_code": lobby_code,
+                "state": "deleted"
+            }))
+            .context("Failed to serialize lobby deletion notification")?,
+        };
         let _: () = self.redis.clone()
-            .publish(RedisKeys::lobby_updates_channel(), lobby_json)
+            .publish(RedisKeys::lobby_updates_channel(), payload)
             .await
             .context("Failed to publish lobby update")?;
         debug!("Published update notification to lobby '{}'", lobby_code);
@@ -693,4 +737,3 @@ impl LobbyManager {
         }
     }
 }
-

@@ -33,7 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tungstenite::Utf8Bytes;
-use crate::lobby_manager::LobbyJoinHandle;
+use crate::lobby_manager::{LobbyJoinHandle, LeaveLobbyResult};
 use crate::user_cache::UserCache;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -857,7 +857,24 @@ async fn handle_websocket_connection(
     // Leave lobby if still in one
     match state {
         ConnectionState::Authenticated { lobby_handle: Some(mut lobby_handle), .. } => {
-            lobby_handle.close().await?;
+            let lobby_code = lobby_handle.lobby_code.clone();
+            if let LeaveLobbyResult::LobbyDeleted = lobby_handle.close().await? {
+                let mut mm = matchmaking_manager.lock().await;
+                if let Err(e) = mm
+                    .remove_lobby_from_all_queues_by_code(&lobby_code)
+                    .await
+                {
+                    warn!(
+                        "Failed to remove empty lobby {} from matchmaking queues during cleanup: {}",
+                        lobby_code, e
+                    );
+                } else {
+                    info!(
+                        "Removed empty lobby {} from all matchmaking queues during cleanup",
+                        lobby_code
+                    );
+                }
+            }
         }
         _ => {}
     }

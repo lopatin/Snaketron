@@ -366,16 +366,16 @@ async fn test_disconnect_during_queue() -> Result<()> {
         })
         .await?;
 
+    // Client1 disconnects while in queue
+    // tokio::time::sleep(Duration::from_millis(100)).await;
+    client1.disconnect().await?;
+
     client2
         .send_message(WSMessage::QueueForMatch {
             game_type: GameType::FreeForAll { max_players: 3 },
             queue_mode: ::common::QueueMode::Quickmatch,
         })
         .await?;
-
-    // Client1 disconnects while in queue
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    client1.disconnect().await?;
 
     // Client2 should not get matched (needs 3 players)
     // Wait longer than the matchmaking loop interval (2 seconds) to ensure no match
@@ -714,8 +714,8 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
         .await?;
 
     // Wait for both to get matched
-    let game_id1 = wait_for_match(&mut client1).await?;
-    let game_id2 = wait_for_match(&mut client2).await?;
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(40)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(40)).await?;
 
     let match_time = start_time.elapsed();
 

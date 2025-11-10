@@ -1010,7 +1010,6 @@ async fn create_game_from_lobbies(
             for &member_idx in &assignment.member_indices {
                 if let Some(member) = lobby.members.get(member_idx) {
                     // Add player to game state
-                    error!("Adding player {} to team {:?}", member.user_id, assignment.team_id);
                     game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
 
                     // Update the snake's team_id
