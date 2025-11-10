@@ -8,9 +8,11 @@ import {
   LobbyPreferences,
   LobbyGameMode,
   LobbyState,
+  User,
 } from '../types';
 import { clockSync } from '../utils/clockSync';
 import { useLatency } from './LatencyContext';
+import { useAuth } from './AuthContext';
 import {
   detectBestRegion,
   fetchRegionMetadata,
@@ -102,13 +104,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences>(DEFAULT_LOBBY_PREFERENCES);
+  const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
   const currentLobbyRef = useRef<Lobby | null>(null);
   const ws = useRef<WebSocket | null>(null);
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
   const onConnectCallback = useRef<(() => void) | null>(null);
-  const pingTimeout = useRef<NodeJS.Timeout | null>(null);
-  const pingSentTime = useRef<number | null>(null);
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
   const isInitializingRef = useRef(false);
   const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
@@ -117,6 +118,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const lobbyChatLobbyIdRef = useRef<number | null>(null);
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
+  const { user, getToken } = useAuth();
+  const authHandshakeRef = useRef(false);
+  const lastAuthTokenRef = useRef<string | null>(null);
+  const previousUserRef = useRef<User | null>(null);
+
+  const setAuthHandshakeState = useCallback((value: boolean) => {
+    if (authHandshakeRef.current !== value) {
+      authHandshakeRef.current = value;
+      setIsSessionAuthenticated(value);
+    }
+  }, []);
 
   useEffect(() => {
     if (hasLoadedStoredLobbyRef.current) {
@@ -182,6 +194,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
+  const resetLobbyState = useCallback(() => {
+    setCurrentLobby(null);
+    currentLobbyRef.current = null;
+    setLobbyMembers([]);
+    setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
+    clearPersistedLobby();
+  }, [clearPersistedLobby]);
+
+  const isLobbyMissingReason = useCallback((reason: string) => {
+    if (!reason || typeof reason !== 'string') {
+      return false;
+    }
+    const normalized = reason.toLowerCase();
+    if (!normalized.includes('lobby')) {
+      return false;
+    }
+    return (
+      normalized.includes('not found') ||
+      normalized.includes('does not exist') ||
+      normalized.includes('missing')
+    );
+  }, []);
+
   const connect = useCallback((url: string, onConnect?: () => void) => {
     if (ws.current?.readyState === WebSocket.OPEN) {
       console.log('WebSocket already connected');
@@ -214,25 +249,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           if (ws.current?.readyState === WebSocket.OPEN) {
             syncRequestTimes.current.set(clientTime, clientTime);
             ws.current.send(JSON.stringify({
-              ClockSyncRequest: { client_time: clientTime }
+              Ping: { client_time: clientTime }
             }));
           }
         });
-        
+
         // Start clock synchronization
         clockSync.start();
-        
-        // Keep legacy latency measurement for backward compatibility
-        const measureLatency = () => {
-          if (ws.current?.readyState === WebSocket.OPEN) {
-            pingSentTime.current = Date.now();
-            ws.current.send(JSON.stringify('Ping'));
-            // Measure latency every 10 seconds (less frequent since we have clock sync)
-            pingTimeout.current = setTimeout(measureLatency, 10000);
-          }
-        };
-        // Delay initial ping to avoid conflict with clock sync
-        setTimeout(measureLatency, 1000);
         
         // Call the onConnect callback if provided
         if (onConnectCallback.current) {
@@ -243,13 +266,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       ws.current.onclose = () => {
         console.log('WebSocket disconnected');
         setIsConnected(false);
-        // Clear ping timeout
-        if (pingTimeout.current) {
-          clearTimeout(pingTimeout.current);
-          pingTimeout.current = null;
-        }
         // Reset clock sync
         clockSync.reset();
+        syncRequestTimes.current.clear();
         // Auto-reconnect after 2 seconds
         reconnectTimeout.current = setTimeout(() => {
           console.log('Attempting to reconnect...');
@@ -268,24 +287,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
             const rawMessage = JSON.parse(event.data);
             console.log('WebSocket message received:', rawMessage);
 
-            // Handle Pong response for latency measurement
-            if (rawMessage === 'Pong' && pingSentTime.current !== null) {
-              const latency = Math.round((Date.now() - pingSentTime.current) / 2);
-              setLatencyMs(latency);
-              console.log('WebSocket latency:', latency, 'ms');
-              pingSentTime.current = null;
-              return;
-            }
-
-            // Handle clock sync response payloads
-            if (rawMessage?.ClockSyncResponse) {
-              const { client_time, server_time } = rawMessage.ClockSyncResponse;
+            // Handle Pong response carrying clock synchronization data
+            if (rawMessage?.Pong) {
+              const { client_time, server_time } = rawMessage.Pong;
               const t1 = syncRequestTimes.current.get(client_time);
               if (t1) {
                 syncRequestTimes.current.delete(client_time);
                 const t3 = Date.now();
                 clockSync.processSyncResponse(t1, server_time, t3);
-                // Update latency with clock sync RTT as well
                 const rtt = t3 - t1;
                 setLatencyMs(Math.round(rtt / 2));
               }
@@ -336,10 +345,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       clearTimeout(reconnectTimeout.current);
       reconnectTimeout.current = null;
     }
-    if (pingTimeout.current) {
-      clearTimeout(pingTimeout.current);
-      pingTimeout.current = null;
-    }
+    syncRequestTimes.current.clear();
     if (ws.current) {
       ws.current.close();
       ws.current = null;
@@ -371,9 +377,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       });
     }
 
-    // Connect to new region
-    // Note: We need to get the auth token and send it on connection
-    // This is handled by the onConnectCallback in App.tsx
+    // Connect to new region. Authentication is handled automatically on connection.
     connect(wsUrl, onConnectCallback.current || undefined);
   }, [connect]);
 
@@ -394,6 +398,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       doSend();
     }
   }, [latencySettings]);
+
+  const authenticateConnection = useCallback(() => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    const token = getToken();
+    if (!token) {
+      console.warn('No auth token available for WebSocket authentication');
+      return false;
+    }
+
+    if (authHandshakeRef.current && lastAuthTokenRef.current === token) {
+      return true;
+    }
+
+    console.log('Authenticating WebSocket connection');
+    sendMessage({ Token: token });
+    lastAuthTokenRef.current = token;
+    setAuthHandshakeState(true);
+    return true;
+  }, [getToken, sendMessage, setAuthHandshakeState]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
     const trimmed = message.trim();
@@ -420,6 +446,44 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!isConnected) {
+      setAuthHandshakeState(false);
+      lastAuthTokenRef.current = null;
+      return;
+    }
+
+    authenticateConnection();
+  }, [isConnected, authenticateConnection, setAuthHandshakeState]);
+
+  useEffect(() => {
+    const previous = previousUserRef.current;
+    if (previous?.isGuest && user && !user.isGuest) {
+      console.log('Guest transitioned to full user, reconnecting WebSocket');
+      previousUserRef.current = user;
+      disconnect();
+      return;
+    }
+
+    previousUserRef.current = user;
+
+    if (!isConnected || !isSessionAuthenticated) {
+      return;
+    }
+
+    const token = getToken();
+    if (!token) {
+      setAuthHandshakeState(false);
+      lastAuthTokenRef.current = null;
+      return;
+    }
+
+    if (token !== lastAuthTokenRef.current) {
+      setAuthHandshakeState(false);
+      authenticateConnection();
+    }
+  }, [user, isConnected, isSessionAuthenticated, disconnect, getToken, authenticateConnection, setAuthHandshakeState]);
 
   // Auto-connect to the preferred or closest region on mount
   useEffect(() => {
@@ -558,17 +622,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      let retryIntervalId: ReturnType<typeof setInterval> | null = null;
 
       const cleanupHandlers = () => {
         cleanupJoined();
         cleanupDenied();
         cleanupMismatch();
         cleanupUpdate();
-        if (retryIntervalId) {
-          clearInterval(retryIntervalId);
-          retryIntervalId = null;
-        }
         if (timeoutId) {
           clearTimeout(timeoutId);
           timeoutId = null;
@@ -613,9 +672,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (settled) {
           return;
         }
+        const reason =
+          typeof message?.data?.reason === 'string' ? message.data.reason : '';
+        if (isLobbyMissingReason(reason)) {
+          resetLobbyState();
+        }
         settled = true;
         cleanupHandlers();
-        reject(new Error(message.data.reason || 'Access denied'));
+        reject(new Error(reason || 'Access denied'));
       });
 
       cleanupMismatch = onMessage('LobbyRegionMismatch', (message: any) => {
@@ -657,16 +721,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
 
-      const sendJoinRequest = () => {
-        if (!settled) {
-          sendMessage({ JoinLobby: { lobby_code: normalizedCode } });
-        }
-      };
-
-      sendJoinRequest();
-      retryIntervalId = setInterval(sendJoinRequest, 300);
+      sendMessage({ JoinLobby: { lobby_code: normalizedCode } });
     });
-  }, [onMessage, sendMessage, connectToRegion, persistLobby]);
+  }, [onMessage, sendMessage, connectToRegion, persistLobby, resetLobbyState, isLobbyMissingReason]);
 
   const leaveLobby = useCallback(async () => {
     return new Promise<void>((resolve, reject) => {
@@ -683,11 +740,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (settled) {
           return;
         }
-        setCurrentLobby(null);
-        currentLobbyRef.current = null;
-        setLobbyMembers([]);
-        setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
-        clearPersistedLobby();
+        resetLobbyState();
         cleanup();
         if (timeoutId) {
           clearTimeout(timeoutId);
@@ -709,7 +762,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         reject(new Error('Timeout waiting to leave lobby'));
       }, 5000);
     });
-  }, [onMessage, sendMessage, clearPersistedLobby]);
+  }, [onMessage, sendMessage, resetLobbyState]);
 
   const updateLobbyPreferences = useCallback(
     (preferences: LobbyPreferences) => {
@@ -789,6 +842,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     return cleanup;
   }, [onMessage]);
+
+  useEffect(() => {
+    return onMessage('AccessDenied', (message: any) => {
+      const reason =
+        typeof message?.data?.reason === 'string' ? message.data.reason : '';
+      if (isLobbyMissingReason(reason)) {
+        resetLobbyState();
+      }
+    });
+  }, [onMessage, resetLobbyState, isLobbyMissingReason]);
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatHistory', (message: any) => {
@@ -1145,7 +1208,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
-    if (!isConnected) {
+    if (!isConnected || !isSessionAuthenticated) {
       return;
     }
 
@@ -1166,33 +1229,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     const attemptRestore = async () => {
       const { code } = storedLobbyRef.current!;
-      const maxAttempts = 3;
 
-      for (let attempt = 0; attempt < maxAttempts && !cancelled; attempt += 1) {
-        try {
-          console.log(`Attempting to restore lobby ${code} (attempt ${attempt + 1})`);
-          await joinLobby(code);
+      try {
+        console.log(`Attempting to restore lobby ${code}`);
+        await joinLobby(code);
+      } catch (error) {
+        if (cancelled) {
           return;
-        } catch (error) {
-          if (cancelled) {
-            return;
-          }
-
-          const message =
-            error instanceof Error ? error.message : String(error ?? 'unknown error');
-          const normalizedMessage = message.toLowerCase();
-
-          if (normalizedMessage.includes('access denied') || normalizedMessage.includes('not found')) {
-            console.warn('Stored lobby is no longer valid, clearing persisted lobby info');
-            clearPersistedLobby();
-            return;
-          }
-
-          if (attempt < maxAttempts - 1) {
-            const delayMs = 1000 * (attempt + 1);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-          }
         }
+
+        const message = error instanceof Error ? error.message : String(error ?? 'unknown error');
+        const normalizedMessage = message.toLowerCase();
+
+        if (normalizedMessage.includes('access denied') || normalizedMessage.includes('not found')) {
+          console.warn('Stored lobby is no longer valid, clearing persisted lobby info');
+          resetLobbyState();
+          return;
+        }
+
+        console.warn('Failed to restore lobby from storage, not retrying automatically:', message);
       }
     };
 
@@ -1207,7 +1262,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     return () => {
       cancelled = true;
     };
-  }, [isConnected, currentLobby, joinLobby, clearPersistedLobby]);
+  }, [isConnected, isSessionAuthenticated, currentLobby, joinLobby, resetLobbyState]);
 
   const value: WebSocketContextType = {
     isConnected,

@@ -62,11 +62,11 @@ impl std::str::FromStr for MemberValue {
 /// Lobby information stored in Redis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lobby {
-    lobby_code: String,
-    members: BTreeMap<u32, LobbyMember>,
-    host_user_id: i32,
-    state: String,
-    preferences: LobbyPreferences,
+    pub lobby_code: String,
+    pub members: BTreeMap<u32, LobbyMember>,
+    pub host_user_id: i32,
+    pub state: String,
+    pub preferences: LobbyPreferences,
 }
 
 impl Lobby {
@@ -287,6 +287,8 @@ impl LobbyManager {
             broadcaster.receiver_count += 1;
             broadcaster.tx.subscribe()
         };
+        
+        self.publish_lobby_update(&lobby.lobby_code).await?;
 
         // Store the handle
         let handle = LobbyJoinHandle {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use common::GameEventMessage;
 use futures_util::{SinkExt, StreamExt};
 use server::ws_server::WSMessage;
@@ -37,13 +38,14 @@ impl TestClient {
     }
 
     pub async fn send_ping(&mut self) -> Result<()> {
-        self.send_message(WSMessage::Ping).await
+        let client_time = Utc::now().timestamp_millis();
+        self.send_message(WSMessage::Ping { client_time }).await
     }
 
     pub async fn expect_pong(&mut self) -> Result<()> {
         let msg = self.receive_message().await?;
         match msg {
-            WSMessage::Pong => Ok(()),
+            WSMessage::Pong { .. } => Ok(()),
             _ => Err(anyhow::anyhow!("Expected Pong, got {:?}", msg)),
         }
     }

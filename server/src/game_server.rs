@@ -129,6 +129,15 @@ impl GameServer {
         // Drop the default receiver to avoid filling up the channel
         drop(pubsub_rx);
 
+        // Ensure RESP3 protocol is enabled for push notifications
+        let redis_url = if !redis_url.contains("protocol=resp3") && !redis_url.contains("protocol=3") {
+            let separator = if redis_url.contains('?') { "&" } else { "?" };
+            format!("{}{}protocol=resp3", redis_url, separator)
+        } else {
+            redis_url
+        };
+        info!("Using Redis URL: {}", redis_url);
+
         // Create the Redis client and connection manager
         let redis_client =
             Client::open(redis_url.clone()).context("Failed to create Redis client")?;

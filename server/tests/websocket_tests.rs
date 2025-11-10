@@ -2,6 +2,7 @@ mod common;
 
 use crate::common::{TestClient, TestEnvironment};
 use anyhow::Result;
+use chrono::Utc;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
 use tracing::info;
@@ -29,7 +30,11 @@ async fn test_ping_pong() -> Result<()> {
         info!("Client connected, sending ping");
 
         // Send ping
-        client.send_message(WSMessage::Ping).await?;
+        client
+            .send_message(WSMessage::Ping {
+                client_time: Utc::now().timestamp_millis(),
+            })
+            .await?;
 
         info!("Ping sent, expecting pong");
 
@@ -38,7 +43,7 @@ async fn test_ping_pong() -> Result<()> {
             loop {
                 if let Ok(msg) = client.receive_text().await {
                     if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
-                        if matches!(ws_msg, WSMessage::Pong) {
+                        if matches!(ws_msg, WSMessage::Pong { .. }) {
                             info!("Pong received");
                             return Ok::<(), anyhow::Error>(());
                         }
@@ -167,14 +172,18 @@ async fn test_authenticated_connection() -> Result<()> {
         info!("Client authenticated successfully");
 
         // Send a ping to verify connection is working
-        client.send_message(WSMessage::Ping).await?;
+        client
+            .send_message(WSMessage::Ping {
+                client_time: Utc::now().timestamp_millis(),
+            })
+            .await?;
 
         // Wait for pong
         timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(msg) = client.receive_text().await {
                     if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
-                        if matches!(ws_msg, WSMessage::Pong) {
+                        if matches!(ws_msg, WSMessage::Pong { .. }) {
                             return Ok::<(), anyhow::Error>(());
                         }
                     }

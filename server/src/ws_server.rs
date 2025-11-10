@@ -3,7 +3,7 @@ use crate::db::Database;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager;
-use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
+use crate::lobby_manager::{LeaveLobbyResult, Lobby, LobbyJoinHandle, LobbyMember};
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
@@ -20,6 +20,7 @@ use futures_util::{SinkExt, Stream};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,13 +70,10 @@ pub enum WSMessage {
         messages: Vec<GameChatBroadcast>,
     },
     Shutdown,
-    Ping,
-    Pong,
-    // Clock synchronization messages
-    ClockSyncRequest {
+    Ping {
         client_time: i64,
     },
-    ClockSyncResponse {
+    Pong {
         client_time: i64,
         server_time: i64,
     },
@@ -416,7 +414,7 @@ async fn handle_websocket_connection(
     let mut game_event_handle: Option<JoinHandle<()>> = None;
 
     // Will be used to track Redis pub/sub subscription for lobby updates
-    let mut lobby_update_handle: Option<JoinHandle<()>> = None;
+    // let mut lobby_update_handle: Option<JoinHandle<()>> = None;
 
     // Will be used to track Redis pub/sub subscription for lobby match notifications
     let mut lobby_match_handle: Option<JoinHandle<()>> = None;
@@ -515,6 +513,35 @@ async fn handle_websocket_connection(
 
             // Lobby updates get sent directly to the user
             lobby_update = next_lobby_update => {
+                match lobby_update {
+                    Ok(lobby) => {
+                        debug!("Received lobby update for lobby {}", lobby.lobby_code);
+                        let ws_message = WSMessage::LobbyUpdate {
+                            lobby_code: lobby.lobby_code,
+                            members: lobby.members.into_values().collect(),
+                            host_user_id: lobby.host_user_id,
+                            state: lobby.state,
+                            preferences: lobby.preferences,
+                        };
+
+                        let json_msg = match serde_json::to_string(&ws_message) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                error!("Failed to serialize lobby update: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+                            warn!("WebSocket channel closed, dropping lobby update");
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to receive lobby update: {}", e);
+                        continue;
+                    }
+                }
 
             }
 
@@ -649,9 +676,9 @@ async fn handle_websocket_connection(
                                             if entering_lobby {
                                                 if let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
                                                     // Subscribe to lobby updates if entering a lobby
-                                                    if let Some(handle) = lobby_update_handle.take() {
-                                                        handle.abort();
-                                                    }
+                                                    // if let Some(handle) = lobby_update_handle.take() {
+                                                    //     handle.abort();
+                                                    // }
                                                     if let Some(handle) = lobby_chat_handle.take() {
                                                         handle.abort();
                                                     }
@@ -660,18 +687,16 @@ async fn handle_websocket_connection(
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let redis_url_clone = redis_url.clone();
-                                                    let lobby_manager_clone = lobby_manager.clone();
 
-                                                    lobby_update_handle = Some(tokio::spawn(async move {
-                                                        if let Err(e) = subscribe_to_lobby_updates(
-                                                            lobby_code_for_updates,
-                                                            redis_url_clone,
-                                                            ws_tx_clone,
-                                                            lobby_manager_clone,
-                                                        ).await {
-                                                            error!("Lobby update subscription failed: {}", e);
-                                                        }
-                                                    }));
+                                                    // lobby_update_handle = Some(tokio::spawn(async move {
+                                                    //     if let Err(e) = subscribe_to_lobby_updates(
+                                                    //         lobby_code_for_updates,
+                                                    //         redis_url_clone,
+                                                    //         ws_tx_clone,
+                                                    //     ).await {
+                                                    //         error!("Lobby update subscription failed: {}", e);
+                                                    //     }
+                                                    // }));
 
                                                     // Subscribe to lobby match notifications
                                                     if let Some(handle) = lobby_match_handle.take() {
@@ -804,10 +829,10 @@ async fn handle_websocket_connection(
                                             if leaving_lobby {
                                                 let keep_match_subscription = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
 
-                                                if let Some(handle) = lobby_update_handle.take() {
-                                                    handle.abort();
-                                                    debug!("Aborted lobby update subscription");
-                                                }
+                                                // if let Some(handle) = lobby_update_handle.take() {
+                                                //     handle.abort();
+                                                //     debug!("Aborted lobby update subscription");
+                                                // }
 
                                                 // Only abort match notification if NOT entering game with lobby_id
                                                 if !keep_match_subscription {
@@ -893,9 +918,9 @@ async fn handle_websocket_connection(
     if let Some(handle) = game_event_handle {
         handle.abort();
     }
-    if let Some(handle) = lobby_update_handle {
-        handle.abort();
-    }
+    // if let Some(handle) = lobby_update_handle {
+    //     handle.abort();
+    // }
     if let Some(handle) = lobby_match_handle {
         handle.abort();
     }
@@ -1499,9 +1524,16 @@ async fn process_ws_message(
                         }
                     }
                 }
-                WSMessage::Ping => {
-                    // Respond with Pong even in unauthenticated state
-                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                WSMessage::Ping { client_time } => {
+                    // Respond with Pong even in unauthenticated state to keep connection alive
+                    let server_time = chrono::Utc::now().timestamp_millis();
+                    let pong_msg = Message::Text(
+                        serde_json::to_string(&WSMessage::Pong {
+                            client_time,
+                            server_time,
+                        })?
+                        .into(),
+                    );
                     ws_tx.send(pong_msg).await?;
                     Ok(ConnectionState::Unauthenticated)
                 }
@@ -2064,21 +2096,10 @@ async fn process_ws_message(
                         websocket_id,
                     })
                 }
-                WSMessage::Ping => {
-                    // Respond with Pong
-                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
-                    ws_tx.send(pong_msg).await?;
-                    Ok(ConnectionState::Authenticated {
-                        metadata,
-                        lobby_handle: lobby,
-                        game_id,
-                        websocket_id,
-                    })
-                }
-                WSMessage::ClockSyncRequest { client_time } => {
-                    // Respond with server time for clock synchronization
+                WSMessage::Ping { client_time } => {
+                    // Respond with Pong including server time for clock synchronization
                     let server_time = chrono::Utc::now().timestamp_millis();
-                    let response = WSMessage::ClockSyncResponse {
+                    let response = WSMessage::Pong {
                         client_time,
                         server_time,
                     };
@@ -2403,23 +2424,43 @@ async fn process_ws_message(
                                     region.to_string(),
                                 )
                                 .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    error!("Failed to join lobby: {}", e);
-                                    let response = WSMessage::AccessDenied {
-                                        reason: format!("Failed to join lobby: {}", e),
-                                    };
-                                    let json_msg = serde_json::to_string(&response)?;
-                                    ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: None,
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
+                                {
+                                    Ok(handle) => handle,
+                                    Err(e) => {
+                                        let err_text = e.to_string();
+                                        let response = if err_text
+                                            .to_lowercase()
+                                            .contains("not found")
+                                        {
+                                            warn!(
+                                                "Lobby '{}' missing when user {} attempted to join",
+                                                lobby_code, metadata.user_id
+                                            );
+                                            WSMessage::AccessDenied {
+                                                reason: format!(
+                                                    "Lobby '{}' does not exist",
+                                                    lobby_code
+                                                ),
+                                            }
+                                        } else {
+                                            error!("Failed to join lobby: {}", err_text);
+                                            WSMessage::AccessDenied {
+                                                reason: format!(
+                                                    "Failed to join lobby: {}",
+                                                    err_text
+                                                ),
+                                            }
+                                        };
+                                        let json_msg = serde_json::to_string(&response)?;
+                                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                                        return Ok(ConnectionState::Authenticated {
+                                            metadata,
+                                            lobby_handle: None,
+                                            game_id,
+                                            websocket_id,
+                                        });
+                                    }
+                                };
 
                             // Send success response
                             let response = WSMessage::JoinedLobby {
@@ -2437,8 +2478,12 @@ async fn process_ws_message(
                             })
                         }
                         Ok(None) => {
+                            warn!(
+                                "User {} attempted to join missing lobby '{}'",
+                                metadata.user_id, lobby_code
+                            );
                             let response = WSMessage::AccessDenied {
-                                reason: "Lobby not found".to_string(),
+                                reason: format!("Lobby '{}' does not exist", lobby_code),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -2548,8 +2593,15 @@ async fn process_ws_message(
         } => {
             // Handle authenticated users not in a lobby (can create/join lobbies)
             match ws_message {
-                WSMessage::Ping => {
-                    let pong_msg = Message::Text(serde_json::to_string(&WSMessage::Pong)?.into());
+                WSMessage::Ping { client_time } => {
+                    let server_time = chrono::Utc::now().timestamp_millis();
+                    let pong_msg = Message::Text(
+                        serde_json::to_string(&WSMessage::Pong {
+                            client_time,
+                            server_time,
+                        })?
+                        .into(),
+                    );
                     ws_tx.send(pong_msg).await?;
                     Ok(ConnectionState::Authenticated {
                         metadata,
@@ -2657,12 +2709,20 @@ async fn subscribe_to_user_count_updates(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct LobbyUpdatePayload {
+    lobby_code: String,
+    members: BTreeMap<u32, lobby_manager::LobbyMember>,
+    host_user_id: i32,
+    state: String,
+    preferences: lobby_manager::LobbyPreferences,
+}
+
 /// Subscribe to lobby updates and forward to WebSocket client
 async fn subscribe_to_lobby_updates(
     lobby_code: String,
     redis_url: String,
     ws_tx: mpsc::Sender<Message>,
-    lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
 ) -> Result<()> {
     info!("Subscribing to lobby '{}' updates", lobby_code);
 
@@ -2676,69 +2736,99 @@ async fn subscribe_to_lobby_updates(
         .context("Failed to create Redis pub/sub connection")?;
 
     // Subscribe to lobby update channel
-    let channel = format!("lobby:{}:updates", lobby_code);
+    let channel = RedisKeys::lobby_updates_channel();
     pubsub_conn
         .subscribe(&channel)
         .await
         .context("Failed to subscribe to lobby updates channel")?;
 
-    info!("Subscribed to lobby updates for lobby '{}'", lobby_code);
+    info!(
+        "Subscribed to lobby updates on '{}' for lobby '{}'",
+        channel, lobby_code
+    );
 
     // Listen for messages
     let mut pubsub_stream = pubsub_conn.on_message();
 
-    while let Some(_msg) = pubsub_stream.next().await {
-        // When we receive an update notification, fetch the current lobby members
-        match lobby_manager.get_lobby_members(&lobby_code).await {
-            Ok(members) => {
-                // Get the lobby info for host_user_id
-                match lobby_manager.get_lobby_metadata(&lobby_code).await {
-                    Ok(Some(lobby)) => {
-                        let preferences =
-                            match lobby_manager.get_lobby_preferences(&lobby_code).await {
-                                Ok(prefs) => prefs,
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to load lobby preferences for lobby '{}': {}",
-                                        lobby_code, e
-                                    );
-                                    crate::lobby_manager::LobbyPreferences::default()
-                                }
-                            };
+    while let Some(msg) = pubsub_stream.next().await {
+        let payload: String = match msg.get_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to read lobby update payload: {}", e);
+                continue;
+            }
+        };
 
-                        // Send lobby update to client
-                        let ws_message = WSMessage::LobbyUpdate {
-                            lobby_code: lobby_code.clone(),
-                            members: members.into_values().collect(),
-                            host_user_id: lobby.host_user_id,
-                            state: lobby.state.clone(),
-                            preferences,
-                        };
+        match serde_json::from_str::<LobbyUpdatePayload>(&payload) {
+            Ok(update) => {
+                if update.lobby_code != lobby_code {
+                    continue;
+                }
 
-                        let json_msg = match serde_json::to_string(&ws_message) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                error!("Failed to serialize lobby update: {}", e);
-                                continue;
-                            }
-                        };
+                let LobbyUpdatePayload {
+                    lobby_code,
+                    members,
+                    host_user_id,
+                    state,
+                    preferences,
+                } = update;
 
-                        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
-                            debug!("WebSocket channel closed, stopping lobby subscription");
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        warn!("Lobby '{}' not found, stopping subscription", lobby_code);
-                        break;
-                    }
+                let ws_message = WSMessage::LobbyUpdate {
+                    lobby_code,
+                    members: members.into_values().collect(),
+                    host_user_id,
+                    state,
+                    preferences,
+                };
+
+                let json_msg = match serde_json::to_string(&ws_message) {
+                    Ok(json) => json,
                     Err(e) => {
-                        error!("Failed to get lobby info: {}", e);
+                        error!("Failed to serialize lobby update: {}", e);
+                        continue;
                     }
+                };
+
+                if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+                    debug!("WebSocket channel closed, stopping lobby subscription");
+                    break;
                 }
             }
             Err(e) => {
-                error!("Failed to get lobby members: {}", e);
+                // Handle lobby deletion notifications or malformed payloads
+                match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(value) => {
+                        let payload_code = value
+                            .get("lobby_code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if payload_code != lobby_code {
+                            continue;
+                        }
+
+                        match value.get("state").and_then(|v| v.as_str()) {
+                            Some("deleted") => {
+                                info!(
+                                    "Received deletion notice for lobby '{}', stopping subscription",
+                                    lobby_code
+                                );
+                                break;
+                            }
+                            _ => {
+                                warn!(
+                                    "Unsupported lobby update payload for '{}': {} ({})",
+                                    lobby_code, payload, e
+                                );
+                            }
+                        }
+                    }
+                    Err(value_err) => {
+                        warn!(
+                            "Failed to parse lobby update payload for '{}': {} ({})",
+                            lobby_code, payload, value_err
+                        );
+                    }
+                }
             }
         }
     }

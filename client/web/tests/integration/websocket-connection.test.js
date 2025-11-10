@@ -36,19 +36,26 @@ test.describe('WebSocket Connection', () => {
     await page.goto(env.getAppUrl());
     await wsMonitor.waitForConnection();
     
-    // Send a ping message
+    // Send a ping message with timestamp for clock sync
     await page.evaluate(() => {
       // Access the WebSocket connection through the React context
       const wsContext = window.__wsContext;
       if (wsContext && wsContext.sendMessage) {
-        wsContext.sendMessage({ type: 'Ping' });
+        wsContext.sendMessage({
+          Ping: { client_time: Date.now() }
+        });
       }
     });
     
     // Wait for pong response
     const pongMessage = await wsMonitor.waitForMessage('Pong', 'received', 5000);
     expect(pongMessage).toBeTruthy();
-    expect(pongMessage.parsed.type).toBe('Pong');
+    expect(pongMessage.messageType).toBe('Pong');
+    expect(pongMessage.parsed).toHaveProperty('Pong');
+    expect(pongMessage.parsed.Pong).toMatchObject({
+      client_time: expect.any(Number),
+      server_time: expect.any(Number)
+    });
   });
 
   test('WebSocket reconnects after disconnection', async ({ page }) => {
