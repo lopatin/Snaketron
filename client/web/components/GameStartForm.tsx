@@ -3,6 +3,31 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { LobbyPreferences, LobbyGameMode } from '../types';
+import {
+  DEFAULT_LOBBY_PREFERENCES,
+  loadStoredLobbyPreferences,
+  persistStoredLobbyPreferences,
+} from '../utils/lobbyPreferencesStorage';
+
+const areModeSetsEqual = (a: Set<LobbyGameMode> | null, b: Set<LobbyGameMode> | null) => {
+  if (a === b) {
+    return true;
+  }
+
+  if (a === null || b === null) {
+    return false;
+  }
+
+  if (a.size !== b.size) {
+    return false;
+  }
+  for (const mode of a) {
+    if (!b.has(mode)) {
+      return false;
+    }
+  }
+  return true;
+};
 
 interface GameStartFormProps {
   onStartGame: (gameModes: LobbyGameMode[], nickname: string, isCompetitive: boolean) => void;
@@ -11,7 +36,8 @@ interface GameStartFormProps {
   isAuthenticated?: boolean;
   isHost?: boolean;
   isLobbyQueued?: boolean;
-  lobbyPreferences: LobbyPreferences;
+  hasActiveLobby?: boolean;
+  lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
 }
 
@@ -22,15 +48,14 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   isAuthenticated = false,
   isHost = true,
   isLobbyQueued = false,
+  hasActiveLobby = false,
   lobbyPreferences,
   onPreferencesChange,
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
-  const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode>>(
-    () => new Set(lobbyPreferences.selectedModes)
-  );
-  const [isCompetitive, setIsCompetitive] = useState(lobbyPreferences.competitive);
+  const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode> | null>(null);
+  const [isCompetitive, setIsCompetitive] = useState<boolean | null>(null);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
   const lastSubmittedNicknameRef = useRef<string | null>(null);
   const { user } = useAuth();
@@ -49,26 +74,48 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   // Keep local selection state in sync with lobby-wide preferences
   useEffect(() => {
-    const nextModes = new Set<LobbyGameMode>(lobbyPreferences.selectedModes);
-    let modesChanged = nextModes.size !== selectedModes.size;
-
-    if (!modesChanged) {
-      for (const mode of nextModes) {
-        if (!selectedModes.has(mode)) {
-          modesChanged = true;
-          break;
-        }
+    if (lobbyPreferences) {
+      const nextModes = lobbyPreferences ? new Set<LobbyGameMode>(lobbyPreferences.selectedModes) : null;
+      if (!areModeSetsEqual(selectedModes, nextModes)) {
+        setSelectedModes(new Set<LobbyGameMode>(lobbyPreferences.selectedModes));
       }
+      if (lobbyPreferences.competitive !== isCompetitive) {
+        setIsCompetitive(lobbyPreferences.competitive);
+      }
+    } else if (selectedModes == null) {
+      const stored = loadStoredLobbyPreferences();
+      const fallbackPreferences: LobbyPreferences = stored ?? {
+        selectedModes: [...DEFAULT_LOBBY_PREFERENCES.selectedModes],
+        competitive: DEFAULT_LOBBY_PREFERENCES.competitive,
+      };
+      setSelectedModes(new Set<LobbyGameMode>(fallbackPreferences.selectedModes));
+      if (isCompetitive === null) {
+        setIsCompetitive(fallbackPreferences.competitive);
+      }
+      onPreferencesChange?.(fallbackPreferences);
+    } else if (isCompetitive === null) {
+      setIsCompetitive(DEFAULT_LOBBY_PREFERENCES.competitive);
+    }
+  }, [
+    lobbyPreferences,
+    selectedModes,
+    isCompetitive,
+    setSelectedModes,
+    setIsCompetitive,
+    onPreferencesChange,
+  ]);
+
+  useEffect(() => {
+    if (!selectedModes) {
+      return;
     }
 
-    if (modesChanged) {
-      setSelectedModes(nextModes);
-    }
-
-    if (lobbyPreferences.competitive !== isCompetitive) {
-      setIsCompetitive(lobbyPreferences.competitive);
-    }
-  }, [lobbyPreferences, selectedModes, isCompetitive]);
+    const preferencesToPersist: LobbyPreferences = {
+      selectedModes: Array.from(selectedModes),
+      competitive: Boolean(isCompetitive),
+    };
+    persistStoredLobbyPreferences(preferencesToPersist);
+  }, [selectedModes, isCompetitive]);
 
   // Sync nickname with currentUsername when it changes (for guest users)
   useEffect(() => {
@@ -123,20 +170,18 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       return;
     }
 
-    const nextSelection = new Set(selectedModes);
+    const nextSelection = new Set(selectedModes ?? []);
     if (nextSelection.has(mode)) {
-      if (nextSelection.size === 1) {
-        return;
-      }
       nextSelection.delete(mode);
     } else {
       nextSelection.add(mode);
     }
 
     setSelectedModes(nextSelection);
+
     onPreferencesChange?.({
       selectedModes: Array.from(nextSelection),
-      competitive: isCompetitive,
+      competitive: isCompetitive || false,
     });
   };
 
@@ -146,12 +191,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       return;
     }
 
-    if (selectedModes.size > 0 && nickname.trim().length >= 3) {
-      onStartGame(Array.from(selectedModes), nickname.trim(), isCompetitive);
+    if (selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3) {
+      onStartGame(Array.from(selectedModes), nickname.trim(), isCompetitive || false);
     }
   };
 
-  const isFormValid = selectedModes.size > 0 && nickname.trim().length >= 3;
+  const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
   const startButtonDisabled = !isHost || isLobbyQueued || !isFormValid || isLoading;
   const startButtonLabel = isLobbyQueued
     ? 'Finding Match...'
@@ -203,7 +248,8 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
         <div className="mb-8">
           <div className="grid grid-cols-2 gap-3">
             {gameModes.map((mode) => {
-              const isSelected = selectedModes.has(mode.id);
+              const isSelected = selectedModes && selectedModes.has(mode.id);
+              // console.log('canEdit:', canEdit, 'isLoading:', isLoading);
               return (
                 <button
                   key={mode.id}
@@ -253,15 +299,18 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             <div className="relative">
               <input
                 type="checkbox"
-                checked={isCompetitive}
+                checked={isCompetitive || false}
                 onChange={(e) => {
                   if (!canEdit) {
                     return;
                   }
                   const nextCompetitive = e.target.checked;
+                  if (nextCompetitive === isCompetitive) {
+                    return;
+                  }
                   setIsCompetitive(nextCompetitive);
                   onPreferencesChange?.({
-                    selectedModes: Array.from(selectedModes),
+                    selectedModes: selectedModes ? Array.from(selectedModes) : [],
                     competitive: nextCompetitive,
                   });
                 }}

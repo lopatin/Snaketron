@@ -332,6 +332,7 @@ export const NewHome: React.FC = () => {
             isAuthenticated={user !== null && !user.isGuest}
             isHost={isGameFormHost}
             isLobbyQueued={isLobbyQueued}
+            hasActiveLobby={Boolean(currentLobby)}
             lobbyPreferences={lobbyPreferences}
             onPreferencesChange={updateLobbyPreferences}
           />
@@ -373,6 +374,7 @@ export const NewHome: React.FC = () => {
           isAuthenticated={user !== null && !user.isGuest}
           isHost={isGameFormHost}
           isLobbyQueued={isLobbyQueued}
+          hasActiveLobby={Boolean(currentLobby)}
           lobbyPreferences={lobbyPreferences}
           onPreferencesChange={updateLobbyPreferences}
         />

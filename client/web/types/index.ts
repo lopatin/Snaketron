@@ -71,7 +71,7 @@ export interface WebSocketContextType {
   lobbyMembers: LobbyMember[];
   lobbyChatMessages: ChatMessage[];
   gameChatMessages: ChatMessage[];
-  lobbyPreferences: LobbyPreferences;
+  lobbyPreferences: LobbyPreferences | null;
 
   // Lobby methods
   createLobby: () => Promise<void>;

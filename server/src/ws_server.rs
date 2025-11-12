@@ -2502,6 +2502,80 @@ async fn process_ws_message(
                         }
                     }
                 }
+                WSMessage::LeaveLobby => {
+                    if let Some(mut lobby_handle) = lobby {
+                        let lobby_code = lobby_handle.lobby_code.clone();
+                        match lobby_handle.close().await {
+                            Ok(result) => {
+                                if let LeaveLobbyResult::LobbyDeleted = result {
+                                    let mut mm = matchmaking_manager.lock().await;
+                                    match mm
+                                        .remove_lobby_from_all_queues_by_code(&lobby_code)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            info!(
+                                                "Removed empty lobby {} from matchmaking queues",
+                                                lobby_code
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            info!(
+                                                "Lobby {} was not present in matchmaking queues",
+                                                lobby_code
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to remove lobby {} from matchmaking queues: {}",
+                                                lobby_code, e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let response = WSMessage::LeftLobby;
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                return Ok(ConnectionState::Authenticated {
+                                    metadata,
+                                    lobby_handle: None,
+                                    game_id,
+                                    websocket_id,
+                                });
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to leave lobby {} for user {}: {}",
+                                    lobby_code, metadata.user_id, e
+                                );
+                                let response = WSMessage::AccessDenied {
+                                    reason: format!("Failed to leave lobby: {}", e),
+                                };
+                                let json_msg = serde_json::to_string(&response)?;
+                                ws_tx.send(Message::Text(json_msg.into())).await?;
+                                return Ok(ConnectionState::Authenticated {
+                                    metadata,
+                                    lobby_handle: Some(lobby_handle),
+                                    game_id,
+                                    websocket_id,
+                                });
+                            }
+                        }
+                    } else {
+                        let response = WSMessage::AccessDenied {
+                            reason: "You are not currently in a lobby".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: None,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+                }
                 WSMessage::Chat(_) => {
                     let response = WSMessage::AccessDenied {
                         reason: "Chat is only available in a lobby or game".to_string(),
