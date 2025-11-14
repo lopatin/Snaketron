@@ -94,6 +94,7 @@ async fn create_lobby_and_queue(
             client
                 .send_message(WSMessage::JoinLobby {
                     lobby_code: lobby_code.clone(),
+                    preferences: None,
                 })
                 .await?;
 

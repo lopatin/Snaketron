@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow, bail};
-use redis::AsyncCommands;
+use anyhow::{Context, Result, anyhow};
 use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
-use serde_json::{self, json};
-use std::collections::{BTreeMap, HashMap};
+use serde_json;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
@@ -12,7 +12,6 @@ use tokio::time::{Duration, interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::db::{Database, models::LobbyMetadata};
-use crate::lobby_manager::LeaveLobbyResult::LobbyDeleted;
 use crate::lobby_manager::LobbyEvent::{LobbyDelete, LobbyUpdate};
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
@@ -275,7 +274,7 @@ impl LobbyManager {
 
     /// Create a new lobby. Generates an id and assigns the host user.
     pub async fn create_lobby(&self, host_user_id: i32, region: &str) -> Result<Lobby> {
-        use chrono::{Duration, Utc};
+        use chrono::Utc;
 
         let now = Utc::now();
         let lobby_code = self.generate_unique_lobby_code(region, 10).await?;
@@ -349,9 +348,11 @@ impl LobbyManager {
         username: String,
         websocket_id: String,
         region: String,
+        requested_preferences: Option<LobbyPreferences>,
     ) -> Result<LobbyJoinHandle> {
         let lobby = if let Some(lobby_code) = lobby_code {
-            self.get_lobby(lobby_code).await?
+            self.ensure_joinable_lobby(lobby_code, user_id, &region, requested_preferences.as_ref())
+                .await?
         } else {
             self.create_lobby(user_id, &region).await?
         };
@@ -526,6 +527,127 @@ impl LobbyManager {
         Ok(())
     }
 
+    async fn ensure_joinable_lobby(
+        &self,
+        lobby_code: &str,
+        host_user_id: i32,
+        region: &str,
+        requested_preferences: Option<&LobbyPreferences>,
+    ) -> Result<Lobby> {
+        if let Some(lobby) = self.get_lobby_opt(lobby_code).await? {
+            return Ok(lobby);
+        }
+
+        self.create_lobby_with_code_if_absent(
+            lobby_code,
+            host_user_id,
+            region,
+            requested_preferences,
+        )
+        .await?;
+
+        self.get_lobby(lobby_code).await
+    }
+
+    async fn create_lobby_with_code_if_absent(
+        &self,
+        lobby_code: &str,
+        host_user_id: i32,
+        region: &str,
+        requested_preferences: Option<&LobbyPreferences>,
+    ) -> Result<bool> {
+        use chrono::Utc;
+
+        let mut redis = self.redis.clone();
+        let metadata_key = RedisKeys::lobby_metadata(lobby_code);
+        let created_at = Utc::now().to_rfc3339();
+
+        let script = Script::new(
+            r#"
+            if redis.call('EXISTS', KEYS[1]) == 1 then
+                return 0
+            end
+            redis.call('HSET', KEYS[1],
+                'hostUserId', ARGV[1],
+                'region', ARGV[2],
+                'createdAt', ARGV[3],
+                'state', ARGV[4]
+            )
+            return 1
+        "#,
+        );
+
+        let created: i32 = script
+            .key(&metadata_key)
+            .arg(host_user_id)
+            .arg(region)
+            .arg(&created_at)
+            .arg("waiting")
+            .invoke_async(&mut redis)
+            .await
+            .context("Failed to atomically create lobby metadata")?;
+
+        if created == 0 {
+            return Ok(false);
+        }
+
+        let preferences = Self::resolve_join_preferences(requested_preferences);
+        self.set_lobby_preferences(lobby_code, &preferences)
+            .await
+            .context("Failed to initialize lobby preferences")?;
+
+        self.touch_lobby(lobby_code, None)
+            .await
+            .context("Failed to initialize lobby TTLs")?;
+
+        info!(
+            "Auto-created lobby '{}' for user {} in region {}",
+            lobby_code, host_user_id, region
+        );
+
+        Ok(true)
+    }
+
+    fn resolve_join_preferences(preferences: Option<&LobbyPreferences>) -> LobbyPreferences {
+        preferences
+            .map(Self::sanitize_lobby_preferences)
+            .unwrap_or_else(LobbyPreferences::default)
+    }
+
+    fn sanitize_lobby_preferences(preferences: &LobbyPreferences) -> LobbyPreferences {
+        let mut seen = HashSet::new();
+        let mut sanitized = Vec::new();
+
+        for mode in &preferences.selected_modes {
+            let normalized = mode.trim().to_lowercase();
+            if normalized.is_empty() || !Self::is_valid_lobby_mode(&normalized) {
+                continue;
+            }
+
+            if seen.insert(normalized.clone()) {
+                sanitized.push(normalized);
+            }
+        }
+
+        if sanitized.is_empty() {
+            sanitized.extend(
+                LobbyPreferences::default()
+                    .selected_modes
+                    .into_iter()
+                    .map(|mode| mode.trim().to_lowercase()),
+            );
+        }
+
+        LobbyPreferences {
+            selected_modes: sanitized,
+            competitive: preferences.competitive,
+        }
+    }
+
+    fn is_valid_lobby_mode(mode: &str) -> bool {
+        matches!(mode, "duel" | "2v2" | "solo" | "ffa")
+    }
+
     /// Stop heartbeat and remove from Redis
     pub async fn leave_lobby(
         &self,
@@ -619,7 +741,7 @@ impl LobbyManager {
                 .map(|id_str| id_str.parse::<u32>().ok())
                 .flatten();
 
-            if let (Some(user_id)) = user_id {
+            if let Some(user_id) = user_id {
                 if let Some(user) = users.get(&user_id) {
                     let username = user.clone();
 

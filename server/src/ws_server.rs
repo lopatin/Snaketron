@@ -156,6 +156,7 @@ pub enum WSMessage {
     },
     JoinLobby {
         lobby_code: String,
+        preferences: Option<lobby_manager::LobbyPreferences>,
     },
     JoinedLobby {
         lobby_code: String,
@@ -1678,6 +1679,7 @@ async fn process_ws_message(
                                     metadata.username.clone(),
                                     websocket_id.to_string(),
                                     region.to_string(),
+                                    None,
                                 )
                                 .await
                             {
@@ -1901,6 +1903,7 @@ async fn process_ws_message(
                                     metadata.username.clone(),
                                     websocket_id.to_string(),
                                     region.to_string(),
+                                    None,
                                 )
                                 .await
                             {
@@ -2313,6 +2316,7 @@ async fn process_ws_message(
                                     metadata.username.clone(),
                                     websocket_id.to_string(),
                                     region.to_string(),
+                                    None,
                                 )
                                 .await
                             {
@@ -2364,89 +2368,49 @@ async fn process_ws_message(
                         }
                     }
                 }
-                WSMessage::JoinLobby { lobby_code } => {
+                WSMessage::JoinLobby {
+                    lobby_code,
+                    preferences,
+                } => {
                     info!(
                         "User {} ({}) joining lobby with code: {}",
                         metadata.username, metadata.user_id, lobby_code
                     );
 
-                    match lobby_manager.get_lobby_metadata(&lobby_code).await {
-                        Ok(Some(lobby_metadata)) => {
-                            // Check region match
-                            if lobby_metadata.region != region {
-                                warn!(
-                                    "Lobby '{}' is in region {}, user is in region {}",
-                                    lobby_code, lobby_metadata.region, region
-                                );
+                    let lobby_metadata = match lobby_manager.get_lobby_metadata(&lobby_code).await {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            error!("Failed to get lobby by code: {}", e);
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to find lobby: {}", e),
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: None,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+                    };
 
-                                // Get WebSocket URL for the target region from database
-                                let ws_url =
-                                    match db.get_region_ws_url(&lobby_metadata.region).await? {
-                                        Some(url) => url,
-                                        None => {
-                                            let response = WSMessage::AccessDenied {
-                                                reason: format!(
-                                                    "No servers available in region {}",
-                                                    lobby_metadata.region
-                                                ),
-                                            };
-                                            let json_msg = serde_json::to_string(&response)?;
-                                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                                            return Ok(ConnectionState::Authenticated {
-                                                metadata,
-                                                lobby_handle: None,
-                                                game_id,
-                                                websocket_id,
-                                            });
-                                        }
-                                    };
+                    if let Some(lobby_metadata) = &lobby_metadata {
+                        if lobby_metadata.region != region {
+                            warn!(
+                                "Lobby '{}' is in region {}, user is in region {}",
+                                lobby_code, lobby_metadata.region, region
+                            );
 
-                                let response = WSMessage::LobbyRegionMismatch {
-                                    target_region: lobby_metadata.region.clone(),
-                                    ws_url,
-                                    lobby_code: lobby_code.clone(),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: None,
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-
-                            // Join the lobby
-                            let lobby_handle = match lobby_manager
-                                .join_lobby(
-                                    Some(&lobby_code),
-                                    metadata.user_id,
-                                    metadata.username.clone(),
-                                    websocket_id.to_string(),
-                                    region.to_string(),
-                                )
-                                .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    let err_text = e.to_string();
-                                    let response = if err_text.to_lowercase().contains("not found")
-                                    {
-                                        warn!(
-                                            "Lobby '{}' missing when user {} attempted to join",
-                                            lobby_code, metadata.user_id
-                                        );
-                                        WSMessage::AccessDenied {
-                                            reason: format!(
-                                                "Lobby '{}' does not exist",
-                                                lobby_code
-                                            ),
-                                        }
-                                    } else {
-                                        error!("Failed to join lobby: {}", err_text);
-                                        WSMessage::AccessDenied {
-                                            reason: format!("Failed to join lobby: {}", err_text),
-                                        }
+                            // Get WebSocket URL for the target region from database
+                            let ws_url = match db.get_region_ws_url(&lobby_metadata.region).await? {
+                                Some(url) => url,
+                                None => {
+                                    let response = WSMessage::AccessDenied {
+                                        reason: format!(
+                                            "No servers available in region {}",
+                                            lobby_metadata.region
+                                        ),
                                     };
                                     let json_msg = serde_json::to_string(&response)?;
                                     ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -2459,53 +2423,71 @@ async fn process_ws_message(
                                 }
                             };
 
-                            // Send success response
-                            let response = WSMessage::JoinedLobby {
-                                lobby_code: lobby_handle.lobby_code.clone(),
+                            let response = WSMessage::LobbyRegionMismatch {
+                                target_region: lobby_metadata.region.clone(),
+                                ws_url,
+                                lobby_code: lobby_code.clone(),
                             };
                             let json_msg = serde_json::to_string(&response)?;
                             ws_tx.send(Message::Text(json_msg.into())).await?;
-
-                            // Transition to InLobby state
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: Some(lobby_handle),
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Ok(None) => {
-                            warn!(
-                                "User {} attempted to join missing lobby '{}'",
-                                metadata.user_id, lobby_code
-                            );
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Lobby '{}' does not exist", lobby_code),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
+                            return Ok(ConnectionState::Authenticated {
                                 metadata,
                                 lobby_handle: None,
                                 game_id,
                                 websocket_id,
-                            })
+                            });
                         }
-                        Err(e) => {
-                            error!("Failed to get lobby by code: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to find lobby: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: None,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
+                    } else {
+                        info!(
+                            "Lobby '{}' missing; auto-creating default lobby for user {}",
+                            lobby_code, metadata.user_id
+                        );
                     }
+
+                    // Join (and auto-create if needed) the lobby
+                    let lobby_handle = match lobby_manager
+                        .join_lobby(
+                            Some(&lobby_code),
+                            metadata.user_id,
+                            metadata.username.clone(),
+                            websocket_id.to_string(),
+                            region.to_string(),
+                            preferences,
+                        )
+                        .await
+                    {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            let err_text = e.to_string();
+                            error!("Failed to join lobby '{}': {}", lobby_code, err_text);
+                            let response = WSMessage::AccessDenied {
+                                reason: format!("Failed to join lobby: {}", err_text),
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: None,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+                    };
+
+                    // Send success response
+                    let response = WSMessage::JoinedLobby {
+                        lobby_code: lobby_handle.lobby_code.clone(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+
+                    // Transition to InLobby state
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: Some(lobby_handle),
+                        game_id: None,
+                        websocket_id: websocket_id.to_string(),
+                    })
                 }
                 WSMessage::LeaveLobby => {
                     if let Some(mut lobby_handle) = lobby {

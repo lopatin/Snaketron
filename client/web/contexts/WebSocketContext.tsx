@@ -659,7 +659,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [onMessage, sendMessage, persistLobby, user?.id, buildInitialLobbyPreferences]);
 
   const joinLobby = useCallback(async (lobbyCode: string) => {
-    const normalizedCode = lobbyCode.toUpperCase();
+    const normalizedCode = lobbyCode.trim().toUpperCase();
+    const joinPreferences = buildInitialLobbyPreferences();
     return new Promise<void>((resolve, reject) => {
       if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
         reject(new Error('WebSocket not connected'));
@@ -768,9 +769,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
 
-      sendMessage({ JoinLobby: { lobby_code: normalizedCode } });
+      sendMessage({
+        JoinLobby: {
+          lobby_code: normalizedCode,
+          preferences: {
+            selected_modes: joinPreferences.selectedModes,
+            competitive: joinPreferences.competitive,
+          },
+        },
+      });
     });
-  }, [onMessage, sendMessage, connectToRegion, persistLobby, resetLobbyState, isLobbyMissingReason]);
+  }, [
+    onMessage,
+    sendMessage,
+    connectToRegion,
+    persistLobby,
+    resetLobbyState,
+    isLobbyMissingReason,
+    buildInitialLobbyPreferences,
+  ]);
 
   const leaveLobby = useCallback(async () => {
     return new Promise<void>((resolve, reject) => {

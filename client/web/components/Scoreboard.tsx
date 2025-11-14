@@ -10,6 +10,7 @@ interface ScoreboardProps {
   onPlayAgain?: () => void;
   isHost?: boolean;
   isInLobby?: boolean;
+  isLobbyQueued?: boolean;
 }
 
 // Snake colors matching render.rs
@@ -27,7 +28,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
   onBackToMenu,
   onPlayAgain,
   isHost = false,
-  isInLobby = false
+  isInLobby = false,
+  isLobbyQueued = false
 }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [logoHovered, setLogoHovered] = useState(false);
@@ -551,18 +553,24 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
               </button>
               <button
                 onClick={onPlayAgain}
-                disabled={isInLobby && !isHost}
+                disabled={(isInLobby && !isHost) || isLobbyQueued}
                 className={`px-3 py-1 text-xs border rounded font-semibold uppercase transition-all ${
-                  isInLobby && !isHost
+                  (isInLobby && !isHost) || isLobbyQueued
                     ? 'border-gray-400 bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'border-green-700 bg-green-600 text-white hover:bg-green-700 cursor-pointer'
                 }`}
                 style={{
                   letterSpacing: '0.5px',
                 }}
-                title={isInLobby && !isHost ? 'Waiting for host to start next game' : 'Play again with your lobby'}
+                title={
+                  isLobbyQueued
+                    ? 'Lobby is already queued and waiting for a match'
+                    : (isInLobby && !isHost
+                        ? 'Waiting for host to start next game'
+                        : 'Play again with your lobby')
+                }
               >
-                Play Again
+                {isLobbyQueued ? 'Queued...' : 'Play Again'}
               </button>
             </div>
           </div>

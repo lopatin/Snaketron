@@ -446,11 +446,16 @@ export default function GameArena() {
   // Determine if user is in a lobby and is the host
   const isInLobby = currentLobby !== null;
   const isHost = currentLobby !== null && currentLobby.hostUserId === user?.id;
+  const isLobbyQueued = currentLobby?.state === 'queued';
 
   // Handle play again
   const handlePlayAgain = () => {
     const state = gameState ?? committedState;
     if (!state) {
+      return;
+    }
+
+    if (isLobbyQueued) {
       return;
     }
 
@@ -504,6 +509,7 @@ export default function GameArena() {
           onPlayAgain={handlePlayAgain}
           isHost={isHost}
           isInLobby={isInLobby}
+          isLobbyQueued={isLobbyQueued}
         />
 
         {/* Game Arena Container */}
