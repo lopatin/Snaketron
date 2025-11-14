@@ -623,9 +623,7 @@ async fn handle_websocket_connection(
                                                             game_id,
                                                             redis_url_clone,
                                                             ws_tx_clone,
-                                                        )
-                                                        .await
-                                                        {
+                                                        ).await {
                                                             error!("Game chat subscription failed: {}", e);
                                                         }
                                                     }));
@@ -2581,12 +2579,91 @@ async fn process_ws_message(
                         });
                     }
                 }
-                WSMessage::Chat(_) => {
-                    let response = WSMessage::AccessDenied {
-                        reason: "Chat is only available in a lobby or game".to_string(),
-                    };
-                    let json_msg = serde_json::to_string(&response)?;
-                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                WSMessage::Chat(message) => {
+                    let trimmed = message.trim();
+                    if trimmed.is_empty() {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+
+                    if trimmed.chars().count() > MAX_CHAT_MESSAGE_LENGTH {
+                        let response = WSMessage::AccessDenied {
+                            reason: format!(
+                                "Chat messages must be {} characters or fewer",
+                                MAX_CHAT_MESSAGE_LENGTH
+                            ),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+
+                    let mut publish_error = false;
+                    if let Some(current_game_id) = game_id {
+                        let payload = GameChatBroadcast {
+                            game_id: current_game_id,
+                            message_id: uuid::Uuid::new_v4().to_string(),
+                            user_id: metadata.user_id,
+                            username: metadata.username.clone(),
+                            message: trimmed.to_string(),
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                        };
+
+                        if let Err(e) = publish_game_chat_message(redis_url, payload).await {
+                            error!(
+                                "Failed to publish game {} chat message for user {}: {}",
+                                current_game_id, metadata.user_id, e
+                            );
+                            publish_error = true;
+                        }
+                    } else if let Some(ref lobby_handle) = lobby {
+                        let payload = LobbyChatBroadcast {
+                            lobby_code: lobby_handle.lobby_code.clone(),
+                            message_id: uuid::Uuid::new_v4().to_string(),
+                            user_id: metadata.user_id,
+                            username: metadata.username.clone(),
+                            message: trimmed.to_string(),
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                        };
+
+                        if let Err(e) = publish_lobby_chat_message(redis_url, payload).await {
+                            error!(
+                                "Failed to publish lobby '{}' chat message for user {}: {}",
+                                lobby_handle.lobby_code, metadata.user_id, e
+                            );
+                            publish_error = true;
+                        }
+                    } else {
+                        let response = WSMessage::AccessDenied {
+                            reason: "Chat is only available in a lobby or game".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+
+                    if publish_error {
+                        let response = WSMessage::AccessDenied {
+                            reason: "Failed to send chat message".to_string(),
+                        };
+                        let json_msg = serde_json::to_string(&response)?;
+                        ws_tx.send(Message::Text(json_msg.into())).await?;
+                    }
+
                     Ok(ConnectionState::Authenticated {
                         metadata,
                         lobby_handle: lobby,
