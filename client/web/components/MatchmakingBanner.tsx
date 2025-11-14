@@ -6,16 +6,22 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 export const MatchmakingBanner: React.FC = () => {
   const { user } = useAuth();
   const { currentLobby } = useWebSocket();
-  const { leaveQueue } = useGameWebSocket();
+  const { leaveQueue, isQueued, isJoiningGame } = useGameWebSocket();
 
-  if (!currentLobby || currentLobby.state !== 'queued') {
+  if (!isQueued && !isJoiningGame) {
     return null;
   }
 
-  const isHost = user && currentLobby.hostUserId === user.id;
+  const isHost = Boolean(user && currentLobby && currentLobby.hostUserId === user.id);
+  const showCancel = isQueued && (!currentLobby || isHost);
+  const statusText = isQueued
+    ? currentLobby
+      ? (isHost ? 'Finding match...' : 'Host is finding a match...')
+      : 'Finding match...'
+    : 'Joining game...';
 
   const handleCancel = () => {
-    if (!isHost) {
+    if (!showCancel) {
       return;
     }
     leaveQueue();
@@ -25,8 +31,8 @@ export const MatchmakingBanner: React.FC = () => {
     <div className="fixed top-4 left-0 right-0 z-50 flex justify-center px-4 pointer-events-none">
       <div className="flex items-center gap-3 px-4 py-2 rounded-full bg-white/95 border border-gray-300 shadow-md text-xs font-bold uppercase tracking-1 text-black-70 pointer-events-auto">
         <span className="w-4 h-4 border-2 border-gray-300 border-t-black rounded-full animate-spin" aria-hidden="true" />
-        <span>{isHost ? 'Finding match...' : 'Host is finding a match...'}</span>
-        {isHost && (
+        <span>{statusText}</span>
+        {showCancel && (
           <button
             type="button"
             onClick={handleCancel}

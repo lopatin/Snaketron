@@ -19,10 +19,8 @@ export default function GameArena() {
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  
-  // Track mount state for React strict mode
-  const isMountedRef = useRef(false);
-  const hasJoinedGameRef = useRef(false);
+  const joinedGameIdRef = useRef<string | null>(null);
+  const previousGameIdRef = useRef<string | null>(null);
   
   const {
     connected,
@@ -32,6 +30,7 @@ export default function GameArena() {
     leaveGame,
     queueForMatch,
     queueForMatchMulti,
+    isJoiningGame,
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
@@ -66,11 +65,31 @@ export default function GameArena() {
   const [rotation, setRotation] = useState<ArenaRotation>(0);
   const rotationSetRef = useRef(false); // Track if rotation has been set
 
+  // Reset local arena state when switching to a new game ID (route change without unmount)
+  useEffect(() => {
+    if (!gameId) {
+      return;
+    }
+
+    if (previousGameIdRef.current && previousGameIdRef.current !== gameId) {
+      console.log('Game ID changed, tearing down previous arena before joining new game:', previousGameIdRef.current, '→', gameId);
+      leaveGame();
+      stopEngine();
+      rotationSetRef.current = false;
+      lastHeadPositionRef.current = null;
+      setGameOver(false);
+      setShowGameOverPanel(false);
+    }
+
+    previousGameIdRef.current = gameId;
+    joinedGameIdRef.current = null;
+  }, [gameId, leaveGame, stopEngine]);
+
   // Join game when user becomes available AND WebSocket is connected
   useEffect(() => {
-    if (user && gameId && connected && !hasJoinedGameRef.current) {
+    if (user && gameId && connected && joinedGameIdRef.current !== gameId) {
       console.log('User authenticated and WebSocket connected, joining game:', gameId);
-      hasJoinedGameRef.current = true;
+      joinedGameIdRef.current = gameId;
       joinGame(gameId);
     }
   }, [user, gameId, connected, joinGame]);
@@ -93,7 +112,7 @@ export default function GameArena() {
       document.body.classList.remove('hide-background-dots');
       console.log('GAME ARENA UNMOUNTED, initial state issue');
 
-      hasJoinedGameRef.current = false; // Reset for next mount
+      joinedGameIdRef.current = null; // Reset for next mount
       rotationSetRef.current = false; // Reset rotation flag for next game
       leaveGame();
       stopEngine();
@@ -104,10 +123,11 @@ export default function GameArena() {
   // Calculate optimal cell size and canvas dimensions
   useEffect(() => {
     const calculateSizes = () => {
-      if (!gameState || !gameState.arena) return;
+      const state = gameState ?? committedState;
+      if (!state || !state.arena) return;
       
-      const gridWidth = gameState.arena.width || 40;
-      const gridHeight = gameState.arena.height || 40;
+      const gridWidth = state.arena.width || 40;
+      const gridHeight = state.arena.height || 40;
       
       const vh = window.innerHeight;
       const vw = window.innerWidth;
@@ -147,7 +167,7 @@ export default function GameArena() {
     window.addEventListener('resize', calculateSizes);
     
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [gameState, rotation]);
+  }, [gameState, committedState, rotation]);
 
   // Check for game completion
   useEffect(() => {
@@ -203,8 +223,9 @@ export default function GameArena() {
 
   // Set rotation based on user's team when game state is first available
   useEffect(() => {
-    if (gameState && user?.id && !rotationSetRef.current) {
-      const player = gameState.players?.[user.id];
+    const state = gameState ?? committedState;
+    if (state && user?.id && !rotationSetRef.current) {
+      const player = state.players?.[user.id];
       if (player) {
         const snakeId = player.snake_id;
         
@@ -224,7 +245,7 @@ export default function GameArena() {
         rotationSetRef.current = true;
       }
     }
-  }, [gameState, user?.id]); // Only run when gameState or user changes
+  }, [gameState, committedState, user?.id]); // Only run when gameState or user changes
 
   useEffect(() => {
     if (!window.wasm) {
@@ -363,10 +384,11 @@ export default function GameArena() {
   
   // Update countdown display
   useEffect(() => {
-    if (!gameState) return;
+    const state = gameState ?? committedState;
+    if (!state) return;
     
     const intervalId = setInterval(() => {
-      const timeLeft = gameState.start_ms - Date.now();
+      const timeLeft = state.start_ms - Date.now();
       if (timeLeft <= 0) {
         clearInterval(intervalId);
       } else {
@@ -376,7 +398,7 @@ export default function GameArena() {
     }, 100); // Update every 100ms for smooth countdown
     
     return () => clearInterval(intervalId);
-  }, [gameState, forceUpdate]);
+  }, [gameState, committedState, forceUpdate]);
 
   const handleSendGameChat = useCallback((message: string) => {
     if (!connected) {
@@ -385,22 +407,20 @@ export default function GameArena() {
     sendChatMessage('game', message);
   }, [connected, sendChatMessage]);
   
-  // Show loading screen while waiting for game state
-  if (!gameState) {
-    return <LoadingScreen message="Joining Game..." />;
-  }
-  
   // Calculate countdown from game start time or round start time
-  let timeUntilStart = gameState.start_ms - Date.now();
+  const countdownState = gameState ?? committedState;
+  const isWaitingForSnapshot = !gameState;
+  const waitingMessage = isJoiningGame ? 'Joining game...' : 'Preparing arena...';
+  let timeUntilStart = countdownState ? countdownState.start_ms - Date.now() : 0;
 
   // For round transitions, use the latest round start time
-  if (gameState.is_transitioning && gameState.round_start_times && gameState.round_start_times.length > 0) {
-    const latestRoundStartTime = gameState.round_start_times[gameState.round_start_times.length - 1];
+  if (countdownState?.is_transitioning && countdownState.round_start_times && countdownState.round_start_times.length > 0) {
+    const latestRoundStartTime = countdownState.round_start_times[countdownState.round_start_times.length - 1];
     timeUntilStart = latestRoundStartTime - Date.now();
   }
 
-  const countdownSeconds = Math.ceil(timeUntilStart / 1000);
-  const showCountdown = countdownSeconds > 0;
+  const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
+  const showCountdown = countdownState ? countdownSeconds > 0 : false;
   
   const convertLobbyModeToGameType = (mode: LobbyGameMode): GameType => {
     switch (mode) {
@@ -429,7 +449,8 @@ export default function GameArena() {
 
   // Handle play again
   const handlePlayAgain = () => {
-    if (!gameState) {
+    const state = gameState ?? committedState;
+    if (!state) {
       return;
     }
 
@@ -450,7 +471,7 @@ export default function GameArena() {
       } else if (gameTypes.length > 1) {
         queueForMatchMulti(gameTypes, queueMode);
       } else {
-        queueForMatch(gameState.game_type);
+        queueForMatch(state.game_type);
       }
       return;
     }
@@ -460,7 +481,7 @@ export default function GameArena() {
       return;
     }
 
-    queueForMatch(gameState.game_type);
+    queueForMatch(state.game_type);
   };
 
   const showAuthLoading = authLoading || !user;
@@ -511,16 +532,24 @@ export default function GameArena() {
                 border: 'none'
               }}
             />
+            {isWaitingForSnapshot && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-20">
+                <span className="w-6 h-6 border-2 border-gray-300 border-t-black rounded-full animate-spin mb-3" aria-hidden="true" />
+                <span className="text-gray-600 font-semibold uppercase tracking-1 text-xs">
+                  {waitingMessage}
+                </span>
+              </div>
+            )}
             
             {/* Countdown Overlay */}
-            {showCountdown && (
+            {showCountdown && countdownState && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
-                {gameState.is_transitioning && (
+                {countdownState.is_transitioning && (
                   <div className="text-white font-bold text-3xl mb-4" style={{
                     textShadow: '0 2px 4px rgba(0,0,0,0.5)'
                   }}>
-                    {gameState.current_round > 1 ?
-                      `Round ${gameState.current_round}` :
+                    {countdownState.current_round > 1 ?
+                      `Round ${countdownState.current_round}` :
                       'Round 1'
                     }
                   </div>

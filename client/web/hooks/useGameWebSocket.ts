@@ -11,6 +11,7 @@ interface UseGameWebSocketReturn {
   isHost: boolean;
   lastGameEvent: any | null;
   isQueued: boolean;
+  isJoiningGame: boolean;
   createCustomGame: (settings: Partial<CustomGameSettings>) => void;
   createGame: (gameType: string) => void;
   createSoloGame: () => void;
@@ -35,6 +36,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const [isHost, setIsHost] = useState(false);
   const [lastGameEvent, setLastGameEvent] = useState<any | null>(null);
   const [isQueued, setIsQueued] = useState(false);
+  const [isJoiningGame, setIsJoiningGame] = useState(false);
 
   // Handle game-specific messages
   useEffect(() => {
@@ -60,6 +62,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         
         // Also extract just the event for local state updates
         const event = eventMessage.event || eventMessage;
+        if (event && typeof event === 'object' && 'Snapshot' in event) {
+          setIsJoiningGame(false);
+        }
         
         // Handle different event types
         // if (event.Snapshot) {
@@ -154,6 +159,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           console.log('Match found! Game ID:', gameId);
           setCurrentGameId(gameId.toString());
           setIsQueued(false);
+          setIsJoiningGame(true);
           
           // DON'T send JoinGame back - GameArena will handle joining
           // sendMessage({ JoinGame: parseInt(gameId.toString()) });
@@ -169,6 +175,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('AccessDenied', (message: any) => {
         console.error('Access denied:', message.data.reason);
         setIsQueued(false);
+        setIsJoiningGame(false);
         // TODO: Show error to user
       })
     );
@@ -177,6 +184,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('QueueLeft', () => {
         console.log('Received QueueLeft message from server, clearing queue state');
         setIsQueued(false);
+        setIsJoiningGame(false);
       })
     );
 
@@ -201,7 +209,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   }, [sendMessage]);
 
   const joinGame = useCallback((gameId: string, gameCode?: string | null) => {
-    // debugger;
+    setIsJoiningGame(true);
     sendMessage({
       JoinGame: parseInt(gameId)
     });
@@ -238,6 +246,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const queueForMatch = useCallback((gameType: GameType, queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
     console.log('Queueing for match with game type:', gameType, 'mode:', queueMode);
     setIsQueued(true);
+    setIsJoiningGame(false);
     sendMessage({
       QueueForMatch: { game_type: gameType, queue_mode: queueMode }
     });
@@ -246,6 +255,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const queueForMatchMulti = useCallback((gameTypes: GameType[], queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
     console.log('Queueing for match with multiple game types:', gameTypes, 'mode:', queueMode);
     setIsQueued(true);
+    setIsJoiningGame(false);
     sendMessage({
       QueueForMatchMulti: { game_types: gameTypes, queue_mode: queueMode }
     });
@@ -255,6 +265,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     console.log('Sending LeaveQueue message');
     sendMessage('LeaveQueue');
     setIsQueued(false);
+    setIsJoiningGame(false);
   }, [sendMessage]);
 
   const leaveGame = useCallback(() => {
@@ -265,6 +276,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     setIsHost(false);
     setCustomGameCode(null);
     setIsQueued(false);
+    setIsJoiningGame(false);
   }, [sendMessage]);
 
   // Create a quick match or competitive game
@@ -294,6 +306,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     isHost,
     lastGameEvent,
     isQueued,
+    isJoiningGame,
     createCustomGame,
     createGame,
     createSoloGame,

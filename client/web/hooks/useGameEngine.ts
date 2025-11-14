@@ -2,7 +2,6 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
 import { getClockDrift } from '../utils/clockSync';
-import {useAuth} from "../contexts/AuthContext";
 
 interface UseGameEngineProps {
   gameId: string;
@@ -42,6 +41,32 @@ export const useGameEngine = ({
   useEffect(() => {
     latencyMsRef.current = latencyMs;
   }, [latencyMs]);
+
+  // Tear down the current engine whenever the game ID changes so we can initialize from the next snapshot
+  useEffect(() => {
+    if (engineGameIdRef.current === gameId) {
+      return;
+    }
+
+    if (engineRef.current) {
+      try {
+        engineRef.current.free();
+      } catch (error) {
+        console.warn('Failed to free previous GameClient while switching games:', error);
+      }
+      engineRef.current = null;
+    }
+
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    engineGameIdRef.current = gameId;
+    setGameState(null);
+    setCommittedState(null);
+    setIsGameComplete(false);
+  }, [gameId]);
 
   const runGameLoop = useCallback(() => {
     if (!engineRef.current) {
@@ -238,6 +263,19 @@ export const useGameEngine = ({
       }
       
       const event = fullEventMessage.event || fullEventMessage;
+      const expectedGameId = parseInt(gameId || '0', 10);
+      const rawMessageGameId = fullEventMessage.game_id;
+      const messageGameId =
+        typeof rawMessageGameId === 'number'
+          ? rawMessageGameId
+          : typeof rawMessageGameId === 'string'
+            ? parseInt(rawMessageGameId, 10)
+            : null;
+
+      if (messageGameId && Number.isFinite(expectedGameId) && messageGameId !== expectedGameId) {
+        console.warn('Ignoring server event for previous game:', messageGameId, 'expected:', expectedGameId);
+        return;
+      }
 
       // Ensure WASM runtime is ready before using the game client
       if (typeof window !== 'undefined') {

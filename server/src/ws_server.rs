@@ -2051,6 +2051,26 @@ async fn process_ws_message(
                         websocket_id,
                     })
                 }
+                WSMessage::LeaveGame => {
+                    if let Some(current_game_id) = game_id {
+                        info!(
+                            "User {} ({}) leaving game {}",
+                            metadata.username, metadata.user_id, current_game_id
+                        );
+                    } else {
+                        debug!(
+                            "Received LeaveGame from user {} ({}) but no active game was set",
+                            metadata.username, metadata.user_id
+                        );
+                    }
+
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id: None,
+                        websocket_id,
+                    })
+                }
                 WSMessage::LeaveQueue => {
                     info!(
                         "User {} ({}) leaving matchmaking queue",
@@ -2630,43 +2650,6 @@ async fn process_ws_message(
                     Ok(ConnectionState::Authenticated {
                         metadata,
                         lobby_handle: lobby,
-                        game_id,
-                        websocket_id,
-                    })
-                }
-            }
-        }
-        ConnectionState::Authenticated {
-            metadata,
-            lobby_handle: None,
-            game_id,
-            websocket_id,
-        } => {
-            // Handle authenticated users not in a lobby (can create/join lobbies)
-            match ws_message {
-                WSMessage::Ping { client_time } => {
-                    let server_time = chrono::Utc::now().timestamp_millis();
-                    let pong_msg = Message::Text(
-                        serde_json::to_string(&WSMessage::Pong {
-                            client_time,
-                            server_time,
-                        })?
-                        .into(),
-                    );
-                    ws_tx.send(pong_msg).await?;
-                    Ok(ConnectionState::Authenticated {
-                        metadata,
-                        lobby_handle: None,
-                        game_id,
-                        websocket_id,
-                    })
-                }
-                _ => {
-                    // Most other messages require being in a lobby
-                    warn!("Received message {:?} while not in a lobby", ws_message);
-                    Ok(ConnectionState::Authenticated {
-                        metadata,
-                        lobby_handle: None,
                         game_id,
                         websocket_id,
                     })
