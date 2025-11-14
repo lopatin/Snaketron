@@ -581,6 +581,7 @@ export default function GameArena() {
         isActive={connected}
         inactiveMessage="Game chat unavailable"
         initialExpanded={true}
+        autoOpenEligible={false}
       />
     </div>
   );

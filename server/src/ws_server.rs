@@ -20,7 +20,7 @@ use futures_util::{SinkExt, Stream};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -99,35 +99,6 @@ pub enum WSMessage {
     UpdateNickname {
         nickname: String,
     },
-    // Custom game messages
-    CreateCustomGame {
-        settings: common::CustomGameSettings,
-    },
-    JoinCustomGame {
-        game_code: String,
-    },
-    UpdateCustomGameSettings {
-        settings: common::CustomGameSettings,
-    },
-    StartCustomGame,
-    SpectateGame {
-        game_id: u32,
-        game_code: Option<String>,
-    },
-    // Solo game messages
-    CreateSoloGame,
-    // Custom game responses
-    CustomGameCreated {
-        game_id: u32,
-        game_code: String,
-    },
-    CustomGameJoined {
-        game_id: u32,
-    },
-    CustomGameSettingsUpdated {
-        settings: common::CustomGameSettings,
-    },
-    CustomGameStarting,
     SpectatorJoined,
     AccessDenied {
         reason: String,
@@ -450,10 +421,10 @@ async fn handle_websocket_connection(
 
     // Spawn task to subscribe to user count updates and forward to client
     let ws_tx_for_counts = ws_tx.clone();
-    let redis_url_for_counts = redis_url.clone();
+    let pubsub_manager_for_counts = pubsub_manager.clone();
     let _user_count_task = tokio::spawn(async move {
         if let Err(e) =
-            subscribe_to_user_count_updates(redis_url_for_counts, ws_tx_for_counts).await
+            subscribe_to_user_count_updates(pubsub_manager_for_counts, ws_tx_for_counts).await
         {
             error!("User count subscription task failed: {}", e);
         }
@@ -575,6 +546,7 @@ async fn handle_websocket_connection(
                                         &pubsub_manager,
                                         &matchmaking_manager,
                                         &replication_manager,
+                                        &redis,
                                         &redis_url,
                                         &lobby_manager,
                                         &websocket_id,
@@ -617,19 +589,21 @@ async fn handle_websocket_connection(
                                                     }));
 
                                                     let ws_tx_clone = ws_tx.clone();
-                                                    let redis_url_clone = redis_url.clone();
+                                                    let pubsub_manager_clone = pubsub_manager.clone();
 
                                                     game_chat_handle = Some(tokio::spawn(async move {
                                                         if let Err(e) = subscribe_to_game_chat(
                                                             game_id,
-                                                            redis_url_clone,
+                                                            pubsub_manager_clone,
                                                             ws_tx_clone,
-                                                        ).await {
+                                                        )
+                                                        .await
+                                                        {
                                                             error!("Game chat subscription failed: {}", e);
                                                         }
                                                     }));
 
-                                                    match load_game_chat_history(&redis_url, game_id).await {
+                                                    match load_game_chat_history(redis.clone(), game_id).await {
                                                         Ok(history) if !history.is_empty() => {
                                                             let history_message = WSMessage::GameChatHistory {
                                                                 game_id,
@@ -754,13 +728,13 @@ async fn handle_websocket_connection(
 
                                                     // Subscribe to lobby chat
                                                     let ws_tx_clone = ws_tx.clone();
-                                                    let redis_url_clone = redis_url.clone();
+                                                    let pubsub_manager_clone = pubsub_manager.clone();
 
                                                     let lobby_code_for_chat = lobby_handle.lobby_code.clone();
                                                     lobby_chat_handle = Some(tokio::spawn(async move {
                                                         if let Err(e) = subscribe_to_lobby_chat(
                                                             lobby_code_for_chat,
-                                                            redis_url_clone,
+                                                            pubsub_manager_clone,
                                                             ws_tx_clone,
                                                         )
                                                         .await
@@ -770,7 +744,7 @@ async fn handle_websocket_connection(
                                                     }));
 
                                                     let lobby_code_for_history = lobby_handle.lobby_code.clone();
-                                                    match load_lobby_chat_history(&redis_url, &lobby_code_for_history).await {
+                                                    match load_lobby_chat_history(redis.clone(), &lobby_code_for_history).await {
                                                         Ok(history) if !history.is_empty() => {
                                                             let history_message = WSMessage::LobbyChatHistory {
                                                                 lobby_code: lobby_code_for_history.clone(),
@@ -919,58 +893,52 @@ async fn handle_websocket_connection(
     Ok(())
 }
 
-async fn publish_lobby_chat_message(redis_url: &str, payload: LobbyChatBroadcast) -> Result<()> {
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for lobby chat publish")?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for lobby chat publish")?;
-
+async fn publish_lobby_chat_message(
+    mut redis: ConnectionManager,
+    payload: LobbyChatBroadcast,
+) -> Result<()> {
     let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
     let history_key = RedisKeys::lobby_chat_history_key(&payload.lobby_code);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize lobby chat payload")?;
 
-    conn.publish::<_, _, ()>(&channel, serialized.clone())
+    redis
+        .publish::<_, _, ()>(&channel, serialized.clone())
         .await
         .context("Failed to publish lobby chat message")?;
 
-    let _: i64 = conn
+    let _: i64 = redis
         .rpush(&history_key, serialized.clone())
         .await
         .context("Failed to append lobby chat history")?;
     let start: isize = -(CHAT_HISTORY_LIMIT as isize);
-    let _: () = conn
+    let _: () = redis
         .ltrim(&history_key, start, -1)
         .await
         .context("Failed to trim lobby chat history")?;
     Ok(())
 }
 
-async fn publish_game_chat_message(redis_url: &str, payload: GameChatBroadcast) -> Result<()> {
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for game chat publish")?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for game chat publish")?;
-
+async fn publish_game_chat_message(
+    mut redis: ConnectionManager,
+    payload: GameChatBroadcast,
+) -> Result<()> {
     let channel = RedisKeys::game_chat_channel(payload.game_id);
     let history_key = RedisKeys::game_chat_history_key(payload.game_id);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize game chat payload")?;
 
-    conn.publish::<_, _, ()>(&channel, serialized.clone())
+    redis
+        .publish::<_, _, ()>(&channel, serialized.clone())
         .await
         .context("Failed to publish game chat message")?;
 
-    let _: i64 = conn
+    let _: i64 = redis
         .rpush(&history_key, serialized.clone())
         .await
         .context("Failed to append game chat history")?;
     let start: isize = -(CHAT_HISTORY_LIMIT as isize);
-    let _: () = conn
+    let _: () = redis
         .ltrim(&history_key, start, -1)
         .await
         .context("Failed to trim game chat history")?;
@@ -1052,18 +1020,11 @@ async fn compute_lobby_avg_mmr(db: &Arc<dyn Database>, members: &[LobbyMember]) 
 }
 
 async fn load_lobby_chat_history(
-    redis_url: &str,
+    mut redis: ConnectionManager,
     lobby_code: &str,
 ) -> Result<Vec<LobbyChatBroadcast>> {
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for lobby chat history")?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for lobby chat history")?;
-
     let key = RedisKeys::lobby_chat_history_key(lobby_code);
-    let entries: Vec<String> = conn
+    let entries: Vec<String> = redis
         .lrange(&key, 0, -1)
         .await
         .context("Failed to load lobby chat history")?;
@@ -1084,16 +1045,12 @@ async fn load_lobby_chat_history(
     Ok(messages)
 }
 
-async fn load_game_chat_history(redis_url: &str, game_id: u32) -> Result<Vec<GameChatBroadcast>> {
-    let client = redis::Client::open(redis_url)
-        .context("Failed to open Redis client for game chat history")?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("Failed to get Redis connection for game chat history")?;
-
+async fn load_game_chat_history(
+    mut redis: ConnectionManager,
+    game_id: u32,
+) -> Result<Vec<GameChatBroadcast>> {
     let key = RedisKeys::game_chat_history_key(game_id);
-    let entries: Vec<String> = conn
+    let entries: Vec<String> = redis
         .lrange(&key, 0, -1)
         .await
         .context("Failed to load game chat history")?;
@@ -1277,39 +1234,24 @@ async fn subscribe_to_game_events(
 
 async fn subscribe_to_game_chat(
     game_id: u32,
-    redis_url: String,
+    pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     info!("Subscribing to game {} chat", game_id);
 
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client for game chat subscription")?;
-    let mut pubsub_conn = client
-        .get_async_pubsub()
-        .await
-        .context("Failed to create Redis pub/sub connection for game chat")?;
-
     let channel = RedisKeys::game_chat_channel(game_id);
-    pubsub_conn
-        .subscribe(&channel)
+    let mut manager = (*pubsub_manager).clone();
+    let mut receiver = manager
+        .subscribe_to_channel(&channel)
         .await
         .context("Failed to subscribe to game chat channel")?;
 
-    let mut stream = pubsub_conn.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: String = match msg.get_payload() {
+    loop {
+        let chat_payload: GameChatBroadcast = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
-                warn!("Failed to read payload from game chat message: {}", e);
-                continue;
-            }
-        };
-
-        let chat_payload: GameChatBroadcast = match serde_json::from_str(&payload) {
-            Ok(payload) => payload,
-            Err(e) => {
-                warn!("Failed to deserialize game chat payload: {}", e);
-                continue;
+                warn!("Failed to receive game chat payload: {}", e);
+                break;
             }
         };
 
@@ -1345,39 +1287,24 @@ async fn subscribe_to_game_chat(
 
 async fn subscribe_to_lobby_chat(
     lobby_code: String,
-    redis_url: String,
+    pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     info!("Subscribing to lobby '{}' chat", lobby_code);
 
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client for lobby chat subscription")?;
-    let mut pubsub_conn = client
-        .get_async_pubsub()
-        .await
-        .context("Failed to create Redis pub/sub connection for lobby chat")?;
-
     let channel = RedisKeys::lobby_chat_channel(&lobby_code);
-    pubsub_conn
-        .subscribe(&channel)
+    let mut manager = (*pubsub_manager).clone();
+    let mut receiver = manager
+        .subscribe_to_channel(&channel)
         .await
         .context("Failed to subscribe to lobby chat channel")?;
 
-    let mut stream = pubsub_conn.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: String = match msg.get_payload() {
+    loop {
+        let chat_payload: LobbyChatBroadcast = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
-                warn!("Failed to read payload from lobby chat message: {}", e);
-                continue;
-            }
-        };
-
-        let chat_payload: LobbyChatBroadcast = match serde_json::from_str(&payload) {
-            Ok(payload) => payload,
-            Err(e) => {
-                warn!("Failed to deserialize lobby chat payload: {}", e);
-                continue;
+                warn!("Failed to receive lobby chat payload: {}", e);
+                break;
             }
         };
 
@@ -1421,6 +1348,7 @@ async fn process_ws_message(
     pubsub_manager: &Arc<PubSubManager>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
+    redis: &ConnectionManager,
     redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     websocket_id: &str,
@@ -2131,175 +2059,6 @@ async fn process_ws_message(
                     })
                 }
 
-                // TODO: Drop support for custom games
-                WSMessage::CreateCustomGame { settings } => {
-                    info!(
-                        "User {} ({}) creating custom game",
-                        metadata.username, metadata.user_id
-                    );
-
-                    Ok(ConnectionState::Authenticated {
-                        metadata,
-                        lobby_handle: lobby,
-                        game_id,
-                        websocket_id,
-                    })
-
-                    // match create_custom_game(
-                    //     db,
-                    //     &pubsub_manager,
-                    //     metadata.user_id,
-                    //     metadata.username.clone(),
-                    //     settings,
-                    // )
-                    // .await
-                    // {
-                    //     Ok((game_id, game_code)) => {
-                    //         // Send success response
-                    //         let response = WSMessage::CustomGameCreated { game_id, game_code };
-                    //         let json_msg = serde_json::to_string(&response)?;
-                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
-                    //
-                    //         // Transition to in-game state
-                    //         Ok(ConnectionState::Authenticated {
-                    //             metadata,
-                    //             game_id: Some(game_id),
-                    //             lobby_handle: None,
-                    //             websocket_id: websocket_id.to_string(), // Custom games don't use lobbies
-                    //         })
-                    //     }
-                    //     Err(e) => {
-                    //         error!("Failed to create custom game: {}", e);
-                    //         let response = WSMessage::AccessDenied {
-                    //             reason: format!("Failed to create game: {}", e),
-                    //         };
-                    //         let json_msg = serde_json::to_string(&response)?;
-                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
-                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
-                    //     }
-                    // }
-                }
-                WSMessage::JoinCustomGame { game_code } => {
-                    info!(
-                        "User {} ({}) joining custom game with code: {}",
-                        metadata.username, metadata.user_id, game_code
-                    );
-
-                    match join_custom_game(db, metadata.user_id, &game_code).await {
-                        Ok(game_id) => {
-                            // Send success response
-                            let response = WSMessage::CustomGameJoined { game_id };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-
-                            // Transition to in-game state
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                game_id: Some(game_id),
-                                lobby_handle: None,
-                                websocket_id: websocket_id.to_string(), // Custom games don't use lobbies
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to join custom game: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to join game: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
-                }
-                WSMessage::SpectateGame {
-                    game_id: spectate_game_id,
-                    game_code,
-                } => {
-                    info!(
-                        "User {} ({}) attempting to spectate game {}",
-                        metadata.username, metadata.user_id, spectate_game_id
-                    );
-
-                    match spectate_game(
-                        db,
-                        metadata.user_id,
-                        spectate_game_id,
-                        game_code.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(actual_game_id) => {
-                            // Send success response
-                            let response = WSMessage::SpectatorJoined;
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-
-                            // Transition to in-game state as spectator
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                game_id: Some(actual_game_id),
-                                lobby_handle: None, // Spectators don't use lobbies
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to spectate game: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to spectate game: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
-                }
-
-                // TODO: Solo games should be started like any other game via matchmaking, not specially handled
-                WSMessage::CreateSoloGame => {
-                    info!(
-                        "User {} ({}) creating solo game",
-                        metadata.username, metadata.user_id
-                    );
-
-                    Ok(ConnectionState::Authenticated {
-                        metadata,
-                        lobby_handle: lobby,
-                        game_id,
-                        websocket_id,
-                    })
-
-                    // match create_solo_game(db, &pubsub_manager, metadata.user_id, metadata.username.clone())
-                    //     .await
-                    // {
-                    //     Ok(created_game_id) => {
-                    //         // Send success response
-                    //         let response = WSMessage::SoloGameCreated { game_id: created_game_id };
-                    //         let json_msg = serde_json::to_string(&response)?;
-                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
-                    //
-                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id: Some(created_game_id), websocket_id })
-                    //     }
-                    //     Err(e) => {
-                    //         error!("Failed to create solo game: {}", e);
-                    //         let response = WSMessage::AccessDenied {
-                    //             reason: format!("Failed to create solo game: {}", e),
-                    //         };
-                    //         let json_msg = serde_json::to_string(&response)?;
-                    //         ws_tx.send(Message::Text(json_msg.into())).await?;
-                    //         Ok(ConnectionState::Authenticated { metadata, lobby_handle: lobby, game_id, websocket_id })
-                    //     }
-                    // }
-                }
                 WSMessage::CreateLobby => {
                     info!(
                         "User {} ({}) creating lobby in region {}",
@@ -2600,7 +2359,7 @@ async fn process_ws_message(
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
-                        if let Err(e) = publish_game_chat_message(redis_url, payload).await {
+                        if let Err(e) = publish_game_chat_message(redis.clone(), payload).await {
                             error!(
                                 "Failed to publish game {} chat message for user {}: {}",
                                 current_game_id, metadata.user_id, e
@@ -2617,7 +2376,7 @@ async fn process_ws_message(
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
-                        if let Err(e) = publish_lobby_chat_message(redis_url, payload).await {
+                        if let Err(e) = publish_lobby_chat_message(redis.clone(), payload).await {
                             error!(
                                 "Failed to publish lobby '{}' chat message for user {}: {}",
                                 lobby_handle.lobby_code, metadata.user_id, e
@@ -2740,49 +2499,26 @@ pub async fn register_server(
 
 /// Subscribe to user count updates from Redis and forward to WebSocket client
 async fn subscribe_to_user_count_updates(
-    redis_url: String,
+    pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
-    // Create Redis client for pub/sub
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client for user count subscription")?;
-
-    let mut pubsub_conn = client
-        .get_async_pubsub()
-        .await
-        .context("Failed to create Redis pub/sub connection")?;
-
-    // Subscribe to user count updates channel
-    pubsub_conn
-        .subscribe("user_count_updates")
+    let mut manager = (*pubsub_manager).clone();
+    let mut receiver = manager
+        .subscribe_to_channel("user_count_updates")
         .await
         .context("Failed to subscribe to user_count_updates channel")?;
 
     info!("Subscribed to user count updates");
 
-    // Listen for messages
-    let mut pubsub_stream = pubsub_conn.on_message();
-
-    while let Some(msg) = pubsub_stream.next().await {
-        let payload: String = match msg.get_payload() {
-            Ok(p) => p,
+    loop {
+        let region_counts: HashMap<String, u32> = match receiver.recv().await {
+            Ok(counts) => counts,
             Err(e) => {
-                warn!("Failed to get payload from user count update: {}", e);
-                continue;
+                warn!("Failed to receive user count update: {}", e);
+                break;
             }
         };
 
-        // Parse the region counts
-        let region_counts: std::collections::HashMap<String, u32> =
-            match serde_json::from_str(&payload) {
-                Ok(counts) => counts,
-                Err(e) => {
-                    warn!("Failed to parse user count update: {}", e);
-                    continue;
-                }
-            };
-
-        // Create WebSocket message
         let ws_message = WSMessage::UserCountUpdate { region_counts };
         let json_msg = match serde_json::to_string(&ws_message) {
             Ok(json) => json,
@@ -2792,7 +2528,6 @@ async fn subscribe_to_user_count_updates(
             }
         };
 
-        // Send to WebSocket client
         if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
             debug!("WebSocket channel closed, stopping user count subscription");
             break;
@@ -2814,24 +2549,15 @@ struct LobbyUpdatePayload {
 /// Subscribe to lobby updates and forward to WebSocket client
 async fn subscribe_to_lobby_updates(
     lobby_code: String,
-    redis_url: String,
+    pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     info!("Subscribing to lobby '{}' updates", lobby_code);
 
-    // Create Redis client for pub/sub
-    let client = redis::Client::open(redis_url.as_str())
-        .context("Failed to create Redis client for lobby subscription")?;
-
-    let mut pubsub_conn = client
-        .get_async_pubsub()
-        .await
-        .context("Failed to create Redis pub/sub connection")?;
-
-    // Subscribe to lobby update channel
     let channel = RedisKeys::lobby_updates_channel();
-    pubsub_conn
-        .subscribe(&channel)
+    let mut manager = (*pubsub_manager).clone();
+    let mut receiver = manager
+        .subscribe_to_channel(&channel)
         .await
         .context("Failed to subscribe to lobby updates channel")?;
 
@@ -2840,18 +2566,7 @@ async fn subscribe_to_lobby_updates(
         channel, lobby_code
     );
 
-    // Listen for messages
-    let mut pubsub_stream = pubsub_conn.on_message();
-
-    while let Some(msg) = pubsub_stream.next().await {
-        let payload: String = match msg.get_payload() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to read lobby update payload: {}", e);
-                continue;
-            }
-        };
-
+    while let Ok(payload) = receiver.recv::<String>().await {
         match serde_json::from_str::<LobbyUpdatePayload>(&payload) {
             Ok(update) => {
                 if update.lobby_code != lobby_code {
@@ -2969,178 +2684,6 @@ fn generate_game_code() -> String {
         })
         .collect()
 }
-
-// async fn create_custom_game(
-//     db: &Arc<dyn Database>,
-//     pubsub_manager: &Arc<PubSubManager>,
-//     user_id: i32,
-//     username: String,
-//     settings: common::CustomGameSettings,
-// ) -> Result<(u32, String)> {
-//     let game_code = generate_game_code();
-//
-//     // Get current server ID from database
-//     let server_id = db.get_server_for_load_balancing("default").await?;
-//
-//     // Create lobby entry
-//     let lobby_id = db
-//         .create_custom_lobby(&game_code, user_id, &serde_json::to_value(&settings)?)
-//         .await?;
-//
-//     // Create game entry
-//     let game_id = db
-//         .create_game(
-//             server_id,
-//             &serde_json::to_value(&common::GameType::Custom {
-//                 settings: settings.clone(),
-//             })?,
-//             "custom",
-//             settings.is_private,
-//             Some(&game_code),
-//         )
-//         .await?;
-//
-//     // Update lobby with game_id
-//     db.update_custom_lobby_game_id(lobby_id, game_id).await?;
-//
-//     // Create game state
-//     let start_ms = chrono::Utc::now().timestamp_millis();
-//     let mut game_state = common::GameState::new(
-//         settings.arena_width,
-//         settings.arena_height,
-//         common::GameType::Custom { settings },
-//         Some(rand::random::<u64>()),
-//         start_ms,
-//     );
-//     game_state.game_code = Some(game_code.clone());
-//     game_state.host_user_id = Some(user_id as u32);
-//
-//     // Add the host as the first player
-//     game_state.add_player(user_id as u32, Some(username))?;
-//
-//     // Spawn initial food items
-//     game_state.spawn_initial_food();
-//
-//     // Publish GameCreated event to Redis stream
-//     let game_id_u32 = game_id as u32;
-//     let partition_id = game_id_u32 % PARTITION_COUNT;
-//
-//     let event = StreamEvent::GameCreated {
-//         game_id: game_id_u32,
-//         game_state: game_state.clone(),
-//     };
-//
-//     // Publish initial snapshot when game is created
-//     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-//     pubsub_manager
-//         .publish_snapshot(partition_id, game_id_u32, &game_state)
-//         .await
-//         .context("Failed to publish initial game snapshot")?;
-//
-//     // Also send GameCreated event via partition command channel
-//     let serialized = serde_json::to_string(&event).context("Failed to serialize GameCreated event")?;
-//     pubsub_manager
-//         .publish_command(partition_id, serialized)
-//         .await
-//         .context("Failed to publish GameCreated event")?;
-//
-//     Ok((game_id as u32, game_code))
-// }
-
-// async fn create_solo_game(
-//     db: &Arc<dyn Database>,
-//     pubsub_manager: &Arc<PubSubManager>,
-//     user_id: i32,
-//     username: String,
-// ) -> Result<u32> {
-//     // Get current server ID from database - use the region from environment or default
-//     let region = std::env::var("SNAKETRON_REGION").unwrap_or_else(|_| "default".to_string());
-//     let server_id = db.get_server_for_load_balancing(&region).await?;
-//
-//     // Create game settings for solo game
-//     let settings = common::CustomGameSettings {
-//         arena_width: 40,
-//         arena_height: 40,
-//         tick_duration_ms: DEFAULT_TICK_INTERVAL_MS,
-//         food_spawn_rate: 3.0,
-//         max_players: 1, // Solo game
-//         game_mode: common::GameMode::Solo,
-//         is_private: true,
-//         allow_spectators: false,
-//         snake_start_length: 4,
-//     };
-//
-//     // Create game entry
-//     let game_id = db
-//         .create_game(
-//             server_id,
-//             &serde_json::to_value(&common::GameType::Custom {
-//                 settings: settings.clone(),
-//             })?,
-//             "solo",
-//             true, // Solo games are private
-//             None, // No game code for solo games
-//         )
-//         .await?;
-//
-//     // Create game state with one player
-//     let start_ms = chrono::Utc::now().timestamp_millis();
-//     let mut game_state = common::GameState::new(
-//         settings.arena_width,
-//         settings.arena_height,
-//         common::GameType::Custom {
-//             settings: settings.clone(),
-//         },
-//         Some(rand::random::<u64>()),
-//         start_ms,
-//     );
-//
-//     // Add the player (only one player for solo mode)
-//     game_state.add_player(user_id as u32, Some(username))?;
-//
-//     // Spawn initial food items
-//     game_state.spawn_initial_food();
-//
-//     // Publish GameCreated event to Redis stream
-//     let game_id_u32 = game_id as u32;
-//     let partition_id = game_id_u32 % PARTITION_COUNT;
-//
-//     let event = StreamEvent::GameCreated {
-//         game_id: game_id_u32,
-//         game_state: game_state.clone(),
-//     };
-//
-//     // Publish initial snapshot when game is created
-//     let partition_id = game_id_u32 % crate::game_executor::PARTITION_COUNT;
-//     pubsub_manager
-//         .publish_snapshot(partition_id, game_id_u32, &game_state)
-//         .await
-//         .context("Failed to publish initial game snapshot")?;
-//
-//     // Also send GameCreated event via partition command channel
-//     let serialized = serde_json::to_string(&event).context("Failed to serialize GameCreated event")?;
-//     pubsub_manager
-//         .publish_command(partition_id, serialized)
-//         .await
-//         .context("Failed to publish GameCreated event")?;
-//
-//     // Start the game immediately (no waiting in solo mode)
-//     let status_event = StreamEvent::StatusUpdated {
-//         game_id: game_id as u32,
-//         status: GameStatus::Started {
-//             server_id: server_id as u64,
-//         },
-//     };
-//
-//     let status_serialized =
-//         serde_json::to_string(&status_event).context("Failed to serialize StatusUpdated event")?;
-//     pubsub_manager
-//         .publish_command(partition_id, status_serialized)
-//         .await
-//         .context("Failed to publish StatusUpdated event")?;
-//
-//     Ok(game_id as u32)
-// }
 
 async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str) -> Result<u32> {
     // Find the game by code
