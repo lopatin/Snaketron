@@ -910,7 +910,9 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        ).await {
+        )
+        .await
+        {
             Ok(game_id) => {
                 games_created += 1;
                 info!(
@@ -929,14 +931,16 @@ async fn create_lobby_matches(
                     // all game type queues it was registered for (prevents double-matching)
                     if let Err(e) = matchmaking_manager
                         .remove_lobby_from_all_queues(lobby)
-                        .await {
+                        .await
+                    {
                         error!(
                             "Failed to remove lobby {} from all queues: {}",
                             lobby.lobby_code, e
                         );
                     } else if let Err(e) = lobby_manager
                         .update_lobby_state(&lobby.lobby_code, "waiting")
-                        .await {
+                        .await
+                    {
                         error!(
                             lobby_code = lobby.lobby_code,
                             error = %e,
@@ -946,7 +950,9 @@ async fn create_lobby_matches(
                 }
 
                 // Publish match notifications to all lobby members
-                if let Err(e) = publish_lobby_match_notifications(&combination.lobbies, game_id).await {
+                if let Err(e) =
+                    publish_lobby_match_notifications(&combination.lobbies, game_id).await
+                {
                     error!("Failed to publish match notifications: {}", e);
                 }
             }

@@ -557,7 +557,8 @@ impl MatchmakingManager {
         // For each game type the lobby was queued for, remove it from that queue
         for game_type in &lobby.game_types {
             let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode);
-            let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
+            let lobby_mmr_key =
+                RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
 
             // We need to find the exact JSON string to remove
             // Since the lobby JSON is stored in Redis, we'll fetch and match

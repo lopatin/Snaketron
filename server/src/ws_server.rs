@@ -181,11 +181,6 @@ pub enum WSMessage {
     // NicknameUpdated {
     //     username: String,
     // },
-    // Play Again / Requeue lobby messages
-    RequeueLobby,
-    LobbyRequeued {
-        lobby_code: String,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -717,7 +712,7 @@ async fn handle_websocket_connection(
                                                                     info!("Successfully subscribed to lobby match notifications for lobby '{}'", lobby_code_for_match);
 
                                                                     let mut pubsub_stream = pubsub.on_message();
-                                                                    // Loop to handle multiple notifications (MatchFound, LobbyRequeued, etc.)
+                                                                    // Loop to handle multiple notifications (MatchFound, etc.)
                                                                     while let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
                                                                         if let Ok(payload) = msg.get_payload::<String>() {
                                                                             // Parse the notification
@@ -742,17 +737,6 @@ async fn handle_websocket_connection(
                                                                                                     error!("Failed to wait for game {} to become available: {}", game_id, e);
                                                                                                 }
                                                                                             }
-                                                                                        }
-                                                                                    }
-                                                                                    "LobbyRequeued" => {
-                                                                                        if let Some(requeue_lobby_code) = notification["lobby_code"].as_str() {
-                                                                                            info!("Lobby '{}' has been requeued by host, sending notification to member", requeue_lobby_code);
-                                                                                            // Send LobbyRequeued message to this client
-                                                                                            let requeue_msg = WSMessage::LobbyRequeued {
-                                                                                                lobby_code: requeue_lobby_code.to_string(),
-                                                                                            };
-                                                                                            let json_msg = serde_json::to_string(&requeue_msg).unwrap();
-                                                                                            let _ = ws_tx_clone_for_match.send(Message::Text(json_msg.into())).await;
                                                                                         }
                                                                                     }
                                                                                     _ => {
@@ -1559,7 +1543,9 @@ async fn process_ws_message(
                         &metadata,
                         &ws_tx,
                         nickname,
-                    ).await {
+                    )
+                    .await
+                    {
                         error!(
                             "Failed to update guest nickname for user {}: {}",
                             metadata.user_id, e
@@ -1589,7 +1575,8 @@ async fn process_ws_message(
                                             selected_modes,
                                             competitive,
                                         },
-                                    ).await?;
+                                    )
+                                    .await?;
                             } else {
                                 let json_msg = serde_json::to_string(&WSMessage::AccessDenied {
                                     reason: "Only the host can update lobby settings".to_string(),
@@ -2509,9 +2496,7 @@ async fn process_ws_message(
                             Ok(result) => {
                                 if let LeaveLobbyResult::LobbyDeleted = result {
                                     let mut mm = matchmaking_manager.lock().await;
-                                    match mm
-                                        .remove_lobby_from_all_queues_by_code(&lobby_code)
-                                        .await
+                                    match mm.remove_lobby_from_all_queues_by_code(&lobby_code).await
                                     {
                                         Ok(true) => {
                                             info!(

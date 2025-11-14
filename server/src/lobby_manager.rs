@@ -200,10 +200,7 @@ impl LobbyManager {
                                 self.forward_lobby_to_broadcasters(lobby);
                             }
                             Ok(LobbyDelete { lobby_code, state }) => {
-                                debug!(
-                                    "Received lobby deletion for '{}' from Redis",
-                                    lobby_code
-                                );
+                                debug!("Received lobby deletion for '{}' from Redis", lobby_code);
                                 self.handle_lobby_deletion(&lobby_code, &state);
                             }
                             Err(e) => {
@@ -231,7 +228,7 @@ impl LobbyManager {
     fn forward_lobby_to_broadcasters(&self, lobby: Lobby) {
         let lobby_code = lobby.lobby_code.clone();
         let broadcasters = self.lobby_broadcasters.read().unwrap();
-        
+
         debug!(
             "Forwarding lobby update for '{}' to {} local receivers",
             lobby_code,
@@ -473,7 +470,7 @@ impl LobbyManager {
             warn!("Lobby '{}' does not exist in Redis", lobby_code);
             return Ok(None);
         }
-        
+
         info!("Fetching metadata for lobby '{}'", lobby_code);
 
         // Fetch all metadata fields
@@ -721,7 +718,7 @@ impl LobbyManager {
     async fn touch_lobby(&self, lobby_code: &str, member: Option<MemberValue>) -> Result<()> {
         let mut redis = self.redis.clone();
         let expires_at = chrono::Utc::now().timestamp_millis() + 30000;
-        
+
         debug!(
             "Touching lobby '{}' with expires_at {}",
             lobby_code, expires_at
@@ -894,12 +891,14 @@ impl LobbyManager {
         let payload = match self.get_lobby_opt(lobby_code).await? {
             Some(lobby) => serde_json::to_string(&LobbyUpdate { lobby })
                 .context("Failed to serialize lobby for update notification")?,
-            None => serde_json::to_string(&LobbyDelete { 
+            None => serde_json::to_string(&LobbyDelete {
                 lobby_code: lobby_code.to_string(),
                 state: "deleted".to_string(),
-            }).context("Failed to serialize lobby deletion notification")?,
+            })
+            .context("Failed to serialize lobby deletion notification")?,
         };
-        let _: () = self .redis
+        let _: () = self
+            .redis
             .clone()
             .publish(RedisKeys::lobby_updates_channel(), payload)
             .await

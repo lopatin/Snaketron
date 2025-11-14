@@ -187,8 +187,10 @@ impl GameServer {
         handles.push(tokio::spawn(async move {
             let mm = match_matchmaking_manager.lock().await.clone();
             drop(match_matchmaking_manager); // Drop the lock
-            if let Err(e) = run_matchmaking_loop(
-                mm, match_pubsub_manager, match_token, match_lobby_manager).await {
+            if let Err(e) =
+                run_matchmaking_loop(mm, match_pubsub_manager, match_token, match_lobby_manager)
+                    .await
+            {
                 error!("Matchmaking loop error: {}", e);
             }
         }));

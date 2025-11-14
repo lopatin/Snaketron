@@ -20,7 +20,6 @@ interface UseGameWebSocketReturn {
   joinCustomGame: (gameCode: string) => void;
   joinGame: (gameId: string, gameCode?: string | null) => void;
   leaveGame: () => void;
-  requeueLobby: () => void;
   updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
   startCustomGame: () => void;
   spectateGame: (gameId: string, gameCode?: string | null) => void;
@@ -126,19 +125,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     unsubscribers.push(
       onMessage('CustomGameJoined', (message: any) => {
         setCurrentGameId(message.data.game_id);
-      })
-    );
-
-    // Lobby requeued (Play Again for lobbies)
-    unsubscribers.push(
-      onMessage('LobbyRequeued', (message: any) => {
-        console.log('Received LobbyRequeued message:', message);
-        // Lobby has been requeued, navigate to queue view
-        const lobbyId = message.data.lobby_id;
-        console.log('Lobby', lobbyId, 'requeued for matchmaking');
-        // The server already transitioned us to InLobby state
-        // Navigate to queue view to show waiting state
-        navigate('/queue');
       })
     );
 
@@ -281,11 +267,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     setIsQueued(false);
   }, [sendMessage]);
 
-  const requeueLobby = useCallback(() => {
-    console.log('Sending RequeueLobby message (Play Again for lobby)');
-    sendMessage('RequeueLobby');
-  }, [sendMessage]);
-
   // Create a quick match or competitive game
   const createGame = useCallback((gameType: string) => {
     console.log('Creating game:', gameType);
@@ -316,7 +297,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     createCustomGame,
     createGame,
     createSoloGame,
-    requeueLobby,
     queueForMatch,
     queueForMatchMulti,
     leaveQueue,

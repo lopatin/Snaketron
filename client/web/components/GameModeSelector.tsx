@@ -4,7 +4,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { api } from '../services/api';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
-import { UsernameStatus, GameModeId, GameType } from '../types';
+import { UsernameStatus, GameType } from '../types';
+import { useWebSocket } from '../contexts/WebSocketContext';
 
 const GAME_MODES = {
   'quick-play': {
@@ -33,7 +34,8 @@ function GameModeSelector() {
   const { category } = useParams();
   const navigate = useNavigate();
   const { user, login, register } = useAuth();
-  const { isConnected, createGame, currentGameId, customGameCode } = useGameWebSocket();
+  const { currentLobby, createLobby } = useWebSocket();
+  const { isConnected, createGame, queueForMatch, queueForMatchMulti } = useGameWebSocket();
   
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -150,6 +152,13 @@ function GameModeSelector() {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
 
+      // Ensure we have a lobby before queueing
+      if (!currentLobby) {
+        await createLobby();
+        // Give the server a brief moment to broadcast lobby info
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
       // Get game types for selected modes
       const gameTypes: GameType[] = [];
       if (gameModeConfig) {
@@ -161,18 +170,18 @@ function GameModeSelector() {
         }
       }
 
+      const queueMode: 'Quickmatch' | 'Competitive' = category === 'competitive' ? 'Competitive' : 'Quickmatch';
+
       // Handle solo mode separately (direct game creation)
       if (selectedModes.has('solo')) {
         createGame('solo');
         console.log('Waiting for SoloGameCreated message...');
       } else if (gameTypes.length > 0) {
-        // Navigate to queue screen with multiple game types
-        navigate('/queue', {
-          state: {
-            gameTypes: gameTypes,
-            autoQueue: true
-          }
-        });
+        if (gameTypes.length === 1) {
+          queueForMatch(gameTypes[0], queueMode);
+        } else {
+          queueForMatchMulti(gameTypes, queueMode);
+        }
       }
     } catch (error) {
       setAuthError((error as Error).message || 'Failed to start queue');

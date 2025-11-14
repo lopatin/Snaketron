@@ -5,12 +5,12 @@ import Auth from './components/Auth';
 import CustomGameCreator from './components/CustomGameCreator';
 import GameLobby from './components/GameLobby';
 import GameArena from './components/GameArena';
-import Queue from './components/Queue';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
 import { NewHome } from './components/NewHome';
+import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
@@ -19,6 +19,7 @@ import { LatencyProvider } from './contexts/LatencyContext';
 function AppContent() {
   return (
     <div className="min-h-screen flex flex-col">
+      <MatchmakingBanner />
       <AnimatedRoutes>
         <Route path="/" element={<NewHome />} />
         <Route path="/auth" element={<Auth />} />
@@ -38,14 +39,6 @@ function AppContent() {
           element={
             <ProtectedRoute>
               <GameArena />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/queue"
-          element={
-            <ProtectedRoute>
-              <Queue />
             </ProtectedRoute>
           }
         />

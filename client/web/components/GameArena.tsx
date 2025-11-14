@@ -4,7 +4,7 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef, ArenaRotation } from '../types';
+import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
@@ -31,12 +31,11 @@ export default function GameArena() {
     lastGameEvent,
     leaveGame,
     queueForMatch,
-    createSoloGame,
-    requeueLobby
+    queueForMatchMulti,
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
-  const { latencyMs, gameChatMessages, sendChatMessage, currentLobby } = useWebSocket();
+  const { latencyMs, gameChatMessages, sendChatMessage, currentLobby, lobbyPreferences } = useWebSocket();
   const playerId = user?.id ?? 0;
 
   // Use game engine for client-side prediction (call unconditionally to keep hook order stable)
@@ -403,6 +402,20 @@ export default function GameArena() {
   const countdownSeconds = Math.ceil(timeUntilStart / 1000);
   const showCountdown = countdownSeconds > 0;
   
+  const convertLobbyModeToGameType = (mode: LobbyGameMode): GameType => {
+    switch (mode) {
+      case 'duel':
+        return { TeamMatch: { per_team: 1 } };
+      case '2v2':
+        return { TeamMatch: { per_team: 2 } };
+      case 'ffa':
+        return { FreeForAll: { max_players: 8 } };
+      case 'solo':
+      default:
+        return 'Solo';
+    }
+  };
+
   // Handle back to menu
   const handleBackToMenu = () => {
     // Leave the game first, then navigate
@@ -416,28 +429,38 @@ export default function GameArena() {
 
   // Handle play again
   const handlePlayAgain = () => {
-    if (!gameState) return;
-
-    // If in a lobby, host can requeue the lobby
-    if (isInLobby) {
-      if (isHost) {
-        console.log('Host requesting requeue for lobby', currentLobby?.id);
-        requeueLobby();
-      } else {
-        console.log('Guest cannot requeue lobby, waiting for host');
-        // Guests can't initiate requeue, button should be disabled
-      }
-    } else {
-      // Not in a lobby (shouldn't happen with new architecture, but keep as fallback)
-      console.warn('Play Again without lobby - this shouldn\'t happen');
-      const gameType = gameState.game_type;
-      navigate('/queue', {
-        state: {
-          gameType,
-          autoQueue: true
-        }
-      });
+    if (!gameState) {
+      return;
     }
+
+    const canHostQueue =
+      isInLobby &&
+      isHost &&
+      lobbyPreferences &&
+      lobbyPreferences.selectedModes.length > 0;
+
+    if (canHostQueue && lobbyPreferences) {
+      const queueMode: 'Quickmatch' | 'Competitive' = lobbyPreferences.competitive
+        ? 'Competitive'
+        : 'Quickmatch';
+      const gameTypes = lobbyPreferences.selectedModes.map(convertLobbyModeToGameType);
+
+      if (gameTypes.length === 1) {
+        queueForMatch(gameTypes[0], queueMode);
+      } else if (gameTypes.length > 1) {
+        queueForMatchMulti(gameTypes, queueMode);
+      } else {
+        queueForMatch(gameState.game_type);
+      }
+      return;
+    }
+
+    if (!isHost) {
+      console.log('Guest cannot start matchmaking; waiting for host');
+      return;
+    }
+
+    queueForMatch(gameState.game_type);
   };
 
   const showAuthLoading = authLoading || !user;

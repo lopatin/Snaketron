@@ -10,7 +10,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
-import { LobbyGameMode, LobbyState } from '../types';
+import { LobbyGameMode } from '../types';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -31,7 +31,7 @@ export const NewHome: React.FC = () => {
     lobbyPreferences,
     updateLobbyPreferences,
   } = useWebSocket();
-  const { createGame, currentGameId, leaveQueue } = useGameWebSocket();
+  const { currentGameId, queueForMatch, queueForMatchMulti } = useGameWebSocket();
   const [isMobile, setIsMobile] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -53,9 +53,6 @@ export const NewHome: React.FC = () => {
   const isCurrentLobbyHost = currentLobby ? currentLobby.hostUserId === user?.id : false;
   const isGameFormHost = !currentLobby || isCurrentLobbyHost;
   const isLobbyQueued = currentLobby?.state === 'queued';
-  const previousLobbyStateRef = useRef<LobbyState | null>(currentLobby?.state ?? null);
-  const queueNavigationInProgressRef = useRef(false);
-  const queueCancelAttemptedRef = useRef(false);
 
   // Check if mobile on mount and resize
   useEffect(() => {
@@ -90,25 +87,6 @@ export const NewHome: React.FC = () => {
       navigate(`/play/${currentGameId}`);
     }
   }, [currentGameId, navigate]);
-
-  useEffect(() => {
-    const nextState = currentLobby?.state ?? null;
-    const previousState = previousLobbyStateRef.current;
-
-    if (nextState === previousState) {
-      return;
-    }
-
-    previousLobbyStateRef.current = nextState;
-
-    if (nextState === 'queued' && !isCurrentLobbyHost) {
-      navigate('/queue', {
-        state: {
-          viewLobbyQueue: true,
-        },
-      });
-    }
-  }, [currentLobby?.state, isCurrentLobbyHost, navigate]);
 
   useEffect(() => {
     const cleanup = onMessage('NicknameUpdated', (message: any) => {
@@ -178,14 +156,13 @@ export const NewHome: React.FC = () => {
         }
       });
 
-      // Navigate to queue with all selected game types
-      queueNavigationInProgressRef.current = true;
-      navigate('/queue', {
-        state: {
-          gameTypes,
-          autoQueue: true,
-        },
-      });
+      const queueMode: 'Quickmatch' | 'Competitive' = isCompetitive ? 'Competitive' : 'Quickmatch';
+
+      if (gameTypes.length === 1) {
+        queueForMatch(gameTypes[0], queueMode);
+      } else if (gameTypes.length > 1) {
+        queueForMatchMulti(gameTypes, queueMode);
+      }
     } catch (error) {
       console.error('Failed to start game:', error);
     } finally {
@@ -227,20 +204,6 @@ export const NewHome: React.FC = () => {
       setIsCreatingInvite(false);
     }
   };
-
-  useEffect(() => {
-    if (!currentLobby || currentLobby.state !== 'queued' || !isGameFormHost) {
-      queueCancelAttemptedRef.current = false;
-      return;
-    }
-
-    if (queueNavigationInProgressRef.current || queueCancelAttemptedRef.current) {
-      return;
-    }
-
-    leaveQueue();
-    queueCancelAttemptedRef.current = true;
-  }, [currentLobby?.state, isGameFormHost, leaveQueue]);
 
   const handleLeaveLobby = async () => {
     try {
