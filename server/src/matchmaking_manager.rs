@@ -41,6 +41,7 @@ pub struct UserQueueStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActiveMatch {
     pub players: Vec<QueuedPlayer>,
+    pub spectators: Vec<QueuedPlayer>,
     pub game_type: GameType,
     pub status: MatchStatus,
     pub partition_id: u32,

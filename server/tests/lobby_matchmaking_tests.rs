@@ -271,6 +271,16 @@ async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
         env.user_ids()[0] as u32,
         "Requesting user (host) should be the solo participant"
     );
+    assert_eq!(
+        active_match.spectators.len(),
+        1,
+        "Non-host lobby members should be recorded as spectators"
+    );
+    assert_eq!(
+        active_match.spectators[0].user_id,
+        env.user_ids()[1] as u32,
+        "Non-host should be recorded as spectator"
+    );
 
     host_client.disconnect().await?;
     spectator_client.disconnect().await?;

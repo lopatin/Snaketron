@@ -1017,6 +1017,7 @@ async fn create_game_from_lobbies(
 
     // Add players to game state with team assignments
     let mut all_players = Vec::new();
+    let mut spectators: Vec<QueuedPlayer> = Vec::new();
     use std::collections::{HashMap, HashSet};
 
     // Build quick lookup for spectators keyed by lobby_code
@@ -1081,6 +1082,22 @@ async fn create_game_from_lobbies(
                 }
             }
         }
+
+        // Register any extras marked as spectators (not part of team assignments)
+        for lobby in &combination.lobbies {
+            if let Some(indices) = spectator_map.get(lobby.lobby_code.as_str()) {
+                for idx in indices {
+                    if let Some(member) = lobby.members.get(*idx) {
+                        game_state.add_spectator(member.user_id as u32, Some(member.username.clone()));
+                        spectators.push(QueuedPlayer {
+                            user_id: member.user_id as u32,
+                            mmr: combination.avg_mmr,
+                            username: member.username.clone(),
+                        });
+                    }
+                }
+            }
+        }
     } else {
         // Non-team game (Solo, FFA)
         for lobby in &combination.lobbies {
@@ -1092,6 +1109,12 @@ async fn create_game_from_lobbies(
             for (idx, member) in lobby.members.iter().enumerate() {
                 // Skip spectators for solo queues that came from multi-member lobbies
                 if spectators_for_lobby.contains(&idx) {
+                    game_state.add_spectator(member.user_id as u32, Some(member.username.clone()));
+                    spectators.push(QueuedPlayer {
+                        user_id: member.user_id as u32,
+                        mmr: combination.avg_mmr,
+                        username: member.username.clone(),
+                    });
                     continue;
                 }
 
@@ -1115,6 +1138,7 @@ async fn create_game_from_lobbies(
         status: MatchStatus::Waiting,
         partition_id,
         created_at: Utc::now().timestamp_millis(),
+        spectators,
     };
     matchmaking_manager
         .store_active_match(game_id, match_info)
@@ -1212,6 +1236,7 @@ pub async fn create_custom_match(
     // Store active match
     let match_info = ActiveMatch {
         players: players.clone(),
+        spectators: Vec::new(),
         game_type: game_type.clone(),
         status: MatchStatus::Waiting,
         partition_id,

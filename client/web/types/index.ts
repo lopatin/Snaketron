@@ -117,6 +117,7 @@ export interface GameState {
   properties: GameProperties;
   players: Record<number, Player>;
   usernames: Record<number, string>;  // Username mappings by user_id
+  spectators: number[];               // User IDs that are spectating (no snakes)
   game_id: string;
   game_ended?: boolean;
   final_score?: number;

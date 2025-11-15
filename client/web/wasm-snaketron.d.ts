@@ -28,6 +28,7 @@ declare module 'wasm-snaketron' {
     game_type: GameType;
     properties: any;
     players: Record<number, { user_id: number; snake_id: number }>;
+    spectators?: number[];
     game_id: string;
   }
 

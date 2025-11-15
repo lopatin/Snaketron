@@ -408,6 +408,8 @@ pub struct GameState {
     pub event_sequence: u64,
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
+    // Spectators by user_id (do not have snakes/players)
+    pub spectators: HashSet<u32>,
     // Score tracking - snake_id -> score
     pub scores: HashMap<u32, u32>,
     // Team scores for team games - team_id -> score
@@ -554,6 +556,7 @@ impl GameState {
             start_ms,
             event_sequence: 0,
             usernames: HashMap::new(),
+            spectators: HashSet::new(),
             scores: HashMap::new(),
             team_scores,
 
@@ -837,6 +840,13 @@ impl GameState {
         Ok(player)
     }
 
+    pub fn add_spectator(&mut self, user_id: u32, username: Option<String>) {
+        if let Some(name) = username {
+            self.usernames.insert(user_id, name);
+        }
+        self.spectators.insert(user_id);
+    }
+
     /// Spawns initial food items when the game starts
     pub fn spawn_initial_food(&mut self) {
         if self.rng.is_none() {
@@ -893,6 +903,19 @@ impl GameState {
     }
 
     pub fn schedule_command(&mut self, command_message: &GameCommandMessage) {
+        // Only allow gameplay commands from active players; spectators should never drive snakes.
+        if let GameCommand::Turn { .. } = command_message.command {
+            let issuing_user_id = command_message
+                .command_id_server
+                .as_ref()
+                .map(|id| id.user_id)
+                .unwrap_or(command_message.command_id_client.user_id);
+
+            if !self.players.contains_key(&issuing_user_id) {
+                return;
+            }
+        }
+
         self.apply_event(
             GameEvent::CommandScheduled {
                 command_message: command_message.clone(),
