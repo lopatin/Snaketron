@@ -330,7 +330,6 @@ export default function GameArena() {
                 dx,
                 dy
               });
-              // debugger; // Enter debugger when non-adjacent movement is detected
             }
           }
 
@@ -349,7 +348,7 @@ export default function GameArena() {
             opponentUsername = opponentEntry[1];
           }
         }
-        
+
         wasm.render_game(
           JSON.stringify(gameState), 
           canvasRef.current!, 

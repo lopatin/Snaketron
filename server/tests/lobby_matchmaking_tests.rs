@@ -124,6 +124,34 @@ async fn create_lobby_and_queue(
     Ok(clients)
 }
 
+// Wait for a single client to receive JoinGame and first snapshot
+async fn wait_for_client_to_join_game(client: &mut TestClient) -> Result<u32> {
+    timeout(Duration::from_secs(30), async {
+        // First wait for JoinGame message
+        let game_id = loop {
+            match client.receive_message().await? {
+                WSMessage::JoinGame(id) => break id,
+                _ => {}
+            }
+        };
+
+        client.send_message(WSMessage::JoinGame(game_id)).await?;
+
+        // Wait for snapshot to confirm game stream started
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        return Ok::<u32, anyhow::Error>(game_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
+
 // Helper to wait for all clients to receive JoinGame and snapshot
 async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result<u32> {
     let mut game_id = None;
@@ -184,6 +212,71 @@ async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option
 // ============================================================================
 // 1V1 TESTS
 // ============================================================================
+
+#[tokio::test]
+async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    setup_test_redis().await?;
+    let mut env = TestEnvironment::new("test_multi_member_lobby_solo_host_only_player").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+
+    // Host queues for solo with a second member present
+    let mut clients = create_lobby_and_queue(
+        &env,
+        0,
+        &[env.user_ids()[0], env.user_ids()[1]],
+        GameType::Solo,
+        QueueMode::Quickmatch,
+    )
+    .await?;
+
+    // Host should be the only player added to the match
+    let mut host_client = clients.remove(0);
+    let mut spectator_client = clients.remove(0);
+
+    let game_id = wait_for_client_to_join_game(&mut host_client).await?;
+
+    // Spectator should still get routed to the game (as a spectator)
+    let spectator_game_id = timeout(Duration::from_secs(10), async {
+        loop {
+            match spectator_client.receive_message().await? {
+                WSMessage::JoinGame(id) => {
+                    spectator_client.send_message(WSMessage::JoinGame(id)).await?;
+                    return Ok::<u32, anyhow::Error>(id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await??;
+
+    assert_eq!(game_id, spectator_game_id, "Lobby members should be directed to the same solo game");
+
+    // Only the host should be stored as a player in the active match
+    let mut matchmaking_manager = create_test_matchmaking_manager().await?;
+    let active_match = matchmaking_manager
+        .get_active_match(game_id)
+        .await?
+        .expect("Active match should be stored");
+
+    assert_eq!(
+        active_match.players.len(),
+        1,
+        "Solo match created from multi-member lobby should only register one player"
+    );
+    assert_eq!(
+        active_match.players[0].user_id,
+        env.user_ids()[0] as u32,
+        "Requesting user (host) should be the solo participant"
+    );
+
+    host_client.disconnect().await?;
+    spectator_client.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_two_player_lobby_creates_1v1_with_split_teams() -> Result<()> {

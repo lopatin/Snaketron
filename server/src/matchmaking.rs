@@ -91,17 +91,43 @@ fn find_best_lobby_combination(
 fn find_solo_combination(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
 ) -> Option<MatchmakingCombination> {
-    // Solo: any single-player lobby
-    lobbies
-        .iter()
-        .find(|l| l.members.len() == 1)
-        .map(|l| MatchmakingCombination {
-            lobbies: vec![l.clone()],
+    // Prefer exact solo lobbies first
+    if let Some(lobby) = lobbies.iter().find(|l| l.members.len() == 1) {
+        return Some(MatchmakingCombination {
+            lobbies: vec![lobby.clone()],
             team_assignments: Vec::new(), // Solo has no teams
             spectators: Vec::new(),
             total_players: 1,
-            avg_mmr: l.avg_mmr,
-        })
+            avg_mmr: lobby.avg_mmr,
+        });
+    }
+
+    // Allow larger lobbies by selecting the requesting user as the lone player and marking
+    // everyone else as spectators.
+    for lobby in lobbies.iter().filter(|l| !l.members.is_empty()) {
+        let requesting_idx = lobby
+            .members
+            .iter()
+            .position(|m| m.user_id as u32 == lobby.requesting_user_id)
+            .unwrap_or(0);
+
+        let mut spectator_indices: Vec<usize> = (0..lobby.members.len()).collect();
+        spectator_indices.retain(|idx| *idx != requesting_idx);
+
+        return Some(MatchmakingCombination {
+            lobbies: vec![lobby.clone()],
+            team_assignments: Vec::new(), // Solo has no teams
+            spectators: if spectator_indices.is_empty() {
+                Vec::new()
+            } else {
+                vec![(lobby.lobby_code.clone(), spectator_indices)]
+            },
+            total_players: 1,
+            avg_mmr: lobby.avg_mmr,
+        });
+    }
+
+    None
 }
 
 /// Find a team combination for per_team players on each of 2 teams (generic for any x vs. x)
@@ -991,11 +1017,18 @@ async fn create_game_from_lobbies(
 
     // Add players to game state with team assignments
     let mut all_players = Vec::new();
+    use std::collections::{HashMap, HashSet};
+
+    // Build quick lookup for spectators keyed by lobby_code
+    let spectator_map: HashMap<&str, HashSet<usize>> = combination
+        .spectators
+        .iter()
+        .map(|(code, indices)| (code.as_str(), indices.iter().copied().collect()))
+        .collect();
 
     if !combination.team_assignments.is_empty() {
         // Team-based game (1v1, 2v2, 3v3, etc.)
         // Build a map of user_id -> team_id for quick lookup
-        use std::collections::HashMap;
         let mut user_team_map: HashMap<u32, common::TeamId> = HashMap::new();
 
         for assignment in &combination.team_assignments {
@@ -1051,7 +1084,17 @@ async fn create_game_from_lobbies(
     } else {
         // Non-team game (Solo, FFA)
         for lobby in &combination.lobbies {
-            for member in &lobby.members {
+            let spectators_for_lobby = spectator_map
+                .get(lobby.lobby_code.as_str())
+                .cloned()
+                .unwrap_or_default();
+
+            for (idx, member) in lobby.members.iter().enumerate() {
+                // Skip spectators for solo queues that came from multi-member lobbies
+                if spectators_for_lobby.contains(&idx) {
+                    continue;
+                }
+
                 game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
 
                 all_players.push(QueuedPlayer {
