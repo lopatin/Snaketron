@@ -380,8 +380,8 @@ async fn handle_websocket_connection(
     // Will be used to track Redis stream subscription for game events
     let mut game_event_handle: Option<JoinHandle<()>> = None;
 
-    // Will be used to track Redis pub/sub subscription for lobby updates
-    // let mut lobby_update_handle: Option<JoinHandle<()>> = None;
+    // Will be used to track lobby update forwarding to the websocket
+    let mut lobby_update_handle: Option<JoinHandle<()>> = None;
 
     // Will be used to track Redis pub/sub subscription for lobby match notifications
     let mut lobby_match_handle: Option<JoinHandle<()>> = None;
@@ -446,16 +446,6 @@ async fn handle_websocket_connection(
         // };
         // debug!("WS: Select loop iteration, current state: {}", state_name);
 
-        let next_lobby_update = async {
-            match &mut state {
-                ConnectionState::Authenticated {
-                    lobby_handle: Some(lobby),
-                    ..
-                } => lobby.rx.recv().await,
-                _ => future::pending().await,
-            }
-        };
-
         tokio::select! {
             // Handle shutdown timeout
             _ = &mut shutdown_timeout, if shutdown_started => {
@@ -477,41 +467,6 @@ async fn handle_websocket_connection(
 
                 // No need for ShuttingDown state anymore, shutdown_started flag is sufficient
             }
-
-            // Lobby updates get sent directly to the user
-            lobby_update = next_lobby_update => {
-                match lobby_update {
-                    Ok(lobby) => {
-                        debug!("Received lobby update for lobby {}", lobby.lobby_code);
-                        let ws_message = WSMessage::LobbyUpdate {
-                            lobby_code: lobby.lobby_code,
-                            members: lobby.members.into_values().collect(),
-                            host_user_id: lobby.host_user_id,
-                            state: lobby.state,
-                            preferences: lobby.preferences,
-                        };
-
-                        let json_msg = match serde_json::to_string(&ws_message) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                error!("Failed to serialize lobby update: {}", e);
-                                continue;
-                            }
-                        };
-
-                        if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
-                            warn!("WebSocket channel closed, dropping lobby update");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to receive lobby update: {}", e);
-                        continue;
-                    }
-                }
-
-            }
-
             // Handle incoming WebSocket messages
             Some(result) = ws_stream.next() => {
                 match result {
@@ -643,28 +598,63 @@ async fn handle_websocket_connection(
                                             // Handle lobby state transitions
                                             if entering_lobby {
                                                 if let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
-                                                    // Subscribe to lobby updates if entering a lobby
-                                                    // if let Some(handle) = lobby_update_handle.take() {
-                                                    //     handle.abort();
-                                                    // }
+                                                    if let Some(handle) = lobby_update_handle.take() {
+                                                        handle.abort();
+                                                    }
                                                     if let Some(handle) = lobby_chat_handle.take() {
                                                         handle.abort();
                                                     }
 
+                                                    let mut lobby_rx = lobby_handle.rx.resubscribe();
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let ws_tx_clone = ws_tx.clone();
-                                                    let redis_url_clone = redis_url.clone();
+                                                    let cancellation_token_clone = cancellation_token.clone();
 
-                                                    // lobby_update_handle = Some(tokio::spawn(async move {
-                                                    //     if let Err(e) = subscribe_to_lobby_updates(
-                                                    //         lobby_code_for_updates,
-                                                    //         redis_url_clone,
-                                                    //         ws_tx_clone,
-                                                    //     ).await {
-                                                    //         error!("Lobby update subscription failed: {}", e);
-                                                    //     }
-                                                    // }));
+                                                    lobby_update_handle = Some(tokio::spawn(async move {
+                                                        loop {
+                                                            tokio::select! {
+                                                                _ = cancellation_token_clone.cancelled() => {
+                                                                    debug!("Lobby update task cancelled for lobby {}", lobby_code_for_updates);
+                                                                    break;
+                                                                }
+                                                                update = lobby_rx.recv() => {
+                                                                    match update {
+                                                                        Ok(lobby) => {
+                                                                            debug!("Received lobby update for lobby {}", lobby.lobby_code);
+                                                                            let ws_message = WSMessage::LobbyUpdate {
+                                                                                lobby_code: lobby.lobby_code,
+                                                                                members: lobby.members.into_values().collect(),
+                                                                                host_user_id: lobby.host_user_id,
+                                                                                state: lobby.state,
+                                                                                preferences: lobby.preferences,
+                                                                            };
+
+                                                                            let json_msg = match serde_json::to_string(&ws_message) {
+                                                                                Ok(json) => json,
+                                                                                Err(e) => {
+                                                                                    error!("Failed to serialize lobby update: {}", e);
+                                                                                    continue;
+                                                                                }
+                                                                            };
+
+                                                                            if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_err() {
+                                                                                debug!("WebSocket channel closed while sending lobby update for {}", lobby_code_for_updates);
+                                                                                break;
+                                                                            }
+                                                                        }
+                                                                        Err(broadcast::error::RecvError::Closed) => {
+                                                                            debug!("Lobby update channel closed for lobby {}", lobby_code_for_updates);
+                                                                            break;
+                                                                        }
+                                                                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                                                            warn!("Missed {} lobby updates for lobby {}", skipped, lobby_code_for_updates);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }));
 
                                                     // Subscribe to lobby match notifications
                                                     if let Some(handle) = lobby_match_handle.take() {
@@ -783,16 +773,16 @@ async fn handle_websocket_connection(
 
                                             // Abort lobby subscription when leaving lobby
                                             // BUT keep lobby_match_handle active if entering Authenticated with a lobby_code (for Play Again notifications)
-                                            if leaving_lobby {
-                                                let keep_match_subscription = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
+                                                if leaving_lobby {
+                                                    let keep_match_subscription = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
 
-                                                // if let Some(handle) = lobby_update_handle.take() {
-                                                //     handle.abort();
-                                                //     debug!("Aborted lobby update subscription");
-                                                // }
+                                                    if let Some(handle) = lobby_update_handle.take() {
+                                                        handle.abort();
+                                                        debug!("Aborted lobby update subscription");
+                                                    }
 
-                                                // Only abort match notification if NOT entering game with lobby_id
-                                                if !keep_match_subscription {
+                                                    // Only abort match notification if NOT entering game with lobby_id
+                                                    if !keep_match_subscription {
                                                     if let Some(handle) = lobby_match_handle.take() {
                                                         handle.abort();
                                                         debug!("Aborted lobby match notification subscription");
@@ -875,9 +865,9 @@ async fn handle_websocket_connection(
     if let Some(handle) = game_event_handle {
         handle.abort();
     }
-    // if let Some(handle) = lobby_update_handle {
-    //     handle.abort();
-    // }
+    if let Some(handle) = lobby_update_handle {
+        handle.abort();
+    }
     if let Some(handle) = lobby_match_handle {
         handle.abort();
     }
@@ -2019,6 +2009,45 @@ async fn process_ws_message(
                         }
                         Err(e) => {
                             error!("Failed to remove user from matchmaking queue: {}", e);
+                        }
+                    }
+
+                    // If a lobby was queued, remove the entire lobby from matchmaking as well
+                    if let Some(lobby_handle) = &lobby {
+                        let lobby_code = lobby_handle.lobby_code.clone();
+                        match matchmaking_manager
+                            .remove_lobby_from_all_queues_by_code(&lobby_code)
+                            .await
+                        {
+                            Ok(true) => {
+                                info!(
+                                    lobby_code = lobby_code,
+                                    "Removed lobby from matchmaking queues after cancel"
+                                );
+                                if let Err(e) = lobby_manager
+                                    .update_lobby_state(&lobby_code, "waiting")
+                                    .await
+                                {
+                                    warn!(
+                                        lobby_code = lobby_code,
+                                        error = %e,
+                                        "Failed to reset lobby state after cancel"
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                info!(
+                                    lobby_code = lobby_code,
+                                    "Lobby was not present in matchmaking queues on cancel"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    lobby_code = lobby_code,
+                                    error = %e,
+                                    "Failed to remove lobby from matchmaking queues on cancel"
+                                );
+                            }
                         }
                     }
 

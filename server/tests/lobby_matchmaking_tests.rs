@@ -243,7 +243,9 @@ async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
         loop {
             match spectator_client.receive_message().await? {
                 WSMessage::JoinGame(id) => {
-                    spectator_client.send_message(WSMessage::JoinGame(id)).await?;
+                    spectator_client
+                        .send_message(WSMessage::JoinGame(id))
+                        .await?;
                     return Ok::<u32, anyhow::Error>(id);
                 }
                 _ => {}
@@ -252,7 +254,10 @@ async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
     })
     .await??;
 
-    assert_eq!(game_id, spectator_game_id, "Lobby members should be directed to the same solo game");
+    assert_eq!(
+        game_id, spectator_game_id,
+        "Lobby members should be directed to the same solo game"
+    );
 
     // Only the host should be stored as a player in the active match
     let mut matchmaking_manager = create_test_matchmaking_manager().await?;

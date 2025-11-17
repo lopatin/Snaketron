@@ -1088,7 +1088,8 @@ async fn create_game_from_lobbies(
             if let Some(indices) = spectator_map.get(lobby.lobby_code.as_str()) {
                 for idx in indices {
                     if let Some(member) = lobby.members.get(*idx) {
-                        game_state.add_spectator(member.user_id as u32, Some(member.username.clone()));
+                        game_state
+                            .add_spectator(member.user_id as u32, Some(member.username.clone()));
                         spectators.push(QueuedPlayer {
                             user_id: member.user_id as u32,
                             mmr: combination.avg_mmr,
