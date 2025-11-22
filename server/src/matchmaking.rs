@@ -15,6 +15,7 @@ use crate::pubsub_manager::PubSubManager;
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
+const FFA_MAX_RECURSION_DEPTH: usize = 8;
 
 /// Explicit player-level team assignment
 #[derive(Debug, Clone)]
@@ -482,119 +483,162 @@ fn find_ffa_combination(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     max_players: usize,
 ) -> Option<MatchmakingCombination> {
-    trace!(
-        max_players = max_players,
-        lobby_count = lobbies.len(),
-        "find_ffa_combination called"
-    );
+    let now_ms = Utc::now().timestamp_millis();
+    let max_depth = lobbies.len().min(FFA_MAX_RECURSION_DEPTH);
 
-    // Log details of all input lobbies
-    for (idx, lobby) in lobbies.iter().enumerate() {
-        trace!(
-            idx = idx,
-            lobby_id = lobby.lobby_code,
-            members = lobby.members.len(),
-            avg_mmr = lobby.avg_mmr,
-            lobby_code = %lobby.lobby_code,
-            "Input lobby details"
-        );
-    }
+    fn passes_wait_time_rules(player_count: usize, longest_wait_ms: i64) -> bool {
+        if player_count < 2 {
+            return false;
+        }
 
-    // Greedy approach: take lobbies until we reach max_players
-    let mut selected = Vec::new();
-    let mut total = 0;
-    let mut total_mmr_weighted = 0;
-    let mut has_incompatible_lobbies = false;
-
-    for (idx, lobby) in lobbies.iter().enumerate() {
-        let would_exceed = total + lobby.members.len() > max_players;
-
-        if !would_exceed {
-            total += lobby.members.len();
-            total_mmr_weighted += lobby.avg_mmr * lobby.members.len() as i32;
-            selected.push(lobby.clone());
-
-            trace!(
-                idx = idx,
-                lobby_id = lobby.lobby_code,
-                members = lobby.members.len(),
-                total_players_now = total,
-                "✓ SELECTED lobby (fits within max_players)"
-            );
-        } else {
-            // Found a lobby that doesn't fit - remember this
-            has_incompatible_lobbies = true;
-
-            trace!(
-                idx = idx,
-                lobby_id = lobby.lobby_code,
-                members = lobby.members.len(),
-                total_players = total,
-                max_players = max_players,
-                would_total = total + lobby.members.len(),
-                "✗ SKIPPED lobby (would exceed max_players)"
-            );
+        let wait_seconds = (longest_wait_ms as f64) / 1000.0;
+        match player_count {
+            2 => wait_seconds > 30.0,
+            3 => wait_seconds > 15.0,
+            _ => true,
         }
     }
 
-    trace!(
-        selected_count = selected.len(),
-        total_players = total,
-        has_incompatible_lobbies = has_incompatible_lobbies,
-        "After lobby selection"
-    );
+    fn build_ffa_combination_from_selection(
+        lobbies: &[crate::matchmaking_manager::QueuedLobby],
+        selection: &[usize],
+        max_players: usize,
+    ) -> MatchmakingCombination {
+        let mut used_lobbies = Vec::new();
+        let mut spectators: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut remaining_slots = max_players;
+        let mut total_players = 0;
+        let mut total_mmr_weighted = 0;
 
-    // Determine if we should create a match:
-    // 1. Multiple lobbies combined: always match (better FFA game)
-    // 2. Single lobby with incompatible lobbies remaining: match it (can't wait for them)
-    // 3. Single lobby alone: don't match (wait for more lobbies to potentially combine)
-    let (should_match, reason) = if selected.len() > 1 {
-        // Multiple lobbies: combine them
-        (true, "Multiple lobbies - combine them")
-    } else if selected.len() == 1 && has_incompatible_lobbies {
-        // Single lobby but there are other lobbies that can't be combined with it
-        // Match this lobby since waiting won't help
-        (true, "Single lobby with incompatible lobbies - match now")
-    } else {
-        // Single lobby with no other lobbies in queue: wait for more to arrive
-        (false, "Single lobby alone - wait for more")
-    };
+        for &lobby_idx in selection {
+            let lobby = &lobbies[lobby_idx];
+            used_lobbies.push(lobby.clone());
 
-    trace!(
-        should_match = should_match,
-        reason = reason,
-        total_players = total,
-        min_players = 2,
-        "Matching decision"
-    );
+            let requesting_idx = lobby
+                .members
+                .iter()
+                .position(|m| m.user_id as u32 == lobby.requesting_user_id);
 
-    if total >= 2 && should_match {
-        let avg_mmr = total_mmr_weighted / total as i32;
+            let mut playing_indices = Vec::new();
 
-        info!(
-            total_players = total,
-            lobby_count = selected.len(),
-            avg_mmr = avg_mmr,
-            "✓ FFA MATCH CREATED"
-        );
+            if remaining_slots > 0 {
+                if let Some(idx) = requesting_idx {
+                    playing_indices.push(idx);
+                    remaining_slots -= 1;
+                    total_players += 1;
+                    total_mmr_weighted += lobby.avg_mmr;
+                }
+            }
 
-        Some(MatchmakingCombination {
-            lobbies: selected,
-            team_assignments: Vec::new(), // FFA has no teams
-            spectators: Vec::new(),
-            total_players: total,
+            for idx in 0..lobby.members.len() {
+                if remaining_slots == 0 {
+                    break;
+                }
+                if Some(idx) == requesting_idx {
+                    continue;
+                }
+                playing_indices.push(idx);
+                remaining_slots -= 1;
+                total_players += 1;
+                total_mmr_weighted += lobby.avg_mmr;
+            }
+
+            let spectator_indices: Vec<usize> = (0..lobby.members.len())
+                .filter(|idx| !playing_indices.contains(idx))
+                .collect();
+
+            if !spectator_indices.is_empty() {
+                spectators.push((lobby.lobby_code.clone(), spectator_indices));
+            }
+        }
+
+        let avg_mmr = if total_players > 0 {
+            total_mmr_weighted / total_players as i32
+        } else {
+            0
+        };
+
+        MatchmakingCombination {
+            lobbies: used_lobbies,
+            team_assignments: Vec::new(),
+            spectators,
+            total_players,
             avg_mmr,
-        })
-    } else {
-        warn!(
-            total_players = total,
-            should_match = should_match,
-            reason = reason,
-            "✗ NO FFA MATCH - not enough players or shouldn't match yet"
-        );
-
-        None
+        }
     }
+
+    fn backtrack_ffa(
+        lobbies: &[crate::matchmaking_manager::QueuedLobby],
+        max_players: usize,
+        now_ms: i64,
+        idx: usize,
+        depth: usize,
+        max_depth: usize,
+        selection: &mut Vec<usize>,
+        total_members: usize,
+        longest_wait_ms: i64,
+    ) -> Option<MatchmakingCombination> {
+        // Evaluate current selection before diving deeper
+        if !selection.is_empty() {
+            let player_count = total_members.min(max_players);
+            if passes_wait_time_rules(player_count, longest_wait_ms) {
+                return Some(build_ffa_combination_from_selection(
+                    lobbies,
+                    selection,
+                    max_players,
+                ));
+            }
+        }
+
+        if depth >= max_depth || idx >= lobbies.len() {
+            return None;
+        }
+
+        // Option 1: include current lobby
+        let lobby = &lobbies[idx];
+        selection.push(idx);
+        let new_total = total_members + lobby.members.len();
+        let new_longest = longest_wait_ms.max(now_ms - lobby.queued_at);
+        if let Some(combo) = backtrack_ffa(
+            lobbies,
+            max_players,
+            now_ms,
+            idx + 1,
+            depth + 1,
+            max_depth,
+            selection,
+            new_total,
+            new_longest,
+        ) {
+            return Some(combo);
+        }
+        selection.pop();
+
+        // Option 2: skip current lobby
+        backtrack_ffa(
+            lobbies,
+            max_players,
+            now_ms,
+            idx + 1,
+            depth + 1,
+            max_depth,
+            selection,
+            total_members,
+            longest_wait_ms,
+        )
+    }
+
+    backtrack_ffa(
+        lobbies,
+        max_players,
+        now_ms,
+        0,
+        0,
+        max_depth,
+        &mut Vec::new(),
+        0,
+        0,
+    )
 }
 
 /// Main matchmaking loop
@@ -625,14 +669,9 @@ pub async fn run_matchmaking_loop(
         // In production, we'd maintain a set of active game types
         let game_types = vec![
             GameType::Solo,
-            GameType::FreeForAll { max_players: 2 },
-            GameType::FreeForAll { max_players: 3 },
             GameType::FreeForAll { max_players: 4 },
-            GameType::FreeForAll { max_players: 6 },
-            GameType::FreeForAll { max_players: 10 },
             GameType::TeamMatch { per_team: 1 },
             GameType::TeamMatch { per_team: 2 },
-            GameType::TeamMatch { per_team: 3 },
         ];
 
         let mut total_games_created = 0;
@@ -673,9 +712,7 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Quickmatch,
                 lobby_manager.clone(),
-            )
-            .await
-            {
+            ).await {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -700,9 +737,7 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Competitive,
                 lobby_manager.clone(),
-            )
-            .await
-            {
+            ).await {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -857,8 +892,14 @@ async fn create_lobby_matches(
 
     // Try to create as many games as possible from available lobbies
     while !available_lobbies.is_empty() {
-        // Get the longest-waiting lobby (first in sorted list)
-        let priority_lobby = &available_lobbies[0];
+        // Randomly choose between:
+        // 1. Get the longest-waiting lobby (first in sorted list)
+        // 2. Random lobby
+        let priority_lobby = if rand::random::<f32>() < 0.5 {
+            &available_lobbies[0]
+        } else {
+            &available_lobbies[rand::random::<usize>() % available_lobbies.len()]
+        };
 
         let wait_time_s = ((now - priority_lobby.queued_at) as f64) / 1000.0;
         let max_acceptable_mmr_diff = calculate_max_mmr_diff(wait_time_s);
@@ -936,9 +977,7 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        )
-        .await
-        {
+        ).await {
             Ok(game_id) => {
                 games_created += 1;
                 info!(

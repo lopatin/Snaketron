@@ -4,7 +4,7 @@ use chrono::Utc;
 use redis::{Client, PushInfo};
 use server::{
     lobby_manager::LobbyMember, matchmaking_manager::MatchmakingManager,
-    redis_utils::create_connection_manager, ws_server::WSMessage,
+    redis_keys::RedisKeys, redis_utils::create_connection_manager, ws_server::WSMessage,
 };
 use tokio::{
     sync::broadcast,
@@ -13,6 +13,20 @@ use tokio::{
 
 mod common;
 use self::common::{TestClient, TestEnvironment};
+
+use std::sync::Once;
+use tracing_subscriber::{fmt, EnvFilter};
+
+static INIT_TRACING: Once = Once::new();
+
+pub fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        fmt()
+            // allow configuring via RUST_LOG, e.g. RUST_LOG=trace
+            .with_env_filter(EnvFilter::from_default_env())
+            .init();
+    });
+}
 
 fn test_redis_url() -> String {
     let mut url = std::env::var("SNAKETRON_REDIS_URL")
@@ -207,6 +221,55 @@ async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option
     // This is a simplified version - in reality you'd need to track the game state
     // For testing purposes, we can infer team from snake positions
     Ok(None) // Placeholder - will be filled based on actual game state
+}
+
+// Helper to age a single queued lobby in Redis
+async fn age_single_queued_lobby(
+    game_type: &GameType,
+    queue_mode: &QueueMode,
+    new_queued_at: i64,
+) -> Result<()> {
+    let mut mm = create_test_matchmaking_manager().await?;
+    let mut redis_conn = redis::Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+
+    let mut lobbies = Vec::new();
+    for _ in 0..10 {
+        lobbies = mm
+            .get_queued_lobbies(game_type, queue_mode)
+            .await
+            .expect("Should fetch queued lobbies");
+        if lobbies.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        lobbies.len(),
+        1,
+        "Expected a single queued lobby after waiting for queue processing"
+    );
+
+    let lobby = lobbies[0].clone();
+    let original_json = serde_json::to_string(&lobby)?;
+
+    let mut aged_lobby = lobby.clone();
+    aged_lobby.queued_at = new_queued_at;
+    let updated_json = serde_json::to_string(&aged_lobby)?;
+
+    let queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
+    let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
+
+    let mut pipe = redis::pipe();
+    pipe.atomic()
+        .zrem(&queue_key, &original_json)
+        .zrem(&mmr_key, &original_json)
+        .zadd(&queue_key, &updated_json, new_queued_at)
+        .zadd(&mmr_key, &updated_json, aged_lobby.avg_mmr);
+    let _: () = pipe.query_async(&mut redis_conn).await?;
+
+    Ok(())
 }
 
 // ============================================================================
@@ -553,7 +616,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_ffa_multiple_lobbies").await?;
     env.add_server().await?;
-    for _ in 0..5 {
+    for _ in 0..4 {
         env.create_user().await?;
     }
 
@@ -562,28 +625,25 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
-        GameType::FreeForAll { max_players: 6 },
+        GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    )
-    .await?;
+    ).await?;
 
     let mut clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[2]],
-        GameType::FreeForAll { max_players: 6 },
+        GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    )
-    .await?;
+    ).await?;
 
     let mut clients3 = create_lobby_and_queue(
         &env,
         0,
-        &[env.user_ids()[3], env.user_ids()[4]],
-        GameType::FreeForAll { max_players: 6 },
+        &[env.user_ids()[3]],
+        GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    )
-    .await?;
+    ).await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -594,7 +654,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     let game_id = wait_for_all_clients_to_join_game(&mut all_clients).await?;
 
     println!(
-        "FFA game created from multiple lobbies: {} (5 total players)",
+        "FFA game created from multiple lobbies: {} (4 total players)",
         game_id
     );
 
@@ -606,70 +666,36 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_ffa_respects_max_players() -> Result<()> {
+async fn test_ffa_single_lobby() -> Result<()> {
+    init_tracing();
+    
     setup_test_redis().await?;
-    let mut env = TestEnvironment::new("test_ffa_max_players").await?;
+    let mut env = TestEnvironment::new("test_ffa_single_lobby").await?;
     env.add_server().await?;
-    for _ in 0..6 {
+    for _ in 0..4 {
         env.create_user().await?;
     }
 
-    // Create two 3-player lobbies, but max is 4
-    let mut clients1 = create_lobby_and_queue(
+    let mut clients = create_lobby_and_queue(
         &env,
         0,
-        &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
+        &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2], env.user_ids()[3]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    )
-    .await?;
+    ).await?;
 
-    let mut clients2 = create_lobby_and_queue(
-        &env,
-        0,
-        &[env.user_ids()[3], env.user_ids()[4], env.user_ids()[5]],
-        GameType::FreeForAll { max_players: 4 },
-        QueueMode::Quickmatch,
-    )
-    .await?;
+    // Wait for game to be created
+    let game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
 
-    // Only the first lobby should get matched (can't fit both)
-    let result1 = timeout(
-        Duration::from_secs(10),
-        wait_for_all_clients_to_join_game(&mut clients1),
-    )
-    .await;
+    println!("FFA game created from single lobby: {}", game_id);
 
-    // Second lobby should timeout (not matched)
-    let result2 = timeout(Duration::from_secs(3), async {
-        loop {
-            match clients2[0].receive_message().await? {
-                WSMessage::JoinGame(_) => {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-
-    assert!(result1.is_ok(), "First lobby should be matched");
-    assert!(
-        result2.is_err(),
-        "Second lobby should NOT be matched (exceeds max_players)"
-    );
-
-    println!("FFA correctly respects max_players limit");
-
-    for client in clients1 {
-        client.disconnect().await?;
-    }
-    for client in clients2 {
+    for client in clients {
         client.disconnect().await?;
     }
     env.shutdown().await?;
     Ok(())
 }
+
 
 #[tokio::test]
 async fn test_ffa_minimum_players() -> Result<()> {
@@ -706,6 +732,88 @@ async fn test_ffa_minimum_players() -> Result<()> {
     );
 
     println!("FFA correctly requires minimum 2 players");
+
+    for client in clients {
+        client.disconnect().await?;
+    }
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ffa_two_player_lobby_matches_after_30_seconds() -> Result<()> {
+    setup_test_redis().await?;
+    let mut env = TestEnvironment::new("test_ffa_two_player_lobby_matches_after_30_seconds").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+
+    let mut clients = create_lobby_and_queue(
+        &env,
+        0,
+        &[env.user_ids()[0], env.user_ids()[1]],
+        GameType::FreeForAll { max_players: 4 },
+        QueueMode::Quickmatch,
+    )
+    .await?;
+
+    // Age the queued lobby so the longest wait time passes the 30s threshold for 2 players
+    let game_type = GameType::FreeForAll { max_players: 4 };
+    let queue_mode = QueueMode::Quickmatch;
+    let aged_ts = Utc::now().timestamp_millis() - 30_000; // ~31s ago
+    age_single_queued_lobby(&game_type, &queue_mode, aged_ts).await?;
+
+    let game_id = timeout(Duration::from_secs(1), async {
+        wait_for_all_clients_to_join_game(&mut clients).await
+    })
+    .await??;
+
+    println!(
+        "FFA game created for two-player lobby after ~30s wait threshold: {}",
+        game_id
+    );
+
+    for client in clients {
+        client.disconnect().await?;
+    }
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ffa_three_player_lobby_matches_after_15_seconds() -> Result<()> {
+    setup_test_redis().await?;
+    let mut env =
+        TestEnvironment::new("test_ffa_three_player_lobby_matches_after_15_seconds").await?;
+    env.add_server().await?;
+    for _ in 0..3 {
+        env.create_user().await?;
+    }
+
+    let mut clients = create_lobby_and_queue(
+        &env,
+        0,
+        &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
+        GameType::FreeForAll { max_players: 4 },
+        QueueMode::Quickmatch,
+    )
+    .await?;
+
+    // Age the queued lobby so the longest wait time passes the 15s threshold for 3 players
+    let game_type = GameType::FreeForAll { max_players: 4 };
+    let queue_mode = QueueMode::Quickmatch;
+    let aged_ts = Utc::now().timestamp_millis() - 15_000; // ~16s ago
+    age_single_queued_lobby(&game_type, &queue_mode, aged_ts).await?;
+
+    let game_id = timeout(Duration::from_secs(2), async {
+        wait_for_all_clients_to_join_game(&mut clients).await
+    })
+    .await??;
+
+    println!(
+        "FFA game created for three-player lobby after ~15s wait threshold: {}",
+        game_id
+    );
 
     for client in clients {
         client.disconnect().await?;
