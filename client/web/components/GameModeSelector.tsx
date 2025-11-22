@@ -12,7 +12,7 @@ const GAME_MODES = {
     title: 'QUICK MATCH',
     modes: [
       { id: 'duel', name: 'DUEL', description: '1v1 battle', gameType: { TeamMatch: { per_team: 1 } } as GameType },
-      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Up to 8 player brawl', gameType: { FreeForAll: { max_players: 8 } } as GameType }
+      { id: 'free-for-all', name: 'FREE FOR ALL', description: 'Up to 4 player brawl', gameType: { FreeForAll: { max_players: 4 } } as GameType }
     ]
   },
   'competitive': {

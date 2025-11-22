@@ -57,7 +57,7 @@ export const NewHome: React.FC = () => {
   // Check if mobile on mount and resize
   useEffect(() => {
     const checkMobile = () => {
-      setIsMobile(window.innerHeight > window.innerWidth);
+      setIsMobile(window.innerWidth < 800);
     };
     checkMobile();
     window.addEventListener('resize', checkMobile);
@@ -150,7 +150,7 @@ export const NewHome: React.FC = () => {
         } else if (mode === '2v2') {
           return { TeamMatch: { per_team: 2 } };
         } else if (mode === 'ffa') {
-          return { FreeForAll: { max_players: 8 } };
+          return { FreeForAll: { max_players: 4 } };
         } else {
           return 'Solo';
         }

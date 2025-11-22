@@ -292,7 +292,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     
     // For multiplayer games, use custom game as a placeholder for now
     createCustomGame({
-      max_players: gameType === 'duel' ? 2 : 8,
+      max_players: gameType === 'duel' ? 2 : 4,
       tick_duration_ms: DEFAULT_TICK_INTERVAL_MS as number, // Normal speed
       arena_width: 40,      // Medium map size
       arena_height: 40

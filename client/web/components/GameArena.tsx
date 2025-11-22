@@ -428,7 +428,7 @@ export default function GameArena() {
       case '2v2':
         return { TeamMatch: { per_team: 2 } };
       case 'ffa':
-        return { FreeForAll: { max_players: 8 } };
+        return { FreeForAll: { max_players: 4 } };
       case 'solo':
       default:
         return 'Solo';
