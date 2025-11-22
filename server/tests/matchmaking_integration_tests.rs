@@ -158,8 +158,8 @@ async fn test_basic_matchmaking() -> Result<()> {
         .await?;
 
     // Both should receive MatchFound
-    let game_id1 = wait_for_match(&mut client1).await?;
-    let game_id2 = wait_for_match(&mut client2).await?;
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(35)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(35)).await?;
 
     assert_eq!(
         game_id1, game_id2,

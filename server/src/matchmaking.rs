@@ -486,9 +486,13 @@ fn find_ffa_combination(
     let now_ms = Utc::now().timestamp_millis();
     let max_depth = lobbies.len().min(FFA_MAX_RECURSION_DEPTH);
 
-    fn passes_wait_time_rules(player_count: usize, longest_wait_ms: i64) -> bool {
+    fn passes_wait_time_rules(player_count: usize, longest_wait_ms: i64, max_players: usize) -> bool {
         if player_count < 2 {
             return false;
+        }
+        
+        if player_count >= max_players {
+            return true;
         }
 
         let wait_seconds = (longest_wait_ms as f64) / 1000.0;
@@ -567,6 +571,20 @@ fn find_ffa_combination(
         }
     }
 
+    // Fast path: single-lobby decision based on wait thresholds
+    if lobbies.len() == 1 {
+        let lobby = &lobbies[0];
+        let player_count = lobby.members.len().min(max_players);
+        let wait_ms = now_ms - lobby.queued_at;
+        if passes_wait_time_rules(player_count, wait_ms, max_players) {
+            return Some(build_ffa_combination_from_selection(
+                lobbies,
+                &[0],
+                max_players,
+            ));
+        }
+    }
+
     fn backtrack_ffa(
         lobbies: &[crate::matchmaking_manager::QueuedLobby],
         max_players: usize,
@@ -581,7 +599,7 @@ fn find_ffa_combination(
         // Evaluate current selection before diving deeper
         if !selection.is_empty() {
             let player_count = total_members.min(max_players);
-            if passes_wait_time_rules(player_count, longest_wait_ms) {
+            if passes_wait_time_rules(player_count, longest_wait_ms, max_players) {
                 return Some(build_ffa_combination_from_selection(
                     lobbies,
                     selection,
@@ -669,6 +687,7 @@ pub async fn run_matchmaking_loop(
         // In production, we'd maintain a set of active game types
         let game_types = vec![
             GameType::Solo,
+            GameType::FreeForAll { max_players: 2 },
             GameType::FreeForAll { max_players: 4 },
             GameType::TeamMatch { per_team: 1 },
             GameType::TeamMatch { per_team: 2 },

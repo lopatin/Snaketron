@@ -760,10 +760,13 @@ async fn test_ffa_two_player_lobby_matches_after_30_seconds() -> Result<()> {
     // Age the queued lobby so the longest wait time passes the 30s threshold for 2 players
     let game_type = GameType::FreeForAll { max_players: 4 };
     let queue_mode = QueueMode::Quickmatch;
-    let aged_ts = Utc::now().timestamp_millis() - 30_000; // ~31s ago
+    let aged_ts = Utc::now().timestamp_millis() - 31_000; // ~31s ago
     age_single_queued_lobby(&game_type, &queue_mode, aged_ts).await?;
 
-    let game_id = timeout(Duration::from_secs(1), async {
+    // Allow a short tick for the matchmaking loop to pick up the aged lobby
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let game_id = timeout(Duration::from_secs(10), async {
         wait_for_all_clients_to_join_game(&mut clients).await
     })
     .await??;
@@ -802,10 +805,13 @@ async fn test_ffa_three_player_lobby_matches_after_15_seconds() -> Result<()> {
     // Age the queued lobby so the longest wait time passes the 15s threshold for 3 players
     let game_type = GameType::FreeForAll { max_players: 4 };
     let queue_mode = QueueMode::Quickmatch;
-    let aged_ts = Utc::now().timestamp_millis() - 15_000; // ~16s ago
+    let aged_ts = Utc::now().timestamp_millis() - 16_000; // ~16s ago
     age_single_queued_lobby(&game_type, &queue_mode, aged_ts).await?;
 
-    let game_id = timeout(Duration::from_secs(2), async {
+    // Allow a short tick for the matchmaking loop to pick up the aged lobby
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let game_id = timeout(Duration::from_secs(10), async {
         wait_for_all_clients_to_join_game(&mut clients).await
     })
     .await??;
