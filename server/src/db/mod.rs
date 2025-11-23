@@ -44,6 +44,32 @@ pub trait Database: Send + Sync {
     ) -> Result<i32>; // Returns new MMR
     async fn get_user_mmrs(&self, user_ids: &[i32]) -> Result<HashMap<i32, (i32, i32)>>; // Returns (ranked_mmr, casual_mmr) for each user
 
+    // Ranking/leaderboard operations
+    async fn upsert_ranking(
+        &self,
+        user_id: i32,
+        username: &str,
+        mmr: i32,
+        queue_mode: &common::QueueMode,
+        region: &str,
+        season: &str,
+        won: bool,
+    ) -> Result<()>;
+    async fn get_leaderboard(
+        &self,
+        queue_mode: &common::QueueMode,
+        region: Option<&str>,
+        season: &str,
+        limit: usize,
+    ) -> Result<Vec<RankingEntry>>;
+    async fn get_user_ranking(
+        &self,
+        user_id: i32,
+        queue_mode: &common::QueueMode,
+        region: &str,
+        season: &str,
+    ) -> Result<Option<RankingEntry>>;
+
     // Game operations
     async fn create_game(
         &self,

@@ -1,10 +1,11 @@
 use crate::db::Database;
+use crate::season::{get_current_season, get_region};
 use anyhow::{anyhow, Result};
 use common::{GameState, GameType, QueueMode, TeamId};
 use skillratings::weng_lin::{weng_lin, weng_lin_multi_team, weng_lin_two_teams, WengLinConfig, WengLinRating};
 use skillratings::MultiTeamOutcome;
 use skillratings::Outcomes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 /// Persist MMR changes for all players in a completed game to the database.
@@ -36,29 +37,37 @@ pub async fn persist_player_mmr(
         game_id, game_state.game_type, game_state.queue_mode, player_count
     );
 
-    // Calculate MMR deltas based on game type
-    let mmr_deltas = match &game_state.game_type {
+    // Calculate MMR deltas and determine winners based on game type
+    let (mmr_deltas, winners) = match &game_state.game_type {
         GameType::TeamMatch { per_team } => {
-            calculate_team_match_mmr_deltas(db, game_state, *per_team).await?
+            let deltas = calculate_team_match_mmr_deltas(db, game_state, *per_team).await?;
+            let winners = get_team_match_winners(game_state);
+            (deltas, winners)
         }
         GameType::FreeForAll { .. } => {
-            calculate_ffa_mmr_deltas(db, game_state).await?
+            let deltas = calculate_ffa_mmr_deltas(db, game_state).await?;
+            let winners = get_ffa_winners(game_state);
+            (deltas, winners)
         }
         GameType::Custom { .. } => {
             // For custom games, determine if it's team-based or FFA
             if game_state.team_scores.is_some() {
                 // Custom team game
-                calculate_team_match_mmr_deltas(db, game_state, 1).await?
+                let deltas = calculate_team_match_mmr_deltas(db, game_state, 1).await?;
+                let winners = get_team_match_winners(game_state);
+                (deltas, winners)
             } else {
                 // Custom FFA game
-                calculate_ffa_mmr_deltas(db, game_state).await?
+                let deltas = calculate_ffa_mmr_deltas(db, game_state).await?;
+                let winners = get_ffa_winners(game_state);
+                (deltas, winners)
             }
         }
         GameType::Solo => return Ok(()), // Already handled above
     };
 
-    // Apply MMR deltas to database
-    apply_mmr_deltas(db, game_id, &game_state.queue_mode, mmr_deltas).await?;
+    // Apply MMR deltas to database and update rankings
+    apply_mmr_deltas(db, game_id, &game_state.queue_mode, game_state, mmr_deltas, winners).await?;
 
     info!("Finished persisting MMR for game {}", game_id);
     Ok(())
@@ -258,19 +267,26 @@ async fn calculate_ffa_mmr_deltas(
 }
 
 /// Apply calculated MMR deltas to the database using atomic operations
+/// Also updates the rankings table for leaderboards
 async fn apply_mmr_deltas(
     db: &dyn Database,
     game_id: u32,
     queue_mode: &QueueMode,
+    game_state: &GameState,
     deltas: HashMap<u32, i32>,
+    winners: HashSet<u32>,
 ) -> Result<()> {
+    let season = get_current_season();
+    let region = get_region();
+
     for (user_id, delta) in deltas {
         if delta == 0 {
             info!("User {} MMR unchanged in game {}", user_id, game_id);
             continue;
         }
 
-        match db
+        // Update user MMR
+        let new_mmr = match db
             .update_user_mmr_by_mode(user_id as i32, delta, queue_mode)
             .await
         {
@@ -285,17 +301,110 @@ async fn apply_mmr_deltas(
                     new_total,
                     game_id
                 );
+                new_total
             }
             Err(e) => {
                 error!(
                     "Failed to update MMR for user {} in game {}: {:?}",
                     user_id, game_id, e
                 );
-                // Don't fail the whole operation if one user fails
-                // This ensures other players still get their MMR updates
+                continue; // Skip ranking update if MMR update failed
+            }
+        };
+
+        // Update ranking
+        let username = game_state
+            .usernames
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("User{}", user_id));
+
+        let won = winners.contains(&user_id);
+
+        match db
+            .upsert_ranking(
+                user_id as i32,
+                &username,
+                new_mmr,
+                queue_mode,
+                &region,
+                &season,
+                won,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Updated ranking for user {} in {} {} (season: {})",
+                    user_id,
+                    match queue_mode {
+                        QueueMode::Competitive => "ranked",
+                        QueueMode::Quickmatch => "casual",
+                    },
+                    region,
+                    season
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to update ranking for user {} in game {}: {:?}",
+                    user_id, game_id, e
+                );
+                // Don't fail the whole operation if ranking update fails
             }
         }
     }
 
     Ok(())
+}
+
+/// Get winners for team-based matches
+fn get_team_match_winners(game_state: &GameState) -> HashSet<u32> {
+    let mut winners = HashSet::new();
+
+    if let Some(team_scores) = &game_state.team_scores {
+        // Find the winning team(s)
+        if let Some((winning_team, _)) = team_scores.iter().max_by_key(|(_, score)| *score) {
+            // Add all players from the winning team
+            for (user_id, player) in &game_state.players {
+                let snake = &game_state.arena.snakes[player.snake_id as usize];
+                if snake.team_id == Some(*winning_team) {
+                    winners.insert(*user_id);
+                }
+            }
+        }
+    }
+
+    winners
+}
+
+/// Get winners for FFA matches (top player or tied for first)
+fn get_ffa_winners(game_state: &GameState) -> HashSet<u32> {
+    let mut winners = HashSet::new();
+
+    // Get all player scores
+    let player_scores: Vec<(u32, u32)> = game_state
+        .players
+        .iter()
+        .map(|(user_id, player)| {
+            let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
+            (*user_id, score)
+        })
+        .collect();
+
+    if player_scores.is_empty() {
+        return winners;
+    }
+
+    // Find max score
+    let max_score = player_scores.iter().map(|(_, score)| *score).max().unwrap_or(0);
+
+    // Add all players with max score (handles ties)
+    for (user_id, score) in player_scores {
+        if score == max_score {
+            winners.insert(user_id);
+        }
+    }
+
+    winners
 }

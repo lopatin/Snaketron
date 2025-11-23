@@ -54,6 +54,10 @@ impl DynamoDatabase {
         format!("{}-game-codes", self.table_prefix)
     }
 
+    fn rankings_table(&self, season: &str) -> String {
+        format!("{}-rankings-{}", self.table_prefix, season)
+    }
+
     async fn ensure_tables_exist(&self) -> Result<()> {
         // Create main table with GSI indexes
         self.create_main_table_if_not_exists().await?;
@@ -63,6 +67,8 @@ impl DynamoDatabase {
 
         // Create game codes table
         self.create_game_codes_table_if_not_exists().await?;
+
+        // Note: Rankings tables are created on-demand per season
 
         Ok(())
     }
@@ -1191,6 +1197,284 @@ impl Database for DynamoDatabase {
             .await
             .ok(); // Ignore if already exists (idempotent)
 
+        Ok(())
+    }
+
+    async fn upsert_ranking(
+        &self,
+        user_id: i32,
+        username: &str,
+        mmr: i32,
+        queue_mode: &common::QueueMode,
+        region: &str,
+        season: &str,
+        won: bool,
+    ) -> Result<()> {
+        // Ensure table exists for this season
+        self.create_rankings_table_if_not_exists(season).await?;
+
+        let queue_mode_str = match queue_mode {
+            common::QueueMode::Competitive => "ranked",
+            common::QueueMode::Quickmatch => "casual",
+        };
+
+        // Pad MMR to 8 digits for sorting (99999999 - mmr for descending order)
+        let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
+        let padded_mmr = format!("{:08}", inverted_mmr);
+
+        let pk = format!("RANKING#{}#{}", queue_mode_str, region);
+        let sk = format!("MMR#{}#USER#{}", padded_mmr, user_id);
+
+        // Try to get existing ranking to calculate delta
+        let existing = self.get_user_ranking(user_id, queue_mode, region, season).await?;
+
+        let (games_played, wins, losses, old_mmr) = match &existing {
+            Some(entry) => {
+                let new_wins = if won { entry.wins + 1 } else { entry.wins };
+                let new_losses = if won { entry.losses } else { entry.losses + 1 };
+                (entry.games_played + 1, new_wins, new_losses, Some(entry.mmr))
+            }
+            None => {
+                let (wins, losses) = if won { (1, 0) } else { (0, 1) };
+                (1, wins, losses, None)
+            }
+        };
+
+        let now = Utc::now();
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), Self::av_s(&pk));
+        item.insert("sk".to_string(), Self::av_s(&sk));
+        item.insert("userId".to_string(), Self::av_n(user_id));
+        item.insert("username".to_string(), Self::av_s(username));
+        item.insert("mmr".to_string(), Self::av_n(mmr));
+        item.insert("gamesPlayed".to_string(), Self::av_n(games_played));
+        item.insert("wins".to_string(), Self::av_n(wins));
+        item.insert("losses".to_string(), Self::av_n(losses));
+        item.insert("region".to_string(), Self::av_s(region));
+        item.insert("queueMode".to_string(), Self::av_s(queue_mode_str));
+        item.insert("season".to_string(), Self::av_s(season));
+        item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
+
+        // Delete old entry if MMR changed (SK will be different)
+        if let Some(prev_mmr) = old_mmr {
+            if prev_mmr != mmr {
+                let old_inverted = 99999999 - prev_mmr.max(0).min(99999999);
+                let old_sk = format!("MMR#{}#USER#{}", format!("{:08}", old_inverted), user_id);
+
+                self.client
+                    .delete_item()
+                    .table_name(self.rankings_table(season))
+                    .key("pk", Self::av_s(&pk))
+                    .key("sk", Self::av_s(&old_sk))
+                    .send()
+                    .await
+                    .ok(); // Ignore errors
+            }
+        }
+
+        // Insert new entry
+        self.client
+            .put_item()
+            .table_name(self.rankings_table(season))
+            .set_item(Some(item))
+            .send()
+            .await
+            .context("Failed to upsert ranking")?;
+
+        info!(
+            "Updated ranking for user {} in {} {} (season: {}, MMR: {}, games: {}, W/L: {}/{})",
+            user_id, queue_mode_str, region, season, mmr, games_played, wins, losses
+        );
+
+        Ok(())
+    }
+
+    async fn get_leaderboard(
+        &self,
+        queue_mode: &common::QueueMode,
+        region: Option<&str>,
+        season: &str,
+        limit: usize,
+    ) -> Result<Vec<RankingEntry>> {
+        // Ensure table exists
+        self.create_rankings_table_if_not_exists(season).await?;
+
+        let queue_mode_str = match queue_mode {
+            common::QueueMode::Competitive => "ranked",
+            common::QueueMode::Quickmatch => "casual",
+        };
+
+        // Query by region if specified, otherwise query all regions
+        let results = if let Some(reg) = region {
+            // Query specific region
+            let pk = format!("RANKING#{}#{}", queue_mode_str, reg);
+
+            let response = self.client
+                .query()
+                .table_name(self.rankings_table(season))
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", Self::av_s(&pk))
+                .limit(limit as i32)
+                .send()
+                .await
+                .context("Failed to query leaderboard")?;
+
+            response.items.unwrap_or_default()
+        } else {
+            // Query all regions by scanning with filter
+            let response = self.client
+                .scan()
+                .table_name(self.rankings_table(season))
+                .filter_expression("begins_with(pk, :prefix)")
+                .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}", queue_mode_str)))
+                .limit(limit as i32)
+                .send()
+                .await
+                .context("Failed to scan leaderboard")?;
+
+            response.items.unwrap_or_default()
+        };
+
+        // Parse results into RankingEntry
+        let mut entries: Vec<RankingEntry> = results
+            .into_iter()
+            .filter_map(|item| {
+                Some(RankingEntry {
+                    user_id: Self::extract_number(&item, "userId")?,
+                    username: Self::extract_string(&item, "username")?,
+                    mmr: Self::extract_number(&item, "mmr")?,
+                    games_played: Self::extract_number(&item, "gamesPlayed")?,
+                    wins: Self::extract_number(&item, "wins")?,
+                    losses: Self::extract_number(&item, "losses")?,
+                    region: Self::extract_string(&item, "region")?,
+                    queue_mode: Self::extract_string(&item, "queueMode")?,
+                    season: Self::extract_string(&item, "season")?,
+                    updated_at: Self::extract_string(&item, "updatedAt")
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now),
+                })
+            })
+            .collect();
+
+        // Sort by MMR descending (in case we scanned multiple regions)
+        entries.sort_by(|a, b| b.mmr.cmp(&a.mmr));
+        entries.truncate(limit);
+
+        Ok(entries)
+    }
+
+    async fn get_user_ranking(
+        &self,
+        user_id: i32,
+        queue_mode: &common::QueueMode,
+        region: &str,
+        season: &str,
+    ) -> Result<Option<RankingEntry>> {
+        // Ensure table exists
+        self.create_rankings_table_if_not_exists(season).await?;
+
+        let queue_mode_str = match queue_mode {
+            common::QueueMode::Competitive => "ranked",
+            common::QueueMode::Quickmatch => "casual",
+        };
+
+        let pk = format!("RANKING#{}#{}", queue_mode_str, region);
+
+        // Query for this user's ranking
+        let response = self.client
+            .query()
+            .table_name(self.rankings_table(season))
+            .key_condition_expression("pk = :pk AND contains(sk, :user_id)")
+            .expression_attribute_values(":pk", Self::av_s(&pk))
+            .expression_attribute_values(":user_id", Self::av_s(&format!("USER#{}", user_id)))
+            .send()
+            .await
+            .context("Failed to query user ranking")?;
+
+        let items = response.items.unwrap_or_default();
+        if items.is_empty() {
+            return Ok(None);
+        }
+
+        let item = &items[0];
+        Ok(Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
+            username: Self::extract_string(item, "username").unwrap_or_default(),
+            mmr: Self::extract_number(item, "mmr").unwrap_or(1000),
+            games_played: Self::extract_number(item, "gamesPlayed").unwrap_or(0),
+            wins: Self::extract_number(item, "wins").unwrap_or(0),
+            losses: Self::extract_number(item, "losses").unwrap_or(0),
+            region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
+            queue_mode: Self::extract_string(item, "queueMode").unwrap_or(queue_mode_str.to_string()),
+            season: Self::extract_string(item, "season").unwrap_or(season.to_string()),
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        }))
+    }
+}
+
+// Private helper methods for rankings
+impl DynamoDatabase {
+    async fn create_rankings_table_if_not_exists(&self, season: &str) -> Result<()> {
+        let table_name = self.rankings_table(season);
+
+        // Check if table exists
+        match self.client.describe_table().table_name(&table_name).send().await {
+            Ok(_) => {
+                debug!("Rankings table {} already exists", table_name);
+                return Ok(());
+            }
+            Err(_) => {
+                info!("Creating rankings table: {}", table_name);
+            }
+        }
+
+        // PK: RANKING#{queue_mode}#{region} (e.g., "RANKING#ranked#us-east-1")
+        // SK: MMR#{padded_mmr}#USER#{user_id} (e.g., "MMR#00001543#USER#1234")
+        // This schema allows:
+        // - Querying top players by queue_mode + region (sorted by MMR descending)
+        // - Querying all regions with queue_mode prefix
+
+        let pk_attr = AttributeDefinition::builder()
+            .attribute_name("pk")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build pk attribute")?;
+
+        let sk_attr = AttributeDefinition::builder()
+            .attribute_name("sk")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build sk attribute")?;
+
+        let pk_key = KeySchemaElement::builder()
+            .attribute_name("pk")
+            .key_type(KeyType::Hash)
+            .build()
+            .context("Failed to build pk key")?;
+
+        let sk_key = KeySchemaElement::builder()
+            .attribute_name("sk")
+            .key_type(KeyType::Range)
+            .build()
+            .context("Failed to build sk key")?;
+
+        self.client
+            .create_table()
+            .table_name(&table_name)
+            .attribute_definitions(pk_attr)
+            .attribute_definitions(sk_attr)
+            .key_schema(pk_key)
+            .key_schema(sk_key)
+            .billing_mode(BillingMode::PayPerRequest)
+            .send()
+            .await
+            .context("Failed to create rankings table")?;
+
+        info!("Successfully created rankings table: {}", table_name);
         Ok(())
     }
 }

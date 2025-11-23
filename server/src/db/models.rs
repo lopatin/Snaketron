@@ -85,6 +85,21 @@ pub struct GameSpectator {
     pub joined_at: DateTime<Utc>,
 }
 
+// Ranking entry for leaderboards
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankingEntry {
+    pub user_id: i32,
+    pub username: String,
+    pub mmr: i32,
+    pub games_played: i32,
+    pub wins: i32,
+    pub losses: i32,
+    pub region: String,
+    pub queue_mode: String, // "ranked" or "casual"
+    pub season: String,     // e.g., "2025-S1"
+    pub updated_at: DateTime<Utc>,
+}
+
 // DynamoDB specific models for single table design
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoItem {
