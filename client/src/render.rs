@@ -240,12 +240,13 @@ pub fn render_game(
             names.sort();
         }
 
-        // Determine text colors based on perspective
-        let (left_text_color, right_text_color) = match local_player_team {
-            Some(0) => ("#c0d8e4", "#e4c0c0"),
-            Some(1) => ("#e4c0c0", "#c0d8e4"),
-            _ => ("#c0d8e4", "#e4c0c0"),
-        };
+        // Background and text colors based on perspective
+        let (left_bg_color, right_bg_color, left_text_color, right_text_color) =
+            match local_player_team {
+                Some(0) => ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0"),
+                Some(1) => ("#ffe6e6", "#e6f4fa", "#e4c0c0", "#c0d8e4"),
+                _ => ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0"),
+            };
 
         let local_name = local_username
             .as_ref()
@@ -267,147 +268,135 @@ pub fn render_game(
             _ => local_name.clone(),
         };
 
-        let format_label = |names: &[String], fallback: &str| -> String {
+        let mut format_names = |names: &[String], fallback: &str| -> Vec<String> {
             if names.is_empty() {
-                fallback.to_string()
+                vec![fallback.to_string()]
             } else {
-                names
-                    .iter()
-                    .map(|s| s.to_uppercase())
-                    .collect::<Vec<String>>()
-                    .join(" | ")
+                names.iter().map(|s| s.to_uppercase()).collect()
             }
         };
 
-        let left_label = format_label(&team_names[0], &default_team0);
-        let right_label = format_label(&team_names[1], &default_team1);
+        let team0_labels = format_names(&team_names[0], &default_team0);
+        let team1_labels = format_names(&team_names[1], &default_team1);
 
-        // Set font for zone text - stadium-style: larger, bold, epic font
-        // Try Impact first (common sports font), fall back to Arial Black, then sans-serif
-        ctx.set_font(&format!(
-            "900 {}px Impact, 'Arial Black', sans-serif",
-            cell_size * 4.0
-        ));
         ctx.set_text_baseline("middle");
+        ctx.set_text_align("center");
 
-        // Helper function to draw text with letter spacing
-        let draw_spaced_text = |ctx: &web_sys::CanvasRenderingContext2d,
-                                text: &str,
-                                x: f64,
-                                y: f64,
-                                spacing: f64|
+        // Compute font size that fits inside a given box
+        let compute_font_size = |text: &str, max_w: f64, max_h: f64| -> f64 {
+            if text.is_empty() || max_w <= 0.0 || max_h <= 0.0 {
+                return 1.0;
+            }
+            let mut size = (max_h * 0.7).min(48.0); // start reasonable
+            let min_size = 8.0;
+            let estimate_width = |s: f64| text.len() as f64 * s * 0.6;
+            while (estimate_width(size) > max_w * 0.9 || size > max_h * 0.8) && size > min_size {
+                size -= 1.0;
+            }
+            size.max(min_size)
+        };
+
+        let draw_label_with_size = |ctx: &web_sys::CanvasRenderingContext2d,
+                                    text: &str,
+                                    center_x: f64,
+                                    center_y: f64,
+                                    box_w: f64,
+                                    box_h: f64,
+                                    text_color: &str,
+                                    bg_color: &str,
+                                    font_size: f64|
          -> Result<(), JsValue> {
-            let chars: Vec<char> = text.chars().collect();
-            if chars.is_empty() {
-                return Ok(());
+            let size = font_size.min(compute_font_size(text, box_w, box_h));
+            ctx.set_font(&format!("900 {}px Impact, 'Arial Black', sans-serif", size));
+            ctx.set_line_width(size * 0.35);
+            ctx.set_stroke_style(&JsValue::from_str(bg_color));
+            ctx.stroke_text(text, center_x, center_y)?;
+            ctx.set_fill_style(&JsValue::from_str(text_color));
+            ctx.fill_text(text, center_x, center_y)?;
+            Ok(())
+        };
+
+        // Helper to draw team labels inside a given rectangle, splitting it into two sub-areas
+        let draw_team_zone = |rect: (f64, f64, f64, f64),
+                              split_vertical: bool,
+                              names: &[String],
+                              bg_color: &str,
+                              text_color: &str|
+         -> Result<(), JsValue> {
+            let (x, y, w, h) = rect;
+            let (centers, box_w, box_h): (Vec<(f64, f64)>, f64, f64) = if split_vertical {
+                let half_h = h / 2.0;
+                (
+                    vec![(x + w / 2.0, y + half_h / 2.0), (x + w / 2.0, y + half_h + half_h / 2.0)],
+                    w * 0.8,
+                    half_h * 0.9,
+                )
+            } else {
+                let half_w = w / 2.0;
+                (
+                    vec![(x + half_w / 2.0, y + h / 2.0), (x + half_w + half_w / 2.0, y + h / 2.0)],
+                    half_w * 0.9,
+                    h * 0.8,
+                )
+            };
+
+            // Use the same font size for both names: smallest that fits all labels in this zone
+            let mut needed_size = compute_font_size(
+                names.get(0).map(|s| s.as_str()).unwrap_or(""),
+                box_w,
+                box_h,
+            );
+            if let Some(name) = names.get(1) {
+                needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
             }
 
-            // Use approximate character width based on font size
-            // For Impact/Arial Black, characters are roughly 0.5x the font size (more condensed)
-            let font_size = cell_size * 4.0;
-            let char_width = font_size * 0.5;
-
-            // Calculate total width with spacing
-            let total_width =
-                (chars.len() as f64 * char_width) + ((chars.len() - 1) as f64 * spacing);
-
-            // Start position (centered)
-            let mut current_x = x - total_width / 2.0 + char_width / 2.0;
-
-            // Draw each character
-            ctx.set_text_align("center");
-            for (i, ch) in chars.iter().enumerate() {
-                let ch_str = ch.to_string();
-                ctx.fill_text(&ch_str, current_x, y)?;
-                current_x += char_width;
-                if i < chars.len() - 1 {
-                    current_x += spacing;
-                }
+            for (i, name) in names.iter().take(2).enumerate() {
+                draw_label_with_size(
+                    &ctx,
+                    name,
+                    centers[i].0,
+                    centers[i].1,
+                    box_w,
+                    box_h,
+                    text_color,
+                    bg_color,
+                    needed_size,
+                )?;
             }
             Ok(())
         };
 
-        let letter_spacing = cell_size * 0.6; // Wider space between letters for more epic look
+        // Compute the rectangles for each team zone in the current orientation
+        let (team0_rect, team1_rect, split_vertical) = match rotation_int {
+            90 => (
+                // team0 = top, team1 = bottom
+                (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
+                (0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size),
+                false,
+            ),
+            180 => (
+                // team0 = right, team1 = left
+                ((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size),
+                (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
+                true,
+            ),
+            270 => (
+                // team0 = bottom, team1 = top
+                (0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size),
+                (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
+                false,
+            ),
+            _ => (
+                // team0 = left, team1 = right
+                (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
+                ((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size),
+                true,
+            ),
+        };
 
-        // Draw text based on rotation
-        match rotation_int {
-            90 => {
-                // Top and bottom zones
-                ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &left_label,
-                    width * cell_size / 2.0,
-                    end_zone_depth * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-                ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &right_label,
-                    width * cell_size / 2.0,
-                    (height - end_zone_depth / 2.0) * cell_size,
-                    letter_spacing,
-                )?;
-            }
-            180 => {
-                // Right and left zones
-                ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &left_label,
-                    (width - end_zone_depth / 2.0) * cell_size,
-                    height * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-                ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &right_label,
-                    end_zone_depth * cell_size / 2.0,
-                    height * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-            }
-            270 => {
-                // Bottom and top zones
-                ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &left_label,
-                    width * cell_size / 2.0,
-                    (height - end_zone_depth / 2.0) * cell_size,
-                    letter_spacing,
-                )?;
-                ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &right_label,
-                    width * cell_size / 2.0,
-                    end_zone_depth * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-            }
-            _ => {
-                // Left and right zones (default)
-                ctx.set_fill_style(&JsValue::from_str(left_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &left_label,
-                    end_zone_depth * cell_size / 2.0,
-                    height * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-                ctx.set_fill_style(&JsValue::from_str(right_text_color));
-                draw_spaced_text(
-                    &ctx,
-                    &right_label,
-                    (width - end_zone_depth / 2.0) * cell_size,
-                    height * cell_size / 2.0,
-                    letter_spacing,
-                )?;
-            }
-        }
+        // Draw labels for each team zone (supports up to two names per team)
+        draw_team_zone(team0_rect, split_vertical, &team0_labels, left_bg_color, left_text_color)?;
+        draw_team_zone(team1_rect, split_vertical, &team1_labels, right_bg_color, right_text_color)?;
     }
 
     // Note: Walls will be drawn after snakes to ensure dead snakes appear behind walls
