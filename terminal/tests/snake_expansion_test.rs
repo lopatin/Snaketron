@@ -9,6 +9,7 @@ fn test_snake_expansion_all_directions() {
         direction: Direction::Right,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
     let expanded = SnakeRenderer::expand_snake_body(&snake_right);
     assert_eq!(
@@ -26,6 +27,7 @@ fn test_snake_expansion_all_directions() {
         direction: Direction::Left,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
     let expanded = SnakeRenderer::expand_snake_body(&snake_left);
     assert_eq!(
@@ -43,6 +45,7 @@ fn test_snake_expansion_all_directions() {
         direction: Direction::Down,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
     let expanded = SnakeRenderer::expand_snake_body(&snake_down);
     assert_eq!(
@@ -60,6 +63,7 @@ fn test_snake_expansion_all_directions() {
         direction: Direction::Up,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
     let expanded = SnakeRenderer::expand_snake_body(&snake_up);
     assert_eq!(
@@ -81,6 +85,7 @@ fn test_snake_expansion_all_directions() {
         direction: Direction::Down,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
     let expanded = SnakeRenderer::expand_snake_body(&snake_turn);
     assert_eq!(
@@ -103,6 +108,7 @@ fn test_snake_expansion_scenarios() {
         direction: Direction::Left,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
 
     println!("Snake 1 (moving left):");
@@ -132,6 +138,7 @@ fn test_snake_expansion_scenarios() {
         direction: Direction::Left,
         is_alive: true,
         food: 0,
+        team_id: None,
     };
 
     println!("\n\nSnake 3 (near left edge):");

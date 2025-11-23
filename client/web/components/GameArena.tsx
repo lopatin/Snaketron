@@ -412,12 +412,6 @@ export default function GameArena() {
   const waitingMessage = isJoiningGame ? 'Joining game...' : 'Preparing arena...';
   let timeUntilStart = countdownState ? countdownState.start_ms - Date.now() : 0;
 
-  // For round transitions, use the latest round start time
-  if (countdownState?.is_transitioning && countdownState.round_start_times && countdownState.round_start_times.length > 0) {
-    const latestRoundStartTime = countdownState.round_start_times[countdownState.round_start_times.length - 1];
-    timeUntilStart = latestRoundStartTime - Date.now();
-  }
-
   const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
   const showCountdown = countdownState ? countdownSeconds > 0 : false;
   
@@ -549,16 +543,11 @@ export default function GameArena() {
             {/* Countdown Overlay */}
             {showCountdown && countdownState && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
-                {countdownState.is_transitioning && (
-                  <div className="text-white font-bold text-3xl mb-4" style={{
-                    textShadow: '0 2px 4px rgba(0,0,0,0.5)'
-                  }}>
-                    {countdownState.current_round > 1 ?
-                      `Round ${countdownState.current_round}` :
-                      'Round 1'
-                    }
-                  </div>
-                )}
+                <div className="text-white font-bold text-3xl mb-4" style={{
+                  textShadow: '0 2px 4px rgba(0,0,0,0.5)'
+                }}>
+                  Starting In
+                </div>
                 <div className="text-white font-black italic uppercase" style={{
                   fontSize: '120px',
                   textShadow: '0 4px 8px rgba(0,0,0,0.5)',

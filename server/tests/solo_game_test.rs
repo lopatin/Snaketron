@@ -16,7 +16,7 @@ async fn test_solo_game() -> Result<()> {
 
     // Clean up Redis before starting the test
     let redis_client = redis::Client::open("redis://localhost:6379")?;
-    let mut redis_conn = redis_client.get_async_connection().await?;
+    let mut redis_conn = redis_client.get_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
 
     // Small delay to ensure Redis is ready

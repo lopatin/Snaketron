@@ -127,13 +127,6 @@ export interface GameState {
   scores: Record<number, number>;  // Snake ID to score mapping
   team_scores?: Record<number, number>;  // Team ID to team score mapping (for team games)
 
-  // Round-based scoring fields
-  current_round: number;                     // Current round number (1, 2, 3...)
-  round_wins: Record<number, number>;        // TeamId to rounds won mapping
-  rounds_to_win: number;                     // 1 for quick match, 2 for competitive
-  round_start_times: number[];              // Start time of each round (ms timestamps)
-  is_transitioning: boolean;                // True during round transitions
-
   // XP tracking (only present after game completion)
   player_xp?: Record<number, number>;       // user_id -> xp_gained
 }
@@ -171,6 +164,7 @@ export type GameMode =
 export interface GameProperties {
   available_food_target: number;
   tick_duration_ms: number;
+  time_limit_ms?: number | null;
 }
 
 export interface Player {

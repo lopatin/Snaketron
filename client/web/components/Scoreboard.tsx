@@ -32,6 +32,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
   isLobbyQueued = false
 }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
+  const [remainingTime, setRemainingTime] = useState<string | null>(null);
   const [logoHovered, setLogoHovered] = useState(false);
   const [gameOverExpanded, setGameOverExpanded] = useState(false);
 
@@ -135,23 +136,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     const team1Snakes = snakeInfo.filter(info => info.team === 1);
     const team2Snakes = snakeInfo.filter(info => info.team === 2);
 
-    // For team games with rounds, use round wins as the score
-    // Otherwise use snake-based scores
-    const isTeamGame = gameState?.game_type && typeof gameState.game_type === 'object' &&
-                       'TeamMatch' in gameState.game_type;
-
-    let team1Score = 0;
-    let team2Score = 0;
-
-    if (isTeamGame && gameState?.round_wins) {
-      // Use round wins for team games
-      team1Score = gameState.round_wins[0] || 0;
-      team2Score = gameState.round_wins[1] || 0;
-    } else {
-      // Fall back to team scores for non-round games
-      team1Score = gameState?.team_scores?.[0] || 0;
-      team2Score = gameState?.team_scores?.[1] || 0;
-    }
+    const team1Score = gameState?.team_scores?.[0] || 0;
+    const team2Score = gameState?.team_scores?.[1] || 0;
 
     // Find which team the current player is on
     const currentPlayerInfo = snakeInfo.find(info => info.isCurrentPlayer);
@@ -170,11 +156,15 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
         alive: team2Snakes.filter(info => info.snake.is_alive).length,
         total: team2Snakes.length
       },
-      currentPlayerTeam,
-      currentRound: gameState?.current_round || 1,
-      totalRounds: gameState?.rounds_to_win ? (gameState.rounds_to_win * 2 - 1) : 1,  // Best of X rounds
-      isTransitioning: gameState?.is_transitioning || false
+      currentPlayerTeam
     };
+  };
+
+  const formatMs = (ms: number) => {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   };
 
   // Calculate elapsed time from game ticks (pure function of game state)
@@ -184,6 +174,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     // If game hasn't started yet (countdown phase)
     if (Date.now() < gameState.start_ms) {
       setElapsedTime('00:00');
+      const limit = gameState.properties?.time_limit_ms ?? null;
+      setRemainingTime(limit ? formatMs(limit) : null);
       return;
     }
 
@@ -191,11 +183,14 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     // The tick count represents the actual game progress
     const tick_duration_ms = gameState.properties?.tick_duration_ms || 100;
     const elapsedMs = gameState.tick * tick_duration_ms;
-    const elapsedSeconds = Math.floor(elapsedMs / 1000);
-    const minutes = Math.floor(elapsedSeconds / 60);
-    const seconds = elapsedSeconds % 60;
-    
-    setElapsedTime(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
+    setElapsedTime(formatMs(elapsedMs));
+
+    const limit = gameState.properties?.time_limit_ms ?? null;
+    if (limit) {
+      setRemainingTime(formatMs(limit - elapsedMs));
+    } else {
+      setRemainingTime(null);
+    }
   }, [gameState]);
 
   // Check if game is complete
@@ -319,6 +314,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
   const currentPlayerStats = snakeStats.find(s => s.isCurrentPlayer);
   const resultText = getResultText();
   const gameStats = calculateGameStats();
+  const timeLimitMs = gameState?.properties?.time_limit_ms ?? null;
+  const timeLabel = timeLimitMs ? 'Time Left' : 'Time';
+  const timeValue = timeLimitMs && remainingTime ? remainingTime : elapsedTime;
+
 
   return (
     <div 
@@ -373,10 +372,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
             
             <div className="flex flex-col items-center">
               <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                Time
+                {timeLabel}
               </div>
               <div className="text-black-70 font-black text-2xl -mt-0.5">
-                {elapsedTime}
+                {timeValue}
               </div>
             </div>
           </div>
@@ -433,10 +432,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
             {/* Time in the middle */}
             <div className="flex flex-col items-center">
               <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-                Time
+                {timeLabel}
               </div>
               <div className="text-black-70 font-black text-2xl -mt-0.5 tabular-nums">
-                {elapsedTime}
+                {timeValue}
               </div>
             </div>
 
@@ -452,13 +451,10 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
           {/* Game Mode & Round Info */}
           <div className="flex flex-col items-center">
             <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
-              {teamStats && teamStats.totalRounds > 1 ?
-                `Round ${teamStats.currentRound} of ${teamStats.totalRounds}` :
-                getGameModeText()
-              }
+              {getGameModeText()}
             </div>
             <div className="text-gray-600 font-bold text-lg -mt-0.5">
-              {teamStats?.isTransitioning ? 'Next Round...' : getGameModeText()}
+              {timeLimitMs ? 'Match ends at time limit' : 'All snakes must fall'}
             </div>
           </div>
         </div>
