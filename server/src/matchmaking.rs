@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::{GameState, GameType};
+use common::{
+    GameState, GameType, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
@@ -1055,7 +1057,7 @@ async fn create_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
     pubsub: &mut PubSubManager,
     game_type: &GameType,
-    _queue_mode: &common::QueueMode,
+    queue_mode: &common::QueueMode,
     combination: &MatchmakingCombination,
 ) -> Result<u32> {
     // Generate game ID
@@ -1072,6 +1074,14 @@ async fn create_game_from_lobbies(
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
     let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
+
+    // Apply queue-mode-specific time limits for team games
+    if matches!(game_type, GameType::TeamMatch { .. }) {
+        game_state.properties.time_limit_ms = Some(match queue_mode {
+            common::QueueMode::Quickmatch => DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS,
+            common::QueueMode::Competitive => DEFAULT_TEAM_TIME_LIMIT_MS,
+        });
+    }
 
     // Add players to game state with team assignments
     let mut all_players = Vec::new();

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { GameState } from '../types';
+import { GameState, QueueMode } from '../types';
 
 interface ScoreboardProps {
   gameState: GameState | null;
@@ -11,6 +11,7 @@ interface ScoreboardProps {
   isHost?: boolean;
   isInLobby?: boolean;
   isLobbyQueued?: boolean;
+  queueMode?: QueueMode;
 }
 
 // Snake colors matching render.rs
@@ -18,7 +19,7 @@ const SNAKE_COLORS = [
   '#70bfe3', // Light blue/teal
   '#556270', // Dark gray
   '#ff6b6b', // Coral red
-  '#f7b731', // Yellow/gold
+  '#ffce22', // Yellow/gold
 ];
 
 const Scoreboard: React.FC<ScoreboardProps> = ({
@@ -29,7 +30,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
   onPlayAgain,
   isHost = false,
   isInLobby = false,
-  isLobbyQueued = false
+  isLobbyQueued = false,
+  queueMode = 'Quickmatch'
 }) => {
   const [elapsedTime, setElapsedTime] = useState('00:00');
   const [remainingTime, setRemainingTime] = useState<string | null>(null);
@@ -83,11 +85,13 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     if (typeof gameType === 'object') {
       if ('TeamMatch' in gameType) {
         const perTeam = gameType.TeamMatch.per_team;
-        if (perTeam === 1) return 'Quick Match';
-        return `Team Battle`;
+        if (perTeam === 1) {
+          return queueMode === 'Competitive' ? 'Competitive Duel' : 'Quick Match';
+        }
+        return queueMode === 'Competitive' ? 'Competitive 2v2' : 'Team Battle';
       }
       if ('FreeForAll' in gameType) {
-        return `Free For All`;
+        return queueMode === 'Competitive' ? 'Competitive FFA' : `Free For All`;
       }
       if ('Custom' in gameType) {
         const mode = gameType.Custom.settings.game_mode;

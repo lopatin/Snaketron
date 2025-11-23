@@ -4,7 +4,7 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode } from '../types';
+import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
@@ -36,6 +36,7 @@ export default function GameArena() {
   const { user, loading: authLoading } = useAuth();
   const { latencyMs, gameChatMessages, sendChatMessage, currentLobby, lobbyPreferences } = useWebSocket();
   const playerId = user?.id ?? 0;
+  const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
 
   // Use game engine for client-side prediction (call unconditionally to keep hook order stable)
   const {
@@ -503,6 +504,7 @@ export default function GameArena() {
           isHost={isHost}
           isInLobby={isInLobby}
           isLobbyQueued={isLobbyQueued}
+          queueMode={queueMode}
         />
 
         {/* Game Arena Container */}
