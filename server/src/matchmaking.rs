@@ -1086,28 +1086,6 @@ async fn create_game_from_lobbies(
         .collect();
 
     if !combination.team_assignments.is_empty() {
-        // Team-based game (1v1, 2v2, 3v3, etc.)
-        // Build a map of user_id -> team_id for quick lookup
-        let mut user_team_map: HashMap<u32, common::TeamId> = HashMap::new();
-
-        for assignment in &combination.team_assignments {
-            // Find the lobby that contains these members
-            let lobby = combination
-                .lobbies
-                .iter()
-                .find(|l| l.lobby_code == assignment.lobby_code)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Lobby {} not found in combination", assignment.lobby_code)
-                })?;
-
-            // Map each member index to their team
-            for &member_idx in &assignment.member_indices {
-                if let Some(member) = lobby.members.get(member_idx) {
-                    user_team_map.insert(member.user_id as u32, assignment.team_id);
-                }
-            }
-        }
-
         // Add all assigned players to the game
         for assignment in &combination.team_assignments {
             let lobby = combination
@@ -1120,17 +1098,12 @@ async fn create_game_from_lobbies(
 
             for &member_idx in &assignment.member_indices {
                 if let Some(member) = lobby.members.get(member_idx) {
-                    // Add player to game state
-                    game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
-
-                    // Update the snake's team_id
-                    if let Some(player) = game_state.players.get(&(member.user_id as u32)) {
-                        if let Some(snake) =
-                            game_state.arena.snakes.get_mut(player.snake_id as usize)
-                        {
-                            snake.team_id = Some(assignment.team_id);
-                        }
-                    }
+                    // Add player to game state with explicit team assignment
+                    game_state.add_player_with_team(
+                        member.user_id as u32,
+                        Some(member.username.clone()),
+                        Some(assignment.team_id),
+                    )?;
 
                     all_players.push(QueuedPlayer {
                         user_id: member.user_id as u32,

@@ -653,6 +653,154 @@ impl GameState {
         positions
     }
 
+    fn calculate_team_starting_positions(&self) -> Vec<(Position, Direction)> {
+        if !matches!(self.game_type, GameType::TeamMatch { .. }) {
+            return self.calculate_starting_positions(self.players.len());
+        }
+
+        let Some(config) = &self.arena.team_zone_config else {
+            return self.calculate_starting_positions(self.players.len());
+        };
+
+        let mut positions: Vec<Option<(Position, Direction)>> =
+            vec![None; self.arena.snakes.len()];
+
+        let mut team_snakes: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        for (idx, snake) in self.arena.snakes.iter().enumerate() {
+            match snake.team_id {
+                Some(TeamId(0)) => team_snakes[0].push(idx),
+                Some(TeamId(1)) => team_snakes[1].push(idx),
+                _ => {}
+            }
+        }
+
+        let snake_length = self.starting_snake_length() as i16;
+        let width = self.arena.width as i16;
+        let height = self.arena.height as i16;
+        let end_zone_depth = config.end_zone_depth as i16;
+
+        // Place snakes near the goal opening so they face the gap instead of a wall
+        let mut positions_for_side =
+            |count: usize, team_id: TeamId, is_left: bool| -> Vec<(Position, Direction)> {
+            let mut side_positions = Vec::with_capacity(count);
+            if count == 0 {
+                return side_positions;
+            }
+
+            let boundary_x = if is_left {
+                end_zone_depth - 1
+            } else {
+                width - end_zone_depth
+            };
+            // Head sits one cell inside the boundary so first move reaches the gate column
+            let head_x = if is_left {
+                (boundary_x - 1).max(0)
+            } else {
+                (boundary_x + 1).min(width - 1)
+            };
+
+            // Use goal opening for vertical placement to align with the gate
+            let (_goal_x, y_start, y_end) = self
+                .arena
+                .goal_bounds(team_id)
+                .unwrap_or((boundary_x, height / 2, height / 2));
+            let gate_top = y_start.max(0);
+            let gate_bottom = y_end.min(height - 1);
+            let gate_height = (gate_bottom - gate_top).max(0);
+
+            for i in 0..count {
+                let y = if count == 1 {
+                    (gate_top + gate_bottom) / 2
+                } else {
+                    let step = if count > 1 {
+                        (gate_height as usize).max(1) / (count - 1)
+                    } else {
+                        0
+                    } as i16;
+                    (gate_top + (i as i16 * step)).clamp(gate_top, gate_bottom)
+                };
+                let direction = if is_left {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
+                side_positions.push((Position { x: head_x, y }, direction));
+            }
+
+            side_positions
+        };
+
+        let team0_positions = positions_for_side(team_snakes[0].len(), TeamId(0), true);
+        let team1_positions = positions_for_side(team_snakes[1].len(), TeamId(1), false);
+
+        for (idx, pos) in team_snakes[0].iter().zip(team0_positions.into_iter()) {
+            if *idx < positions.len() {
+                positions[*idx] = Some(pos);
+            }
+        }
+        for (idx, pos) in team_snakes[1].iter().zip(team1_positions.into_iter()) {
+            if *idx < positions.len() {
+                positions[*idx] = Some(pos);
+            }
+        }
+
+        let fallback = self.calculate_starting_positions(self.players.len());
+        positions
+            .into_iter()
+            .enumerate()
+            .map(|(idx, pos)| {
+                pos.unwrap_or_else(|| {
+                    fallback
+                        .get(idx)
+                        .copied()
+                        .unwrap_or((
+                            Position { x: 0, y: 0 },
+                            Direction::Right,
+                        ))
+                })
+            })
+            .collect()
+    }
+
+    fn apply_starting_positions(&mut self, player_count: usize) {
+        let starting_positions = if matches!(self.game_type, GameType::TeamMatch { .. }) {
+            self.calculate_team_starting_positions()
+        } else {
+            self.calculate_starting_positions(player_count)
+        };
+
+        let snake_length = match &self.game_type {
+            GameType::Custom { settings } => settings.snake_start_length as usize,
+            _ => DEFAULT_SNAKE_LENGTH,
+        };
+
+        for (snake_id, snake) in self.arena.snakes.iter_mut().enumerate() {
+            if let Some((head_pos, direction)) = starting_positions.get(snake_id) {
+                let tail_pos = match direction {
+                    Direction::Left => Position {
+                        x: head_pos.x + (snake_length - 1) as i16,
+                        y: head_pos.y,
+                    },
+                    Direction::Right => Position {
+                        x: head_pos.x - (snake_length - 1) as i16,
+                        y: head_pos.y,
+                    },
+                    Direction::Up => Position {
+                        x: head_pos.x,
+                        y: head_pos.y + (snake_length - 1) as i16,
+                    },
+                    Direction::Down => Position {
+                        x: head_pos.x,
+                        y: head_pos.y - (snake_length - 1) as i16,
+                    },
+                };
+
+                snake.body = vec![*head_pos, tail_pos];
+                snake.direction = *direction;
+            }
+        }
+    }
+
     fn starting_snake_length(&self) -> usize {
         match &self.game_type {
             GameType::Custom { settings } => settings.snake_start_length as usize,
@@ -661,7 +809,11 @@ impl GameState {
     }
 
     fn respawn_event_for_snake(&self, snake_id: u32) -> Option<GameEvent> {
-        let starting_positions = self.calculate_starting_positions(self.players.len());
+        let starting_positions = if matches!(self.game_type, GameType::TeamMatch { .. }) {
+            self.calculate_team_starting_positions()
+        } else {
+            self.calculate_starting_positions(self.players.len())
+        };
         let position_idx = snake_id as usize;
 
         let mut candidate_positions: Vec<(Position, Direction)> = Vec::new();
@@ -688,7 +840,12 @@ impl GameState {
         None
     }
 
-    pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
+    pub fn add_player_with_team(
+        &mut self,
+        user_id: u32,
+        username: Option<String>,
+        team_override: Option<TeamId>,
+    ) -> Result<Player> {
         if self.players.contains_key(&user_id) {
             return Err(anyhow::anyhow!(
                 "Player with user_id {} already exists",
@@ -709,8 +866,9 @@ impl GameState {
         }
 
         // Determine team assignment for team games
-        let team_id = match &self.game_type {
-            GameType::TeamMatch { .. } => {
+        let team_id = match (&self.game_type, team_override) {
+            (GameType::TeamMatch { .. }, Some(team)) => Some(team),
+            (GameType::TeamMatch { .. }, None) => {
                 // Assign teams alternately: A, B, A, B...
                 let existing_player_count = self.players.len();
                 let team_index = (existing_player_count % 2) as u8;
@@ -734,91 +892,13 @@ impl GameState {
 
         // Calculate starting positions for all players
         let player_count = self.players.len();
-        let starting_positions = self.calculate_starting_positions(player_count);
-
-        // Get snake length from custom settings or use default
-        let snake_length = match &self.game_type {
-            GameType::Custom { settings } => settings.snake_start_length as usize,
-            _ => DEFAULT_SNAKE_LENGTH,
-        };
-
-        // Rearrange all snakes to their starting positions
-        // Use deterministic assignment based on team or snake_id
-        if let GameType::TeamMatch { .. } = &self.game_type {
-            // For team games, assign positions based on team_id
-            for (_user_id, player) in self.players.iter() {
-                let snake = &mut self.arena.snakes[player.snake_id as usize];
-
-                // Determine position index based on team
-                let position_idx = match snake.team_id {
-                    Some(TeamId(0)) => 0,          // Team 0 gets first position (left endzone)
-                    Some(TeamId(1)) => 1,          // Team 1 gets second position (right endzone)
-                    Some(TeamId(n)) => n as usize, // Other teams use their index
-                    None => continue,              // Should not happen in team games
-                };
-
-                if position_idx < starting_positions.len() {
-                    let (head_pos, direction) = &starting_positions[position_idx];
-
-                    // Build compressed snake body: just head and tail for a straight snake
-                    let tail_pos = match direction {
-                        Direction::Left => Position {
-                            x: head_pos.x + (snake_length - 1) as i16,
-                            y: head_pos.y,
-                        },
-                        Direction::Right => Position {
-                            x: head_pos.x - (snake_length - 1) as i16,
-                            y: head_pos.y,
-                        },
-                        Direction::Up => Position {
-                            x: head_pos.x,
-                            y: head_pos.y + (snake_length - 1) as i16,
-                        },
-                        Direction::Down => Position {
-                            x: head_pos.x,
-                            y: head_pos.y - (snake_length - 1) as i16,
-                        },
-                    };
-
-                    snake.body = vec![*head_pos, tail_pos];
-                    snake.direction = *direction;
-                }
-            }
-        } else {
-            // For non-team games, use snake_id as position index for deterministic assignment
-            for (_user_id, player) in self.players.iter() {
-                let snake_id = player.snake_id as usize;
-                if snake_id < starting_positions.len() {
-                    let (head_pos, direction) = &starting_positions[snake_id];
-                    let snake = &mut self.arena.snakes[snake_id];
-
-                    // Build compressed snake body: just head and tail for a straight snake
-                    let tail_pos = match direction {
-                        Direction::Left => Position {
-                            x: head_pos.x + (snake_length - 1) as i16,
-                            y: head_pos.y,
-                        },
-                        Direction::Right => Position {
-                            x: head_pos.x - (snake_length - 1) as i16,
-                            y: head_pos.y,
-                        },
-                        Direction::Up => Position {
-                            x: head_pos.x,
-                            y: head_pos.y + (snake_length - 1) as i16,
-                        },
-                        Direction::Down => Position {
-                            x: head_pos.x,
-                            y: head_pos.y - (snake_length - 1) as i16,
-                        },
-                    };
-
-                    snake.body = vec![*head_pos, tail_pos];
-                    snake.direction = *direction;
-                }
-            }
-        }
+        self.apply_starting_positions(player_count);
 
         Ok(player)
+    }
+
+    pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
+        self.add_player_with_team(user_id, username, None)
     }
 
     pub fn add_spectator(&mut self, user_id: u32, username: Option<String>) {

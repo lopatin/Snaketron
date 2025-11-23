@@ -213,61 +213,74 @@ pub fn render_game(
     if let Some(team_zone_config) = &team_zone_config_data {
         let end_zone_depth = team_zone_config["end_zone_depth"].as_u64().unwrap_or(10) as f64;
 
-        // Retrieve the previously calculated colors and labels
-        // Using much lighter shades for better visibility
-        let (_, _, left_text_color, right_text_color, left_label, right_label) =
-            match local_player_team {
-                Some(0) => {
-                    let local_name = local_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 0".to_string());
-                    let opponent_name = opponent_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 1".to_string());
-                    // Much lighter blue (#c0d8e4) and lighter red (#e4c0c0)
-                    (
-                        "#e6f4fa",
-                        "#ffe6e6",
-                        "#c0d8e4",
-                        "#e4c0c0",
-                        local_name,
-                        opponent_name,
-                    )
+        // Build team labels from player usernames; show both teammates side by side
+        let username_map = game_state["usernames"].as_object();
+        let mut team_names: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        if let (Some(players), Some(snakes)) =
+            (game_state["players"].as_object(), arena["snakes"].as_array())
+        {
+            for (user_id_str, player_val) in players {
+                if let Some(snake_id) = player_val["snake_id"].as_u64() {
+                    if let Some(snake) = snakes.get(snake_id as usize) {
+                        if let Some(team_id) = snake["team_id"].as_u64() {
+                            if (team_id as usize) < 2 {
+                                let username = username_map
+                                    .and_then(|map| map.get(user_id_str))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_else(|| user_id_str.as_str());
+                                team_names[team_id as usize].push(username.to_string());
+                            }
+                        }
+                    }
                 }
-                Some(1) => {
-                    let local_name = local_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 1".to_string());
-                    let opponent_name = opponent_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 0".to_string());
-                    // Much lighter red (#e4c0c0) and lighter blue (#c0d8e4)
-                    (
-                        "#ffe6e6",
-                        "#e6f4fa",
-                        "#e4c0c0",
-                        "#c0d8e4",
-                        opponent_name,
-                        local_name,
-                    )
-                }
-                _ => {
-                    let user0 = opponent_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 0".to_string());
-                    let user1 = local_username
-                        .as_ref()
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_else(|| "USER 1".to_string());
-                    // Much lighter blue (#c0d8e4) and lighter red (#e4c0c0)
-                    ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0", user0, user1)
-                }
-            };
+            }
+        }
+
+        for names in team_names.iter_mut() {
+            names.sort();
+        }
+
+        // Determine text colors based on perspective
+        let (left_text_color, right_text_color) = match local_player_team {
+            Some(0) => ("#c0d8e4", "#e4c0c0"),
+            Some(1) => ("#e4c0c0", "#c0d8e4"),
+            _ => ("#c0d8e4", "#e4c0c0"),
+        };
+
+        let local_name = local_username
+            .as_ref()
+            .map(|s| s.to_uppercase())
+            .unwrap_or_else(|| "USER 0".to_string());
+        let opponent_name = opponent_username
+            .as_ref()
+            .map(|s| s.to_uppercase())
+            .unwrap_or_else(|| "USER 1".to_string());
+
+        let default_team0 = match local_player_team {
+            Some(0) => local_name.clone(),
+            Some(1) => opponent_name.clone(),
+            _ => opponent_name.clone(),
+        };
+        let default_team1 = match local_player_team {
+            Some(0) => opponent_name.clone(),
+            Some(1) => local_name.clone(),
+            _ => local_name.clone(),
+        };
+
+        let format_label = |names: &[String], fallback: &str| -> String {
+            if names.is_empty() {
+                fallback.to_string()
+            } else {
+                names
+                    .iter()
+                    .map(|s| s.to_uppercase())
+                    .collect::<Vec<String>>()
+                    .join(" | ")
+            }
+        };
+
+        let left_label = format_label(&team_names[0], &default_team0);
+        let right_label = format_label(&team_names[1], &default_team1);
 
         // Set font for zone text - stadium-style: larger, bold, epic font
         // Try Impact first (common sports font), fall back to Arial Black, then sans-serif

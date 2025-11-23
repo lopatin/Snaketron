@@ -228,10 +228,10 @@ export default function GameArena() {
       const player = state.players?.[user.id];
       if (player) {
         const snakeId = player.snake_id;
-        
-        // In team games, team 0 has their endzone on the left, team 1 on the right
-        // We determine team by snake_id: even indices are team 0, odd indices are team 1
-        const teamId = snakeId % 2;
+        const snake = state.arena?.snakes?.[snakeId];
+
+        // Use the actual team_id from the snake when available; fall back to snake_id parity
+        const teamId = snake?.team_id ?? (snakeId % 2);
         
         if (teamId === 0) {
           // Team 0: endzone is on the left - rotate 270° so it appears at bottom
