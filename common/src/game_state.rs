@@ -1761,6 +1761,43 @@ mod tests {
     }
 
     #[test]
+    fn snake_collides_with_itself_after_turning() {
+        let mut game = GameState::new(
+            10,
+            10,
+            GameType::FreeForAll { max_players: 1 },
+            None,
+            0,
+        );
+
+        game.arena.snakes.push(Snake {
+            body: vec![
+                Position { x: 2, y: 2 },
+                Position { x: 2, y: 3 },
+                Position { x: 1, y: 3 },
+                Position { x: 1, y: 2 },
+                Position { x: 1, y: 1 },
+            ],
+            direction: Direction::Left,
+            is_alive: true,
+            food: 1,
+            team_id: None,
+        });
+
+        let events = game
+            .tick_forward(true)
+            .expect("tick_forward should succeed");
+
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 })),
+            "expected snake to die after colliding with itself"
+        );
+        assert!(!game.arena.snakes[0].is_alive);
+    }
+
+    #[test]
     fn test_command_queue_basic_push_pop() {
         let mut queue = CommandQueue::new();
 
