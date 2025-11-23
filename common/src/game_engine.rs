@@ -1,6 +1,6 @@
 use crate::{
     CommandId, DEFAULT_TICK_INTERVAL_MS, GameCommand, GameCommandMessage, GameEvent,
-    GameEventMessage, GameState, GameType,
+    GameEventMessage, GameState, GameType, QueueMode,
 };
 use anyhow::Result;
 
@@ -23,6 +23,7 @@ impl GameEngine {
                 10,
                 10,
                 GameType::TeamMatch { per_team: 1 },
+                QueueMode::Quickmatch,
                 None,
                 start_ms,
             ),
@@ -30,6 +31,7 @@ impl GameEngine {
                 10,
                 10,
                 GameType::TeamMatch { per_team: 1 },
+                QueueMode::Quickmatch,
                 None,
                 start_ms,
             )),
@@ -72,10 +74,11 @@ impl GameEngine {
                 width,
                 height,
                 game_type.clone(),
+                QueueMode::Quickmatch,
                 Some(rng_seed),
                 start_ms,
             ),
-            predicted_state: Some(GameState::new(width, height, game_type, None, start_ms)), // Client prediction doesn't need RNG
+            predicted_state: Some(GameState::new(width, height, game_type, QueueMode::Quickmatch, None, start_ms)), // Client prediction doesn't need RNG
             event_log: Vec::new(),
             committed_state_lag_ms: 500,
             local_player_id: None,

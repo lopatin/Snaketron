@@ -1,6 +1,6 @@
 use ::common::{
     CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameState,
-    GameStatus, GameType,
+    GameStatus, GameType, QueueMode,
 };
 use anyhow::Result;
 use server::game_server::GameServer;
@@ -33,7 +33,7 @@ async fn test_replay_with_tick_forward() -> Result<()> {
 
     // Create a simple game
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let mut game_state = GameState::new(20, 20, GameType::FreeForAll { max_players: 2 }, Some(12345), start_ms);
+    let mut game_state = GameState::new(20, 20, GameType::FreeForAll { max_players: 2 }, QueueMode::Quickmatch, Some(12345), start_ms);
     game_state.add_player(1, Some("Player1".to_string()))?;
     game_state.add_player(2, Some("Player2".to_string()))?;
     game_state.status = GameStatus::Started { server_id: server.id() };

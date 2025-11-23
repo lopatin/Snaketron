@@ -567,6 +567,8 @@ impl Database for DynamoDatabase {
         username_item.insert("userId".to_string(), Self::av_n(user_id));
         username_item.insert("passwordHash".to_string(), Self::av_s(password_hash));
         username_item.insert("mmr".to_string(), Self::av_n(mmr));
+        username_item.insert("rankedMmr".to_string(), Self::av_n(1000));
+        username_item.insert("casualMmr".to_string(), Self::av_n(1000));
         username_item.insert("xp".to_string(), Self::av_n(0));
 
         // This will fail if username already exists
@@ -589,6 +591,8 @@ impl Database for DynamoDatabase {
         item.insert("username".to_string(), Self::av_s(username));
         item.insert("passwordHash".to_string(), Self::av_s(password_hash));
         item.insert("mmr".to_string(), Self::av_n(mmr));
+        item.insert("rankedMmr".to_string(), Self::av_n(1000));
+        item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
@@ -606,6 +610,8 @@ impl Database for DynamoDatabase {
             username: username.to_string(),
             password_hash: password_hash.to_string(),
             mmr,
+            ranked_mmr: 1000,
+            casual_mmr: 1000,
             xp: 0,
             created_at: now,
             is_guest: false,
@@ -629,6 +635,8 @@ impl Database for DynamoDatabase {
         item.insert("username".to_string(), Self::av_s(nickname)); // Use nickname as username
         item.insert("passwordHash".to_string(), Self::av_s("")); // Empty password hash for guests
         item.insert("mmr".to_string(), Self::av_n(mmr));
+        item.insert("rankedMmr".to_string(), Self::av_n(1000));
+        item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
@@ -652,6 +660,8 @@ impl Database for DynamoDatabase {
             username: nickname.to_string(),
             password_hash: String::new(),
             mmr,
+            ranked_mmr: 1000,
+            casual_mmr: 1000,
             xp: 0,
             created_at: now,
             is_guest: true,
@@ -679,6 +689,8 @@ impl Database for DynamoDatabase {
                         .ok_or_else(|| anyhow!("Missing username"))?,
                     password_hash: Self::extract_string(&item, "passwordHash").unwrap_or_default(),
                     mmr: Self::extract_number(&item, "mmr").unwrap_or(1000),
+                    ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
+                    casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
                     xp: Self::extract_number(&item, "xp").unwrap_or(0),
                     created_at: Self::extract_string(&item, "createdAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
@@ -715,6 +727,8 @@ impl Database for DynamoDatabase {
                     username: username.to_string(),
                     password_hash: Self::extract_string(&item, "passwordHash").unwrap_or_default(),
                     mmr: Self::extract_number(&item, "mmr").unwrap_or(1000),
+                    ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
+                    casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
                     xp: Self::extract_number(&item, "xp").unwrap_or(0),
                     created_at: Utc::now(), // Not stored in username table, use current time
                     is_guest: false,        // Users in username table are never guests
@@ -816,6 +830,73 @@ impl Database for DynamoDatabase {
             xp_to_add, user_id, new_xp
         );
         Ok(new_xp)
+    }
+
+    async fn update_user_mmr_by_mode(
+        &self,
+        user_id: i32,
+        mmr_delta: i32,
+        queue_mode: &common::QueueMode,
+    ) -> Result<i32> {
+        // Determine which MMR field to update based on queue mode
+        let mmr_field = match queue_mode {
+            common::QueueMode::Competitive => "rankedMmr",
+            common::QueueMode::Quickmatch => "casualMmr",
+        };
+
+        // Atomic ADD operation in DynamoDB main table
+        let response = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{}", user_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression(format!("ADD {} :mmr_delta", mmr_field))
+            .expression_attribute_values(":mmr_delta", Self::av_n(mmr_delta))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await
+            .context("Failed to update user MMR")?;
+
+        // Extract and return new MMR total
+        let new_mmr = response
+            .attributes
+            .and_then(|attrs| Self::extract_number(&attrs, mmr_field))
+            .unwrap_or(1000 + mmr_delta);
+
+        // Also update username table for consistency
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| anyhow!("User not found"))?;
+
+        self.client
+            .update_item()
+            .table_name(self.usernames_table())
+            .key("username", Self::av_s(&user.username))
+            .update_expression(format!("ADD {} :mmr_delta", mmr_field))
+            .expression_attribute_values(":mmr_delta", Self::av_n(mmr_delta))
+            .send()
+            .await
+            .context("Failed to update MMR in username table")?;
+
+        info!(
+            "Updated {} for user {} by {} (new total: {})",
+            mmr_field, user_id, mmr_delta, new_mmr
+        );
+        Ok(new_mmr)
+    }
+
+    async fn get_user_mmrs(&self, user_ids: &[i32]) -> Result<HashMap<i32, (i32, i32)>> {
+        let mut mmr_map = HashMap::new();
+
+        for &user_id in user_ids {
+            if let Some(user) = self.get_user_by_id(user_id).await? {
+                mmr_map.insert(user_id, (user.ranked_mmr, user.casual_mmr));
+            }
+        }
+
+        Ok(mmr_map)
     }
 
     // Game operations

@@ -18,6 +18,7 @@ pub mod user_cache;
 pub mod ws_matchmaking;
 pub mod ws_server;
 pub mod xp_persistence;
+pub mod mmr_persistence;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

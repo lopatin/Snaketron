@@ -35,6 +35,15 @@ pub trait Database: Send + Sync {
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
 
+    // MMR operations for ranked/casual queues
+    async fn update_user_mmr_by_mode(
+        &self,
+        user_id: i32,
+        mmr_delta: i32,
+        queue_mode: &common::QueueMode,
+    ) -> Result<i32>; // Returns new MMR
+    async fn get_user_mmrs(&self, user_ids: &[i32]) -> Result<HashMap<i32, (i32, i32)>>; // Returns (ranked_mmr, casual_mmr) for each user
+
     // Game operations
     async fn create_game(
         &self,

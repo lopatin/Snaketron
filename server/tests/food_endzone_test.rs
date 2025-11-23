@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common::{GameState, GameType, TeamId};
+use common::{GameState, GameType, QueueMode, TeamId};
 
 #[test]
 fn test_initial_food_spawning() -> Result<()> {
@@ -8,6 +8,7 @@ fn test_initial_food_spawning() -> Result<()> {
         40,
         40,
         GameType::FreeForAll { max_players: 4 },
+        QueueMode::Quickmatch,
         Some(12345),
         0,
     );
@@ -41,7 +42,7 @@ fn test_initial_food_spawning() -> Result<()> {
 fn test_food_never_spawns_in_endzones() -> Result<()> {
     // Create a team match game with endzones
     let game_type = GameType::TeamMatch { per_team: 1 };
-    let mut game_state = GameState::new(60, 40, game_type, Some(12345), 0);
+    let mut game_state = GameState::new(60, 40, game_type, QueueMode::Quickmatch, Some(12345), 0);
 
     // Add two players to different teams
     game_state.add_player(1, Some("Player1".to_string()))?;

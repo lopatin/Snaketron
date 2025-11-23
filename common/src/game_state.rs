@@ -354,6 +354,7 @@ pub struct GameState {
     pub status: GameStatus,
     pub arena: Arena,
     pub game_type: GameType,
+    pub queue_mode: QueueMode,
     pub properties: GameProperties,
     pub command_queue: CommandQueue,
     // Players by user_id
@@ -449,6 +450,7 @@ impl GameState {
         width: u16,
         height: u16,
         game_type: GameType,
+        queue_mode: QueueMode,
         rng_seed: Option<u64>,
         start_ms: i64,
     ) -> Self {
@@ -510,6 +512,7 @@ impl GameState {
                 team_zone_config,
             },
             game_type: game_type.clone(),
+            queue_mode,
             properties,
             command_queue: CommandQueue::new(),
             players: HashMap::new(),
@@ -1572,6 +1575,7 @@ mod tests {
             10,
             10,
             GameType::FreeForAll { max_players: 1 },
+            QueueMode::Quickmatch,
             None,
             0,
         );
@@ -1814,6 +1818,7 @@ mod tests {
             60,
             40,
             GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
             Some(4242),
             0,
         );
@@ -1870,6 +1875,7 @@ mod tests {
             60,
             40,
             GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
             Some(777),
             0,
         );

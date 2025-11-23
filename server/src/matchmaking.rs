@@ -1073,7 +1073,7 @@ async fn create_game_from_lobbies(
     };
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
+    let mut game_state = GameState::new(width, height, game_type.clone(), queue_mode.clone(), rng_seed, start_ms);
 
     // Apply queue-mode-specific time limits for team games
     if matches!(game_type, GameType::TeamMatch { .. }) {
@@ -1266,7 +1266,8 @@ pub async fn create_custom_match(
     };
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type.clone(), rng_seed, start_ms);
+    // Custom games default to Quickmatch queue mode
+    let mut game_state = GameState::new(width, height, game_type.clone(), common::QueueMode::Quickmatch, rng_seed, start_ms);
 
     // Add players
     for player in &players {

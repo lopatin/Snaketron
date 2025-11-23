@@ -21,7 +21,9 @@ pub struct User {
     pub id: i32,
     pub username: String,
     pub password_hash: String,
-    pub mmr: i32,
+    pub mmr: i32, // Legacy field, kept for backwards compatibility
+    pub ranked_mmr: i32,
+    pub casual_mmr: i32,
     pub xp: i32,
     pub created_at: DateTime<Utc>,
     pub is_guest: bool,

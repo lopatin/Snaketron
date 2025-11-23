@@ -194,6 +194,14 @@ async fn run_game(
                                 }
                             }
 
+                            // Persist MMR changes to database
+                            if !game_state.players.is_empty() {
+                                info!("Persisting MMR for {} players in game {}", game_state.players.len(), game_id);
+                                if let Err(e) = crate::mmr_persistence::persist_player_mmr(db.as_ref(), game_id, &game_state).await {
+                                    error!("Failed to persist MMR for game {}: {:?}", game_id, e);
+                                }
+                            }
+
                             break;
                         }
                     }

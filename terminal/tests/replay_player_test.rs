@@ -1,7 +1,7 @@
 use anyhow::Result;
 use common::{
     CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameState,
-    GameStatus,
+    GameStatus, QueueMode,
 };
 use std::time::SystemTime;
 use terminal::replay::player::ReplayPlayer;
@@ -15,6 +15,7 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
         20,
         20,
         common::GameType::FreeForAll { max_players: 2 },
+        QueueMode::Quickmatch,
         Some(12345),
         start_ms,
     );

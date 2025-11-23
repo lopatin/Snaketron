@@ -1790,7 +1790,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.53.5",
 ]
 
 [[package]]
@@ -2771,6 +2771,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "skillratings",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2871,6 +2872,12 @@ dependencies = [
  "thiserror 2.0.12",
  "time",
 ]
+
+[[package]]
+name = "skillratings"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c8196a815d27d6dbd2439058a2cbf6597a549a68ca6368611df240df7c2987"
 
 [[package]]
 name = "slab"
