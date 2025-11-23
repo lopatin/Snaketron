@@ -321,36 +321,56 @@ pub fn render_game(
                               split_vertical: bool,
                               names: &[String],
                               bg_color: &str,
-                              text_color: &str|
+                              text_color: &str,
+                              split_labels: bool|
          -> Result<(), JsValue> {
             let (x, y, w, h) = rect;
-            let (centers, box_w, box_h): (Vec<(f64, f64)>, f64, f64) = if split_vertical {
-                let half_h = h / 2.0;
-                (
-                    vec![(x + w / 2.0, y + half_h / 2.0), (x + w / 2.0, y + half_h + half_h / 2.0)],
-                    w * 0.8,
-                    half_h * 0.9,
-                )
+
+            // Decide whether to split into two sub-areas (only when we have >1 name and game mode requires it)
+            let (centers, box_w, box_h): (Vec<(f64, f64)>, f64, f64) = if split_labels && names.len() > 1 {
+                if split_vertical {
+                    let half_h = h / 2.0;
+                    (
+                        vec![
+                            (x + w / 2.0, y + half_h / 2.0),
+                            (x + w / 2.0, y + half_h + half_h / 2.0),
+                        ],
+                        w * 0.8,
+                        half_h * 0.9,
+                    )
+                } else {
+                    let half_w = w / 2.0;
+                    (
+                        vec![
+                            (x + half_w / 2.0, y + h / 2.0),
+                            (x + half_w + half_w / 2.0, y + h / 2.0),
+                        ],
+                        half_w * 0.9,
+                        h * 0.8,
+                    )
+                }
             } else {
-                let half_w = w / 2.0;
+                // Single name fills whole zone
                 (
-                    vec![(x + half_w / 2.0, y + h / 2.0), (x + half_w + half_w / 2.0, y + h / 2.0)],
-                    half_w * 0.9,
+                    vec![(x + w / 2.0, y + h / 2.0)],
+                    w * 0.9,
                     h * 0.8,
                 )
             };
 
-            // Use the same font size for both names: smallest that fits all labels in this zone
+            // Use the same font size for all labels in this zone: smallest that fits every label
             let mut needed_size = compute_font_size(
                 names.get(0).map(|s| s.as_str()).unwrap_or(""),
                 box_w,
                 box_h,
             );
-            if let Some(name) = names.get(1) {
-                needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
+            if split_labels && names.len() > 1 {
+                if let Some(name) = names.get(1) {
+                    needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
+                }
             }
 
-            for (i, name) in names.iter().take(2).enumerate() {
+            for (i, name) in names.iter().take(centers.len()).enumerate() {
                 draw_label_with_size(
                     &ctx,
                     name,
@@ -395,8 +415,24 @@ pub fn render_game(
         };
 
         // Draw labels for each team zone (supports up to two names per team)
-        draw_team_zone(team0_rect, split_vertical, &team0_labels, left_bg_color, left_text_color)?;
-        draw_team_zone(team1_rect, split_vertical, &team1_labels, right_bg_color, right_text_color)?;
+        let team0_split_labels = team0_labels.len() > 1;
+        let team1_split_labels = team1_labels.len() > 1;
+        draw_team_zone(
+            team0_rect,
+            split_vertical,
+            &team0_labels,
+            left_bg_color,
+            left_text_color,
+            team0_split_labels,
+        )?;
+        draw_team_zone(
+            team1_rect,
+            split_vertical,
+            &team1_labels,
+            right_bg_color,
+            right_text_color,
+            team1_split_labels,
+        )?;
     }
 
     // Note: Walls will be drawn after snakes to ensure dead snakes appear behind walls
