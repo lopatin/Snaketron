@@ -706,18 +706,17 @@ impl GameState {
                 .unwrap_or((boundary_x, height / 2, height / 2));
             let gate_top = y_start.max(0);
             let gate_bottom = y_end.min(height - 1);
-            let gate_height = (gate_bottom - gate_top).max(0);
+            let gate_span = (gate_bottom - gate_top).max(0);
 
             for i in 0..count {
                 let y = if count == 1 {
                     (gate_top + gate_bottom) / 2
                 } else {
-                    let step = if count > 1 {
-                        (gate_height as usize).max(1) / (count - 1)
-                    } else {
-                        0
-                    } as i16;
-                    (gate_top + (i as i16 * step)).clamp(gate_top, gate_bottom)
+                    // Evenly space within gate interior, avoiding the extreme ends
+                    let spacing = (gate_span as f64) / ((count as f64) + 1.0);
+                    let pos = gate_top as f64 + spacing * ((i as f64) + 1.0);
+                    pos.round()
+                        .clamp(gate_top as f64, gate_bottom as f64) as i16
                 };
                 let direction = if is_left {
                     Direction::Right

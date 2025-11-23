@@ -299,12 +299,8 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
       return 'Victory!';
     }
     
-    const winner = snakeStats.find(s => s.index === winningSnakeId);
-    if (winner) {
-      return winner.isCurrentPlayer ? 'Victory!' : `${winner.name} Wins!`;
-    }
-    
-    return 'Game Over';
+    // Player lost
+    return 'Defeat!';
   };
 
   const solo = isSoloGame();
