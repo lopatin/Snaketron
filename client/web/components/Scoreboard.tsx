@@ -453,9 +453,9 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
             <div className="text-gray-500 font-semibold text-xs uppercase tracking-wider">
               {getGameModeText()}
             </div>
-            <div className="text-gray-600 font-bold text-lg -mt-0.5">
-              {timeLimitMs ? 'Match ends at time limit' : 'All snakes must fall'}
-            </div>
+            {/*<div className="text-gray-600 font-bold text-lg -mt-0.5">*/}
+            {/*  {timeLimitMs ? 'Match ends at time limit' : 'All snakes must fall'}*/}
+            {/*</div>*/}
           </div>
         </div>
       )}
