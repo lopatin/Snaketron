@@ -189,25 +189,22 @@ impl Arena {
         false
     }
 
-    /// Check if a snake has reached the enemy goal
-    pub fn has_reached_goal(&self, snake: &Snake, team_id: TeamId) -> bool {
-        if let (Some(head), Some(config)) = (snake.head().ok(), &self.team_zone_config) {
-            // Team 0's goal is to reach Team 1's end zone (right side)
-            // Team 1's goal is to reach Team 0's end zone (left side)
-            match team_id.0 {
-                0 => {
-                    // Check if in Team 1's end zone
-                    head.x >= self.width as i16 - config.end_zone_depth as i16
-                }
-                1 => {
-                    // Check if in Team 0's end zone
-                    head.x < config.end_zone_depth as i16
-                }
-                _ => false, // Other teams default to false
-            }
-        } else {
-            false
-        }
+    pub fn is_in_team_base(&self, pos: &Position, team_id: TeamId) -> bool {
+        self.team_zone_bounds(team_id)
+            .map(|(x_start, x_end, y_start, y_end)| {
+                pos.x >= x_start && pos.x <= x_end && pos.y >= y_start && pos.y <= y_end
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn is_in_enemy_base(&self, pos: &Position, team_id: TeamId) -> bool {
+        let enemy_team = match team_id.0 {
+            0 => TeamId(1),
+            1 => TeamId(0),
+            _ => TeamId(1),
+        };
+
+        self.is_in_team_base(pos, enemy_team)
     }
 }
 
@@ -572,10 +569,7 @@ impl GameState {
         let arena_height = self.arena.height as i16;
 
         // Get snake length from custom settings or use default
-        let snake_length = match &self.game_type {
-            GameType::Custom { settings } => settings.snake_start_length as i16,
-            _ => DEFAULT_SNAKE_LENGTH as i16,
-        };
+        let snake_length = self.starting_snake_length() as i16;
 
         // For team games, adjust starting positions to be in the main field
         let (left_boundary, right_boundary) =
@@ -657,6 +651,13 @@ impl GameState {
         }
 
         positions
+    }
+
+    fn starting_snake_length(&self) -> usize {
+        match &self.game_type {
+            GameType::Custom { settings } => settings.snake_start_length as usize,
+            _ => DEFAULT_SNAKE_LENGTH,
+        }
     }
 
     fn respawn_event_for_snake(&self, snake_id: u32) -> Option<GameEvent> {
@@ -967,6 +968,14 @@ impl GameState {
                     continue 'main_snake_loop;
                 }
 
+                // Entering the enemy base kills the snake
+                if let Some(team_id) = snake.team_id {
+                    if self.arena.is_in_enemy_base(head, team_id) {
+                        died_snake_ids.insert(snake_id);
+                        continue 'main_snake_loop;
+                    }
+                }
+
                 // If not within bounds
                 if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
                     died_snake_ids.insert(snake_id);
@@ -1095,34 +1104,61 @@ impl GameState {
             // Track goal touches as simple score increments in team games
             if let GameType::TeamMatch { .. } = &self.game_type {
                 if self.team_scores.is_some() {
-                    let mut updates: Vec<(TeamId, u32)> = Vec::new();
-                    let mut respawns: Vec<GameEvent> = Vec::new();
+                    let mut team_score_deltas: HashMap<TeamId, u32> = HashMap::new();
+                    let mut respawns: Vec<u32> = Vec::new();
+                    let starting_length = self.starting_snake_length();
+
                     for (snake_id, snake) in self.iter_snakes() {
-                        if snake.is_alive {
-                            if let Some(team_id) = snake.team_id {
-                                if self.arena.has_reached_goal(snake, team_id) {
-                                    let current_score = self.team_scores.as_ref()
-                                        .and_then(|scores| scores.get(&team_id).copied())
-                                        .unwrap_or(0);
-                                    let next_score = current_score + 1;
-                                    updates.push((team_id, next_score));
-                                    if let Some(event) = self.respawn_event_for_snake(snake_id) {
-                                        respawns.push(event);
-                                    }
-                                }
-                            }
+                        if !snake.is_alive {
+                            continue;
                         }
+
+                        let Some(team_id) = snake.team_id else {
+                            continue;
+                        };
+
+                        let Ok(head) = snake.head() else {
+                            continue;
+                        };
+
+                        if !self.arena.is_in_team_base(head, team_id) {
+                            continue;
+                        }
+
+                        let snake_length = snake.length();
+                        let extra_segments = snake_length.saturating_sub(starting_length);
+                        let carried_segments = extra_segments + snake.food as usize;
+                        let carried_food = (carried_segments / 2) as u32;
+
+                        if carried_food == 0 {
+                            continue;
+                        }
+
+                        *team_score_deltas.entry(team_id).or_default() += carried_food;
+                        respawns.push(snake_id);
                     }
 
-                    for (team_id, score) in updates {
+                    for (team_id, delta) in team_score_deltas {
+                        let current_score = self
+                            .team_scores
+                            .as_ref()
+                            .and_then(|scores| scores.get(&team_id).copied())
+                            .unwrap_or(0);
+
                         self.apply_event(
-                            GameEvent::TeamScoreUpdated { team_id, score },
+                            GameEvent::TeamScoreUpdated {
+                                team_id,
+                                score: current_score + delta,
+                            },
                             Some(&mut out),
                         );
                     }
 
-                    for event in respawns {
-                        self.apply_event(event, Some(&mut out));
+                    for snake_id in respawns {
+                        self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+                        if let Some(event) = self.respawn_event_for_snake(snake_id) {
+                            self.apply_event(event, Some(&mut out));
+                        }
                     }
                 }
             }
@@ -1375,11 +1411,7 @@ impl GameState {
                 position,
                 direction,
             } => {
-                // Get snake length from game settings first
-                let snake_length = match &self.game_type {
-                    GameType::Custom { settings } => settings.snake_start_length as i16,
-                    _ => 4, // Default snake length
-                };
+                let snake_length = self.starting_snake_length() as i16;
 
                 // Build compressed snake body: just head and tail for a straight snake
                 let tail_pos = match direction {
@@ -1695,6 +1727,118 @@ mod tests {
         queue.push(create_command_message(10, 1, 1, false));
         assert!(queue.pop(10).is_some());
         assert!(queue.pop(10).is_none());
+    }
+
+    #[test]
+    fn team_scores_when_returning_food_to_base() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            Some(4242),
+            0,
+        );
+
+        game.add_player(1, Some("Player1".to_string()))
+            .expect("add player 1");
+        game.add_player(2, Some("Player2".to_string()))
+            .expect("add player 2");
+
+        {
+            let snake = &mut game.arena.snakes[0];
+            snake.body = vec![
+                Position { x: 5, y: 10 },
+                Position { x: 2, y: 10 },
+            ];
+            snake.direction = Direction::Right;
+            snake.is_alive = true;
+            snake.food = 2; // carrying one food
+        }
+
+        let events = game.tick_forward(false).expect("tick_forward should work");
+
+        let scored = events.iter().any(|(_, event)| {
+            matches!(
+                event,
+                GameEvent::TeamScoreUpdated {
+                    team_id,
+                    score: 1
+                } if *team_id == TeamId(0)
+            )
+        });
+        assert!(scored, "team should score after returning food to base");
+
+        let respawned = events.iter().any(|(_, event)| {
+            matches!(event, GameEvent::SnakeRespawned { snake_id, .. } if *snake_id == 0)
+        });
+        assert!(respawned, "snake should respawn after scoring");
+
+        let score = game
+            .team_scores
+            .as_ref()
+            .and_then(|scores| scores.get(&TeamId(0)).copied())
+            .unwrap_or(0);
+        assert_eq!(score, 1, "team score should increment by carried food");
+
+        let snake = &game.arena.snakes[0];
+        assert!(snake.is_alive);
+        assert_eq!(snake.food, 0, "snake should not keep carried food after respawn");
+    }
+
+    #[test]
+    fn snake_dies_on_enemy_base_contact() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            Some(777),
+            0,
+        );
+
+        game.add_player(1, Some("Player1".to_string()))
+            .expect("add player 1");
+        game.add_player(2, Some("Player2".to_string()))
+            .expect("add player 2");
+
+        let enemy_zone_start =
+            game.arena.width as i16 - game.arena.team_zone_config.as_ref().unwrap().end_zone_depth as i16;
+
+        {
+            let snake = &mut game.arena.snakes[0];
+            snake.body = vec![
+                Position {
+                    x: enemy_zone_start + 1,
+                    y: 15,
+                },
+                Position {
+                    x: enemy_zone_start - 2,
+                    y: 15,
+                },
+            ];
+            snake.direction = Direction::Right;
+            snake.is_alive = true;
+        }
+
+        let events = game.tick_forward(false).expect("tick_forward should work");
+
+        assert!(
+            events.iter().any(|(_, event)| {
+                matches!(event, GameEvent::SnakeDied { snake_id } if *snake_id == 0)
+            }),
+            "snake should die when entering enemy base"
+        );
+
+        assert!(
+            game.arena.snakes[0].is_alive,
+            "snake should respawn after dying in team games"
+        );
+
+        let score = game
+            .team_scores
+            .as_ref()
+            .and_then(|scores| scores.get(&TeamId(0)).copied())
+            .unwrap_or(0);
+        assert_eq!(score, 0, "touching enemy base should not award points");
     }
 
     #[test]
