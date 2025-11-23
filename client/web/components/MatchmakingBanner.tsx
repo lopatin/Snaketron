@@ -1,31 +1,25 @@
 import React from 'react';
-import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 
 export const MatchmakingBanner: React.FC = () => {
-  const { user } = useAuth();
   const { currentLobby } = useWebSocket();
   const { leaveQueue, isQueued, isJoiningGame } = useGameWebSocket();
 
   const isLobbyQueued = currentLobby?.state === 'queued';
-  const isHost = Boolean(user && currentLobby && currentLobby.hostUserId === user.id);
   const isBannerVisible = isQueued || isJoiningGame || isLobbyQueued;
 
   if (!isBannerVisible) {
     return null;
   }
 
-  const showCancel = (isQueued || isLobbyQueued) && (!currentLobby || isHost);
+  const showCancel = isQueued || isLobbyQueued;
   const statusText = (() => {
     if (isJoiningGame) {
       return 'Joining game...';
     }
 
     if (isQueued || isLobbyQueued) {
-      if (currentLobby) {
-        return isHost ? 'Finding match...' : 'Host is finding a match...';
-      }
       return 'Finding match...';
     }
 

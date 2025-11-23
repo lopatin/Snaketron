@@ -50,8 +50,6 @@ export const NewHome: React.FC = () => {
     onMessage,
   });
   const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
-  const isCurrentLobbyHost = currentLobby ? currentLobby.hostUserId === user?.id : false;
-  const isGameFormHost = !currentLobby || isCurrentLobbyHost;
   const isLobbyQueued = currentLobby?.state === 'queued';
 
   // Check if mobile on mount and resize
@@ -112,7 +110,7 @@ export const NewHome: React.FC = () => {
     nickname: string,
     isCompetitive: boolean
   ) => {
-    if (isLobbyQueued || !isGameFormHost) {
+    if (isLobbyQueued) {
       return;
     }
 
@@ -233,7 +231,6 @@ export const NewHome: React.FC = () => {
           lobbyMembers={lobbyMembers}
           lobbyCode={currentLobby?.code || null}
           currentUserId={user?.id}
-          isHost={isCurrentLobbyHost}
           onInvite={handleInvite}
           isInviteDisabled={isCreatingInvite}
           onLeaveLobby={handleLeaveLobby}
@@ -293,9 +290,7 @@ export const NewHome: React.FC = () => {
             currentUsername={user?.username}
             isLoading={isLoading}
             isAuthenticated={user !== null && !user.isGuest}
-            isHost={isGameFormHost}
             isLobbyQueued={isLobbyQueued}
-            hasActiveLobby={Boolean(currentLobby)}
             lobbyPreferences={lobbyPreferences}
             onPreferencesChange={updateLobbyPreferences}
           />
@@ -332,15 +327,13 @@ export const NewHome: React.FC = () => {
       <div className="flex-1 flex items-center justify-center px-4 py-8">
         <GameStartForm
           onStartGame={handleStartGame}
-          currentUsername={user?.username}
-          isLoading={isLoading}
-          isAuthenticated={user !== null && !user.isGuest}
-          isHost={isGameFormHost}
-          isLobbyQueued={isLobbyQueued}
-          hasActiveLobby={Boolean(currentLobby)}
-          lobbyPreferences={lobbyPreferences}
-          onPreferencesChange={updateLobbyPreferences}
-        />
+            currentUsername={user?.username}
+            isLoading={isLoading}
+            isAuthenticated={user !== null && !user.isGuest}
+            isLobbyQueued={isLobbyQueued}
+            lobbyPreferences={lobbyPreferences}
+            onPreferencesChange={updateLobbyPreferences}
+          />
       </div>
 
       {/* Bottom Right: Lobby Chat - Hidden in mobile */}

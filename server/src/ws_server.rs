@@ -1481,25 +1481,15 @@ async fn process_ws_message(
                 } => {
                     {
                         if let Some(ref lobby_handle) = lobby {
-                            if lobby_manager
-                                .is_lobby_host(&lobby_handle.lobby_code, metadata.user_id)
-                                .await?
-                            {
-                                lobby_manager
-                                    .set_lobby_preferences(
-                                        &lobby_handle.lobby_code,
-                                        &lobby_manager::LobbyPreferences {
-                                            selected_modes,
-                                            competitive,
-                                        },
-                                    )
-                                    .await?;
-                            } else {
-                                let json_msg = serde_json::to_string(&WSMessage::AccessDenied {
-                                    reason: "Only the host can update lobby settings".to_string(),
-                                })?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                            }
+                            lobby_manager
+                                .set_lobby_preferences(
+                                    &lobby_handle.lobby_code,
+                                    &lobby_manager::LobbyPreferences {
+                                        selected_modes,
+                                        competitive,
+                                    },
+                                )
+                                .await?;
                         }
                     }
                     Ok(ConnectionState::Authenticated {
@@ -1519,24 +1509,6 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if !lobby_manager
-                            .is_lobby_host(&lobby_handle.lobby_code, metadata.user_id)
-                            .await?
-                        {
-                            let response = WSMessage::AccessDenied {
-                                reason: "Only the host can queue the lobby for matchmaking"
-                                    .to_string(),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            return Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            });
-                        }
-
                         if let Err(e) = queue_existing_lobby_for_game_types(
                             lobby_handle,
                             &[game_type.clone()],
@@ -1743,24 +1715,6 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if !lobby_manager
-                            .is_lobby_host(&lobby_handle.lobby_code, metadata.user_id)
-                            .await?
-                        {
-                            let response = WSMessage::AccessDenied {
-                                reason: "Only the host can queue the lobby for matchmaking"
-                                    .to_string(),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            return Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            });
-                        }
-
                         if let Err(e) = queue_existing_lobby_for_game_types(
                             lobby_handle,
                             &game_types,

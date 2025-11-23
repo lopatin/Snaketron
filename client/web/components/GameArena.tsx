@@ -439,7 +439,6 @@ export default function GameArena() {
   
   // Determine if user is in a lobby and is the host
   const isInLobby = currentLobby !== null;
-  const isHost = currentLobby !== null && currentLobby.hostUserId === user?.id;
   const isLobbyQueued = currentLobby?.state === 'queued';
 
   // Handle play again
@@ -453,13 +452,12 @@ export default function GameArena() {
       return;
     }
 
-    const canHostQueue =
+    const canLobbyQueue =
       isInLobby &&
-      isHost &&
       lobbyPreferences &&
       lobbyPreferences.selectedModes.length > 0;
 
-    if (canHostQueue && lobbyPreferences) {
+    if (canLobbyQueue && lobbyPreferences) {
       const queueMode: 'Quickmatch' | 'Competitive' = lobbyPreferences.competitive
         ? 'Competitive'
         : 'Quickmatch';
@@ -472,11 +470,6 @@ export default function GameArena() {
       } else {
         queueForMatch(state.game_type);
       }
-      return;
-    }
-
-    if (!isHost) {
-      console.log('Guest cannot start matchmaking; waiting for host');
       return;
     }
 
@@ -501,8 +494,6 @@ export default function GameArena() {
           showGameOver={showGameOverPanel}
           onBackToMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
-          isHost={isHost}
-          isInLobby={isInLobby}
           isLobbyQueued={isLobbyQueued}
           queueMode={queueMode}
         />

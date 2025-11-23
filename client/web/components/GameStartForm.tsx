@@ -34,9 +34,7 @@ interface GameStartFormProps {
   currentUsername?: string;
   isLoading?: boolean;
   isAuthenticated?: boolean;
-  isHost?: boolean;
   isLobbyQueued?: boolean;
-  hasActiveLobby?: boolean;
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
 }
@@ -46,9 +44,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   currentUsername,
   isLoading = false,
   isAuthenticated = false,
-  isHost = true,
   isLobbyQueued = false,
-  hasActiveLobby = false,
   lobbyPreferences,
   onPreferencesChange,
 }) => {
@@ -61,7 +57,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   const { user } = useAuth();
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
-  const canEdit = isHost && !isLobbyQueued;
+  const canEdit = !isLobbyQueued;
 
   // Debounce nickname validation to avoid showing errors while typing
   const debouncedNickname = useDebouncedValue(nickname, 500);
@@ -187,7 +183,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isHost || isLobbyQueued) {
+    if (isLobbyQueued) {
       return;
     }
 
@@ -197,12 +193,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   };
 
   const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
-  const startButtonDisabled = !isHost || isLobbyQueued || !isFormValid || isLoading;
+  const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading;
   const startButtonLabel = isLobbyQueued
     ? 'Finding Match...'
-    : !isHost
-      ? 'Waiting for Host'
-      : isLoading
+    : isLoading
         ? 'Starting...'
         : 'Start Game';
 

@@ -10,7 +10,6 @@ interface SidebarProps {
   lobbyMembers: LobbyMember[];
   lobbyCode: string | null;
   currentUserId?: number;
-  isHost: boolean;
   onInvite?: () => void;
   onLeaveLobby?: () => void;
   onStartGame?: () => void;
@@ -25,7 +24,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   lobbyMembers,
   lobbyCode,
   currentUserId,
-  isHost,
   onInvite,
   onLeaveLobby,
   onStartGame,
@@ -94,7 +92,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     <span className={member.user_id === currentUserId ? 'font-bold' : ''}>
                       {member.username}
                     </span>
-                    {member.is_host && <span className="text-xs">(Host)</span>}
                     <div className="w-2 h-2 rounded-full bg-green-500" />
                   </div>
                 ))}

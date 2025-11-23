@@ -8,8 +8,6 @@ interface ScoreboardProps {
   showGameOver?: boolean;
   onBackToMenu?: () => void;
   onPlayAgain?: () => void;
-  isHost?: boolean;
-  isInLobby?: boolean;
   isLobbyQueued?: boolean;
   queueMode?: QueueMode;
 }
@@ -28,8 +26,6 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
   currentUserId,
   onBackToMenu,
   onPlayAgain,
-  isHost = false,
-  isInLobby = false,
   isLobbyQueued = false,
   queueMode = 'Quickmatch'
 }) => {
@@ -549,9 +545,9 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
               </button>
               <button
                 onClick={onPlayAgain}
-                disabled={(isInLobby && !isHost) || isLobbyQueued}
+                disabled={isLobbyQueued}
                 className={`px-3 py-1 text-xs border rounded font-semibold uppercase transition-all ${
-                  (isInLobby && !isHost) || isLobbyQueued
+                  isLobbyQueued
                     ? 'border-gray-400 bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'border-green-700 bg-green-600 text-white hover:bg-green-700 cursor-pointer'
                 }`}
@@ -561,9 +557,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
                 title={
                   isLobbyQueued
                     ? 'Lobby is already queued and waiting for a match'
-                    : (isInLobby && !isHost
-                        ? 'Waiting for host to start next game'
-                        : 'Play again with your lobby')
+                    : 'Play again with your lobby'
                 }
               >
                 {isLobbyQueued ? 'Queued...' : 'Play Again'}
