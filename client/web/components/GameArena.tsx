@@ -65,6 +65,7 @@ export default function GameArena() {
   const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
   const [rotation, setRotation] = useState<ArenaRotation>(0);
   const rotationSetRef = useRef(false); // Track if rotation has been set
+  const [isShortWideScreen, setIsShortWideScreen] = useState(false);
 
   // Reset local arena state when switching to a new game ID (route change without unmount)
   useEffect(() => {
@@ -118,6 +119,20 @@ export default function GameArena() {
       leaveGame();
       stopEngine();
     };
+  }, []);
+
+  // Track short/wide screens (e.g., mobile landscape) to adjust arena rotation
+  useEffect(() => {
+    const updateScreenShape = () => {
+      const { innerWidth, innerHeight } = window;
+      const isLandscape = innerWidth >= innerHeight;
+      const shortHeight = innerHeight < 700;
+      setIsShortWideScreen(isLandscape && shortHeight);
+    };
+
+    updateScreenShape();
+    window.addEventListener('resize', updateScreenShape);
+    return () => window.removeEventListener('resize', updateScreenShape);
   }, []);
 
 
@@ -225,28 +240,34 @@ export default function GameArena() {
   // Set rotation based on user's team when game state is first available
   useEffect(() => {
     const state = gameState ?? committedState;
-    if (state && user?.id && !rotationSetRef.current) {
-      const player = state.players?.[user.id];
-      if (player) {
-        const snakeId = player.snake_id;
-        const snake = state.arena?.snakes?.[snakeId];
-
-        // Use the actual team_id from the snake when available; fall back to snake_id parity
-        const teamId = snake?.team_id ?? (snakeId % 2);
-        
-        if (teamId === 0) {
-          // Team 0: endzone is on the left - rotate 270° so it appears at bottom
-          setRotation(270);
-        } else {
-          // Team 1: endzone is on the right - rotate 90° so it appears at bottom
-          setRotation(90);
-        }
-        
-        // Mark rotation as set so we don't recalculate
-        rotationSetRef.current = true;
-      }
+    if (!state || !user?.id) {
+      return;
     }
-  }, [gameState, committedState, user?.id]); // Only run when gameState or user changes
+
+    const player = state.players?.[user.id];
+    if (!player) {
+      return;
+    }
+
+    const snakeId = player.snake_id;
+    const snake = state.arena?.snakes?.[snakeId];
+
+    // Use the actual team_id from the snake when available; fall back to snake_id parity
+    const teamId = snake?.team_id ?? (snakeId % 2);
+    const isTeamGame = typeof state.game_type === 'object' && 'TeamMatch' in state.game_type;
+    const forceUnrotated = isTeamGame && isShortWideScreen;
+
+    const desiredRotation: ArenaRotation = forceUnrotated
+      ? 0
+      : teamId === 0
+        ? 270
+        : 90;
+
+    if (!rotationSetRef.current || desiredRotation !== rotation) {
+      setRotation(desiredRotation);
+      rotationSetRef.current = true;
+    }
+  }, [gameState, committedState, user?.id, isShortWideScreen, rotation]); // Recompute when game state, user, rotation, or viewport changes
 
   useEffect(() => {
     if (!window.wasm) {
