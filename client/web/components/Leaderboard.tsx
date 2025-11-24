@@ -35,15 +35,56 @@ const isValidLeaderboardMode = (mode: string | null): mode is LobbyGameMode =>
 const isValidLeaderboardRegion = (region: string | null) =>
   Boolean(region && LEADERBOARD_REGIONS.some(availableRegion => availableRegion.id === region));
 
-// Helper to determine rank tier from MMR
-const getRankTierFromMMR = (mmr: number): RankTier => {
-  if (mmr >= 2400) return 'grandmaster';
-  if (mmr >= 2200) return 'master';
-  if (mmr >= 2000) return 'diamond';
-  if (mmr >= 1800) return 'platinum';
-  if (mmr >= 1600) return 'gold';
-  if (mmr >= 1400) return 'silver';
-  return 'bronze';
+const RANK_BANDS: Array<{ min: number; max?: number; tier: RankTier; division: RankDivision }> = [
+  { min: 0, max: 200, tier: 'bronze', division: 1 },
+  { min: 200, max: 400, tier: 'bronze', division: 2 },
+  { min: 400, max: 600, tier: 'bronze', division: 3 },
+  { min: 600, max: 800, tier: 'silver', division: 1 },
+  { min: 800, max: 1000, tier: 'silver', division: 2 },
+  { min: 1000, max: 1200, tier: 'silver', division: 3 },
+  { min: 1200, max: 1300, tier: 'gold', division: 1 },
+  { min: 1300, max: 1400, tier: 'gold', division: 2 },
+  { min: 1400, max: 1500, tier: 'gold', division: 3 },
+  { min: 1500, max: 1600, tier: 'platinum', division: 1 },
+  { min: 1600, max: 1700, tier: 'platinum', division: 2 },
+  { min: 1700, max: 1800, tier: 'platinum', division: 3 },
+  { min: 1800, max: 1900, tier: 'platinum', division: 4 },
+  { min: 1900, max: 2000, tier: 'diamond', division: 1 },
+  { min: 2000, max: 2100, tier: 'diamond', division: 2 },
+  { min: 2100, max: 2200, tier: 'diamond', division: 3 },
+  { min: 2200, max: 2300, tier: 'diamond', division: 4 },
+  { min: 2300, max: 2400, tier: 'grandmaster', division: 1 },
+  { min: 2400, max: 2500, tier: 'grandmaster', division: 2 },
+  { min: 2500, max: 2600, tier: 'grandmaster', division: 3 },
+  { min: 2600, tier: 'grandmaster', division: 4 },
+];
+
+const getRankFromMMR = (mmr: number): Rank => {
+  const normalizedMmr = Math.max(0, mmr);
+  const band =
+    RANK_BANDS.find(({ min, max }) => normalizedMmr >= min && (max == null || normalizedMmr < max)) ??
+    RANK_BANDS[RANK_BANDS.length - 1];
+
+  return {
+    tier: band.tier,
+    division: band.division,
+    mmr: normalizedMmr,
+  };
+};
+
+const formatRankLabel = (rank: Rank): string => {
+  const tierLabel: Record<RankTier, string> = {
+    bronze: 'Bronze',
+    silver: 'Silver',
+    gold: 'Gold',
+    platinum: 'Platinum',
+    diamond: 'Diamond',
+    master: 'Master',
+    grandmaster: 'Grand Master',
+  };
+  const divisionLabel = ['I', 'II', 'III', 'IV'][rank.division - 1] ?? '';
+
+  return `${tierLabel[rank.tier]} ${divisionLabel}`.trim();
 };
 
 const getRankImage = (tier: RankTier | 'unranked'): string => {
@@ -147,10 +188,11 @@ const LeaderboardContent: React.FC<{
   };
 
   const placementMatchesPlayed = (userRanking?.wins ?? 0) + (userRanking?.losses ?? 0);
-  const completedPlacementMatches = Math.min(placementMatchesPlayed, PLACEMENT_MATCHES_REQUIRED);
-  const rankTier = userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked';
+  const rank = userRanking?.mmr != null ? getRankFromMMR(userRanking.mmr) : null;
+  const rankTier = rank?.tier ?? 'unranked';
   const rankImage = getRankImage(rankTier);
-  const isRanked = Boolean(userRanking?.rank);
+  const hasCompetitiveMMR = Boolean(rank);
+  const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
   const placementMatchesLeft = Math.max(PLACEMENT_MATCHES_REQUIRED - placementMatchesPlayed, 0);
 
   return (
@@ -169,15 +211,15 @@ const LeaderboardContent: React.FC<{
               <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
                 Your Rank
               </div>
-              <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
-                {isRanked ? `#${userRanking?.rank}` : 'UNRANKED'}
+              <div className="font-black italic tracking-1 text-lg text-black-70">
+                {rankLabel}
               </div>
               <div className="text-xs text-black-70">
                 {!isAuthenticated ? (
                   <Link to="/auth" className="font-bold text-blue-600 hover:underline">
                     Login to play ranked
                   </Link>
-                ) : isRanked && userRanking?.mmr != null ? (
+                ) : hasCompetitiveMMR && userRanking?.mmr != null ? (
                   `${userRanking.mmr} MMR`
                 ) : (
                   `${placementMatchesLeft} placement matches left`

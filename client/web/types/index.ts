@@ -380,7 +380,7 @@ export interface RegionSelectorProps {
 
 // Leaderboard Types
 export type RankTier = 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond' | 'master' | 'grandmaster';
-export type RankDivision = 1 | 2 | 3;
+export type RankDivision = 1 | 2 | 3 | 4;
 
 export interface Rank {
   tier: RankTier;
