@@ -116,7 +116,8 @@ class API {
     gameType: 'solo' | 'duel' | '2v2' | 'ffa',
     season?: string,
     limit?: number,
-    offset?: number
+    offset?: number,
+    region?: string
   ): Promise<LeaderboardResponse> {
     const params = new URLSearchParams({
       queue_mode: queueMode,
@@ -126,6 +127,7 @@ class API {
     if (season) params.append('season', season);
     if (limit !== undefined) params.append('limit', limit.toString());
     if (offset !== undefined) params.append('offset', offset.toString());
+    if (region) params.append('region', region);
 
     return this.request<LeaderboardResponse>(`/leaderboard?${params.toString()}`);
   }

@@ -19,6 +19,7 @@ const LeaderboardContent: React.FC<{
   selectedMode: LobbyGameMode;
   setSelectedMode: (mode: LobbyGameMode) => void;
 }> = ({ selectedSeason, setSelectedSeason, selectedMode, setSelectedMode }) => {
+  const [selectedRegion, setSelectedRegion] = useState<string>('global');
   const [seasons, setSeasons] = useState<string[]>([]);
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -26,6 +27,13 @@ const LeaderboardContent: React.FC<{
   const [hasMore, setHasMore] = useState(false);
   const [offset, setOffset] = useState(0);
   const LIMIT = 25;
+
+  // Available regions for filtering
+  const regions = [
+    { id: 'global', label: 'Global' },
+    { id: 'us-east-1', label: 'US East' },
+    { id: 'eu-west-1', label: 'EU West' },
+  ];
 
   // Fetch seasons on mount
   useEffect(() => {
@@ -54,7 +62,8 @@ const LeaderboardContent: React.FC<{
           selectedMode,
           selectedSeason || undefined,
           LIMIT,
-          offset
+          offset,
+          selectedRegion === 'global' ? undefined : selectedRegion
         );
         if (offset === 0) {
           setLeaderboardData(data.entries);
@@ -72,12 +81,12 @@ const LeaderboardContent: React.FC<{
     };
 
     fetchLeaderboard();
-  }, [selectedSeason, selectedMode, offset]);
+  }, [selectedSeason, selectedMode, selectedRegion, offset]);
 
   // Reset offset when filters change
   useEffect(() => {
     setOffset(0);
-  }, [selectedSeason, selectedMode]);
+  }, [selectedSeason, selectedMode, selectedRegion]);
 
   const handleLoadMore = () => {
     setOffset(prev => prev + LIMIT);
@@ -93,15 +102,45 @@ const LeaderboardContent: React.FC<{
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
       {/* Header row with selectors */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-end gap-4 mb-8">
-        {/* Selectors */}
-        <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
-          {/* Season Selector */}
-          <div className="relative">
+      <div className="flex flex-col md:flex-row md:items-end md:justify-end gap-6 mb-8">
+        {/* Region Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Region
+          </label>
+          <div className="relative h-[38px]">
+            <select
+              value={selectedRegion}
+              onChange={(e) => setSelectedRegion(e.target.value)}
+              className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
+                         font-black italic uppercase tracking-1 text-sm text-black-70
+                         focus:outline-none focus:border-blue-500 cursor-pointer
+                         appearance-none"
+            >
+              {regions.map((region) => (
+                <option key={region.id} value={region.id}>
+                  {region.label}
+                </option>
+              ))}
+            </select>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
+              <svg className="w-4 h-4 text-black-70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Season Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Season
+          </label>
+          <div className="relative h-[38px]">
             <select
               value={selectedSeason}
               onChange={(e) => setSelectedSeason(e.target.value)}
-              className="w-full sm:w-auto px-4 py-2 pr-8 border-2 border-gray-300 rounded-lg bg-white
+              className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
                          font-black italic uppercase tracking-1 text-sm text-black-70
                          focus:outline-none focus:border-blue-500 cursor-pointer
                          appearance-none"
@@ -118,9 +157,14 @@ const LeaderboardContent: React.FC<{
               </svg>
             </div>
           </div>
+        </div>
 
-          {/* Game Mode Selector */}
-          <div className="grid grid-cols-4 gap-2">
+        {/* Game Mode Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Game Mode
+          </label>
+          <div className="grid grid-cols-4 gap-2 h-[38px]">
             {gameModes.map((mode) => {
               const isSelected = selectedMode === mode.id;
               return (
@@ -129,7 +173,7 @@ const LeaderboardContent: React.FC<{
                   type="button"
                   onClick={() => setSelectedMode(mode.id)}
                   className={`
-                    px-3 py-2 rounded-lg font-black italic uppercase tracking-1 text-xs
+                    h-full px-3 rounded-lg font-black italic uppercase tracking-1 text-xs
                     transition-all border-2
                     ${
                       isSelected

@@ -20,6 +20,8 @@ pub struct LeaderboardQuery {
     pub limit: Option<usize>,
     /// Offset for pagination (default: 0)
     pub offset: Option<usize>,
+    /// Region filter (optional, omit for global rankings)
+    pub region: Option<String>,
 }
 
 /// Leaderboard entry response format for frontend
@@ -103,11 +105,11 @@ pub async fn get_leaderboard(
     // Fetch one extra entry to determine if there are more results
     let fetch_limit = limit + 1;
 
-    // Query leaderboard from database (global rankings, no region filter)
+    // Query leaderboard from database (with optional region filter)
     let entries = match state.db.get_leaderboard(
         &queue_mode,
         Some(&game_type),
-        None, // region = None for global rankings
+        query.region.as_deref(), // Pass region if specified, None for global
         &season,
         offset + fetch_limit, // Fetch up to offset + limit + 1
     ).await {
