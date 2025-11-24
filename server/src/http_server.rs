@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    http::StatusCode,
     extract::{State, ws::WebSocketUpgrade},
     middleware,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, options},
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -171,6 +172,8 @@ pub async fn run_http_server(
                 rate_limit_middleware,
             )),
         )
+        // Catch-all preflight for all API routes to avoid 500s on OPTIONS
+        .route("/api/*path", options(|| async { StatusCode::NO_CONTENT }))
         .merge(protected_routes)
         .merge(region_routes)
         .merge(leaderboard_routes)
