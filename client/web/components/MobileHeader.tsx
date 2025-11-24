@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { RegionSelector } from './RegionSelector';
 import { Region, User } from '../types';
 
@@ -25,6 +25,9 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
   isInviteDisabled = false
 }) => {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const location = useLocation();
+  const isPlayPage = location.pathname === '/';
+  const isLeaderboardsPage = location.pathname === '/leaderboards';
 
   return (
     <>
@@ -86,17 +89,25 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
               <Link
                 to="/"
                 onClick={() => setIsSidebarOpen(false)}
-                className="text-black-70 font-black italic uppercase tracking-1 opacity-100 underline underline-offset-6"
+                className={`text-black-70 font-black italic uppercase tracking-1 transition-opacity ${
+                  isPlayPage
+                    ? 'opacity-100 underline underline-offset-6'
+                    : 'opacity-70 hover:opacity-100'
+                }`}
               >
                 Play
               </Link>
-              <a
-                href="#"
+              <Link
+                to="/leaderboards"
                 onClick={() => setIsSidebarOpen(false)}
-                className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity"
+                className={`text-black-70 font-black italic uppercase tracking-1 transition-opacity ${
+                  isLeaderboardsPage
+                    ? 'opacity-100 underline underline-offset-6'
+                    : 'opacity-70 hover:opacity-100'
+                }`}
               >
                 Leaderboards
-              </a>
+              </Link>
               <Link
                 to="/spectate"
                 onClick={() => setIsSidebarOpen(false)}

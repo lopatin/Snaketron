@@ -10,6 +10,7 @@ import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
 import { NewHome } from './components/NewHome';
+import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider } from './contexts/AuthContext';
@@ -23,6 +24,7 @@ function AppContent() {
       <AnimatedRoutes>
         <Route path="/" element={<NewHome />} />
         <Route path="/auth" element={<Auth />} />
+        <Route path="/leaderboards" element={<Leaderboard />} />
         <Route path="/game-modes/:category" element={<GameModeSelector />} />
         <Route path="/custom" element={<CustomGameCreator />} />
         <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />

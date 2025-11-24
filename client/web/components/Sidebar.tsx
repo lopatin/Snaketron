@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { RegionSelector } from './RegionSelector';
 import { Region, LobbyMember } from '../types';
 
@@ -30,6 +30,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onJoinGame,
   isInviteDisabled = false
 }) => {
+  const location = useLocation();
+  const isPlayPage = location.pathname === '/';
+  const isLeaderboardsPage = location.pathname === '/leaderboards';
+
   return (
     <aside className="sidebar h-screen flex flex-col">
       {/* Spacer to push content to center */}
@@ -41,16 +45,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <nav className="flex flex-col items-end pr-8 gap-3 mb-8">
         <Link
           to="/"
-          className="text-black-70 font-black italic uppercase tracking-1 opacity-100 underline underline-offset-6"
+          className={`text-black-70 font-black italic uppercase tracking-1 transition-opacity ${
+            isPlayPage
+              ? 'opacity-100 underline underline-offset-6'
+              : 'opacity-70 hover:opacity-100'
+          }`}
         >
           Play
         </Link>
-        <a
-          href="#"
-          className="text-black-70 font-black italic uppercase tracking-1 opacity-70 hover:opacity-100 transition-opacity"
+        <Link
+          to="/leaderboards"
+          className={`text-black-70 font-black italic uppercase tracking-1 transition-opacity ${
+            isLeaderboardsPage
+              ? 'opacity-100 underline underline-offset-6'
+              : 'opacity-70 hover:opacity-100'
+          }`}
         >
           Leaderboards
-        </a>
+        </Link>
         <a
           href="#"
           onClick={(e) => {

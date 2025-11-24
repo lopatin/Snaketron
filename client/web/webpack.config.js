@@ -34,7 +34,11 @@ module.exports = {
   },
   mode: "development",
   plugins: [
-    new CopyWebpackPlugin(['index.html', 'SnaketronLogo.png']),
+    new CopyWebpackPlugin([
+      'index.html',
+      'SnaketronLogo.png',
+      { from: 'public/images', to: 'images' }
+    ]),
     new webpack.DefinePlugin({
       'process.env.REACT_APP_WS_URL': JSON.stringify(process.env.REACT_APP_WS_URL || ''),
       'process.env.REACT_APP_API_URL': JSON.stringify(process.env.REACT_APP_API_URL || ''),

@@ -377,3 +377,28 @@ export interface RegionSelectorProps {
   currentRegionId: string;
   onRegionChange: (regionId: string) => void;
 }
+
+// Leaderboard Types
+export type RankTier = 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond' | 'master' | 'grandmaster';
+export type RankDivision = 1 | 2 | 3;
+
+export interface Rank {
+  tier: RankTier;
+  division: RankDivision;
+  mmr: number;
+}
+
+export interface LeaderboardEntry {
+  rank: number;
+  username: string;
+  mmr: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+}
+
+export interface LeaderboardData {
+  season: string;
+  gameMode: LobbyGameMode;
+  entries: LeaderboardEntry[];
+}

@@ -2,7 +2,7 @@ You are an expert frontend software engineer. Please make the appropriate change
 
 When designing UI components, use the following screenshots to guide the look and feel: 
 - @client/design/design-vibe-10.png
-- @client/design/design-vibe-new.png
+- @client/design/design-vibe-new-2.png
 
 The look and feel of the Scoreboard in the screenshots is a good example of what to aim for. It is clean, sleek, and modern.
 
