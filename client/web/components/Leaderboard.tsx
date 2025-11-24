@@ -8,8 +8,9 @@ import JoinGameModal from './JoinGameModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
-import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry } from '../types';
+import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry, GameType } from '../types';
 import { api } from '../services/api';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -112,6 +113,8 @@ const LeaderboardContent: React.FC<{
   seasons,
   isAuthenticated
 }) => {
+  const { queueForMatch } = useGameWebSocket();
+  const { isConnected, currentLobby, createLobby, updateLobbyPreferences } = useWebSocket();
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -119,7 +122,7 @@ const LeaderboardContent: React.FC<{
   const [offset, setOffset] = useState(0);
   const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
   const LIMIT = 25;
-  const PLACEMENT_MATCHES_REQUIRED = 10;
+  const [isStartingPlacementQueue, setIsStartingPlacementQueue] = useState(false);
 
   // Fetch user's ranking when authenticated and filters change
   useEffect(() => {
@@ -187,13 +190,55 @@ const LeaderboardContent: React.FC<{
     setOffset(prev => prev + LIMIT);
   };
 
-  const placementMatchesPlayed = (userRanking?.wins ?? 0) + (userRanking?.losses ?? 0);
+  const toGameType = (mode: LobbyGameMode): GameType => {
+    switch (mode) {
+      case 'duel':
+        return { TeamMatch: { per_team: 1 } };
+      case '2v2':
+        return { TeamMatch: { per_team: 2 } };
+      case 'ffa':
+        return { FreeForAll: { max_players: 4 } };
+      default:
+        return 'Solo';
+    }
+  };
+
+  const startPlacementQueue = async () => {
+    if (isStartingPlacementQueue || selectedMode === 'solo') {
+      return;
+    }
+
+    setIsStartingPlacementQueue(true);
+    try {
+      if (!isConnected) {
+        throw new Error('Not connected to game server');
+      }
+
+      if (!currentLobby) {
+        await createLobby();
+      }
+
+      updateLobbyPreferences({
+        selectedModes: [selectedMode],
+        competitive: true,
+      });
+
+      // Small delay so the server registers preference updates
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      queueForMatch(toGameType(selectedMode), 'Competitive');
+    } catch (err) {
+      console.error('Failed to start placement matchmaking:', err);
+    } finally {
+      setIsStartingPlacementQueue(false);
+    }
+  };
+
   const rank = userRanking?.mmr != null ? getRankFromMMR(userRanking.mmr) : null;
   const rankTier = rank?.tier ?? 'unranked';
   const rankImage = getRankImage(rankTier);
   const hasCompetitiveMMR = Boolean(rank);
   const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
-  const placementMatchesLeft = Math.max(PLACEMENT_MATCHES_REQUIRED - placementMatchesPlayed, 0);
 
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
@@ -222,7 +267,14 @@ const LeaderboardContent: React.FC<{
                 ) : hasCompetitiveMMR && userRanking?.mmr != null ? (
                   `${userRanking.mmr} MMR`
                 ) : (
-                  `${placementMatchesLeft} placement matches left`
+                  <button
+                    type="button"
+                    onClick={startPlacementQueue}
+                    disabled={isStartingPlacementQueue}
+                    className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {isStartingPlacementQueue ? 'Starting matchmaking...' : 'Play your first game'}
+                  </button>
                 )}
               </div>
             </div>
