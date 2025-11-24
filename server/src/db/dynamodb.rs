@@ -1489,6 +1489,16 @@ impl Database for DynamoDatabase {
 
         let timestamp = Utc::now().to_rfc3339();
 
+        debug!(
+            "Inserting high score - table: {}, pk: {}, sk: {}, user: {}, score: {}, season: {}",
+            self.high_scores_table(),
+            pk,
+            sk,
+            username,
+            score,
+            season
+        );
+
         self.client
             .put_item()
             .table_name(self.high_scores_table())
@@ -1523,6 +1533,14 @@ impl Database for DynamoDatabase {
         // PK for querying high scores
         let pk = format!("SCORE#{}#{}", game_type_str, region_str);
 
+        debug!(
+            "Querying high scores - table: {}, pk: {}, season: {}, limit: {}",
+            self.high_scores_table(),
+            pk,
+            season,
+            limit
+        );
+
         // Query high scores table with season filter
         let response = self.client
             .query()
@@ -1537,12 +1555,13 @@ impl Database for DynamoDatabase {
             .context("Failed to query high scores")?;
 
         let items = response.items.unwrap_or_default();
+        debug!("Retrieved {} high score items from DynamoDB", items.len());
 
         // Parse results into HighScoreEntry
         let entries: Vec<HighScoreEntry> = items
             .into_iter()
             .filter_map(|item| {
-                Some(HighScoreEntry {
+                let entry = HighScoreEntry {
                     game_id: Self::extract_string(&item, "gameId")?,
                     user_id: Self::extract_number(&item, "userId")?,
                     username: Self::extract_string(&item, "username")?,
@@ -1554,10 +1573,16 @@ impl Database for DynamoDatabase {
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(Utc::now),
-                })
+                };
+                debug!(
+                    "Parsed high score entry - user: {}, score: {}, game_id: {}",
+                    entry.username, entry.score, entry.game_id
+                );
+                Some(entry)
             })
             .collect();
 
+        debug!("Successfully parsed {} high score entries", entries.len());
         Ok(entries)
     }
 }

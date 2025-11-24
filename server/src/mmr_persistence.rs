@@ -6,7 +6,7 @@ use skillratings::weng_lin::{weng_lin, weng_lin_multi_team, weng_lin_two_teams, 
 use skillratings::MultiTeamOutcome;
 use skillratings::Outcomes;
 use std::collections::{HashMap, HashSet};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Persist MMR changes for all players in a completed game to the database.
 /// Uses the Weng-Lin algorithm to calculate new ratings and atomic ADD operations for updates.
@@ -421,6 +421,14 @@ async fn persist_solo_high_scores(
     let season = get_current_season();
     let region = get_region();
 
+    info!(
+        "Persisting high scores for solo game {} with {} players (season: {}, region: {})",
+        game_id,
+        game_state.players.len(),
+        season,
+        region
+    );
+
     // For each player, insert their high score
     for (user_id, player) in &game_state.players {
         let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
@@ -429,6 +437,11 @@ async fn persist_solo_high_scores(
             .get(user_id)
             .cloned()
             .unwrap_or_else(|| format!("User{}", user_id));
+
+        debug!(
+            "Processing high score for user {} ({}): score={}, snake_id={}",
+            user_id, username, score, player.snake_id
+        );
 
         match db
             .insert_high_score(

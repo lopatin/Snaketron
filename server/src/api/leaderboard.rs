@@ -1,7 +1,7 @@
 use axum::{Json, extract::{Query, State}, http::StatusCode, Extension};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use std::sync::Arc;
 
 use crate::db::Database;
@@ -128,6 +128,14 @@ pub async fn get_leaderboard(
 
     // For Solo mode, fetch high scores instead of rankings
     if matches!(game_type, GameType::Solo) {
+        info!(
+            "Fetching Solo high scores - region: {:?}, season: {}, limit: {}, offset: {}",
+            query.region.as_deref(),
+            season,
+            limit,
+            offset
+        );
+
         let high_scores = match state.db.get_high_scores(
             &game_type,
             query.region.as_deref(),
@@ -135,8 +143,10 @@ pub async fn get_leaderboard(
             offset + fetch_limit,
         ).await {
             Ok(mut scores) => {
+                info!("Fetched {} high scores from database", scores.len());
                 // Skip entries up to offset
                 scores.drain(..offset.min(scores.len()));
+                info!("After offset, {} high scores remain", scores.len());
                 scores
             }
             Err(e) => {
@@ -169,6 +179,12 @@ pub async fn get_leaderboard(
                 })
             })
             .collect();
+
+        info!(
+            "Returning {} high score entries (has_more: {})",
+            response_entries.len(),
+            has_more
+        );
 
         return Json(LeaderboardResponse {
             entries: response_entries,
