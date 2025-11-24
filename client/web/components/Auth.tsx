@@ -278,7 +278,7 @@ function Auth() {
                       : 'border-gray-300 bg-gray-50 cursor-not-allowed opacity-50 text-gray-500'
                   }`}
                 >
-                  START GAME
+                  LOGIN
                 </button>
               </div>
             </>
