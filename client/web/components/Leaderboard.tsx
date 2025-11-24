@@ -433,10 +433,16 @@ export const Leaderboard: React.FC = () => {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
-  const [selectedSeason, setSelectedSeason] = useState<string>('');
-  const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(DEFAULT_LEADERBOARD_MODE);
-  const [selectedLeaderboardRegion, setSelectedLeaderboardRegion] = useState<string>(DEFAULT_LEADERBOARD_REGION);
   const [seasons, setSeasons] = useState<string[]>([]);
+  const [selectedSeason, setSelectedSeason] = useState<string>(() => searchParams.get('season') || '');
+  const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
+    const queryMode = searchParams.get('mode');
+    return isValidLeaderboardMode(queryMode) ? queryMode : DEFAULT_LEADERBOARD_MODE;
+  });
+  const [selectedLeaderboardRegion, setSelectedLeaderboardRegion] = useState<string>(() => {
+    const queryRegion = searchParams.get('region');
+    return isValidLeaderboardRegion(queryRegion) ? queryRegion : DEFAULT_LEADERBOARD_REGION;
+  });
 
   // Use regions hook for live data
   const {
@@ -475,65 +481,72 @@ export const Leaderboard: React.FC = () => {
     fetchSeasons();
   }, []);
 
-  // Apply query params (or defaults) to the local selections
+  // Sync local selections from URL (and season list) whenever the URL changes
   useEffect(() => {
     const modeFromQuery = searchParams.get('mode');
     const regionFromQuery = searchParams.get('region');
+    const seasonFromQuery = searchParams.get('season');
 
-    const queryMode: LobbyGameMode = isValidLeaderboardMode(modeFromQuery)
+    const resolvedMode: LobbyGameMode = isValidLeaderboardMode(modeFromQuery)
       ? modeFromQuery
       : DEFAULT_LEADERBOARD_MODE;
-    const queryRegion = isValidLeaderboardRegion(regionFromQuery)
+
+    const resolvedRegion = isValidLeaderboardRegion(regionFromQuery)
       ? regionFromQuery
       : DEFAULT_LEADERBOARD_REGION;
 
-    setSelectedMode(queryMode);
-    setSelectedLeaderboardRegion(queryRegion);
-  }, [searchParams]);
+    const resolvedSeason =
+      seasons.length === 0
+        ? ''
+        : seasonFromQuery && seasons.includes(seasonFromQuery)
+          ? seasonFromQuery
+          : seasons[0];
 
+    setSelectedMode(prev => (prev === resolvedMode ? prev : resolvedMode));
+    setSelectedLeaderboardRegion(prev => (prev === resolvedRegion ? prev : resolvedRegion));
+    setSelectedSeason(prev => (prev === resolvedSeason ? prev : resolvedSeason));
+  }, [searchParams, seasons]);
+
+  // Keep the URL in sync with the current selections
   useEffect(() => {
     if (seasons.length === 0) {
       return;
     }
 
-    const latestSeason = seasons[0];
-    const querySeason = searchParams.get('season');
-    const resolvedSeason = querySeason && seasons.includes(querySeason) ? querySeason : latestSeason;
-
-    if (resolvedSeason) {
-      setSelectedSeason(resolvedSeason);
-    }
-  }, [searchParams, seasons]);
-
-  // Keep the URL in sync with the current selections
-  useEffect(() => {
     const params = new URLSearchParams(searchParams);
     let hasChanged = false;
 
-    if (selectedSeason) {
-      if (params.get('season') !== selectedSeason) {
-        params.set('season', selectedSeason);
-        hasChanged = true;
-      }
-    } else if (params.has('season')) {
-      params.delete('season');
+    if (!isValidLeaderboardMode(params.get('mode'))) {
+      params.set('mode', DEFAULT_LEADERBOARD_MODE);
       hasChanged = true;
     }
-
     if (params.get('mode') !== selectedMode) {
       params.set('mode', selectedMode);
       hasChanged = true;
     }
 
+    if (!isValidLeaderboardRegion(params.get('region'))) {
+      params.set('region', DEFAULT_LEADERBOARD_REGION);
+      hasChanged = true;
+    }
     if (params.get('region') !== selectedLeaderboardRegion) {
       params.set('region', selectedLeaderboardRegion);
+      hasChanged = true;
+    }
+
+    const season = selectedSeason || params.get('season');
+    const resolvedSeason =
+      season && seasons.includes(season) ? season : seasons[0];
+
+    if (params.get('season') !== resolvedSeason) {
+      params.set('season', resolvedSeason);
       hasChanged = true;
     }
 
     if (hasChanged) {
       setSearchParams(params, { replace: true });
     }
-  }, [selectedSeason, selectedMode, selectedLeaderboardRegion, searchParams, setSearchParams]);
+  }, [selectedSeason, selectedMode, selectedLeaderboardRegion, searchParams, seasons, setSearchParams]);
 
   // Connect to selected region when it changes
   useEffect(() => {
