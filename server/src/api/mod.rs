@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod jwt;
+pub mod leaderboard;
 pub mod middleware;
 pub mod rate_limit;
 pub mod regions;

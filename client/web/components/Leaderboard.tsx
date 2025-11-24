@@ -9,79 +9,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry } from '../types';
+import { api } from '../services/api';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
-
-// Dummy data for demonstration
-const DUMMY_LEADERBOARD_DATA: Record<string, Record<LobbyGameMode, LeaderboardEntry[]>> = {
-  'Season 1': {
-    duel: [
-      { rank: 1, username: 'SnakeMaster', mmr: 2450, wins: 142, losses: 38, winRate: 78.9 },
-      { rank: 2, username: 'Lopatron', mmr: 2380, wins: 128, losses: 42, winRate: 75.3 },
-      { rank: 3, username: 'VenomousViper', mmr: 2310, wins: 115, losses: 45, winRate: 71.9 },
-      { rank: 4, username: 'SlitherKing', mmr: 2280, wins: 105, losses: 48, winRate: 68.6 },
-      { rank: 5, username: 'CobraCommander', mmr: 2245, wins: 98, losses: 52, winRate: 65.3 },
-      { rank: 6, username: 'PythonPro', mmr: 2210, wins: 92, losses: 55, winRate: 62.6 },
-      { rank: 7, username: 'RattlerRex', mmr: 2180, wins: 88, losses: 58, winRate: 60.3 },
-      { rank: 8, username: 'AnacondaAce', mmr: 2150, wins: 85, losses: 61, winRate: 58.2 },
-      { rank: 9, username: 'SerpentSage', mmr: 2120, wins: 82, losses: 64, winRate: 56.2 },
-      { rank: 10, username: 'ViperVault', mmr: 2090, wins: 78, losses: 67, winRate: 53.8 },
-    ],
-    '2v2': [
-      { rank: 1, username: 'TeamTango', mmr: 2520, wins: 156, losses: 32, winRate: 83.0 },
-      { rank: 2, username: 'DuoDestroyer', mmr: 2440, wins: 138, losses: 40, winRate: 77.5 },
-      { rank: 3, username: 'PartnerPlay', mmr: 2370, wins: 122, losses: 46, winRate: 72.6 },
-      { rank: 4, username: 'SyncSquad', mmr: 2310, wins: 110, losses: 52, winRate: 67.9 },
-      { rank: 5, username: 'TagTeamTitan', mmr: 2260, wins: 102, losses: 56, winRate: 64.6 },
-      { rank: 6, username: 'CoopChampion', mmr: 2220, wins: 95, losses: 60, winRate: 61.3 },
-      { rank: 7, username: 'AllyAces', mmr: 2180, wins: 88, losses: 64, winRate: 57.9 },
-      { rank: 8, username: 'BuddyBrawler', mmr: 2150, wins: 82, losses: 68, winRate: 54.7 },
-      { rank: 9, username: 'PairPower', mmr: 2110, wins: 76, losses: 72, winRate: 51.4 },
-      { rank: 10, username: 'DuoDynamic', mmr: 2080, wins: 72, losses: 75, winRate: 49.0 },
-    ],
-    solo: [
-      { rank: 1, username: 'LoneWolf', mmr: 2380, wins: 135, losses: 40, winRate: 77.1 },
-      { rank: 2, username: 'SoloSurvivor', mmr: 2320, wins: 118, losses: 45, winRate: 72.4 },
-      { rank: 3, username: 'OneManArmy', mmr: 2260, wins: 105, losses: 50, winRate: 67.7 },
-      { rank: 4, username: 'IndieInvader', mmr: 2210, wins: 96, losses: 54, winRate: 64.0 },
-      { rank: 5, username: 'RogueSerpent', mmr: 2170, wins: 88, losses: 58, winRate: 60.3 },
-      { rank: 6, username: 'FreestyleKing', mmr: 2130, wins: 82, losses: 62, winRate: 56.9 },
-      { rank: 7, username: 'SoloSlayer', mmr: 2100, wins: 76, losses: 66, winRate: 53.5 },
-      { rank: 8, username: 'LoneStar', mmr: 2070, wins: 72, losses: 70, winRate: 50.7 },
-      { rank: 9, username: 'Maverick', mmr: 2040, wins: 68, losses: 74, winRate: 47.9 },
-      { rank: 10, username: 'SoloStorm', mmr: 2010, wins: 64, losses: 78, winRate: 45.1 },
-    ],
-    ffa: [
-      { rank: 1, username: 'ChaosKing', mmr: 2490, wins: 148, losses: 36, winRate: 80.4 },
-      { rank: 2, username: 'BrawlBoss', mmr: 2410, wins: 132, losses: 42, winRate: 75.9 },
-      { rank: 3, username: 'MeleeMaster', mmr: 2340, wins: 118, losses: 48, winRate: 71.1 },
-      { rank: 4, username: 'RumbleRuler', mmr: 2280, wins: 106, losses: 52, winRate: 67.1 },
-      { rank: 5, username: 'FFAPhenom', mmr: 2230, wins: 98, losses: 56, winRate: 63.6 },
-      { rank: 6, username: 'AllOutAttack', mmr: 2190, wins: 90, losses: 60, winRate: 60.0 },
-      { rank: 7, username: 'FreeForAllFury', mmr: 2150, wins: 84, losses: 64, winRate: 56.8 },
-      { rank: 8, username: 'BattleRoyale', mmr: 2120, wins: 78, losses: 68, winRate: 53.4 },
-      { rank: 9, username: 'ScrambleSnake', mmr: 2080, wins: 72, losses: 72, winRate: 50.0 },
-      { rank: 10, username: 'MultiMayhem', mmr: 2050, wins: 68, losses: 76, winRate: 47.2 },
-    ],
-  },
-};
-
-const MY_CURRENT_RANK: Rank = {
-  tier: 'gold',
-  division: 2,
-  mmr: 1850,
-};
-
-const formatRankDisplay = (rank: Rank): string => {
-  const tierName = rank.tier.charAt(0).toUpperCase() + rank.tier.slice(1);
-  return `${tierName} ${rank.division}`;
-};
-
-const getRankImage = (tier: RankTier): string => {
-  // Map master to grandmaster since we don't have a separate master.png
-  const imageTier = tier === 'master' ? 'grandmaster' : tier;
-  return `/images/${imageTier}.png`;
-};
 
 const LeaderboardContent: React.FC<{
   selectedSeason: string;
@@ -89,8 +19,69 @@ const LeaderboardContent: React.FC<{
   selectedMode: LobbyGameMode;
   setSelectedMode: (mode: LobbyGameMode) => void;
 }> = ({ selectedSeason, setSelectedSeason, selectedMode, setSelectedMode }) => {
-  const seasons = Object.keys(DUMMY_LEADERBOARD_DATA);
-  const leaderboardData = DUMMY_LEADERBOARD_DATA[selectedSeason]?.[selectedMode] || [];
+  const [seasons, setSeasons] = useState<string[]>([]);
+  const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const LIMIT = 25;
+
+  // Fetch seasons on mount
+  useEffect(() => {
+    const fetchSeasons = async () => {
+      try {
+        const data = await api.getSeasons();
+        setSeasons(data.seasons);
+        if (data.seasons.length > 0 && !selectedSeason) {
+          setSelectedSeason(data.current);
+        }
+      } catch (err) {
+        console.error('Failed to fetch seasons:', err);
+      }
+    };
+    fetchSeasons();
+  }, []);
+
+  // Fetch leaderboard data when filters change (always use competitive mode)
+  useEffect(() => {
+    const fetchLeaderboard = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await api.getLeaderboard(
+          'competitive', // Only show competitive (ranked) MMR
+          selectedMode,
+          selectedSeason || undefined,
+          LIMIT,
+          offset
+        );
+        if (offset === 0) {
+          setLeaderboardData(data.entries);
+        } else {
+          setLeaderboardData(prev => [...prev, ...data.entries]);
+        }
+        setHasMore(data.hasMore);
+      } catch (err) {
+        console.error('Failed to fetch leaderboard:', err);
+        setError('Failed to load leaderboard data');
+        setLeaderboardData([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchLeaderboard();
+  }, [selectedSeason, selectedMode, offset]);
+
+  // Reset offset when filters change
+  useEffect(() => {
+    setOffset(0);
+  }, [selectedSeason, selectedMode]);
+
+  const handleLoadMore = () => {
+    setOffset(prev => prev + LIMIT);
+  };
 
   const gameModes: Array<{ id: LobbyGameMode; label: string }> = [
     { id: 'duel', label: 'DUEL' },
@@ -101,26 +92,10 @@ const LeaderboardContent: React.FC<{
 
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
-      {/* Header row with current rank and selectors */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
-        {/* Current Rank Display */}
-        <div className="flex items-center gap-3">
-          <img
-            src={getRankImage(MY_CURRENT_RANK.tier)}
-            alt={MY_CURRENT_RANK.tier}
-            className="w-12 h-12 object-contain"
-          />
-          <div>
-            <div className="text-xs uppercase tracking-1 text-black-70 font-bold">Your Rank</div>
-            <div className="font-black italic uppercase tracking-1 text-lg">
-              {formatRankDisplay(MY_CURRENT_RANK)}
-            </div>
-            <div className="text-xs text-black-70">{MY_CURRENT_RANK.mmr} MMR</div>
-          </div>
-        </div>
-
+      {/* Header row with selectors */}
+      <div className="flex flex-col md:flex-row md:items-center md:justify-end gap-4 mb-8">
         {/* Selectors */}
-        <div className="flex flex-col sm:flex-row gap-3">
+        <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
           {/* Season Selector */}
           <div className="relative">
             <select
@@ -185,44 +160,80 @@ const LeaderboardContent: React.FC<{
 
         {/* Table Body */}
         <div className="divide-y divide-gray-200">
-          {leaderboardData.map((entry) => (
-            <div
-              key={entry.rank}
-              className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
-            >
-              {/* Rank */}
-              <div className="flex items-center">
-                <span className="font-black text-base text-black-70">{entry.rank}</span>
-              </div>
-
-              {/* Username */}
-              <div className="flex items-center font-bold text-sm text-black-70 truncate">
-                {entry.username}
-              </div>
-
-              {/* MMR */}
-              <div className="flex items-center justify-end font-black italic text-base text-black-70">
-                {entry.mmr}
-              </div>
-
-              {/* Wins (hidden on mobile) */}
-              <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
-                {entry.wins}
-              </div>
-
-              {/* Losses (hidden on mobile) */}
-              <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
-                {entry.losses}
-              </div>
-
-              {/* Win Rate */}
-              <div className="flex items-center justify-end font-bold text-sm text-black-70">
-                {entry.winRate.toFixed(1)}%
-              </div>
+          {loading && offset === 0 ? (
+            <div className="px-4 py-12 text-center text-black-70">
+              Loading...
             </div>
-          ))}
+          ) : error ? (
+            <div className="px-4 py-12 text-center text-red-600">
+              {error}
+            </div>
+          ) : leaderboardData.length === 0 ? (
+            <div className="px-4 py-12 text-center text-black-70">
+              No players have been ranked yet in this mode.
+            </div>
+          ) : (
+            leaderboardData.map((entry) => (
+              <div
+                key={entry.rank}
+                className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+              >
+                {/* Rank */}
+                <div className="flex items-center">
+                  <span className="font-black text-base text-black-70">{entry.rank}</span>
+                </div>
+
+                {/* Username */}
+                <div className="flex items-center font-bold text-sm text-black-70 truncate">
+                  {entry.username}
+                </div>
+
+                {/* MMR */}
+                <div className="flex items-center justify-end font-black italic text-base text-black-70">
+                  {entry.mmr}
+                </div>
+
+                {/* Wins (hidden on mobile) */}
+                <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                  {entry.wins}
+                </div>
+
+                {/* Losses (hidden on mobile) */}
+                <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                  {entry.losses}
+                </div>
+
+                {/* Win Rate */}
+                <div className="flex items-center justify-end font-bold text-sm text-black-70">
+                  {entry.winRate.toFixed(1)}%
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </div>
+
+      {/* Load More Button */}
+      {hasMore && !loading && (
+        <div className="mt-6 text-center">
+          <button
+            type="button"
+            onClick={handleLoadMore}
+            className="px-6 py-2 border-2 border-gray-300 rounded-lg bg-white text-black-70
+                       font-black italic uppercase tracking-1 text-sm
+                       hover:border-gray-400 transition-all"
+          >
+            LOAD MORE
+          </button>
+        </div>
+      )}
+
+      {/* Loading More Indicator */}
+      {loading && offset > 0 && (
+        <div className="mt-6 text-center text-black-70">
+          Loading more...
+        </div>
+      )}
     </div>
   );
 };

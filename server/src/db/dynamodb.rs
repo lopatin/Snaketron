@@ -361,6 +361,17 @@ impl DynamoDatabase {
         AttributeValue::Bool(b)
     }
 
+    fn game_type_to_string(game_type: &common::GameType) -> String {
+        match game_type {
+            common::GameType::Solo => "solo".to_string(),
+            common::GameType::TeamMatch { per_team: 1 } => "duel".to_string(),
+            common::GameType::TeamMatch { per_team: 2 } => "2v2".to_string(),
+            common::GameType::TeamMatch { per_team } => format!("team-{}", per_team),
+            common::GameType::FreeForAll { .. } => "ffa".to_string(),
+            common::GameType::Custom { .. } => "custom".to_string(),
+        }
+    }
+
     fn extract_string(item: &HashMap<String, AttributeValue>, key: &str) -> Option<String> {
         item.get(key).and_then(|v| v.as_s().ok()).cloned()
     }
@@ -1206,6 +1217,7 @@ impl Database for DynamoDatabase {
         username: &str,
         mmr: i32,
         queue_mode: &common::QueueMode,
+        game_type: &common::GameType,
         region: &str,
         season: &str,
         won: bool,
@@ -1218,15 +1230,17 @@ impl Database for DynamoDatabase {
             common::QueueMode::Quickmatch => "casual",
         };
 
+        let game_type_str = Self::game_type_to_string(game_type);
+
         // Pad MMR to 8 digits for sorting (99999999 - mmr for descending order)
         let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
         let padded_mmr = format!("{:08}", inverted_mmr);
 
-        let pk = format!("RANKING#{}#{}", queue_mode_str, region);
+        let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, region);
         let sk = format!("MMR#{}#USER#{}", padded_mmr, user_id);
 
         // Try to get existing ranking to calculate delta
-        let existing = self.get_user_ranking(user_id, queue_mode, region, season).await?;
+        let existing = self.get_user_ranking(user_id, queue_mode, game_type, region, season).await?;
 
         let (games_played, wins, losses, old_mmr) = match &existing {
             Some(entry) => {
@@ -1252,6 +1266,7 @@ impl Database for DynamoDatabase {
         item.insert("losses".to_string(), Self::av_n(losses));
         item.insert("region".to_string(), Self::av_s(region));
         item.insert("queueMode".to_string(), Self::av_s(queue_mode_str));
+        item.insert("gameType".to_string(), Self::av_s(&game_type_str));
         item.insert("season".to_string(), Self::av_s(season));
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
 
@@ -1282,8 +1297,8 @@ impl Database for DynamoDatabase {
             .context("Failed to upsert ranking")?;
 
         info!(
-            "Updated ranking for user {} in {} {} (season: {}, MMR: {}, games: {}, W/L: {}/{})",
-            user_id, queue_mode_str, region, season, mmr, games_played, wins, losses
+            "Updated ranking for user {} in {} {} {} (season: {}, MMR: {}, games: {}, W/L: {}/{})",
+            user_id, queue_mode_str, game_type_str, region, season, mmr, games_played, wins, losses
         );
 
         Ok(())
@@ -1292,6 +1307,7 @@ impl Database for DynamoDatabase {
     async fn get_leaderboard(
         &self,
         queue_mode: &common::QueueMode,
+        game_type: Option<&common::GameType>,
         region: Option<&str>,
         season: &str,
         limit: usize,
@@ -1304,24 +1320,41 @@ impl Database for DynamoDatabase {
             common::QueueMode::Quickmatch => "casual",
         };
 
-        // Query by region if specified, otherwise query all regions
-        let results = if let Some(reg) = region {
-            // Query specific region
-            let pk = format!("RANKING#{}#{}", queue_mode_str, reg);
+        // Query by region and game_type if specified, otherwise scan with filters
+        let results = if let Some(game_type_ref) = game_type {
+            let game_type_str = Self::game_type_to_string(game_type_ref);
 
-            let response = self.client
-                .query()
-                .table_name(self.rankings_table(season))
-                .key_condition_expression("pk = :pk")
-                .expression_attribute_values(":pk", Self::av_s(&pk))
-                .limit(limit as i32)
-                .send()
-                .await
-                .context("Failed to query leaderboard")?;
+            if let Some(reg) = region {
+                // Query specific region and game type
+                let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, reg);
 
-            response.items.unwrap_or_default()
+                let response = self.client
+                    .query()
+                    .table_name(self.rankings_table(season))
+                    .key_condition_expression("pk = :pk")
+                    .expression_attribute_values(":pk", Self::av_s(&pk))
+                    .limit(limit as i32)
+                    .send()
+                    .await
+                    .context("Failed to query leaderboard")?;
+
+                response.items.unwrap_or_default()
+            } else {
+                // Query all regions for specific game type
+                let response = self.client
+                    .scan()
+                    .table_name(self.rankings_table(season))
+                    .filter_expression("begins_with(pk, :prefix)")
+                    .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}#{}", queue_mode_str, game_type_str)))
+                    .limit(limit as i32)
+                    .send()
+                    .await
+                    .context("Failed to scan leaderboard")?;
+
+                response.items.unwrap_or_default()
+            }
         } else {
-            // Query all regions by scanning with filter
+            // Query all game types and regions
             let response = self.client
                 .scan()
                 .table_name(self.rankings_table(season))
@@ -1348,6 +1381,7 @@ impl Database for DynamoDatabase {
                     losses: Self::extract_number(&item, "losses")?,
                     region: Self::extract_string(&item, "region")?,
                     queue_mode: Self::extract_string(&item, "queueMode")?,
+                    game_type: Self::extract_string(&item, "gameType").unwrap_or_else(|| "unknown".to_string()),
                     season: Self::extract_string(&item, "season")?,
                     updated_at: Self::extract_string(&item, "updatedAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
@@ -1368,6 +1402,7 @@ impl Database for DynamoDatabase {
         &self,
         user_id: i32,
         queue_mode: &common::QueueMode,
+        game_type: &common::GameType,
         region: &str,
         season: &str,
     ) -> Result<Option<RankingEntry>> {
@@ -1379,7 +1414,8 @@ impl Database for DynamoDatabase {
             common::QueueMode::Quickmatch => "casual",
         };
 
-        let pk = format!("RANKING#{}#{}", queue_mode_str, region);
+        let game_type_str = Self::game_type_to_string(game_type);
+        let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, region);
 
         // Query for this user's ranking
         let response = self.client
@@ -1407,6 +1443,7 @@ impl Database for DynamoDatabase {
             losses: Self::extract_number(item, "losses").unwrap_or(0),
             region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
             queue_mode: Self::extract_string(item, "queueMode").unwrap_or(queue_mode_str.to_string()),
+            game_type: Self::extract_string(item, "gameType").unwrap_or(game_type_str.clone()),
             season: Self::extract_string(item, "season").unwrap_or(season.to_string()),
             updated_at: Self::extract_string(item, "updatedAt")
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())

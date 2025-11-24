@@ -96,6 +96,7 @@ pub struct RankingEntry {
     pub losses: i32,
     pub region: String,
     pub queue_mode: String, // "ranked" or "casual"
+    pub game_type: String,  // "solo", "duel", "2v2", "ffa"
     pub season: String,     // e.g., "2025-S1"
     pub updated_at: DateTime<Utc>,
 }

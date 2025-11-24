@@ -51,6 +51,7 @@ pub trait Database: Send + Sync {
         username: &str,
         mmr: i32,
         queue_mode: &common::QueueMode,
+        game_type: &common::GameType,
         region: &str,
         season: &str,
         won: bool,
@@ -58,6 +59,7 @@ pub trait Database: Send + Sync {
     async fn get_leaderboard(
         &self,
         queue_mode: &common::QueueMode,
+        game_type: Option<&common::GameType>,
         region: Option<&str>,
         season: &str,
         limit: usize,
@@ -66,6 +68,7 @@ pub trait Database: Send + Sync {
         &self,
         user_id: i32,
         queue_mode: &common::QueueMode,
+        game_type: &common::GameType,
         region: &str,
         season: &str,
     ) -> Result<Option<RankingEntry>>;

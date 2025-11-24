@@ -13,6 +13,7 @@ use tracing::info;
 
 use crate::api::auth::{self, AuthState};
 use crate::api::jwt::JwtManager;
+use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::auth_middleware;
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
@@ -142,6 +143,15 @@ pub async fn run_http_server(
         .route("/api/regions/user-counts", get(regions::get_user_counts))
         .with_state(state.clone());
 
+    // Build leaderboard routes with LeaderboardState
+    let leaderboard_state = LeaderboardState {
+        db: db.clone(),
+    };
+    let leaderboard_routes = Router::new()
+        .route("/api/leaderboard", get(leaderboard::get_leaderboard))
+        .route("/api/seasons", get(leaderboard::list_seasons))
+        .with_state(leaderboard_state);
+
     // Build API routes with AuthState
     let api_routes = Router::new()
         .route("/api/health", get(regions::health_check_json))
@@ -157,6 +167,7 @@ pub async fn run_http_server(
         )
         .merge(protected_routes)
         .merge(region_routes)
+        .merge(leaderboard_routes)
         .with_state(auth_state);
 
     // Build main router combining API and WebSocket endpoints

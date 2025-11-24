@@ -1,4 +1,4 @@
-import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse } from '../types';
+import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse, LeaderboardResponse, SeasonsResponse } from '../types';
 
 interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
@@ -109,6 +109,29 @@ class API {
 
   async getCurrentUser(): Promise<User> {
     return this.request<User>('/auth/me');
+  }
+
+  async getLeaderboard(
+    queueMode: 'quickmatch' | 'competitive',
+    gameType: 'solo' | 'duel' | '2v2' | 'ffa',
+    season?: string,
+    limit?: number,
+    offset?: number
+  ): Promise<LeaderboardResponse> {
+    const params = new URLSearchParams({
+      queue_mode: queueMode,
+      game_type: gameType,
+    });
+
+    if (season) params.append('season', season);
+    if (limit !== undefined) params.append('limit', limit.toString());
+    if (offset !== undefined) params.append('offset', offset.toString());
+
+    return this.request<LeaderboardResponse>(`/leaderboard?${params.toString()}`);
+  }
+
+  async getSeasons(): Promise<SeasonsResponse> {
+    return this.request<SeasonsResponse>('/seasons');
   }
 }
 

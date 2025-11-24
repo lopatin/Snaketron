@@ -327,6 +327,7 @@ async fn apply_mmr_deltas(
                 &username,
                 new_mmr,
                 queue_mode,
+                &game_state.game_type,
                 &region,
                 &season,
                 won,
