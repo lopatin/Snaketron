@@ -114,7 +114,7 @@ class API {
   async getLeaderboard(
     queueMode: 'quickmatch' | 'competitive',
     gameType: 'solo' | 'duel' | '2v2' | 'ffa',
-    season?: string,
+    season?: number,
     limit?: number,
     offset?: number,
     region?: string
@@ -124,7 +124,7 @@ class API {
       game_type: gameType,
     });
 
-    if (season) params.append('season', season);
+    if (season !== undefined) params.append('season', season.toString());
     if (limit !== undefined) params.append('limit', limit.toString());
     if (offset !== undefined) params.append('offset', offset.toString());
     if (region) params.append('region', region);
@@ -139,7 +139,7 @@ class API {
   async getMyRanking(
     queueMode: 'quickmatch' | 'competitive',
     gameType: 'solo' | 'duel' | '2v2' | 'ffa',
-    season?: string,
+    season?: number,
     region?: string
   ): Promise<UserRankingResponse> {
     const params = new URLSearchParams({
@@ -147,7 +147,7 @@ class API {
       game_type: gameType,
     });
 
-    if (season) params.append('season', season);
+    if (season !== undefined) params.append('season', season.toString());
     if (region) params.append('region', region);
 
     return this.request<UserRankingResponse>(`/leaderboard/me?${params.toString()}`);

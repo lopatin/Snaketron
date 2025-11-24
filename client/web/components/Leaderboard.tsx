@@ -94,14 +94,22 @@ const getRankImage = (tier: RankTier | 'unranked'): string => {
   return `/images/${imageTier}.png`;
 };
 
+const parseSeasonParam = (value: string | null): number | null => {
+  if (value == null) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
 const LeaderboardContent: React.FC<{
-  selectedSeason: string;
-  setSelectedSeason: (season: string) => void;
+  selectedSeason: number | null;
+  setSelectedSeason: React.Dispatch<React.SetStateAction<number | null>>;
   selectedMode: LobbyGameMode;
   setSelectedMode: (mode: LobbyGameMode) => void;
   selectedRegion: string;
   setSelectedRegion: (region: string) => void;
-  seasons: string[];
+  seasons: number[];
   isAuthenticated: boolean;
 }> = ({
   selectedSeason,
@@ -136,7 +144,7 @@ const LeaderboardContent: React.FC<{
         const data = await api.getMyRanking(
           'competitive',
           selectedMode,
-          selectedSeason || undefined,
+          selectedSeason ?? undefined,
           selectedRegion === 'global' ? undefined : selectedRegion
         );
         setUserRanking(data);
@@ -158,7 +166,7 @@ const LeaderboardContent: React.FC<{
         const data = await api.getLeaderboard(
           'competitive', // Only show competitive (ranked) MMR
           selectedMode,
-          selectedSeason || undefined,
+          selectedSeason ?? undefined,
           LIMIT,
           offset,
           selectedRegion === 'global' ? undefined : selectedRegion
@@ -321,16 +329,21 @@ const LeaderboardContent: React.FC<{
           </label>
           <div className="relative h-[38px]">
             <select
-              value={selectedSeason || ''}
-              onChange={(e) => setSelectedSeason(e.target.value)}
+              value={selectedSeason != null ? selectedSeason.toString() : ''}
+              onChange={(e) => {
+                const parsedSeason = parseSeasonParam(e.target.value);
+                if (parsedSeason != null) {
+                  setSelectedSeason(parsedSeason);
+                }
+              }}
               className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
                          font-black italic uppercase tracking-1 text-sm text-black-70
                          focus:outline-none focus:border-blue-500 cursor-pointer
                          appearance-none"
             >
               {seasons.map((season) => (
-                <option key={season} value={season}>
-                  {season}
+                <option key={season} value={season.toString()}>
+                  {season.toString()}
                 </option>
               ))}
             </select>
@@ -539,8 +552,8 @@ export const Leaderboard: React.FC = () => {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
-  const [seasons, setSeasons] = useState<string[]>([]);
-  const [selectedSeason, setSelectedSeason] = useState<string>(() => searchParams.get('season') || '');
+  const [seasons, setSeasons] = useState<number[]>([]);
+  const [selectedSeason, setSelectedSeason] = useState<number | null>(() => parseSeasonParam(searchParams.get('season')));
   const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
     const queryMode = searchParams.get('mode');
     return isValidLeaderboardMode(queryMode) ? queryMode : DEFAULT_LEADERBOARD_MODE;
@@ -579,6 +592,15 @@ export const Leaderboard: React.FC = () => {
       try {
         const data = await api.getSeasons();
         setSeasons(data.seasons);
+        setSelectedSeason(prev => {
+          if (prev != null) {
+            return prev;
+          }
+          if (data.current != null) {
+            return data.current;
+          }
+          return data.seasons[0] ?? null;
+        });
       } catch (err) {
         console.error('Failed to fetch seasons:', err);
       }
@@ -591,7 +613,7 @@ export const Leaderboard: React.FC = () => {
   useEffect(() => {
     const modeFromQuery = searchParams.get('mode');
     const regionFromQuery = searchParams.get('region');
-    const seasonFromQuery = searchParams.get('season');
+    const seasonFromQuery = parseSeasonParam(searchParams.get('season'));
 
     const resolvedMode: LobbyGameMode = isValidLeaderboardMode(modeFromQuery)
       ? modeFromQuery
@@ -603,8 +625,8 @@ export const Leaderboard: React.FC = () => {
 
     const resolvedSeason =
       seasons.length === 0
-        ? ''
-        : seasonFromQuery && seasons.includes(seasonFromQuery)
+        ? null
+        : seasonFromQuery != null && seasons.includes(seasonFromQuery)
           ? seasonFromQuery
           : seasons[0];
 
@@ -640,12 +662,17 @@ export const Leaderboard: React.FC = () => {
       hasChanged = true;
     }
 
-    const season = selectedSeason || params.get('season');
+    const seasonFromParams = parseSeasonParam(params.get('season'));
     const resolvedSeason =
-      season && seasons.includes(season) ? season : seasons[0];
+      selectedSeason != null && seasons.includes(selectedSeason)
+        ? selectedSeason
+        : seasonFromParams != null && seasons.includes(seasonFromParams)
+          ? seasonFromParams
+          : seasons[0];
 
-    if (params.get('season') !== resolvedSeason) {
-      params.set('season', resolvedSeason);
+    const resolvedSeasonString = resolvedSeason != null ? resolvedSeason.toString() : '';
+    if (params.get('season') !== resolvedSeasonString) {
+      params.set('season', resolvedSeasonString);
       hasChanged = true;
     }
 

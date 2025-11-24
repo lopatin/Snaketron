@@ -331,7 +331,7 @@ async fn apply_mmr_deltas(
                 queue_mode,
                 &game_state.game_type,
                 &region,
-                &season,
+                season,
                 won,
             )
             .await
@@ -451,7 +451,7 @@ async fn persist_solo_high_scores(
                 score as i32,
                 &game_state.game_type,
                 &region,
-                &season,
+                season,
             )
             .await
         {

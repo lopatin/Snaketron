@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use super::Database;
 use super::models::*;
+use crate::season::Season;
 
 pub struct DynamoDatabase {
     client: Client,
@@ -1229,7 +1230,7 @@ impl Database for DynamoDatabase {
         queue_mode: &common::QueueMode,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
         won: bool,
     ) -> Result<()> {
         // Ensure table exists
@@ -1241,14 +1242,15 @@ impl Database for DynamoDatabase {
         };
 
         let game_type_str = Self::game_type_to_string(game_type);
-        let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season);
+        let season_str = season.to_string();
+        let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
 
         // Pad MMR to 8 digits for sorting (99999999 - mmr for descending order)
         let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
         let padded_mmr = format!("{:08}", inverted_mmr);
 
         // Include season in PK for single-table design
-        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season);
+        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season_str);
         let sk = format!("MMR#{}#USER#{}", padded_mmr, user_id);
 
         // Try to get existing ranking to calculate delta
@@ -1280,7 +1282,7 @@ impl Database for DynamoDatabase {
         item.insert("region".to_string(), Self::av_s(region));
         item.insert("queueMode".to_string(), Self::av_s(queue_mode_str));
         item.insert("gameType".to_string(), Self::av_s(&game_type_str));
-        item.insert("season".to_string(), Self::av_s(season));
+        item.insert("season".to_string(), Self::av_n(season));
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
 
         // Delete old entry if MMR changed (SK will be different)
@@ -1322,7 +1324,7 @@ impl Database for DynamoDatabase {
         queue_mode: &common::QueueMode,
         game_type: Option<&common::GameType>,
         region: Option<&str>,
-        season: &str,
+        season: Season,
         limit: usize,
     ) -> Result<Vec<RankingEntry>> {
         // Ensure table exists
@@ -1333,13 +1335,15 @@ impl Database for DynamoDatabase {
             common::QueueMode::Quickmatch => "casual",
         };
 
+        let season_str = season.to_string();
+
         // Query by region and game_type if specified, otherwise scan with filters
         let mut items = if let Some(game_type_ref) = game_type {
             let game_type_str = Self::game_type_to_string(game_type_ref);
 
             if let Some(reg) = region {
                 // Query specific region, game type, and season
-                let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, reg, season);
+                let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, reg, season_str);
 
                 let response = self.client
                     .query()
@@ -1354,7 +1358,7 @@ impl Database for DynamoDatabase {
                 response.items.unwrap_or_default()
             } else {
                 // Prefer the GameTypeSeasonIndex to query all regions in a single partition
-                let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season);
+                let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
                 let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
 
                 match self.client
@@ -1393,7 +1397,7 @@ impl Database for DynamoDatabase {
                             .table_name(self.rankings_table())
                             .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
                             .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
-                            .expression_attribute_values(":season", Self::av_s(season))
+                            .expression_attribute_values(":season", Self::av_s(&season_str))
                             .limit((target_items - items.len()) as i32);
 
                         if let Some(ref lek) = last_evaluated_key {
@@ -1447,7 +1451,9 @@ impl Database for DynamoDatabase {
                     region: Self::extract_string(&item, "region")?,
                     queue_mode: Self::extract_string(&item, "queueMode")?,
                     game_type: Self::extract_string(&item, "gameType").unwrap_or_else(|| "unknown".to_string()),
-                    season: Self::extract_string(&item, "season")?,
+                    season: Self::extract_number(&item, "season")
+                        .map(|s| s as Season)
+                        .unwrap_or(season),
                     updated_at: Self::extract_string(&item, "updatedAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
@@ -1469,7 +1475,7 @@ impl Database for DynamoDatabase {
         queue_mode: &common::QueueMode,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
     ) -> Result<Option<RankingEntry>> {
         // Ensure table exists
         self.create_rankings_table_if_not_exists().await?;
@@ -1514,7 +1520,9 @@ impl Database for DynamoDatabase {
             region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
             queue_mode: Self::extract_string(item, "queueMode").unwrap_or(queue_mode_str.to_string()),
             game_type: Self::extract_string(item, "gameType").unwrap_or(game_type_str.clone()),
-            season: Self::extract_string(item, "season").unwrap_or(season.to_string()),
+            season: Self::extract_number(item, "season")
+                .map(|s| s as Season)
+                .unwrap_or(season),
             updated_at: Self::extract_string(item, "updatedAt")
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc))
@@ -1530,7 +1538,7 @@ impl Database for DynamoDatabase {
         score: i32,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
     ) -> Result<()> {
         let game_type_str = Self::game_type_to_string(game_type);
 
@@ -1566,7 +1574,7 @@ impl Database for DynamoDatabase {
             .item("score", Self::av_n(score))
             .item("region", Self::av_s(region))
             .item("gameType", Self::av_s(&game_type_str))
-            .item("season", Self::av_s(season))
+            .item("season", Self::av_n(season))
             .item("gameTypeSeason", Self::av_s(&game_type_season))
             .item("timestamp", Self::av_s(&timestamp))
             .send()
@@ -1581,15 +1589,16 @@ impl Database for DynamoDatabase {
         &self,
         game_type: &common::GameType,
         region: Option<&str>,
-        season: &str,
+        season: Season,
         limit: usize,
     ) -> Result<Vec<HighScoreEntry>> {
         let game_type_str = Self::game_type_to_string(game_type);
         let region_str = region.unwrap_or("global");
+        let season_str = season.to_string();
 
         // If a specific region is requested, do a keyed query on that partition.
         if region.is_some() && region_str != "global" {
-            let pk = format!("SCORE#{}#{}#{}", game_type_str, season, region_str);
+            let pk = format!("SCORE#{}#{}#{}", game_type_str, season_str, region_str);
 
             debug!(
                 "Querying high scores - table: {}, pk: {}, season: {}, limit: {}",
@@ -1622,7 +1631,7 @@ impl Database for DynamoDatabase {
                         score: Self::extract_number(&item, "score")?,
                         region: Self::extract_string(&item, "region")?,
                         game_type: Self::extract_string(&item, "gameType")?,
-                        season: Self::extract_string(&item, "season")?,
+                        season: Self::extract_number(&item, "season")?.max(0) as Season,
                         timestamp: Self::extract_string(&item, "timestamp")
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&Utc))
@@ -1641,7 +1650,7 @@ impl Database for DynamoDatabase {
         }
 
         // Global view: prefer the GameTypeSeasonIndex GSI for an ordered, single-partition query.
-        let gsi_pk = format!("{}#{}", game_type_str, season);
+        let gsi_pk = format!("{}#{}", game_type_str, season_str);
 
         match self.client
             .query()
@@ -1670,7 +1679,7 @@ impl Database for DynamoDatabase {
                             score: Self::extract_number(&item, "score")?,
                             region: Self::extract_string(&item, "region")?,
                             game_type: Self::extract_string(&item, "gameType")?,
-                            season: Self::extract_string(&item, "season")?,
+                            season: Self::extract_number(&item, "season")?.max(0) as Season,
                             timestamp: Self::extract_string(&item, "timestamp")
                                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                                 .map(|dt| dt.with_timezone(&Utc))
@@ -1692,7 +1701,7 @@ impl Database for DynamoDatabase {
         }
 
         // Fallback: scan across partitions filtered by game type + season, short-circuiting once we have enough.
-        let pk_prefix = format!("SCORE#{}#{}#", game_type_str, season);
+        let pk_prefix = format!("SCORE#{}#{}#", game_type_str, season_str);
         let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
         let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
         // Read a little more than the requested limit to improve ordering accuracy before we sort.
@@ -1743,7 +1752,7 @@ impl Database for DynamoDatabase {
                     score: Self::extract_number(&item, "score")?,
                     region: Self::extract_string(&item, "region")?,
                     game_type: Self::extract_string(&item, "gameType")?,
-                    season: Self::extract_string(&item, "season")?,
+                    season: Self::extract_number(&item, "season")?.max(0) as Season,
                     timestamp: Self::extract_string(&item, "timestamp")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))

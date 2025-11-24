@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use std::sync::Arc;
 
 use crate::db::Database;
-use crate::season::get_current_season;
+use crate::season::{get_current_season, Season};
 use crate::api::middleware::AuthUser;
 use common::{QueueMode, GameType};
 
@@ -17,7 +17,7 @@ pub struct LeaderboardQuery {
     /// Game type: "solo", "duel", "2v2", "ffa"
     pub game_type: String,
     /// Season (optional, defaults to current season)
-    pub season: Option<String>,
+    pub season: Option<Season>,
     /// Number of entries to return (default: 25, max: 100)
     pub limit: Option<usize>,
     /// Offset for pagination (default: 0)
@@ -61,7 +61,7 @@ pub enum LeaderboardEntry {
 #[derive(Debug, Serialize)]
 pub struct LeaderboardResponse {
     pub entries: Vec<LeaderboardEntry>,
-    pub season: String,
+    pub season: Season,
     #[serde(rename = "queueMode")]
     pub queue_mode: String,
     #[serde(rename = "gameType")]
@@ -73,8 +73,8 @@ pub struct LeaderboardResponse {
 /// Seasons list response
 #[derive(Debug, Serialize)]
 pub struct SeasonsResponse {
-    pub seasons: Vec<String>,
-    pub current: String,
+    pub seasons: Vec<Season>,
+    pub current: Season,
 }
 
 /// State for leaderboard endpoints (contains database)
@@ -139,7 +139,7 @@ pub async fn get_leaderboard(
         let high_scores = match state.db.get_high_scores(
             &game_type,
             query.region.as_deref(),
-            &season,
+            season,
             offset + fetch_limit,
         ).await {
             Ok(mut scores) => {
@@ -153,7 +153,7 @@ pub async fn get_leaderboard(
                 error!("Failed to fetch high scores: {:?}", e);
                 return Json(LeaderboardResponse {
                     entries: vec![],
-                    season: season.clone(),
+                    season,
                     queue_mode: query.queue_mode,
                     game_type: query.game_type,
                     has_more: false,
@@ -200,7 +200,7 @@ pub async fn get_leaderboard(
         &queue_mode,
         Some(&game_type),
         query.region.as_deref(), // Pass region if specified, None for global
-        &season,
+        season,
         offset + fetch_limit, // Fetch up to offset + limit + 1
     ).await {
         Ok(mut entries) => {
@@ -212,7 +212,7 @@ pub async fn get_leaderboard(
             error!("Failed to fetch leaderboard: {:?}", e);
             return Json(LeaderboardResponse {
                 entries: vec![],
-                season: season.clone(),
+                season,
                 queue_mode: query.queue_mode,
                 game_type: query.game_type,
                 has_more: false,
@@ -259,30 +259,11 @@ pub async fn get_leaderboard(
 /// List available seasons
 /// Returns a list of all seasons that have ranking data
 pub async fn list_seasons(
-    State(state): State<LeaderboardState>,
+    State(_state): State<LeaderboardState>,
 ) -> Json<SeasonsResponse> {
-    // For now, we'll return the current season and a few past seasons
-    // In the future, this could query DynamoDB for all available ranking tables
+    // Placeholder: return only the current season until season schedule/roller exists
     let current_season = get_current_season();
-
-    // Generate past seasons (current season and last 3 seasons)
-    // Season format: YYYY-SN where N is 1-4 (quarterly)
-    let mut seasons = vec![current_season.clone()];
-
-    // Parse current season to generate past seasons
-    if let Some((year_str, season_num_str)) = current_season.split_once("-S") {
-        if let (Ok(mut year), Ok(mut season_num)) = (year_str.parse::<i32>(), season_num_str.parse::<i32>()) {
-            // Add previous 3 seasons
-            for _ in 0..3 {
-                season_num -= 1;
-                if season_num < 1 {
-                    season_num = 4;
-                    year -= 1;
-                }
-                seasons.push(format!("{}-S{}", year, season_num));
-            }
-        }
-    }
+    let seasons = vec![current_season];
 
     Json(SeasonsResponse {
         seasons,
@@ -336,7 +317,7 @@ pub async fn get_my_ranking(
         &queue_mode,
         &game_type,
         region,
-        &season,
+        season,
     ).await {
         Ok(Some(entry)) => {
             // Calculate rank by querying all entries with higher MMR
@@ -344,7 +325,7 @@ pub async fn get_my_ranking(
                 &queue_mode,
                 Some(&game_type),
                 Some(region),
-                &season,
+                season,
                 10000, // Large limit to get all entries
             ).await.unwrap_or_default();
 

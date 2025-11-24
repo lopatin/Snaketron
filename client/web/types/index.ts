@@ -420,7 +420,7 @@ export function isHighScoreEntry(entry: LeaderboardEntry): entry is HighScoreEnt
 }
 
 export interface LeaderboardData {
-  season: string;
+  season: number;
   gameMode: LobbyGameMode;
   entries: LeaderboardEntry[];
 }
@@ -428,15 +428,15 @@ export interface LeaderboardData {
 // API Response Types for Leaderboard
 export interface LeaderboardResponse {
   entries: LeaderboardEntry[];
-  season: string;
+  season: number;
   queueMode: string;
   gameType: string;
   hasMore: boolean;
 }
 
 export interface SeasonsResponse {
-  seasons: string[];
-  current: string;
+  seasons: number[];
+  current: number;
 }
 
 export interface UserRankingResponse {

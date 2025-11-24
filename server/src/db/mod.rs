@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use common::GameType;
 use models::*;
+use crate::season::Season;
 
 #[async_trait]
 pub trait Database: Send + Sync {
@@ -53,7 +54,7 @@ pub trait Database: Send + Sync {
         queue_mode: &common::QueueMode,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
         won: bool,
     ) -> Result<()>;
     async fn get_leaderboard(
@@ -61,7 +62,7 @@ pub trait Database: Send + Sync {
         queue_mode: &common::QueueMode,
         game_type: Option<&common::GameType>,
         region: Option<&str>,
-        season: &str,
+        season: Season,
         limit: usize,
     ) -> Result<Vec<RankingEntry>>;
     async fn get_user_ranking(
@@ -70,7 +71,7 @@ pub trait Database: Send + Sync {
         queue_mode: &common::QueueMode,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
     ) -> Result<Option<RankingEntry>>;
 
     // High score operations for solo games
@@ -82,13 +83,13 @@ pub trait Database: Send + Sync {
         score: i32,
         game_type: &common::GameType,
         region: &str,
-        season: &str,
+        season: Season,
     ) -> Result<()>;
     async fn get_high_scores(
         &self,
         game_type: &common::GameType,
         region: Option<&str>,
-        season: &str,
+        season: Season,
         limit: usize,
     ) -> Result<Vec<HighScoreEntry>>;
 
