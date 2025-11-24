@@ -273,7 +273,7 @@ const LeaderboardContent: React.FC<{
                     disabled={isStartingPlacementQueue}
                     className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    {isStartingPlacementQueue ? 'Starting matchmaking...' : 'Play your first game'}
+                    {isStartingPlacementQueue ? 'Starting matchmaking...' : 'Play ranked now'}
                   </button>
                 )}
               </div>
