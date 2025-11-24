@@ -1241,6 +1241,7 @@ impl Database for DynamoDatabase {
         };
 
         let game_type_str = Self::game_type_to_string(game_type);
+        let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season);
 
         // Pad MMR to 8 digits for sorting (99999999 - mmr for descending order)
         let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
@@ -1269,6 +1270,7 @@ impl Database for DynamoDatabase {
         let mut item = HashMap::new();
         item.insert("pk".to_string(), Self::av_s(&pk));
         item.insert("sk".to_string(), Self::av_s(&sk));
+        item.insert("gameTypeSeason".to_string(), Self::av_s(&game_type_season));
         item.insert("userId".to_string(), Self::av_n(user_id));
         item.insert("username".to_string(), Self::av_s(username));
         item.insert("mmr".to_string(), Self::av_n(mmr));
@@ -1332,7 +1334,7 @@ impl Database for DynamoDatabase {
         };
 
         // Query by region and game_type if specified, otherwise scan with filters
-        let results = if let Some(game_type_ref) = game_type {
+        let mut items = if let Some(game_type_ref) = game_type {
             let game_type_str = Self::game_type_to_string(game_type_ref);
 
             if let Some(reg) = region {
@@ -1351,18 +1353,70 @@ impl Database for DynamoDatabase {
 
                 response.items.unwrap_or_default()
             } else {
-                // Scan all regions for specific game type and season
-                let response = self.client
-                    .scan()
+                // Prefer the GameTypeSeasonIndex to query all regions in a single partition
+                let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season);
+                let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+
+                match self.client
+                    .query()
                     .table_name(self.rankings_table())
-                    .filter_expression("begins_with(pk, :prefix)")
-                    .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}#{}#", queue_mode_str, game_type_str)))
+                    .index_name("GameTypeSeasonIndex")
+                    .key_condition_expression("gameTypeSeason = :gts")
+                    .expression_attribute_values(":gts", Self::av_s(&game_type_season))
                     .limit(limit as i32)
                     .send()
                     .await
-                    .context("Failed to scan leaderboard")?;
+                {
+                    Ok(response) => {
+                        gsi_items = response.items.unwrap_or_default();
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Falling back to scan for global rankings (GameTypeSeasonIndex not available?): {:?}",
+                            err
+                        );
+                    }
+                }
 
-                response.items.unwrap_or_default()
+                if !gsi_items.is_empty() {
+                    gsi_items
+                } else {
+                    // Fallback: scan across all regions for the requested season
+                    let pk_prefix = format!("RANKING#{}#{}#", queue_mode_str, game_type_str);
+                    let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+                    let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+                    let target_items = limit.saturating_mul(3).max(limit + 5);
+
+                    while items.len() < target_items {
+                        let mut scan_builder = self.client
+                            .scan()
+                            .table_name(self.rankings_table())
+                            .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
+                            .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
+                            .expression_attribute_values(":season", Self::av_s(season))
+                            .limit((target_items - items.len()) as i32);
+
+                        if let Some(ref lek) = last_evaluated_key {
+                            scan_builder = scan_builder.set_exclusive_start_key(Some(lek.clone()));
+                        }
+
+                        let response = scan_builder
+                            .send()
+                            .await
+                            .context("Failed to scan leaderboard")?;
+
+                        if let Some(mut batch) = response.items {
+                            items.append(&mut batch);
+                        }
+
+                        last_evaluated_key = response.last_evaluated_key;
+                        if last_evaluated_key.is_none() {
+                            break;
+                        }
+                    }
+
+                    items
+                }
             }
         } else {
             // Scan all game types and regions for a season
@@ -1380,7 +1434,7 @@ impl Database for DynamoDatabase {
         };
 
         // Parse results into RankingEntry
-        let mut entries: Vec<RankingEntry> = results
+        let mut entries: Vec<RankingEntry> = items
             .into_iter()
             .filter_map(|item| {
                 Some(RankingEntry {
@@ -1712,10 +1766,70 @@ impl DynamoDatabase {
     async fn create_rankings_table_if_not_exists(&self) -> Result<()> {
         let table_name = self.rankings_table();
 
-        // Check if table exists
+        // Shared key schema definitions for the GameTypeSeasonIndex GSI
+        let gsi_game_type_season_pk = KeySchemaElement::builder()
+            .attribute_name("gameTypeSeason")
+            .key_type(KeyType::Hash)
+            .build()
+            .context("Failed to build gameTypeSeason hash key for rankings")?;
+
+        let gsi_game_type_season_sk = KeySchemaElement::builder()
+            .attribute_name("sk")
+            .key_type(KeyType::Range)
+            .build()
+            .context("Failed to build gameTypeSeason sort key for rankings")?;
+
+        // Check if table exists, and add the cross-region GSI if missing
         match self.client.describe_table().table_name(&table_name).send().await {
-            Ok(_) => {
+            Ok(output) => {
                 debug!("Rankings table {} already exists", table_name);
+
+                let has_game_type_season_gsi = if let Some(table_desc) = output.table() {
+                    let gsis = table_desc.global_secondary_indexes();
+                    gsis.iter()
+                        .any(|g| g.index_name.as_deref() == Some("GameTypeSeasonIndex"))
+                } else {
+                    false
+                };
+
+                if !has_game_type_season_gsi {
+                    info!(
+                        "Adding missing GameTypeSeasonIndex to existing rankings table: {}",
+                        table_name
+                    );
+
+                    self.client
+                        .update_table()
+                        .table_name(&table_name)
+                        .attribute_definitions(
+                            AttributeDefinition::builder()
+                                .attribute_name("gameTypeSeason")
+                                .attribute_type(ScalarAttributeType::S)
+                                .build()
+                                .context("Failed to build gameTypeSeason attribute for rankings update")?,
+                        )
+                        .global_secondary_index_updates(
+                            GlobalSecondaryIndexUpdate::builder()
+                                .create(
+                                    CreateGlobalSecondaryIndexAction::builder()
+                                        .index_name("GameTypeSeasonIndex")
+                                        .key_schema(gsi_game_type_season_pk.clone())
+                                        .key_schema(gsi_game_type_season_sk.clone())
+                                        .projection(
+                                            Projection::builder()
+                                                .projection_type(ProjectionType::All)
+                                                .build(),
+                                        )
+                                        .build()
+                                        .context("Failed to build rankings GameTypeSeasonIndex update action")?,
+                                )
+                                .build(),
+                        )
+                        .send()
+                        .await
+                        .context("Failed to add GameTypeSeasonIndex to existing rankings table")?;
+                }
+
                 return Ok(());
             }
             Err(_) => {
@@ -1725,8 +1839,10 @@ impl DynamoDatabase {
 
         // PK: RANKING#{queue_mode}#{game_type}#{region}#{season} (e.g., "RANKING#ranked#solo#us-east-1#2025-S1")
         // SK: MMR#{padded_mmr}#USER#{user_id} (e.g., "MMR#00001543#USER#1234")
+        // GSI: GameTypeSeasonIndex with gameTypeSeason as PK and sk as SK for cross-region seasonal lookups
         // This schema allows:
         // - Querying top players by queue_mode + game_type + region + season (sorted by MMR descending)
+        // - Querying top players across all regions for a queue/game_type/season via the GSI
         // - Single table stores all seasons
 
         let pk_attr = AttributeDefinition::builder()
@@ -1741,6 +1857,13 @@ impl DynamoDatabase {
             .build()
             .context("Failed to build sk attribute")?;
 
+        // Attribute for global seasonal lookups
+        let gsi_game_type_season_attr = AttributeDefinition::builder()
+            .attribute_name("gameTypeSeason")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build gameTypeSeason attribute for rankings")?;
+
         let pk_key = KeySchemaElement::builder()
             .attribute_name("pk")
             .key_type(KeyType::Hash)
@@ -1753,13 +1876,28 @@ impl DynamoDatabase {
             .build()
             .context("Failed to build sk key")?;
 
+        // GSI for cross-region lookups by queue mode + game type + season
+        let game_type_season_gsi = GlobalSecondaryIndex::builder()
+            .index_name("GameTypeSeasonIndex")
+            .key_schema(gsi_game_type_season_pk)
+            .key_schema(gsi_game_type_season_sk)
+            .projection(
+                Projection::builder()
+                    .projection_type(ProjectionType::All)
+                    .build(),
+            )
+            .build()
+            .context("Failed to build GameTypeSeasonIndex GSI for rankings")?;
+
         self.client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(pk_attr)
             .attribute_definitions(sk_attr)
+            .attribute_definitions(gsi_game_type_season_attr)
             .key_schema(pk_key)
             .key_schema(sk_key)
+            .global_secondary_indexes(game_type_season_gsi)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
             .await
