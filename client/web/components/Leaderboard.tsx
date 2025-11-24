@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { MobileHeader } from './MobileHeader';
 import { LobbyChat } from './LobbyChat';
@@ -78,6 +78,7 @@ const LeaderboardContent: React.FC<{
   const [offset, setOffset] = useState(0);
   const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
   const LIMIT = 25;
+  const PLACEMENT_MATCHES_REQUIRED = 10;
 
   // Fetch user's ranking when authenticated and filters change
   useEffect(() => {
@@ -145,32 +146,43 @@ const LeaderboardContent: React.FC<{
     setOffset(prev => prev + LIMIT);
   };
 
+  const placementMatchesPlayed = (userRanking?.wins ?? 0) + (userRanking?.losses ?? 0);
+  const completedPlacementMatches = Math.min(placementMatchesPlayed, PLACEMENT_MATCHES_REQUIRED);
+  const rankTier = userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked';
+  const rankImage = getRankImage(rankTier);
+  const isRanked = Boolean(userRanking?.rank);
+  const placementMatchesLeft = Math.max(PLACEMENT_MATCHES_REQUIRED - placementMatchesPlayed, 0);
+
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
       {/* Header row with rank and selectors */}
-      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-6 mb-8">
+      <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-6 mb-8">
         {/* Your Rank Display (left side) - Not shown for Solo mode */}
-        {isAuthenticated && selectedMode !== 'solo' ? (
-          <div className="flex items-center gap-3">
+        {selectedMode !== 'solo' ? (
+          <div className="flex items-start gap-4">
             <img
-              src={getRankImage(userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked')}
-              alt={userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked'}
-              className="w-12 h-12 object-contain"
+              src={rankImage}
+              alt={rankTier}
+              className="w-16 h-16 object-contain"
             />
-            <div>
-              <div className="text-xs uppercase tracking-1 text-gray-500 font-bold">Your Rank</div>
-              {userRanking?.rank ? (
-                <>
-                  <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
-                    #{userRanking.rank}
-                  </div>
-                  <div className="text-xs text-black-70">{userRanking.mmr} MMR</div>
-                </>
-              ) : (
-                <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
-                  UNRANKED
-                </div>
-              )}
+            <div className="flex flex-col gap-1">
+              <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+                Your Rank
+              </div>
+              <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
+                {isRanked ? `#${userRanking?.rank}` : 'UNRANKED'}
+              </div>
+              <div className="text-xs text-black-70">
+                {!isAuthenticated ? (
+                  <Link to="/auth" className="font-bold text-blue-600 hover:underline">
+                    Login to play ranked
+                  </Link>
+                ) : isRanked && userRanking?.mmr != null ? (
+                  `${userRanking.mmr} MMR`
+                ) : (
+                  `${placementMatchesLeft} placement matches left`
+                )}
+              </div>
             </div>
           </div>
         ) : (
