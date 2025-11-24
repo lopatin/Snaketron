@@ -2,8 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, Projection, ProjectionType, ReturnValue, ScalarAttributeType,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
+    KeySchemaElement, KeyType, Projection, ProjectionType, ReturnValue, ScalarAttributeType,
+    CreateGlobalSecondaryIndexAction,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
@@ -1479,15 +1480,16 @@ impl Database for DynamoDatabase {
     ) -> Result<()> {
         let game_type_str = Self::game_type_to_string(game_type);
 
-        // PK: SCORE#{game_type}#{region} (e.g., SCORE#solo#us-east-1 or SCORE#solo#global)
-        let pk = format!("SCORE#{}#{}", game_type_str, region);
-
         // SK: SCORE#{inverted_score}#GAME#{game_id}
         // Invert score for descending order (99999999 - score)
         let inverted_score = 99999999 - score;
         let sk = format!("SCORE#{:08}#GAME#{}", inverted_score, game_id);
 
         let timestamp = Utc::now().to_rfc3339();
+
+        // PK: SCORE#{game_type}#{season}#{region} (e.g., SCORE#solo#2025-S1#us-east-1)
+        let pk = format!("SCORE#{}#{}#{}", game_type_str, season, region);
+        let game_type_season = format!("{}#{}", game_type_str, season);
 
         debug!(
             "Inserting high score - table: {}, pk: {}, sk: {}, user: {}, score: {}, season: {}",
@@ -1511,6 +1513,7 @@ impl Database for DynamoDatabase {
             .item("region", Self::av_s(region))
             .item("gameType", Self::av_s(&game_type_str))
             .item("season", Self::av_s(season))
+            .item("gameTypeSeason", Self::av_s(&game_type_season))
             .item("timestamp", Self::av_s(&timestamp))
             .send()
             .await
@@ -1530,35 +1533,153 @@ impl Database for DynamoDatabase {
         let game_type_str = Self::game_type_to_string(game_type);
         let region_str = region.unwrap_or("global");
 
-        // PK for querying high scores
-        let pk = format!("SCORE#{}#{}", game_type_str, region_str);
+        // If a specific region is requested, do a keyed query on that partition.
+        if region.is_some() && region_str != "global" {
+            let pk = format!("SCORE#{}#{}#{}", game_type_str, season, region_str);
 
-        debug!(
-            "Querying high scores - table: {}, pk: {}, season: {}, limit: {}",
-            self.high_scores_table(),
-            pk,
-            season,
-            limit
-        );
+            debug!(
+                "Querying high scores - table: {}, pk: {}, season: {}, limit: {}",
+                self.high_scores_table(),
+                pk,
+                season,
+                limit
+            );
 
-        // Query high scores table with season filter
-        let response = self.client
+            let response = self.client
+                .query()
+                .table_name(self.high_scores_table())
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", Self::av_s(&pk))
+                .limit(limit as i32)
+                .send()
+                .await
+                .context("Failed to query high scores")?;
+
+            let items = response.items.unwrap_or_default();
+            debug!("Retrieved {} high score items from DynamoDB", items.len());
+
+            let entries: Vec<HighScoreEntry> = items
+                .into_iter()
+                .filter_map(|item| {
+                    let entry = HighScoreEntry {
+                        game_id: Self::extract_string(&item, "gameId")?,
+                        user_id: Self::extract_number(&item, "userId")?,
+                        username: Self::extract_string(&item, "username")?,
+                        score: Self::extract_number(&item, "score")?,
+                        region: Self::extract_string(&item, "region")?,
+                        game_type: Self::extract_string(&item, "gameType")?,
+                        season: Self::extract_string(&item, "season")?,
+                        timestamp: Self::extract_string(&item, "timestamp")
+                            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(Utc::now),
+                    };
+                    debug!(
+                        "Parsed high score entry - user: {}, score: {}, game_id: {}",
+                        entry.username, entry.score, entry.game_id
+                    );
+                    Some(entry)
+                })
+                .collect();
+
+            debug!("Successfully parsed {} high score entries", entries.len());
+            return Ok(entries);
+        }
+
+        // Global view: prefer the GameTypeSeasonIndex GSI for an ordered, single-partition query.
+        let gsi_pk = format!("{}#{}", game_type_str, season);
+
+        match self.client
             .query()
             .table_name(self.high_scores_table())
-            .key_condition_expression("pk = :pk")
-            .filter_expression("season = :season")
-            .expression_attribute_values(":pk", Self::av_s(&pk))
-            .expression_attribute_values(":season", Self::av_s(season))
+            .index_name("GameTypeSeasonIndex")
+            .key_condition_expression("gameTypeSeason = :gts")
+            .expression_attribute_values(":gts", Self::av_s(&gsi_pk))
             .limit(limit as i32)
             .send()
             .await
-            .context("Failed to query high scores")?;
+        {
+            Ok(response) => {
+                let items = response.items.unwrap_or_default();
+                debug!(
+                    "Retrieved {} high score items from GameTypeSeasonIndex for global view",
+                    items.len()
+                );
 
-        let items = response.items.unwrap_or_default();
-        debug!("Retrieved {} high score items from DynamoDB", items.len());
+                let entries: Vec<HighScoreEntry> = items
+                    .into_iter()
+                    .filter_map(|item| {
+                        let entry = HighScoreEntry {
+                            game_id: Self::extract_string(&item, "gameId")?,
+                            user_id: Self::extract_number(&item, "userId")?,
+                            username: Self::extract_string(&item, "username")?,
+                            score: Self::extract_number(&item, "score")?,
+                            region: Self::extract_string(&item, "region")?,
+                            game_type: Self::extract_string(&item, "gameType")?,
+                            season: Self::extract_string(&item, "season")?,
+                            timestamp: Self::extract_string(&item, "timestamp")
+                                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                                .map(|dt| dt.with_timezone(&Utc))
+                                .unwrap_or_else(Utc::now),
+                        };
+                        Some(entry)
+                    })
+                    .collect();
 
-        // Parse results into HighScoreEntry
-        let entries: Vec<HighScoreEntry> = items
+                debug!("Successfully parsed {} high score entries", entries.len());
+                return Ok(entries);
+            }
+            Err(err) => {
+                warn!(
+                    "Falling back to scan for global high scores (GameTypeSeasonIndex not available?): {:?}",
+                    err
+                );
+            }
+        }
+
+        // Fallback: scan across partitions filtered by game type + season, short-circuiting once we have enough.
+        let pk_prefix = format!("SCORE#{}#{}#", game_type_str, season);
+        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+        // Read a little more than the requested limit to improve ordering accuracy before we sort.
+        let target_items = limit.saturating_mul(3).max(limit + 5);
+
+        while items.len() < target_items {
+            let mut scan_builder = self.client
+                .scan()
+                .table_name(self.high_scores_table())
+                .filter_expression("begins_with(pk, :pk_prefix)")
+                .expression_attribute_values(":pk_prefix", Self::av_s(&pk_prefix))
+                .limit((target_items - items.len()) as i32);
+
+            if let Some(ref lek) = last_evaluated_key {
+                scan_builder = scan_builder.set_exclusive_start_key(Some(lek.clone()));
+            }
+
+            let response = scan_builder
+                .send()
+                .await
+                .context("Failed to scan high scores for global leaderboard")?;
+
+            if let Some(mut batch) = response.items {
+                items.append(&mut batch);
+            }
+
+            last_evaluated_key = response.last_evaluated_key;
+
+            if last_evaluated_key.is_none() {
+                break;
+            }
+        }
+
+        debug!(
+            "Global high score scan collected {} items (requested limit: {}, target read: {})",
+            items.len(),
+            limit,
+            target_items
+        );
+
+        let mut entries: Vec<HighScoreEntry> = items
             .into_iter()
             .filter_map(|item| {
                 let entry = HighScoreEntry {
@@ -1574,15 +1695,14 @@ impl Database for DynamoDatabase {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(Utc::now),
                 };
-                debug!(
-                    "Parsed high score entry - user: {}, score: {}, game_id: {}",
-                    entry.username, entry.score, entry.game_id
-                );
                 Some(entry)
             })
             .collect();
 
-        debug!("Successfully parsed {} high score entries", entries.len());
+        entries.sort_by(|a, b| b.score.cmp(&a.score));
+        entries.truncate(limit);
+
+        debug!("Successfully parsed {} high score entries (fallback scan)", entries.len());
         Ok(entries)
     }
 }
@@ -1652,10 +1772,70 @@ impl DynamoDatabase {
     async fn create_high_scores_table_if_not_exists(&self) -> Result<()> {
         let table_name = self.high_scores_table();
 
+        // Shared key schema definitions for the GameTypeSeasonIndex GSI
+        let gsi_game_type_season_pk = KeySchemaElement::builder()
+            .attribute_name("gameTypeSeason")
+            .key_type(KeyType::Hash)
+            .build()
+            .context("Failed to build gameTypeSeason hash key")?;
+
+        let gsi_game_type_season_sk = KeySchemaElement::builder()
+            .attribute_name("sk")
+            .key_type(KeyType::Range)
+            .build()
+            .context("Failed to build gameTypeSeason sort key")?;
+
         // Check if table exists
         match self.client.describe_table().table_name(&table_name).send().await {
-            Ok(_) => {
+            Ok(output) => {
                 debug!("High scores table {} already exists", table_name);
+
+                let has_game_type_season_gsi = if let Some(table_desc) = output.table() {
+                    let gsis = table_desc.global_secondary_indexes();
+                    gsis.iter()
+                        .any(|g| g.index_name.as_deref() == Some("GameTypeSeasonIndex"))
+                } else {
+                    false
+                };
+
+                if !has_game_type_season_gsi {
+                    info!(
+                        "Adding missing GameTypeSeasonIndex to existing high scores table: {}",
+                        table_name
+                    );
+
+                    self.client
+                        .update_table()
+                        .table_name(&table_name)
+                        .attribute_definitions(
+                            AttributeDefinition::builder()
+                                .attribute_name("gameTypeSeason")
+                                .attribute_type(ScalarAttributeType::S)
+                                .build()
+                                .context("Failed to build gameTypeSeason attribute for update")?,
+                        )
+                        .global_secondary_index_updates(
+                            GlobalSecondaryIndexUpdate::builder()
+                                .create(
+                                    CreateGlobalSecondaryIndexAction::builder()
+                                        .index_name("GameTypeSeasonIndex")
+                                        .key_schema(gsi_game_type_season_pk.clone())
+                                        .key_schema(gsi_game_type_season_sk.clone())
+                                        .projection(
+                                            Projection::builder()
+                                                .projection_type(ProjectionType::All)
+                                                .build(),
+                                        )
+                                        .build()
+                                        .context("Failed to build GameTypeSeasonIndex update action")?,
+                                )
+                                .build(),
+                        )
+                        .send()
+                        .await
+                        .context("Failed to add GameTypeSeasonIndex to existing high scores table")?;
+                }
+
                 return Ok(());
             }
             Err(_) => {
@@ -1663,12 +1843,14 @@ impl DynamoDatabase {
             }
         }
 
-        // PK: SCORE#{game_type}#{region} (e.g., "SCORE#solo#us-east-1" or "SCORE#solo#global")
+        // PK: SCORE#{game_type}#{season}#{region} (e.g., "SCORE#solo#2025-S1#us-east-1")
         // SK: SCORE#{inverted_score}#GAME#{game_id} (e.g., "SCORE#99998457#GAME#1234")
         // GSI: UserScoreIndex with userId as PK and sk as SK for user-specific lookups
+        // GSI: GameTypeSeasonIndex with gameTypeSeason as PK and sk as SK for cross-region seasonal lookups
         // This schema allows:
-        // - Querying top scores by game_type + region (sorted by score descending)
-        // - Single table stores all seasons (season stored as attribute)
+        // - Querying top scores by game_type + season + region (sorted by score descending)
+        // - Querying top scores by game_type + season across all regions via GSI
+        // - Single table stores all seasons
 
         let pk_attr = AttributeDefinition::builder()
             .attribute_name("pk")
@@ -1687,6 +1869,13 @@ impl DynamoDatabase {
             .attribute_type(ScalarAttributeType::N)
             .build()
             .context("Failed to build userId attribute")?;
+
+        // GSI for global aggregation by game type + season
+        let gsi_game_type_season_attr = AttributeDefinition::builder()
+            .attribute_name("gameTypeSeason")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build gameTypeSeason attribute")?;
 
         let pk_key = KeySchemaElement::builder()
             .attribute_name("pk")
@@ -1725,15 +1914,30 @@ impl DynamoDatabase {
             .build()
             .context("Failed to build GSI")?;
 
+        // GSI for querying by game type + season (global leaderboard)
+        let game_type_season_gsi = GlobalSecondaryIndex::builder()
+            .index_name("GameTypeSeasonIndex")
+            .key_schema(gsi_game_type_season_pk.clone())
+            .key_schema(gsi_game_type_season_sk.clone())
+            .projection(
+                Projection::builder()
+                    .projection_type(ProjectionType::All)
+                    .build(),
+            )
+            .build()
+            .context("Failed to build GameTypeSeasonIndex GSI")?;
+
         self.client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(pk_attr)
             .attribute_definitions(sk_attr)
             .attribute_definitions(user_id_attr)
+            .attribute_definitions(gsi_game_type_season_attr)
             .key_schema(pk_key)
             .key_schema(sk_key)
             .global_secondary_indexes(gsi)
+            .global_secondary_indexes(game_type_season_gsi)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
             .await

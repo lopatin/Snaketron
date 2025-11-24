@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { MobileHeader } from './MobileHeader';
 import { LobbyChat } from './LobbyChat';
@@ -12,6 +12,28 @@ import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRank
 import { api } from '../services/api';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
+
+const DEFAULT_LEADERBOARD_REGION = 'global';
+const DEFAULT_LEADERBOARD_MODE: LobbyGameMode = 'duel';
+
+const LEADERBOARD_REGIONS = [
+  { id: 'global', label: 'Global' },
+  { id: 'us-east-1', label: 'US East' },
+  { id: 'eu-west-1', label: 'EU West' },
+];
+
+const GAME_MODES: Array<{ id: LobbyGameMode; label: string }> = [
+  { id: 'duel', label: 'DUEL' },
+  { id: '2v2', label: '2V2' },
+  { id: 'solo', label: 'SOLO' },
+  { id: 'ffa', label: 'FFA' },
+];
+
+const isValidLeaderboardMode = (mode: string | null): mode is LobbyGameMode =>
+  Boolean(mode && GAME_MODES.some(gameMode => gameMode.id === mode));
+
+const isValidLeaderboardRegion = (region: string | null) =>
+  Boolean(region && LEADERBOARD_REGIONS.some(availableRegion => availableRegion.id === region));
 
 // Helper to determine rank tier from MMR
 const getRankTierFromMMR = (mmr: number): RankTier => {
@@ -35,10 +57,20 @@ const LeaderboardContent: React.FC<{
   setSelectedSeason: (season: string) => void;
   selectedMode: LobbyGameMode;
   setSelectedMode: (mode: LobbyGameMode) => void;
+  selectedRegion: string;
+  setSelectedRegion: (region: string) => void;
+  seasons: string[];
   isAuthenticated: boolean;
-}> = ({ selectedSeason, setSelectedSeason, selectedMode, setSelectedMode, isAuthenticated }) => {
-  const [selectedRegion, setSelectedRegion] = useState<string>('global');
-  const [seasons, setSeasons] = useState<string[]>([]);
+}> = ({
+  selectedSeason,
+  setSelectedSeason,
+  selectedMode,
+  setSelectedMode,
+  selectedRegion,
+  setSelectedRegion,
+  seasons,
+  isAuthenticated
+}) => {
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,29 +78,6 @@ const LeaderboardContent: React.FC<{
   const [offset, setOffset] = useState(0);
   const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
   const LIMIT = 25;
-
-  // Available regions for filtering
-  const regions = [
-    { id: 'global', label: 'Global' },
-    { id: 'us-east-1', label: 'US East' },
-    { id: 'eu-west-1', label: 'EU West' },
-  ];
-
-  // Fetch seasons on mount
-  useEffect(() => {
-    const fetchSeasons = async () => {
-      try {
-        const data = await api.getSeasons();
-        setSeasons(data.seasons);
-        if (data.seasons.length > 0 && !selectedSeason) {
-          setSelectedSeason(data.current);
-        }
-      } catch (err) {
-        console.error('Failed to fetch seasons:', err);
-      }
-    };
-    fetchSeasons();
-  }, []);
 
   // Fetch user's ranking when authenticated and filters change
   useEffect(() => {
@@ -136,13 +145,6 @@ const LeaderboardContent: React.FC<{
     setOffset(prev => prev + LIMIT);
   };
 
-  const gameModes: Array<{ id: LobbyGameMode; label: string }> = [
-    { id: 'duel', label: 'DUEL' },
-    { id: '2v2', label: '2V2' },
-    { id: 'solo', label: 'SOLO' },
-    { id: 'ffa', label: 'FFA' },
-  ];
-
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
       {/* Header row with rank and selectors */}
@@ -192,7 +194,7 @@ const LeaderboardContent: React.FC<{
                          focus:outline-none focus:border-blue-500 cursor-pointer
                          appearance-none"
             >
-              {regions.map((region) => (
+              {LEADERBOARD_REGIONS.map((region) => (
                 <option key={region.id} value={region.id}>
                   {region.label}
                 </option>
@@ -213,7 +215,7 @@ const LeaderboardContent: React.FC<{
           </label>
           <div className="relative h-[38px]">
             <select
-              value={selectedSeason}
+              value={selectedSeason || ''}
               onChange={(e) => setSelectedSeason(e.target.value)}
               className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
                          font-black italic uppercase tracking-1 text-sm text-black-70
@@ -240,7 +242,7 @@ const LeaderboardContent: React.FC<{
             Game Mode
           </label>
           <div className="grid grid-cols-4 gap-2 h-[38px]">
-            {gameModes.map((mode) => {
+            {GAME_MODES.map((mode) => {
               const isSelected = selectedMode === mode.id;
               return (
                 <button
@@ -413,6 +415,7 @@ const LeaderboardContent: React.FC<{
 
 export const Leaderboard: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { user, logout } = useAuth();
   const {
     connectToRegion,
@@ -430,13 +433,15 @@ export const Leaderboard: React.FC = () => {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
-  const [selectedSeason, setSelectedSeason] = useState<string>('Season 1');
-  const [selectedMode, setSelectedMode] = useState<LobbyGameMode>('duel');
+  const [selectedSeason, setSelectedSeason] = useState<string>('');
+  const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(DEFAULT_LEADERBOARD_MODE);
+  const [selectedLeaderboardRegion, setSelectedLeaderboardRegion] = useState<string>(DEFAULT_LEADERBOARD_REGION);
+  const [seasons, setSeasons] = useState<string[]>([]);
 
   // Use regions hook for live data
   const {
     regions,
-    selectedRegion,
+    selectedRegion: selectedWsRegion,
     selectRegion,
     isLoading: regionsLoading,
     error: regionsError,
@@ -444,7 +449,7 @@ export const Leaderboard: React.FC = () => {
     isWebSocketConnected: isConnected,
     onMessage,
   });
-  const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
+  const currentRegionId = selectedWsRegion?.id ?? regions[0]?.id ?? '';
 
   // Check if mobile on mount and resize
   useEffect(() => {
@@ -456,22 +461,96 @@ export const Leaderboard: React.FC = () => {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
+  // Fetch seasons once so we can hydrate the query defaults
+  useEffect(() => {
+    const fetchSeasons = async () => {
+      try {
+        const data = await api.getSeasons();
+        setSeasons(data.seasons);
+      } catch (err) {
+        console.error('Failed to fetch seasons:', err);
+      }
+    };
+
+    fetchSeasons();
+  }, []);
+
+  // Apply query params (or defaults) to the local selections
+  useEffect(() => {
+    const modeFromQuery = searchParams.get('mode');
+    const regionFromQuery = searchParams.get('region');
+
+    const queryMode: LobbyGameMode = isValidLeaderboardMode(modeFromQuery)
+      ? modeFromQuery
+      : DEFAULT_LEADERBOARD_MODE;
+    const queryRegion = isValidLeaderboardRegion(regionFromQuery)
+      ? regionFromQuery
+      : DEFAULT_LEADERBOARD_REGION;
+
+    setSelectedMode(queryMode);
+    setSelectedLeaderboardRegion(queryRegion);
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (seasons.length === 0) {
+      return;
+    }
+
+    const latestSeason = seasons[0];
+    const querySeason = searchParams.get('season');
+    const resolvedSeason = querySeason && seasons.includes(querySeason) ? querySeason : latestSeason;
+
+    if (resolvedSeason) {
+      setSelectedSeason(resolvedSeason);
+    }
+  }, [searchParams, seasons]);
+
+  // Keep the URL in sync with the current selections
+  useEffect(() => {
+    const params = new URLSearchParams(searchParams);
+    let hasChanged = false;
+
+    if (selectedSeason) {
+      if (params.get('season') !== selectedSeason) {
+        params.set('season', selectedSeason);
+        hasChanged = true;
+      }
+    } else if (params.has('season')) {
+      params.delete('season');
+      hasChanged = true;
+    }
+
+    if (params.get('mode') !== selectedMode) {
+      params.set('mode', selectedMode);
+      hasChanged = true;
+    }
+
+    if (params.get('region') !== selectedLeaderboardRegion) {
+      params.set('region', selectedLeaderboardRegion);
+      hasChanged = true;
+    }
+
+    if (hasChanged) {
+      setSearchParams(params, { replace: true });
+    }
+  }, [selectedSeason, selectedMode, selectedLeaderboardRegion, searchParams, setSearchParams]);
+
   // Connect to selected region when it changes
   useEffect(() => {
-    if (!selectedRegion) {
+    if (!selectedWsRegion) {
       return;
     }
 
-    if (currentRegionUrl === selectedRegion.wsUrl) {
+    if (currentRegionUrl === selectedWsRegion.wsUrl) {
       return;
     }
 
-    console.log('Connecting to region:', selectedRegion.name, selectedRegion.wsUrl);
-    connectToRegion(selectedRegion.wsUrl, {
-      regionId: selectedRegion.id,
-      origin: selectedRegion.origin,
+    console.log('Connecting to region:', selectedWsRegion.name, selectedWsRegion.wsUrl);
+    connectToRegion(selectedWsRegion.wsUrl, {
+      regionId: selectedWsRegion.id,
+      origin: selectedWsRegion.origin,
     });
-  }, [selectedRegion?.id, selectedRegion?.wsUrl, selectedRegion?.origin, connectToRegion, currentRegionUrl]);
+  }, [selectedWsRegion?.id, selectedWsRegion?.wsUrl, selectedWsRegion?.origin, connectToRegion, currentRegionUrl]);
 
   const handleRegionChange = (regionId: string) => {
     selectRegion(regionId);
@@ -582,6 +661,9 @@ export const Leaderboard: React.FC = () => {
             setSelectedSeason={setSelectedSeason}
             selectedMode={selectedMode}
             setSelectedMode={setSelectedMode}
+            selectedRegion={selectedLeaderboardRegion}
+            setSelectedRegion={setSelectedLeaderboardRegion}
+            seasons={seasons}
             isAuthenticated={Boolean(user && !user.isGuest)}
           />
         </div>
@@ -620,6 +702,9 @@ export const Leaderboard: React.FC = () => {
           setSelectedSeason={setSelectedSeason}
           selectedMode={selectedMode}
           setSelectedMode={setSelectedMode}
+          selectedRegion={selectedLeaderboardRegion}
+          setSelectedRegion={setSelectedLeaderboardRegion}
+          seasons={seasons}
           isAuthenticated={Boolean(user && !user.isGuest)}
         />
       </div>
