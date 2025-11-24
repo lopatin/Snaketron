@@ -464,6 +464,10 @@ const LeaderboardContent: React.FC<{
                 );
               } else if (isRankingEntry(entry)) {
                 // Render ranking entry (Duel, 2v2, FFA)
+                const entryRank = getRankFromMMR(entry.mmr);
+                const entryRankImage = getRankImage(entryRank.tier);
+                const entryRankLabel = formatRankLabel(entryRank);
+
                 return (
                   <div
                     key={entry.rank}
@@ -475,8 +479,13 @@ const LeaderboardContent: React.FC<{
                     </div>
 
                     {/* Username */}
-                    <div className="flex items-center font-bold text-sm text-black-70 truncate">
-                      {entry.username}
+                    <div className="flex items-center gap-2 font-bold text-sm text-black-70 min-w-0">
+                      <img
+                        src={entryRankImage}
+                        alt={`${entryRankLabel} icon`}
+                        className="w-6 h-6 flex-shrink-0"
+                      />
+                      <span className="truncate">{entry.username}</span>
                     </div>
 
                     {/* MMR */}
