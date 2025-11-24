@@ -73,6 +73,25 @@ pub trait Database: Send + Sync {
         season: &str,
     ) -> Result<Option<RankingEntry>>;
 
+    // High score operations for solo games
+    async fn insert_high_score(
+        &self,
+        game_id: &str,
+        user_id: i32,
+        username: &str,
+        score: i32,
+        game_type: &common::GameType,
+        region: &str,
+        season: &str,
+    ) -> Result<()>;
+    async fn get_high_scores(
+        &self,
+        game_type: &common::GameType,
+        region: Option<&str>,
+        season: &str,
+        limit: usize,
+    ) -> Result<Vec<HighScoreEntry>>;
+
     // Game operations
     async fn create_game(
         &self,

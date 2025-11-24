@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 /// Persist MMR changes for all players in a completed game to the database.
 /// Uses the Weng-Lin algorithm to calculate new ratings and atomic ADD operations for updates.
+/// For Solo games, persists high scores instead of MMR.
 ///
 /// # Arguments
 /// * `db` - Database interface
@@ -20,9 +21,10 @@ pub async fn persist_player_mmr(
     game_id: u32,
     game_state: &GameState,
 ) -> Result<()> {
-    // Only update MMR for non-solo games
+    // Handle Solo games differently - persist high scores instead of MMR
     if matches!(game_state.game_type, GameType::Solo) {
-        info!("Skipping MMR update for solo game {}", game_id);
+        info!("Persisting high scores for solo game {}", game_id);
+        persist_solo_high_scores(db, game_id, game_state).await?;
         return Ok(());
     }
 
@@ -408,4 +410,53 @@ fn get_ffa_winners(game_state: &GameState) -> HashSet<u32> {
     }
 
     winners
+}
+
+/// Persist high scores for solo games
+async fn persist_solo_high_scores(
+    db: &dyn Database,
+    game_id: u32,
+    game_state: &GameState,
+) -> Result<()> {
+    let season = get_current_season();
+    let region = get_region();
+
+    // For each player, insert their high score
+    for (user_id, player) in &game_state.players {
+        let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
+        let username = game_state
+            .usernames
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("User{}", user_id));
+
+        match db
+            .insert_high_score(
+                &game_id.to_string(),
+                *user_id as i32,
+                &username,
+                score as i32,
+                &game_state.game_type,
+                &region,
+                &season,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Inserted high score for user {} (score: {}) in solo game {} (season: {})",
+                    user_id, score, game_id, season
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to insert high score for user {} in game {}: {:?}",
+                    user_id, game_id, e
+                );
+                // Don't fail the whole operation if one high score insert fails
+            }
+        }
+    }
+
+    Ok(())
 }

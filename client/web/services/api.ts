@@ -1,4 +1,4 @@
-import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse, LeaderboardResponse, SeasonsResponse } from '../types';
+import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse, LeaderboardResponse, SeasonsResponse, UserRankingResponse } from '../types';
 
 interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
@@ -134,6 +134,23 @@ class API {
 
   async getSeasons(): Promise<SeasonsResponse> {
     return this.request<SeasonsResponse>('/seasons');
+  }
+
+  async getMyRanking(
+    queueMode: 'quickmatch' | 'competitive',
+    gameType: 'solo' | 'duel' | '2v2' | 'ffa',
+    season?: string,
+    region?: string
+  ): Promise<UserRankingResponse> {
+    const params = new URLSearchParams({
+      queue_mode: queueMode,
+      game_type: gameType,
+    });
+
+    if (season) params.append('season', season);
+    if (region) params.append('region', region);
+
+    return this.request<UserRankingResponse>(`/leaderboard/me?${params.toString()}`);
   }
 }
 

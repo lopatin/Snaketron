@@ -134,7 +134,7 @@ pub async fn run_http_server(
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
-        .layer(middleware::from_fn_with_state(jwt_manager, auth_middleware))
+        .layer(middleware::from_fn_with_state(jwt_manager.clone(), auth_middleware))
         .with_state(auth_state.clone());
 
     // Build region routes with HttpServerState (for Redis access)
@@ -150,6 +150,12 @@ pub async fn run_http_server(
     let leaderboard_routes = Router::new()
         .route("/api/leaderboard", get(leaderboard::get_leaderboard))
         .route("/api/seasons", get(leaderboard::list_seasons))
+        .with_state(leaderboard_state.clone());
+
+    // Build protected leaderboard routes (requires authentication)
+    let protected_leaderboard_routes = Router::new()
+        .route("/api/leaderboard/me", get(leaderboard::get_my_ranking))
+        .layer(middleware::from_fn_with_state(jwt_manager.clone(), auth_middleware))
         .with_state(leaderboard_state);
 
     // Build API routes with AuthState
@@ -168,6 +174,7 @@ pub async fn run_http_server(
         .merge(protected_routes)
         .merge(region_routes)
         .merge(leaderboard_routes)
+        .merge(protected_leaderboard_routes)
         .with_state(auth_state);
 
     // Build main router combining API and WebSocket endpoints

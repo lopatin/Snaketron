@@ -8,17 +8,35 @@ import JoinGameModal from './JoinGameModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
-import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry } from '../types';
+import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry } from '../types';
 import { api } from '../services/api';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
+
+// Helper to determine rank tier from MMR
+const getRankTierFromMMR = (mmr: number): RankTier => {
+  if (mmr >= 2400) return 'grandmaster';
+  if (mmr >= 2200) return 'master';
+  if (mmr >= 2000) return 'diamond';
+  if (mmr >= 1800) return 'platinum';
+  if (mmr >= 1600) return 'gold';
+  if (mmr >= 1400) return 'silver';
+  return 'bronze';
+};
+
+const getRankImage = (tier: RankTier | 'unranked'): string => {
+  if (tier === 'unranked') return '/images/unranked.png';
+  const imageTier = tier === 'master' ? 'grandmaster' : tier;
+  return `/images/${imageTier}.png`;
+};
 
 const LeaderboardContent: React.FC<{
   selectedSeason: string;
   setSelectedSeason: (season: string) => void;
   selectedMode: LobbyGameMode;
   setSelectedMode: (mode: LobbyGameMode) => void;
-}> = ({ selectedSeason, setSelectedSeason, selectedMode, setSelectedMode }) => {
+  isAuthenticated: boolean;
+}> = ({ selectedSeason, setSelectedSeason, selectedMode, setSelectedMode, isAuthenticated }) => {
   const [selectedRegion, setSelectedRegion] = useState<string>('global');
   const [seasons, setSeasons] = useState<string[]>([]);
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
@@ -26,6 +44,7 @@ const LeaderboardContent: React.FC<{
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [offset, setOffset] = useState(0);
+  const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
   const LIMIT = 25;
 
   // Available regions for filtering
@@ -50,6 +69,31 @@ const LeaderboardContent: React.FC<{
     };
     fetchSeasons();
   }, []);
+
+  // Fetch user's ranking when authenticated and filters change
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setUserRanking(null);
+      return;
+    }
+
+    const fetchUserRanking = async () => {
+      try {
+        const data = await api.getMyRanking(
+          'competitive',
+          selectedMode,
+          selectedSeason || undefined,
+          selectedRegion === 'global' ? undefined : selectedRegion
+        );
+        setUserRanking(data);
+      } catch (err) {
+        console.error('Failed to fetch user ranking:', err);
+        setUserRanking(null);
+      }
+    };
+
+    fetchUserRanking();
+  }, [isAuthenticated, selectedSeason, selectedMode, selectedRegion]);
 
   // Fetch leaderboard data when filters change (always use competitive mode)
   useEffect(() => {
@@ -101,8 +145,39 @@ const LeaderboardContent: React.FC<{
 
   return (
     <div className="w-full max-w-4xl mx-auto px-4 py-8">
-      {/* Header row with selectors */}
-      <div className="flex flex-col md:flex-row md:items-end md:justify-end gap-6 mb-8">
+      {/* Header row with rank and selectors */}
+      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-6 mb-8">
+        {/* Your Rank Display (left side) - Not shown for Solo mode */}
+        {isAuthenticated && selectedMode !== 'solo' ? (
+          <div className="flex items-center gap-3">
+            <img
+              src={getRankImage(userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked')}
+              alt={userRanking?.mmr ? getRankTierFromMMR(userRanking.mmr) : 'unranked'}
+              className="w-12 h-12 object-contain"
+            />
+            <div>
+              <div className="text-xs uppercase tracking-1 text-gray-500 font-bold">Your Rank</div>
+              {userRanking?.rank ? (
+                <>
+                  <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
+                    #{userRanking.rank}
+                  </div>
+                  <div className="text-xs text-black-70">{userRanking.mmr} MMR</div>
+                </>
+              ) : (
+                <div className="font-black italic uppercase tracking-1 text-lg text-black-70">
+                  UNRANKED
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          // Empty div to maintain flex layout spacing
+          <div className="hidden md:block"></div>
+        )}
+
+        {/* Selectors (right side) */}
+        <div className="flex flex-col sm:flex-row gap-6">
         {/* Region Selector */}
         <div className="flex flex-col gap-1">
           <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
@@ -188,19 +263,31 @@ const LeaderboardContent: React.FC<{
             })}
           </div>
         </div>
+        </div>
       </div>
 
       {/* Leaderboard Table */}
       <div className="bg-white border-2 border-gray-300 rounded-lg overflow-hidden">
         {/* Table Header */}
-        <div className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
-          <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
-          <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
-          <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">MMR</div>
-          <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Wins</div>
-          <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Losses</div>
-          <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Win %</div>
-        </div>
+        {selectedMode === 'solo' ? (
+          // Solo mode header - show Score and Date instead of MMR/Wins/Losses
+          <div className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Score</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Date</div>
+          </div>
+        ) : (
+          // Other modes header - show MMR, Wins, Losses, Win%
+          <div className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">MMR</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Wins</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Losses</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Win %</div>
+          </div>
+        )}
 
         {/* Table Body */}
         <div className="divide-y divide-gray-200">
@@ -217,42 +304,84 @@ const LeaderboardContent: React.FC<{
               No players have been ranked yet in this mode.
             </div>
           ) : (
-            leaderboardData.map((entry) => (
-              <div
-                key={entry.rank}
-                className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
-              >
-                {/* Rank */}
-                <div className="flex items-center">
-                  <span className="font-black text-base text-black-70">{entry.rank}</span>
-                </div>
+            leaderboardData.map((entry) => {
+              // Check if this is a high score entry (Solo mode) or ranking entry
+              if (isHighScoreEntry(entry)) {
+                // Render Solo mode entry
+                const date = new Date(entry.timestamp);
+                const formattedDate = date.toLocaleDateString('en-US', {
+                  month: 'short',
+                  day: 'numeric',
+                  year: 'numeric'
+                });
 
-                {/* Username */}
-                <div className="flex items-center font-bold text-sm text-black-70 truncate">
-                  {entry.username}
-                </div>
+                return (
+                  <div
+                    key={`${entry.gameId}-${entry.rank}`}
+                    className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                  >
+                    {/* Rank */}
+                    <div className="flex items-center">
+                      <span className="font-black text-base text-black-70">{entry.rank}</span>
+                    </div>
 
-                {/* MMR */}
-                <div className="flex items-center justify-end font-black italic text-base text-black-70">
-                  {entry.mmr}
-                </div>
+                    {/* Username */}
+                    <div className="flex items-center font-bold text-sm text-black-70 truncate">
+                      {entry.username}
+                    </div>
 
-                {/* Wins (hidden on mobile) */}
-                <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
-                  {entry.wins}
-                </div>
+                    {/* Score */}
+                    <div className="flex items-center justify-end font-black italic text-base text-black-70">
+                      {entry.score}
+                    </div>
 
-                {/* Losses (hidden on mobile) */}
-                <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
-                  {entry.losses}
-                </div>
+                    {/* Date (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {formattedDate}
+                    </div>
+                  </div>
+                );
+              } else if (isRankingEntry(entry)) {
+                // Render ranking entry (Duel, 2v2, FFA)
+                return (
+                  <div
+                    key={entry.rank}
+                    className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                  >
+                    {/* Rank */}
+                    <div className="flex items-center">
+                      <span className="font-black text-base text-black-70">{entry.rank}</span>
+                    </div>
 
-                {/* Win Rate */}
-                <div className="flex items-center justify-end font-bold text-sm text-black-70">
-                  {entry.winRate.toFixed(1)}%
-                </div>
-              </div>
-            ))
+                    {/* Username */}
+                    <div className="flex items-center font-bold text-sm text-black-70 truncate">
+                      {entry.username}
+                    </div>
+
+                    {/* MMR */}
+                    <div className="flex items-center justify-end font-black italic text-base text-black-70">
+                      {entry.mmr}
+                    </div>
+
+                    {/* Wins (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {entry.wins}
+                    </div>
+
+                    {/* Losses (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {entry.losses}
+                    </div>
+
+                    {/* Win Rate */}
+                    <div className="flex items-center justify-end font-bold text-sm text-black-70">
+                      {entry.winRate.toFixed(1)}%
+                    </div>
+                  </div>
+                );
+              }
+              return null;
+            })
           )}
         </div>
       </div>
@@ -453,6 +582,7 @@ export const Leaderboard: React.FC = () => {
             setSelectedSeason={setSelectedSeason}
             selectedMode={selectedMode}
             setSelectedMode={setSelectedMode}
+            isAuthenticated={Boolean(user && !user.isGuest)}
           />
         </div>
 
@@ -490,6 +620,7 @@ export const Leaderboard: React.FC = () => {
           setSelectedSeason={setSelectedSeason}
           selectedMode={selectedMode}
           setSelectedMode={setSelectedMode}
+          isAuthenticated={Boolean(user && !user.isGuest)}
         />
       </div>
 

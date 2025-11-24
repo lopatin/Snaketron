@@ -54,8 +54,13 @@ impl DynamoDatabase {
         format!("{}-game-codes", self.table_prefix)
     }
 
-    fn rankings_table(&self, season: &str) -> String {
-        format!("{}-rankings-{}", self.table_prefix, season)
+    fn rankings_table(&self) -> String {
+        // Single table for all seasons - season is stored in the partition key
+        format!("{}-rankings", self.table_prefix)
+    }
+
+    fn high_scores_table(&self) -> String {
+        format!("{}-highscores", self.table_prefix)
     }
 
     async fn ensure_tables_exist(&self) -> Result<()> {
@@ -68,7 +73,11 @@ impl DynamoDatabase {
         // Create game codes table
         self.create_game_codes_table_if_not_exists().await?;
 
-        // Note: Rankings tables are created on-demand per season
+        // Create rankings table (single table for all seasons)
+        self.create_rankings_table_if_not_exists().await?;
+
+        // Create high scores table (for solo mode leaderboards)
+        self.create_high_scores_table_if_not_exists().await?;
 
         Ok(())
     }
@@ -1222,8 +1231,8 @@ impl Database for DynamoDatabase {
         season: &str,
         won: bool,
     ) -> Result<()> {
-        // Ensure table exists for this season
-        self.create_rankings_table_if_not_exists(season).await?;
+        // Ensure table exists
+        self.create_rankings_table_if_not_exists().await?;
 
         let queue_mode_str = match queue_mode {
             common::QueueMode::Competitive => "ranked",
@@ -1236,7 +1245,8 @@ impl Database for DynamoDatabase {
         let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
         let padded_mmr = format!("{:08}", inverted_mmr);
 
-        let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, region);
+        // Include season in PK for single-table design
+        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season);
         let sk = format!("MMR#{}#USER#{}", padded_mmr, user_id);
 
         // Try to get existing ranking to calculate delta
@@ -1278,7 +1288,7 @@ impl Database for DynamoDatabase {
 
                 self.client
                     .delete_item()
-                    .table_name(self.rankings_table(season))
+                    .table_name(self.rankings_table())
                     .key("pk", Self::av_s(&pk))
                     .key("sk", Self::av_s(&old_sk))
                     .send()
@@ -1290,7 +1300,7 @@ impl Database for DynamoDatabase {
         // Insert new entry
         self.client
             .put_item()
-            .table_name(self.rankings_table(season))
+            .table_name(self.rankings_table())
             .set_item(Some(item))
             .send()
             .await
@@ -1313,7 +1323,7 @@ impl Database for DynamoDatabase {
         limit: usize,
     ) -> Result<Vec<RankingEntry>> {
         // Ensure table exists
-        self.create_rankings_table_if_not_exists(season).await?;
+        self.create_rankings_table_if_not_exists().await?;
 
         let queue_mode_str = match queue_mode {
             common::QueueMode::Competitive => "ranked",
@@ -1325,12 +1335,12 @@ impl Database for DynamoDatabase {
             let game_type_str = Self::game_type_to_string(game_type_ref);
 
             if let Some(reg) = region {
-                // Query specific region and game type
-                let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, reg);
+                // Query specific region, game type, and season
+                let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, reg, season);
 
                 let response = self.client
                     .query()
-                    .table_name(self.rankings_table(season))
+                    .table_name(self.rankings_table())
                     .key_condition_expression("pk = :pk")
                     .expression_attribute_values(":pk", Self::av_s(&pk))
                     .limit(limit as i32)
@@ -1340,12 +1350,12 @@ impl Database for DynamoDatabase {
 
                 response.items.unwrap_or_default()
             } else {
-                // Query all regions for specific game type
+                // Scan all regions for specific game type and season
                 let response = self.client
                     .scan()
-                    .table_name(self.rankings_table(season))
+                    .table_name(self.rankings_table())
                     .filter_expression("begins_with(pk, :prefix)")
-                    .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}#{}", queue_mode_str, game_type_str)))
+                    .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}#{}#", queue_mode_str, game_type_str)))
                     .limit(limit as i32)
                     .send()
                     .await
@@ -1354,10 +1364,10 @@ impl Database for DynamoDatabase {
                 response.items.unwrap_or_default()
             }
         } else {
-            // Query all game types and regions
+            // Scan all game types and regions for a season
             let response = self.client
                 .scan()
-                .table_name(self.rankings_table(season))
+                .table_name(self.rankings_table())
                 .filter_expression("begins_with(pk, :prefix)")
                 .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}", queue_mode_str)))
                 .limit(limit as i32)
@@ -1407,7 +1417,7 @@ impl Database for DynamoDatabase {
         season: &str,
     ) -> Result<Option<RankingEntry>> {
         // Ensure table exists
-        self.create_rankings_table_if_not_exists(season).await?;
+        self.create_rankings_table_if_not_exists().await?;
 
         let queue_mode_str = match queue_mode {
             common::QueueMode::Competitive => "ranked",
@@ -1415,25 +1425,30 @@ impl Database for DynamoDatabase {
         };
 
         let game_type_str = Self::game_type_to_string(game_type);
-        let pk = format!("RANKING#{}#{}#{}", queue_mode_str, game_type_str, region);
+        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season);
 
-        // Query for this user's ranking
+        // Query all rankings for this PK and filter in memory for the user
+        // We can't use filter on sk since it's a key attribute
         let response = self.client
             .query()
-            .table_name(self.rankings_table(season))
-            .key_condition_expression("pk = :pk AND contains(sk, :user_id)")
+            .table_name(self.rankings_table())
+            .key_condition_expression("pk = :pk")
             .expression_attribute_values(":pk", Self::av_s(&pk))
-            .expression_attribute_values(":user_id", Self::av_s(&format!("USER#{}", user_id)))
             .send()
             .await
-            .context("Failed to query user ranking")?;
+            .context("Failed to query rankings")?;
 
         let items = response.items.unwrap_or_default();
-        if items.is_empty() {
-            return Ok(None);
-        }
 
-        let item = &items[0];
+        // Filter in memory for the specific user
+        let user_item = items.iter().find(|item| {
+            Self::extract_number(item, "userId") == Some(user_id)
+        });
+
+        let item = match user_item {
+            Some(item) => item,
+            None => return Ok(None),
+        };
         Ok(Some(RankingEntry {
             user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
             username: Self::extract_string(item, "username").unwrap_or_default(),
@@ -1451,12 +1466,106 @@ impl Database for DynamoDatabase {
                 .unwrap_or_else(Utc::now),
         }))
     }
+
+    async fn insert_high_score(
+        &self,
+        game_id: &str,
+        user_id: i32,
+        username: &str,
+        score: i32,
+        game_type: &common::GameType,
+        region: &str,
+        season: &str,
+    ) -> Result<()> {
+        let game_type_str = Self::game_type_to_string(game_type);
+
+        // PK: SCORE#{game_type}#{region} (e.g., SCORE#solo#us-east-1 or SCORE#solo#global)
+        let pk = format!("SCORE#{}#{}", game_type_str, region);
+
+        // SK: SCORE#{inverted_score}#GAME#{game_id}
+        // Invert score for descending order (99999999 - score)
+        let inverted_score = 99999999 - score;
+        let sk = format!("SCORE#{:08}#GAME#{}", inverted_score, game_id);
+
+        let timestamp = Utc::now().to_rfc3339();
+
+        self.client
+            .put_item()
+            .table_name(self.high_scores_table())
+            .item("pk", Self::av_s(&pk))
+            .item("sk", Self::av_s(&sk))
+            .item("gameId", Self::av_s(game_id))
+            .item("userId", Self::av_n(user_id))
+            .item("username", Self::av_s(username))
+            .item("score", Self::av_n(score))
+            .item("region", Self::av_s(region))
+            .item("gameType", Self::av_s(&game_type_str))
+            .item("season", Self::av_s(season))
+            .item("timestamp", Self::av_s(&timestamp))
+            .send()
+            .await
+            .context("Failed to insert high score")?;
+
+        info!("Inserted high score for game {} (user: {}, score: {})", game_id, username, score);
+        Ok(())
+    }
+
+    async fn get_high_scores(
+        &self,
+        game_type: &common::GameType,
+        region: Option<&str>,
+        season: &str,
+        limit: usize,
+    ) -> Result<Vec<HighScoreEntry>> {
+        let game_type_str = Self::game_type_to_string(game_type);
+        let region_str = region.unwrap_or("global");
+
+        // PK for querying high scores
+        let pk = format!("SCORE#{}#{}", game_type_str, region_str);
+
+        // Query high scores table with season filter
+        let response = self.client
+            .query()
+            .table_name(self.high_scores_table())
+            .key_condition_expression("pk = :pk")
+            .filter_expression("season = :season")
+            .expression_attribute_values(":pk", Self::av_s(&pk))
+            .expression_attribute_values(":season", Self::av_s(season))
+            .limit(limit as i32)
+            .send()
+            .await
+            .context("Failed to query high scores")?;
+
+        let items = response.items.unwrap_or_default();
+
+        // Parse results into HighScoreEntry
+        let entries: Vec<HighScoreEntry> = items
+            .into_iter()
+            .filter_map(|item| {
+                Some(HighScoreEntry {
+                    game_id: Self::extract_string(&item, "gameId")?,
+                    user_id: Self::extract_number(&item, "userId")?,
+                    username: Self::extract_string(&item, "username")?,
+                    score: Self::extract_number(&item, "score")?,
+                    region: Self::extract_string(&item, "region")?,
+                    game_type: Self::extract_string(&item, "gameType")?,
+                    season: Self::extract_string(&item, "season")?,
+                    timestamp: Self::extract_string(&item, "timestamp")
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now),
+                })
+            })
+            .collect();
+
+        Ok(entries)
+    }
 }
 
 // Private helper methods for rankings
 impl DynamoDatabase {
-    async fn create_rankings_table_if_not_exists(&self, season: &str) -> Result<()> {
-        let table_name = self.rankings_table(season);
+    async fn create_rankings_table_if_not_exists(&self) -> Result<()> {
+        let table_name = self.rankings_table();
 
         // Check if table exists
         match self.client.describe_table().table_name(&table_name).send().await {
@@ -1469,11 +1578,11 @@ impl DynamoDatabase {
             }
         }
 
-        // PK: RANKING#{queue_mode}#{region} (e.g., "RANKING#ranked#us-east-1")
+        // PK: RANKING#{queue_mode}#{game_type}#{region}#{season} (e.g., "RANKING#ranked#solo#us-east-1#2025-S1")
         // SK: MMR#{padded_mmr}#USER#{user_id} (e.g., "MMR#00001543#USER#1234")
         // This schema allows:
-        // - Querying top players by queue_mode + region (sorted by MMR descending)
-        // - Querying all regions with queue_mode prefix
+        // - Querying top players by queue_mode + game_type + region + season (sorted by MMR descending)
+        // - Single table stores all seasons
 
         let pk_attr = AttributeDefinition::builder()
             .attribute_name("pk")
@@ -1512,6 +1621,100 @@ impl DynamoDatabase {
             .context("Failed to create rankings table")?;
 
         info!("Successfully created rankings table: {}", table_name);
+        Ok(())
+    }
+
+    async fn create_high_scores_table_if_not_exists(&self) -> Result<()> {
+        let table_name = self.high_scores_table();
+
+        // Check if table exists
+        match self.client.describe_table().table_name(&table_name).send().await {
+            Ok(_) => {
+                debug!("High scores table {} already exists", table_name);
+                return Ok(());
+            }
+            Err(_) => {
+                info!("Creating high scores table: {}", table_name);
+            }
+        }
+
+        // PK: SCORE#{game_type}#{region} (e.g., "SCORE#solo#us-east-1" or "SCORE#solo#global")
+        // SK: SCORE#{inverted_score}#GAME#{game_id} (e.g., "SCORE#99998457#GAME#1234")
+        // GSI: UserScoreIndex with userId as PK and sk as SK for user-specific lookups
+        // This schema allows:
+        // - Querying top scores by game_type + region (sorted by score descending)
+        // - Single table stores all seasons (season stored as attribute)
+
+        let pk_attr = AttributeDefinition::builder()
+            .attribute_name("pk")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build pk attribute")?;
+
+        let sk_attr = AttributeDefinition::builder()
+            .attribute_name("sk")
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .context("Failed to build sk attribute")?;
+
+        let user_id_attr = AttributeDefinition::builder()
+            .attribute_name("userId")
+            .attribute_type(ScalarAttributeType::N)
+            .build()
+            .context("Failed to build userId attribute")?;
+
+        let pk_key = KeySchemaElement::builder()
+            .attribute_name("pk")
+            .key_type(KeyType::Hash)
+            .build()
+            .context("Failed to build pk key")?;
+
+        let sk_key = KeySchemaElement::builder()
+            .attribute_name("sk")
+            .key_type(KeyType::Range)
+            .build()
+            .context("Failed to build sk key")?;
+
+        // GSI for user-specific lookups
+        let gsi_pk_key = KeySchemaElement::builder()
+            .attribute_name("userId")
+            .key_type(KeyType::Hash)
+            .build()
+            .context("Failed to build GSI pk key")?;
+
+        let gsi_sk_key = KeySchemaElement::builder()
+            .attribute_name("sk")
+            .key_type(KeyType::Range)
+            .build()
+            .context("Failed to build GSI sk key")?;
+
+        let gsi = GlobalSecondaryIndex::builder()
+            .index_name("UserScoreIndex")
+            .key_schema(gsi_pk_key)
+            .key_schema(gsi_sk_key)
+            .projection(
+                Projection::builder()
+                    .projection_type(ProjectionType::All)
+                    .build(),
+            )
+            .build()
+            .context("Failed to build GSI")?;
+
+        self.client
+            .create_table()
+            .table_name(&table_name)
+            .attribute_definitions(pk_attr)
+            .attribute_definitions(sk_attr)
+            .attribute_definitions(user_id_attr)
+            .key_schema(pk_key)
+            .key_schema(sk_key)
+            .global_secondary_indexes(gsi)
+            .billing_mode(BillingMode::PayPerRequest)
+            .send()
+            .await
+            .context("Failed to create high scores table")?;
+
+        info!("Successfully created high scores table: {}", table_name);
         Ok(())
     }
 }

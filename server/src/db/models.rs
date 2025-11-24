@@ -101,6 +101,19 @@ pub struct RankingEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+// High score entry for solo game leaderboards
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighScoreEntry {
+    pub game_id: String,
+    pub user_id: i32,
+    pub username: String,
+    pub score: i32,
+    pub region: String,
+    pub game_type: String, // "solo"
+    pub season: String,    // e.g., "2025-S1"
+    pub timestamp: DateTime<Utc>,
+}
+
 // DynamoDB specific models for single table design
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoItem {

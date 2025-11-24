@@ -388,13 +388,35 @@ export interface Rank {
   mmr: number;
 }
 
-export interface LeaderboardEntry {
+// Leaderboard entry for ranking-based modes (duel, 2v2, ffa)
+export interface RankingEntry {
   rank: number;
   username: string;
   mmr: number;
   wins: number;
   losses: number;
   winRate: number;
+}
+
+// High score entry for solo mode
+export interface HighScoreEntry {
+  rank: number;
+  username: string;
+  score: number;
+  timestamp: string;
+  gameId: string;
+}
+
+// Union type for leaderboard entries
+export type LeaderboardEntry = RankingEntry | HighScoreEntry;
+
+// Type guards for discriminating entry types
+export function isRankingEntry(entry: LeaderboardEntry): entry is RankingEntry {
+  return 'mmr' in entry;
+}
+
+export function isHighScoreEntry(entry: LeaderboardEntry): entry is HighScoreEntry {
+  return 'score' in entry;
 }
 
 export interface LeaderboardData {
@@ -415,4 +437,12 @@ export interface LeaderboardResponse {
 export interface SeasonsResponse {
   seasons: string[];
   current: string;
+}
+
+export interface UserRankingResponse {
+  rank: number | null;
+  mmr: number | null;
+  wins: number | null;
+  losses: number | null;
+  winRate: number | null;
 }
