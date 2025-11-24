@@ -58,6 +58,7 @@ export interface LobbyPreferences {
 // WebSocket Types
 export interface WebSocketContextType {
   isConnected: boolean;
+  isSessionAuthenticated: boolean;
   sendMessage: (message: any) => void;
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;

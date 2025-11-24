@@ -20,6 +20,7 @@ export const NewHome: React.FC = () => {
   const {
     connectToRegion,
     isConnected,
+    isSessionAuthenticated,
     onMessage,
     currentRegionUrl,
     currentLobby,
@@ -37,6 +38,25 @@ export const NewHome: React.FC = () => {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
+
+  const waitForConnection = async (timeoutMs = 5000) => {
+    const start = Date.now();
+    // Trigger a reconnect if we have region data but no active socket
+    if (!isConnected) {
+      const target = selectedRegion ?? regions[0];
+      if (target && currentRegionUrl !== target.wsUrl) {
+        connectToRegion(target.wsUrl, { regionId: target.id, origin: target.origin });
+      }
+    }
+
+    while (Date.now() - start < timeoutMs) {
+      if (isConnected && (!user || isSessionAuthenticated)) {
+        return true;
+      }
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    return false;
+  };
 
   // Use regions hook for live data
   const {
@@ -188,6 +208,12 @@ export const NewHome: React.FC = () => {
         }
 
         await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      const connected = await waitForConnection();
+      if (!connected) {
+        console.error('Could not establish WebSocket connection for lobby invite');
+        return;
       }
 
       if (!currentLobby) {

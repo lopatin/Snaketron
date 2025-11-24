@@ -8,10 +8,9 @@ class API {
   private baseURL: string;
 
   constructor() {
-    // Use environment variable if available, otherwise default to localhost for development
-    // For local development, we need to add /api prefix
-    const envUrl = process.env.REACT_APP_API_URL;
-    this.baseURL = envUrl || 'http://localhost:8080/api';
+    // Base API host; endpoints below include the /api prefix explicitly
+    const envUrl = process.env.REACT_APP_API_URL?.replace(/\/+$/, '');
+    this.baseURL = envUrl || 'http://localhost:8080';
   }
 
   private getToken(): string | null {
@@ -58,7 +57,7 @@ class API {
   }
 
   async login(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/auth/login', {
+    const data = await this.request<LoginResponse>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -67,7 +66,7 @@ class API {
   }
 
   async register(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/auth/register', {
+    const data = await this.request<LoginResponse>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -76,7 +75,7 @@ class API {
   }
 
   async createGuest(nickname: string): Promise<CreateGuestResponse> {
-    const data = await this.request<CreateGuestResponse>('/auth/guest', {
+    const data = await this.request<CreateGuestResponse>('/api/auth/guest', {
       method: 'POST',
       body: JSON.stringify({ nickname }),
     });
@@ -86,7 +85,7 @@ class API {
 
   async checkUsername(username: string): Promise<CheckUsernameResponse> {
     try {
-      const response = await this.request<CheckUsernameResponse>('/auth/check-username', {
+      const response = await this.request<CheckUsernameResponse>('/api/auth/check-username', {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
@@ -108,7 +107,7 @@ class API {
   }
 
   async getCurrentUser(): Promise<User> {
-    return this.request<User>('/auth/me');
+    return this.request<User>('/api/auth/me');
   }
 
   async getLeaderboard(
@@ -129,11 +128,11 @@ class API {
     if (offset !== undefined) params.append('offset', offset.toString());
     if (region) params.append('region', region);
 
-    return this.request<LeaderboardResponse>(`/leaderboard?${params.toString()}`);
+    return this.request<LeaderboardResponse>(`/api/leaderboard?${params.toString()}`);
   }
 
   async getSeasons(): Promise<SeasonsResponse> {
-    return this.request<SeasonsResponse>('/seasons');
+    return this.request<SeasonsResponse>('/api/seasons');
   }
 
   async getMyRanking(
@@ -150,7 +149,7 @@ class API {
     if (season !== undefined) params.append('season', season.toString());
     if (region) params.append('region', region);
 
-    return this.request<UserRankingResponse>(`/leaderboard/me?${params.toString()}`);
+    return this.request<UserRankingResponse>(`/api/leaderboard/me?${params.toString()}`);
   }
 }
 

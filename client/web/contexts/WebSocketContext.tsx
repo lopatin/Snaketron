@@ -496,7 +496,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     previousUserRef.current = user;
 
-    if (!isConnected || !isSessionAuthenticated) {
+    if (!isConnected) {
       return;
     }
 
@@ -507,7 +507,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
-    if (token !== lastAuthTokenRef.current) {
+    // If token changed or session not yet authenticated, perform handshake
+    if (!isSessionAuthenticated || token !== lastAuthTokenRef.current) {
       setAuthHandshakeState(false);
       authenticateConnection();
     }
@@ -1361,6 +1362,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   const value: WebSocketContextType = {
     isConnected,
+    isSessionAuthenticated,
     sendMessage,
     onMessage,
     connect,

@@ -344,9 +344,10 @@ interface CreateGuestResponse {
   user: User & { isGuest: boolean };
 }
 
+// Base URL now set to host; endpoints include /api prefix directly.
 class API {
   async createGuest(nickname: string): Promise<CreateGuestResponse> {
-    const data = await this.request<CreateGuestResponse>('/auth/guest', {
+    const data = await this.request<CreateGuestResponse>('/api/auth/guest', {
       method: 'POST',
       body: JSON.stringify({ nickname }),
     });
