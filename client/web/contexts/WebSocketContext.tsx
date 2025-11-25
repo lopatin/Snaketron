@@ -487,6 +487,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const previous = previousUserRef.current;
+    const token = getToken();
+    if (!token) {
+      setAuthHandshakeState(false);
+      lastAuthTokenRef.current = null;
+      return;
+    }
+
+    const tokenChanged = lastAuthTokenRef.current && token !== lastAuthTokenRef.current;
+
+    // If the auth token changes (guest -> real account, logout, etc.), force a reconnect
+    // because the server only accepts authentication during the initial handshake.
+    if (isConnected && tokenChanged) {
+      console.log('Auth token changed, reconnecting WebSocket');
+      previousUserRef.current = user;
+      setAuthHandshakeState(false);
+      disconnect();
+      return;
+    }
+
     if (previous?.isGuest && user && !user.isGuest) {
       console.log('Guest transitioned to full user, reconnecting WebSocket');
       previousUserRef.current = user;
@@ -497,13 +516,6 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     previousUserRef.current = user;
 
     if (!isConnected) {
-      return;
-    }
-
-    const token = getToken();
-    if (!token) {
-      setAuthHandshakeState(false);
-      lastAuthTokenRef.current = null;
       return;
     }
 
