@@ -6,12 +6,39 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 
+const gaMeasurementId = process.env.REACT_APP_GA_ID?.trim();
+
+const initializeGoogleAnalytics = (measurementId: string) => {
+  if (window.gtag) {
+    return;
+  }
+
+  const script = document.createElement('script');
+  script.async = true;
+  script.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(measurementId)}`;
+  document.head?.appendChild(script);
+
+  window.dataLayer = window.dataLayer || [];
+  window.gtag = (...args: unknown[]) => {
+    window.dataLayer?.push(args);
+  };
+
+  window.gtag('js', new Date());
+  window.gtag('config', measurementId);
+};
+
 // Extend window interface to include wasm helpers
 declare global {
   interface Window {
     wasm?: typeof wasm;
     wasmReady?: Promise<void>;
+    dataLayer?: unknown[][];
+    gtag?: (...args: unknown[]) => void;
   }
+}
+
+if (gaMeasurementId) {
+  initializeGoogleAnalytics(gaMeasurementId);
 }
 
 // Initialize game client after WASM is loaded and expose readiness
