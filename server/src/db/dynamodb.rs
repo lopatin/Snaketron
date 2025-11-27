@@ -388,8 +388,17 @@ impl DynamoDatabase {
     }
 
     fn extract_number(item: &HashMap<String, AttributeValue>, key: &str) -> Option<i32> {
-        item.get(key)
+        // Handle numeric attributes stored as either Number or String in DynamoDB
+        if let Some(val) = item
+            .get(key)
             .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            return Some(val);
+        }
+
+        item.get(key)
+            .and_then(|v| v.as_s().ok())
             .and_then(|s| s.parse::<i32>().ok())
     }
 
@@ -1569,7 +1578,7 @@ impl Database for DynamoDatabase {
             .item("pk", Self::av_s(&pk))
             .item("sk", Self::av_s(&sk))
             .item("gameId", Self::av_s(game_id))
-            .item("userId", Self::av_n(user_id))
+            .item("userId", Self::av_s(user_id.to_string()))
             .item("username", Self::av_s(username))
             .item("score", Self::av_n(score))
             .item("region", Self::av_s(region))
@@ -2013,7 +2022,7 @@ impl DynamoDatabase {
 
         let user_id_attr = AttributeDefinition::builder()
             .attribute_name("userId")
-            .attribute_type(ScalarAttributeType::N)
+            .attribute_type(ScalarAttributeType::S)
             .build()
             .context("Failed to build userId attribute")?;
 
