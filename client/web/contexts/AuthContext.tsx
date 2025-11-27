@@ -38,8 +38,16 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setUser(userInfo);
     } catch (err) {
       console.error('Failed to fetch current user:', err);
-      // Token is invalid or expired
-      api.setAuthToken(null);
+      const status = (err as any)?.response?.status;
+      const isAuthError = status === 401 || status === 403;
+      const isAbortError = err instanceof Error && err.name === 'AbortError';
+
+      // Only clear the token for real auth failures, not for transient/aborted requests
+      if (isAuthError) {
+        api.setAuthToken(null);
+      } else if (isAbortError) {
+        console.debug('Fetch aborted while loading user; keeping existing auth token');
+      }
     } finally {
       setLoading(false);
     }
