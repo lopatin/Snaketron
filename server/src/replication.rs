@@ -1,7 +1,7 @@
 use crate::game_executor::PARTITION_COUNT;
 use crate::pubsub_manager::{PartitionSubscription, PubSubManager};
 use anyhow::{Context, Result};
-use common::{GameEvent, GameEventMessage, GameState};
+use common::{GameEvent, GameEventMessage, GameState, GameStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast};
