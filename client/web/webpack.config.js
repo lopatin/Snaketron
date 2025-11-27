@@ -1,13 +1,19 @@
-const CopyWebpackPlugin = require("copy-webpack-plugin");
 const webpack = require('webpack');
 const path = require('path');
+const CopyWebpackPlugin = require("copy-webpack-plugin");
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+
+const isProduction = process.env.NODE_ENV === 'production';
 
 module.exports = {
   entry: "./bootstrap.ts",
   output: {
     path: path.resolve(__dirname, "dist"),
-    filename: "bootstrap.js",
+    filename: isProduction ? "[name].[contenthash].js" : "[name].js",
+    chunkFilename: isProduction ? "[name].[contenthash].js" : "[name].js",
+    assetModuleFilename: isProduction ? "[name].[contenthash][ext]" : "[name][ext]",
     publicPath: '/',
+    clean: true,
   },
   resolve: {
     extensions: ['.ts', '.tsx', '.js', '.jsx'],
@@ -32,13 +38,18 @@ module.exports = {
       },
     ],
   },
-  mode: "development",
+  mode: isProduction ? "production" : "development",
   plugins: [
     new CopyWebpackPlugin([
-      'index.html',
       'SnaketronLogo.png',
       { from: 'public/images', to: 'images' }
     ]),
+    new HtmlWebpackPlugin({
+      template: path.resolve(__dirname, 'index.html'),
+      filename: 'index.html',
+      scriptLoading: 'defer',
+      inject: 'body',
+    }),
     new webpack.DefinePlugin({
       'process.env.REACT_APP_WS_URL': JSON.stringify(process.env.REACT_APP_WS_URL || ''),
       'process.env.REACT_APP_API_URL': JSON.stringify(process.env.REACT_APP_API_URL || ''),
