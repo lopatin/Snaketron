@@ -124,6 +124,8 @@ impl PartitionReplica {
             game_id, self.partition_id
         );
 
+        let mut is_completion = false;
+
         match &event_msg.event {
             GameEvent::Snapshot { game_state } => {
                 info!(
@@ -133,6 +135,7 @@ impl PartitionReplica {
                 // Always update with the latest snapshot
                 let mut states = self.game_states.write().await;
                 states.insert(game_id, game_state.clone());
+                is_completion = matches!(game_state.status, GameStatus::Complete { .. });
             }
             _ => {
                 let mut states = self.game_states.write().await;
@@ -146,6 +149,7 @@ impl PartitionReplica {
 
                     // Apply event to game state
                     game_state.apply_event(event_msg.event.clone(), None);
+                    is_completion = matches!(game_state.status, GameStatus::Complete { .. });
                     debug!(
                         "Applied event to game {} state: {:?}",
                         game_id, event_msg.event
@@ -175,6 +179,21 @@ impl PartitionReplica {
                     }
                 }
             }
+        }
+
+        if is_completion {
+            {
+                let mut states = self.game_states.write().await;
+                states.remove(&game_id);
+            }
+            {
+                let mut broadcasters = self.game_event_broadcasters.write().await;
+                broadcasters.remove(&game_id);
+            }
+            info!(
+                "Game {} completed; evicted from replication cache and dropped broadcasters",
+                game_id
+            );
         }
 
         Ok(())

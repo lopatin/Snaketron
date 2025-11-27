@@ -186,6 +186,17 @@ async fn run_game(
                                 warn!("Failed to publish final snapshot: {}", e);
                             }
 
+                            // Notify other executor instances that the game completed so they can clean up local state.
+                            if let Err(e) = pubsub.publish_command(
+                                partition_id,
+                                &StreamEvent::StatusUpdated {
+                                    game_id,
+                                    status: game_state.status.clone(),
+                                },
+                            ).await {
+                                warn!("Failed to publish game completion command for {}: {}", game_id, e);
+                            }
+
                             // Persist XP to database
                             if !game_state.player_xp.is_empty() {
                                 info!("Persisting XP for {} players in game {}", game_state.player_xp.len(), game_id);
