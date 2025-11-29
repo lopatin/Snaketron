@@ -16,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub const PARTITION_COUNT: u32 = 10;
-pub const SNAPSHOT_INTERVAL_TICKS: u32 = 10; // Publish snapshot every 10 ticks (1 second at 100ms tick rate)
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
@@ -93,8 +92,6 @@ async fn run_game(
     let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut last_snapshot_tick = 0u32;
-
     loop {
         tokio::select! {
             biased;
@@ -164,16 +161,6 @@ async fn run_game(
                             if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
                                 warn!("Failed to publish game event: {}", e);
                             }
-                        }
-
-                        // Publish periodic snapshots
-                        let current_tick = engine.current_tick();
-                        if current_tick >= last_snapshot_tick + SNAPSHOT_INTERVAL_TICKS {
-                            let snapshot = engine.get_committed_state();
-                            if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &snapshot).await {
-                                warn!("Failed to publish periodic snapshot: {}", e);
-                            }
-                            last_snapshot_tick = current_tick;
                         }
 
                         // Check if game has completed
