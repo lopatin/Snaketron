@@ -107,6 +107,14 @@ impl GameEngine {
         self.local_player_id = Some(player_id);
     }
 
+    pub fn committed_state(&self) -> &GameState {
+        &self.committed_state
+    }
+
+    pub fn predicted_state(&self) -> Option<&GameState> {
+        self.predicted_state.as_ref()
+    }
+
     /// Process a local command with client-side prediction
     pub fn process_local_command(&mut self, command: GameCommand) -> Result<GameCommandMessage> {
         let Some(player_id) = self.local_player_id else {

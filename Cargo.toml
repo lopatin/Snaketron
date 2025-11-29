@@ -4,5 +4,6 @@ members = [
     "common",
     "server",
     "client",
-    "terminal"
+    "terminal",
+    "bot"
 ]
