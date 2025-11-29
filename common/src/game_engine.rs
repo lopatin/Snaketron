@@ -78,7 +78,14 @@ impl GameEngine {
                 Some(rng_seed),
                 start_ms,
             ),
-            predicted_state: Some(GameState::new(width, height, game_type, QueueMode::Quickmatch, None, start_ms)), // Client prediction doesn't need RNG
+            predicted_state: Some(GameState::new(
+                width,
+                height,
+                game_type,
+                QueueMode::Quickmatch,
+                None,
+                start_ms,
+            )), // Client prediction doesn't need RNG
             event_log: Vec::new(),
             committed_state_lag_ms: 500,
             local_player_id: None,

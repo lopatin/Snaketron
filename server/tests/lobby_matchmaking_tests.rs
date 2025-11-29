@@ -3,8 +3,8 @@ use anyhow::Result;
 use chrono::Utc;
 use redis::{Client, PushInfo};
 use server::{
-    lobby_manager::LobbyMember, matchmaking_manager::MatchmakingManager,
-    redis_keys::RedisKeys, redis_utils::create_connection_manager, ws_server::WSMessage,
+    lobby_manager::LobbyMember, matchmaking_manager::MatchmakingManager, redis_keys::RedisKeys,
+    redis_utils::create_connection_manager, ws_server::WSMessage,
 };
 use tokio::{
     sync::broadcast,
@@ -15,7 +15,7 @@ mod common;
 use self::common::{TestClient, TestEnvironment};
 
 use std::sync::Once;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 static INIT_TRACING: Once = Once::new();
 
@@ -627,7 +627,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[0], env.user_ids()[1]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let mut clients2 = create_lobby_and_queue(
         &env,
@@ -635,7 +636,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[2]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     let mut clients3 = create_lobby_and_queue(
         &env,
@@ -643,7 +645,8 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
         &[env.user_ids()[3]],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Combine all clients
     let mut all_clients = clients1;
@@ -668,7 +671,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
 #[tokio::test]
 async fn test_ffa_single_lobby() -> Result<()> {
     init_tracing();
-    
+
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_ffa_single_lobby").await?;
     env.add_server().await?;
@@ -679,10 +682,16 @@ async fn test_ffa_single_lobby() -> Result<()> {
     let mut clients = create_lobby_and_queue(
         &env,
         0,
-        &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2], env.user_ids()[3]],
+        &[
+            env.user_ids()[0],
+            env.user_ids()[1],
+            env.user_ids()[2],
+            env.user_ids()[3],
+        ],
         GameType::FreeForAll { max_players: 4 },
         QueueMode::Quickmatch,
-    ).await?;
+    )
+    .await?;
 
     // Wait for game to be created
     let game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
@@ -695,7 +704,6 @@ async fn test_ffa_single_lobby() -> Result<()> {
     env.shutdown().await?;
     Ok(())
 }
-
 
 #[tokio::test]
 async fn test_ffa_minimum_players() -> Result<()> {
@@ -743,7 +751,8 @@ async fn test_ffa_minimum_players() -> Result<()> {
 #[tokio::test]
 async fn test_ffa_two_player_lobby_matches_after_30_seconds() -> Result<()> {
     setup_test_redis().await?;
-    let mut env = TestEnvironment::new("test_ffa_two_player_lobby_matches_after_30_seconds").await?;
+    let mut env =
+        TestEnvironment::new("test_ffa_two_player_lobby_matches_after_30_seconds").await?;
     env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;

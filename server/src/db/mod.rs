@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
+use crate::season::Season;
 use common::GameType;
 use models::*;
-use crate::season::Season;
 
 #[async_trait]
 pub trait Database: Send + Sync {

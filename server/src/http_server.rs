@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    http::StatusCode,
     extract::{State, ws::WebSocketUpgrade},
+    http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{get, post, options},
+    routing::{get, options, post},
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -135,7 +135,10 @@ pub async fn run_http_server(
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
-        .layer(middleware::from_fn_with_state(jwt_manager.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            jwt_manager.clone(),
+            auth_middleware,
+        ))
         .with_state(auth_state.clone());
 
     // Build region routes with HttpServerState (for Redis access)
@@ -145,9 +148,7 @@ pub async fn run_http_server(
         .with_state(state.clone());
 
     // Build leaderboard routes with LeaderboardState
-    let leaderboard_state = LeaderboardState {
-        db: db.clone(),
-    };
+    let leaderboard_state = LeaderboardState { db: db.clone() };
     let leaderboard_routes = Router::new()
         .route("/api/leaderboard", get(leaderboard::get_leaderboard))
         .route("/api/seasons", get(leaderboard::list_seasons))
@@ -156,7 +157,10 @@ pub async fn run_http_server(
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
         .route("/api/leaderboard/me", get(leaderboard::get_my_ranking))
-        .layer(middleware::from_fn_with_state(jwt_manager.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            jwt_manager.clone(),
+            auth_middleware,
+        ))
         .with_state(leaderboard_state);
 
     // Build API routes with AuthState

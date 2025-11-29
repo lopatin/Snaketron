@@ -364,7 +364,8 @@ fn should_return_to_base(
         0
     };
 
-    let total_return_score = base_food_score as i32 + time_pressure_score + score_differential_bonus;
+    let total_return_score =
+        base_food_score as i32 + time_pressure_score + score_differential_bonus;
 
     // Decision threshold: >= 40 means return to base
     total_return_score >= 40

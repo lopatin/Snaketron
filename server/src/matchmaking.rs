@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::{
-    GameState, GameType, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS,
+    DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS, GameState, GameType,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -488,11 +488,15 @@ fn find_ffa_combination(
     let now_ms = Utc::now().timestamp_millis();
     let max_depth = lobbies.len().min(FFA_MAX_RECURSION_DEPTH);
 
-    fn passes_wait_time_rules(player_count: usize, longest_wait_ms: i64, max_players: usize) -> bool {
+    fn passes_wait_time_rules(
+        player_count: usize,
+        longest_wait_ms: i64,
+        max_players: usize,
+    ) -> bool {
         if player_count < 2 {
             return false;
         }
-        
+
         if player_count >= max_players {
             return true;
         }
@@ -733,7 +737,9 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Quickmatch,
                 lobby_manager.clone(),
-            ).await {
+            )
+            .await
+            {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -758,7 +764,9 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Competitive,
                 lobby_manager.clone(),
-            ).await {
+            )
+            .await
+            {
                 Ok(games_count) if games_count > 0 => {
                     total_games_created += games_count;
                     info!(
@@ -998,7 +1006,9 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
-        ).await {
+        )
+        .await
+        {
             Ok(game_id) => {
                 games_created += 1;
                 info!(
@@ -1073,7 +1083,14 @@ async fn create_game_from_lobbies(
     };
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(width, height, game_type.clone(), queue_mode.clone(), rng_seed, start_ms);
+    let mut game_state = GameState::new(
+        width,
+        height,
+        game_type.clone(),
+        queue_mode.clone(),
+        rng_seed,
+        start_ms,
+    );
 
     // Apply queue-mode-specific time limits for team games
     if matches!(game_type, GameType::TeamMatch { .. }) {
@@ -1267,7 +1284,14 @@ pub async fn create_custom_match(
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
     // Custom games default to Quickmatch queue mode
-    let mut game_state = GameState::new(width, height, game_type.clone(), common::QueueMode::Quickmatch, rng_seed, start_ms);
+    let mut game_state = GameState::new(
+        width,
+        height,
+        game_type.clone(),
+        common::QueueMode::Quickmatch,
+        rng_seed,
+        start_ms,
+    );
 
     // Add players
     for player in &players {

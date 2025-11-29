@@ -1,23 +1,29 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::Parser;
 use common::{
-    calculate_ai_move, Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState,
-    GameStatus, GameType, QueueMode,
+    Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus,
+    GameType, QueueMode, calculate_ai_move,
 };
 use futures_util::{Sink, SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use server::ws_server::WSMessage;
+use std::pin::Pin;
 use tokio::sync::watch;
-use tokio::time::{Duration, Instant, Interval, MissedTickBehavior};
+use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, Sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
+const GAME_OVER_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Parser, Debug)]
-#[command(name = "snaketron-bot", about = "Run one or more AI bots against a Snaketron server")]
+#[command(
+    name = "snaketron-bot",
+    about = "Run one or more AI bots against a Snaketron server"
+)]
 struct Args {
     /// Base HTTP URL for the API/WebSocket server (e.g. http://localhost:8080)
     #[arg(long, default_value = "http://localhost:8080")]
@@ -68,11 +74,7 @@ async fn main() -> Result<()> {
 
     info!(
         "Starting {} bot(s) targeting {} ({}) in {:?} mode, {} game(s) each",
-        args.bots,
-        base_url,
-        ws_url,
-        queue_mode,
-        args.games
+        args.bots, base_url, ws_url, queue_mode, args.games
     );
 
     let mut handles = Vec::new();
@@ -85,8 +87,16 @@ async fn main() -> Result<()> {
         let games = args.games;
 
         let handle = tokio::spawn(async move {
-            if let Err(err) =
-                run_bot(idx, games, base_url, ws_url, game_type, queue_mode, http_client).await
+            if let Err(err) = run_bot(
+                idx,
+                games,
+                base_url,
+                ws_url,
+                game_type,
+                queue_mode,
+                http_client,
+            )
+            .await
             {
                 error!("Bot {} failed: {:#}", idx + 1, err);
             }
@@ -118,7 +128,12 @@ async fn run_bot(
     let nickname = format!("bot{}-{}", idx + 1, uuid_suffix);
     let guest = create_guest(&http_client, &base_url, &nickname).await?;
     let user_id = guest.user.id as u32;
-    info!("Bot {} authenticated as {} (user_id {})", idx + 1, guest.user.username, user_id);
+    info!(
+        "Bot {} authenticated as {} (user_id {})",
+        idx + 1,
+        guest.user.username,
+        user_id
+    );
 
     for game_idx in 1..=total_games {
         send_status(&status_tx, game_idx, total_games, "starting new game");
@@ -182,10 +197,28 @@ async fn play_single_game(
     let mut engine: Option<GameEngine> = None;
     let mut snake_id: Option<u32> = None;
     let mut tick_interval: Option<Interval> = None;
-    let mut _game_id: Option<u32> = None;
+    let mut game_id: Option<u32> = None;
+    let mut game_started = false;
+    let mut game_completed = false;
+    let mut hang_timer = tokio::time::sleep(GAME_OVER_TIMEOUT);
+    tokio::pin!(hang_timer);
 
     loop {
         tokio::select! {
+            _ = &mut hang_timer, if game_started && !game_completed => {
+                let game_label = game_id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string());
+                let msg = format!(
+                    "Bot {} game {}/{} stalled waiting for game over (game {}) after {:?}",
+                    idx + 1,
+                    game_idx,
+                    total_games,
+                    game_label,
+                    GAME_OVER_TIMEOUT
+                );
+                error!("{msg}");
+                send_status(status_tx, game_idx, total_games, "stalled waiting for game over");
+                return Err(anyhow!(msg));
+            }
             msg = ws_reader.next() => {
                 let Some(msg) = msg else { break };
                 let msg = msg?;
@@ -199,7 +232,10 @@ async fn play_single_game(
                             &mut snake_id,
                             &mut tick_interval,
                             user_id,
-                            &mut _game_id,
+                            &mut game_id,
+                            &mut game_started,
+                            &mut game_completed,
+                            &mut hang_timer,
                             status_tx,
                             game_idx,
                             total_games,
@@ -216,6 +252,9 @@ async fn play_single_game(
                             &mut snake_id,
                             &mut tick_interval,
                             user_id,
+                            &mut game_started,
+                            &mut game_completed,
+                            &mut hang_timer,
                             status_tx,
                             game_idx,
                             total_games,
@@ -244,6 +283,22 @@ async fn play_single_game(
     }
 
     let _ = ws_writer.send(Message::Close(None)).await;
+    if game_started && !game_completed {
+        let game_label = game_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = format!(
+            "Bot {} game {}/{} ended without a game over event (game {})",
+            idx + 1,
+            game_idx,
+            total_games,
+            game_label
+        );
+        error!("{msg}");
+        send_status(status_tx, game_idx, total_games, "ended without game over");
+        return Err(anyhow!(msg));
+    }
+
     Ok(())
 }
 
@@ -255,7 +310,10 @@ async fn handle_ws_message<S>(
     snake_id: &mut Option<u32>,
     tick_interval: &mut Option<Interval>,
     user_id: u32,
-    _game_id: &mut Option<u32>,
+    game_id: &mut Option<u32>,
+    game_started: &mut bool,
+    game_completed: &mut bool,
+    hang_timer: &mut Pin<&mut Sleep>,
     status_tx: &watch::Sender<String>,
     game_idx: usize,
     total_games: usize,
@@ -267,20 +325,47 @@ where
     match ws_msg {
         WSMessage::JoinGame(id) => {
             info!("Bot {} matched to game {}", idx + 1, id);
-            *_game_id = Some(id);
+            *game_id = Some(id);
             send_ws(ws_writer, WSMessage::JoinGame(id)).await?;
-            send_status(status_tx, game_idx, total_games, format!("joined game {}", id));
+            send_status(
+                status_tx,
+                game_idx,
+                total_games,
+                format!("joined game {}", id),
+            );
         }
         WSMessage::MatchFound { game_id: found_id } => {
             info!("Bot {} received MatchFound {}", idx + 1, found_id);
-            *_game_id = Some(found_id);
+            *game_id = Some(found_id);
             send_ws(ws_writer, WSMessage::JoinGame(found_id)).await?;
-            send_status(status_tx, game_idx, total_games, format!("match found {}", found_id));
+            send_status(
+                status_tx,
+                game_idx,
+                total_games,
+                format!("match found {}", found_id),
+            );
         }
         WSMessage::GameEvent(event_msg) => {
-            return handle_game_event(idx, event_msg, engine, snake_id, tick_interval, user_id, status_tx, game_idx, total_games).await;
+            return handle_game_event(
+                idx,
+                event_msg,
+                engine,
+                snake_id,
+                tick_interval,
+                user_id,
+                game_started,
+                game_completed,
+                hang_timer,
+                status_tx,
+                game_idx,
+                total_games,
+            )
+            .await;
         }
-        WSMessage::QueueUpdate { position, estimated_wait_seconds } => {
+        WSMessage::QueueUpdate {
+            position,
+            estimated_wait_seconds,
+        } => {
             info!(
                 "Bot {} queue position {} ({}s)",
                 idx + 1,
@@ -305,6 +390,11 @@ where
             debug!("Bot {} ignored message: {:?}", idx + 1, ws_msg);
         }
     }
+    if *game_started && !*game_completed {
+        hang_timer
+            .as_mut()
+            .reset(Instant::now() + GAME_OVER_TIMEOUT);
+    }
     Ok(false)
 }
 
@@ -315,10 +405,19 @@ async fn handle_game_event(
     snake_id: &mut Option<u32>,
     tick_interval: &mut Option<Interval>,
     user_id: u32,
+    game_started: &mut bool,
+    game_completed: &mut bool,
+    hang_timer: &mut Pin<&mut Sleep>,
     status_tx: &watch::Sender<String>,
     game_idx: usize,
     total_games: usize,
 ) -> Result<bool> {
+    if *game_started && !*game_completed {
+        hang_timer
+            .as_mut()
+            .reset(Instant::now() + GAME_OVER_TIMEOUT);
+    }
+
     match &event_msg.event {
         GameEvent::Snapshot { game_state } => {
             let mut new_engine = GameEngine::new_from_state(event_msg.game_id, game_state.clone());
@@ -339,6 +438,25 @@ async fn handle_game_event(
                 game_state.current_tick(),
                 snake_id
             );
+            if !*game_started {
+                *game_started = true;
+                hang_timer
+                    .as_mut()
+                    .reset(Instant::now() + GAME_OVER_TIMEOUT);
+                info!(
+                    "Bot {} entered game {} (game {}/{})",
+                    idx + 1,
+                    event_msg.game_id,
+                    game_idx,
+                    total_games
+                );
+                send_status(
+                    status_tx,
+                    game_idx,
+                    total_games,
+                    format!("entered game {}", event_msg.game_id),
+                );
+            }
 
             *engine = Some(new_engine);
             send_status(
@@ -350,22 +468,26 @@ async fn handle_game_event(
         }
         GameEvent::StatusUpdated { status } => {
             if matches!(status, GameStatus::Complete { .. }) {
-                info!(
-                    "Bot {} saw game {} complete",
-                    idx + 1,
-                    event_msg.game_id
-                );
+                info!("Bot {} saw game {} complete", idx + 1, event_msg.game_id);
                 *tick_interval = None;
             }
             if let Some(engine) = engine {
                 engine.process_server_event(&event_msg)?;
             }
             if matches!(status, GameStatus::Complete { .. }) {
+                *game_completed = true;
                 send_status(
                     status_tx,
                     game_idx,
                     total_games,
-                    "completed match",
+                    format!("completed match {}", event_msg.game_id),
+                );
+                info!(
+                    "Bot {} finished game {} (game {}/{})",
+                    idx + 1,
+                    event_msg.game_id,
+                    game_idx,
+                    total_games
                 );
                 return Ok(true);
             }
@@ -438,10 +560,11 @@ async fn create_guest(client: &Client, base_url: &Url, nickname: &str) -> Result
             "use1.snaketron.io" | "euw1.snaketron.io" => {
                 // Production: use api.snaketron.io
                 let mut url = base_url.clone();
-                url.set_host(Some("api.snaketron.io")).map_err(|_| anyhow!("Failed to set API host"))?;
+                url.set_host(Some("api.snaketron.io"))
+                    .map_err(|_| anyhow!("Failed to set API host"))?;
                 url
             }
-            _ => base_url.clone()
+            _ => base_url.clone(),
         }
     } else {
         base_url.clone()
@@ -477,14 +600,17 @@ async fn create_guest(client: &Client, base_url: &Url, nickname: &str) -> Result
 }
 
 fn normalize_base_url(raw: &str) -> Result<Url> {
-    let mut url = Url::parse(raw).or_else(|_| Url::parse(&format!("http://{raw}"))).context("Invalid base URL")?;
+    let mut url = Url::parse(raw)
+        .or_else(|_| Url::parse(&format!("http://{raw}")))
+        .context("Invalid base URL")?;
 
     // Handle production snaketron.io URLs - convert to regional endpoint
     if let Some(host) = url.host_str() {
         match host {
             "snaketron.io" | "www.snaketron.io" => {
                 // Default to US region for WebSocket
-                url.set_host(Some("use1.snaketron.io")).map_err(|_| anyhow!("Failed to set host"))?;
+                url.set_host(Some("use1.snaketron.io"))
+                    .map_err(|_| anyhow!("Failed to set host"))?;
                 info!("Converted main site URL to US region endpoint: {}", url);
             }
             _ => {}
@@ -538,14 +664,26 @@ fn build_interval(game_state: &GameState) -> Option<Interval> {
     let next_tick_ms = start_ms + ((ticks_elapsed + 1) * tick_ms) as i64;
     let delay_ms = (next_tick_ms - now_ms).max(0) as u64;
 
-    let mut interval =
-        tokio::time::interval_at(Instant::now() + Duration::from_millis(delay_ms), Duration::from_millis(tick_ms));
+    let mut interval = tokio::time::interval_at(
+        Instant::now() + Duration::from_millis(delay_ms),
+        Duration::from_millis(tick_ms),
+    );
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     Some(interval)
 }
 
-fn send_status(status_tx: &watch::Sender<String>, game_idx: usize, total_games: usize, status: impl Into<String>) {
-    let _ = status_tx.send(format!("game {}/{}: {}", game_idx, total_games, status.into()));
+fn send_status(
+    status_tx: &watch::Sender<String>,
+    game_idx: usize,
+    total_games: usize,
+    status: impl Into<String>,
+) {
+    let _ = status_tx.send(format!(
+        "game {}/{}: {}",
+        game_idx,
+        total_games,
+        status.into()
+    ));
 }
 
 async fn log_progress(idx: usize, mut status_rx: watch::Receiver<String>) {

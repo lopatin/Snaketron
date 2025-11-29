@@ -120,15 +120,13 @@ impl Snake {
     }
 
     pub fn contains_point(&self, point: &Position, skip_head: bool) -> bool {
-        self.iter_body()
-            .enumerate()
-            .any(|(idx, (p1, p2))| {
-                if skip_head && idx == 0 && *p1 == *point {
-                    return false;
-                }
+        self.iter_body().enumerate().any(|(idx, (p1, p2))| {
+            if skip_head && idx == 0 && *p1 == *point {
+                return false;
+            }
 
-                point.is_between(p1, p2)
-            })
+            point.is_between(p1, p2)
+        })
     }
 
     pub fn is_head(&self, point: &Position) -> bool {

@@ -8,18 +8,18 @@ pub mod http_server;
 pub mod lobby_manager;
 pub mod matchmaking;
 pub mod matchmaking_manager;
+pub mod mmr_persistence;
 pub mod pubsub_manager;
 pub mod redis_keys;
 pub mod redis_utils;
 pub mod region_cache;
 pub mod replay;
 pub mod replication;
+pub mod season;
 pub mod user_cache;
 pub mod ws_matchmaking;
 pub mod ws_server;
 pub mod xp_persistence;
-pub mod mmr_persistence;
-pub mod season;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

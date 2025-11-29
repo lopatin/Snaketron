@@ -216,9 +216,10 @@ pub fn render_game(
         // Build team labels from player usernames; show both teammates side by side
         let username_map = game_state["usernames"].as_object();
         let mut team_names: [Vec<String>; 2] = [Vec::new(), Vec::new()];
-        if let (Some(players), Some(snakes)) =
-            (game_state["players"].as_object(), arena["snakes"].as_array())
-        {
+        if let (Some(players), Some(snakes)) = (
+            game_state["players"].as_object(),
+            arena["snakes"].as_array(),
+        ) {
             for (user_id_str, player_val) in players {
                 if let Some(snake_id) = player_val["snake_id"].as_u64() {
                     if let Some(snake) = snakes.get(snake_id as usize) {
@@ -327,43 +328,37 @@ pub fn render_game(
             let (x, y, w, h) = rect;
 
             // Decide whether to split into two sub-areas (only when we have >1 name and game mode requires it)
-            let (centers, box_w, box_h): (Vec<(f64, f64)>, f64, f64) = if split_labels && names.len() > 1 {
-                if split_vertical {
-                    let half_h = h / 2.0;
-                    (
-                        vec![
-                            (x + w / 2.0, y + half_h / 2.0),
-                            (x + w / 2.0, y + half_h + half_h / 2.0),
-                        ],
-                        w * 0.8,
-                        half_h * 0.9,
-                    )
+            let (centers, box_w, box_h): (Vec<(f64, f64)>, f64, f64) =
+                if split_labels && names.len() > 1 {
+                    if split_vertical {
+                        let half_h = h / 2.0;
+                        (
+                            vec![
+                                (x + w / 2.0, y + half_h / 2.0),
+                                (x + w / 2.0, y + half_h + half_h / 2.0),
+                            ],
+                            w * 0.8,
+                            half_h * 0.9,
+                        )
+                    } else {
+                        let half_w = w / 2.0;
+                        (
+                            vec![
+                                (x + half_w / 2.0, y + h / 2.0),
+                                (x + half_w + half_w / 2.0, y + h / 2.0),
+                            ],
+                            half_w * 0.9,
+                            h * 0.8,
+                        )
+                    }
                 } else {
-                    let half_w = w / 2.0;
-                    (
-                        vec![
-                            (x + half_w / 2.0, y + h / 2.0),
-                            (x + half_w + half_w / 2.0, y + h / 2.0),
-                        ],
-                        half_w * 0.9,
-                        h * 0.8,
-                    )
-                }
-            } else {
-                // Single name fills whole zone
-                (
-                    vec![(x + w / 2.0, y + h / 2.0)],
-                    w * 0.9,
-                    h * 0.8,
-                )
-            };
+                    // Single name fills whole zone
+                    (vec![(x + w / 2.0, y + h / 2.0)], w * 0.9, h * 0.8)
+                };
 
             // Use the same font size for all labels in this zone: smallest that fits every label
-            let mut needed_size = compute_font_size(
-                names.get(0).map(|s| s.as_str()).unwrap_or(""),
-                box_w,
-                box_h,
-            );
+            let mut needed_size =
+                compute_font_size(names.get(0).map(|s| s.as_str()).unwrap_or(""), box_w, box_h);
             if split_labels && names.len() > 1 {
                 if let Some(name) = names.get(1) {
                     needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
@@ -391,25 +386,45 @@ pub fn render_game(
             90 => (
                 // team0 = top, team1 = bottom
                 (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
-                (0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size),
+                (
+                    0.0,
+                    (height - end_zone_depth) * cell_size,
+                    width * cell_size,
+                    end_zone_depth * cell_size,
+                ),
                 false,
             ),
             180 => (
                 // team0 = right, team1 = left
-                ((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size),
+                (
+                    (width - end_zone_depth) * cell_size,
+                    0.0,
+                    end_zone_depth * cell_size,
+                    height * cell_size,
+                ),
                 (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
                 true,
             ),
             270 => (
                 // team0 = bottom, team1 = top
-                (0.0, (height - end_zone_depth) * cell_size, width * cell_size, end_zone_depth * cell_size),
+                (
+                    0.0,
+                    (height - end_zone_depth) * cell_size,
+                    width * cell_size,
+                    end_zone_depth * cell_size,
+                ),
                 (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
                 false,
             ),
             _ => (
                 // team0 = left, team1 = right
                 (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
-                ((width - end_zone_depth) * cell_size, 0.0, end_zone_depth * cell_size, height * cell_size),
+                (
+                    (width - end_zone_depth) * cell_size,
+                    0.0,
+                    end_zone_depth * cell_size,
+                    height * cell_size,
+                ),
                 true,
             ),
         };

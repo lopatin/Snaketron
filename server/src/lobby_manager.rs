@@ -373,10 +373,13 @@ impl LobbyManager {
             let mut interval = interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                if let Err(err) = self_for_heartbeat.touch_lobby( 
-                    lobby_code_for_heartbeat.as_str(), 
-                    Some(member_value.clone())
-                ).await {
+                if let Err(err) = self_for_heartbeat
+                    .touch_lobby(
+                        lobby_code_for_heartbeat.as_str(),
+                        Some(member_value.clone()),
+                    )
+                    .await
+                {
                     error!("Failed to send heartbeat for user {}: {}", user_id, err);
                 }
             }

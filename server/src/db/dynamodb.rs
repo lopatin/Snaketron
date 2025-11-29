@@ -2,9 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
-    KeySchemaElement, KeyType, Projection, ProjectionType, ReturnValue, ScalarAttributeType,
-    CreateGlobalSecondaryIndexAction,
+    AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndexAction,
+    GlobalSecondaryIndex, GlobalSecondaryIndexUpdate, KeySchemaElement, KeyType, Projection,
+    ProjectionType, ReturnValue, ScalarAttributeType,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
@@ -1259,17 +1259,27 @@ impl Database for DynamoDatabase {
         let padded_mmr = format!("{:08}", inverted_mmr);
 
         // Include season in PK for single-table design
-        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season_str);
+        let pk = format!(
+            "RANKING#{}#{}#{}#{}",
+            queue_mode_str, game_type_str, region, season_str
+        );
         let sk = format!("MMR#{}#USER#{}", padded_mmr, user_id);
 
         // Try to get existing ranking to calculate delta
-        let existing = self.get_user_ranking(user_id, queue_mode, game_type, region, season).await?;
+        let existing = self
+            .get_user_ranking(user_id, queue_mode, game_type, region, season)
+            .await?;
 
         let (games_played, wins, losses, old_mmr) = match &existing {
             Some(entry) => {
                 let new_wins = if won { entry.wins + 1 } else { entry.wins };
                 let new_losses = if won { entry.losses } else { entry.losses + 1 };
-                (entry.games_played + 1, new_wins, new_losses, Some(entry.mmr))
+                (
+                    entry.games_played + 1,
+                    new_wins,
+                    new_losses,
+                    Some(entry.mmr),
+                )
             }
             None => {
                 let (wins, losses) = if won { (1, 0) } else { (0, 1) };
@@ -1352,9 +1362,13 @@ impl Database for DynamoDatabase {
 
             if let Some(reg) = region {
                 // Query specific region, game type, and season
-                let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, reg, season_str);
+                let pk = format!(
+                    "RANKING#{}#{}#{}#{}",
+                    queue_mode_str, game_type_str, reg, season_str
+                );
 
-                let response = self.client
+                let response = self
+                    .client
                     .query()
                     .table_name(self.rankings_table())
                     .key_condition_expression("pk = :pk")
@@ -1367,10 +1381,12 @@ impl Database for DynamoDatabase {
                 response.items.unwrap_or_default()
             } else {
                 // Prefer the GameTypeSeasonIndex to query all regions in a single partition
-                let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
+                let game_type_season =
+                    format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
                 let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
 
-                match self.client
+                match self
+                    .client
                     .query()
                     .table_name(self.rankings_table())
                     .index_name("GameTypeSeasonIndex")
@@ -1401,7 +1417,8 @@ impl Database for DynamoDatabase {
                     let target_items = limit.saturating_mul(3).max(limit + 5);
 
                     while items.len() < target_items {
-                        let mut scan_builder = self.client
+                        let mut scan_builder = self
+                            .client
                             .scan()
                             .table_name(self.rankings_table())
                             .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
@@ -1433,11 +1450,15 @@ impl Database for DynamoDatabase {
             }
         } else {
             // Scan all game types and regions for a season
-            let response = self.client
+            let response = self
+                .client
                 .scan()
                 .table_name(self.rankings_table())
                 .filter_expression("begins_with(pk, :prefix)")
-                .expression_attribute_values(":prefix", Self::av_s(&format!("RANKING#{}", queue_mode_str)))
+                .expression_attribute_values(
+                    ":prefix",
+                    Self::av_s(&format!("RANKING#{}", queue_mode_str)),
+                )
                 .limit(limit as i32)
                 .send()
                 .await
@@ -1459,7 +1480,8 @@ impl Database for DynamoDatabase {
                     losses: Self::extract_number(&item, "losses")?,
                     region: Self::extract_string(&item, "region")?,
                     queue_mode: Self::extract_string(&item, "queueMode")?,
-                    game_type: Self::extract_string(&item, "gameType").unwrap_or_else(|| "unknown".to_string()),
+                    game_type: Self::extract_string(&item, "gameType")
+                        .unwrap_or_else(|| "unknown".to_string()),
                     season: Self::extract_number(&item, "season")
                         .map(|s| s as Season)
                         .unwrap_or(season),
@@ -1495,11 +1517,15 @@ impl Database for DynamoDatabase {
         };
 
         let game_type_str = Self::game_type_to_string(game_type);
-        let pk = format!("RANKING#{}#{}#{}#{}", queue_mode_str, game_type_str, region, season);
+        let pk = format!(
+            "RANKING#{}#{}#{}#{}",
+            queue_mode_str, game_type_str, region, season
+        );
 
         // Query all rankings for this PK and filter in memory for the user
         // We can't use filter on sk since it's a key attribute
-        let response = self.client
+        let response = self
+            .client
             .query()
             .table_name(self.rankings_table())
             .key_condition_expression("pk = :pk")
@@ -1511,9 +1537,9 @@ impl Database for DynamoDatabase {
         let items = response.items.unwrap_or_default();
 
         // Filter in memory for the specific user
-        let user_item = items.iter().find(|item| {
-            Self::extract_number(item, "userId") == Some(user_id)
-        });
+        let user_item = items
+            .iter()
+            .find(|item| Self::extract_number(item, "userId") == Some(user_id));
 
         let item = match user_item {
             Some(item) => item,
@@ -1527,7 +1553,8 @@ impl Database for DynamoDatabase {
             wins: Self::extract_number(item, "wins").unwrap_or(0),
             losses: Self::extract_number(item, "losses").unwrap_or(0),
             region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
-            queue_mode: Self::extract_string(item, "queueMode").unwrap_or(queue_mode_str.to_string()),
+            queue_mode: Self::extract_string(item, "queueMode")
+                .unwrap_or(queue_mode_str.to_string()),
             game_type: Self::extract_string(item, "gameType").unwrap_or(game_type_str.clone()),
             season: Self::extract_number(item, "season")
                 .map(|s| s as Season)
@@ -1590,7 +1617,10 @@ impl Database for DynamoDatabase {
             .await
             .context("Failed to insert high score")?;
 
-        info!("Inserted high score for game {} (user: {}, score: {})", game_id, username, score);
+        info!(
+            "Inserted high score for game {} (user: {}, score: {})",
+            game_id, username, score
+        );
         Ok(())
     }
 
@@ -1617,7 +1647,8 @@ impl Database for DynamoDatabase {
                 limit
             );
 
-            let response = self.client
+            let response = self
+                .client
                 .query()
                 .table_name(self.high_scores_table())
                 .key_condition_expression("pk = :pk")
@@ -1661,7 +1692,8 @@ impl Database for DynamoDatabase {
         // Global view: prefer the GameTypeSeasonIndex GSI for an ordered, single-partition query.
         let gsi_pk = format!("{}#{}", game_type_str, season_str);
 
-        match self.client
+        match self
+            .client
             .query()
             .table_name(self.high_scores_table())
             .index_name("GameTypeSeasonIndex")
@@ -1717,7 +1749,8 @@ impl Database for DynamoDatabase {
         let target_items = limit.saturating_mul(3).max(limit + 5);
 
         while items.len() < target_items {
-            let mut scan_builder = self.client
+            let mut scan_builder = self
+                .client
                 .scan()
                 .table_name(self.high_scores_table())
                 .filter_expression("begins_with(pk, :pk_prefix)")
@@ -1774,7 +1807,10 @@ impl Database for DynamoDatabase {
         entries.sort_by(|a, b| b.score.cmp(&a.score));
         entries.truncate(limit);
 
-        debug!("Successfully parsed {} high score entries (fallback scan)", entries.len());
+        debug!(
+            "Successfully parsed {} high score entries (fallback scan)",
+            entries.len()
+        );
         Ok(entries)
     }
 }
@@ -1798,7 +1834,13 @@ impl DynamoDatabase {
             .context("Failed to build gameTypeSeason sort key for rankings")?;
 
         // Check if table exists, and add the cross-region GSI if missing
-        match self.client.describe_table().table_name(&table_name).send().await {
+        match self
+            .client
+            .describe_table()
+            .table_name(&table_name)
+            .send()
+            .await
+        {
             Ok(output) => {
                 debug!("Rankings table {} already exists", table_name);
 
@@ -1942,7 +1984,13 @@ impl DynamoDatabase {
             .context("Failed to build gameTypeSeason sort key")?;
 
         // Check if table exists
-        match self.client.describe_table().table_name(&table_name).send().await {
+        match self
+            .client
+            .describe_table()
+            .table_name(&table_name)
+            .send()
+            .await
+        {
             Ok(output) => {
                 debug!("High scores table {} already exists", table_name);
 
@@ -1983,13 +2031,17 @@ impl DynamoDatabase {
                                                 .build(),
                                         )
                                         .build()
-                                        .context("Failed to build GameTypeSeasonIndex update action")?,
+                                        .context(
+                                            "Failed to build GameTypeSeasonIndex update action",
+                                        )?,
                                 )
                                 .build(),
                         )
                         .send()
                         .await
-                        .context("Failed to add GameTypeSeasonIndex to existing high scores table")?;
+                        .context(
+                            "Failed to add GameTypeSeasonIndex to existing high scores table",
+                        )?;
                 }
 
                 return Ok(());

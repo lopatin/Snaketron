@@ -1,10 +1,12 @@
 use crate::db::Database;
 use crate::season::{get_current_season, get_region};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use common::{GameState, GameType, QueueMode, TeamId};
-use skillratings::weng_lin::{weng_lin, weng_lin_multi_team, weng_lin_two_teams, WengLinConfig, WengLinRating};
 use skillratings::MultiTeamOutcome;
 use skillratings::Outcomes;
+use skillratings::weng_lin::{
+    WengLinConfig, WengLinRating, weng_lin, weng_lin_multi_team, weng_lin_two_teams,
+};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
@@ -69,7 +71,15 @@ pub async fn persist_player_mmr(
     };
 
     // Apply MMR deltas to database and update rankings
-    apply_mmr_deltas(db, game_id, &game_state.queue_mode, game_state, mmr_deltas, winners).await?;
+    apply_mmr_deltas(
+        db,
+        game_id,
+        &game_state.queue_mode,
+        game_state,
+        mmr_deltas,
+        winners,
+    )
+    .await?;
 
     info!("Finished persisting MMR for game {}", game_id);
     Ok(())
@@ -119,12 +129,13 @@ async fn calculate_team_match_mmr_deltas(
 
     // Extract MMRs based on queue mode
     let get_mmr = |user_id: u32| -> i32 {
-        mmr_map.get(&(user_id as i32)).map(|(ranked, casual)| {
-            match game_state.queue_mode {
+        mmr_map
+            .get(&(user_id as i32))
+            .map(|(ranked, casual)| match game_state.queue_mode {
                 QueueMode::Competitive => *ranked,
                 QueueMode::Quickmatch => *casual,
-            }
-        }).unwrap_or(1000)
+            })
+            .unwrap_or(1000)
     };
 
     // Create Weng-Lin ratings
@@ -132,7 +143,10 @@ async fn calculate_team_match_mmr_deltas(
         .iter()
         .map(|&user_id| {
             let mmr = get_mmr(user_id);
-            WengLinRating { rating: mmr as f64, uncertainty: 350.0 }
+            WengLinRating {
+                rating: mmr as f64,
+                uncertainty: 350.0,
+            }
         })
         .collect();
 
@@ -140,7 +154,10 @@ async fn calculate_team_match_mmr_deltas(
         .iter()
         .map(|&user_id| {
             let mmr = get_mmr(user_id);
-            WengLinRating { rating: mmr as f64, uncertainty: 350.0 }
+            WengLinRating {
+                rating: mmr as f64,
+                uncertainty: 350.0,
+            }
         })
         .collect();
 
@@ -153,7 +170,8 @@ async fn calculate_team_match_mmr_deltas(
 
     // Calculate new ratings
     let config = WengLinConfig::new();
-    let (new_team_0, new_team_1) = weng_lin_two_teams(&team_0_ratings, &team_1_ratings, &outcome, &config);
+    let (new_team_0, new_team_1) =
+        weng_lin_two_teams(&team_0_ratings, &team_1_ratings, &outcome, &config);
 
     // Calculate deltas
     let mut deltas = HashMap::new();
@@ -188,7 +206,11 @@ async fn calculate_ffa_mmr_deltas(
         .players
         .iter()
         .map(|(user_id, player)| {
-            let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
+            let score = game_state
+                .scores
+                .get(&player.snake_id)
+                .copied()
+                .unwrap_or(0);
             (*user_id, score)
         })
         .collect();
@@ -202,12 +224,13 @@ async fn calculate_ffa_mmr_deltas(
 
     // Extract MMRs based on queue mode
     let get_mmr = |user_id: u32| -> i32 {
-        mmr_map.get(&(user_id as i32)).map(|(ranked, casual)| {
-            match game_state.queue_mode {
+        mmr_map
+            .get(&(user_id as i32))
+            .map(|(ranked, casual)| match game_state.queue_mode {
                 QueueMode::Competitive => *ranked,
                 QueueMode::Quickmatch => *casual,
-            }
-        }).unwrap_or(1000)
+            })
+            .unwrap_or(1000)
     };
 
     // If only 2 players, use 1v1 algorithm
@@ -215,8 +238,14 @@ async fn calculate_ffa_mmr_deltas(
         let user_0 = player_scores[0].0;
         let user_1 = player_scores[1].0;
 
-        let rating_0 = WengLinRating { rating: get_mmr(user_0) as f64, uncertainty: 350.0 };
-        let rating_1 = WengLinRating { rating: get_mmr(user_1) as f64, uncertainty: 350.0 };
+        let rating_0 = WengLinRating {
+            rating: get_mmr(user_0) as f64,
+            uncertainty: 350.0,
+        };
+        let rating_1 = WengLinRating {
+            rating: get_mmr(user_1) as f64,
+            uncertainty: 350.0,
+        };
 
         let config = WengLinConfig::new();
         let (new_rating_0, new_rating_1) = weng_lin(&rating_0, &rating_1, &Outcomes::WIN, &config);
@@ -232,7 +261,10 @@ async fn calculate_ffa_mmr_deltas(
     let teams_with_ratings: Vec<Vec<WengLinRating>> = player_scores
         .iter()
         .map(|(user_id, _)| {
-            vec![WengLinRating { rating: get_mmr(*user_id) as f64, uncertainty: 350.0 }]
+            vec![WengLinRating {
+                rating: get_mmr(*user_id) as f64,
+                uncertainty: 350.0,
+            }]
         })
         .collect();
 
@@ -262,7 +294,10 @@ async fn calculate_ffa_mmr_deltas(
     info!(
         "FFA match: {} players, placements: {:?}",
         player_scores.len(),
-        player_scores.iter().map(|(id, score)| (*id, *score)).collect::<Vec<_>>()
+        player_scores
+            .iter()
+            .map(|(id, score)| (*id, *score))
+            .collect::<Vec<_>>()
     );
 
     Ok(deltas)
@@ -296,12 +331,7 @@ async fn apply_mmr_deltas(
                 let sign = if delta > 0 { "+" } else { "" };
                 info!(
                     "User {} {:?} MMR: {}{} (new total: {}) from game {}",
-                    user_id,
-                    queue_mode,
-                    sign,
-                    delta,
-                    new_total,
-                    game_id
+                    user_id, queue_mode, sign, delta, new_total, game_id
                 );
                 new_total
             }
@@ -390,7 +420,11 @@ fn get_ffa_winners(game_state: &GameState) -> HashSet<u32> {
         .players
         .iter()
         .map(|(user_id, player)| {
-            let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
+            let score = game_state
+                .scores
+                .get(&player.snake_id)
+                .copied()
+                .unwrap_or(0);
             (*user_id, score)
         })
         .collect();
@@ -400,7 +434,11 @@ fn get_ffa_winners(game_state: &GameState) -> HashSet<u32> {
     }
 
     // Find max score
-    let max_score = player_scores.iter().map(|(_, score)| *score).max().unwrap_or(0);
+    let max_score = player_scores
+        .iter()
+        .map(|(_, score)| *score)
+        .max()
+        .unwrap_or(0);
 
     // Add all players with max score (handles ties)
     for (user_id, score) in player_scores {
@@ -431,7 +469,11 @@ async fn persist_solo_high_scores(
 
     // For each player, insert their high score
     for (user_id, player) in &game_state.players {
-        let score = game_state.scores.get(&player.snake_id).copied().unwrap_or(0);
+        let score = game_state
+            .scores
+            .get(&player.snake_id)
+            .copied()
+            .unwrap_or(0);
         let username = game_state
             .usernames
             .get(user_id)

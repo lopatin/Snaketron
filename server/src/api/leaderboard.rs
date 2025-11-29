@@ -1,13 +1,17 @@
-use axum::{Json, extract::{Query, State}, http::StatusCode, Extension};
 use axum::response::{IntoResponse, Response};
+use axum::{
+    Extension, Json,
+    extract::{Query, State},
+    http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
 use std::sync::Arc;
+use tracing::{error, info, warn};
 
-use crate::db::Database;
-use crate::season::{get_current_season, Season};
 use crate::api::middleware::AuthUser;
-use common::{QueueMode, GameType};
+use crate::db::Database;
+use crate::season::{Season, get_current_season};
+use common::{GameType, QueueMode};
 
 /// Query parameters for leaderboard endpoint
 #[derive(Debug, Deserialize)]
@@ -99,7 +103,10 @@ pub async fn get_leaderboard(
         "quickmatch" | "casual" => QueueMode::Quickmatch,
         "competitive" | "ranked" => QueueMode::Competitive,
         _ => {
-            warn!("Invalid queue_mode: {}, defaulting to Quickmatch", query.queue_mode);
+            warn!(
+                "Invalid queue_mode: {}, defaulting to Quickmatch",
+                query.queue_mode
+            );
             QueueMode::Quickmatch
         }
     };
@@ -136,12 +143,16 @@ pub async fn get_leaderboard(
             offset
         );
 
-        let high_scores = match state.db.get_high_scores(
-            &game_type,
-            query.region.as_deref(),
-            season,
-            offset + fetch_limit,
-        ).await {
+        let high_scores = match state
+            .db
+            .get_high_scores(
+                &game_type,
+                query.region.as_deref(),
+                season,
+                offset + fetch_limit,
+            )
+            .await
+        {
             Ok(mut scores) => {
                 info!("Fetched {} high scores from database", scores.len());
                 // Skip entries up to offset
@@ -196,13 +207,17 @@ pub async fn get_leaderboard(
     }
 
     // For non-Solo modes, query rankings (existing logic)
-    let entries = match state.db.get_leaderboard(
-        &queue_mode,
-        Some(&game_type),
-        query.region.as_deref(), // Pass region if specified, None for global
-        season,
-        offset + fetch_limit, // Fetch up to offset + limit + 1
-    ).await {
+    let entries = match state
+        .db
+        .get_leaderboard(
+            &queue_mode,
+            Some(&game_type),
+            query.region.as_deref(), // Pass region if specified, None for global
+            season,
+            offset + fetch_limit, // Fetch up to offset + limit + 1
+        )
+        .await
+    {
         Ok(mut entries) => {
             // Skip entries up to offset
             entries.drain(..offset.min(entries.len()));
@@ -258,9 +273,7 @@ pub async fn get_leaderboard(
 
 /// List available seasons
 /// Returns a list of all seasons that have ranking data
-pub async fn list_seasons(
-    State(_state): State<LeaderboardState>,
-) -> Json<SeasonsResponse> {
+pub async fn list_seasons(State(_state): State<LeaderboardState>) -> Json<SeasonsResponse> {
     // Placeholder: return only the current season until season schedule/roller exists
     let current_season = get_current_season();
     let seasons = vec![current_season];
@@ -312,24 +325,27 @@ pub async fn get_my_ranking(
     let region = query.region.as_deref().unwrap_or("us-east-1");
 
     // Get user's ranking from database
-    let ranking = match state.db.get_user_ranking(
-        auth_user.user_id,
-        &queue_mode,
-        &game_type,
-        region,
-        season,
-    ).await {
+    let ranking = match state
+        .db
+        .get_user_ranking(auth_user.user_id, &queue_mode, &game_type, region, season)
+        .await
+    {
         Ok(Some(entry)) => {
             // Calculate rank by querying all entries with higher MMR
-            let all_entries = state.db.get_leaderboard(
-                &queue_mode,
-                Some(&game_type),
-                Some(region),
-                season,
-                10000, // Large limit to get all entries
-            ).await.unwrap_or_default();
+            let all_entries = state
+                .db
+                .get_leaderboard(
+                    &queue_mode,
+                    Some(&game_type),
+                    Some(region),
+                    season,
+                    10000, // Large limit to get all entries
+                )
+                .await
+                .unwrap_or_default();
 
-            let rank = all_entries.iter()
+            let rank = all_entries
+                .iter()
                 .position(|e| e.user_id == auth_user.user_id)
                 .map(|pos| pos + 1);
 

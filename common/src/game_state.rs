@@ -665,8 +665,7 @@ impl GameState {
             return self.calculate_starting_positions(self.players.len());
         };
 
-        let mut positions: Vec<Option<(Position, Direction)>> =
-            vec![None; self.arena.snakes.len()];
+        let mut positions: Vec<Option<(Position, Direction)>> = vec![None; self.arena.snakes.len()];
 
         let mut team_snakes: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
         for (idx, snake) in self.arena.snakes.iter().enumerate() {
@@ -685,52 +684,51 @@ impl GameState {
         // Place snakes near the goal opening so they face the gap instead of a wall
         let mut positions_for_side =
             |count: usize, team_id: TeamId, is_left: bool| -> Vec<(Position, Direction)> {
-            let mut side_positions = Vec::with_capacity(count);
-            if count == 0 {
-                return side_positions;
-            }
+                let mut side_positions = Vec::with_capacity(count);
+                if count == 0 {
+                    return side_positions;
+                }
 
-            let boundary_x = if is_left {
-                end_zone_depth - 1
-            } else {
-                width - end_zone_depth
-            };
-            // Head sits one cell inside the boundary so first move reaches the gate column
-            let head_x = if is_left {
-                (boundary_x - 1).max(0)
-            } else {
-                (boundary_x + 1).min(width - 1)
-            };
-
-            // Use goal opening for vertical placement to align with the gate
-            let (_goal_x, y_start, y_end) = self
-                .arena
-                .goal_bounds(team_id)
-                .unwrap_or((boundary_x, height / 2, height / 2));
-            let gate_top = y_start.max(0);
-            let gate_bottom = y_end.min(height - 1);
-            let gate_span = (gate_bottom - gate_top).max(0);
-
-            for i in 0..count {
-                let y = if count == 1 {
-                    (gate_top + gate_bottom) / 2
+                let boundary_x = if is_left {
+                    end_zone_depth - 1
                 } else {
-                    // Evenly space within gate interior, avoiding the extreme ends
-                    let spacing = (gate_span as f64) / ((count as f64) + 1.0);
-                    let pos = gate_top as f64 + spacing * ((i as f64) + 1.0);
-                    pos.round()
-                        .clamp(gate_top as f64, gate_bottom as f64) as i16
+                    width - end_zone_depth
                 };
-                let direction = if is_left {
-                    Direction::Right
+                // Head sits one cell inside the boundary so first move reaches the gate column
+                let head_x = if is_left {
+                    (boundary_x - 1).max(0)
                 } else {
-                    Direction::Left
+                    (boundary_x + 1).min(width - 1)
                 };
-                side_positions.push((Position { x: head_x, y }, direction));
-            }
 
-            side_positions
-        };
+                // Use goal opening for vertical placement to align with the gate
+                let (_goal_x, y_start, y_end) =
+                    self.arena
+                        .goal_bounds(team_id)
+                        .unwrap_or((boundary_x, height / 2, height / 2));
+                let gate_top = y_start.max(0);
+                let gate_bottom = y_end.min(height - 1);
+                let gate_span = (gate_bottom - gate_top).max(0);
+
+                for i in 0..count {
+                    let y = if count == 1 {
+                        (gate_top + gate_bottom) / 2
+                    } else {
+                        // Evenly space within gate interior, avoiding the extreme ends
+                        let spacing = (gate_span as f64) / ((count as f64) + 1.0);
+                        let pos = gate_top as f64 + spacing * ((i as f64) + 1.0);
+                        pos.round().clamp(gate_top as f64, gate_bottom as f64) as i16
+                    };
+                    let direction = if is_left {
+                        Direction::Right
+                    } else {
+                        Direction::Left
+                    };
+                    side_positions.push((Position { x: head_x, y }, direction));
+                }
+
+                side_positions
+            };
 
         let team0_positions = positions_for_side(team_snakes[0].len(), TeamId(0), true);
         let team1_positions = positions_for_side(team_snakes[1].len(), TeamId(1), false);
@@ -755,10 +753,7 @@ impl GameState {
                     fallback
                         .get(idx)
                         .copied()
-                        .unwrap_or((
-                            Position { x: 0, y: 0 },
-                            Direction::Right,
-                        ))
+                        .unwrap_or((Position { x: 0, y: 0 }, Direction::Right))
                 })
             })
             .collect()
@@ -1262,15 +1257,12 @@ impl GameState {
                             let elapsed_ms =
                                 (self.tick as i64) * (self.properties.tick_duration_ms as i64);
                             if elapsed_ms >= limit_ms as i64 {
-                                let winning_team = self
-                                    .team_scores
-                                    .as_ref()
-                                    .and_then(|scores| {
-                                        scores
-                                            .iter()
-                                            .max_by_key(|(_, score)| *score)
-                                            .map(|(team_id, _)| *team_id)
-                                    });
+                                let winning_team = self.team_scores.as_ref().and_then(|scores| {
+                                    scores
+                                        .iter()
+                                        .max_by_key(|(_, score)| *score)
+                                        .map(|(team_id, _)| *team_id)
+                                });
 
                                 let winning_snake_id = winning_team
                                     .and_then(|team_id| {
@@ -1296,13 +1288,9 @@ impl GameState {
 
                                 let mut player_xp_awards = HashMap::new();
                                 for (user_id, player) in &self.players {
-                                    let score = self
-                                        .scores
-                                        .get(&player.snake_id)
-                                        .copied()
-                                        .unwrap_or(0);
-                                    let snake =
-                                        &self.arena.snakes[player.snake_id as usize];
+                                    let score =
+                                        self.scores.get(&player.snake_id).copied().unwrap_or(0);
+                                    let snake = &self.arena.snakes[player.snake_id as usize];
                                     let is_winner = winning_team
                                         .map_or(false, |team| snake.team_id == Some(team));
 
@@ -1333,8 +1321,7 @@ impl GameState {
 
                             let mut player_xp_awards = HashMap::new();
                             for (user_id, player) in &self.players {
-                                let score =
-                                    self.scores.get(&player.snake_id).copied().unwrap_or(0);
+                                let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
                                 let base_xp = score * 10; // 10 XP per food eaten
                                 player_xp_awards.insert(*user_id, base_xp + 10);
                             }
@@ -1525,9 +1512,7 @@ impl GameState {
             }
 
             GameEvent::XPAwarded { player_xp } => {
-                eprintln!("APPLYING XPAwarded event: {:?}", player_xp);
                 self.player_xp = player_xp;
-                eprintln!("GameState.player_xp after applying: {:?}", self.player_xp);
             }
         }
     }
@@ -1830,10 +1815,7 @@ mod tests {
 
         {
             let snake = &mut game.arena.snakes[0];
-            snake.body = vec![
-                Position { x: 5, y: 10 },
-                Position { x: 2, y: 10 },
-            ];
+            snake.body = vec![Position { x: 5, y: 10 }, Position { x: 2, y: 10 }];
             snake.direction = Direction::Right;
             snake.is_alive = true;
             snake.food = 2; // carrying one food
@@ -1866,7 +1848,10 @@ mod tests {
 
         let snake = &game.arena.snakes[0];
         assert!(snake.is_alive);
-        assert_eq!(snake.food, 0, "snake should not keep carried food after respawn");
+        assert_eq!(
+            snake.food, 0,
+            "snake should not keep carried food after respawn"
+        );
     }
 
     #[test]
@@ -1885,8 +1870,8 @@ mod tests {
         game.add_player(2, Some("Player2".to_string()))
             .expect("add player 2");
 
-        let enemy_zone_start =
-            game.arena.width as i16 - game.arena.team_zone_config.as_ref().unwrap().end_zone_depth as i16;
+        let enemy_zone_start = game.arena.width as i16
+            - game.arena.team_zone_config.as_ref().unwrap().end_zone_depth as i16;
 
         {
             let snake = &mut game.arena.snakes[0];
