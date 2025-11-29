@@ -21,22 +21,24 @@ COPY common/Cargo.toml ./common/
 COPY macros/Cargo.toml ./macros/
 COPY client/Cargo.toml ./client/
 COPY terminal/Cargo.toml ./terminal/
+COPY bot/Cargo.toml ./bot/
 
 # Create dummy source files to build dependencies
-RUN mkdir -p server/src common/src macros/src client/src terminal/src && \
+RUN mkdir -p server/src common/src macros/src client/src terminal/src bot/src && \
     echo "fn main() {}" > server/src/main.rs && \
     echo "fn main() {}" > server/src/lib.rs && \
     echo "fn main() {}" > common/src/lib.rs && \
     echo "fn main() {}" > macros/src/lib.rs && \
     echo "fn main() {}" > client/src/lib.rs && \
     echo "fn main() {}" > terminal/src/main.rs && \
-    echo "fn main() {}" > terminal/src/lib.rs
+    echo "fn main() {}" > terminal/src/lib.rs && \
+    echo "fn main() {}" > bot/src/main.rs
 
 # Build dependencies only
 RUN cargo build --release --bin server
 
 # Remove dummy source files
-RUN rm -rf server/src common/src macros/src client/src terminal/src
+RUN rm -rf server/src common/src macros/src client/src terminal/src bot/src
 
 # The actual source will be mounted as volumes
 
