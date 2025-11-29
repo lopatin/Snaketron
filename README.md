@@ -71,6 +71,12 @@ cargo test
 RUST_LOG=info cargo test -p server -- --nocapture
 ```
 
+
+### Run load test
+```bash
+cargo run -p bot -- --url http://localhost:8080 --mode duel --bots 40 --games 10 --queue-mode quickmatch
+```
+
 ### Project Structure
 
 - `common/` - Shared game logic (compiled to both native and WASM)
