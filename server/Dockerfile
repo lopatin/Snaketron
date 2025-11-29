@@ -19,6 +19,7 @@ COPY common ./common
 COPY server ./server
 COPY client ./client
 COPY terminal ./terminal
+COPY bot ./bot
 
 # Build the server
 RUN cargo build --release --bin server
