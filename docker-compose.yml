@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: snaketron-localstack
+    environment:
+      - SERVICES=dynamodb
+      - DEBUG=0
+      - PERSISTENCE=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    ports:
+      - "4566:4566"
+    volumes:
+      - "./localstack-data:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./localstack-init.sh:/etc/localstack/init/ready.d/init-dynamodb.sh"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - snaketron-network
+
+  redis:
+    image: valkey/valkey:latest
+    container_name: snaketron-valkey
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - snaketron-network
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: snaketron-server
+    environment:
+      # DynamoDB configuration
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      DYNAMODB_TABLE_PREFIX: snaketron
+      # Server configuration
+      SNAKETRON_HTTP_PORT: 8080
+      SNAKETRON_GRPC_PORT: 50051
+      SNAKETRON_REGION: us
+      SNAKETRON_ENV: dev
+      # Logging
+      RUST_LOG: info,server=debug
+      # Replay directory (using volume)
+      SNAKETRON_REPLAY_DIR: /var/lib/snaketron/replays
+      # Test mode - accept any token (set to "true" for testing without auth)
+      # SNAKETRON_TEST_MODE: "true"
+      # JWT secret (use a secure secret in production)
+      SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
+      # Redis configuration for cluster singleton coordination
+      SNAKETRON_REDIS_URL: "redis://redis:6379"
+    ports:
+      - "8080:8080"   # HTTP port (API + WebSocket)
+      - "50051:50051" # gRPC port
+    volumes:
+      - ./replays:/var/lib/snaketron/replays
+    depends_on:
+      localstack:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - snaketron-network
+
+networks:
+  snaketron-network:
+    driver: bridge
+
+volumes:
+  valkey-data:

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package stream_exchange;
+
+service StreamExchange {
+  rpc StartExchange (stream OutboundMessage) returns (stream InboundMessage);
+}
+
+// Message sent from the client to the server
+message OutboundMessage {
+  string client_id = 1;
+  string payload = 2;
+  int64 ts_ms = 3;
+}
+
+// Message received by the client from the server
+message InboundMessage {
+  string server_id = 1;
+  string response_payload = 2;
+  int64 ts_ms = 3;
+}

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "macros",
+    "common",
+    "server",
+    "client",
+    "terminal",
+    "bot"
+]

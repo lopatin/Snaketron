@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package game_relay;
+
+service GameRelay {
+  // Stream commands and events between servers
+  rpc StreamGameMessages(stream GameMessage) returns (stream GameMessage);
+  
+  // Notify other servers about impending shutdown
+  rpc NotifyShutdown(ShutdownNotification) returns (ShutdownAck);
+}
+
+message GameMessage {
+  oneof message {
+    GameCommand command = 1;
+    GameEvent event = 2;
+    Subscribe subscribe = 3;
+    Unsubscribe unsubscribe = 4;
+    GameSnapshot snapshot = 5;
+  }
+}
+
+message GameCommandMessage {
+  bytes command_data = 4; // Bincode-serialized common::GameCommandMessage
+}
+
+message GameCommand {
+  uint32 game_id = 1;
+  uint32 tick = 2;
+  int32 user_id = 3;
+  bytes command_data = 4; // Bincode-serialized common::GameCommand
+}
+
+message GameEvent {
+  uint32 game_id = 1;
+  uint32 tick = 2;
+  optional int32 user_id = 3;
+  bytes event_data = 4; // Bincode-serialized common::GameEvent
+}
+
+message Subscribe {
+  uint32 game_id = 1;
+  bool commands = 2;
+  bool events = 3;
+}
+
+message Unsubscribe {
+  uint32 game_id = 1;
+}
+
+message GameSnapshot {
+  uint32 game_id = 1;
+  bytes game_state = 2; // Bincode-serialized common::GameState
+}
+
+// High Availability Messages
+
+message GameStateUpdate {
+  bytes game_state = 1; // Bincode-serialized common::GameState
+  uint32 tick = 2;
+}
+
+message GameDeleted {
+  string reason = 1;
+}
+
+message ShutdownNotification {
+  string server_id = 1;
+  uint32 grace_period_ms = 2;
+  repeated uint32 affected_game_ids = 3;
+}
+
+message ShutdownAck {
+  bool acknowledged = 1;
+  repeated uint32 accepted_game_ids = 2;
+}

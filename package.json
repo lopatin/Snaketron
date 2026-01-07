@@ -1,54 +1,5 @@
 {
-  "name": "SnakeTron",
-  "description": "Multi-player Snake",
-  "version": "0.1.0",
-  "homepage": "https://github.com/lopatin/SnakeTron",
-  "author": {
-    "name": "Alex Lopatin",
-    "email": "lopatin1@illinois.edu"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/lopatin/SnakeTron.git"
-  },
-  "bugs": {
-    "url": "https://github.com/lopatin/SnakeTron/issues"
-  },
-  "licenses": [
-    {
-      "type": "MIT",
-      "url": "https://github.com/lopatin/SnakeTron/blob/master/LICENSE-MIT"
-    }
-  ],
-  "main": "lib/SnakeTron",
-  "engines": {
-    "node": ">= 0.8.0"
-  },
-  "scripts": {
-    "test": "grunt nodeunit"
-  },
-  "keywords": [],
   "dependencies": {
-    "passport": "~0.1.17",
-    "grunt-contrib-jshint": "~0.1.1",
-    "grunt-contrib-watch": "~0.2.0",
-    "grunt": "~0.4.1",
-    "grunt-contrib-sass": "~0.3.0",
-    "grunt-contrib-haml": "~0.1.0",
-    "requirejs": "~2.1.6",
-    "grunt-contrib-coffee": "~0.7.0",
-    "amdefine": "0.0.5",
-    "socket.io": "~0.9.16",
-    "express": "~3.2.4",
-    "underscore": "~1.4.4",
-    "redis": "~0.8.3",
-    "hiredis": "~0.1.15",
-    "passport-local": "~0.1.6",
-    "passport-facebook": "~1.0.2",
-    "session.socket.io": "~0.1.6",
-    "connect-redis": "~1.4.6",
-    "bcrypt": "~0.7.7",
-    "node-uuid": "~1.4.1",
-    "backbone": "~1.1.0"
+    "ws": "^8.18.2"
   }
 }

@@ -1,0 +1,2 @@
+-- V2 migration is now empty since V1 already includes all needed columns
+-- Keeping this file for migration continuity

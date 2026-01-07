@@ -1,0 +1,42 @@
+# Development override for faster local development
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  localstack:
+    environment:
+      - DEBUG=1
+      - LS_LOG=debug
+    volumes:
+      - "./localstack-data:/var/lib/localstack"
+      - "./scripts/init-dynamodb.sh:/etc/localstack/init/ready.d/init-dynamodb.sh"
+
+  server:
+    # Use a different build strategy for development
+    build:
+      context: .
+      dockerfile: server/Dockerfile.dev
+    volumes:
+      # Mount source code for hot reloading
+      - ./server:/usr/src/app/server:delegated
+      - ./common:/usr/src/app/common:delegated
+      - ./macros:/usr/src/app/macros:delegated
+      - ./client:/usr/src/app/client:delegated
+      - ./terminal:/usr/src/app/terminal:delegated
+      - ./bot:/usr/src/app/bot:delegated
+      - ./Cargo.toml:/usr/src/app/Cargo.toml:delegated
+      - ./Cargo.lock:/usr/src/app/Cargo.lock:delegated
+      # Named volume for target directory to avoid rebuilding dependencies
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-target:/usr/src/app/target
+    environment:
+      # Enable cargo-watch for auto-reload
+      CARGO_WATCH: "true"
+      # Faster builds in development
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 1
+
+volumes:
+  cargo-cache:
+  cargo-target:

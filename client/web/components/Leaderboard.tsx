@@ -1,0 +1,900 @@
+import React, { useState, useEffect } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Sidebar } from './Sidebar';
+import { MobileHeader } from './MobileHeader';
+import { LobbyChat } from './LobbyChat';
+import { InviteFriendsModal } from './InviteFriendsModal';
+import JoinGameModal from './JoinGameModal';
+import { useAuth } from '../contexts/AuthContext';
+import { useWebSocket } from '../contexts/WebSocketContext';
+import { useRegions } from '../hooks/useRegions';
+import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry, GameType } from '../types';
+import { api } from '../services/api';
+import { useGameWebSocket } from '../hooks/useGameWebSocket';
+
+const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
+
+const DEFAULT_LEADERBOARD_REGION = 'global';
+const DEFAULT_LEADERBOARD_MODE: LobbyGameMode = 'duel';
+
+const LEADERBOARD_REGIONS = [
+  { id: 'global', label: 'Global' },
+  { id: 'us-east-1', label: 'US East' },
+  { id: 'eu-west-1', label: 'EU West' },
+];
+
+const GAME_MODES: Array<{ id: LobbyGameMode; label: string }> = [
+  { id: 'duel', label: 'DUEL' },
+  { id: '2v2', label: '2V2' },
+  { id: 'solo', label: 'SOLO' },
+  { id: 'ffa', label: 'FFA' },
+];
+
+const isValidLeaderboardMode = (mode: string | null): mode is LobbyGameMode =>
+  Boolean(mode && GAME_MODES.some(gameMode => gameMode.id === mode));
+
+const isValidLeaderboardRegion = (region: string | null) =>
+  Boolean(region && LEADERBOARD_REGIONS.some(availableRegion => availableRegion.id === region));
+
+const RANK_BANDS: Array<{ min: number; max?: number; tier: RankTier; division: RankDivision }> = [
+  { min: 0, max: 200, tier: 'bronze', division: 1 },
+  { min: 200, max: 400, tier: 'bronze', division: 2 },
+  { min: 400, max: 600, tier: 'bronze', division: 3 },
+  { min: 600, max: 800, tier: 'silver', division: 1 },
+  { min: 800, max: 1000, tier: 'silver', division: 2 },
+  { min: 1000, max: 1200, tier: 'silver', division: 3 },
+  { min: 1200, max: 1300, tier: 'gold', division: 1 },
+  { min: 1300, max: 1400, tier: 'gold', division: 2 },
+  { min: 1400, max: 1500, tier: 'gold', division: 3 },
+  { min: 1500, max: 1600, tier: 'platinum', division: 1 },
+  { min: 1600, max: 1700, tier: 'platinum', division: 2 },
+  { min: 1700, max: 1800, tier: 'platinum', division: 3 },
+  { min: 1800, max: 1900, tier: 'platinum', division: 4 },
+  { min: 1900, max: 2000, tier: 'diamond', division: 1 },
+  { min: 2000, max: 2100, tier: 'diamond', division: 2 },
+  { min: 2100, max: 2200, tier: 'diamond', division: 3 },
+  { min: 2200, max: 2300, tier: 'diamond', division: 4 },
+  { min: 2300, max: 2400, tier: 'grandmaster', division: 1 },
+  { min: 2400, max: 2500, tier: 'grandmaster', division: 2 },
+  { min: 2500, max: 2600, tier: 'grandmaster', division: 3 },
+  { min: 2600, tier: 'grandmaster', division: 4 },
+];
+
+const getRankFromMMR = (mmr: number): Rank => {
+  const normalizedMmr = Math.max(0, mmr);
+  const band =
+    RANK_BANDS.find(({ min, max }) => normalizedMmr >= min && (max == null || normalizedMmr < max)) ??
+    RANK_BANDS[RANK_BANDS.length - 1];
+
+  return {
+    tier: band.tier,
+    division: band.division,
+    mmr: normalizedMmr,
+  };
+};
+
+const formatRankLabel = (rank: Rank): string => {
+  const tierLabel: Record<RankTier, string> = {
+    bronze: 'Bronze',
+    silver: 'Silver',
+    gold: 'Gold',
+    platinum: 'Platinum',
+    diamond: 'Diamond',
+    master: 'Master',
+    grandmaster: 'Grand Master',
+  };
+  const divisionLabel = ['I', 'II', 'III', 'IV'][rank.division - 1] ?? '';
+
+  return `${tierLabel[rank.tier]} ${divisionLabel}`.trim();
+};
+
+const getRankImage = (tier: RankTier | 'unranked'): string => {
+  if (tier === 'unranked') return '/images/unranked.png';
+  const imageTier = tier === 'master' ? 'grandmaster' : tier;
+  return `/images/${imageTier}.png`;
+};
+
+const parseSeasonParam = (value: string | null): number | null => {
+  if (value == null) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const LeaderboardContent: React.FC<{
+  selectedSeason: number | null;
+  setSelectedSeason: React.Dispatch<React.SetStateAction<number | null>>;
+  selectedMode: LobbyGameMode;
+  setSelectedMode: (mode: LobbyGameMode) => void;
+  selectedRegion: string;
+  setSelectedRegion: (region: string) => void;
+  seasons: number[];
+  isAuthenticated: boolean;
+}> = ({
+  selectedSeason,
+  setSelectedSeason,
+  selectedMode,
+  setSelectedMode,
+  selectedRegion,
+  setSelectedRegion,
+  seasons,
+  isAuthenticated
+}) => {
+  const { queueForMatch } = useGameWebSocket();
+  const { isConnected, currentLobby, createLobby, updateLobbyPreferences } = useWebSocket();
+  const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
+  const LIMIT = 25;
+  const [isStartingPlacementQueue, setIsStartingPlacementQueue] = useState(false);
+
+  // Fetch user's ranking when authenticated and filters change
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setUserRanking(null);
+      return;
+    }
+
+    const fetchUserRanking = async () => {
+      try {
+        const data = await api.getMyRanking(
+          'competitive',
+          selectedMode,
+          selectedSeason ?? undefined,
+          selectedRegion === 'global' ? undefined : selectedRegion
+        );
+        setUserRanking(data);
+      } catch (err) {
+        console.error('Failed to fetch user ranking:', err);
+        setUserRanking(null);
+      }
+    };
+
+    fetchUserRanking();
+  }, [isAuthenticated, selectedSeason, selectedMode, selectedRegion]);
+
+  // Fetch leaderboard data when filters change (always use competitive mode)
+  useEffect(() => {
+    const fetchLeaderboard = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await api.getLeaderboard(
+          'competitive', // Only show competitive (ranked) MMR
+          selectedMode,
+          selectedSeason ?? undefined,
+          LIMIT,
+          offset,
+          selectedRegion === 'global' ? undefined : selectedRegion
+        );
+        if (offset === 0) {
+          setLeaderboardData(data.entries);
+        } else {
+          setLeaderboardData(prev => [...prev, ...data.entries]);
+        }
+        setHasMore(data.hasMore);
+      } catch (err) {
+        console.error('Failed to fetch leaderboard:', err);
+        setError('Failed to load leaderboard data');
+        setLeaderboardData([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchLeaderboard();
+  }, [selectedSeason, selectedMode, selectedRegion, offset]);
+
+  // Reset offset when filters change
+  useEffect(() => {
+    setOffset(0);
+  }, [selectedSeason, selectedMode, selectedRegion]);
+
+  const handleLoadMore = () => {
+    setOffset(prev => prev + LIMIT);
+  };
+
+  const toGameType = (mode: LobbyGameMode): GameType => {
+    switch (mode) {
+      case 'duel':
+        return { TeamMatch: { per_team: 1 } };
+      case '2v2':
+        return { TeamMatch: { per_team: 2 } };
+      case 'ffa':
+        return { FreeForAll: { max_players: 4 } };
+      default:
+        return 'Solo';
+    }
+  };
+
+  const startPlacementQueue = async () => {
+    if (isStartingPlacementQueue || selectedMode === 'solo') {
+      return;
+    }
+
+    setIsStartingPlacementQueue(true);
+    try {
+      if (!isConnected) {
+        throw new Error('Not connected to game server');
+      }
+
+      if (!currentLobby) {
+        await createLobby();
+      }
+
+      updateLobbyPreferences({
+        selectedModes: [selectedMode],
+        competitive: true,
+      });
+
+      // Small delay so the server registers preference updates
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      queueForMatch(toGameType(selectedMode), 'Competitive');
+    } catch (err) {
+      console.error('Failed to start placement matchmaking:', err);
+    } finally {
+      setIsStartingPlacementQueue(false);
+    }
+  };
+
+  const rank = userRanking?.mmr != null ? getRankFromMMR(userRanking.mmr) : null;
+  const rankTier = rank?.tier ?? 'unranked';
+  const rankImage = getRankImage(rankTier);
+  const hasCompetitiveMMR = Boolean(rank);
+  const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
+
+  return (
+    <div className="w-full max-w-4xl mx-auto px-4 py-8">
+      {/* Header row with rank and selectors */}
+      <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-6 mb-8">
+        {/* Your Rank Display (left side) - Not shown for Solo mode */}
+        {selectedMode !== 'solo' ? (
+          <div className="flex items-start gap-4">
+            <img
+              src={rankImage}
+              alt={rankTier}
+              className="w-16 h-16 object-contain"
+            />
+            <div className="flex flex-col gap-1">
+              <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+                Your Rank
+              </div>
+              <div className="font-black italic tracking-1 text-lg text-black-70">
+                {rankLabel}
+              </div>
+              <div className="text-xs text-black-70">
+                {!isAuthenticated ? (
+                  <Link to="/auth" className="font-bold text-blue-600 hover:underline">
+                    Login to play ranked
+                  </Link>
+                ) : hasCompetitiveMMR && userRanking?.mmr != null ? (
+                  `${userRanking.mmr} MMR`
+                ) : (
+                  <button
+                    type="button"
+                    onClick={startPlacementQueue}
+                    disabled={isStartingPlacementQueue}
+                    className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {isStartingPlacementQueue ? 'Starting matchmaking...' : 'Play ranked now'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          // Empty div to maintain flex layout spacing
+          <div className="hidden md:block"></div>
+        )}
+
+        {/* Selectors (right side) */}
+        <div className="flex flex-col sm:flex-row gap-6">
+        {/* Region Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Region
+          </label>
+          <div className="relative h-[38px]">
+            <select
+              value={selectedRegion}
+              onChange={(e) => setSelectedRegion(e.target.value)}
+              className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
+                         font-black italic uppercase tracking-1 text-sm text-black-70
+                         focus:outline-none focus:border-blue-500 cursor-pointer
+                         appearance-none"
+            >
+              {LEADERBOARD_REGIONS.map((region) => (
+                <option key={region.id} value={region.id}>
+                  {region.label}
+                </option>
+              ))}
+            </select>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
+              <svg className="w-4 h-4 text-black-70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Season Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Season
+          </label>
+          <div className="relative h-[38px]">
+            <select
+              value={selectedSeason != null ? selectedSeason.toString() : ''}
+              onChange={(e) => {
+                const parsedSeason = parseSeasonParam(e.target.value);
+                if (parsedSeason != null) {
+                  setSelectedSeason(parsedSeason);
+                }
+              }}
+              className="w-full sm:w-auto h-full px-4 pr-8 border-2 border-gray-300 rounded-lg bg-white
+                         font-black italic uppercase tracking-1 text-sm text-black-70
+                         focus:outline-none focus:border-blue-500 cursor-pointer
+                         appearance-none"
+            >
+              {seasons.map((season) => (
+                <option key={season} value={season.toString()}>
+                  {season.toString()}
+                </option>
+              ))}
+            </select>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
+              <svg className="w-4 h-4 text-black-70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Game Mode Selector */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+            Game Mode
+          </label>
+          <div className="grid grid-cols-4 gap-2 h-[38px]">
+            {GAME_MODES.map((mode) => {
+              const isSelected = selectedMode === mode.id;
+              return (
+                <button
+                  key={mode.id}
+                  type="button"
+                  onClick={() => setSelectedMode(mode.id)}
+                  className={`
+                    h-full px-3 rounded-lg font-black italic uppercase tracking-1 text-xs
+                    transition-all border-2
+                    ${
+                      isSelected
+                        ? 'border-blue-500 bg-blue-50 text-black-70'
+                        : 'border-gray-300 bg-white text-black-70 hover:border-gray-400'
+                    }
+                  `}
+                >
+                  {mode.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        </div>
+      </div>
+
+      {/* Leaderboard Table */}
+      <div className="bg-white border-2 border-gray-300 rounded-lg overflow-hidden">
+        {/* Table Header */}
+        {selectedMode === 'solo' ? (
+          // Solo mode header - show Score and Date instead of MMR/Wins/Losses
+          <div className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Score</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Date</div>
+          </div>
+        ) : (
+          // Other modes header - show MMR, Wins, Losses, Win%
+          <div className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">MMR</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Wins</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right hidden sm:block">Losses</div>
+            <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Win %</div>
+          </div>
+        )}
+
+        {/* Table Body */}
+        <div className="divide-y divide-gray-200">
+          {loading && offset === 0 ? (
+            <div className="px-4 py-12 text-center text-black-70">
+              Loading...
+            </div>
+          ) : error ? (
+            <div className="px-4 py-12 text-center text-red-600">
+              {error}
+            </div>
+          ) : leaderboardData.length === 0 ? (
+            <div className="px-4 py-12 text-center text-black-70">
+              No players have been ranked yet in this mode.
+            </div>
+          ) : (
+            leaderboardData.map((entry) => {
+              // Check if this is a high score entry (Solo mode) or ranking entry
+              if (isHighScoreEntry(entry)) {
+                // Render Solo mode entry
+                const date = new Date(entry.timestamp);
+                const formattedDate = date.toLocaleDateString('en-US', {
+                  month: 'short',
+                  day: 'numeric',
+                  year: 'numeric'
+                });
+
+                return (
+                  <div
+                    key={`${entry.gameId}-${entry.rank}`}
+                    className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                  >
+                    {/* Rank */}
+                    <div className="flex items-center">
+                      <span className="font-black text-base text-black-70">{entry.rank}</span>
+                    </div>
+
+                    {/* Username */}
+                    <div className="flex items-center font-bold text-sm text-black-70 truncate">
+                      {entry.username}
+                    </div>
+
+                    {/* Score */}
+                    <div className="flex items-center justify-end font-black italic text-base text-black-70">
+                      {entry.score}
+                    </div>
+
+                    {/* Date (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {formattedDate}
+                    </div>
+                  </div>
+                );
+              } else if (isRankingEntry(entry)) {
+                // Render ranking entry (Duel, 2v2, FFA)
+                const entryRank = getRankFromMMR(entry.mmr);
+                const entryRankImage = getRankImage(entryRank.tier);
+                const entryRankLabel = formatRankLabel(entryRank);
+
+                return (
+                  <div
+                    key={entry.rank}
+                    className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                  >
+                    {/* Rank */}
+                    <div className="flex items-center">
+                      <span className="font-black text-base text-black-70">{entry.rank}</span>
+                    </div>
+
+                    {/* Username */}
+                    <div className="flex items-center gap-2 font-bold text-sm text-black-70 min-w-0">
+                      <img
+                        src={entryRankImage}
+                        alt={`${entryRankLabel} icon`}
+                        className="w-6 h-6 flex-shrink-0"
+                      />
+                      <span className="truncate">{entry.username}</span>
+                    </div>
+
+                    {/* MMR */}
+                    <div className="flex items-center justify-end font-black italic text-base text-black-70">
+                      {entry.mmr}
+                    </div>
+
+                    {/* Wins (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {entry.wins}
+                    </div>
+
+                    {/* Losses (hidden on mobile) */}
+                    <div className="hidden sm:flex items-center justify-end text-sm text-black-70">
+                      {entry.losses}
+                    </div>
+
+                    {/* Win Rate */}
+                    <div className="flex items-center justify-end font-bold text-sm text-black-70">
+                      {entry.winRate.toFixed(1)}%
+                    </div>
+                  </div>
+                );
+              }
+              return null;
+            })
+          )}
+        </div>
+      </div>
+
+      {/* Load More Button */}
+      {hasMore && !loading && (
+        <div className="mt-6 text-center">
+          <button
+            type="button"
+            onClick={handleLoadMore}
+            className="px-6 py-2 border-2 border-gray-300 rounded-lg bg-white text-black-70
+                       font-black italic uppercase tracking-1 text-sm
+                       hover:border-gray-400 transition-all"
+          >
+            LOAD MORE
+          </button>
+        </div>
+      )}
+
+      {/* Loading More Indicator */}
+      {loading && offset > 0 && (
+        <div className="mt-6 text-center text-black-70">
+          Loading more...
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const Leaderboard: React.FC = () => {
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { user, logout } = useAuth();
+  const {
+    connectToRegion,
+    isConnected,
+    onMessage,
+    currentRegionUrl,
+    currentLobby,
+    lobbyMembers,
+    createLobby,
+    leaveLobby,
+    lobbyChatMessages,
+    sendChatMessage,
+  } = useWebSocket();
+  const [isMobile, setIsMobile] = useState(false);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [showJoinModal, setShowJoinModal] = useState(false);
+  const [isCreatingInvite, setIsCreatingInvite] = useState(false);
+  const [seasons, setSeasons] = useState<number[]>([]);
+  const [selectedSeason, setSelectedSeason] = useState<number | null>(() => parseSeasonParam(searchParams.get('season')));
+  const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
+    const queryMode = searchParams.get('mode');
+    return isValidLeaderboardMode(queryMode) ? queryMode : DEFAULT_LEADERBOARD_MODE;
+  });
+  const [selectedLeaderboardRegion, setSelectedLeaderboardRegion] = useState<string>(() => {
+    const queryRegion = searchParams.get('region');
+    return isValidLeaderboardRegion(queryRegion) ? queryRegion : DEFAULT_LEADERBOARD_REGION;
+  });
+
+  // Use regions hook for live data
+  const {
+    regions,
+    selectedRegion: selectedWsRegion,
+    selectRegion,
+    isLoading: regionsLoading,
+    error: regionsError,
+  } = useRegions({
+    isWebSocketConnected: isConnected,
+    onMessage,
+  });
+  const currentRegionId = selectedWsRegion?.id ?? regions[0]?.id ?? '';
+
+  // Check if mobile on mount and resize
+  useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile(window.innerWidth < 800);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // Fetch seasons once so we can hydrate the query defaults
+  useEffect(() => {
+    const fetchSeasons = async () => {
+      try {
+        const data = await api.getSeasons();
+        setSeasons(data.seasons);
+        setSelectedSeason(prev => {
+          if (prev != null) {
+            return prev;
+          }
+          if (data.current != null) {
+            return data.current;
+          }
+          return data.seasons[0] ?? null;
+        });
+      } catch (err) {
+        console.error('Failed to fetch seasons:', err);
+      }
+    };
+
+    fetchSeasons();
+  }, []);
+
+  // Sync local selections from URL (and season list) whenever the URL changes
+  useEffect(() => {
+    const modeFromQuery = searchParams.get('mode');
+    const regionFromQuery = searchParams.get('region');
+    const seasonFromQuery = parseSeasonParam(searchParams.get('season'));
+
+    const resolvedMode: LobbyGameMode = isValidLeaderboardMode(modeFromQuery)
+      ? modeFromQuery
+      : DEFAULT_LEADERBOARD_MODE;
+
+    const resolvedRegion = isValidLeaderboardRegion(regionFromQuery)
+      ? regionFromQuery
+      : DEFAULT_LEADERBOARD_REGION;
+
+    const resolvedSeason =
+      seasons.length === 0
+        ? null
+        : seasonFromQuery != null && seasons.includes(seasonFromQuery)
+          ? seasonFromQuery
+          : seasons[0];
+
+    setSelectedMode(prev => (prev === resolvedMode ? prev : resolvedMode));
+    setSelectedLeaderboardRegion(prev => (prev === resolvedRegion ? prev : resolvedRegion));
+    setSelectedSeason(prev => (prev === resolvedSeason ? prev : resolvedSeason));
+  }, [searchParams, seasons]);
+
+  // Keep the URL in sync with the current selections
+  useEffect(() => {
+    if (seasons.length === 0) {
+      return;
+    }
+
+    const params = new URLSearchParams(searchParams);
+    let hasChanged = false;
+
+    if (!isValidLeaderboardMode(params.get('mode'))) {
+      params.set('mode', DEFAULT_LEADERBOARD_MODE);
+      hasChanged = true;
+    }
+    if (params.get('mode') !== selectedMode) {
+      params.set('mode', selectedMode);
+      hasChanged = true;
+    }
+
+    if (!isValidLeaderboardRegion(params.get('region'))) {
+      params.set('region', DEFAULT_LEADERBOARD_REGION);
+      hasChanged = true;
+    }
+    if (params.get('region') !== selectedLeaderboardRegion) {
+      params.set('region', selectedLeaderboardRegion);
+      hasChanged = true;
+    }
+
+    const seasonFromParams = parseSeasonParam(params.get('season'));
+    const resolvedSeason =
+      selectedSeason != null && seasons.includes(selectedSeason)
+        ? selectedSeason
+        : seasonFromParams != null && seasons.includes(seasonFromParams)
+          ? seasonFromParams
+          : seasons[0];
+
+    const resolvedSeasonString = resolvedSeason != null ? resolvedSeason.toString() : '';
+    if (params.get('season') !== resolvedSeasonString) {
+      params.set('season', resolvedSeasonString);
+      hasChanged = true;
+    }
+
+    if (hasChanged) {
+      setSearchParams(params, { replace: true });
+    }
+  }, [selectedSeason, selectedMode, selectedLeaderboardRegion, searchParams, seasons, setSearchParams]);
+
+  // Connect to selected region when it changes
+  useEffect(() => {
+    if (!selectedWsRegion) {
+      return;
+    }
+
+    if (currentRegionUrl === selectedWsRegion.wsUrl) {
+      return;
+    }
+
+    console.log('Connecting to region:', selectedWsRegion.name, selectedWsRegion.wsUrl);
+    connectToRegion(selectedWsRegion.wsUrl, {
+      regionId: selectedWsRegion.id,
+      origin: selectedWsRegion.origin,
+    });
+  }, [selectedWsRegion?.id, selectedWsRegion?.wsUrl, selectedWsRegion?.origin, connectToRegion, currentRegionUrl]);
+
+  const handleRegionChange = (regionId: string) => {
+    selectRegion(regionId);
+  };
+
+  const handleSendMessage = (message: string) => {
+    sendChatMessage('lobby', message);
+  };
+
+  const handleInvite = async () => {
+    if (isCreatingInvite) {
+      return;
+    }
+
+    setIsCreatingInvite(true);
+    try {
+      if (!currentLobby) {
+        await createLobby();
+        console.log('Lobby created successfully');
+      }
+
+      setShowInviteModal(true);
+    } catch (error) {
+      console.error('Failed to create lobby:', error);
+    } finally {
+      setIsCreatingInvite(false);
+    }
+  };
+
+  const handleLeaveLobby = async () => {
+    try {
+      await leaveLobby();
+      console.log('Left lobby successfully');
+    } catch (error) {
+      console.error('Failed to leave lobby:', error);
+    }
+  };
+
+  const handleLoginClick = () => {
+    navigate('/auth');
+  };
+
+  const desktopLayout = (
+    <>
+      <div className="w-80 flex-shrink-0">
+        <Sidebar
+          regions={regions}
+          currentRegionId={currentRegionId}
+          onRegionChange={handleRegionChange}
+          lobbyMembers={lobbyMembers}
+          lobbyCode={currentLobby?.code || null}
+          currentUserId={user?.id}
+          onInvite={handleInvite}
+          isInviteDisabled={isCreatingInvite}
+          onLeaveLobby={handleLeaveLobby}
+          onJoinGame={() => setShowJoinModal(true)}
+        />
+      </div>
+      <div className="flex-1 flex flex-col relative">
+        {/* Top Right: Login/Username */}
+        <div className="absolute top-8 right-8 z-20">
+          {user && !user.isGuest ? (
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-black-70 font-bold uppercase tracking-1">
+                {user.username}
+              </span>
+              <div className="relative group">
+                <button
+                  onClick={logout}
+                  className="text-black-70 hover:opacity-70 transition-opacity cursor-pointer"
+                  aria-label="Logout"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    className="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
+                    />
+                  </svg>
+                </button>
+                {/* Tooltip */}
+                <div className="absolute right-0 top-full mt-2 px-2 py-1 bg-gray-800 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                  Logout
+                </div>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={handleLoginClick}
+              className="text-sm text-black-70 font-bold uppercase tracking-1 hover:opacity-70 transition-opacity"
+            >
+              LOGIN
+            </button>
+          )}
+        </div>
+
+        {/* Center: Leaderboard Content */}
+        <div className="flex-1 flex items-center justify-center px-8 overflow-y-auto">
+          <LeaderboardContent
+            selectedSeason={selectedSeason}
+            setSelectedSeason={setSelectedSeason}
+            selectedMode={selectedMode}
+            setSelectedMode={setSelectedMode}
+            selectedRegion={selectedLeaderboardRegion}
+            setSelectedRegion={setSelectedLeaderboardRegion}
+            seasons={seasons}
+            isAuthenticated={Boolean(user && !user.isGuest)}
+          />
+        </div>
+
+        {/* Bottom Right: Lobby Chat */}
+        <LobbyChat
+          title="Lobby Chat"
+          messages={lobbyChatMessages}
+          onSendMessage={handleSendMessage}
+          currentUsername={user?.username}
+          isActive={Boolean(currentLobby)}
+          inactiveMessage="Join or create a lobby to chat"
+          initialExpanded={true}
+        />
+      </div>
+    </>
+  );
+
+  const mobileLayout = (
+    <div className="flex-1 flex flex-col">
+      <MobileHeader
+        regions={regions}
+        currentRegionId={currentRegionId}
+        onRegionChange={handleRegionChange}
+        currentUser={user}
+        onLoginClick={handleLoginClick}
+        lobbyUsers={lobbyMembers.map(m => m.username)}
+        onInvite={handleInvite}
+        isInviteDisabled={isCreatingInvite}
+      />
+
+      {/* Center: Leaderboard Content */}
+      <div className="flex-1 overflow-y-auto px-4 py-8">
+        <LeaderboardContent
+          selectedSeason={selectedSeason}
+          setSelectedSeason={setSelectedSeason}
+          selectedMode={selectedMode}
+          setSelectedMode={setSelectedMode}
+          selectedRegion={selectedLeaderboardRegion}
+          setSelectedRegion={setSelectedLeaderboardRegion}
+          seasons={seasons}
+          isAuthenticated={Boolean(user && !user.isGuest)}
+        />
+      </div>
+
+      {/* Bottom Right: Lobby Chat */}
+      <LobbyChat
+        title="Lobby Chat"
+        messages={lobbyChatMessages}
+        onSendMessage={handleSendMessage}
+        currentUsername={user?.username}
+        isActive={Boolean(currentLobby)}
+        inactiveMessage="Join or create a lobby to chat"
+        initialExpanded={false}
+      />
+    </div>
+  );
+
+  return (
+    <>
+      <div className="min-h-screen flex home-page relative">
+        {isMobile ? mobileLayout : desktopLayout}
+      </div>
+
+      {/* Invite Friends Modal */}
+      <InviteFriendsModal
+        isOpen={showInviteModal}
+        onClose={() => setShowInviteModal(false)}
+        lobbyCode={currentLobby?.code || null}
+      />
+
+      {/* Join Game Modal */}
+      <JoinGameModal
+        isOpen={showJoinModal}
+        onClose={() => setShowJoinModal(false)}
+      />
+    </>
+  );
+};

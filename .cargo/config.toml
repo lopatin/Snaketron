@@ -1,0 +1,11 @@
+# Cargo configuration for SnakeTron
+
+[env]
+# Default environment variables for running tests locally
+AWS_ENDPOINT_URL = { value = "http://localhost:4566", force = false }
+AWS_REGION = { value = "us-east-1", force = false }
+AWS_ACCESS_KEY_ID = { value = "test", force = false }
+AWS_SECRET_ACCESS_KEY = { value = "test", force = false }
+DYNAMODB_TABLE_PREFIX = { value = "snaketron", force = false }
+SNAKETRON_ENV = { value = "test", force = false }
+SNAKETRON_REDIS_URL = { value = "redis://localhost:6379", force = false }
