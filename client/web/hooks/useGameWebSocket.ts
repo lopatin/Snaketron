@@ -46,6 +46,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const [isQueued, setIsQueued] = useState(false);
   const [isJoiningGame, setIsJoiningGame] = useState(false);
   const requestedGameRef = useRef<{ routeGameId: string; gameId: number } | null>(null);
+  const serverAssignedGameRef = useRef<number | null>(null);
   const awaitingGameSnapshotRef = useRef<string | null>(null);
   const isGameSnapshotSynchronizedRef = useRef(false);
 
@@ -79,6 +80,27 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         }
 
         const eventGameId = parseU32GameId(eventMessage.game_id);
+        const event = eventMessage.event || eventMessage;
+
+        // useGameWebSocket is currently instantiated independently by the global
+        // matchmaking banner and the game arena. The banner's instance sees the
+        // server's JoinGame notification, but the arena's instance sends the
+        // subsequent JoinGame request and acknowledges its Snapshot. Clear the
+        // notification-side joining state here when this hook instance sees the
+        // matching Snapshot, while keeping arena event processing correlated to
+        // requestedGameRef below.
+        if (
+          eventGameId !== null &&
+          serverAssignedGameRef.current === eventGameId &&
+          event &&
+          typeof event === 'object' &&
+          'Snapshot' in event
+        ) {
+          serverAssignedGameRef.current = null;
+          setIsQueued(false);
+          setIsJoiningGame(false);
+        }
+
         const requestedGame = requestedGameRef.current;
 
         if (
@@ -160,6 +182,12 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
 
+        if (serverAssignedGameRef.current === gameId) {
+          serverAssignedGameRef.current = null;
+          setIsQueued(false);
+          setIsJoiningGame(false);
+        }
+
         const requestedGame = requestedGameRef.current;
         if (!requestedGame || requestedGame.gameId !== gameId) {
           console.warn(
@@ -225,10 +253,12 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         // Extract game ID - it could be directly the number or in a data field
         const gameId = typeof message === 'number' ? message : 
                       (message.data || message.JoinGame || message);
-        
-        if (gameId) {
-          console.log('Match found! Game ID:', gameId);
-          setCurrentGameId(gameId.toString());
+
+        const parsedGameId = parseU32GameId(gameId);
+        if (parsedGameId !== null) {
+          console.log('Match found! Game ID:', parsedGameId);
+          serverAssignedGameRef.current = parsedGameId;
+          setCurrentGameId(parsedGameId.toString());
           setIsQueued(false);
           setIsJoiningGame(true);
           
@@ -236,7 +266,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           // sendMessage({ JoinGame: parseInt(gameId.toString()) });
           
           // Navigate to the game arena
-          navigate(`/play/${gameId}`);
+          navigate(`/play/${parsedGameId}`);
         }
       })
     );
@@ -245,6 +275,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     unsubscribers.push(
       onMessage('AccessDenied', (message: any) => {
         console.error('Access denied:', message.data.reason);
+        serverAssignedGameRef.current = null;
         setIsQueued(false);
         setIsJoiningGame(false);
         // TODO: Show error to user
@@ -254,6 +285,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     unsubscribers.push(
       onMessage('QueueLeft', () => {
         console.log('Received QueueLeft message from server, clearing queue state');
+        serverAssignedGameRef.current = null;
         setIsQueued(false);
         setIsJoiningGame(false);
       })
@@ -382,8 +414,13 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   }, [isConnected, isSessionAuthenticated, sendMessage]);
 
   const createSoloGame = useCallback(() => {
-    console.log('Sending CreateSoloGame message');
-    sendMessage('CreateSoloGame');
+    console.log('Queueing for a solo game');
+    serverAssignedGameRef.current = null;
+    setIsQueued(true);
+    setIsJoiningGame(false);
+    sendMessage({
+      QueueForMatch: { game_type: 'Solo', queue_mode: 'Quickmatch' }
+    });
   }, [sendMessage]);
 
   const queueForMatch = useCallback((gameType: GameType, queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
@@ -407,6 +444,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const leaveQueue = useCallback(() => {
     console.log('Sending LeaveQueue message');
     sendMessage('LeaveQueue');
+    serverAssignedGameRef.current = null;
     setIsQueued(false);
     setIsJoiningGame(false);
   }, [sendMessage]);
@@ -416,6 +454,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     sendMessage('LeaveGame');
     // Clear current game state
     requestedGameRef.current = null;
+    serverAssignedGameRef.current = null;
     updateGameSnapshotSynchronization(false);
     setLastGameEvent(null);
     updateAwaitingGameSnapshot(null);

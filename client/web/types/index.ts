@@ -234,8 +234,6 @@ export interface QueueForMatchMultiMessage {
   };
 }
 
-export type CreateSoloGameMessage = 'CreateSoloGame';
-
 export interface GameCommandMessage {
   GameCommand: GameCommand;
 }
@@ -251,7 +249,6 @@ export type WebSocketMessage =
   | GameLoadFailedMessage
   | QueueForMatchMessage
   | QueueForMatchMultiMessage
-  | CreateSoloGameMessage
   | GameCommandMessage
   | TokenMessage
   | string;
