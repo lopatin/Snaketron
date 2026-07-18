@@ -103,6 +103,10 @@ pub enum WSMessage {
     AccessDenied {
         reason: String,
     },
+    GameLoadFailed {
+        game_id: u32,
+        reason: String,
+    },
     // Solo game responses
     SoloGameCreated {
         game_id: u32,
@@ -490,6 +494,13 @@ async fn handle_websocket_connection(
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                     let was_in_lobby = matches!(&state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
+                                    // Keep the requested id so a denied switch does not look like a
+                                    // successful re-entry into the connection's previously authorized
+                                    // game. Successful JoinGame retries still restart subscriptions.
+                                    let requested_game_id = match &ws_message {
+                                        WSMessage::JoinGame(game_id) => Some(*game_id),
+                                        _ => None,
+                                    };
 
                                     match process_ws_message(
                                         state,
@@ -509,7 +520,16 @@ async fn handle_websocket_connection(
                                     ).await {
                                         Ok(new_state) => {
                                             // Check if we're entering a game or lobby
-                                            let entering_game = matches!(&new_state, ConnectionState::Authenticated { game_id: Some(_), .. }) && !was_in_game;
+                                            let entered_game_id = match &new_state {
+                                                ConnectionState::Authenticated { game_id, .. } => *game_id,
+                                                ConnectionState::Unauthenticated => None,
+                                            };
+                                            let entering_game = match requested_game_id {
+                                                Some(requested_game_id) => {
+                                                    entered_game_id == Some(requested_game_id)
+                                                }
+                                                None => entered_game_id.is_some() && !was_in_game,
+                                            };
                                             let entering_lobby = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. }) && !was_in_lobby;
                                             let leaving_lobby = was_in_lobby && !matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
                                             let leaving_game = was_in_game && !matches!(&new_state, ConnectionState::Authenticated { game_id: Some(_), .. });
@@ -1061,6 +1081,135 @@ async fn load_game_chat_history(
     Ok(messages)
 }
 
+fn game_state_records_user(game_state: &GameState, user_id: u32) -> bool {
+    game_state.players.contains_key(&user_id) || game_state.spectators.contains(&user_id)
+}
+
+/// Resolve and authorize a JoinGame request before it changes connection state.
+///
+/// Live games are authoritative in replication memory. Completed games may instead live in the
+/// short Redis reload cache or DynamoDB. Returning success means the requested user was present in
+/// the canonical state from one of those sources; callers may then enable game events and chat.
+async fn authorize_game_join(
+    game_id: u32,
+    user_id: u32,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    db: &Arc<dyn Database>,
+) -> std::result::Result<(), String> {
+    if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
+        if game_state_records_user(&game_state, user_id) {
+            return Ok(());
+        }
+
+        warn!(
+            "Denied live game {} join to user {}: user is not a recorded participant",
+            game_id, user_id
+        );
+        return Err("This game is unavailable".to_string());
+    }
+
+    match replication_manager.get_stored_snapshot(game_id).await {
+        Ok(Some(game_state)) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+            if game_state_records_user(&game_state, user_id) {
+                return Ok(());
+            }
+
+            warn!(
+                "Denied stored Redis game {} join to user {}: user is not a recorded participant",
+                game_id, user_id
+            );
+            return Err("This game is unavailable".to_string());
+        }
+        Ok(Some(cached_game_state)) => {
+            // GameCreated acknowledgement proves that the executor accepted the game, but the
+            // replica can consume its initial snapshot a moment later. A non-terminal Redis
+            // snapshot identifies that startup window, so wait briefly for the subscribable
+            // in-memory state before treating the request as a durable reload.
+            match replication_manager.wait_for_game(game_id, 1).await {
+                Ok(live_game_state)
+                    if live_game_state.start_ms == cached_game_state.start_ms
+                        && live_game_state.event_sequence >= cached_game_state.event_sequence =>
+                {
+                    if game_state_records_user(&live_game_state, user_id) {
+                        return Ok(());
+                    }
+
+                    warn!(
+                        "Denied newly replicated game {} join to user {}: user is not a recorded participant",
+                        game_id, user_id
+                    );
+                    return Err("This game is unavailable".to_string());
+                }
+                Ok(live_game_state) => {
+                    warn!(
+                        "Refusing game {} join because cached and replicated runtime identities differ (cached start {}, sequence {}; live start {}, sequence {})",
+                        game_id,
+                        cached_game_state.start_ms,
+                        cached_game_state.event_sequence,
+                        live_game_state.start_ms,
+                        live_game_state.event_sequence
+                    );
+                    return Err("This game is unavailable".to_string());
+                }
+                Err(e) => {
+                    debug!(
+                        "Live game {} did not reach replication during the bounded authorization wait; checking durable storage: {}",
+                        game_id, e
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "Failed to load stored Redis snapshot while authorizing game {}: {}",
+                game_id, e
+            );
+        }
+    }
+
+    let database_game_id =
+        i32::try_from(game_id).map_err(|_| "This game was not found or has expired".to_string())?;
+    let game = db.get_game_by_id(database_game_id).await.map_err(|e| {
+        error!(
+            "Failed to fetch game {} while authorizing user {}: {}",
+            game_id, user_id, e
+        );
+        "The game could not be loaded right now".to_string()
+    })?;
+    let Some(game) = game else {
+        return Err("This game was not found or has expired".to_string());
+    };
+    let Some(game_state_json) = game.game_state else {
+        return Err("The saved game data is unavailable".to_string());
+    };
+    let game_state = serde_json::from_value::<GameState>(game_state_json).map_err(|e| {
+        error!(
+            "Failed to deserialize game {} while authorizing user {}: {}",
+            game_id, user_id, e
+        );
+        "The saved game data could not be loaded".to_string()
+    })?;
+
+    if !matches!(game_state.status, GameStatus::Complete { .. }) {
+        warn!(
+            "Refusing database-only non-complete game {} join for user {}",
+            game_id, user_id
+        );
+        return Err("The saved game data is unavailable".to_string());
+    }
+
+    if !game_state_records_user(&game_state, user_id) {
+        warn!(
+            "Denied database game {} join to user {}: user is not a recorded participant",
+            game_id, user_id
+        );
+        return Err("This game is unavailable".to_string());
+    }
+
+    Ok(())
+}
+
 // Helper function to subscribe to game events
 async fn subscribe_to_game_events(
     game_id: u32,
@@ -1077,57 +1226,124 @@ async fn subscribe_to_game_events(
     let (game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
         Ok(result) => result,
         Err(e) => {
-            // If failed to get from memory, try to get from database
+            // Durably completed games are eventually evicted from replication memory. Their
+            // final snapshot remains in Redis briefly, so check that grace-period cache before
+            // the durable database fallback.
             info!(
-                "Failed to subscribe to game {} from memory, checking database: {}",
+                "Failed to subscribe to game {} from memory, checking stored snapshot: {}",
                 game_id, e
             );
 
-            match db.get_game_by_id(game_id as i32).await {
+            match replication_manager.get_stored_snapshot(game_id).await {
+                Ok(Some(game_state))
+                    if matches!(game_state.status, GameStatus::Complete { .. }) =>
+                {
+                    send_completed_game_snapshot(
+                        &ws_tx,
+                        game_id,
+                        user_id,
+                        &game_state,
+                        "stored Redis snapshot",
+                    )
+                    .await;
+                    return;
+                }
+                Ok(Some(_)) => {
+                    // During a rolling deploy or a failed terminal cache write, Redis can still
+                    // contain the preceding active snapshot. Prefer the durable completed record
+                    // instead of stranding the client on a stale, non-terminal frame with no live
+                    // subscription.
+                    debug!(
+                        "Ignoring non-complete stored Redis snapshot for game {}, checking database",
+                        game_id
+                    );
+                }
+                Ok(None) => {
+                    debug!("No stored Redis snapshot found for game {}", game_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load stored Redis snapshot for game {}, checking database: {}",
+                        game_id, e
+                    );
+                }
+            }
+
+            let Ok(database_game_id) = i32::try_from(game_id) else {
+                warn!("Game ID {} is outside the durable database range", game_id);
+                send_game_load_failed(&ws_tx, game_id, "This game was not found or has expired")
+                    .await;
+                return;
+            };
+
+            match db.get_game_by_id(database_game_id).await {
                 Ok(Some(game)) => {
                     if let Some(game_state_json) = game.game_state {
                         match serde_json::from_value::<GameState>(game_state_json) {
                             Ok(game_state) => {
-                                info!("Loaded game {} state from database", game_id);
-                                // Send the loaded state as an initial snapshot
-                                let snapshot_event = GameEventMessage {
-                                    game_id: game_id,
-                                    tick: game_state.tick,
-                                    sequence: 0,
-                                    user_id: Some(user_id),
-                                    event: GameEvent::Snapshot {
-                                        game_state: game_state.clone(),
-                                    },
-                                };
-                                let json =
-                                    serde_json::to_string(&WSMessage::GameEvent(snapshot_event))
-                                        .unwrap();
-                                let _ = ws_tx.send(Message::Text(json.into())).await;
+                                send_completed_game_snapshot(
+                                    &ws_tx,
+                                    game_id,
+                                    user_id,
+                                    &game_state,
+                                    "database snapshot",
+                                )
+                                .await;
 
                                 // Return early - we can't subscribe to future events without memory state
                                 return;
                             }
                             Err(e) => {
                                 error!("Failed to deserialize game state from database: {}", e);
+                                send_game_load_failed(
+                                    &ws_tx,
+                                    game_id,
+                                    "The saved game data could not be loaded",
+                                )
+                                .await;
                                 return;
                             }
                         }
                     } else {
                         error!("Game {} found in database but has no game_state", game_id);
+                        send_game_load_failed(
+                            &ws_tx,
+                            game_id,
+                            "The saved game data is unavailable",
+                        )
+                        .await;
                         return;
                     }
                 }
                 Ok(None) => {
                     error!("Game {} not found in database", game_id);
+                    send_game_load_failed(
+                        &ws_tx,
+                        game_id,
+                        "This game was not found or has expired",
+                    )
+                    .await;
                     return;
                 }
                 Err(e) => {
                     error!("Failed to fetch game {} from database: {}", game_id, e);
+                    send_game_load_failed(
+                        &ws_tx,
+                        game_id,
+                        "The game could not be loaded right now",
+                    )
+                    .await;
                     return;
                 }
             }
         }
     };
+
+    if matches!(game_state.status, GameStatus::Complete { .. }) {
+        send_completed_game_snapshot(&ws_tx, game_id, user_id, &game_state, "replication cache")
+            .await;
+        return;
+    }
 
     // Send the snapshot
     let snapshot_event = GameEventMessage {
@@ -1218,6 +1434,96 @@ async fn subscribe_to_game_events(
                     break;
                 }
             }
+        }
+    }
+}
+
+async fn send_game_snapshot(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    game_state: &GameState,
+) -> Result<()> {
+    let snapshot_event = GameEventMessage {
+        game_id,
+        tick: game_state.tick,
+        sequence: game_state.event_sequence,
+        user_id: Some(user_id),
+        event: GameEvent::Snapshot {
+            game_state: game_state.clone(),
+        },
+    };
+    let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event))?;
+    ws_tx
+        .send(Message::Text(json.into()))
+        .await
+        .context("WebSocket channel closed while sending game snapshot")
+}
+
+async fn send_completed_game_snapshot(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    game_state: &GameState,
+    source: &str,
+) {
+    if !matches!(game_state.status, GameStatus::Complete { .. }) {
+        error!(
+            "Refusing to send non-complete {} for game {} to user {}",
+            source, game_id, user_id
+        );
+        send_game_load_failed(ws_tx, game_id, "The saved game data is unavailable").await;
+        return;
+    }
+
+    // Completed snapshots can include the full player and arena state. Only users recorded
+    // as participants in the canonical GameState may reload them; guessed IDs do not grant
+    // access once the live subscription is gone.
+    if !game_state_records_user(game_state, user_id) {
+        warn!(
+            "Denied {} reload for game {} to user {}: user is not a recorded participant",
+            source, game_id, user_id
+        );
+        send_game_load_failed(ws_tx, game_id, "This game is unavailable").await;
+        return;
+    }
+
+    info!(
+        "Loaded game {} state from {} for user {}",
+        game_id, source, user_id
+    );
+    if let Err(e) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
+        error!(
+            "Failed to send {} for game {} to user {}: {}",
+            source, game_id, user_id, e
+        );
+    }
+}
+
+async fn send_game_load_failed(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    reason: impl Into<String>,
+) {
+    let response = WSMessage::GameLoadFailed {
+        game_id,
+        reason: reason.into(),
+    };
+
+    match serde_json::to_string(&response) {
+        Ok(json) => {
+            if let Err(e) = ws_tx.send(Message::Text(json.into())).await {
+                debug!(
+                    "WebSocket channel closed while reporting load failure for game {}: {}",
+                    game_id, e
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to serialize load failure response for game {}: {}",
+                game_id, e
+            );
         }
     }
 }
@@ -1911,16 +2217,47 @@ async fn process_ws_message(
                         }
                     }
                 }
-                WSMessage::JoinGame(game_id) => {
+                WSMessage::JoinGame(requested_game_id) => {
                     info!(
                         "User {} ({}) joining game {}",
-                        metadata.username, metadata.user_id, game_id
+                        metadata.username, metadata.user_id, requested_game_id
                     );
+
+                    let user_id = match u32::try_from(metadata.user_id) {
+                        Ok(user_id) => user_id,
+                        Err(_) => {
+                            send_game_load_failed(
+                                ws_tx,
+                                requested_game_id,
+                                "This game is unavailable",
+                            )
+                            .await;
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id: None,
+                                websocket_id,
+                            });
+                        }
+                    };
+
+                    if let Err(reason) =
+                        authorize_game_join(requested_game_id, user_id, replication_manager, db)
+                            .await
+                    {
+                        send_game_load_failed(ws_tx, requested_game_id, reason).await;
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id: None,
+                            websocket_id,
+                        });
+                    }
 
                     Ok(ConnectionState::Authenticated {
                         metadata,
                         lobby_handle: lobby,
-                        game_id: Some(game_id),
+                        game_id: Some(requested_game_id),
                         websocket_id,
                     })
                 }

@@ -1,8 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, GameType, GameCommand, Command, CustomGameSettings } from '../types';
+import { GameState, GameType, GameCommand, Command, CustomGameSettings, GameLoadFailure } from '../types';
 import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
+import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 
 interface UseGameWebSocketReturn {
   isConnected: boolean;
@@ -10,6 +11,9 @@ interface UseGameWebSocketReturn {
   customGameCode: string | null;
   isHost: boolean;
   lastGameEvent: any | null;
+  gameLoadFailure: GameLoadFailure | null;
+  awaitingGameSnapshotForId: string | null;
+  isGameSnapshotSynchronized: boolean;
   isQueued: boolean;
   isJoiningGame: boolean;
   createCustomGame: (settings: Partial<CustomGameSettings>) => void;
@@ -19,7 +23,8 @@ interface UseGameWebSocketReturn {
   queueForMatchMulti: (gameTypes: GameType[], queueMode?: 'Quickmatch' | 'Competitive') => void;
   leaveQueue: () => void;
   joinCustomGame: (gameCode: string) => void;
-  joinGame: (gameId: string, gameCode?: string | null) => void;
+  joinGame: (gameId: string, gameCode?: string | null) => boolean;
+  acknowledgeGameSnapshot: (gameId: number) => void;
   leaveGame: () => void;
   updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
   startCustomGame: () => void;
@@ -29,14 +34,30 @@ interface UseGameWebSocketReturn {
 }
 
 export const useGameWebSocket = (): UseGameWebSocketReturn => {
-  const { isConnected, sendMessage, onMessage } = useWebSocket();
+  const { isConnected, isSessionAuthenticated, sendMessage, onMessage } = useWebSocket();
   const navigate = useNavigate();
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [customGameCode, setCustomGameCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [lastGameEvent, setLastGameEvent] = useState<any | null>(null);
+  const [gameLoadFailure, setGameLoadFailure] = useState<GameLoadFailure | null>(null);
+  const [awaitingGameSnapshotForId, setAwaitingGameSnapshotForId] = useState<string | null>(null);
+  const [isGameSnapshotSynchronized, setIsGameSnapshotSynchronized] = useState(false);
   const [isQueued, setIsQueued] = useState(false);
   const [isJoiningGame, setIsJoiningGame] = useState(false);
+  const requestedGameRef = useRef<{ routeGameId: string; gameId: number } | null>(null);
+  const awaitingGameSnapshotRef = useRef<string | null>(null);
+  const isGameSnapshotSynchronizedRef = useRef(false);
+
+  const updateAwaitingGameSnapshot = useCallback((routeGameId: string | null) => {
+    awaitingGameSnapshotRef.current = routeGameId;
+    setAwaitingGameSnapshotForId(routeGameId);
+  }, []);
+
+  const updateGameSnapshotSynchronization = useCallback((isSynchronized: boolean) => {
+    isGameSnapshotSynchronizedRef.current = isSynchronized;
+    setIsGameSnapshotSynchronized(isSynchronized);
+  }, []);
 
   // Handle game-specific messages
   useEffect(() => {
@@ -56,15 +77,26 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           console.error('Invalid GameEvent message structure:', message);
           return;
         }
+
+        const eventGameId = parseU32GameId(eventMessage.game_id);
+        const requestedGame = requestedGameRef.current;
+
+        if (
+          !requestedGame ||
+          eventGameId === null ||
+          eventGameId !== requestedGame.gameId
+        ) {
+          console.warn(
+            'Ignoring GameEvent for a game other than the active request:',
+            eventGameId,
+            'requested:',
+            requestedGame?.gameId ?? null
+          );
+          return;
+        }
         
         // Store the full event message (including tick) for the game engine to process
         setLastGameEvent(eventMessage);
-        
-        // Also extract just the event for local state updates
-        const event = eventMessage.event || eventMessage;
-        if (event && typeof event === 'object' && 'Snapshot' in event) {
-          setIsJoiningGame(false);
-        }
         
         // Handle different event types
         // if (event.Snapshot) {
@@ -114,6 +146,45 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         //   // Other events
         //   console.log('Unhandled game event:', event);
         // }
+      })
+    );
+
+    // A game may have existed but no longer have a loadable live or persisted snapshot.
+    unsubscribers.push(
+      onMessage('GameLoadFailed', (message: any) => {
+        const payload = message?.data ?? message?.GameLoadFailed ?? message;
+        const gameId = parseU32GameId(payload?.game_id);
+
+        if (gameId === null) {
+          console.error('Invalid GameLoadFailed message:', message);
+          return;
+        }
+
+        const requestedGame = requestedGameRef.current;
+        if (!requestedGame || requestedGame.gameId !== gameId) {
+          console.warn(
+            'Ignoring GameLoadFailed for a game other than the active request:',
+            gameId,
+            'requested:',
+            requestedGame?.gameId ?? null
+          );
+          return;
+        }
+
+        const reason =
+          typeof payload?.reason === 'string' && payload.reason.trim()
+            ? payload.reason.trim()
+            : 'This game is no longer available. It may have expired or been removed.';
+
+        console.warn(`Failed to load game ${gameId}: ${reason}`);
+        updateGameSnapshotSynchronization(false);
+        setIsJoiningGame(false);
+        updateAwaitingGameSnapshot(null);
+        setGameLoadFailure({
+          gameId,
+          requestedGameId: requestedGame.routeGameId,
+          reason,
+        });
       })
     );
 
@@ -193,7 +264,27 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       console.log('Cleaning up game WebSocket listeners (initial state issue)');
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [onMessage, navigate, sendMessage]);
+  }, [
+    onMessage,
+    navigate,
+    sendMessage,
+    updateAwaitingGameSnapshot,
+    updateGameSnapshotSynchronization,
+  ]);
+
+  useEffect(() => {
+    const requestedGame = requestedGameRef.current;
+    if (requestedGame && (!isConnected || !isSessionAuthenticated)) {
+      updateGameSnapshotSynchronization(false);
+      updateAwaitingGameSnapshot(requestedGame.routeGameId);
+      setIsJoiningGame(true);
+    }
+  }, [
+    isConnected,
+    isSessionAuthenticated,
+    updateAwaitingGameSnapshot,
+    updateGameSnapshotSynchronization,
+  ]);
 
   // Game actions
   const createCustomGame = useCallback((settings: Partial<CustomGameSettings>) => {
@@ -209,11 +300,53 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   }, [sendMessage]);
 
   const joinGame = useCallback((gameId: string, gameCode?: string | null) => {
+    const parsedGameId = parseU32GameId(gameId);
+
+    if (parsedGameId === null) {
+      requestedGameRef.current = null;
+      updateGameSnapshotSynchronization(false);
+      setLastGameEvent(null);
+      updateAwaitingGameSnapshot(null);
+      setIsJoiningGame(false);
+      setGameLoadFailure({
+        gameId: null,
+        requestedGameId: gameId,
+        reason: INVALID_GAME_ID_REASON,
+      });
+      return false;
+    }
+
+    requestedGameRef.current = {
+      routeGameId: gameId,
+      gameId: parsedGameId,
+    };
+    updateGameSnapshotSynchronization(false);
+    setCurrentGameId(parsedGameId.toString());
+    setLastGameEvent(null);
+    setGameLoadFailure(null);
+    updateAwaitingGameSnapshot(gameId);
     setIsJoiningGame(true);
     sendMessage({
-      JoinGame: parseInt(gameId)
+      JoinGame: parsedGameId
     });
-  }, [sendMessage]);
+    return true;
+  }, [
+    sendMessage,
+    updateAwaitingGameSnapshot,
+    updateGameSnapshotSynchronization,
+  ]);
+
+  const acknowledgeGameSnapshot = useCallback((gameId: number) => {
+    const requestedGame = requestedGameRef.current;
+    if (!requestedGame || requestedGame.gameId !== gameId) {
+      return;
+    }
+
+    updateGameSnapshotSynchronization(true);
+    updateAwaitingGameSnapshot(null);
+    setGameLoadFailure(null);
+    setIsJoiningGame(false);
+  }, [updateAwaitingGameSnapshot, updateGameSnapshotSynchronization]);
 
   const updateCustomGameSettings = useCallback((settings: Partial<CustomGameSettings>) => {
     sendMessage({
@@ -232,11 +365,21 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   }, [sendMessage]);
 
   const sendGameCommand = useCallback((command: GameCommand) => {
+    if (
+      !isConnected ||
+      !isSessionAuthenticated ||
+      awaitingGameSnapshotRef.current !== null ||
+      !isGameSnapshotSynchronizedRef.current
+    ) {
+      console.warn('Ignoring game command while the game connection is not synchronized');
+      return;
+    }
+
     console.log('Sending game command (sendGameCommand):', command);
     sendMessage({
       GameCommand: command
     });
-  }, [sendMessage]);
+  }, [isConnected, isSessionAuthenticated, sendMessage]);
 
   const createSoloGame = useCallback(() => {
     console.log('Sending CreateSoloGame message');
@@ -272,12 +415,21 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     console.log('Sending LeaveGame message (initial state issue):');
     sendMessage('LeaveGame');
     // Clear current game state
+    requestedGameRef.current = null;
+    updateGameSnapshotSynchronization(false);
+    setLastGameEvent(null);
+    updateAwaitingGameSnapshot(null);
     setCurrentGameId(null);
     setIsHost(false);
     setCustomGameCode(null);
+    setGameLoadFailure(null);
     setIsQueued(false);
     setIsJoiningGame(false);
-  }, [sendMessage]);
+  }, [
+    sendMessage,
+    updateAwaitingGameSnapshot,
+    updateGameSnapshotSynchronization,
+  ]);
 
   // Create a quick match or competitive game
   const createGame = useCallback((gameType: string) => {
@@ -305,6 +457,9 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     customGameCode,
     isHost,
     lastGameEvent,
+    gameLoadFailure,
+    awaitingGameSnapshotForId,
+    isGameSnapshotSynchronized,
     isQueued,
     isJoiningGame,
     createCustomGame,
@@ -315,6 +470,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     leaveQueue,
     joinCustomGame,
     joinGame,
+    acknowledgeGameSnapshot,
     leaveGame,
     updateCustomGameSettings,
     startCustomGame,

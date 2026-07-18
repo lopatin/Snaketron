@@ -1,24 +1,33 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndexAction,
     GlobalSecondaryIndex, GlobalSecondaryIndexUpdate, KeySchemaElement, KeyType, Projection,
-    ProjectionType, ReturnValue, ScalarAttributeType,
+    ProjectionType, ReturnValue, ScalarAttributeType, TableStatus, TimeToLiveSpecification,
+    TimeToLiveStatus,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use super::Database;
 use super::models::*;
+use super::{DURABLE_GAME_ID_FLOOR, Database};
 use crate::season::Season;
 
 pub struct DynamoDatabase {
     client: Client,
     table_prefix: String,
 }
+
+const COMPLETED_GAME_RETENTION_DAYS_ENV: &str = "SNAKETRON_COMPLETED_GAME_RETENTION_DAYS";
+const DEFAULT_COMPLETED_GAME_RETENTION_DAYS: i64 = 30;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
+const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 impl DynamoDatabase {
     pub async fn new() -> Result<Self> {
@@ -81,7 +90,232 @@ impl DynamoDatabase {
         // Create high scores table (for solo mode leaderboards)
         self.create_high_scores_table_if_not_exists().await?;
 
+        // Do this after all table creation calls so a newly created main table
+        // has time to become active. This is also run for pre-existing tables.
+        self.ensure_main_table_ttl_enabled().await?;
+
         Ok(())
+    }
+
+    async fn wait_for_table_active(&self, table_name: &str) -> Result<()> {
+        let mut last_observation = "table status was not returned".to_string();
+
+        for attempt in 1..=DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS {
+            match self
+                .client
+                .describe_table()
+                .table_name(table_name)
+                .send()
+                .await
+            {
+                Ok(response) => match response.table().and_then(|table| table.table_status()) {
+                    Some(TableStatus::Active) => return Ok(()),
+                    Some(status)
+                        if matches!(status, TableStatus::Creating | TableStatus::Updating) =>
+                    {
+                        last_observation = format!("table status was {}", status.as_str());
+                    }
+                    Some(status) => {
+                        return Err(anyhow!(
+                            "Cannot configure TTL for DynamoDB table {} while its status is {}",
+                            table_name,
+                            status.as_str()
+                        ));
+                    }
+                    None => {
+                        last_observation = "table status was not returned".to_string();
+                    }
+                },
+                Err(error)
+                    if error
+                        .as_service_error()
+                        .is_some_and(|error| error.is_resource_not_found_exception()) =>
+                {
+                    // DescribeTable can briefly return ResourceNotFound immediately after
+                    // CreateTable even though the create request succeeded.
+                    last_observation = "table was not yet visible".to_string();
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to verify DynamoDB table {} status", table_name)
+                    });
+                }
+            }
+
+            if attempt < DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS {
+                sleep(DYNAMODB_CONTROL_PLANE_RETRY_DELAY).await;
+            }
+        }
+
+        Err(anyhow!(
+            "DynamoDB table {} did not become ACTIVE after {} attempts; last observation: {}",
+            table_name,
+            DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS,
+            last_observation
+        ))
+    }
+
+    async fn ensure_main_table_ttl_enabled(&self) -> Result<()> {
+        let table_name = self.main_table();
+        self.wait_for_table_active(&table_name).await?;
+
+        let mut update_requested = false;
+        let mut last_observation = "TTL status was not returned".to_string();
+        let mut last_update_error = None;
+
+        for attempt in 1..=DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS {
+            let ttl_description = match self
+                .client
+                .describe_time_to_live()
+                .table_name(&table_name)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error)
+                    if error
+                        .as_service_error()
+                        .is_some_and(|error| error.is_resource_not_found_exception()) =>
+                {
+                    last_observation = "table was not yet visible to the TTL API".to_string();
+                    if attempt < DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS {
+                        sleep(DYNAMODB_CONTROL_PLANE_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to describe TTL configuration for DynamoDB table {}",
+                            table_name
+                        )
+                    });
+                }
+            };
+
+            let description = ttl_description.time_to_live_description();
+            let status = description.and_then(|description| description.time_to_live_status());
+            let attribute_name = description.and_then(|description| description.attribute_name());
+
+            match status {
+                Some(status)
+                    if matches!(
+                        status,
+                        TimeToLiveStatus::Enabled | TimeToLiveStatus::Enabling
+                    ) =>
+                {
+                    if attribute_name != Some("ttl") {
+                        return Err(anyhow!(
+                            "DynamoDB table {} has TTL status {} on attribute {:?}; expected attribute 'ttl'",
+                            table_name,
+                            status.as_str(),
+                            attribute_name
+                        ));
+                    }
+
+                    if update_requested {
+                        info!(
+                            "Verified TTL on attribute 'ttl' is {} for table {}",
+                            status.as_str(),
+                            table_name
+                        );
+                    } else {
+                        debug!(
+                            "TTL on attribute 'ttl' is already {} for table {}",
+                            status.as_str(),
+                            table_name
+                        );
+                    }
+                    return Ok(());
+                }
+                Some(TimeToLiveStatus::Disabled) if !update_requested => {
+                    last_observation = "TTL status was DISABLED".to_string();
+                    let specification = TimeToLiveSpecification::builder()
+                        .attribute_name("ttl")
+                        .enabled(true)
+                        .build()
+                        .context("Failed to build main table TTL specification")?;
+
+                    match self
+                        .client
+                        .update_time_to_live()
+                        .table_name(&table_name)
+                        .time_to_live_specification(specification)
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {
+                            update_requested = true;
+                            info!(
+                                "Requested TTL on attribute 'ttl' for table {}; verifying status",
+                                table_name
+                            );
+                        }
+                        Err(error) => {
+                            let service_error = error.as_service_error();
+                            let resource_is_transitioning = service_error.is_some_and(|error| {
+                                error.is_resource_in_use_exception()
+                                    || error.is_resource_not_found_exception()
+                            });
+                            let validation_requires_verification = service_error
+                                .is_some_and(|error| error.code() == Some("ValidationException"));
+
+                            if validation_requires_verification {
+                                // UpdateTimeToLive is not idempotent. A concurrent or recent
+                                // request can return ValidationException, so only a subsequent
+                                // exact DescribeTimeToLive result is allowed to prove success.
+                                update_requested = true;
+                                last_update_error = Some(error.to_string());
+                                warn!(
+                                    "TTL update for table {} returned ValidationException; verifying the actual TTL status",
+                                    table_name
+                                );
+                            } else if resource_is_transitioning {
+                                last_update_error = Some(error.to_string());
+                                warn!(
+                                    "DynamoDB table {} changed while enabling TTL; retrying after status verification",
+                                    table_name
+                                );
+                            } else {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "Failed to enable TTL for DynamoDB table {}",
+                                        table_name
+                                    )
+                                });
+                            }
+                        }
+                    }
+                }
+                Some(TimeToLiveStatus::Disabled) => {
+                    last_observation = "TTL remained DISABLED after the update request".to_string();
+                }
+                Some(TimeToLiveStatus::Disabling) => {
+                    last_observation = "TTL status was DISABLING".to_string();
+                }
+                Some(status) => {
+                    last_observation = format!("TTL status was {}", status.as_str());
+                }
+                None => {
+                    last_observation = "TTL status was not returned".to_string();
+                }
+            }
+
+            if attempt < DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS {
+                sleep(DYNAMODB_CONTROL_PLANE_RETRY_DELAY).await;
+            }
+        }
+
+        let update_error = last_update_error
+            .map(|error| format!("; last update error: {error}"))
+            .unwrap_or_default();
+        Err(anyhow!(
+            "Could not verify TTL status ENABLING or ENABLED on attribute 'ttl' for DynamoDB table {} after {} attempts; last observation: {}{}",
+            table_name,
+            DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS,
+            last_observation,
+            update_error
+        ))
     }
 
     async fn create_main_table_if_not_exists(&self) -> Result<()> {
@@ -322,8 +556,11 @@ impl DynamoDatabase {
             .table_name(self.main_table())
             .key("pk", Self::av_s("COUNTER"))
             .key("sk", Self::av_s(entity_type))
-            .update_expression("ADD #counter :increment")
+            .update_expression(
+                "SET #counter = if_not_exists(#counter, :initial_value) + :increment",
+            )
             .expression_attribute_names("#counter", "counter")
+            .expression_attribute_values(":initial_value", Self::av_n(999))
             .expression_attribute_values(":increment", Self::av_n(1))
             .return_values(ReturnValue::AllNew)
             .send()
@@ -336,28 +573,8 @@ impl DynamoDatabase {
             .and_then(|attrs| Self::extract_number(&attrs, "counter"))
             .ok_or_else(|| anyhow!("Failed to extract counter value"))?;
 
-        // If this is the first time (counter was 1), initialize it to 1000
-        // This ensures we start at 1000 like the old in-memory counter
-        let final_id = if counter == 1 {
-            // Set counter to 1000
-            self.client
-                .update_item()
-                .table_name(self.main_table())
-                .key("pk", Self::av_s("COUNTER"))
-                .key("sk", Self::av_s(entity_type))
-                .update_expression("SET #counter = :init_value")
-                .expression_attribute_names("#counter", "counter")
-                .expression_attribute_values(":init_value", Self::av_n(1000))
-                .send()
-                .await
-                .context(format!("Failed to initialize counter for {}", entity_type))?;
-            1000
-        } else {
-            counter
-        };
-
-        debug!("Generated ID {} for entity type {}", final_id, entity_type);
-        Ok(final_id)
+        debug!("Generated ID {} for entity type {}", counter, entity_type);
+        Ok(counter)
     }
 
     fn av_s(s: impl Into<String>) -> AttributeValue {
@@ -402,18 +619,188 @@ impl DynamoDatabase {
             .and_then(|s| s.parse::<i32>().ok())
     }
 
+    fn extract_i64(item: &HashMap<String, AttributeValue>, key: &str) -> Option<i64> {
+        if let Some(value) = item
+            .get(key)
+            .and_then(|value| value.as_n().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            return Some(value);
+        }
+
+        item.get(key)
+            .and_then(|value| value.as_s().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+    }
+
     fn extract_bool(item: &HashMap<String, AttributeValue>, key: &str) -> Option<bool> {
         item.get(key).and_then(|v| v.as_bool().ok()).copied()
     }
 
-    fn extract_datetime(
+    fn extract_optional_datetime(
         item: &HashMap<String, AttributeValue>,
         key: &str,
-    ) -> Result<DateTime<Utc>> {
-        Self::extract_string(item, key)
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok_or_else(|| anyhow!("Missing or invalid datetime for key: {}", key))
+    ) -> Result<Option<DateTime<Utc>>> {
+        let Some(value) = Self::extract_string(item, key) else {
+            return Ok(None);
+        };
+
+        DateTime::parse_from_rfc3339(&value)
+            .map(|datetime| Some(datetime.with_timezone(&Utc)))
+            .with_context(|| format!("Invalid datetime for key: {}", key))
+    }
+
+    fn game_from_item(game_id: i32, item: &HashMap<String, AttributeValue>) -> Result<Game> {
+        let created_at =
+            Self::extract_optional_datetime(item, "createdAt")?.unwrap_or_else(Utc::now);
+        let last_activity =
+            Self::extract_optional_datetime(item, "lastActivity")?.unwrap_or(created_at);
+
+        Ok(Game {
+            id: game_id,
+            server_id: Self::extract_number(item, "serverId"),
+            game_type: Self::extract_string(item, "gameType")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(json!({})),
+            game_state: Self::extract_string(item, "gameState")
+                .and_then(|value| serde_json::from_str(&value).ok()),
+            status: Self::extract_string(item, "status").unwrap_or_else(|| "waiting".to_string()),
+            ended_at: Self::extract_optional_datetime(item, "endedAt")?,
+            last_activity,
+            created_at,
+            game_mode: Self::extract_string(item, "gameMode")
+                .unwrap_or_else(|| "matchmaking".to_string()),
+            is_private: Self::extract_bool(item, "isPrivate").unwrap_or(false),
+            game_code: Self::extract_string(item, "gameCode"),
+        })
+    }
+
+    fn completed_game_retention_days(configured_value: Option<&str>) -> i64 {
+        configured_value
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|days| *days > 0)
+            .unwrap_or(DEFAULT_COMPLETED_GAME_RETENTION_DAYS)
+    }
+
+    fn item_is_expired(item: &HashMap<String, AttributeValue>, now_epoch_seconds: i64) -> bool {
+        Self::extract_i64(item, "ttl").is_some_and(|ttl| ttl <= now_epoch_seconds)
+    }
+
+    fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
+        format!("{}:{}", game_id, game_state.start_ms)
+    }
+
+    async fn game_item_exists(&self, game_id: i32) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", game_id)))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("pk")
+            .send()
+            .await
+            .context("Failed to check whether a durable game ID is already in use")?;
+
+        Ok(response.item.is_some())
+    }
+
+    async fn ensure_durable_game_id_floor(&self) -> Result<()> {
+        let floor_predecessor = DURABLE_GAME_ID_FLOOR - 1;
+        let result = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s("COUNTER"))
+            .key("sk", Self::av_s("GAME"))
+            .update_expression("SET #counter = :floor_predecessor")
+            .condition_expression("attribute_not_exists(#counter) OR #counter < :floor_predecessor")
+            .expression_attribute_names("#counter", "counter")
+            .expression_attribute_values(":floor_predecessor", Self::av_n(floor_predecessor))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_conditional_check_failed_exception()) =>
+            {
+                // The counter is already inside the durable namespace (or another allocator
+                // moved it there concurrently).
+                Ok(())
+            }
+            Err(error) => Err(error).context("Failed to reserve the durable game ID namespace"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_game_retention_uses_configured_positive_days() {
+        assert_eq!(
+            DynamoDatabase::completed_game_retention_days(Some("45")),
+            45
+        );
+    }
+
+    #[test]
+    fn completed_game_retention_rejects_invalid_or_non_positive_values() {
+        for value in [None, Some(""), Some("invalid"), Some("0"), Some("-1")] {
+            assert_eq!(
+                DynamoDatabase::completed_game_retention_days(value),
+                DEFAULT_COMPLETED_GAME_RETENTION_DAYS
+            );
+        }
+    }
+
+    #[test]
+    fn game_from_item_reads_persisted_timestamps() {
+        let created_at = "2026-07-17T10:00:00+00:00";
+        let last_activity = "2026-07-17T10:05:00+00:00";
+        let ended_at = "2026-07-17T10:06:00+00:00";
+        let mut item = HashMap::new();
+        item.insert("createdAt".to_string(), DynamoDatabase::av_s(created_at));
+        item.insert(
+            "lastActivity".to_string(),
+            DynamoDatabase::av_s(last_activity),
+        );
+        item.insert("endedAt".to_string(), DynamoDatabase::av_s(ended_at));
+        item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        item.insert(
+            "gameState".to_string(),
+            DynamoDatabase::av_s(r#"{"tick":42}"#),
+        );
+
+        let game = DynamoDatabase::game_from_item(123, &item).unwrap();
+
+        assert_eq!(game.created_at.to_rfc3339(), created_at);
+        assert_eq!(game.last_activity.to_rfc3339(), last_activity);
+        assert_eq!(
+            game.ended_at.map(|value| value.to_rfc3339()).as_deref(),
+            Some(ended_at)
+        );
+        assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
+    }
+
+    #[test]
+    fn item_expiration_supports_dynamo_numbers_and_legacy_strings() {
+        let mut numeric_item = HashMap::new();
+        numeric_item.insert("ttl".to_string(), DynamoDatabase::av_n(100));
+        assert!(DynamoDatabase::item_is_expired(&numeric_item, 100));
+        assert!(!DynamoDatabase::item_is_expired(&numeric_item, 99));
+
+        let mut string_item = HashMap::new();
+        string_item.insert("ttl".to_string(), DynamoDatabase::av_s("100"));
+        assert!(DynamoDatabase::item_is_expired(&string_item, 101));
+
+        let item_without_ttl = HashMap::new();
+        assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
     }
 }
 
@@ -937,6 +1324,30 @@ impl Database for DynamoDatabase {
     }
 
     // Game operations
+    async fn allocate_game_id(&self) -> Result<i32> {
+        // Legacy nodes continue allocating below DURABLE_GAME_ID_FLOOR from Redis while new
+        // nodes allocate exclusively from this DynamoDB epoch. The disjoint namespaces remain
+        // safe even if Redis is lost during a rolling deployment.
+        self.ensure_durable_game_id_floor().await?;
+
+        // Skip physically retained rows as an additional guard for restored/imported tables.
+        for _ in 0..1024 {
+            let candidate = self.generate_id_for_entity("GAME").await?;
+            if !self.game_item_exists(candidate).await? {
+                return Ok(candidate);
+            }
+
+            warn!(
+                "Skipping durable game ID {} because a retained game already uses it",
+                candidate
+            );
+        }
+
+        Err(anyhow!(
+            "Failed to allocate a free durable game ID after 1024 attempts"
+        ))
+    }
+
     async fn create_game(
         &self,
         server_id: i32,
@@ -945,7 +1356,7 @@ impl Database for DynamoDatabase {
         is_private: bool,
         game_code: Option<&str>,
     ) -> Result<i32> {
-        let game_id = self.generate_id_for_entity("GAME").await?;
+        let game_id = self.allocate_game_id().await?;
         let now = Utc::now();
 
         // If game code provided, register it first
@@ -1007,32 +1418,23 @@ impl Database for DynamoDatabase {
             .table_name(self.main_table())
             .key("pk", Self::av_s(format!("GAME#{}", game_id)))
             .key("sk", Self::av_s("META"))
+            // Completion persistence races with immediate refreshes. A strongly consistent
+            // read guarantees that once the upsert succeeds, reload cannot observe older
+            // metadata without gameState.
+            .consistent_read(true)
             .send()
             .await
             .context("Failed to get game")?;
 
         match response.item {
-            Some(item) => {
-                let game = Game {
-                    id: game_id,
-                    server_id: Self::extract_number(&item, "serverId"),
-                    game_type: Self::extract_string(&item, "gameType")
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or(json!({})),
-                    game_state: Self::extract_string(&item, "gameState")
-                        .and_then(|s| serde_json::from_str(&s).ok()),
-                    status: Self::extract_string(&item, "status")
-                        .unwrap_or_else(|| "waiting".to_string()),
-                    ended_at: None,
-                    last_activity: Utc::now(),
-                    created_at: Utc::now(),
-                    game_mode: Self::extract_string(&item, "gameMode")
-                        .unwrap_or_else(|| "matchmaking".to_string()),
-                    is_private: Self::extract_bool(&item, "isPrivate").unwrap_or(false),
-                    game_code: Self::extract_string(&item, "gameCode"),
-                };
-                Ok(Some(game))
+            Some(item) if Self::item_is_expired(&item, Utc::now().timestamp()) => {
+                debug!(
+                    "Treating expired completed game {} as absent while DynamoDB TTL deletion is pending",
+                    game_id
+                );
+                Ok(None)
             }
+            Some(item) => Ok(Some(Self::game_from_item(game_id, &item)?)),
             None => Ok(None),
         }
     }
@@ -1080,6 +1482,119 @@ impl Database for DynamoDatabase {
             .await
             .context("Failed to update game status")?;
 
+        Ok(())
+    }
+
+    async fn upsert_completed_game(
+        &self,
+        game_id: i32,
+        server_id: i32,
+        game_state: &common::GameState,
+    ) -> Result<()> {
+        if !matches!(&game_state.status, common::GameStatus::Complete { .. }) {
+            return Err(anyhow!(
+                "Cannot persist game {} as completed while status is {:?}",
+                game_id,
+                game_state.status
+            ));
+        }
+
+        let ended_at = Utc::now();
+        let created_at =
+            DateTime::<Utc>::from_timestamp_millis(game_state.start_ms).unwrap_or(ended_at);
+        let configured_retention = std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV).ok();
+        let retention_days = Self::completed_game_retention_days(configured_retention.as_deref());
+        let ttl = ended_at
+            .timestamp()
+            .saturating_add(retention_days.saturating_mul(SECONDS_PER_DAY));
+
+        if configured_retention
+            .as_deref()
+            .is_some_and(|value| value.parse::<i64>().ok().filter(|days| *days > 0).is_none())
+        {
+            warn!(
+                "Invalid {} value {:?}; using the {} day default",
+                COMPLETED_GAME_RETENTION_DAYS_ENV,
+                configured_retention,
+                DEFAULT_COMPLETED_GAME_RETENTION_DAYS
+            );
+        }
+
+        let serialized_game_state = serde_json::to_string(game_state)
+            .context("Failed to serialize completed game state")?;
+        let serialized_game_type = serde_json::to_string(&game_state.game_type)
+            .context("Failed to serialize completed game type")?;
+        let runtime_identity = Self::runtime_game_identity(game_id, game_state);
+        let game_mode = if matches!(&game_state.game_type, common::GameType::Custom { .. }) {
+            "custom"
+        } else {
+            "matchmaking"
+        };
+
+        let mut update_expression = concat!(
+            "SET gsi1pk = :gsi1pk, gsi1sk = :gsi1sk, id = :id, ",
+            "serverId = :server_id, gameType = :game_type, gameState = :game_state, ",
+            "#status = :status, endedAt = :ended_at, lastActivity = :last_activity, ",
+            "createdAt = :created_at, gameMode = :game_mode, ",
+            "isPrivate = :is_private, runtimeIdentity = :runtime_identity, #ttl = :ttl"
+        )
+        .to_string();
+
+        if game_state.game_code.is_some() {
+            update_expression.push_str(", gameCode = :game_code");
+        }
+
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", game_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression(update_expression)
+            // Replays of the same completion are idempotent. A metadata-only row created
+            // for this game on the same server may be adopted, but a different retained
+            // game (which has gameState/runtimeIdentity) must never be overwritten.
+            .condition_expression(concat!(
+                "attribute_not_exists(pk) OR runtimeIdentity = :runtime_identity OR ",
+                "(attribute_not_exists(runtimeIdentity) AND attribute_not_exists(gameState) ",
+                "AND serverId = :server_id AND #status <> :status)"
+            ))
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_values(":gsi1pk", Self::av_s("GAME"))
+            .expression_attribute_values(
+                ":gsi1sk",
+                Self::av_s(format!("complete#{}", ended_at.to_rfc3339())),
+            )
+            .expression_attribute_values(":id", Self::av_n(game_id))
+            .expression_attribute_values(":server_id", Self::av_n(server_id))
+            .expression_attribute_values(":game_type", Self::av_s(serialized_game_type))
+            .expression_attribute_values(":game_state", Self::av_s(serialized_game_state))
+            .expression_attribute_values(":status", Self::av_s("complete"))
+            .expression_attribute_values(":ended_at", Self::av_s(ended_at.to_rfc3339()))
+            .expression_attribute_values(":last_activity", Self::av_s(ended_at.to_rfc3339()))
+            .expression_attribute_values(":created_at", Self::av_s(created_at.to_rfc3339()))
+            .expression_attribute_values(":game_mode", Self::av_s(game_mode))
+            .expression_attribute_values(":runtime_identity", Self::av_s(runtime_identity))
+            .expression_attribute_values(
+                ":is_private",
+                Self::av_bool(game_state.game_code.is_some()),
+            )
+            .expression_attribute_values(":ttl", Self::av_n(ttl));
+
+        if let Some(game_code) = &game_state.game_code {
+            request = request.expression_attribute_values(":game_code", Self::av_s(game_code));
+        }
+
+        request
+            .send()
+            .await
+            .context("Failed to persist completed game state")?;
+
+        info!(
+            "Persisted completed game {} with a {} day retention TTL",
+            game_id, retention_days
+        );
         Ok(())
     }
 

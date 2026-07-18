@@ -205,6 +205,21 @@ export interface JoinGameMessage {
   JoinGame: number;
 }
 
+export interface GameLoadFailedPayload {
+  game_id: number;
+  reason: string;
+}
+
+export interface GameLoadFailedMessage {
+  GameLoadFailed: GameLoadFailedPayload;
+}
+
+export interface GameLoadFailure {
+  gameId: number | null;
+  requestedGameId: string;
+  reason: string;
+}
+
 export interface QueueForMatchMessage {
   QueueForMatch: {
     game_type: GameType;
@@ -233,6 +248,7 @@ export type WebSocketMessage =
   | CreateCustomGameMessage
   | JoinCustomGameMessage
   | JoinGameMessage
+  | GameLoadFailedMessage
   | QueueForMatchMessage
   | QueueForMatchMultiMessage
   | CreateSoloGameMessage

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
 import { getClockDrift } from '../utils/clockSync';
+import { parseU32GameId } from '../utils/gameId';
 
 interface UseGameEngineProps {
   gameId: string;
@@ -16,7 +17,7 @@ interface UseGameEngineReturn {
   committedState: GameState | null;
   isGameComplete: boolean;
   sendCommand: (command: Command) => void;
-  processServerEvent: (event: any) => void;
+  processServerEvent: (event: any) => Promise<boolean>;
   stopEngine: () => void;
 }
 
@@ -201,6 +202,14 @@ export const useGameEngine = ({
     }
   }, []);
 
+  const startEngine = useCallback(() => {
+    if (!engineRef.current || animationFrameRef.current !== null) {
+      return;
+    }
+
+    runGameLoop();
+  }, [runGameLoop]);
+
   // Send command with client-side prediction
   const sendCommand = useCallback((command: Command) => {
     console.log('sendCommand called with:', command, 'timestamp:', Date.now());
@@ -255,7 +264,7 @@ export const useGameEngine = ({
       if (!eventMessage.game_id && !eventMessage.tick && !eventMessage.event) {
         console.warn('Received bare event, wrapping in GameEventMessage structure');
         fullEventMessage = {
-          game_id: parseInt(gameId || '0'),
+          game_id: parseU32GameId(gameId) ?? 0,
           tick: 0, // The server should provide the tick
           user_id: null,
           event: eventMessage
@@ -263,18 +272,16 @@ export const useGameEngine = ({
       }
       
       const event = fullEventMessage.event || fullEventMessage;
-      const expectedGameId = parseInt(gameId || '0', 10);
-      const rawMessageGameId = fullEventMessage.game_id;
-      const messageGameId =
-        typeof rawMessageGameId === 'number'
-          ? rawMessageGameId
-          : typeof rawMessageGameId === 'string'
-            ? parseInt(rawMessageGameId, 10)
-            : null;
+      const expectedGameId = parseU32GameId(gameId);
+      const messageGameId = parseU32GameId(fullEventMessage.game_id);
 
-      if (messageGameId && Number.isFinite(expectedGameId) && messageGameId !== expectedGameId) {
+      if (
+        messageGameId === null ||
+        expectedGameId === null ||
+        messageGameId !== expectedGameId
+      ) {
         console.warn('Ignoring server event for previous game:', messageGameId, 'expected:', expectedGameId);
-        return;
+        return false;
       }
 
       // Ensure WASM runtime is ready before using the game client
@@ -285,30 +292,42 @@ export const useGameEngine = ({
               await window.wasmReady;
             } catch (initError) {
               console.error('WASM initialization failed, cannot process server event:', initError);
-              return;
+              return false;
             }
           }
         }
 
         if (!window.wasm || !window.wasm.GameClient) {
           console.warn('WASM runtime unavailable, skipping server event processing');
-          return;
+          return false;
         }
       } else {
         console.warn('Window object is not available; skipping server event');
-        return;
+        return false;
       }
 
-      if (event.Snapshot && event.Snapshot.game_state) {
-        // Initialize the game engine
-        if (!engineRef.current) {
-          engineRef.current = window.wasm.GameClient.newFromState(
-              parseInt(gameId),
-              JSON.stringify(event.Snapshot.game_state)
-          );
-          engineRef.current.setLocalPlayerId(playerId);
-          runGameLoop();
+      const isSnapshot = Boolean(event.Snapshot && event.Snapshot.game_state);
+      if (isSnapshot) {
+        // A reconnect Snapshot replaces both committed and predicted state. Applying it to an
+        // existing client only replaces committed state, which can leave pre-disconnect
+        // prediction visible, so rebuild the client from the authoritative snapshot instead.
+        if (animationFrameRef.current !== null) {
+          cancelAnimationFrame(animationFrameRef.current);
+          animationFrameRef.current = null;
         }
+        if (engineRef.current) {
+          try {
+            engineRef.current.free();
+          } catch (error) {
+            console.warn('Failed to free GameClient before applying Snapshot:', error);
+          }
+        }
+
+        engineRef.current = window.wasm.GameClient.newFromState(
+            expectedGameId,
+            JSON.stringify(event.Snapshot.game_state)
+        );
+        engineRef.current.setLocalPlayerId(playerId);
       }
 
       if (engineRef.current) {
@@ -319,7 +338,9 @@ export const useGameEngine = ({
         //   console.log('🎯 Received XPAwarded event:', fullEventMessage.event.XPAwarded);
         // }
 
-        engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
+        if (!isSnapshot) {
+          engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
+        }
 
         // DEBUG: Log state after processing XPAwarded
         // if (fullEventMessage.event && 'XPAwarded' in fullEventMessage.event) {
@@ -328,13 +349,35 @@ export const useGameEngine = ({
         // }
 
         console.log('Current game status:', engineRef.current.getCommittedStateJson());
+
+        if (isSnapshot) {
+          // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.
+          // This prevents a reconnect or retry from briefly revealing the stale pre-reconnect
+          // arena between receipt and the next animation frame.
+          const nextGameState = JSON.parse(engineRef.current.getGameStateJson());
+          const nextCommittedState = JSON.parse(engineRef.current.getCommittedStateJson());
+          const snapshotIsComplete =
+            typeof nextCommittedState.status === 'object' &&
+            nextCommittedState.status !== null &&
+            'Complete' in nextCommittedState.status;
+          setGameState(nextGameState);
+          setCommittedState(nextCommittedState);
+          setIsGameComplete(snapshotIsComplete);
+          if (!snapshotIsComplete) {
+            startEngine();
+          }
+        }
       } else {
         console.error('Game engine not initialized, cannot process server event:', fullEventMessage);
+        return false;
       }
+
+      return true;
     } catch (error) {
       console.error('Failed to process server event:', error);
+      return false;
     }
-  }, [playerId, gameId, runGameLoop, setIsGameComplete]);
+  }, [playerId, gameId, startEngine]);
 
   return {
     gameEngine: engineRef.current,

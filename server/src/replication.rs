@@ -1,8 +1,8 @@
-use crate::game_executor::PARTITION_COUNT;
+use crate::game_executor::{PARTITION_COUNT, StreamEvent};
 use crate::pubsub_manager::{PartitionSubscription, PubSubManager};
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState, GameStatus};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -116,6 +116,21 @@ impl PartitionReplica {
         self.status.clone()
     }
 
+    async fn evict_game(&self, game_id: u32) {
+        {
+            let mut states = self.game_states.write().await;
+            states.remove(&game_id);
+        }
+        {
+            let mut broadcasters = self.game_event_broadcasters.write().await;
+            broadcasters.remove(&game_id);
+        }
+        info!(
+            "Game {} durably completed; evicted from replication cache and dropped broadcasters",
+            game_id
+        );
+    }
+
     /// Process a game event and update the game state
     async fn process_event(&self, event_msg: GameEventMessage) -> Result<()> {
         let game_id = event_msg.game_id;
@@ -123,8 +138,6 @@ impl PartitionReplica {
             "Processing game event for game {} in partition {}",
             game_id, self.partition_id
         );
-
-        let mut is_completion = false;
 
         match &event_msg.event {
             GameEvent::Snapshot { game_state } => {
@@ -135,7 +148,6 @@ impl PartitionReplica {
                 // Always update with the latest snapshot
                 let mut states = self.game_states.write().await;
                 states.insert(game_id, game_state.clone());
-                is_completion = matches!(game_state.status, GameStatus::Complete { .. });
             }
             _ => {
                 let mut states = self.game_states.write().await;
@@ -149,7 +161,6 @@ impl PartitionReplica {
 
                     // Apply event to game state
                     game_state.apply_event(event_msg.event.clone(), None);
-                    is_completion = matches!(game_state.status, GameStatus::Complete { .. });
                     debug!(
                         "Applied event to game {} state: {:?}",
                         game_id, event_msg.event
@@ -179,21 +190,6 @@ impl PartitionReplica {
                     }
                 }
             }
-        }
-
-        if is_completion {
-            {
-                let mut states = self.game_states.write().await;
-                states.remove(&game_id);
-            }
-            {
-                let mut broadcasters = self.game_event_broadcasters.write().await;
-                broadcasters.remove(&game_id);
-            }
-            info!(
-                "Game {} completed; evicted from replication cache and dropped broadcasters",
-                game_id
-            );
         }
 
         Ok(())
@@ -227,6 +223,13 @@ impl PartitionReplica {
         // Mark as ready immediately (no catch-up needed with PubSub)
         self.status.write().await.is_ready = true;
 
+        // Events and commands use separate Redis channels, so the durable completion marker can
+        // arrive before the final snapshot even though the executor publishes the snapshot first.
+        // Track both sides and evict only after this replica has processed (and broadcast) that
+        // terminal snapshot.
+        let mut terminal_snapshots_seen = HashSet::new();
+        let mut durable_completion_markers = HashSet::new();
+
         // Main event processing loop
         loop {
             tokio::select! {
@@ -241,8 +244,20 @@ impl PartitionReplica {
                 event = event_receiver.recv() => {
                     match event {
                         Some(event) => {
+                            let game_id = event.game_id;
+                            let is_terminal_snapshot = matches!(
+                                &event.event,
+                                GameEvent::Snapshot { game_state }
+                                    if matches!(game_state.status, GameStatus::Complete { .. })
+                            );
                             if let Err(e) = self.process_event(event).await {
                                 error!("Failed to process event in partition {}: {}", self.partition_id, e);
+                            } else if is_terminal_snapshot {
+                                terminal_snapshots_seen.insert(game_id);
+                                if durable_completion_markers.remove(&game_id) {
+                                    terminal_snapshots_seen.remove(&game_id);
+                                    self.evict_game(game_id).await;
+                                }
                             }
                         }
                         None => {
@@ -253,10 +268,20 @@ impl PartitionReplica {
                     }
                 }
 
-                // Drain commands (processed by game executor, not used here)
-                Some(_) = command_receiver.recv() => {
-                    // Commands are handled by the game executor, we just drain them
-                    // to prevent the channel from filling up and blocking the PubSub handler
+                // Completion commands are published only after the final state is durable.
+                // Until then, keep the completed in-memory state available for refreshes.
+                Some(command) = command_receiver.recv() => {
+                    if let StreamEvent::StatusUpdated {
+                        game_id,
+                        status: GameStatus::Complete { .. },
+                    } = command
+                    {
+                        if terminal_snapshots_seen.remove(&game_id) {
+                            self.evict_game(game_id).await;
+                        } else {
+                            durable_completion_markers.insert(game_id);
+                        }
+                    }
                 }
 
                 // Drain snapshot requests (processed by game executor, not used here)
@@ -314,6 +339,16 @@ impl GameStateReader for ReplicationManager {
 }
 
 impl ReplicationManager {
+    /// Load the most recently published game snapshot from Redis.
+    ///
+    /// Durably completed games are deliberately evicted from the in-memory replication cache,
+    /// while their final snapshot remains in Redis for a short grace period. Callers can use
+    /// this method before falling back to durable storage.
+    pub async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
+        let mut pubsub = self.pubsub.lock().await;
+        pubsub.get_stored_snapshot(game_id).await
+    }
+
     /// Subscribe to game events for a specific game
     /// Returns the current game state as a snapshot and a receiver for subsequent events
     pub async fn subscribe_to_game(
