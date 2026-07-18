@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { Sidebar } from './Sidebar';
-import { MobileHeader } from './MobileHeader';
+import { HomeHeader } from './HomeHeader';
+import { SocialFooter } from './SocialFooter';
 import { LobbyChat } from './LobbyChat';
+import { RegionSelector } from './RegionSelector';
 import { InviteFriendsModal } from './InviteFriendsModal';
 import JoinGameModal from './JoinGameModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -33,7 +34,7 @@ const GAME_MODES: Array<{ id: LobbyGameMode; label: string }> = [
 const isValidLeaderboardMode = (mode: string | null): mode is LobbyGameMode =>
   Boolean(mode && GAME_MODES.some(gameMode => gameMode.id === mode));
 
-const isValidLeaderboardRegion = (region: string | null) =>
+const isValidLeaderboardRegion = (region: string | null): region is string =>
   Boolean(region && LEADERBOARD_REGIONS.some(availableRegion => availableRegion.id === region));
 
 const RANK_BANDS: Array<{ min: number; max?: number; tier: RankTier; division: RankDivision }> = [
@@ -249,9 +250,9 @@ const LeaderboardContent: React.FC<{
   const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
 
   return (
-    <div className="w-full max-w-4xl mx-auto px-4 py-8">
+    <div className="leaderboard-content w-full max-w-4xl mx-auto px-4 py-8">
       {/* Header row with rank and selectors */}
-      <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-6 mb-8">
+      <div className="leaderboard-summary flex flex-col md:flex-row md:items-start md:justify-between gap-6 mb-8">
         {/* Your Rank Display (left side) - Not shown for Solo mode */}
         {selectedMode !== 'solo' ? (
           <div className="flex items-start gap-4">
@@ -299,7 +300,7 @@ const LeaderboardContent: React.FC<{
           <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
             Region
           </label>
-          <div className="relative h-[38px]">
+          <div className="leaderboard-control-frame relative h-[38px]">
             <select
               value={selectedRegion}
               onChange={(e) => setSelectedRegion(e.target.value)}
@@ -327,7 +328,7 @@ const LeaderboardContent: React.FC<{
           <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
             Season
           </label>
-          <div className="relative h-[38px]">
+          <div className="leaderboard-control-frame relative h-[38px]">
             <select
               value={selectedSeason != null ? selectedSeason.toString() : ''}
               onChange={(e) => {
@@ -360,7 +361,7 @@ const LeaderboardContent: React.FC<{
           <label className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
             Game Mode
           </label>
-          <div className="grid grid-cols-4 gap-2 h-[38px]">
+          <div className="leaderboard-control-frame grid grid-cols-4 gap-2 h-[38px]">
             {GAME_MODES.map((mode) => {
               const isSelected = selectedMode === mode.id;
               return (
@@ -388,11 +389,11 @@ const LeaderboardContent: React.FC<{
       </div>
 
       {/* Leaderboard Table */}
-      <div className="bg-white border-2 border-gray-300 rounded-lg overflow-hidden">
+      <div className="leaderboard-table bg-white border-2 border-gray-300 rounded-lg overflow-hidden">
         {/* Table Header */}
         {selectedMode === 'solo' ? (
           // Solo mode header - show Score and Date instead of MMR/Wins/Losses
-          <div className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+          <div className="leaderboard-grid leaderboard-grid--solo grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
             <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
             <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
             <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">Score</div>
@@ -400,7 +401,7 @@ const LeaderboardContent: React.FC<{
           </div>
         ) : (
           // Other modes header - show MMR, Wins, Losses, Win%
-          <div className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
+          <div className="leaderboard-grid leaderboard-grid--ranked grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 bg-gray-50 border-b-2 border-gray-300">
             <div className="font-black uppercase tracking-1 text-xs text-black-70">#</div>
             <div className="font-black uppercase tracking-1 text-xs text-black-70">Player</div>
             <div className="font-black uppercase tracking-1 text-xs text-black-70 text-right">MMR</div>
@@ -439,7 +440,7 @@ const LeaderboardContent: React.FC<{
                 return (
                   <div
                     key={`${entry.gameId}-${entry.rank}`}
-                    className="grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                    className="leaderboard-grid leaderboard-grid--solo grid grid-cols-[50px_1fr_120px_150px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
                   >
                     {/* Rank */}
                     <div className="flex items-center">
@@ -471,7 +472,7 @@ const LeaderboardContent: React.FC<{
                 return (
                   <div
                     key={entry.rank}
-                    className="grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                    className="leaderboard-grid leaderboard-grid--ranked grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
                   >
                     {/* Rank */}
                     <div className="flex items-center">
@@ -557,7 +558,6 @@ export const Leaderboard: React.FC = () => {
     lobbyChatMessages,
     sendChatMessage,
   } = useWebSocket();
-  const [isMobile, setIsMobile] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
@@ -584,16 +584,6 @@ export const Leaderboard: React.FC = () => {
     onMessage,
   });
   const currentRegionId = selectedWsRegion?.id ?? regions[0]?.id ?? '';
-
-  // Check if mobile on mount and resize
-  useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 800);
-    };
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
 
   // Fetch seasons once so we can hydrate the query defaults
   useEffect(() => {
@@ -748,69 +738,57 @@ export const Leaderboard: React.FC = () => {
     navigate('/auth');
   };
 
-  const desktopLayout = (
-    <>
-      <div className="w-80 flex-shrink-0">
-        <Sidebar
-          regions={regions}
-          currentRegionId={currentRegionId}
-          onRegionChange={handleRegionChange}
-          lobbyMembers={lobbyMembers}
-          lobbyCode={currentLobby?.code || null}
-          currentUserId={user?.id}
-          onInvite={handleInvite}
-          isInviteDisabled={isCreatingInvite}
-          onLeaveLobby={handleLeaveLobby}
-          onJoinGame={() => setShowJoinModal(true)}
-        />
-      </div>
-      <div className="flex-1 flex flex-col relative">
-        {/* Top Right: Login/Username */}
-        <div className="absolute top-8 right-8 z-20">
-          {user && !user.isGuest ? (
-            <div className="flex items-center gap-3">
-              <span className="text-sm text-black-70 font-bold uppercase tracking-1">
-                {user.username}
-              </span>
-              <div className="relative group">
-                <button
-                  onClick={logout}
-                  className="text-black-70 hover:opacity-70 transition-opacity cursor-pointer"
-                  aria-label="Logout"
-                >
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    className="h-5 w-5"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
-                    />
-                  </svg>
-                </button>
-                {/* Tooltip */}
-                <div className="absolute right-0 top-full mt-2 px-2 py-1 bg-gray-800 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                  Logout
-                </div>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={handleLoginClick}
-              className="text-sm text-black-70 font-bold uppercase tracking-1 hover:opacity-70 transition-opacity"
-            >
-              LOGIN
-            </button>
-          )}
-        </div>
+  const shouldShowRegionReminder = !regionsLoading && !regionsError && currentRegionId === '';
+  const shouldShowRegionError = Boolean(regionsError);
+  const shouldShowConnectionBanner = !isConnected;
+  const shouldShowRegionLoading = regionsLoading;
+  const shouldShowStatusBanner =
+    shouldShowRegionLoading || shouldShowRegionError || shouldShowRegionReminder || shouldShowConnectionBanner;
 
-        {/* Center: Leaderboard Content */}
-        <div className="flex-1 flex items-center justify-center px-8 overflow-y-auto">
+  return (
+    <>
+      <div className="home-page leaderboard-page">
+        <HomeHeader
+          activePage="leaderboards"
+          currentUser={user}
+          lobbyMembers={lobbyMembers}
+          hasLobby={Boolean(currentLobby)}
+          isInviteDisabled={isCreatingInvite}
+          onInvite={handleInvite}
+          onJoinGame={() => setShowJoinModal(true)}
+          onLeaveLobby={handleLeaveLobby}
+          onLoginClick={handleLoginClick}
+          onLogout={logout}
+        />
+
+        {shouldShowStatusBanner && (
+          <div className="home-status-rack" aria-live="polite" aria-label="Connection status">
+            {shouldShowRegionLoading && (
+              <div className="home-status-badge">
+                <span className="home-status-spinner" aria-hidden="true" />
+                <span>Loading region data…</span>
+              </div>
+            )}
+            {shouldShowRegionError && !shouldShowRegionLoading && (
+              <div className="home-status-badge is-error">
+                <span>Failed to load regions</span>
+              </div>
+            )}
+            {shouldShowRegionReminder && (
+              <div className="home-status-badge is-warning">
+                <span>Select a region to continue</span>
+              </div>
+            )}
+            {shouldShowConnectionBanner && (
+              <div className="home-status-badge is-warning">
+                <span className="home-status-dot" aria-hidden="true" />
+                <span>Connecting to game server…</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <main className="leaderboard-main">
           <LeaderboardContent
             selectedSeason={selectedSeason}
             setSelectedSeason={setSelectedSeason}
@@ -821,9 +799,19 @@ export const Leaderboard: React.FC = () => {
             seasons={seasons}
             isAuthenticated={Boolean(user && !user.isGuest)}
           />
+        </main>
+
+        <SocialFooter />
+
+        <div className="home-utility-dock">
+          <RegionSelector
+            regions={regions}
+            currentRegionId={currentRegionId}
+            onRegionChange={handleRegionChange}
+            placement="top"
+          />
         </div>
 
-        {/* Bottom Right: Lobby Chat */}
         <LobbyChat
           title="Lobby Chat"
           messages={lobbyChatMessages}
@@ -833,54 +821,6 @@ export const Leaderboard: React.FC = () => {
           inactiveMessage="Join or create a lobby to chat"
           initialExpanded={true}
         />
-      </div>
-    </>
-  );
-
-  const mobileLayout = (
-    <div className="flex-1 flex flex-col">
-      <MobileHeader
-        regions={regions}
-        currentRegionId={currentRegionId}
-        onRegionChange={handleRegionChange}
-        currentUser={user}
-        onLoginClick={handleLoginClick}
-        lobbyUsers={lobbyMembers.map(m => m.username)}
-        onInvite={handleInvite}
-        isInviteDisabled={isCreatingInvite}
-      />
-
-      {/* Center: Leaderboard Content */}
-      <div className="flex-1 overflow-y-auto px-4 py-8">
-        <LeaderboardContent
-          selectedSeason={selectedSeason}
-          setSelectedSeason={setSelectedSeason}
-          selectedMode={selectedMode}
-          setSelectedMode={setSelectedMode}
-          selectedRegion={selectedLeaderboardRegion}
-          setSelectedRegion={setSelectedLeaderboardRegion}
-          seasons={seasons}
-          isAuthenticated={Boolean(user && !user.isGuest)}
-        />
-      </div>
-
-      {/* Bottom Right: Lobby Chat */}
-      <LobbyChat
-        title="Lobby Chat"
-        messages={lobbyChatMessages}
-        onSendMessage={handleSendMessage}
-        currentUsername={user?.username}
-        isActive={Boolean(currentLobby)}
-        inactiveMessage="Join or create a lobby to chat"
-        initialExpanded={false}
-      />
-    </div>
-  );
-
-  return (
-    <>
-      <div className="min-h-screen flex home-page relative">
-        {isMobile ? mobileLayout : desktopLayout}
       </div>
 
       {/* Invite Friends Modal */}

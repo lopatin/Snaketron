@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Sidebar } from './Sidebar';
-import { MobileHeader } from './MobileHeader';
+import { HomeHeader } from './HomeHeader';
 import { GameStartForm } from './GameStartForm';
+import { SocialFooter } from './SocialFooter';
 import { LobbyChat } from './LobbyChat';
+import { RegionSelector } from './RegionSelector';
 import { InviteFriendsModal } from './InviteFriendsModal';
 import JoinGameModal from './JoinGameModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -16,7 +17,7 @@ const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 90
 
 export const NewHome: React.FC = () => {
   const navigate = useNavigate();
-  const { user, login, register, createGuest, logout, updateGuestNickname } = useAuth();
+  const { user, createGuest, logout, updateGuestNickname } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -33,7 +34,6 @@ export const NewHome: React.FC = () => {
     updateLobbyPreferences,
   } = useWebSocket();
   const { currentGameId, queueForMatch, queueForMatchMulti } = useGameWebSocket();
-  const [isMobile, setIsMobile] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -71,16 +71,6 @@ export const NewHome: React.FC = () => {
   });
   const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
   const isLobbyQueued = currentLobby?.state === 'queued';
-
-  // Check if mobile on mount and resize
-  useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 800);
-    };
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
 
   // Connect to selected region when it changes
   useEffect(() => {
@@ -238,142 +228,9 @@ export const NewHome: React.FC = () => {
     }
   };
 
-  const handleStartGameFromLobby = () => {
-    // TODO: Queue lobby for matchmaking
-    console.log('Start game from lobby - TODO: implement matchmaking');
-  };
-
   const handleLoginClick = () => {
     navigate('/auth');
   };
-
-  const desktopLayout = (
-    <>
-      <div className="w-80 flex-shrink-0">
-        <Sidebar
-          regions={regions}
-          currentRegionId={currentRegionId}
-          onRegionChange={handleRegionChange}
-          lobbyMembers={lobbyMembers}
-          lobbyCode={currentLobby?.code || null}
-          currentUserId={user?.id}
-          onInvite={handleInvite}
-          isInviteDisabled={isCreatingInvite}
-          onLeaveLobby={handleLeaveLobby}
-          onStartGame={handleStartGameFromLobby}
-          onJoinGame={() => setShowJoinModal(true)}
-        />
-      </div>
-      <div className="flex-1 flex flex-col relative">
-        {/* Top Right: Login/Username */}
-        <div className="absolute top-8 right-8 z-20">
-          {user && !user.isGuest ? (
-            <div className="flex items-center gap-3">
-              <span className="text-sm text-black-70 font-bold uppercase tracking-1">
-                {user.username}
-              </span>
-              <div className="relative group">
-                <button
-                  onClick={logout}
-                  className="text-black-70 hover:opacity-70 transition-opacity cursor-pointer"
-                  aria-label="Logout"
-                >
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    className="h-5 w-5"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
-                    />
-                  </svg>
-                </button>
-                {/* Tooltip */}
-                <div className="absolute right-0 top-full mt-2 px-2 py-1 bg-gray-800 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                  Logout
-                </div>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={handleLoginClick}
-              className="text-sm text-black-70 font-bold uppercase tracking-1 hover:opacity-70 transition-opacity"
-            >
-              LOGIN
-            </button>
-          )}
-        </div>
-
-        {/* Center: Game Start Form */}
-        <div className="flex-1 flex items-center justify-center px-8">
-          <GameStartForm
-            onStartGame={handleStartGame}
-            currentUsername={user?.username}
-            isLoading={isLoading}
-            isAuthenticated={user !== null && !user.isGuest}
-            isLobbyQueued={isLobbyQueued}
-            lobbyPreferences={lobbyPreferences}
-            onPreferencesChange={updateLobbyPreferences}
-          />
-        </div>
-
-        {/* Bottom Right: Lobby Chat */}
-        <LobbyChat
-          title="Lobby Chat"
-          messages={lobbyChatMessages}
-          onSendMessage={handleSendMessage}
-          currentUsername={user?.username}
-          isActive={Boolean(currentLobby)}
-          inactiveMessage="Join or create a lobby to chat"
-          initialExpanded={true}
-        />
-      </div>
-    </>
-  );
-
-  const mobileLayout = (
-    <div className="flex-1 flex flex-col">
-      <MobileHeader
-        regions={regions}
-        currentRegionId={currentRegionId}
-        onRegionChange={handleRegionChange}
-        currentUser={user}
-        onLoginClick={handleLoginClick}
-        lobbyUsers={lobbyMembers.map(m => m.username)}
-        onInvite={handleInvite}
-        isInviteDisabled={isCreatingInvite}
-      />
-
-      {/* Center: Game Start Form */}
-      <div className="flex-1 flex items-center justify-center px-4 py-8">
-        <GameStartForm
-          onStartGame={handleStartGame}
-            currentUsername={user?.username}
-            isLoading={isLoading}
-            isAuthenticated={user !== null && !user.isGuest}
-            isLobbyQueued={isLobbyQueued}
-            lobbyPreferences={lobbyPreferences}
-            onPreferencesChange={updateLobbyPreferences}
-          />
-      </div>
-
-      {/* Bottom Right: Lobby Chat - Hidden in mobile */}
-      <LobbyChat
-        title="Lobby Chat"
-        messages={lobbyChatMessages}
-        onSendMessage={handleSendMessage}
-        currentUsername={user?.username}
-        isActive={Boolean(currentLobby)}
-        inactiveMessage="Join or create a lobby to chat"
-        initialExpanded={false}
-      />
-    </div>
-  );
 
   const shouldShowRegionReminder = !regionsLoading && !regionsError && currentRegionId === '';
   const shouldShowRegionError = Boolean(regionsError);
@@ -384,33 +241,79 @@ export const NewHome: React.FC = () => {
 
   return (
     <>
-      <div className="min-h-screen flex home-page relative">
-        {isMobile ? mobileLayout : desktopLayout}
+      <div className="home-page">
+        <HomeHeader
+          currentUser={user}
+          lobbyMembers={lobbyMembers}
+          hasLobby={Boolean(currentLobby)}
+          isInviteDisabled={isCreatingInvite}
+          onInvite={handleInvite}
+          onJoinGame={() => setShowJoinModal(true)}
+          onLeaveLobby={handleLeaveLobby}
+          onLoginClick={handleLoginClick}
+          onLogout={logout}
+        />
+
         {shouldShowStatusBanner && (
-          <div className="pointer-events-none absolute top-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2">
+          <div className="home-status-rack" aria-live="polite" aria-label="Connection status">
             {shouldShowRegionLoading && (
-              <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white border border-gray-300 text-xs font-bold uppercase tracking-1 text-black-70 shadow-sm">
-                <span className="animate-spin w-4 h-4 border-2 border-gray-300 border-t-transparent rounded-full" />
+              <div className="home-status-badge">
+                <span className="home-status-spinner" aria-hidden="true" />
                 <span>Loading region data…</span>
               </div>
             )}
             {shouldShowRegionError && !shouldShowRegionLoading && (
-              <div className="px-4 py-2 rounded-full bg-red-50 border border-red-200 text-xs font-bold uppercase tracking-1 text-red-600 shadow-sm">
-                Failed to load regions
+              <div className="home-status-badge is-error">
+                <span>Failed to load regions</span>
               </div>
             )}
             {shouldShowRegionReminder && (
-              <div className="px-4 py-2 rounded-full bg-yellow-50 border border-yellow-200 text-xs font-bold uppercase tracking-1 text-yellow-700 shadow-sm">
-                Select a region to continue
+              <div className="home-status-badge is-warning">
+                <span>Select a region to continue</span>
               </div>
             )}
             {shouldShowConnectionBanner && (
-              <div className="px-4 py-2 rounded-full bg-yellow-50 border border-yellow-200 text-xs font-bold uppercase tracking-1 text-yellow-700 shadow-sm">
-                Connecting to game server…
+              <div className="home-status-badge is-warning">
+                <span className="home-status-dot" aria-hidden="true" />
+                <span>Connecting to game server…</span>
               </div>
             )}
           </div>
         )}
+
+        <main className="home-main">
+          <div className="home-center-stack">
+            <GameStartForm
+              onStartGame={handleStartGame}
+              currentUsername={user?.username}
+              isLoading={isLoading}
+              isAuthenticated={user !== null && !user.isGuest}
+              isLobbyQueued={isLobbyQueued}
+              lobbyPreferences={lobbyPreferences}
+              onPreferencesChange={updateLobbyPreferences}
+            />
+            <SocialFooter />
+          </div>
+        </main>
+
+        <div className="home-utility-dock">
+          <RegionSelector
+            regions={regions}
+            currentRegionId={currentRegionId}
+            onRegionChange={handleRegionChange}
+            placement="top"
+          />
+        </div>
+
+        <LobbyChat
+          title="Lobby Chat"
+          messages={lobbyChatMessages}
+          onSendMessage={handleSendMessage}
+          currentUsername={user?.username}
+          isActive={Boolean(currentLobby)}
+          inactiveMessage="Join or create a lobby to chat"
+          initialExpanded={true}
+        />
       </div>
 
       {/* Invite Friends Modal */}
