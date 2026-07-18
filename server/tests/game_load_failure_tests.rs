@@ -328,6 +328,11 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
     let mut live_state = completed_game_state(player_user_id as u32)?;
     live_state.status = GameStatus::Started { server_id };
     live_state.event_sequence = 17;
+    // completed_game_state backdates start_ms by 10s. An executor that adopts
+    // this orphaned Started game would catch up that whole backlog at once and
+    // could even complete the game mid-test, so anchor the game to now to keep
+    // any progression incremental.
+    live_state.start_ms = chrono::Utc::now().timestamp_millis();
 
     let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
     let redis_client = redis::Client::open(redis_url)?;
@@ -368,8 +373,21 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
 
     let loaded_state = receive_snapshot(&mut client).await?;
     assert_eq!(loaded_state.start_ms, live_state.start_ms);
-    assert_eq!(loaded_state.event_sequence, live_state.event_sequence);
-    assert_eq!(loaded_state.status, live_state.status);
+    // The failover-safe executor may adopt the orphaned Started game and
+    // advance it between the publish above and delivery, so the first
+    // snapshot the client sees can be at or past the published sequence —
+    // but never behind it, and never a load failure or a stale state.
+    assert!(
+        loaded_state.event_sequence >= live_state.event_sequence,
+        "client received a snapshot older than the published replica state: {} < {}",
+        loaded_state.event_sequence,
+        live_state.event_sequence
+    );
+    assert!(
+        matches!(loaded_state.status, GameStatus::Started { .. }),
+        "expected a live Started snapshot, got {:?}",
+        loaded_state.status
+    );
 
     let _: usize = redis.del(snapshot_key).await?;
     client.disconnect().await?;
