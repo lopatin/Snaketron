@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use server::{
     api::jwt::JwtManager,
     db::{Database, dynamodb::DynamoDatabase},
-    game_server::{GameServer, start_test_server, start_test_server_with_grpc},
+    game_server::{GameServer, start_test_server_with_grpc},
     ws_server::JwtVerifier,
 };
 use std::sync::Arc;
@@ -125,7 +125,7 @@ impl TestEnvironment {
         Ok((index, server_id))
     }
 
-    /// Add a server with custom JWT verifier
+    // Add a server with custom JWT verifier
     // pub async fn add_server_with_jwt(
     //     &mut self,
     //     jwt_verifier: Arc<dyn JwtVerifier>,

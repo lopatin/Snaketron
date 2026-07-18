@@ -16,6 +16,8 @@ use models::*;
 /// Redis loss safe while old nodes are still present.
 pub const DURABLE_GAME_ID_FLOOR: i32 = 1_000_000_000;
 
+// Several DB methods take a full column set as separate parameters by design.
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait Database: Send + Sync {
     // Server operations

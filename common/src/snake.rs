@@ -55,7 +55,7 @@ pub struct Snake {
 
 impl Snake {
     pub fn head(&self) -> Result<&Position> {
-        self.body.get(0).context("Snake has no head")
+        self.body.first().context("Snake has no head")
     }
 
     pub fn tail(&self) -> Result<&Position> {

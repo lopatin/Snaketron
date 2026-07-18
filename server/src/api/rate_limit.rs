@@ -75,20 +75,20 @@ impl RateLimiter {
 /// Extracts IP address from request headers or connection info
 fn get_client_ip(headers: &HeaderMap) -> String {
     // Try to get IP from X-Forwarded-For header (for proxies)
-    if let Some(forwarded_for) = headers.get("x-forwarded-for") {
-        if let Ok(value) = forwarded_for.to_str() {
-            // Take the first IP in the chain
-            if let Some(ip) = value.split(',').next() {
-                return ip.trim().to_string();
-            }
+    if let Some(forwarded_for) = headers.get("x-forwarded-for")
+        && let Ok(value) = forwarded_for.to_str()
+    {
+        // Take the first IP in the chain
+        if let Some(ip) = value.split(',').next() {
+            return ip.trim().to_string();
         }
     }
 
     // Try to get IP from X-Real-IP header
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(value) = real_ip.to_str() {
-            return value.to_string();
-        }
+    if let Some(real_ip) = headers.get("x-real-ip")
+        && let Ok(value) = real_ip.to_str()
+    {
+        return value.to_string();
     }
 
     // Default to a placeholder if we can't determine the IP

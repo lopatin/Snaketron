@@ -1,8 +1,7 @@
-use ::common::{GameEvent, GameType};
+use ::common::GameEvent;
 use anyhow::Result;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
-use tracing::info;
 
 mod common;
 use self::common::{TestClient, TestEnvironment};
@@ -206,7 +205,7 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
 
     // Wait for match - with auto-joining, we receive the game snapshot directly
     println!("test_game_lifecycle_with_cleanup: Waiting for game snapshot...");
-    let game_id = match timeout(Duration::from_secs(5), async {
+    let _game_id = match timeout(Duration::from_secs(5), async {
         loop {
             if let Some(event) = client1.receive_game_event().await? {
                 println!(
@@ -232,10 +231,10 @@ async fn test_game_lifecycle_with_cleanup() -> Result<()> {
     // Client2 should also receive the snapshot
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(event) = client2.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    break;
-                }
+            if let Some(event) = client2.receive_game_event().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                break;
             }
         }
         Ok::<(), anyhow::Error>(())

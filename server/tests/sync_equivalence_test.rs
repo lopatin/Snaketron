@@ -10,9 +10,8 @@
 
 use anyhow::Result;
 use common::{
-    DEFAULT_TICK_INTERVAL_MS, Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent,
-    GameEventMessage, GameState, GameStatus, GameType, MAX_PREDICTION_AHEAD_MS, PseudoRandom,
-    QueueMode,
+    Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState,
+    GameStatus, GameType, MAX_PREDICTION_AHEAD_MS, PseudoRandom, QueueMode,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -149,11 +148,13 @@ impl Transport {
         // Snapshots are the reliable join/recovery path; everything else is
         // at-most-once pub/sub and may be dropped.
         let droppable = !matches!(msg.event, GameEvent::Snapshot { .. });
-        if droppable && self.cfg.drop_probability > 0.0 && self.delivery_enabled {
-            if self.rng.next_f32() < self.cfg.drop_probability {
-                self.dropped_to_client += 1;
-                return;
-            }
+        if droppable
+            && self.cfg.drop_probability > 0.0
+            && self.delivery_enabled
+            && self.rng.next_f32() < self.cfg.drop_probability
+        {
+            self.dropped_to_client += 1;
+            return;
         }
         let latency = self.sample_latency();
         self.enqueue(now_ms, latency, Wire::ToClient(Box::new(msg)));
@@ -179,10 +180,10 @@ impl Transport {
     }
 
     fn pop_due(&mut self, now_ms: i64) -> Option<Wire> {
-        if let Some(Reverse(head)) = self.queue.peek() {
-            if head.arrival_ms <= now_ms {
-                return self.queue.pop().map(|Reverse(f)| f.payload);
-            }
+        if let Some(Reverse(head)) = self.queue.peek()
+            && head.arrival_ms <= now_ms
+        {
+            return self.queue.pop().map(|Reverse(f)| f.payload);
         }
         None
     }
@@ -203,6 +204,7 @@ impl Transport {
 
 #[derive(Debug, Clone, Copy)]
 struct ProbeResult {
+    #[allow(dead_code)] // kept for debug output completeness
     tick: u32,
     matched: bool,
 }

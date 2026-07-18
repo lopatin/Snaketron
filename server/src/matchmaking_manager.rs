@@ -186,18 +186,18 @@ impl MatchmakingManager {
                 self.redis.zrange_withscores(&queue_key, 0, -1).await?;
 
             for (member_json, _old_score) in members {
-                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                    if player.user_id == user_id {
-                        // Update timestamp to current time
-                        let new_timestamp = Utc::now().timestamp_millis();
-                        let _: () = self
-                            .redis
-                            .zadd(&queue_key, &member_json, new_timestamp)
-                            .await?;
+                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
+                    && player.user_id == user_id
+                {
+                    // Update timestamp to current time
+                    let new_timestamp = Utc::now().timestamp_millis();
+                    let _: () = self
+                        .redis
+                        .zadd(&queue_key, &member_json, new_timestamp)
+                        .await?;
 
-                        debug!("Renewed queue position for user {}", user_id);
-                        return Ok(true);
-                    }
+                    debug!("Renewed queue position for user {}", user_id);
+                    return Ok(true);
                 }
             }
         }
@@ -222,20 +222,20 @@ impl MatchmakingManager {
                 self.redis.zrange_withscores(&queue_key, 0, -1).await?;
 
             for (member_json, _score) in members {
-                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                    if player.user_id == user_id {
-                        // Remove from queue and MMR index
-                        let mut pipe = redis::pipe();
-                        pipe.atomic();
-                        pipe.zrem(&queue_key, &member_json);
-                        pipe.zrem(&mmr_key, user_id.to_string());
-                        pipe.del(&user_key);
+                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
+                    && player.user_id == user_id
+                {
+                    // Remove from queue and MMR index
+                    let mut pipe = redis::pipe();
+                    pipe.atomic();
+                    pipe.zrem(&queue_key, &member_json);
+                    pipe.zrem(&mmr_key, user_id.to_string());
+                    pipe.del(&user_key);
 
-                        let _: () = pipe.query_async(&mut self.redis).await?;
+                    let _: () = pipe.query_async(&mut self.redis).await?;
 
-                        info!("Removed user {} from matchmaking queue", user_id);
-                        return Ok(Some(status.game_type));
-                    }
+                    info!("Removed user {} from matchmaking queue", user_id);
+                    return Ok(Some(status.game_type));
                 }
             }
         }
@@ -268,10 +268,10 @@ impl MatchmakingManager {
         let members: Vec<String> = self.redis.zrange(&queue_key, 0, -1).await?;
 
         for (position, member_json) in members.iter().enumerate() {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(member_json) {
-                if player.user_id == user_id {
-                    return Ok(Some(position + 1)); // 1-indexed position
-                }
+            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(member_json)
+                && player.user_id == user_id
+            {
+                return Ok(Some(position + 1)); // 1-indexed position
             }
         }
 
@@ -440,10 +440,10 @@ impl MatchmakingManager {
 
         // Helper to process lobby JSON and add if unique
         let mut process_lobby = |member_json: &str| {
-            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json) {
-                if seen_lobby_codes.insert(lobby.lobby_code.clone()) {
-                    unique_lobbies.push(lobby);
-                }
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json)
+                && seen_lobby_codes.insert(lobby.lobby_code.clone())
+            {
+                unique_lobbies.push(lobby);
             }
         };
 
@@ -491,13 +491,13 @@ impl MatchmakingManager {
         pipe.atomic();
 
         for (member_json, _score) in members {
-            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                if lobby.lobby_code == lobby_code {
-                    // Remove from both sorted sets using the same lobby JSON
-                    pipe.zrem(&lobby_queue_key, &member_json);
-                    pipe.zrem(&lobby_mmr_key, &member_json);
-                    break;
-                }
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
+                && lobby.lobby_code == lobby_code
+            {
+                // Remove from both sorted sets using the same lobby JSON
+                pipe.zrem(&lobby_queue_key, &member_json);
+                pipe.zrem(&lobby_mmr_key, &member_json);
+                break;
             }
         }
 
@@ -531,10 +531,10 @@ impl MatchmakingManager {
                 let member_entries: Vec<String> = self.redis.zrange(&key, 0, -1).await?;
 
                 for member_json in member_entries {
-                    if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                        if lobby.lobby_code == lobby_code {
-                            return Ok(Some(lobby));
-                        }
+                    if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
+                        && lobby.lobby_code == lobby_code
+                    {
+                        return Ok(Some(lobby));
                     }
                 }
             }
@@ -577,13 +577,13 @@ impl MatchmakingManager {
             let members: Vec<String> = self.redis.zrange(&lobby_queue_key, 0, -1).await?;
 
             for member_json in members {
-                if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json) {
-                    if queued_lobby.lobby_code == lobby.lobby_code {
-                        // Remove from both sorted sets using the same lobby JSON
-                        pipe.zrem(&lobby_queue_key, &member_json);
-                        pipe.zrem(&lobby_mmr_key, &member_json);
-                        break;
-                    }
+                if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
+                    && queued_lobby.lobby_code == lobby.lobby_code
+                {
+                    // Remove from both sorted sets using the same lobby JSON
+                    pipe.zrem(&lobby_queue_key, &member_json);
+                    pipe.zrem(&lobby_mmr_key, &member_json);
+                    break;
                 }
             }
         }
@@ -644,12 +644,12 @@ impl MatchmakingManager {
         pipe.atomic();
 
         for (member_json, _score) in members {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                if user_ids.contains(&player.user_id) {
-                    pipe.zrem(&queue_key, &member_json);
-                    pipe.zrem(&mmr_key, player.user_id.to_string());
-                    pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
-                }
+            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
+                && user_ids.contains(&player.user_id)
+            {
+                pipe.zrem(&queue_key, &member_json);
+                pipe.zrem(&mmr_key, player.user_id.to_string());
+                pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
             }
         }
 

@@ -1,6 +1,8 @@
 use super::types::{CharDimensions, CharPattern};
 use common::Direction;
 
+// Lib-facing API; the snaketron bin compiles these modules too and uses a subset.
+#[allow(dead_code)]
 pub trait GameObjectRenderer {
     fn char_dimensions(&self) -> CharDimensions;
 

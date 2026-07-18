@@ -737,73 +737,6 @@ impl DynamoDatabase {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn completed_game_retention_uses_configured_positive_days() {
-        assert_eq!(
-            DynamoDatabase::completed_game_retention_days(Some("45")),
-            45
-        );
-    }
-
-    #[test]
-    fn completed_game_retention_rejects_invalid_or_non_positive_values() {
-        for value in [None, Some(""), Some("invalid"), Some("0"), Some("-1")] {
-            assert_eq!(
-                DynamoDatabase::completed_game_retention_days(value),
-                DEFAULT_COMPLETED_GAME_RETENTION_DAYS
-            );
-        }
-    }
-
-    #[test]
-    fn game_from_item_reads_persisted_timestamps() {
-        let created_at = "2026-07-17T10:00:00+00:00";
-        let last_activity = "2026-07-17T10:05:00+00:00";
-        let ended_at = "2026-07-17T10:06:00+00:00";
-        let mut item = HashMap::new();
-        item.insert("createdAt".to_string(), DynamoDatabase::av_s(created_at));
-        item.insert(
-            "lastActivity".to_string(),
-            DynamoDatabase::av_s(last_activity),
-        );
-        item.insert("endedAt".to_string(), DynamoDatabase::av_s(ended_at));
-        item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
-        item.insert(
-            "gameState".to_string(),
-            DynamoDatabase::av_s(r#"{"tick":42}"#),
-        );
-
-        let game = DynamoDatabase::game_from_item(123, &item).unwrap();
-
-        assert_eq!(game.created_at.to_rfc3339(), created_at);
-        assert_eq!(game.last_activity.to_rfc3339(), last_activity);
-        assert_eq!(
-            game.ended_at.map(|value| value.to_rfc3339()).as_deref(),
-            Some(ended_at)
-        );
-        assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
-    }
-
-    #[test]
-    fn item_expiration_supports_dynamo_numbers_and_legacy_strings() {
-        let mut numeric_item = HashMap::new();
-        numeric_item.insert("ttl".to_string(), DynamoDatabase::av_n(100));
-        assert!(DynamoDatabase::item_is_expired(&numeric_item, 100));
-        assert!(!DynamoDatabase::item_is_expired(&numeric_item, 99));
-
-        let mut string_item = HashMap::new();
-        string_item.insert("ttl".to_string(), DynamoDatabase::av_s("100"));
-        assert!(DynamoDatabase::item_is_expired(&string_item, 101));
-
-        let item_without_ttl = HashMap::new();
-        assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
-    }
-}
-
 #[async_trait]
 impl Database for DynamoDatabase {
     // Server operations
@@ -1691,14 +1624,14 @@ impl Database for DynamoDatabase {
         Ok(lobby_id)
     }
 
-    async fn update_custom_lobby_game_id(&self, lobby_id: i32, game_id: i32) -> Result<()> {
+    async fn update_custom_lobby_game_id(&self, _lobby_id: i32, _game_id: i32) -> Result<()> {
         // Note: In real implementation, we'd need to query by lobby_id first to get the game_code
         // For now, this is simplified
         warn!("link_lobby_to_game: simplified implementation - would need to query by lobby_id");
         Ok(())
     }
 
-    async fn get_custom_lobby_host(&self, game_id: i32) -> Result<Option<i32>> {
+    async fn get_custom_lobby_host(&self, _game_id: i32) -> Result<Option<i32>> {
         // Note: In real implementation, we'd need to query lobbies by game_id
         // For now, return None
         warn!("get_custom_lobby_host: simplified implementation - returning None");
@@ -1707,7 +1640,7 @@ impl Database for DynamoDatabase {
 
     async fn get_custom_lobby_by_code(&self, game_code: &str) -> Result<Option<CustomLobby>> {
         // Query the game code index table
-        let result = self
+        let _result = self
             .client
             .get_item()
             .table_name(format!("{}-game-codes", self.table_prefix))
@@ -1770,7 +1703,7 @@ impl Database for DynamoDatabase {
         let game_type_season = format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
 
         // Pad MMR to 8 digits for sorting (99999999 - mmr for descending order)
-        let inverted_mmr = 99999999 - mmr.max(0).min(99999999);
+        let inverted_mmr = 99999999 - mmr.clamp(0, 99999999);
         let padded_mmr = format!("{:08}", inverted_mmr);
 
         // Include season in PK for single-table design
@@ -1820,20 +1753,20 @@ impl Database for DynamoDatabase {
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
 
         // Delete old entry if MMR changed (SK will be different)
-        if let Some(prev_mmr) = old_mmr {
-            if prev_mmr != mmr {
-                let old_inverted = 99999999 - prev_mmr.max(0).min(99999999);
-                let old_sk = format!("MMR#{}#USER#{}", format!("{:08}", old_inverted), user_id);
+        if let Some(prev_mmr) = old_mmr
+            && prev_mmr != mmr
+        {
+            let old_inverted = 99999999 - prev_mmr.clamp(0, 99999999);
+            let old_sk = format!("MMR#{:08}#USER#{}", old_inverted, user_id);
 
-                self.client
-                    .delete_item()
-                    .table_name(self.rankings_table())
-                    .key("pk", Self::av_s(&pk))
-                    .key("sk", Self::av_s(&old_sk))
-                    .send()
-                    .await
-                    .ok(); // Ignore errors
-            }
+            self.client
+                .delete_item()
+                .table_name(self.rankings_table())
+                .key("pk", Self::av_s(&pk))
+                .key("sk", Self::av_s(&old_sk))
+                .send()
+                .await
+                .ok(); // Ignore errors
         }
 
         // Insert new entry
@@ -1872,7 +1805,7 @@ impl Database for DynamoDatabase {
         let season_str = season.to_string();
 
         // Query by region and game_type if specified, otherwise scan with filters
-        let mut items = if let Some(game_type_ref) = game_type {
+        let items = if let Some(game_type_ref) = game_type {
             let game_type_str = Self::game_type_to_string(game_type_ref);
 
             if let Some(reg) = region {
@@ -1972,7 +1905,7 @@ impl Database for DynamoDatabase {
                 .filter_expression("begins_with(pk, :prefix)")
                 .expression_attribute_values(
                     ":prefix",
-                    Self::av_s(&format!("RANKING#{}", queue_mode_str)),
+                    Self::av_s(format!("RANKING#{}", queue_mode_str)),
                 )
                 .limit(limit as i32)
                 .send()
@@ -2009,7 +1942,7 @@ impl Database for DynamoDatabase {
             .collect();
 
         // Sort by MMR descending (in case we scanned multiple regions)
-        entries.sort_by(|a, b| b.mmr.cmp(&a.mmr));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.mmr));
         entries.truncate(limit);
 
         Ok(entries)
@@ -2319,7 +2252,7 @@ impl Database for DynamoDatabase {
             })
             .collect();
 
-        entries.sort_by(|a, b| b.score.cmp(&a.score));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.score));
         entries.truncate(limit);
 
         debug!(
@@ -2668,5 +2601,72 @@ impl DynamoDatabase {
 
         info!("Successfully created high scores table: {}", table_name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_game_retention_uses_configured_positive_days() {
+        assert_eq!(
+            DynamoDatabase::completed_game_retention_days(Some("45")),
+            45
+        );
+    }
+
+    #[test]
+    fn completed_game_retention_rejects_invalid_or_non_positive_values() {
+        for value in [None, Some(""), Some("invalid"), Some("0"), Some("-1")] {
+            assert_eq!(
+                DynamoDatabase::completed_game_retention_days(value),
+                DEFAULT_COMPLETED_GAME_RETENTION_DAYS
+            );
+        }
+    }
+
+    #[test]
+    fn game_from_item_reads_persisted_timestamps() {
+        let created_at = "2026-07-17T10:00:00+00:00";
+        let last_activity = "2026-07-17T10:05:00+00:00";
+        let ended_at = "2026-07-17T10:06:00+00:00";
+        let mut item = HashMap::new();
+        item.insert("createdAt".to_string(), DynamoDatabase::av_s(created_at));
+        item.insert(
+            "lastActivity".to_string(),
+            DynamoDatabase::av_s(last_activity),
+        );
+        item.insert("endedAt".to_string(), DynamoDatabase::av_s(ended_at));
+        item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        item.insert(
+            "gameState".to_string(),
+            DynamoDatabase::av_s(r#"{"tick":42}"#),
+        );
+
+        let game = DynamoDatabase::game_from_item(123, &item).unwrap();
+
+        assert_eq!(game.created_at.to_rfc3339(), created_at);
+        assert_eq!(game.last_activity.to_rfc3339(), last_activity);
+        assert_eq!(
+            game.ended_at.map(|value| value.to_rfc3339()).as_deref(),
+            Some(ended_at)
+        );
+        assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
+    }
+
+    #[test]
+    fn item_expiration_supports_dynamo_numbers_and_legacy_strings() {
+        let mut numeric_item = HashMap::new();
+        numeric_item.insert("ttl".to_string(), DynamoDatabase::av_n(100));
+        assert!(DynamoDatabase::item_is_expired(&numeric_item, 100));
+        assert!(!DynamoDatabase::item_is_expired(&numeric_item, 99));
+
+        let mut string_item = HashMap::new();
+        string_item.insert("ttl".to_string(), DynamoDatabase::av_s("100"));
+        assert!(DynamoDatabase::item_is_expired(&string_item, 101));
+
+        let item_without_ttl = HashMap::new();
+        assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
     }
 }

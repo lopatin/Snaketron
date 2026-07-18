@@ -26,9 +26,8 @@ use crate::replication::ReplicationManager;
 use crate::user_cache::UserCache;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 
-use crate::redis_utils::create_connection_manager;
+use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
@@ -70,6 +69,7 @@ pub struct HttpServerState {
 }
 
 /// Run the combined HTTP server with both API and WebSocket endpoints
+#[allow(clippy::too_many_arguments)]
 pub async fn run_http_server(
     addr: &str,
     db: Arc<dyn Database>,

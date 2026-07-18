@@ -1,7 +1,6 @@
 use super::*;
 use common::GameEvent;
 use std::fs;
-use tokio::sync::broadcast;
 
 pub struct ReplayListener {
     recorders: Arc<RwLock<HashMap<u32, GameReplayRecorder>>>,
@@ -16,6 +15,7 @@ impl ReplayListener {
         }
     }
 
+    #[allow(dead_code)] // superseded by the bus subscription path; kept for direct-dispatch use
     async fn handle_game_event(&self, game_id: u32, event: GameEventMessage) -> Result<()> {
         // Check if this is a completion event before acquiring the lock
         let is_completion = matches!(&event.event, GameEvent::StatusUpdated { status } if matches!(status, GameStatus::Complete { .. }));
@@ -35,10 +35,10 @@ impl ReplayListener {
 
             if let Some(recorder) = recorders.get_mut(&game_id) {
                 // Handle special case where this is a Snapshot event (initial state)
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    if let GameEvent::Snapshot { game_state } = &event.event {
-                        recorder.set_initial_state(game_state.clone());
-                    }
+                if matches!(event.event, GameEvent::Snapshot { .. })
+                    && let GameEvent::Snapshot { game_state } = &event.event
+                {
+                    recorder.set_initial_state(game_state.clone());
                 }
 
                 recorder.record_event(event.clone());
@@ -53,24 +53,23 @@ impl ReplayListener {
             } else {
                 // If we receive an event for a game we're not tracking, create a recorder
                 // This can happen if the replay listener starts after games are already running
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    if let GameEvent::Snapshot { game_state } = &event.event {
-                        let mut recorder =
-                            GameReplayRecorder::new(game_id, self.output_dir.clone());
-                        recorder.set_initial_state(game_state.clone());
+                if matches!(event.event, GameEvent::Snapshot { .. })
+                    && let GameEvent::Snapshot { game_state } = &event.event
+                {
+                    let mut recorder = GameReplayRecorder::new(game_id, self.output_dir.clone());
+                    recorder.set_initial_state(game_state.clone());
 
-                        for (user_id, player) in &game_state.players {
-                            recorder.add_player(
-                                *user_id,
-                                player.snake_id,
-                                format!("Player_{}", user_id),
-                            );
-                        }
-
-                        recorder.record_event(event.clone());
-                        recorders.insert(game_id, recorder);
-                        tracing::debug!("Created replay recorder for existing game {}", game_id);
+                    for (user_id, player) in &game_state.players {
+                        recorder.add_player(
+                            *user_id,
+                            player.snake_id,
+                            format!("Player_{}", user_id),
+                        );
                     }
+
+                    recorder.record_event(event.clone());
+                    recorders.insert(game_id, recorder);
+                    tracing::debug!("Created replay recorder for existing game {}", game_id);
                 }
             }
         } // Lock is released here
@@ -96,7 +95,7 @@ impl ReplayListener {
         }
 
         // Look for the replay file
-        let pattern = format!("game_{}_*.replay", game_id);
+        let _pattern = format!("game_{}_*.replay", game_id);
         let entries = fs::read_dir(&self.output_dir)?;
 
         for entry in entries {

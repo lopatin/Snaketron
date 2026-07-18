@@ -73,11 +73,11 @@ impl GameObjectRenderer for StandardRenderer {
             let mut pattern = vec![vec![' '; self.char_dims.horizontal]; self.char_dims.vertical];
 
             // Place food characters in a reasonable pattern
-            for y in 0..self.char_dims.vertical {
-                for x in 0..self.char_dims.horizontal {
+            for (y, row) in pattern.iter_mut().enumerate() {
+                for (x, cell) in row.iter_mut().enumerate() {
                     // Create a checkerboard-like pattern for larger sizes
                     if (x + y) % 2 == 0 {
-                        pattern[y][x] = '●';
+                        *cell = '●';
                     }
                 }
             }

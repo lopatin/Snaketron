@@ -54,17 +54,17 @@ fn event(game_id: u32, stream_seq: u64) -> GameEventMessage {
 }
 
 async fn cleanup(partition: u32) {
-    if let Ok(client) = redis::Client::open(REDIS_URL) {
-        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-            use redis::AsyncCommands;
-            let _: std::result::Result<(), _> = conn
-                .del::<_, ()>(&[
-                    RedisKeys::stream_events(partition),
-                    RedisKeys::stream_commands(partition),
-                    RedisKeys::stream_snapshot_requests(partition),
-                ])
-                .await;
-        }
+    if let Ok(client) = redis::Client::open(REDIS_URL)
+        && let Ok(mut conn) = client.get_multiplexed_async_connection().await
+    {
+        use redis::AsyncCommands;
+        let _: std::result::Result<(), _> = conn
+            .del::<_, ()>(&[
+                RedisKeys::stream_events(partition),
+                RedisKeys::stream_commands(partition),
+                RedisKeys::stream_snapshot_requests(partition),
+            ])
+            .await;
     }
 }
 
@@ -309,16 +309,16 @@ async fn reader_reconnect_resumes_without_loss_or_duplicates() -> Result<()> {
             .await?;
         let mut killed = 0;
         for line in list.lines() {
-            if line.contains("cmd=xread") {
-                if let Some(id) = line.split_whitespace().find_map(|f| f.strip_prefix("id=")) {
-                    let _: i64 = redis::cmd("CLIENT")
-                        .arg("KILL")
-                        .arg("ID")
-                        .arg(id)
-                        .query_async(&mut admin)
-                        .await?;
-                    killed += 1;
-                }
+            if line.contains("cmd=xread")
+                && let Some(id) = line.split_whitespace().find_map(|f| f.strip_prefix("id="))
+            {
+                let _: i64 = redis::cmd("CLIENT")
+                    .arg("KILL")
+                    .arg("ID")
+                    .arg(id)
+                    .query_async(&mut admin)
+                    .await?;
+                killed += 1;
             }
         }
         assert!(

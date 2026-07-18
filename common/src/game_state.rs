@@ -34,6 +34,10 @@ pub struct GameEventMessage {
     pub event: GameEvent,
 }
 
+// Snapshot intentionally carries a full inline GameState: events are message
+// envelopes that are serialized or sent through channels, not stored in bulk,
+// so boxing the snapshot would add indirection without a meaningful win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum GameEvent {
     SnakeTurned {
@@ -295,6 +299,12 @@ pub struct CommandQueue {
     tombstone_ids: HashSet<CommandId>,
 }
 
+impl Default for CommandQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandQueue {
     pub fn new() -> Self {
         CommandQueue {
@@ -494,7 +504,7 @@ impl GameState {
                 // Calculate goal width as 20% of arena height
                 let goal_width = ((height as f32 * 0.2).round() as u16).max(3);
                 // Make sure it's odd for symmetry
-                let goal_width = if goal_width % 2 == 0 {
+                let goal_width = if goal_width.is_multiple_of(2) {
                     goal_width + 1
                 } else {
                     goal_width
@@ -638,7 +648,7 @@ impl GameState {
             }
             _ => {
                 // More than 2 players: arranged in two columns facing each other
-                let left_count = (player_count + 1) / 2;
+                let left_count = player_count.div_ceil(2);
                 let right_count = player_count / 2;
 
                 // Calculate vertical spacing
@@ -692,13 +702,13 @@ impl GameState {
             }
         }
 
-        let snake_length = self.starting_snake_length() as i16;
+        let _snake_length = self.starting_snake_length() as i16;
         let width = self.arena.width as i16;
         let height = self.arena.height as i16;
         let end_zone_depth = config.end_zone_depth as i16;
 
         // Place snakes near the goal opening so they face the gap instead of a wall
-        let mut positions_for_side =
+        let positions_for_side =
             |count: usize, team_id: TeamId, is_left: bool| -> Vec<(Position, Direction)> {
                 let mut side_positions = Vec::with_capacity(count);
                 if count == 0 {
@@ -749,12 +759,12 @@ impl GameState {
         let team0_positions = positions_for_side(team_snakes[0].len(), TeamId(0), true);
         let team1_positions = positions_for_side(team_snakes[1].len(), TeamId(1), false);
 
-        for (idx, pos) in team_snakes[0].iter().zip(team0_positions.into_iter()) {
+        for (idx, pos) in team_snakes[0].iter().zip(team0_positions) {
             if *idx < positions.len() {
                 positions[*idx] = Some(pos);
             }
         }
-        for (idx, pos) in team_snakes[1].iter().zip(team1_positions.into_iter()) {
+        for (idx, pos) in team_snakes[1].iter().zip(team1_positions) {
             if *idx < positions.len() {
                 positions[*idx] = Some(pos);
             }
@@ -833,7 +843,7 @@ impl GameState {
         if let Some(preferred) = starting_positions.get(position_idx) {
             candidate_positions.push(*preferred);
         }
-        candidate_positions.extend(starting_positions.into_iter());
+        candidate_positions.extend(starting_positions);
 
         for (pos, dir) in candidate_positions {
             let occupied = self
@@ -1062,11 +1072,11 @@ impl GameState {
                 }
 
                 // Entering the enemy base kills the snake
-                if let Some(team_id) = snake.team_id {
-                    if self.arena.is_in_enemy_base(head, team_id) {
-                        died_snake_ids.insert(snake_id);
-                        continue 'main_snake_loop;
-                    }
+                if let Some(team_id) = snake.team_id
+                    && self.arena.is_in_enemy_base(head, team_id)
+                {
+                    died_snake_ids.insert(snake_id);
+                    continue 'main_snake_loop;
                 }
 
                 // If not within bounds
@@ -1097,10 +1107,10 @@ impl GameState {
             self.arena.snakes[snake_id as usize] = old_snakes[snake_id as usize].clone();
             self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
 
-            if let GameType::TeamMatch { .. } = &self.game_type {
-                if let Some(event) = self.respawn_event_for_snake(snake_id) {
-                    self.apply_event(event, Some(&mut out));
-                }
+            if let GameType::TeamMatch { .. } = &self.game_type
+                && let Some(event) = self.respawn_event_for_snake(snake_id)
+            {
+                self.apply_event(event, Some(&mut out));
             }
         }
 
@@ -1201,63 +1211,63 @@ impl GameState {
             }
 
             // Track goal touches as simple score increments in team games
-            if let GameType::TeamMatch { .. } = &self.game_type {
-                if self.team_scores.is_some() {
-                    let mut team_score_deltas: HashMap<TeamId, u32> = HashMap::new();
-                    let mut respawns: Vec<u32> = Vec::new();
-                    let starting_length = self.starting_snake_length();
+            if let GameType::TeamMatch { .. } = &self.game_type
+                && self.team_scores.is_some()
+            {
+                let mut team_score_deltas: HashMap<TeamId, u32> = HashMap::new();
+                let mut respawns: Vec<u32> = Vec::new();
+                let starting_length = self.starting_snake_length();
 
-                    for (snake_id, snake) in self.iter_snakes() {
-                        if !snake.is_alive {
-                            continue;
-                        }
-
-                        let Some(team_id) = snake.team_id else {
-                            continue;
-                        };
-
-                        let Ok(head) = snake.head() else {
-                            continue;
-                        };
-
-                        if !self.arena.is_in_team_base(head, team_id) {
-                            continue;
-                        }
-
-                        let snake_length = snake.length();
-                        let extra_segments = snake_length.saturating_sub(starting_length);
-                        let carried_segments = extra_segments + snake.food as usize;
-                        let carried_food = (carried_segments / 2) as u32;
-
-                        if carried_food == 0 {
-                            continue;
-                        }
-
-                        *team_score_deltas.entry(team_id).or_default() += carried_food;
-                        respawns.push(snake_id);
+                for (snake_id, snake) in self.iter_snakes() {
+                    if !snake.is_alive {
+                        continue;
                     }
 
-                    for (team_id, delta) in team_score_deltas {
-                        let current_score = self
-                            .team_scores
-                            .as_ref()
-                            .and_then(|scores| scores.get(&team_id).copied())
-                            .unwrap_or(0);
+                    let Some(team_id) = snake.team_id else {
+                        continue;
+                    };
 
-                        self.apply_event(
-                            GameEvent::TeamScoreUpdated {
-                                team_id,
-                                score: current_score + delta,
-                            },
-                            Some(&mut out),
-                        );
+                    let Ok(head) = snake.head() else {
+                        continue;
+                    };
+
+                    if !self.arena.is_in_team_base(head, team_id) {
+                        continue;
                     }
 
-                    for snake_id in respawns {
-                        self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
-                        if let Some(event) = self.respawn_event_for_snake(snake_id) {
-                            self.apply_event(event, Some(&mut out));
-                        }
+                    let snake_length = snake.length();
+                    let extra_segments = snake_length.saturating_sub(starting_length);
+                    let carried_segments = extra_segments + snake.food as usize;
+                    let carried_food = (carried_segments / 2) as u32;
+
+                    if carried_food == 0 {
+                        continue;
+                    }
+
+                    *team_score_deltas.entry(team_id).or_default() += carried_food;
+                    respawns.push(snake_id);
+                }
+
+                for (team_id, delta) in team_score_deltas {
+                    let current_score = self
+                        .team_scores
+                        .as_ref()
+                        .and_then(|scores| scores.get(&team_id).copied())
+                        .unwrap_or(0);
+
+                    self.apply_event(
+                        GameEvent::TeamScoreUpdated {
+                            team_id,
+                            score: current_score + delta,
+                        },
+                        Some(&mut out),
+                    );
+                }
+
+                for snake_id in respawns {
+                    self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+                    if let Some(event) = self.respawn_event_for_snake(snake_id) {
+                        self.apply_event(event, Some(&mut out));
                     }
                 }
             }
@@ -1314,7 +1324,7 @@ impl GameState {
                                         self.scores.get(&player.snake_id).copied().unwrap_or(0);
                                     let snake = &self.arena.snakes[player.snake_id as usize];
                                     let is_winner = winning_team
-                                        .map_or(false, |team| snake.team_id == Some(team));
+                                        .is_some_and(|team| snake.team_id == Some(team));
 
                                     let base_xp = score * 10; // 10 XP per food eaten
                                     let bonus_xp = if is_winner { 50 } else { 10 }; // Winner bonus or participation
@@ -1472,10 +1482,10 @@ impl GameState {
 
             GameEvent::FoodEaten { snake_id, position } => {
                 let removed = self.remove_food(&position);
-                if let Ok(snake) = self.get_snake_mut(snake_id) {
-                    if removed {
-                        snake.food += 2; // Each food now adds 2 segments instead of 1
-                    }
+                if let Ok(snake) = self.get_snake_mut(snake_id)
+                    && removed
+                {
+                    snake.food += 2; // Each food now adds 2 segments instead of 1
                 }
             }
 

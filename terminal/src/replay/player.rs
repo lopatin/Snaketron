@@ -91,11 +91,13 @@ impl ReplayPlayer {
     }
 
     /// Get the current tick
+    #[allow(dead_code)] // lib-facing API; the snaketron bin compiles these modules too
     pub fn current_tick(&self) -> u32 {
         self.current_tick
     }
 
     /// Get the current game state
+    #[allow(dead_code)] // lib-facing API; the snaketron bin compiles these modules too
     pub fn current_state(&self) -> &GameState {
         &self.current_state
     }

@@ -40,6 +40,7 @@ impl LayoutMode {
 
 pub struct ReplayViewerState {
     player: ReplayPlayer,
+    #[allow(dead_code)] // reserved for frame-time diagnostics
     last_update: Instant,
     playback_accumulator: f32,
     event_log_scroll: Cell<u16>,
@@ -186,11 +187,7 @@ impl ReplayViewerState {
         let total_lines = self.event_log_total_lines.get();
 
         // Calculate max scroll position
-        let max_scroll = if total_lines > visible_height {
-            total_lines - visible_height
-        } else {
-            0
-        };
+        let max_scroll = total_lines.saturating_sub(visible_height);
 
         let current_scroll = self.event_log_scroll.get();
         let new_scroll = (current_scroll + lines).min(max_scroll);
@@ -298,7 +295,7 @@ impl ReplayViewerState {
         }
     }
 
-    fn render_header(&self) -> Paragraph {
+    fn render_header(&self) -> Paragraph<'_> {
         let title = format!(
             "Tick: {} / {} | Speed: {}x | {}",
             self.player.current_tick,
@@ -379,7 +376,7 @@ impl ReplayViewerState {
             line_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
 
             // Arena content
-            for (ch, style) in chars.into_iter().zip(styles.into_iter()) {
+            for (ch, style) in chars.into_iter().zip(styles) {
                 line_spans.push(Span::styled(ch.to_string(), style));
             }
 
@@ -406,7 +403,7 @@ impl ReplayViewerState {
         frame.render_widget(game_view, inner);
     }
 
-    fn render_status(&self) -> Paragraph {
+    fn render_status(&self) -> Paragraph<'_> {
         let mut lines = vec![];
 
         // Game status
@@ -465,7 +462,7 @@ impl ReplayViewerState {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
     }
 
-    fn render_controls(&self) -> Paragraph {
+    fn render_controls(&self) -> Paragraph<'_> {
         let lines = vec![
             Line::from("Space: Play/Pause | j/k: ±1 tick | h/l: ±5 ticks | q: Back to menu"),
             Line::from("Shift+J/K: Scroll event log | PageUp/Down: Scroll event log (5 lines)"),
@@ -522,7 +519,7 @@ impl ReplayViewerState {
                     }
                 }
             } else {
-                lines.push(Line::from(format!("Failed to serialize event")));
+                lines.push(Line::from("Failed to serialize event".to_string()));
             }
 
             // Add empty line between events

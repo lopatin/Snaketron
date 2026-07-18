@@ -162,10 +162,10 @@ async fn test_solo_game() -> Result<()> {
     // sending the turn sequence.
     timeout(Duration::from_secs(10), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if event.tick >= 1 {
-                    break Ok::<(), anyhow::Error>(());
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && event.tick >= 1
+            {
+                break Ok::<(), anyhow::Error>(());
             }
         }
     })

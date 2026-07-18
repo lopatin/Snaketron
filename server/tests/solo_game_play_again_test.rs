@@ -1,9 +1,7 @@
 mod common;
 
 use crate::common::{TestClient, TestEnvironment};
-use ::common::{GameEvent, GameStatus};
 use anyhow::Result;
-use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
 
 // #[tokio::test]
@@ -80,6 +78,7 @@ async fn test_solo_game_play_again() -> Result<()> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // fields kept for debug output completeness
 struct GameCompletionResult {
     winning_snake_id: Option<u32>,
     score: u32,

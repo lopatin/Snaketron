@@ -12,11 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compile-only guard: every test binary in the workspace must build, even the
-  # ones that are not executed in CI. Without this, test targets that fail to
-  # compile silently provide zero coverage (see DEBUGGING.md postmortem).
+  # Lint + compile guard: every test binary in the workspace must build, even
+  # the ones that are not executed in CI. Without this, test targets that fail
+  # to compile silently provide zero coverage (see DEBUGGING.md postmortem).
+  #
+  # The fmt and clippy steps MUST stay identical to the ones in the
+  # snaketron-io deployment repo (.github/workflows/test.yml), which runs them
+  # as a deploy gate. If they diverge, this repo can be green while the deploy
+  # pipeline fails on the same commit.
   compile-tests:
-    name: Compile All Test Targets
+    name: Lint and Compile All Test Targets
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -42,6 +47,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
           protoc --version
+
+      - name: Run cargo fmt check (same gate as snaketron-io)
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy (same gate as snaketron-io)
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Compile all test targets (no run)
         env:

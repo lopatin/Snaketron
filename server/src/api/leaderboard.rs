@@ -1,4 +1,3 @@
-use axum::response::{IntoResponse, Response};
 use axum::{
     Extension, Json,
     extract::{Query, State},
@@ -127,7 +126,7 @@ pub async fn get_leaderboard(
     let season = query.season.unwrap_or_else(get_current_season);
 
     // Parse limit and offset with constraints
-    let limit = query.limit.unwrap_or(25).min(100).max(1);
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
     let offset = query.offset.unwrap_or(0);
 
     // Fetch one extra entry to determine if there are more results

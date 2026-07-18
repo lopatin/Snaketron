@@ -101,7 +101,7 @@ fn render_with_dimensions(arena: &Arena, char_dims: CharDimensions) {
     // Note: In a real terminal with color support, these would show in their respective colors
     for (chars, styles) in styled_lines {
         print!("│");
-        for (ch, _style) in chars.into_iter().zip(styles.into_iter()) {
+        for (ch, _style) in chars.into_iter().zip(styles) {
             print!("{}", ch);
         }
         println!("│");

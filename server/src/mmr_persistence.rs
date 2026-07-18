@@ -89,7 +89,7 @@ pub async fn persist_player_mmr(
 async fn calculate_team_match_mmr_deltas(
     db: &dyn Database,
     game_state: &GameState,
-    per_team: u8,
+    _per_team: u8,
 ) -> Result<HashMap<u32, i32>> {
     let team_scores = game_state
         .team_scores
@@ -216,7 +216,7 @@ async fn calculate_ffa_mmr_deltas(
         .collect();
 
     // Sort by score descending (higher score = better placement)
-    player_scores.sort_by(|a, b| b.1.cmp(&a.1));
+    player_scores.sort_by_key(|p| std::cmp::Reverse(p.1));
 
     // Get current MMRs
     let all_users: Vec<i32> = player_scores.iter().map(|(id, _)| *id as i32).collect();

@@ -41,13 +41,12 @@ async fn test_ping_pong() -> Result<()> {
         // Expect pong response
         timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(msg) = client.receive_text().await {
-                    if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
-                        if matches!(ws_msg, WSMessage::Pong { .. }) {
-                            info!("Pong received");
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                    }
+                if let Ok(msg) = client.receive_text().await
+                    && let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg)
+                    && matches!(ws_msg, WSMessage::Pong { .. })
+                {
+                    info!("Pong received");
+                    return Ok::<(), anyhow::Error>(());
                 }
             }
         })
@@ -181,12 +180,11 @@ async fn test_authenticated_connection() -> Result<()> {
         // Wait for pong
         timeout(Duration::from_secs(2), async {
             loop {
-                if let Ok(msg) = client.receive_text().await {
-                    if let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg) {
-                        if matches!(ws_msg, WSMessage::Pong { .. }) {
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                    }
+                if let Ok(msg) = client.receive_text().await
+                    && let Ok(ws_msg) = serde_json::from_str::<WSMessage>(&msg)
+                    && matches!(ws_msg, WSMessage::Pong { .. })
+                {
+                    return Ok::<(), anyhow::Error>(());
                 }
             }
         })

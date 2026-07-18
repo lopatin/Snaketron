@@ -1,9 +1,7 @@
 mod common;
 
 use crate::common::{TestClient, TestEnvironment};
-use ::common::{
-    CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameEventMessage, GameType,
-};
+use ::common::{CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameType};
 use anyhow::Result;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
@@ -86,10 +84,10 @@ async fn test_game_events_delivered() -> Result<()> {
     // Wait for initial snapshots
     let snapshot1 = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client1.receive_message().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client1.receive_message().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })
@@ -97,10 +95,10 @@ async fn test_game_events_delivered() -> Result<()> {
 
     let snapshot2 = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client2.receive_message().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client2.receive_message().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })
@@ -201,11 +199,11 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Wait for match found
     let game_id = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if let GameEvent::Snapshot { .. } = event.event {
-                    let game_id = event.game_id;
-                    return Ok::<_, anyhow::Error>(game_id);
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && let GameEvent::Snapshot { .. } = event.event
+            {
+                let game_id = event.game_id;
+                return Ok::<_, anyhow::Error>(game_id);
             }
         }
     })
@@ -217,10 +215,10 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Wait for initial snapshot
     let snapshot = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })
@@ -256,10 +254,10 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Should receive event
     let _event = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if !matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && !matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })
@@ -276,10 +274,10 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Should receive snapshot
     let _snapshot = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })
@@ -304,10 +302,10 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Should still receive events
     let event = timeout(Duration::from_secs(5), async {
         loop {
-            if let WSMessage::GameEvent(event) = client.receive_message().await? {
-                if !matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok::<_, anyhow::Error>(event);
-                }
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && !matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<_, anyhow::Error>(event);
             }
         }
     })

@@ -137,14 +137,14 @@ impl GameTraceRecorder {
     }
 
     pub fn record(&mut self, record: &TraceRecord) {
-        if let Some(writer) = self.writer.as_mut() {
-            if let Err(e) = writer.record(record) {
-                warn!(
-                    "Trace write failed for game {}: {}; tracing disabled for this game",
-                    self.game_id, e
-                );
-                self.writer = None;
-            }
+        if let Some(writer) = self.writer.as_mut()
+            && let Err(e) = writer.record(record)
+        {
+            warn!(
+                "Trace write failed for game {}: {}; tracing disabled for this game",
+                self.game_id, e
+            );
+            self.writer = None;
         }
     }
 
@@ -156,14 +156,14 @@ impl GameTraceRecorder {
     }
 
     pub fn flush(&mut self) {
-        if let Some(writer) = self.writer.as_mut() {
-            if let Err(e) = writer.flush() {
-                warn!(
-                    "Trace flush failed for game {}: {}; tracing disabled for this game",
-                    self.game_id, e
-                );
-                self.writer = None;
-            }
+        if let Some(writer) = self.writer.as_mut()
+            && let Err(e) = writer.flush()
+        {
+            warn!(
+                "Trace flush failed for game {}: {}; tracing disabled for this game",
+                self.game_id, e
+            );
+            self.writer = None;
         }
     }
 }
