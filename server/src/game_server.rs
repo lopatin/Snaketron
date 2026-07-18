@@ -251,11 +251,16 @@ impl GameServer {
                     partition_id
                 );
 
+                // 3s lease (renewed every 150ms): with the renewal-error
+                // grace window at 60% of the lease, a Redis blip of up to
+                // ~1.8s no longer cancels the partition's games, while
+                // failover after a real death still completes within ~3s —
+                // inside the client liveness watchdog's reconnect overlay.
                 let singleton = ClusterSingleton::new(
                     exec_redis_clone.clone(),
                     server_id,
                     RedisKeys::partition_executor_lease(partition_id),
-                    Duration::from_secs(1),
+                    Duration::from_secs(3),
                     exec_token.clone(),
                 );
 

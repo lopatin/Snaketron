@@ -19,8 +19,8 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
         Some(12345),
         start_ms,
     );
-    initial_state.add_player(1)?;
-    initial_state.add_player(2)?;
+    initial_state.add_player(1, None)?;
+    initial_state.add_player(2, None)?;
     initial_state.status = GameStatus::Started { server_id: 1 };
 
     // Create replay data
@@ -71,6 +71,7 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
             game_id: 1,
             tick: 1,
             sequence: 1,
+            stream_seq: 0,
             user_id: Some(1),
             event: GameEvent::CommandScheduled {
                 command_message: command_msg,
@@ -86,6 +87,7 @@ fn test_replay_player_with_tick_forward() -> Result<()> {
             game_id: 1,
             tick: 3,
             sequence: 2,
+            stream_seq: 0,
             user_id: None,
             event: GameEvent::SnakeTurned {
                 snake_id: 0,

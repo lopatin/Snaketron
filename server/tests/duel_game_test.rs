@@ -3,9 +3,45 @@ mod common;
 use crate::common::{TestClient, TestEnvironment};
 use ::common::{GameEvent, GameStatus, GameType, TeamId};
 use anyhow::Result;
-use redis::AsyncCommands;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
+
+/// Wait for a JoinGame message, skipping unrelated messages (e.g. UserCountUpdate).
+async fn wait_for_join_game(client: &mut TestClient, label: &str) -> Result<u32> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::JoinGame(id) => break Ok::<u32, anyhow::Error>(id),
+                other => println!(
+                    "{}: ignoring message while waiting for JoinGame: {:?}",
+                    label, other
+                ),
+            }
+        }
+    })
+    .await?
+}
+
+/// Wait for a GameEvent carrying a Snapshot, skipping unrelated messages.
+async fn wait_for_snapshot(client: &mut TestClient, label: &str) -> Result<WSMessage> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let msg = client.receive_message().await?;
+            match &msg {
+                WSMessage::GameEvent(event)
+                    if matches!(event.event, GameEvent::Snapshot { .. }) =>
+                {
+                    break Ok::<WSMessage, anyhow::Error>(msg);
+                }
+                other => println!(
+                    "{}: ignoring message while waiting for snapshot: {:?}",
+                    label, other
+                ),
+            }
+        }
+    })
+    .await?
+}
 
 #[tokio::test]
 async fn test_duel_game() -> Result<()> {
@@ -53,32 +89,16 @@ async fn test_duel_game() -> Result<()> {
 
     println!("Clients queued for duel mode");
 
-    // Wait for JoinGame messages first
-    let join_msg1 = timeout(Duration::from_secs(10), async {
-        client1.receive_message().await
-    })
-    .await??;
+    // Wait for JoinGame messages first, skipping unrelated messages
+    let join_id1 = wait_for_join_game(&mut client1, "Client1").await?;
+    println!("Client1 received JoinGame({})", join_id1);
 
-    println!("Client1 received: {:?}", join_msg1);
-
-    let join_msg2 = timeout(Duration::from_secs(10), async {
-        client2.receive_message().await
-    })
-    .await??;
-
-    println!("Client2 received: {:?}", join_msg2);
+    let join_id2 = wait_for_join_game(&mut client2, "Client2").await?;
+    println!("Client2 received JoinGame({})", join_id2);
 
     // Verify both clients received JoinGame messages for the same game
-    let game_id = match (&join_msg1, &join_msg2) {
-        (WSMessage::JoinGame(id1), WSMessage::JoinGame(id2)) => {
-            assert_eq!(id1, id2, "Both clients should join the same game");
-            *id1
-        }
-        _ => panic!(
-            "Expected JoinGame messages, got {:?} and {:?}",
-            join_msg1, join_msg2
-        ),
-    };
+    assert_eq!(join_id1, join_id2, "Both clients should join the same game");
+    let game_id = join_id1;
 
     println!("Both clients joined game {}", game_id);
 
@@ -88,19 +108,11 @@ async fn test_duel_game() -> Result<()> {
 
     println!("Clients acknowledged join");
 
-    // Now wait for game snapshots after joining
-    let msg1 = timeout(Duration::from_secs(10), async {
-        client1.receive_message().await
-    })
-    .await??;
-
+    // Now wait for game snapshots after joining, skipping unrelated messages
+    let msg1 = wait_for_snapshot(&mut client1, "Client1").await?;
     println!("Client1 received after join: {:?}", msg1);
 
-    let msg2 = timeout(Duration::from_secs(10), async {
-        client2.receive_message().await
-    })
-    .await??;
-
+    let msg2 = wait_for_snapshot(&mut client2, "Client2").await?;
     println!("Client2 received after join: {:?}", msg2);
 
     // Verify both clients received game snapshots and extract game_id and snake_ids
@@ -223,10 +235,13 @@ async fn test_duel_game() -> Result<()> {
                         snake2_head, snake2.team_id
                     );
 
-                    // Verify starting positions in endzones
-                    // One snake should be in left endzone (x=5), one in right endzone (x=35 for 40-width arena)
-                    let expected_left_x = 5;
-                    let expected_right_x = state1.arena.width as i16 - 5;
+                    // Verify starting positions in endzones.
+                    // Snakes spawn one cell inside their endzone boundary, facing the
+                    // goal gate: left head at end_zone_depth - 2, right head at
+                    // width - end_zone_depth + 1 (see calculate_team_starting_positions).
+                    let end_zone_depth = team_config.end_zone_depth as i16;
+                    let expected_left_x = end_zone_depth - 2;
+                    let expected_right_x = state1.arena.width as i16 - end_zone_depth + 1;
 
                     // Check that one snake is in left endzone and one in right
                     let has_left_snake =
@@ -247,7 +262,7 @@ async fn test_duel_game() -> Result<()> {
 
                     // Verify directions match positions
                     // Note: Team assignments alternate - first player gets TeamA, second gets TeamB
-                    // TeamA starts in left endzone (x=5), TeamB starts in right endzone (x=55)
+                    // TeamA (TeamId(0)) starts in the left endzone, TeamB (TeamId(1)) in the right
                     if snake1_head.x == expected_left_x {
                         assert_eq!(
                             snake1.direction,

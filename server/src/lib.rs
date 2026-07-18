@@ -16,6 +16,7 @@ pub mod region_cache;
 pub mod replay;
 pub mod replication;
 pub mod season;
+pub mod sync_trace;
 pub mod user_cache;
 pub mod ws_matchmaking;
 pub mod ws_server;

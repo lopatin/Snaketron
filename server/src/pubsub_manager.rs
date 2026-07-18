@@ -24,12 +24,33 @@ pub struct ChannelReceiver {
 }
 
 impl ChannelReceiver {
+    /// Receive the next message for this channel.
+    ///
+    /// Only a closed broadcast (shutdown) returns an error. Lagging behind
+    /// the shared Redis push firehose and malformed payloads are logged and
+    /// skipped — before this, either one propagated as a fatal error and the
+    /// subscription task above us broke its loop, permanently and silently
+    /// severing a partition's entire event/command feed on this server. Lost
+    /// messages surface downstream as stream_seq gaps, which trigger a
+    /// snapshot resync.
     pub async fn recv<T>(&mut self) -> Result<T>
     where
         T: DeserializeOwned + Send + 'static,
     {
         loop {
-            let PushInfo { kind, data } = self.inner.recv().await?;
+            let PushInfo { kind, data } = match self.inner.recv().await {
+                Ok(info) => info,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "Redis push receiver for channel {} lagged, {} pushes skipped; continuing (downstream gap detection will resync)",
+                        self.channel, skipped
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(anyhow!("Redis push broadcast closed"));
+                }
+            };
 
             if !matches!(kind, PushKind::Message) {
                 continue;
@@ -39,25 +60,25 @@ impl ChannelReceiver {
                 continue;
             };
 
-            let channel =
-                String::from_utf8(ch.clone()).context("Failed to parse channel name as UTF-8")?;
+            let channel = match String::from_utf8(ch.clone()) {
+                Ok(channel) => channel,
+                Err(e) => {
+                    warn!("Skipping Redis push with non-UTF-8 channel name: {}", e);
+                    continue;
+                }
+            };
 
             if channel != self.channel {
                 continue;
             }
 
-            let payload_str =
-                String::from_utf8(payload.clone()).context("Failed to parse payload as UTF-8")?;
-
-            let msg = serde_json::from_slice::<T>(payload).map_err(|e| {
-                anyhow!(
-                    "Failed to deserialize message from channel {}: {}",
-                    channel,
-                    e
-                )
-            })?;
-
-            return Ok(msg);
+            match serde_json::from_slice::<T>(payload) {
+                Ok(msg) => return Ok(msg),
+                Err(e) => {
+                    warn!("Skipping malformed message on channel {}: {}", channel, e);
+                    continue;
+                }
+            }
         }
     }
 }
@@ -147,18 +168,25 @@ impl PubSubManager {
         Ok(())
     }
 
-    /// Publish a snapshot to a partition channel and store in Redis
+    /// Publish a snapshot to a partition channel and store in Redis.
+    ///
+    /// `stream_seq` is the executor-assigned transport sequence for this
+    /// message (0 for pre-executor publishes, e.g. match creation). Returns
+    /// the constructed snapshot event so callers can trace exactly what was
+    /// published without rebuilding it.
     pub async fn publish_snapshot(
         &self,
         partition_id: u32,
         game_id: u32,
         snapshot: &GameState,
-    ) -> Result<()> {
+        stream_seq: u64,
+    ) -> Result<GameEventMessage> {
         // Create a snapshot event
         let event = GameEventMessage {
             game_id,
             tick: snapshot.tick,
             sequence: snapshot.event_sequence,
+            stream_seq,
             user_id: None,
             event: GameEvent::Snapshot {
                 game_state: snapshot.clone(),
@@ -178,27 +206,30 @@ impl PubSubManager {
         self.store_snapshot(game_id, snapshot).await?;
 
         info!(
-            "Published snapshot for game {} at tick {} to partition {}",
-            game_id, snapshot.tick, partition_id
+            "Published snapshot for game {} at tick {} to partition {} (stream_seq {})",
+            game_id, snapshot.tick, partition_id, stream_seq
         );
 
-        Ok(())
+        Ok(event)
     }
 
-    /// Store a reload snapshot without broadcasting it.
+    /// Store a game snapshot in Redis WITHOUT publishing it to subscribers.
     ///
-    /// The executor uses this to establish the terminal Redis fallback before publishing
-    /// completion events and, once persistence succeeds, releasing the in-memory copy.
+    /// Two callers rely on this: the game loop refreshes it periodically so a
+    /// takeover executor can resume in-flight games from near-current state
+    /// (see game_executor::resume_partition_games), and the completion path
+    /// stores the terminal state as the reload fallback before publishing
+    /// completion events and releasing the in-memory copy. 5-minute TTL: a
+    /// game whose executor stays dead longer than that is not resumable.
     pub async fn store_snapshot(&self, game_id: u32, snapshot: &GameState) -> Result<()> {
         let key = RedisKeys::game_snapshot(game_id);
-        let snapshot_data =
+        let data =
             serde_json::to_vec(snapshot).context("Failed to serialize snapshot for storage")?;
         let mut redis = self.redis.clone();
         let _: () = redis
-            .set_ex(&key, snapshot_data, 300)
+            .set_ex(&key, data, 300)
             .await
             .context("Failed to store snapshot")?;
-
         Ok(())
     }
 

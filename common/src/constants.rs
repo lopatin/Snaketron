@@ -18,3 +18,8 @@ pub const DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS: u32 = 90_000;
 
 /// Default interval for cluster singleton renewal in milliseconds
 pub const CLUSTER_RENEWAL_INTERVAL_MS: u64 = 150;
+
+/// How often (in committed ticks) the game executor publishes a TickHash
+/// heartbeat carrying the authoritative sync hash. Also used as a wall-clock
+/// cadence (interval * tick duration) when the committed tick is not advancing.
+pub const TICK_HASH_INTERVAL_TICKS: u32 = 10;

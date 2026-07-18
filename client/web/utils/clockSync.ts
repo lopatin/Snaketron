@@ -3,6 +3,8 @@
  * between client and server to compensate for clock drift.
  */
 
+import { record as recordTrace } from './syncTrace';
+
 interface SyncMeasurement {
   offset: number;
   rtt: number;
@@ -75,6 +77,8 @@ class ClockSync {
       this.measurements.shift();
     }
 
+    recordTrace({ Clock: { ts_ms: t3, drift_ms: offset, rtt_ms: rtt } });
+
     console.log(`Clock sync - RTT: ${rtt}ms, Offset: ${offset.toFixed(1)}ms, Total measurements: ${this.measurements.length}`);
   }
 
@@ -128,10 +132,20 @@ class ClockSync {
   }
 
   /**
-   * Clear all measurements
+   * Reset for a new connection, carrying the last known drift forward.
+   *
+   * Wiping measurements entirely would make getClockDrift() return 0 until
+   * several new Pongs arrive — snapping the game-loop time base by the full
+   * true drift on every reconnect. That spike used to mis-stamp command
+   * ticks (the snake stops responding right after a reconnect). The real
+   * clock offset barely changes across a reconnect, so seed the new window
+   * with the previous estimate and let fresh measurements displace it.
    */
   reset() {
-    this.measurements = [];
+    const carriedDrift = this.getClockDrift();
+    this.measurements = this.measurements.length > 0
+      ? [{ offset: carriedDrift, rtt: 0, timestamp: Date.now() }]
+      : [];
     this.syncsSent = 0;
   }
 }

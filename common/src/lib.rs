@@ -1,14 +1,18 @@
 mod ai;
 mod arena;
 mod constants;
+mod fingerprint;
 mod game_engine;
 mod game_state;
+pub mod replay;
 mod snake;
+pub mod trace;
 
 pub mod util;
 
 pub use ai::*;
 pub use constants::*;
+pub use fingerprint::SyncHasher;
 pub use game_engine::*;
 pub use game_state::*;
 pub use snake::*;

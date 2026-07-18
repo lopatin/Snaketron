@@ -11,6 +11,11 @@ use tracing::{debug, error, info, warn};
 /// In-memory game state storage
 pub type GameStateStore = Arc<RwLock<HashMap<u32, GameState>>>;
 
+/// Per-game last-seen transport stream_seq (the replica watermark).
+/// Updated together with `GameStateStore` while holding the state write lock,
+/// so a state clone and its watermark are always mutually consistent.
+pub type GameStreamSeqs = Arc<RwLock<HashMap<u32, u64>>>;
+
 /// Game event broadcast channels
 pub type GameEventBroadcasters = Arc<RwLock<HashMap<u32, broadcast::Sender<GameEventMessage>>>>;
 
@@ -21,11 +26,16 @@ pub struct ReplicationStatus {
     pub is_ready: bool,
 }
 
-/// A wrapper around broadcast::Receiver that filters out events before a certain sequence number
+/// A wrapper around broadcast::Receiver that filters out events already
+/// contained in the snapshot handed out alongside it.
+///
+/// Filtering uses the transport-level stream_seq when both the message and the
+/// snapshot watermark carry one (> 0); otherwise it falls back to the legacy
+/// engine event sequence, which is not reliably monotonic across snapshots.
 pub struct FilteredEventReceiver {
     inner: broadcast::Receiver<GameEventMessage>,
-    // sender: Arc<broadcast::Sender<GameEventMessage>>,
     min_sequence: u64,
+    min_stream_seq: u64,
     game_id: u32,
 }
 
@@ -33,47 +43,67 @@ impl FilteredEventReceiver {
     /// Create a new FilteredEventReceiver
     pub fn new(
         inner: broadcast::Receiver<GameEventMessage>,
-        sender: Arc<broadcast::Sender<GameEventMessage>>,
         min_sequence: u64,
+        min_stream_seq: u64,
         game_id: u32,
     ) -> Self {
         Self {
             inner,
-            // sender,
             min_sequence,
+            min_stream_seq,
             game_id,
         }
     }
 
-    /// Receive the next event that passes the filter
+    /// Receive the next event that passes the filter.
+    ///
+    /// `Err(Lagged(n))` is surfaced to the caller instead of being silently
+    /// swallowed: a lagged receiver has lost events, and the caller must
+    /// resync its downstream consumer (e.g. send a fresh snapshot). The
+    /// receiver stays usable afterwards and continues from the oldest
+    /// retained message.
     pub async fn recv(&mut self) -> Result<GameEventMessage, broadcast::error::RecvError> {
         loop {
-            let event = match self.inner.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        "Broadcast receiver for game {} lagged and skipped {} messages - receiver too slow!",
-                        self.game_id, skipped
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            let event = self.inner.recv().await?;
 
-            // Only forward events after our snapshot sequence
-            if event.sequence > self.min_sequence {
+            // Snapshots re-anchor the stream unconditionally. A restarted
+            // executor (failover/resume) begins a NEW stream_seq sequence
+            // starting near 1; filtering its snapshot as "stale" against the
+            // old stream's high watermark would wedge this subscriber — and
+            // its client — forever. Forward the snapshot and adopt its
+            // stream as the new baseline (mirrors the client engine, which
+            // also resets its watermark on every snapshot).
+            if matches!(event.event, GameEvent::Snapshot { .. }) {
+                self.min_stream_seq = event.stream_seq;
+                self.min_sequence = event.sequence;
                 debug!(
-                    "Forwarding event for game {} with sequence {} (min_sequence: {})",
-                    self.game_id, event.sequence, self.min_sequence
+                    "Forwarding snapshot for game {} and re-anchoring stream (stream_seq {})",
+                    self.game_id, event.stream_seq
                 );
                 return Ok(event);
-            } else {
-                debug!(
-                    "Filtering out stale event for game {} with sequence {} (min_sequence: {})",
-                    self.game_id, event.sequence, self.min_sequence
-                );
-                // Continue to next event
             }
+
+            let is_fresh = if event.stream_seq > 0 && self.min_stream_seq > 0 {
+                event.stream_seq > self.min_stream_seq
+            } else {
+                event.sequence > self.min_sequence
+            };
+
+            if is_fresh {
+                debug!(
+                    "Forwarding event for game {} (sequence {}, stream_seq {})",
+                    self.game_id, event.sequence, event.stream_seq
+                );
+                return Ok(event);
+            }
+            debug!(
+                "Filtering out stale event for game {} (sequence {} <= {}, stream_seq {} <= {})",
+                self.game_id,
+                event.sequence,
+                self.min_sequence,
+                event.stream_seq,
+                self.min_stream_seq
+            );
         }
     }
 }
@@ -84,8 +114,12 @@ pub struct PartitionReplica {
     pubsub: Arc<Mutex<PubSubManager>>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
+    game_stream_seqs: GameStreamSeqs,
     status: Arc<RwLock<ReplicationStatus>>,
     cancellation_token: CancellationToken,
+    /// Wall-clock ms of the last gap-triggered snapshot request, for
+    /// rate-limiting self-heal requests under sustained loss.
+    last_gap_request_ms: std::sync::atomic::AtomicI64,
 }
 
 impl PartitionReplica {
@@ -94,6 +128,7 @@ impl PartitionReplica {
         pubsub: Arc<Mutex<PubSubManager>>,
         game_states: GameStateStore,
         game_event_broadcasters: GameEventBroadcasters,
+        game_stream_seqs: GameStreamSeqs,
         cancellation_token: CancellationToken,
     ) -> Self {
         let status = Arc::new(RwLock::new(ReplicationStatus {
@@ -106,8 +141,10 @@ impl PartitionReplica {
             pubsub,
             game_states,
             game_event_broadcasters,
+            game_stream_seqs,
             status,
             cancellation_token,
+            last_gap_request_ms: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -125,6 +162,10 @@ impl PartitionReplica {
             let mut broadcasters = self.game_event_broadcasters.write().await;
             broadcasters.remove(&game_id);
         }
+        {
+            let mut seqs = self.game_stream_seqs.write().await;
+            seqs.remove(&game_id);
+        }
         info!(
             "Game {} durably completed; evicted from replication cache and dropped broadcasters",
             game_id
@@ -139,11 +180,44 @@ impl PartitionReplica {
             game_id, self.partition_id
         );
 
+        // Transport-integrity check. Redis pub/sub is at-most-once: a gap in
+        // stream_seq means this replica lost messages and its state can no
+        // longer be trusted, so ask the executor for fresh snapshots. Stale
+        // or duplicate messages are dropped instead of double-applied.
+        let is_snapshot = matches!(&event_msg.event, GameEvent::Snapshot { .. });
+        if event_msg.stream_seq > 0 {
+            let last = {
+                let seqs = self.game_stream_seqs.read().await;
+                seqs.get(&game_id).copied().unwrap_or(0)
+            };
+            if !is_snapshot && last > 0 {
+                if event_msg.stream_seq <= last {
+                    debug!(
+                        "Replica for partition {} dropping stale message for game {} (stream_seq {} <= {})",
+                        self.partition_id, game_id, event_msg.stream_seq, last
+                    );
+                    return Ok(());
+                }
+                if event_msg.stream_seq > last + 1 {
+                    warn!(
+                        "Replica for partition {} detected stream gap for game {}: expected {}, got {} ({} messages lost); requesting snapshots",
+                        self.partition_id,
+                        game_id,
+                        last + 1,
+                        event_msg.stream_seq,
+                        event_msg.stream_seq - last - 1
+                    );
+                    self.request_snapshots_rate_limited().await;
+                }
+            }
+        }
+
+
         match &event_msg.event {
             GameEvent::Snapshot { game_state } => {
                 info!(
-                    "Received snapshot for game {} at tick {}",
-                    game_id, event_msg.tick
+                    "Received snapshot for game {} at tick {} (stream_seq {})",
+                    game_id, event_msg.tick, event_msg.stream_seq
                 );
                 // Always update with the latest snapshot
                 let mut states = self.game_states.write().await;
@@ -152,10 +226,15 @@ impl PartitionReplica {
             _ => {
                 let mut states = self.game_states.write().await;
                 if let Some(game_state) = states.get_mut(&game_id) {
-                    // Tick forward until we reach the event's tick
-                    if event_msg.tick > game_state.tick {
+                    // Tick forward until we reach the event's tick. This must
+                    // loop: events can arrive more than one tick apart (quiet
+                    // stretches emit nothing), and catching up a single tick
+                    // per event leaves the replica permanently behind —
+                    // corrupting every join snapshot served from it.
+                    while game_state.tick < event_msg.tick {
                         if let Err(e) = game_state.tick_forward(true) {
                             error!("Error during tick_forward: {:?}", e);
+                            break;
                         }
                     }
 
@@ -169,6 +248,14 @@ impl PartitionReplica {
                     warn!("Received event for unknown game {}", game_id);
                 }
             }
+        }
+
+        // Record the watermark AFTER the state update so a concurrent
+        // subscribe_to_game (which reads watermark first, then state) can
+        // only over-deliver, never under-deliver.
+        if event_msg.stream_seq > 0 {
+            let mut seqs = self.game_stream_seqs.write().await;
+            seqs.insert(game_id, event_msg.stream_seq);
         }
 
         // Broadcast the event to any local subscribers
@@ -192,7 +279,33 @@ impl PartitionReplica {
             }
         }
 
+
         Ok(())
+    }
+
+    /// Ask the executor to republish snapshots for this partition, at most
+    /// once per second, so sustained loss doesn't turn into a request storm.
+    async fn request_snapshots_rate_limited(&self) {
+        use std::sync::atomic::Ordering;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let last = self.last_gap_request_ms.load(Ordering::Relaxed);
+        if now_ms - last < 1000 {
+            return;
+        }
+        if self
+            .last_gap_request_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return; // Another task just requested.
+        }
+        let mut pubsub = self.pubsub.lock().await;
+        if let Err(e) = pubsub.request_partition_snapshots(self.partition_id).await {
+            error!(
+                "Failed to request snapshots for partition {} after stream gap: {}",
+                self.partition_id, e
+            );
+        }
     }
 
     /// Run the replication worker
@@ -301,6 +414,7 @@ pub struct ReplicationManager {
     workers: Vec<tokio::task::JoinHandle<Result<()>>>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
+    game_stream_seqs: GameStreamSeqs,
     statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
     pubsub: Arc<Mutex<PubSubManager>>,
 }
@@ -349,39 +463,55 @@ impl ReplicationManager {
         pubsub.get_stored_snapshot(game_id).await
     }
 
-    /// Subscribe to game events for a specific game
-    /// Returns the current game state as a snapshot and a receiver for subsequent events
+    /// Subscribe to game events for a specific game.
+    /// Returns the current game state, its transport watermark (the
+    /// stream_seq already reflected in that state — stamp it onto snapshots
+    /// derived from the state), and a receiver for subsequent events.
+    ///
+    /// Ordering matters: the broadcast subscription is created BEFORE the
+    /// state is read. A broadcast receiver only sees messages sent after
+    /// `subscribe()`, so subscribing first guarantees no event between
+    /// snapshot and subscription can be missed; events already contained in
+    /// the snapshot are dropped by the stream_seq filter instead.
     pub async fn subscribe_to_game(
         &self,
         game_id: u32,
-    ) -> Result<(GameState, FilteredEventReceiver)> {
-        // Get state from memory or fail
+    ) -> Result<(GameState, u64, FilteredEventReceiver)> {
+        let receiver = {
+            let mut broadcasters = self.game_event_broadcasters.write().await;
+            broadcasters
+                .entry(game_id)
+                .or_insert_with(|| {
+                    let (tx, _) = broadcast::channel(1028);
+                    tx
+                })
+                .subscribe()
+        };
+
+        // Watermark is read BEFORE the state (separate locks): if an event
+        // lands in between, the filter under-estimates and re-delivers an
+        // event already in the state — harmless, receivers skip stale
+        // stream_seqs. The reverse order could silently drop an event.
+        let watermark = self.get_stream_seq(game_id).await;
         let game_state = self
             .get_game_state(game_id)
             .await
             .context("Game not available in replication manager")?;
 
-        // Get or create broadcast channel for this game. Acquires lock.
-        {
-            let mut broadcasters = self.game_event_broadcasters.write().await;
-            let sender = broadcasters.entry(game_id).or_insert_with(|| {
-                let (tx, _) = broadcast::channel(1028);
-                tx
-            });
+        let filtered_receiver = FilteredEventReceiver {
+            inner: receiver,
+            min_sequence: game_state.event_sequence,
+            min_stream_seq: watermark,
+            game_id,
+        };
 
-            let receiver = sender.subscribe();
+        Ok((game_state, watermark, filtered_receiver))
+    }
 
-            // Create filtered receiver
-            let snapshot_sequence = game_state.event_sequence;
-            let filtered_receiver = FilteredEventReceiver {
-                inner: receiver,
-                // sender: sender.clone(),
-                min_sequence: snapshot_sequence,
-                game_id,
-            };
-
-            Ok((game_state, filtered_receiver))
-        }
+    /// Last transport stream_seq applied to the replica state of a game.
+    pub async fn get_stream_seq(&self, game_id: u32) -> u64 {
+        let seqs = self.game_stream_seqs.read().await;
+        seqs.get(&game_id).copied().unwrap_or(0)
     }
 
     /// Get a game state, always ready with PubSub
@@ -441,6 +571,7 @@ impl ReplicationManager {
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
+        let game_stream_seqs: GameStreamSeqs = Arc::new(RwLock::new(HashMap::new()));
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
 
@@ -464,6 +595,7 @@ impl ReplicationManager {
                 pubsub.clone(),
                 game_states.clone(),
                 game_event_broadcasters.clone(),
+                game_stream_seqs.clone(),
                 cancellation_token.clone(),
             );
 
@@ -482,6 +614,7 @@ impl ReplicationManager {
             workers,
             game_states,
             game_event_broadcasters,
+            game_stream_seqs,
             statuses,
             pubsub,
         })
@@ -514,5 +647,93 @@ impl ReplicationManager {
             worker.await??;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilteredEventReceiver;
+    use common::{GameEvent, GameEventMessage, GameState, GameType, QueueMode};
+    use tokio::sync::broadcast;
+
+    fn event(sequence: u64, stream_seq: u64) -> GameEventMessage {
+        GameEventMessage {
+            game_id: 1,
+            tick: 1,
+            sequence,
+            stream_seq,
+            user_id: None,
+            event: GameEvent::TickHash {
+                hash: 0,
+                server_ts_ms: 0,
+            },
+        }
+    }
+
+    fn snapshot(sequence: u64, stream_seq: u64) -> GameEventMessage {
+        let state = GameState::new(
+            10,
+            10,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        GameEventMessage {
+            game_id: 1,
+            tick: 1,
+            sequence,
+            stream_seq,
+            user_id: None,
+            event: GameEvent::Snapshot { game_state: state },
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_drops_stale_and_passes_fresh_by_stream_seq() {
+        let (tx, rx) = broadcast::channel(16);
+        let mut filtered = FilteredEventReceiver::new(rx, 0, 500, 1);
+
+        tx.send(event(0, 400)).unwrap(); // stale: absorbed by the snapshot
+        tx.send(event(0, 501)).unwrap(); // fresh
+        let got = filtered.recv().await.unwrap();
+        assert_eq!(got.stream_seq, 501);
+    }
+
+    #[tokio::test]
+    async fn snapshot_re_anchors_stream_after_executor_restart() {
+        // Subscriber anchored to the OLD executor's stream at watermark 500.
+        let (tx, rx) = broadcast::channel(16);
+        let mut filtered = FilteredEventReceiver::new(rx, 0, 500, 1);
+
+        // A restarted executor begins a new stream: snapshot at stream_seq 2,
+        // then ordinary events 3, 4. Without re-anchoring, ALL of these would
+        // be filtered as stale (< 500) and the client would be wedged.
+        tx.send(snapshot(7, 2)).unwrap();
+        tx.send(event(8, 3)).unwrap();
+        tx.send(event(8, 2)).unwrap(); // duplicate/stale vs the new anchor
+        tx.send(event(9, 4)).unwrap();
+
+        let got = filtered.recv().await.unwrap();
+        assert!(matches!(got.event, GameEvent::Snapshot { .. }));
+        assert_eq!(got.stream_seq, 2);
+
+        let got = filtered.recv().await.unwrap();
+        assert_eq!(got.stream_seq, 3);
+
+        // The stale seq-2 event is skipped; next delivered is 4.
+        let got = filtered.recv().await.unwrap();
+        assert_eq!(got.stream_seq, 4);
+    }
+
+    #[tokio::test]
+    async fn legacy_messages_without_stream_seq_filter_by_engine_sequence() {
+        let (tx, rx) = broadcast::channel(16);
+        let mut filtered = FilteredEventReceiver::new(rx, 10, 0, 1);
+
+        tx.send(event(9, 0)).unwrap(); // stale by engine sequence
+        tx.send(event(11, 0)).unwrap(); // fresh
+        let got = filtered.recv().await.unwrap();
+        assert_eq!(got.sequence, 11);
     }
 }

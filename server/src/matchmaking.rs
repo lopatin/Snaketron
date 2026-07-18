@@ -1215,8 +1215,9 @@ async fn create_game_from_lobbies(
         game_state: game_state.clone(),
     };
 
+    // stream_seq 0: the executor owning the game loop assigns the stream.
     pubsub
-        .publish_snapshot(partition_id, game_id, &game_state)
+        .publish_snapshot(partition_id, game_id, &game_state, 0)
         .await
         .context("Failed to publish initial game snapshot")?;
 
@@ -1325,8 +1326,9 @@ pub async fn create_custom_match(
         game_state: game_state.clone(),
     };
 
+    // stream_seq 0: the executor owning the game loop assigns the stream.
     pubsub
-        .publish_snapshot(partition_id, game_id, &game_state)
+        .publish_snapshot(partition_id, game_id, &game_state, 0)
         .await?;
 
     pubsub.publish_command(partition_id, &event).await?;

@@ -12,6 +12,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Compile-only guard: every test binary in the workspace must build, even the
+  # ones that are not executed in CI. Without this, test targets that fail to
+  # compile silently provide zero coverage (see DEBUGGING.md postmortem).
+  compile-tests:
+    name: Compile All Test Targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+          protoc --version
+
+      - name: Compile all test targets (no run)
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          echo "Compiling every test target in the workspace..."
+          cargo test --all --no-run
+
   test:
     name: Run Simple Game Test
     runs-on: ubuntu-latest

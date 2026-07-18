@@ -8,7 +8,7 @@ use terminal::render::{
 #[test]
 fn test_2x1_rendering() {
     // Create a simple arena with one snake and one food
-    let mut arena = Arena {
+    let arena = Arena {
         width: 10,
         height: 10,
         snakes: vec![Snake {
@@ -19,8 +19,10 @@ fn test_2x1_rendering() {
             direction: Direction::Right,
             is_alive: true,
             food: 0,
+            team_id: None,
         }],
         food: vec![Position { x: 7, y: 7 }],
+        team_zone_config: None,
     };
 
     // Create renderer with 2x1 configuration
@@ -63,8 +65,10 @@ fn test_1x1_rendering() {
             direction: Direction::Right,
             is_alive: true,
             food: 0,
+            team_id: None,
         }],
         food: vec![Position { x: 3, y: 3 }],
+        team_zone_config: None,
     };
 
     // Create renderer with 1x1 configuration
@@ -101,6 +105,7 @@ fn test_custom_dimensions() {
         height: 3,
         snakes: vec![],
         food: vec![Position { x: 1, y: 1 }],
+        team_zone_config: None,
     };
 
     let char_dims = CharDimensions::new(3, 2);

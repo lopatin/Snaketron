@@ -24,6 +24,12 @@ pub struct GameEventMessage {
     pub game_id: u32,
     pub tick: u32,
     pub sequence: u64,
+    /// Transport-level sequence, assigned by the publishing game executor and
+    /// strictly monotonic per game across ALL published messages (events,
+    /// snapshots, tick hashes). Receivers detect lost messages by checking
+    /// contiguity. 0 means "unassigned" (legacy or locally constructed).
+    #[serde(default)]
+    pub stream_seq: u64,
     pub user_id: Option<u32>,
     pub event: GameEvent,
 }
@@ -73,6 +79,16 @@ pub enum GameEvent {
     XPAwarded {
         player_xp: HashMap<u32, u32>,
     }, // user_id -> xp_gained
+
+    /// Periodic server heartbeat carrying the authoritative state fingerprint
+    /// at the message's tick (see `GameState::sync_hash`). Clients compare it
+    /// against their own committed state to detect divergence, use its arrival
+    /// as a liveness signal, and use `server_ts_ms` as a clock reference.
+    /// Never mutates state.
+    TickHash {
+        hash: u64,
+        server_ts_ms: i64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1070,7 +1086,13 @@ impl GameState {
             }
         }
 
-        // Rollback and kill snakes that crashed
+        // Rollback and kill snakes that crashed.
+        // Sorted order is required for determinism: HashSet iteration order
+        // differs between processes (native server vs WASM client), and
+        // respawn events consume RNG / emit events whose order must be
+        // identical on both sides.
+        let mut died_snake_ids: Vec<u32> = died_snake_ids.into_iter().collect();
+        died_snake_ids.sort_unstable();
         for snake_id in died_snake_ids {
             self.arena.snakes[snake_id as usize] = old_snakes[snake_id as usize].clone();
             self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
@@ -1514,6 +1536,9 @@ impl GameState {
             GameEvent::XPAwarded { player_xp } => {
                 self.player_xp = player_xp;
             }
+
+            // Pure observability signal; state is never mutated by it.
+            GameEvent::TickHash { .. } => {}
         }
     }
 }

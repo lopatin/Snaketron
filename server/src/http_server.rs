@@ -147,6 +147,14 @@ pub async fn run_http_server(
         .route("/api/regions/user-counts", get(regions::get_user_counts))
         .with_state(state.clone());
 
+    // Debug/observability routes: clients upload their sync trace (flight
+    // recorder ring buffer) here when they detect a desync. Body capped at
+    // 10 MB; records are validated as TraceRecords before being persisted
+    // next to the server-side traces.
+    let debug_routes = Router::new()
+        .route("/api/debug/client-trace", post(upload_client_trace))
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
+
     // Build leaderboard routes with LeaderboardState
     let leaderboard_state = LeaderboardState { db: db.clone() };
     let leaderboard_routes = Router::new()
@@ -182,6 +190,7 @@ pub async fn run_http_server(
         .merge(region_routes)
         .merge(leaderboard_routes)
         .merge(protected_leaderboard_routes)
+        .merge(debug_routes)
         .with_state(auth_state);
 
     // Build main router combining API and WebSocket endpoints
@@ -207,6 +216,67 @@ pub async fn run_http_server(
         })
         .await
         .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
+}
+
+#[derive(serde::Deserialize)]
+struct ClientTraceUpload {
+    game_id: u32,
+    user_id: u32,
+    records: Vec<serde_json::Value>,
+}
+
+/// Persist a client-side sync trace next to the server traces so a desync
+/// can be analyzed from both perspectives (see DEBUGGING.md).
+async fn upload_client_trace(
+    axum::Json(upload): axum::Json<ClientTraceUpload>,
+) -> impl IntoResponse {
+    // Validate every record parses as a TraceRecord; a malformed trace is
+    // rejected rather than persisted half-usable.
+    let mut records = Vec::with_capacity(upload.records.len());
+    for (idx, value) in upload.records.into_iter().enumerate() {
+        match serde_json::from_value::<common::trace::TraceRecord>(value) {
+            Ok(record) => records.push(record),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("record {} is not a valid TraceRecord: {}", idx, e),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let config = crate::sync_trace::TraceConfig::from_env();
+    let game_id = upload.game_id;
+    let user_id = upload.user_id;
+    // File I/O is small (<=10MB) but still blocking; keep it off the reactor.
+    let result = tokio::task::spawn_blocking(move || {
+        crate::sync_trace::write_client_trace(&config, game_id, user_id, &records)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(path)) => {
+            info!(
+                "Stored client sync trace for game {} user {} at {:?}",
+                game_id, user_id, path
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "Failed to store client trace for game {} user {}: {}",
+                game_id,
+                user_id,
+                e
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Client trace writer task panicked: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// WebSocket upgrade handler

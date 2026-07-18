@@ -54,6 +54,11 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 ## Project Structure
 - The _old directory can be fully ignored for all purposes
 
+## Debugging State Sync
+- Read DEBUGGING.md before touching anything related to game-state synchronization, event delivery, or client prediction. It documents the sync primitives (state fingerprints, TickHash heartbeats, stream_seq transport sequencing, flight-recorder traces) and the trace-to-local-repro workflow.
+- For a reported desync/phantom-death/ghost-game issue, use the debug-desync skill (.claude/skills/debug-desync).
+- The chaos suite server/tests/sync_equivalence_test.rs is the regression barrier for sync bugs: any change to the engine, executor publishing, or client reconciliation must keep it green.
+
 ## Development Notes
 - When developing migrations, just update the V1 migration, instead of adding a new one. And then, when necessary to run tests, clear / restart the db docker container before running them if necessary.
 - When modifying Snake position vectors, always remember to use the compressed Snake representation where the snake vector contains the head, turns, and tail, rather than every point of the logical snake. The logic is described in the code at @common/src/snake.rs in the `step_forward` function. For example, a straight snake of length 5 should have only 2 positions in the body vector, not 5.

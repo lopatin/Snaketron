@@ -1,11 +1,14 @@
 use crate::db::Database;
 use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotRequest};
 use crate::redis_keys::RedisKeys;
+use crate::replication::GameStateReader;
+use crate::sync_trace::GameTraceRecorder;
 use crate::xp_persistence;
 use anyhow::{Context, Result};
+use common::trace::{TRACE_FORMAT_VERSION, TraceRecord, TraceSide};
 use common::{
     EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
-    GameState, GameStatus,
+    GameState, GameStatus, TICK_HASH_INTERVAL_TICKS,
 };
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -81,6 +84,42 @@ pub enum StreamEvent {
     },
 }
 
+/// Decides when to emit a TickHash heartbeat: every `interval_ticks` committed
+/// ticks, or the equivalent span of wall time when the committed tick is not
+/// advancing (pre-start, completion pending) so it doubles as a liveness
+/// signal.
+pub(crate) struct TickHashCadence {
+    interval_ticks: u32,
+    interval_ms: i64,
+    last_tick: u32,
+    last_ms: i64,
+}
+
+impl TickHashCadence {
+    pub(crate) fn new(
+        interval_ticks: u32,
+        tick_duration_ms: u32,
+        start_tick: u32,
+        start_ms: i64,
+    ) -> Self {
+        Self {
+            interval_ticks,
+            interval_ms: interval_ticks as i64 * tick_duration_ms.max(1) as i64,
+            last_tick: start_tick,
+            last_ms: start_ms,
+        }
+    }
+
+    pub(crate) fn due(&self, tick: u32, now_ms: i64) -> bool {
+        tick >= self.last_tick + self.interval_ticks || now_ms >= self.last_ms + self.interval_ms
+    }
+
+    pub(crate) fn mark(&mut self, tick: u32, now_ms: i64) {
+        self.last_tick = tick;
+        self.last_ms = now_ms;
+    }
+}
+
 /// Create a game engine and run the game loop for a specific game.
 async fn run_game(
     server_id: u64,
@@ -95,28 +134,60 @@ async fn run_game(
     info!("run_game called for game {}", game_id);
     let partition_id = game_id % PARTITION_COUNT;
 
-    // Create the game engine from the provided game state
-    let _start_ms = chrono::Utc::now().timestamp_millis();
+    // Transport-level sequence for every message this executor publishes for
+    // the game. Strictly monotonic starting at 1; receivers detect lost
+    // messages via contiguity.
+    let mut stream_seq: u64 = 0;
 
     // If the game is in Stopped status, start it before creating the engine
     let mut initial_state = game_state;
-    if matches!(initial_state.status, GameStatus::Stopped) {
+    let publish_started = matches!(initial_state.status, GameStatus::Stopped);
+    if publish_started {
         info!("Game {} is in Stopped status, starting it", game_id);
         initial_state.status = GameStatus::Started { server_id };
+    }
 
+    // Flight recorder: Meta + full initial state (including rng) form the
+    // deterministic replay anchor. Recorder failures never break the loop.
+    let mut recorder = GameTraceRecorder::for_server_game(game_id);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    recorder.record(&TraceRecord::Meta {
+        version: TRACE_FORMAT_VERSION,
+        side: TraceSide::Server,
+        game_id,
+        session: server_id.to_string(),
+        ts_ms: now_ms,
+        build: env!("CARGO_PKG_VERSION").to_string(),
+        tick_duration_ms: initial_state.properties.tick_duration_ms,
+    });
+    recorder.record(&TraceRecord::State {
+        ts_ms: now_ms,
+        tick: initial_state.tick,
+        state: Box::new(initial_state.clone()),
+    });
+
+    if publish_started {
         // Emit status update event
+        stream_seq += 1;
         let status_event = GameEventMessage {
             game_id,
             tick: initial_state.tick,
             sequence: initial_state.event_sequence + 1,
+            stream_seq,
             user_id: None,
             event: GameEvent::StatusUpdated {
                 status: GameStatus::Started { server_id },
             },
         };
 
-        if let Err(e) = pubsub.publish_event(partition_id, &status_event).await {
+        let publish_result = pubsub.publish_event(partition_id, &status_event).await;
+        recorder.record(&TraceRecord::EventOut {
+            ts_ms: now_ms,
+            msg: Box::new(status_event),
+        });
+        if let Err(e) = publish_result {
             error!("Failed to publish game started status: {}", e);
+            recorder.note(format!("failed to publish game started status: {}", e));
         }
     }
 
@@ -128,12 +199,34 @@ async fn run_game(
     );
 
     // Publish initial snapshot
-    if let Err(e) = pubsub
-        .publish_snapshot(partition_id, game_id, &engine.get_committed_state())
+    stream_seq += 1;
+    match pubsub
+        .publish_snapshot(
+            partition_id,
+            game_id,
+            engine.get_committed_state(),
+            stream_seq,
+        )
         .await
     {
-        error!("Failed to publish initial snapshot: {}", e);
+        Ok(snapshot_event) => {
+            recorder.record(&TraceRecord::EventOut {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                msg: Box::new(snapshot_event),
+            });
+        }
+        Err(e) => {
+            error!("Failed to publish initial snapshot: {}", e);
+            recorder.note(format!("failed to publish initial snapshot: {}", e));
+        }
     }
+
+    let mut hash_cadence = TickHashCadence::new(
+        TICK_HASH_INTERVAL_TICKS,
+        engine.get_committed_state().properties.tick_duration_ms,
+        engine.current_tick(),
+        chrono::Utc::now().timestamp_millis(),
+    );
 
     let mut interval = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -144,6 +237,7 @@ async fn run_game(
 
             _ = cancellation_token.cancelled() => {
                 info!("Game loop for game {} shutting down", game_id);
+                recorder.note("game loop cancelled");
                 break;
             }
 
@@ -152,9 +246,22 @@ async fn run_game(
                 debug!("Received snapshot request for partition {}", request.partition_id);
                 // Only publish snapshot if this game belongs to the requested partition
                 if game_id % PARTITION_COUNT == request.partition_id {
-                    let snapshot = engine.get_committed_state();
-                    if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &snapshot).await {
-                        error!("Failed to publish requested snapshot: {}", e);
+                    recorder.note(format!(
+                        "snapshot requested for partition {} by {:?}",
+                        request.partition_id, request.requester_id
+                    ));
+                    stream_seq += 1;
+                    match pubsub.publish_snapshot(partition_id, game_id, engine.get_committed_state(), stream_seq).await {
+                        Ok(snapshot_event) => {
+                            recorder.record(&TraceRecord::EventOut {
+                                ts_ms: chrono::Utc::now().timestamp_millis(),
+                                msg: Box::new(snapshot_event),
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to publish requested snapshot: {}", e);
+                            recorder.note(format!("failed to publish requested snapshot: {}", e));
+                        }
                     }
                 }
             }
@@ -164,27 +271,42 @@ async fn run_game(
                 debug!("Processing command for game {}. Command: {:?}",
                     game_id, command);
 
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                recorder.record(&TraceRecord::CmdIn {
+                    ts_ms: now_ms,
+                    cmd: command.clone(),
+                });
+
                 // Process the command through the game engine
                 match engine.process_command(command) {
                     Ok(scheduled_command) => {
                         // Emit CommandScheduled event
                         let event = GameEvent::CommandScheduled { command_message: scheduled_command };
                         let current_state = engine.get_committed_state();
+                        stream_seq += 1;
                         let event_msg = GameEventMessage {
                             game_id,
                             tick: engine.current_tick(),
                             sequence: current_state.event_sequence + 1,
+                            stream_seq,
                             user_id: None,
                             event,
                         };
 
                         // Publish event via PubSub
-                        if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
+                        let publish_result = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                        recorder.record(&TraceRecord::EventOut {
+                            ts_ms: now_ms,
+                            msg: Box::new(event_msg),
+                        });
+                        if let Err(e) = publish_result {
                             warn!("Failed to publish command scheduled event: {}", e);
+                            recorder.note(format!("failed to publish command scheduled event: {}", e));
                         }
                     }
                     Err(e) => {
                         warn!("Failed to process command for game {}: {:?}", game_id, e);
+                        recorder.note(format!("failed to process command: {:?}", e));
                     }
                 }
             }
@@ -236,17 +358,71 @@ async fn run_game(
                         };
 
                         for (tick, sequence, event) in &events {
+                            stream_seq += 1;
                             let event_msg = GameEventMessage {
                                 game_id,
                                 tick: *tick,
                                 sequence: *sequence,
+                                stream_seq,
                                 user_id: None,
                                 event: event.clone(),
                             };
 
                             // Publish event via PubSub
-                            if let Err(e) = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await {
+                            let publish_result = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                            recorder.record(&TraceRecord::EventOut {
+                                ts_ms: now_ms,
+                                msg: Box::new(event_msg),
+                            });
+                            if let Err(e) = publish_result {
                                 warn!("Failed to publish game event: {}", e);
+                                recorder.note(format!("failed to publish game event: {}", e));
+                            }
+                        }
+
+                        let committed_tick = engine.current_tick();
+
+                        // Publish the TickHash heartbeat: on the tick cadence,
+                        // on the equivalent wall-clock cadence when ticks are
+                        // not advancing, and immediately on completion (final
+                        // authoritative hash).
+                        if game_completed || hash_cadence.due(committed_tick, now_ms) {
+                            stream_seq += 1;
+                            let hash = engine.committed_sync_hash();
+                            let hash_msg = GameEventMessage {
+                                game_id,
+                                tick: committed_tick,
+                                sequence: engine.get_committed_state().event_sequence,
+                                stream_seq,
+                                user_id: None,
+                                event: GameEvent::TickHash { hash, server_ts_ms: now_ms },
+                            };
+                            let publish_result = pubsub.publish_event(partition_id, &hash_msg).await;
+                            recorder.record(&TraceRecord::EventOut {
+                                ts_ms: now_ms,
+                                msg: Box::new(hash_msg),
+                            });
+                            if let Err(e) = publish_result {
+                                warn!("Failed to publish tick hash: {}", e);
+                                recorder.note(format!("failed to publish tick hash: {}", e));
+                            }
+                            recorder.record(&TraceRecord::Fingerprint {
+                                ts_ms: now_ms,
+                                tick: committed_tick,
+                                hash,
+                            });
+                            recorder.flush();
+                            hash_cadence.mark(committed_tick, now_ms);
+
+                            // Refresh the stored (not published) snapshot at
+                            // the same cadence so a takeover executor can
+                            // resume this game from <=1s-stale state.
+                            if let Err(e) = pubsub
+                                .store_snapshot(game_id, engine.get_committed_state())
+                                .await
+                            {
+                                warn!("Failed to refresh stored snapshot for game {}: {}", game_id, e);
+                                recorder.note(format!("failed to refresh stored snapshot: {}", e));
                             }
                         }
 
@@ -255,8 +431,18 @@ async fn run_game(
                             info!("Game {} has completed, exiting game loop", game_id);
 
                             // Publish final snapshot
-                            if let Err(e) = pubsub.publish_snapshot(partition_id, game_id, &game_state).await {
-                                warn!("Failed to publish final snapshot: {}", e);
+                            stream_seq += 1;
+                            match pubsub.publish_snapshot(partition_id, game_id, game_state, stream_seq).await {
+                                Ok(snapshot_event) => {
+                                    recorder.record(&TraceRecord::EventOut {
+                                        ts_ms: now_ms,
+                                        msg: Box::new(snapshot_event),
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("Failed to publish final snapshot: {}", e);
+                                    recorder.note(format!("failed to publish final snapshot: {}", e));
+                                }
                             }
 
                             // Completion events and the final Redis snapshot are already visible
@@ -318,22 +504,106 @@ async fn run_game(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error running game tick: {:?}", e);
+                        error!("Error running game tick: {:?}", e);
+                        recorder.note(format!("error running game tick: {:?}", e));
                     }
                 }
             }
         }
     }
+
+    // Final state + flush regardless of how the loop ended (completion,
+    // cancellation, error) so the trace always has a terminal anchor.
+    let final_state = engine.get_committed_state();
+    recorder.record(&TraceRecord::State {
+        ts_ms: chrono::Utc::now().timestamp_millis(),
+        tick: final_state.tick,
+        state: Box::new(final_state.clone()),
+    });
+    recorder.flush();
+}
+
+/// Load every stored game snapshot from Redis (game:snapshot:* keys, written
+/// by publish_snapshot and refreshed at TickHash cadence by live game loops).
+/// Unreadable entries are skipped with a warning — resume is best-effort.
+pub async fn load_stored_snapshots(redis: &mut ConnectionManager) -> Vec<(u32, GameState)> {
+    use redis::AsyncCommands;
+
+    let prefix = crate::redis_keys::RedisKeys::game_snapshot(0);
+    let prefix = prefix.trim_end_matches('0');
+    let pattern = format!("{}*", prefix);
+
+    let keys: Vec<String> = {
+        let mut keys = Vec::new();
+        match redis.scan_match::<_, String>(&pattern).await {
+            Ok(mut iter) => {
+                while let Some(key) = iter.next_item().await {
+                    keys.push(key);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to scan stored game snapshots: {}", e);
+                return Vec::new();
+            }
+        }
+        keys
+    };
+
+    let mut games = Vec::new();
+    for key in keys {
+        let Some(game_id) = key
+            .strip_prefix(prefix)
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match redis.get::<_, Option<Vec<u8>>>(&key).await {
+            Ok(Some(bytes)) => match serde_json::from_slice::<GameState>(&bytes) {
+                Ok(state) => games.push((game_id, state)),
+                Err(e) => warn!("Skipping unreadable stored snapshot {}: {}", key, e),
+            },
+            Ok(None) => {} // expired between scan and get
+            Err(e) => warn!("Failed to read stored snapshot {}: {}", key, e),
+        }
+    }
+    games
+}
+
+/// Choose which games a freshly started partition executor must resume.
+/// Replica states (event-current) take precedence over stored snapshots
+/// (periodically refreshed, slightly staler). Completed games are never
+/// resumed; Stopped ones are (their GameCreated message may have been lost
+/// while no executor was listening — run_game starts them).
+pub fn select_resumable_games(
+    partition_id: u32,
+    replica_games: Vec<(u32, GameState)>,
+    snapshot_games: Vec<(u32, GameState)>,
+) -> Vec<(u32, GameState)> {
+    let mut by_id: HashMap<u32, GameState> = HashMap::new();
+    for (game_id, state) in snapshot_games {
+        by_id.insert(game_id, state);
+    }
+    for (game_id, state) in replica_games {
+        by_id.insert(game_id, state);
+    }
+
+    let mut resumable: Vec<(u32, GameState)> = by_id
+        .into_iter()
+        .filter(|(game_id, _)| game_id % PARTITION_COUNT == partition_id)
+        .filter(|(_, state)| !matches!(state.status, GameStatus::Complete { .. }))
+        .collect();
+    resumable.sort_by_key(|(game_id, _)| *game_id);
+    resumable
 }
 
 /// Run the game executor service for a specific partition
 pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
-    redis: ConnectionManager,
+    mut redis: ConnectionManager,
     mut pubsub_manager: PubSubManager,
     db: Arc<dyn Database>,
-    _replication_manager: Arc<crate::replication::ReplicationManager>,
+    replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     info!(
@@ -420,6 +690,40 @@ pub async fn run_game_executor(
 
         true
     };
+
+    // Resume in-flight games. This executor only starts once this server
+    // holds the partition lease, so any game found here belongs to an
+    // executor that died or lost its lease — without this, those games were
+    // cancelled forever and later player commands silently discarded. The
+    // replica state (event-current) wins over stored Redis snapshots
+    // (refreshed at TickHash cadence, so <=~1s stale); snapshots cover games
+    // this server's replica never saw, including games whose GameCreated
+    // pub/sub message was lost while no executor was listening. run_game
+    // re-anchors clients by publishing a fresh snapshot first, which resets
+    // stream_seq watermarks all the way down.
+    {
+        let replica_games = replication_manager.get_partition_games(partition_id).await;
+        let snapshot_games = load_stored_snapshots(&mut redis).await;
+        let resumable = select_resumable_games(partition_id, replica_games, snapshot_games);
+        if !resumable.is_empty() {
+            info!(
+                "Partition {} resuming {} in-flight game(s) after executor (re)start: {:?}",
+                partition_id,
+                resumable.len(),
+                resumable.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+            );
+        }
+        for (game_id, game_state) in resumable {
+            try_start_game(
+                game_id,
+                game_state,
+                pubsub_manager.clone(),
+                db.clone(),
+                cancellation_token.clone(),
+                &mut game_channels,
+            );
+        }
+    }
 
     loop {
         tokio::select! {
@@ -515,4 +819,118 @@ pub async fn run_game_executor(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PARTITION_COUNT, TickHashCadence, select_resumable_games};
+    use common::{GameState, GameStatus, GameType, QueueMode};
+
+    fn state(status: GameStatus, tick: u32) -> GameState {
+        let mut s = GameState::new(
+            10,
+            10,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        s.status = status;
+        s.tick = tick;
+        s
+    }
+
+    #[test]
+    fn resume_selects_started_and_stopped_games_for_own_partition() {
+        let partition = 3;
+        let own_started = partition; // game_id % PARTITION_COUNT == partition
+        let own_stopped = partition + PARTITION_COUNT;
+        let own_complete = partition + 2 * PARTITION_COUNT;
+        let other_partition = partition + 1;
+
+        let snapshot_games = vec![
+            (own_started, state(GameStatus::Started { server_id: 1 }, 50)),
+            (own_stopped, state(GameStatus::Stopped, 0)),
+            (
+                own_complete,
+                state(
+                    GameStatus::Complete {
+                        winning_snake_id: None,
+                    },
+                    99,
+                ),
+            ),
+            (
+                other_partition,
+                state(GameStatus::Started { server_id: 1 }, 10),
+            ),
+        ];
+
+        let resumable = select_resumable_games(partition, Vec::new(), snapshot_games);
+        let ids: Vec<u32> = resumable.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![own_started, own_stopped]);
+    }
+
+    #[test]
+    fn resume_prefers_replica_state_over_stored_snapshot() {
+        let partition = 0;
+        let game_id = PARTITION_COUNT; // partition 0
+        let replica = vec![(game_id, state(GameStatus::Started { server_id: 1 }, 120))];
+        let snapshot = vec![(game_id, state(GameStatus::Started { server_id: 1 }, 90))];
+
+        let resumable = select_resumable_games(partition, replica, snapshot);
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(
+            resumable[0].1.tick, 120,
+            "replica (event-current) state must win"
+        );
+    }
+
+    #[test]
+    fn resume_skips_games_completed_per_replica_even_if_snapshot_is_stale() {
+        let partition = 0;
+        let game_id = PARTITION_COUNT;
+        let replica = vec![(
+            game_id,
+            state(
+                GameStatus::Complete {
+                    winning_snake_id: Some(0),
+                },
+                200,
+            ),
+        )];
+        let snapshot = vec![(game_id, state(GameStatus::Started { server_id: 1 }, 150))];
+
+        let resumable = select_resumable_games(partition, replica, snapshot);
+        assert!(
+            resumable.is_empty(),
+            "a completed game must never be resurrected"
+        );
+    }
+
+    #[test]
+    fn tick_hash_due_on_tick_cadence() {
+        let cadence = TickHashCadence::new(10, 100, 0, 0);
+        assert!(!cadence.due(5, 100));
+        assert!(cadence.due(10, 100));
+        assert!(cadence.due(15, 100));
+    }
+
+    #[test]
+    fn tick_hash_due_on_wall_clock_when_ticks_stall() {
+        // 10 ticks * 100ms = 1000ms heartbeat interval.
+        let cadence = TickHashCadence::new(10, 100, 0, 0);
+        assert!(!cadence.due(0, 999));
+        assert!(cadence.due(0, 1000));
+    }
+
+    #[test]
+    fn tick_hash_mark_resets_both_cadences() {
+        let mut cadence = TickHashCadence::new(10, 100, 0, 0);
+        assert!(cadence.due(10, 500));
+        cadence.mark(10, 500);
+        assert!(!cadence.due(19, 1499));
+        assert!(cadence.due(20, 600));
+        assert!(cadence.due(19, 1500));
+    }
 }
