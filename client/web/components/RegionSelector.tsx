@@ -6,12 +6,14 @@ interface RegionSelectorProps {
   regions: Region[];
   currentRegionId: string;
   onRegionChange: (regionId: string) => void;
+  placement?: 'top' | 'bottom';
 }
 
 export const RegionSelector: React.FC<RegionSelectorProps> = ({
   regions,
   currentRegionId,
-  onRegionChange
+  onRegionChange,
+  placement = 'bottom',
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -41,21 +43,30 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
     <div className="relative" ref={dropdownRef}>
       {/* Current Region Button */}
       <button
+        type="button"
         onClick={() => setIsOpen(!isOpen)}
-        className="text-sm text-black-70 font-bold uppercase tracking-1 bg-transparent border border-black-70 rounded px-3 py-1 cursor-pointer hover:bg-gray-50 transition-colors flex items-center gap-2"
+        className="region-selector-trigger"
+        aria-expanded={isOpen}
+        aria-haspopup="listbox"
       >
+        <span className="region-selector-icon" aria-hidden="true">
+          <NetworkIcon className="w-4 h-4" />
+          {currentRegion && (
+            <ConnectionIndicator
+              isConnected={currentRegion.isConnected}
+              className="region-selector-connection"
+            />
+          )}
+        </span>
+        <span className="region-selector-label">{currentRegion?.name || 'Select Region'}</span>
         {currentRegion && (
-          <ConnectionIndicator isConnected={currentRegion.isConnected} className="flex-shrink-0" />
-        )}
-        {currentRegion?.name || 'Select Region'}
-        {currentRegion && (
-          <div className="flex items-center gap-1" style={{ letterSpacing: '0' }}>
+          <span className="region-selector-population">
             <UserIcon className="w-3 h-3 text-gray-500" />
             <span className="tabular-nums">{currentRegion.userCount}</span>
-          </div>
+          </span>
         )}
         <svg
-          className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+          className={`region-selector-chevron ${isOpen ? 'rotate-180' : ''}`}
           fill="none"
           stroke="currentColor"
           viewBox="0 0 24 24"
@@ -67,11 +78,11 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
       {/* Dropdown List */}
       {isOpen && (
         <div
-          className="absolute right-0 mt-2 bg-white rounded-lg z-50 region-dropdown"
-          style={{
-            minWidth: '240px',
-            border: '2px solid rgba(0, 0, 0, 0.2)'
-          }}
+          className={`region-selector-dropdown absolute bg-white rounded-lg z-50 region-dropdown ${
+            placement === 'top' ? 'bottom-full mb-2 left-0' : 'right-0 mt-2'
+          }`}
+          role="listbox"
+          aria-label="Game regions"
         >
           {regions.map((region, index) => (
             <div
@@ -81,8 +92,11 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({
               }}
             >
               <button
+                type="button"
                 onClick={() => handleRegionSelect(region.id)}
-                className="group w-full px-4 py-2 flex items-center gap-3 text-left cursor-pointer"
+                className="region-selector-option group w-full px-4 py-2 flex items-center gap-3 text-left cursor-pointer"
+                role="option"
+                aria-selected={region.id === currentRegionId}
               >
                 {/* Connection Indicator */}
                 <ConnectionIndicator isConnected={region.isConnected} className="flex-shrink-0" />

@@ -113,26 +113,16 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
   const unreadLabel = unreadCount > 99 ? '99+' : unreadCount.toString();
 
   return (
-    <div className="fixed bottom-4 right-4 z-30 flex flex-col items-end gap-3">
+    <div className="home-lobby-chat fixed bottom-4 right-4 z-30 flex flex-col items-end gap-3">
       {!isExpanded && (
         <button
           type="button"
           onClick={handleExpand}
-          className={`
-            group relative flex items-center gap-2 rounded-full border-2 px-3 py-1.5 font-bold uppercase tracking-1 text-xs
-            transition-transform duration-150 cursor-pointer
-            ${hasUnread
-              ? 'border-black-70 text-black-70 bg-white hover:-translate-y-0.5'
-              : 'border-gray-300 text-gray-500 bg-white/90 opacity-80'
-            }
-          `}
+          className={`home-chat-trigger ${hasUnread ? 'has-unread' : ''}`}
           aria-label="Open chat"
         >
           <span
-            className={`
-              relative -ml-1 flex h-8 w-8 items-center justify-center rounded-full
-              ${hasUnread ? 'bg-black-70 text-white' : 'bg-gray-200 text-gray-600'}
-            `}
+            className={`home-chat-icon ${hasUnread ? 'has-unread' : ''}`}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -149,19 +139,19 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
               />
             </svg>
             {hasUnread && (
-              <span className="absolute -top-1 -right-1 rounded-full bg-rose-500 text-white text-[10px] font-bold px-1.5 py-0.5 shadow">
+              <span className="absolute -top-1 -right-1 rounded bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5">
                 {unreadLabel}
               </span>
             )}
           </span>
-          <span className="text-sm font-semibold normal-case">{title}</span>
+          <span className="home-chat-label">{title}</span>
         </button>
       )}
 
       {isExpanded && (
-        <div className="w-80 rounded-2xl border border-black/20 bg-white shadow-lg overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 bg-white">
-            <div className="text-xs font-semibold uppercase tracking-1 text-black-70">
+        <div className="home-chat-panel w-80 rounded-lg border-2 border-gray-300 bg-white overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 bg-white border-b-2 border-gray-100">
+            <div className="text-xs font-black italic uppercase tracking-1 text-black-70">
               {title}
             </div>
             <button
