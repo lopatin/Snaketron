@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useId } from 'react';
 import { ChatMessage } from '../types';
 
 interface LobbyChatProps {
@@ -35,14 +35,27 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
   const [inputValue, setInputValue] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const panelId = useId();
+  const panelTitleId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const collapseButtonRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const previousMessageCountRef = useRef(0);
   const hasInitializedRef = useRef(false);
   const hasManuallyCollapsedRef = useRef(false);
+  const shouldFocusPanelRef = useRef(false);
+  const shouldRestoreTriggerFocusRef = useRef(false);
+  const canSendMessage = Boolean(currentUsername && isActive);
 
   const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
-    if (isExpanded) {
-      messagesEndRef.current?.scrollIntoView({ behavior });
+    const messagesContainer = messagesContainerRef.current;
+    if (isExpanded && messagesContainer) {
+      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      messagesContainer.scrollTo({
+        top: messagesContainer.scrollHeight,
+        behavior: prefersReducedMotion ? 'auto' : behavior
+      });
     }
   };
 
@@ -79,6 +92,16 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
     }
   }, [isExpanded]);
 
+  useEffect(() => {
+    if (isExpanded && shouldFocusPanelRef.current) {
+      shouldFocusPanelRef.current = false;
+      (canSendMessage ? inputRef.current : collapseButtonRef.current)?.focus();
+    } else if (!isExpanded && shouldRestoreTriggerFocusRef.current) {
+      shouldRestoreTriggerFocusRef.current = false;
+      triggerRef.current?.focus();
+    }
+  }, [isExpanded, canSendMessage]);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = inputValue.trim();
@@ -89,12 +112,14 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
     }
   };
 
-  const handleCollapse = () => {
+  const handleCollapse = (event: React.MouseEvent<HTMLButtonElement>) => {
+    shouldRestoreTriggerFocusRef.current = event.detail === 0;
     setIsExpanded(false);
     hasManuallyCollapsedRef.current = true;
   };
 
-  const handleExpand = () => {
+  const handleExpand = (event: React.MouseEvent<HTMLButtonElement>) => {
+    shouldFocusPanelRef.current = event.detail === 0;
     setIsExpanded(true);
   };
 
@@ -102,7 +127,6 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
     return null; // Hidden in mobile mode
   }
 
-  const canSendMessage = Boolean(currentUsername && isActive);
   const statusMessage = !currentUsername
     ? 'Login to chat'
     : isActive
@@ -113,13 +137,21 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
   const unreadLabel = unreadCount > 99 ? '99+' : unreadCount.toString();
 
   return (
-    <div className="home-lobby-chat fixed bottom-4 right-4 z-30 flex flex-col items-end gap-3">
+    <div
+      className={`home-lobby-chat fixed bottom-4 right-4 z-30 flex flex-col items-end gap-3 ${isExpanded ? 'is-expanded' : ''}`}
+    >
       {!isExpanded && (
         <button
+          ref={triggerRef}
           type="button"
           onClick={handleExpand}
           className={`home-chat-trigger ${hasUnread ? 'has-unread' : ''}`}
-          aria-label="Open chat"
+          aria-label={hasUnread
+            ? `Open ${title}, ${unreadLabel} unread ${unreadCount === 1 ? 'message' : 'messages'}`
+            : `Open ${title}`
+          }
+          aria-controls={panelId}
+          aria-expanded={false}
         >
           <span
             className={`home-chat-icon ${hasUnread ? 'has-unread' : ''}`}
@@ -149,16 +181,28 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
       )}
 
       {isExpanded && (
-        <div className="home-chat-panel w-80 rounded-lg border-2 border-gray-300 bg-white overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 bg-white border-b-2 border-gray-100">
-            <div className="text-xs font-black italic uppercase tracking-1 text-black-70">
+        <div
+          id={panelId}
+          className="home-chat-panel"
+          role="region"
+          aria-labelledby={panelTitleId}
+        >
+          <div className="home-chat-panel-header">
+            <div id={panelTitleId} className="home-chat-panel-title">
+              <span
+                className={`home-chat-panel-status ${canSendMessage ? 'is-active' : ''}`}
+                aria-hidden="true"
+              />
               {title}
             </div>
             <button
+              ref={collapseButtonRef}
               type="button"
               onClick={handleCollapse}
-              className="flex h-7 w-7 items-center justify-center text-black-70 hover:text-black cursor-pointer transition-colors"
+              className="home-chat-collapse"
               aria-label="Minimize chat"
+              aria-controls={panelId}
+              aria-expanded={true}
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -173,44 +217,52 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
             </button>
           </div>
 
-          <div className="flex flex-col" style={{ maxHeight: '320px' }}>
-            <div className="flex-1 overflow-y-auto px-4 pt-2 pb-3 space-y-1">
+          <div className="home-chat-content">
+            <div
+              ref={messagesContainerRef}
+              className="home-chat-messages"
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions text"
+              aria-label={`${title} messages`}
+            >
               {messages.length === 0 ? (
-                <div className="text-xs text-gray-500 italic py-4">
+                <div className="home-chat-empty">
                   No messages yet
                 </div>
               ) : (
                 messages.map((msg) => (
-                  <div key={msg.id}>
+                  <div key={msg.id} className="home-chat-message">
                     {msg.type === 'system' ? (
-                      <div className="text-xs text-gray-500 italic py-0.5">
+                      <div className="home-chat-system-message">
                         {msg.message}
                       </div>
                     ) : (
-                      <div className="text-xs leading-relaxed">
-                        <span className="font-bold text-black-70">{msg.username ?? 'Player'}:</span>
-                        <span className="text-black-70 ml-1">{msg.message}</span>
+                      <div className="home-chat-player-message">
+                        <span className="home-chat-username">{msg.username ?? 'Player'}</span>
+                        <span className="home-chat-message-text">{msg.message}</span>
                       </div>
                     )}
                   </div>
                 ))
               )}
-              <div ref={messagesEndRef} />
             </div>
 
             {statusMessage ? (
-              <div className="px-4 pb-3 text-xs text-gray-500 italic">
+              <div className="home-chat-unavailable">
                 {statusMessage}
               </div>
             ) : (
-              <form onSubmit={handleSubmit} className="px-4 pb-4 pt-2">
-                <div className="flex gap-2">
+              <form onSubmit={handleSubmit} className="home-chat-composer">
+                <div className="home-chat-composer-row">
                   <input
+                    ref={inputRef}
                     type="text"
                     value={inputValue}
                     onChange={(e) => setInputValue(e.target.value)}
                     placeholder="Say something..."
-                    className="flex-1 px-3 py-2 text-xs bg-white border border-gray-300 rounded-lg focus:outline-none focus:border-black-70 transition-colors"
+                    aria-label="Chat message"
+                    className="home-chat-input"
                     maxLength={200}
                     disabled={!canSendMessage}
                   />
@@ -218,11 +270,10 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
                     type="submit"
                     disabled={!inputValue.trim() || !canSendMessage}
                     className={`
-                      px-3 py-2 rounded-lg font-bold uppercase text-[11px] tracking-1 border
-                      transition-all
+                      home-chat-send
                       ${inputValue.trim() && canSendMessage
-                        ? 'bg-white border-black-70 text-black-70 hover:bg-gray-50 cursor-pointer'
-                        : 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
+                        ? 'is-ready'
+                        : ''
                       }
                     `}
                   >

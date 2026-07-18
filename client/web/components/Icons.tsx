@@ -48,6 +48,57 @@ export const UserIcon = ({ className = '' }) => (
   </svg>
 );
 
+export const UserPlusIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={1.8}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M15 19a6 6 0 00-12 0m6-8a4 4 0 100-8 4 4 0 000 8zm9-4v6m3-3h-6"
+    />
+  </svg>
+);
+
+export const KeyIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={1.8}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M10.5 13.5a5 5 0 11-2-2L21 11.5v4h-3v3h-3v-3h-4.5"
+    />
+  </svg>
+);
+
+export const LogoutIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={1.8}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M10 5H5v14h5m4-3 4-4-4-4m4 4H9"
+    />
+  </svg>
+);
+
 export const ConnectionIndicator = ({ className = '', isConnected = false }) => (
   <div
     className={`w-2 h-2 rounded-full ${className}`}
