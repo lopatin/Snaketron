@@ -717,6 +717,28 @@ pub async fn run_game_executor(
             );
         }
         for (game_id, game_state) in resumable {
+            // Completion-race guard: the durable store may already hold this
+            // game's terminal state while Redis still has the immediately
+            // preceding active snapshot (the previous executor died between
+            // persisting completion and the snapshot expiring). Resuming
+            // would resurrect a finished game and could re-complete it with
+            // a different outcome, so the durable verdict wins. DB errors
+            // fall through to resume: dropping a live game is worse than
+            // briefly resurrecting a finished one.
+            match db.get_game_by_id(game_id as i32).await {
+                Ok(Some(game)) if game.status == "complete" => {
+                    info!(
+                        "Partition {} not resuming game {}: durable store already records completion",
+                        partition_id, game_id
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "Resume guard could not check durable state for game {}: {}",
+                    game_id, e
+                ),
+            }
             try_start_game(
                 game_id,
                 game_state,
