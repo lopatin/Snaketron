@@ -1,11 +1,9 @@
 use crate::game_executor::StreamEvent;
 use crate::redis_keys::RedisKeys;
-use crate::redis_utils;
 use anyhow::{Context, Result, anyhow};
-use common::{GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus};
-use futures_util::{Stream, StreamExt};
-use redis::aio::{ConnectionManager, PubSub};
-use redis::{AsyncCommands, Client, PushInfo, PushKind, Value};
+use common::{GameEvent, GameEventMessage, GameState};
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, PushInfo, PushKind, Value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

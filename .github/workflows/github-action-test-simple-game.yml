@@ -51,9 +51,15 @@ jobs:
           cargo test --all --no-run
 
   test:
-    name: Run Simple Game Test
+    name: Run Tests (bus=${{ matrix.bus }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both game-bus transports must pass the full suite (see
+        # STREAMS_MIGRATION.md).
+        bus: [pubsub, streams]
     
     services:
       postgres:
@@ -128,10 +134,11 @@ jobs:
           DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
           TEST_DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
+          SNAKETRON_BUS: ${{ matrix.bus }}
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |
-          echo "Running all tests..."
+          echo "Running all tests with SNAKETRON_BUS=${{ matrix.bus }}..."
           cargo test --all -- --nocapture --test-threads=1
           
       - name: Upload test results

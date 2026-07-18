@@ -1,3 +1,4 @@
+use crate::game_bus::{BusKind, GameBus};
 use crate::game_executor::{PARTITION_COUNT, StreamEvent};
 use crate::pubsub_manager::{PartitionSubscription, PubSubManager};
 use anyhow::{Context, Result};
@@ -111,7 +112,7 @@ impl FilteredEventReceiver {
 /// PartitionReplica subscribes to partition events via PubSub and maintains game states
 pub struct PartitionReplica {
     partition_id: u32,
-    pubsub: Arc<Mutex<PubSubManager>>,
+    bus: Arc<GameBus>,
     game_states: GameStateStore,
     game_event_broadcasters: GameEventBroadcasters,
     game_stream_seqs: GameStreamSeqs,
@@ -125,7 +126,7 @@ pub struct PartitionReplica {
 impl PartitionReplica {
     pub fn new(
         partition_id: u32,
-        pubsub: Arc<Mutex<PubSubManager>>,
+        bus: Arc<GameBus>,
         game_states: GameStateStore,
         game_event_broadcasters: GameEventBroadcasters,
         game_stream_seqs: GameStreamSeqs,
@@ -138,7 +139,7 @@ impl PartitionReplica {
 
         Self {
             partition_id,
-            pubsub,
+            bus,
             game_states,
             game_event_broadcasters,
             game_stream_seqs,
@@ -212,7 +213,6 @@ impl PartitionReplica {
             }
         }
 
-
         match &event_msg.event {
             GameEvent::Snapshot { game_state } => {
                 info!(
@@ -279,7 +279,6 @@ impl PartitionReplica {
             }
         }
 
-
         Ok(())
     }
 
@@ -299,8 +298,11 @@ impl PartitionReplica {
         {
             return; // Another task just requested.
         }
-        let mut pubsub = self.pubsub.lock().await;
-        if let Err(e) = pubsub.request_partition_snapshots(self.partition_id).await {
+        if let Err(e) = self
+            .bus
+            .request_partition_snapshots(self.partition_id)
+            .await
+        {
             error!(
                 "Failed to request snapshots for partition {} after stream gap: {}",
                 self.partition_id, e
@@ -316,14 +318,12 @@ impl PartitionReplica {
         );
 
         // Subscribe to the partition
-        let mut pubsub = self.pubsub.lock().await;
-        let subscription = pubsub.subscribe_to_partition(self.partition_id).await?;
+        let subscription = self.bus.subscribe_to_partition(self.partition_id).await?;
 
         // Request initial snapshots for this partition
-        pubsub
+        self.bus
             .request_partition_snapshots(self.partition_id)
             .await?;
-        drop(pubsub); // Release lock
 
         // Destructure subscription so each receiver can be borrowed independently in select!
         let PartitionSubscription {
@@ -416,7 +416,7 @@ pub struct ReplicationManager {
     game_event_broadcasters: GameEventBroadcasters,
     game_stream_seqs: GameStreamSeqs,
     statuses: Arc<RwLock<HashMap<u32, Arc<RwLock<ReplicationStatus>>>>>,
-    pubsub: Arc<Mutex<PubSubManager>>,
+    bus: Arc<GameBus>,
 }
 
 /// API for querying replicated game states
@@ -459,8 +459,7 @@ impl ReplicationManager {
     /// while their final snapshot remains in Redis for a short grace period. Callers can use
     /// this method before falling back to durable storage.
     pub async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
-        let mut pubsub = self.pubsub.lock().await;
-        pubsub.get_stored_snapshot(game_id).await
+        self.bus.get_stored_snapshot(game_id).await
     }
 
     /// Subscribe to game events for a specific game.
@@ -568,6 +567,7 @@ impl ReplicationManager {
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
         redis_url: &str,
+        bus_kind: BusKind,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
@@ -575,24 +575,29 @@ impl ReplicationManager {
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
 
-        // Create Redis client and connection manager
+        // The replication workers get their own Redis connection (and thus
+        // their own push firehose under pubsub), isolated from the main
+        // server's connection.
         let redis_client = redis::Client::open(redis_url)?;
         let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
         let redis =
-            crate::redis_utils::create_connection_manager(redis_client, pubsub_tx.clone()).await?;
+            crate::redis_utils::create_connection_manager(redis_client.clone(), pubsub_tx.clone())
+                .await?;
 
-        // Create PubSub manager
-        let pubsub = Arc::new(Mutex::new(PubSubManager::new(
+        let pubsub = PubSubManager::new(redis.clone(), pubsub_tx, cancellation_token.clone());
+        let bus = Arc::new(GameBus::new(
+            bus_kind,
+            pubsub,
             redis,
-            pubsub_tx,
+            redis_client,
             cancellation_token.clone(),
-        )));
+        ));
 
         for partition_id in partitions {
             // Create worker
             let worker = PartitionReplica::new(
                 partition_id,
-                pubsub.clone(),
+                bus.clone(),
                 game_states.clone(),
                 game_event_broadcasters.clone(),
                 game_stream_seqs.clone(),
@@ -616,7 +621,7 @@ impl ReplicationManager {
             game_event_broadcasters,
             game_stream_seqs,
             statuses,
-            pubsub,
+            bus,
         })
     }
 

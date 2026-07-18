@@ -19,6 +19,7 @@ use crate::api::middleware::auth_middleware;
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
 use crate::db::Database;
+use crate::game_bus::GameBus;
 use crate::lobby_manager::LobbyManager;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
@@ -43,8 +44,10 @@ pub struct HttpServerState {
     pub redis: ConnectionManager,
     /// Redis URL for creating new connections
     pub redis_url: String,
-    /// PubSub manager for Redis pub/sub operations
+    /// PubSub manager for loss-tolerant fan-out (chat, lobby, counters)
     pub pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
+    /// Game-critical message bus (transport per SNAKETRON_BUS)
+    pub game_bus: Arc<GameBus>,
     /// Matchmaking manager for queue operations
     pub matchmaking_manager:
         Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
@@ -75,6 +78,7 @@ pub async fn run_http_server(
     redis: ConnectionManager,
     redis_url: String,
     pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
+    game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
     replication_manager: Arc<ReplicationManager>,
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -94,6 +98,7 @@ pub async fn run_http_server(
         redis: redis.clone(),
         redis_url,
         pubsub_manager,
+        game_bus,
         matchmaking_manager,
         replication_manager,
         cancellation_token: cancellation_token.clone(),
@@ -300,6 +305,7 @@ async fn websocket_handler(
             state.redis,
             state.redis_url,
             state.pubsub_manager,
+            state.game_bus,
             state.matchmaking_manager,
             state.replication_manager,
             state.cancellation_token,

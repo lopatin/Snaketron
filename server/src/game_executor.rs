@@ -1,5 +1,6 @@
 use crate::db::Database;
-use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotRequest};
+use crate::game_bus::GameBus;
+use crate::pubsub_manager::{PartitionSubscription, SnapshotRequest};
 use crate::redis_keys::RedisKeys;
 use crate::replication::GameStateReader;
 use crate::sync_trace::GameTraceRecorder;
@@ -125,7 +126,7 @@ async fn run_game(
     server_id: u64,
     game_id: u32,
     game_state: GameState,
-    mut pubsub: PubSubManager,
+    bus: Arc<GameBus>,
     mut command_receiver: mpsc::Receiver<GameCommandMessage>,
     mut snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
     db: Arc<dyn Database>,
@@ -180,7 +181,7 @@ async fn run_game(
             },
         };
 
-        let publish_result = pubsub.publish_event(partition_id, &status_event).await;
+        let publish_result = bus.publish_event(partition_id, &status_event).await;
         recorder.record(&TraceRecord::EventOut {
             ts_ms: now_ms,
             msg: Box::new(status_event),
@@ -200,7 +201,7 @@ async fn run_game(
 
     // Publish initial snapshot
     stream_seq += 1;
-    match pubsub
+    match bus
         .publish_snapshot(
             partition_id,
             game_id,
@@ -251,7 +252,7 @@ async fn run_game(
                         request.partition_id, request.requester_id
                     ));
                     stream_seq += 1;
-                    match pubsub.publish_snapshot(partition_id, game_id, engine.get_committed_state(), stream_seq).await {
+                    match bus.publish_snapshot(partition_id, game_id, engine.get_committed_state(), stream_seq).await {
                         Ok(snapshot_event) => {
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: chrono::Utc::now().timestamp_millis(),
@@ -294,7 +295,7 @@ async fn run_game(
                         };
 
                         // Publish event via PubSub
-                        let publish_result = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                        let publish_result = bus.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
                         recorder.record(&TraceRecord::EventOut {
                             ts_ms: now_ms,
                             msg: Box::new(event_msg),
@@ -324,7 +325,7 @@ async fn run_game(
                             // Establish the terminal grace-period cache before any Complete event
                             // can evict replicas. This keeps refreshes loadable while durable
                             // persistence retries outside the client-visible completion path.
-                            if let Err(e) = pubsub.store_snapshot(game_id, &game_state).await {
+                            if let Err(e) = bus.store_snapshot(game_id, &game_state).await {
                                 error!(
                                     "Failed to store terminal reload snapshot for game {}: {:?}",
                                     game_id, e
@@ -369,7 +370,7 @@ async fn run_game(
                             };
 
                             // Publish event via PubSub
-                            let publish_result = pubsub.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                            let publish_result = bus.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: now_ms,
                                 msg: Box::new(event_msg),
@@ -397,7 +398,7 @@ async fn run_game(
                                 user_id: None,
                                 event: GameEvent::TickHash { hash, server_ts_ms: now_ms },
                             };
-                            let publish_result = pubsub.publish_event(partition_id, &hash_msg).await;
+                            let publish_result = bus.publish_event(partition_id, &hash_msg).await;
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: now_ms,
                                 msg: Box::new(hash_msg),
@@ -417,7 +418,7 @@ async fn run_game(
                             // Refresh the stored (not published) snapshot at
                             // the same cadence so a takeover executor can
                             // resume this game from <=1s-stale state.
-                            if let Err(e) = pubsub
+                            if let Err(e) = bus
                                 .store_snapshot(game_id, engine.get_committed_state())
                                 .await
                             {
@@ -432,7 +433,7 @@ async fn run_game(
 
                             // Publish final snapshot
                             stream_seq += 1;
-                            match pubsub.publish_snapshot(partition_id, game_id, game_state, stream_seq).await {
+                            match bus.publish_snapshot(partition_id, game_id, game_state, stream_seq).await {
                                 Ok(snapshot_event) => {
                                     recorder.record(&TraceRecord::EventOut {
                                         ts_ms: now_ms,
@@ -473,7 +474,7 @@ async fn run_game(
                             // Replicas use this command as the durable-commit marker. Never evict
                             // the authoritative completed state when persistence did not succeed.
                             if completion_is_durable {
-                                if let Err(e) = pubsub.publish_command(
+                                if let Err(e) = bus.publish_command(
                                     partition_id,
                                     &StreamEvent::StatusUpdated {
                                         game_id,
@@ -601,7 +602,7 @@ pub async fn run_game_executor(
     server_id: u64,
     partition_id: u32,
     mut redis: ConnectionManager,
-    mut pubsub_manager: PubSubManager,
+    bus: Arc<GameBus>,
     db: Arc<dyn Database>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
@@ -617,7 +618,7 @@ pub async fn run_game_executor(
     //     .context("Failed to create PubSub manager")?;
 
     // Subscribe to partition commands and snapshot requests
-    let partition_sub = pubsub_manager
+    let partition_sub = bus
         .subscribe_to_partition(partition_id)
         .await
         .context("Failed to subscribe to partition")?;
@@ -640,7 +641,7 @@ pub async fn run_game_executor(
 
     let try_start_game = |game_id: u32,
                           game_state: GameState,
-                          pubsub: PubSubManager,
+                          bus: Arc<GameBus>,
                           db: Arc<dyn Database>,
                           cancellation_token: CancellationToken,
                           game_channels: &mut HashMap<
@@ -678,7 +679,7 @@ pub async fn run_game_executor(
                 server_id,
                 game_id,
                 game_state,
-                pubsub,
+                bus,
                 cmd_rx,
                 snap_rx,
                 db,
@@ -717,7 +718,7 @@ pub async fn run_game_executor(
             try_start_game(
                 game_id,
                 game_state,
-                pubsub_manager.clone(),
+                bus.clone(),
                 db.clone(),
                 cancellation_token.clone(),
                 &mut game_channels,
@@ -760,13 +761,13 @@ pub async fn run_game_executor(
                 match command_data {
                     StreamEvent::GameCreated { game_id, game_state } => {
                         info!("Received GameCreated event for game {}", game_id);
-                        let pubsub_clone = pubsub_manager.clone();
+                        let bus_clone = bus.clone();
                         let db_clone = db.clone();
                         let cancellation_token_clone = cancellation_token.clone();
                         let accepted = try_start_game(
                             game_id,
                             game_state,
-                            pubsub_clone,
+                            bus_clone,
                             db_clone,
                             cancellation_token_clone,
                             &mut game_channels

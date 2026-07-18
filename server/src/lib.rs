@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cluster_singleton;
 pub mod db;
+pub mod game_bus;
 pub mod game_executor;
 pub mod game_server;
 pub mod grpc_server;

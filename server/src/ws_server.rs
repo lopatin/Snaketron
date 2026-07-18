@@ -1,5 +1,6 @@
 use crate::api::auth::validate_username;
 use crate::db::Database;
+use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager;
@@ -327,6 +328,7 @@ pub async fn handle_websocket(
     redis: ConnectionManager,
     redis_url: String,
     pubsub_manager: Arc<PubSubManager>,
+    game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
@@ -341,6 +343,7 @@ pub async fn handle_websocket(
         db,
         user_cache.clone(),
         pubsub_manager,
+        game_bus,
         matchmaking_manager,
         jwt_verifier,
         cancellation_token,
@@ -362,6 +365,7 @@ async fn handle_websocket_connection(
     db: Arc<dyn Database>,
     user_cache: UserCache,
     pubsub_manager: Arc<PubSubManager>,
+    game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
@@ -565,7 +569,7 @@ async fn handle_websocket_connection(
                                         &db,
                                         user_cache.clone(),
                                         &ws_tx,
-                                        &pubsub_manager,
+                                        &game_bus,
                                         &matchmaking_manager,
                                         &replication_manager,
                                         &redis,
@@ -1565,6 +1569,7 @@ async fn send_game_snapshot(
         game_id,
         tick: game_state.tick,
         sequence: game_state.event_sequence,
+        stream_seq: 0, // terminal snapshot; no live stream follows
         user_id: Some(user_id),
         event: GameEvent::Snapshot {
             game_state: game_state.clone(),
@@ -1758,7 +1763,7 @@ async fn process_ws_message(
     db: &Arc<dyn Database>,
     user_cache: UserCache,
     ws_tx: &mpsc::Sender<Message>,
-    pubsub_manager: &Arc<PubSubManager>,
+    game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
     redis: &ConnectionManager,
@@ -2860,11 +2865,11 @@ async fn process_ws_message(
                             command: command_message,
                         };
 
-                        // Send command via PubSub
-                        match pubsub_manager.publish_command(partition_id, &event).await {
+                        // Send command via the game bus
+                        match game_bus.publish_command(partition_id, &event).await {
                             Ok(_) => {
                                 debug!(
-                                    "Successfully submitted game command via PubSub: {:?}",
+                                    "Successfully submitted game command via the game bus: {:?}",
                                     event
                                 );
                                 Ok(ConnectionState::Authenticated {

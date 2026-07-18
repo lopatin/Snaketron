@@ -65,7 +65,7 @@ async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
     let expected = completed_game_state();
 
     manager
-        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &expected)
+        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &expected, 0)
         .await?;
 
     let actual = manager

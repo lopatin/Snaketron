@@ -248,3 +248,4 @@ every hop; traces make any surviving bug replayable offline.
 | `SNAKETRON_TRACE_DIR` | `./traces` | Where server + uploaded client traces go |
 | `SNAKETRON_TRACE_DISABLE` | unset | `1` disables the server flight recorder |
 | `SNAKETRON_TRACE_MAX_FILES` | `200` | Trace-dir rotation limit |
+| `SNAKETRON_BUS` | `streams` | Game-critical transport: `streams` (default) or `pubsub` fallback (see STREAMS_MIGRATION.md). On `streams`, the gap/resync counters should sit at ~0 — nonzero values there mean a transport bug |

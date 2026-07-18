@@ -2,6 +2,7 @@ use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode};
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use server::db::DURABLE_GAME_ID_FLOOR;
+use server::game_bus::{BusKind, GameBus};
 use server::game_executor::{PARTITION_COUNT, StreamEvent, run_game_executor};
 use server::matchmaking_manager::MatchmakingManager;
 use server::pubsub_manager::PubSubManager;
@@ -245,7 +246,18 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
     let (push_tx, _) = broadcast::channel(16);
     let publisher_connection =
         create_connection_manager(redis_client.clone(), push_tx.clone()).await?;
-    let publisher = PubSubManager::new(publisher_connection, push_tx, CancellationToken::new());
+    // Publish on the same transport the test server's replicas subscribe to.
+    let publisher = GameBus::new(
+        BusKind::from_env(),
+        PubSubManager::new(
+            publisher_connection.clone(),
+            push_tx,
+            CancellationToken::new(),
+        ),
+        publisher_connection,
+        redis_client.clone(),
+        CancellationToken::new(),
+    );
     let partition_id = game_id % PARTITION_COUNT;
 
     // Pub/Sub startup is asynchronous. Republish until this server's replica proves the live
@@ -253,7 +265,7 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
     timeout(Duration::from_secs(10), async {
         loop {
             publisher
-                .publish_snapshot(partition_id, game_id, &live_state)
+                .publish_snapshot(partition_id, game_id, &live_state, 0)
                 .await?;
             if env
                 .server(0)
@@ -328,8 +340,20 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
         .await?;
 
     let (push_tx, _) = broadcast::channel(16);
-    let publisher_connection = create_connection_manager(redis_client, push_tx.clone()).await?;
-    let publisher = PubSubManager::new(publisher_connection, push_tx, CancellationToken::new());
+    let publisher_connection =
+        create_connection_manager(redis_client.clone(), push_tx.clone()).await?;
+    // Publish on the same transport the test server's replicas subscribe to.
+    let publisher = GameBus::new(
+        BusKind::from_env(),
+        PubSubManager::new(
+            publisher_connection.clone(),
+            push_tx,
+            CancellationToken::new(),
+        ),
+        publisher_connection,
+        redis_client.clone(),
+        CancellationToken::new(),
+    );
 
     let server_addr = env.ws_addr(0).expect("test server should be running");
     let mut client = TestClient::connect(&server_addr).await?;
@@ -341,7 +365,7 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
     // snapshot after GameCreated was already acknowledged.
     tokio::time::sleep(Duration::from_millis(200)).await;
     publisher
-        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &live_state)
+        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &live_state, 0)
         .await?;
 
     let loaded_state = receive_snapshot(&mut client).await?;
@@ -493,6 +517,15 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
         push_tx.clone(),
         cancellation_token.clone(),
     );
+    // This test drives hand-built Pub/Sub publishers, so the executor's bus
+    // is pinned to pubsub independent of the SNAKETRON_BUS test matrix.
+    let executor_bus = Arc::new(GameBus::new(
+        BusKind::PubSub,
+        executor_pubsub,
+        executor_connection.clone(),
+        redis_client.clone(),
+        cancellation_token.clone(),
+    ));
     let publisher_pubsub = PubSubManager::new(
         executor_connection.clone(),
         push_tx,
@@ -503,6 +536,7 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
             vec![partition_id],
             cancellation_token.clone(),
             &std::env::var("SNAKETRON_REDIS_URL")?,
+            BusKind::PubSub,
         )
         .await?,
     );
@@ -513,7 +547,7 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
             4242,
             partition_id,
             executor_connection,
-            executor_pubsub,
+            executor_bus,
             executor_db,
             replication_manager,
             executor_token,

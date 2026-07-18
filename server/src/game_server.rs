@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::api::jwt::JwtManager;
+use crate::game_bus::{BusKind, GameBus};
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::http_server::run_http_server;
@@ -152,6 +153,20 @@ impl GameServer {
             cancellation_token.clone(),
         ));
 
+        // Create the game-critical message bus (transport per SNAKETRON_BUS).
+        // Loss-tolerant fan-out (chat/lobby/counters) stays on the
+        // PubSubManager regardless of this setting.
+        let bus_kind = BusKind::from_env();
+        info!("Game bus transport: {:?}", bus_kind);
+        let game_bus = Arc::new(GameBus::new(
+            bus_kind,
+            (*pubsub_manager).clone(),
+            redis.clone(),
+            Client::open(redis_url.clone())
+                .context("Failed to create Redis client for game bus")?,
+            cancellation_token.clone(),
+        ));
+
         // Create the LobbyManager
         let lobby_manager = Arc::new(LobbyManager::new(
             redis.clone(),
@@ -180,7 +195,7 @@ impl GameServer {
         // Start the matchmaking service
         info!("Starting matchmaking service");
         let match_token = cancellation_token.clone();
-        let match_pubsub_manager = (*pubsub_manager).clone();
+        let match_game_bus = game_bus.clone();
         let match_matchmaking_manager = matchmaking_manager.clone();
         let match_lobby_manager = lobby_manager.clone();
         let match_db = db.clone();
@@ -190,7 +205,7 @@ impl GameServer {
             drop(match_matchmaking_manager); // Drop the lock
             if let Err(e) = run_matchmaking_loop(
                 mm,
-                match_pubsub_manager,
+                match_game_bus,
                 match_token,
                 match_lobby_manager,
                 match_db,
@@ -209,6 +224,7 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
+                bus_kind,
             )
             .await
             .context("Failed to create replication manager")?,
@@ -243,7 +259,7 @@ impl GameServer {
             let exec_redis_clone = redis.clone();
             let exec_db = db.clone();
             let exec_replication_manager = replication_manager.clone();
-            let exec_pubsub_manager = pubsub_manager.clone();
+            let exec_game_bus = game_bus.clone();
 
             handles.push(tokio::spawn(async move {
                 info!(
@@ -270,7 +286,7 @@ impl GameServer {
                     let server_id_clone = server_id;
                     let partition_id_clone = partition_id;
                     let exec_redis_clone = exec_redis_clone.clone();
-                    let exec_pubsub_manager_clone = (*exec_pubsub_manager).clone();
+                    let exec_game_bus_clone = exec_game_bus.clone();
                     let exec_db = exec_db.clone();
                     let exec_replication_manager = exec_replication_manager.clone();
 
@@ -284,7 +300,7 @@ impl GameServer {
                             server_id_clone,
                             partition_id_clone,
                             exec_redis_clone,
-                            exec_pubsub_manager_clone,
+                            exec_game_bus_clone,
                             exec_db,
                             exec_replication_manager,
                             token,
@@ -322,6 +338,7 @@ impl GameServer {
         let http_redis = redis.clone();
         let http_redis_url = redis_url.clone();
         let http_pubsub_manager = pubsub_manager.clone();
+        let http_game_bus = game_bus.clone();
         let http_matchmaking_manager = matchmaking_manager.clone();
         let http_replication_manager = replication_manager.clone();
         let http_cancellation_token = cancellation_token.clone();
@@ -338,6 +355,7 @@ impl GameServer {
                 http_redis,
                 http_redis_url,
                 http_pubsub_manager,
+                http_game_bus,
                 http_matchmaking_manager,
                 http_replication_manager,
                 http_cancellation_token,

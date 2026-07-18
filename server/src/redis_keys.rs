@@ -178,6 +178,23 @@ impl RedisKeys {
         format!("game:creation-ack:{}", game_id)
     }
 
+    // === Game Bus Streams Keys (SNAKETRON_BUS=streams) ===
+
+    /// Stream carrying game events for a partition
+    pub fn stream_events(partition_id: u32) -> String {
+        format!("snaketron:stream:events:{}", partition_id)
+    }
+
+    /// Stream carrying commands (GameCreated, GameCommandSubmitted, ...) for a partition
+    pub fn stream_commands(partition_id: u32) -> String {
+        format!("snaketron:stream:commands:{}", partition_id)
+    }
+
+    /// Stream carrying snapshot requests for a partition
+    pub fn stream_snapshot_requests(partition_id: u32) -> String {
+        format!("snaketron:stream:snapreq:{}", partition_id)
+    }
+
     // === Cluster Singleton Keys ===
 
     /// Lease key for a singleton service
