@@ -39,6 +39,7 @@ export default function GameArena() {
     queueForMatch,
     queueForMatchMulti,
     isJoiningGame,
+    sendRequestResync,
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
@@ -53,12 +54,17 @@ export default function GameArena() {
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
 
+  const handleRequestResync = useCallback(() => {
+    sendRequestResync(gameId);
+  }, [sendRequestResync, gameId]);
+
   // Use game engine for client-side prediction (call unconditionally to keep hook order stable)
   const {
     gameEngine,
     gameState,
     committedState,
     isGameComplete,
+    connectionStale,
     // isRunning,
     sendCommand,
     processServerEvent,
@@ -67,6 +73,7 @@ export default function GameArena() {
     gameId,
     playerId,
     onCommandReady: sendGameCommand,
+    onRequestResync: handleRequestResync,
     latencyMs
   });
 
@@ -698,6 +705,16 @@ export default function GameArena() {
               </div>
             )}
             
+            {/* Connection watchdog overlay: prediction is frozen by the engine
+                while server messages are missing; explain the freeze */}
+            {connectionStale && !gameOver && (
+              <div className="absolute inset-0 flex items-center justify-center bg-white/85 z-30">
+                <span className="text-black font-black italic uppercase tracking-1 text-xl text-center px-4">
+                  CONNECTION LOST — RESYNCING
+                </span>
+              </div>
+            )}
+
             {/* Countdown Overlay */}
             {showCountdown && countdownState && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">

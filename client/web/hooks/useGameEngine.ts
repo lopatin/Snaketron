@@ -3,11 +3,13 @@ import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
 import { getClockDrift } from '../utils/clockSync';
 import { parseU32GameId } from '../utils/gameId';
+import { startTrace, record as recordTrace, autoUploadOnce } from '../utils/syncTrace';
 
 interface UseGameEngineProps {
   gameId: string;
   playerId: number;
   onCommandReady?: (commandMessage: any) => void;
+  onRequestResync?: () => void;
   latencyMs?: number;
 }
 
@@ -16,16 +18,26 @@ interface UseGameEngineReturn {
   gameState: GameState | null;
   committedState: GameState | null;
   isGameComplete: boolean;
+  connectionStale: boolean;
   sendCommand: (command: Command) => void;
   processServerEvent: (event: any) => Promise<boolean>;
   stopEngine: () => void;
 }
 
+// Liveness watchdog: no server message for this long while the game is
+// running means the connection is effectively dead for gameplay purposes.
+const WATCHDOG_STALE_MS = 3000;
+// RequestResync pacing: needs_resync sends are debounced, watchdog sends
+// back off exponentially while the connection stays stale.
+const RESYNC_DEBOUNCE_MS = 2000;
+const WATCHDOG_BACKOFF_INITIAL_MS = 2000;
+const WATCHDOG_BACKOFF_MAX_MS = 10000;
 
 export const useGameEngine = ({
   gameId,
   playerId,
   onCommandReady,
+  onRequestResync,
   latencyMs = 0
 }: UseGameEngineProps): UseGameEngineReturn => {
   const engineRef = useRef<GameClient | null>(null);
@@ -33,8 +45,16 @@ export const useGameEngine = ({
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [committedState, setCommittedState] = useState<GameState | null>(null);
   const [isGameComplete, setIsGameComplete] = useState(false);
+  const [connectionStale, setConnectionStale] = useState(false);
   const engineGameIdRef = useRef<string | null>(null);
   const latencyMsRef = useRef(latencyMs);
+  const onRequestResyncRef = useRef(onRequestResync);
+  const lastServerMsgAtRef = useRef<number | null>(null);
+  const staleRef = useRef(false);
+  const lastResyncSentAtRef = useRef(0);
+  const watchdogBackoffMsRef = useRef(WATCHDOG_BACKOFF_INITIAL_MS);
+  const watchdogNextSendAtRef = useRef(0);
+  const prevSyncStatusRef = useRef<any | null>(null);
 
   // console.log('useGameEngine called (initial state:', !!initialState);
 
@@ -42,6 +62,10 @@ export const useGameEngine = ({
   useEffect(() => {
     latencyMsRef.current = latencyMs;
   }, [latencyMs]);
+
+  useEffect(() => {
+    onRequestResyncRef.current = onRequestResync;
+  }, [onRequestResync]);
 
   // Tear down the current engine whenever the game ID changes so we can initialize from the next snapshot
   useEffect(() => {
@@ -67,6 +91,13 @@ export const useGameEngine = ({
     setGameState(null);
     setCommittedState(null);
     setIsGameComplete(false);
+    setConnectionStale(false);
+    staleRef.current = false;
+    lastServerMsgAtRef.current = null;
+    lastResyncSentAtRef.current = 0;
+    watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
+    watchdogNextSendAtRef.current = 0;
+    prevSyncStatusRef.current = null;
   }, [gameId]);
 
   const runGameLoop = useCallback(() => {
@@ -165,6 +196,86 @@ export const useGameEngine = ({
         }
       }
 
+      // Sync health: watch the engine's stream/hash accounting for gaps and
+      // divergence, and drive the resync + liveness watchdog paths.
+      try {
+        const sync = JSON.parse(engineRef.current.getSyncStatusJson());
+        const prevSync = prevSyncStatusRef.current;
+        const nowMs = Date.now();
+
+        if (prevSync) {
+          if (sync.stream_gap_count > prevSync.stream_gap_count) {
+            recordTrace({
+              Note: {
+                ts_ms: nowMs,
+                note: `stream gap detected: gaps=${sync.stream_gap_count} missed=${sync.missed_messages} last_seq=${sync.last_stream_seq}`
+              }
+            });
+            autoUploadOnce('stream gap detected');
+          }
+          if (sync.total_mismatches > prevSync.total_mismatches) {
+            recordTrace({
+              Note: {
+                ts_ms: nowMs,
+                note: `hash mismatch at probe tick ${sync.last_probe_tick} (consecutive=${sync.consecutive_hash_mismatches}, total=${sync.total_mismatches})`
+              }
+            });
+          }
+          if (sync.consecutive_hash_mismatches >= 2 && prevSync.consecutive_hash_mismatches < 2) {
+            autoUploadOnce('2+ consecutive hash mismatches');
+          }
+        }
+        prevSyncStatusRef.current = sync;
+
+        if (sync.needs_resync && nowMs - lastResyncSentAtRef.current >= RESYNC_DEBOUNCE_MS) {
+          lastResyncSentAtRef.current = nowMs;
+          onRequestResyncRef.current?.();
+          engineRef.current.clearNeedsResync();
+          recordTrace({ Note: { ts_ms: nowMs, note: 'resync requested (needs_resync)' } });
+        }
+
+        // Liveness watchdog: the engine's bounded prediction freezes the
+        // simulation when server messages stop; surface that to the UI and
+        // nudge the server for a fresh snapshot with exponential backoff.
+        const committedStatus = committedState.status;
+        const isStarted =
+          typeof committedStatus === 'object' &&
+          committedStatus !== null &&
+          'Started' in committedStatus;
+        const lastMsgAt = lastServerMsgAtRef.current;
+
+        if (isStarted && lastMsgAt !== null && nowMs - lastMsgAt > WATCHDOG_STALE_MS) {
+          if (!staleRef.current) {
+            staleRef.current = true;
+            setConnectionStale(true);
+            watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
+            watchdogNextSendAtRef.current = nowMs;
+            recordTrace({
+              Note: {
+                ts_ms: nowMs,
+                note: `watchdog fired: no server message for ${nowMs - lastMsgAt}ms`
+              }
+            });
+          }
+          if (nowMs >= watchdogNextSendAtRef.current) {
+            onRequestResyncRef.current?.();
+            recordTrace({
+              Note: {
+                ts_ms: nowMs,
+                note: `resync requested (watchdog, next backoff=${watchdogBackoffMsRef.current}ms)`
+              }
+            });
+            watchdogNextSendAtRef.current = nowMs + watchdogBackoffMsRef.current;
+            watchdogBackoffMsRef.current = Math.min(
+              watchdogBackoffMsRef.current * 2,
+              WATCHDOG_BACKOFF_MAX_MS
+            );
+          }
+        }
+      } catch (syncError) {
+        console.warn('Sync health check failed:', syncError);
+      }
+
       // Stop the loop if game is complete
       // if (typeof newState.status === 'object' && newState.status !== null && 'Complete' in newState.status) {
       //   console.log('Game completed, stopping game loop');
@@ -246,6 +357,14 @@ export const useGameEngine = ({
       const commandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
 
+      recordTrace({
+        CmdOut: {
+          ts_ms: Date.now(),
+          predicted_tick: commandMessage?.command_id_client?.tick ?? 0,
+          cmd: commandMessage
+        }
+      });
+
       onCommandReady?.(commandMessage);
       console.log('Command sent to server at', Date.now());
     } catch (error) {
@@ -315,6 +434,7 @@ export const useGameEngine = ({
           cancelAnimationFrame(animationFrameRef.current);
           animationFrameRef.current = null;
         }
+        const isFirstInit = !engineRef.current;
         if (engineRef.current) {
           try {
             engineRef.current.free();
@@ -328,7 +448,38 @@ export const useGameEngine = ({
             JSON.stringify(event.Snapshot.game_state)
         );
         engineRef.current.setLocalPlayerId(playerId);
+
+        if (isFirstInit) {
+          // Use the game's real tick duration (custom games can differ from
+          // the default) so RCA clock-drift thresholds are computed correctly.
+          startTrace(
+            expectedGameId,
+            playerId,
+            event.Snapshot.game_state?.properties?.tick_duration_ms
+          );
+        } else {
+          // The rebuilt engine starts with fresh sync counters; the snapshot
+          // itself re-anchors the stream watermark.
+          recordTrace({ Note: { ts_ms: Date.now(), note: 'engine rebuilt from snapshot (resync)' } });
+        }
       }
+
+      // Liveness: any accepted server message for this game proves the pipe is alive
+      lastServerMsgAtRef.current = Date.now();
+      if (staleRef.current) {
+        staleRef.current = false;
+        setConnectionStale(false);
+        watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
+        recordTrace({ Note: { ts_ms: Date.now(), note: 'watchdog cleared: server messages resumed' } });
+      }
+
+      recordTrace({
+        EventIn: {
+          ts_ms: Date.now(),
+          committed_tick: engineRef.current ? engineRef.current.getCommittedTick() : 0,
+          msg: fullEventMessage
+        }
+      });
 
       if (engineRef.current) {
         console.log('Processing server event:', fullEventMessage);
@@ -384,6 +535,7 @@ export const useGameEngine = ({
     gameState,
     committedState,
     isGameComplete,
+    connectionStale,
     sendCommand,
     processServerEvent,
     stopEngine,

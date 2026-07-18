@@ -1,5 +1,6 @@
 use crate::api::auth::validate_username;
 use crate::db::Database;
+use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager;
@@ -7,6 +8,7 @@ use crate::lobby_manager::{LeaveLobbyResult, Lobby, LobbyJoinHandle, LobbyMember
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
+use crate::replication::GameStateReader;
 use crate::user_cache::UserCache;
 use crate::ws_matchmaking::remove_from_matchmaking_queue;
 use anyhow::{Context, Result, anyhow};
@@ -70,6 +72,12 @@ pub enum WSMessage {
         messages: Vec<GameChatBroadcast>,
     },
     Shutdown,
+    /// Client -> server: the client detected message loss or state divergence
+    /// (stream_seq gap, repeated TickHash mismatch, or a silent feed) and
+    /// needs its event subscription restarted with a fresh snapshot.
+    RequestResync {
+        game_id: u32,
+    },
     Ping {
         client_time: i64,
     },
@@ -320,6 +328,7 @@ pub async fn handle_websocket(
     redis: ConnectionManager,
     redis_url: String,
     pubsub_manager: Arc<PubSubManager>,
+    game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
     cancellation_token: CancellationToken,
@@ -334,6 +343,7 @@ pub async fn handle_websocket(
         db,
         user_cache.clone(),
         pubsub_manager,
+        game_bus,
         matchmaking_manager,
         jwt_verifier,
         cancellation_token,
@@ -355,6 +365,7 @@ async fn handle_websocket_connection(
     db: Arc<dyn Database>,
     user_cache: UserCache,
     pubsub_manager: Arc<PubSubManager>,
+    game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
@@ -383,6 +394,8 @@ async fn handle_websocket_connection(
 
     // Will be used to track Redis stream subscription for game events
     let mut game_event_handle: Option<JoinHandle<()>> = None;
+    // Rate limit for client-initiated resyncs (RequestResync).
+    let mut last_resync_at: Option<tokio::time::Instant> = None;
 
     // Will be used to track lobby update forwarding to the websocket
     let mut lobby_update_handle: Option<JoinHandle<()>> = None;
@@ -490,6 +503,53 @@ async fn handle_websocket_connection(
                         // Process the message
                         if let Message::Text(text) = tungstenite_msg {
                             match serde_json::from_str::<WSMessage>(&text) {
+                                Ok(WSMessage::RequestResync { game_id: resync_game_id }) => {
+                                    // The client detected loss or divergence (stream
+                                    // gap, repeated fingerprint mismatch, or a dead
+                                    // feed). Restart its event forwarder — which
+                                    // sends a fresh watermarked snapshot as its
+                                    // first message — instead of trusting whatever
+                                    // subscription state it had. Rate-limited so a
+                                    // stuck client cannot spam resubscriptions.
+                                    let in_this_game = matches!(
+                                        &state,
+                                        ConnectionState::Authenticated { game_id: Some(g), .. } if *g == resync_game_id
+                                    );
+                                    let now = tokio::time::Instant::now();
+                                    let allowed = last_resync_at
+                                        .map(|t| now.duration_since(t) >= Duration::from_millis(500))
+                                        .unwrap_or(true);
+                                    if in_this_game && allowed {
+                                        last_resync_at = Some(now);
+                                        if let ConnectionState::Authenticated { metadata, .. } = &state {
+                                            info!(
+                                                "Resync requested by user {} for game {}; restarting event subscription",
+                                                metadata.user_id, resync_game_id
+                                            );
+                                            if let Some(handle) = game_event_handle.take() {
+                                                handle.abort();
+                                            }
+                                            let user_id = metadata.user_id as u32;
+                                            let ws_tx_clone = ws_tx.clone();
+                                            let replication_manager_clone = replication_manager.clone();
+                                            let db_clone = db.clone();
+                                            game_event_handle = Some(tokio::spawn(async move {
+                                                subscribe_to_game_events(
+                                                    resync_game_id,
+                                                    user_id,
+                                                    ws_tx_clone,
+                                                    replication_manager_clone,
+                                                    db_clone,
+                                                ).await;
+                                            }));
+                                        }
+                                    } else if !in_this_game {
+                                        debug!(
+                                            "Ignoring resync request for game {} from connection not in that game",
+                                            resync_game_id
+                                        );
+                                    }
+                                }
                                 Ok(ws_message) => {
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
@@ -509,7 +569,7 @@ async fn handle_websocket_connection(
                                         &db,
                                         user_cache.clone(),
                                         &ws_tx,
-                                        &pubsub_manager,
+                                        &game_bus,
                                         &matchmaking_manager,
                                         &replication_manager,
                                         &redis,
@@ -1223,7 +1283,10 @@ async fn subscribe_to_game_events(
         game_id, user_id
     );
 
-    let (game_state, mut rx) = match replication_manager.subscribe_to_game(game_id).await {
+    let (game_state, stream_watermark, mut rx) = match replication_manager
+        .subscribe_to_game(game_id)
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             // Durably completed games are eventually evicted from replication memory. Their
@@ -1345,11 +1408,13 @@ async fn subscribe_to_game_events(
         return;
     }
 
-    // Send the snapshot
+    // Send the snapshot, stamped with the replica's transport watermark so
+    // the client's gap detection starts from the right point.
     let snapshot_event = GameEventMessage {
         game_id: game_id,
         tick: game_state.tick,
         sequence: 0,
+        stream_seq: stream_watermark,
         user_id: Some(user_id),
         event: GameEvent::Snapshot {
             game_state: game_state.clone(),
@@ -1381,33 +1446,84 @@ async fn subscribe_to_game_events(
         }
     }
 
-    while let Ok(event_msg) = rx.recv().await {
-        // Check if the game has ended
-        if let GameEvent::StatusUpdated { status } = &event_msg.event {
-            if matches!(status, GameStatus::Complete { .. }) {
-                info!("Game {} completed, stopping event subscription", game_id);
-                // Send the final event before breaking
-                let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
-                if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
-                    match e {
-                        mpsc::error::TrySendError::Full(msg) => {
-                            warn!(
-                                "WebSocket send channel full on game complete for game {}, blocking send",
-                                game_id
-                            );
-                            let _ = ws_tx.send(msg).await;
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
+    loop {
+        let event_msg = match rx.recv().await {
+            Ok(event_msg) => event_msg,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                // This connection fell behind the broadcast and lost events.
+                // Recover by sending a fresh snapshot (with its watermark) so
+                // the client re-anchors instead of silently diverging.
+                warn!(
+                    "Event forwarder for game {} (user {}) lagged, {} events lost; resyncing client with fresh snapshot",
+                    game_id, user_id, skipped
+                );
+                match replication_manager.subscribe_to_game(game_id).await {
+                    Ok((state, watermark, new_rx)) => {
+                        rx = new_rx;
+                        let resync = GameEventMessage {
+                            game_id,
+                            tick: state.tick,
+                            sequence: 0,
+                            stream_seq: watermark,
+                            user_id: Some(user_id),
+                            event: GameEvent::Snapshot { game_state: state },
+                        };
+                        let json = serde_json::to_string(&WSMessage::GameEvent(resync)).unwrap();
+                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             debug!(
-                                "WebSocket send channel closed on game complete for game {}",
+                                "WebSocket send channel closed for game {} during lag resync",
                                 game_id
                             );
+                            return;
                         }
+                        continue;
+                    }
+                    Err(e) => {
+                        // Game likely completed and was evicted mid-lag.
+                        error!(
+                            "Failed to resubscribe to game {} after lag: {}; ending subscription",
+                            game_id, e
+                        );
+                        return;
                     }
                 }
-                break;
             }
-        }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                // Broadcaster dropped. If the game is still live in the
+                // replica, hand the client one last authoritative snapshot so
+                // it can at least resync via RequestResync; either way, log
+                // loudly — a silent exit here is how ghost games are born.
+                if let Some(state) = replication_manager.get_game_state(game_id).await {
+                    error!(
+                        "Event broadcaster closed for live game {} (user {}); sending final snapshot",
+                        game_id, user_id
+                    );
+                    let final_snapshot = GameEventMessage {
+                        game_id,
+                        tick: state.tick,
+                        sequence: 0,
+                        stream_seq: replication_manager.get_stream_seq(game_id).await,
+                        user_id: Some(user_id),
+                        event: GameEvent::Snapshot { game_state: state },
+                    };
+                    let json =
+                        serde_json::to_string(&WSMessage::GameEvent(final_snapshot)).unwrap();
+                    let _ = ws_tx.send(Message::Text(json.into())).await;
+                } else {
+                    info!(
+                        "Event broadcaster closed for game {} (game evicted); ending subscription",
+                        game_id
+                    );
+                }
+                return;
+            }
+        };
+
+        // Check if the game has ended
+        let is_final = matches!(
+            &event_msg.event,
+            GameEvent::StatusUpdated { status } if matches!(status, GameStatus::Complete { .. })
+        );
 
         let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
         let msg = Message::Text(json.into());
@@ -1435,6 +1551,11 @@ async fn subscribe_to_game_events(
                 }
             }
         }
+
+        if is_final {
+            info!("Game {} completed, stopping event subscription", game_id);
+            break;
+        }
     }
 }
 
@@ -1448,6 +1569,7 @@ async fn send_game_snapshot(
         game_id,
         tick: game_state.tick,
         sequence: game_state.event_sequence,
+        stream_seq: 0, // terminal snapshot; no live stream follows
         user_id: Some(user_id),
         event: GameEvent::Snapshot {
             game_state: game_state.clone(),
@@ -1641,7 +1763,7 @@ async fn process_ws_message(
     db: &Arc<dyn Database>,
     user_cache: UserCache,
     ws_tx: &mpsc::Sender<Message>,
-    pubsub_manager: &Arc<PubSubManager>,
+    game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
     redis: &ConnectionManager,
@@ -2743,11 +2865,11 @@ async fn process_ws_message(
                             command: command_message,
                         };
 
-                        // Send command via PubSub
-                        match pubsub_manager.publish_command(partition_id, &event).await {
+                        // Send command via the game bus
+                        match game_bus.publish_command(partition_id, &event).await {
                             Ok(_) => {
                                 debug!(
-                                    "Successfully submitted game command via PubSub: {:?}",
+                                    "Successfully submitted game command via the game bus: {:?}",
                                     event
                                 );
                                 Ok(ConnectionState::Authenticated {

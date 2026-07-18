@@ -1,12 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use common::CLUSTER_RENEWAL_INTERVAL_MS;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use redis::aio::ConnectionManager;
-use redis::{
-    AsyncCommands, ExistenceCheck, RedisResult, Script, ScriptInvocation, SetExpiry, SetOptions,
-    TypedCommands,
-};
+use redis::{AsyncCommands, Script};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -85,6 +82,10 @@ impl ClusterSingleton {
         let mut service_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut service_token: Option<CancellationToken> = None;
         let mut rng = StdRng::from_entropy();
+        // When the last successful lease renewal (or acquisition) happened.
+        // Transient Redis errors are tolerated while the lease is provably
+        // still ours (see `renew_error_should_step_down`).
+        let mut last_renewal_success = tokio::time::Instant::now();
 
         // Create the initial claim sleep
         let claim_duration_ms = rng.gen_range(500..=1500);
@@ -108,6 +109,7 @@ impl ClusterSingleton {
                             Ok(true) => {
                                 info!("Became leader for server_id={}", self.server_id);
                                 self.is_leader.store(true, Ordering::Release);
+                                last_renewal_success = tokio::time::Instant::now();
 
                                 // Start the user service
                                 if service_handle.is_none() {
@@ -136,32 +138,55 @@ impl ClusterSingleton {
                 }
                 _ = renew_interval.tick() => {
                     if self.is_leader() {
-                        // debug!("Renewing lease for server_id={}", self.server_id);
                         match self.renew_lease().await {
                             Ok(true) => {
-                                // debug!("Successfully renewed lease");
+                                last_renewal_success = tokio::time::Instant::now();
                             }
                             Ok(false) => {
+                                // Definitive: the key is gone or owned by
+                                // someone else. Step down immediately.
                                 warn!("Lost leadership - failed to renew lease");
                                 self.is_leader.store(false, Ordering::Release);
-
-                                // Stop the user service
                                 self.stop_service(&mut service_token, &mut service_handle).await;
                             }
                             Err(e) => {
-                                error!("Error renewing lease: {}", e);
-                                self.is_leader.store(false, Ordering::Release);
-
-                                // Stop the user service on error
-                                self.stop_service(&mut service_token, &mut service_handle).await;
+                                // Transient (couldn't reach Redis): the lease
+                                // key may well still be ours and unexpired.
+                                // Cancelling every running game on the first
+                                // blip is what used to make a brief Redis
+                                // hiccup wipe out all in-flight games. Keep
+                                // leadership within the safety window; beyond
+                                // it the key may have expired and another
+                                // server may own it, so step down.
+                                let elapsed = last_renewal_success.elapsed();
+                                if renew_error_should_step_down(elapsed, self.lease_duration_ms) {
+                                    error!(
+                                        "Error renewing lease for {:?} (last success {:?} ago); stepping down: {}",
+                                        self.lease_key, elapsed, e
+                                    );
+                                    self.is_leader.store(false, Ordering::Release);
+                                    self.stop_service(&mut service_token, &mut service_handle).await;
+                                } else {
+                                    warn!(
+                                        "Error renewing lease for {:?} (last success {:?} ago, within grace window); retrying: {}",
+                                        self.lease_key, elapsed, e
+                                    );
+                                }
                             }
                         }
                     }
                 }
                 _ = health_check_interval.tick() => {
                     let ping_timeout = Duration::from_secs(1);
-                    let ping_result = timeout(ping_timeout, self.redis.ping::<String>()).await
-                        .map_err(|_| anyhow!("Redis PING timed out after {:?}", ping_timeout))?;
+                    // A timed-out PING must take the same step-down path as a
+                    // failed PING. Propagating it with `?` would exit run()
+                    // WITHOUT stopping the running service — leaving a zombie
+                    // leader still executing games while another server
+                    // acquires the lease and starts duplicates (split brain).
+                    let ping_result = match timeout(ping_timeout, self.redis.ping::<String>()).await {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => Err(anyhow!("Redis PING timed out after {:?}", ping_timeout)),
+                    };
 
                     match ping_result {
                         Ok(rsp) => if rsp != "PONG" {
@@ -183,19 +208,38 @@ impl ClusterSingleton {
         Ok(())
     }
 
-    async fn try_acquire_lease(&mut self) -> RedisResult<bool> {
-        let acquired: bool = self
+    async fn try_acquire_lease(&mut self) -> Result<bool> {
+        // Acquire when free, OR reclaim a lease that still holds OUR id.
+        // Plain SET NX cannot reclaim: after a transient Redis outage our
+        // still-unexpired key would block us from re-acquiring our own lease
+        // until it expires, extending the outage for no reason.
+        let lua_script = r#"
+            local v = redis.call("get", KEYS[1])
+            if v == false then
+                redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2])
+                return 1
+            elseif v == ARGV[1] then
+                redis.call("pexpire", KEYS[1], ARGV[2])
+                return 1
+            else
+                return 0
+            end
+        "#;
+
+        let script = Script::new(lua_script);
+        let _: String = self.redis.load_script(&script).await?;
+
+        let result = self
             .redis
-            .set_options(
-                &self.lease_key,
-                self.server_id.to_string(),
-                SetOptions::default()
-                    .conditional_set(ExistenceCheck::NX)
-                    .with_expiration(SetExpiry::PX(self.lease_duration_ms)),
+            .invoke_script::<i32>(
+                script
+                    .key(self.lease_key.clone())
+                    .arg(self.server_id.to_string())
+                    .arg(self.lease_duration_ms),
             )
             .await?;
 
-        Ok(acquired)
+        Ok(result == 1)
     }
 
     async fn renew_lease(&mut self) -> Result<bool> {
@@ -255,5 +299,56 @@ impl ClusterSingleton {
                 }
             }
         }
+    }
+}
+
+/// Whether a transient (Err, not Ok(false)) lease-renewal failure should end
+/// leadership. The lease key's TTL is reset on every successful renewal, so
+/// another server cannot acquire it until `lease_duration` has passed since
+/// our last success. Tolerating errors for 60% of that window keeps a >=40%
+/// safety margin between "we stop acting as leader" and "someone else can
+/// possibly become leader" — no split-brain, but a brief Redis blip no longer
+/// cancels every running game.
+fn renew_error_should_step_down(elapsed_since_success: Duration, lease_duration_ms: u64) -> bool {
+    elapsed_since_success.as_millis() as u64 * 10 >= lease_duration_ms * 6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_renewal_errors_tolerated_within_grace() {
+        // 3s lease -> grace window is 1.8s.
+        assert!(!renew_error_should_step_down(
+            Duration::from_millis(0),
+            3000
+        ));
+        assert!(!renew_error_should_step_down(
+            Duration::from_millis(1500),
+            3000
+        ));
+        assert!(!renew_error_should_step_down(
+            Duration::from_millis(1799),
+            3000
+        ));
+    }
+
+    #[test]
+    fn sustained_renewal_errors_step_down_before_lease_expiry() {
+        assert!(renew_error_should_step_down(
+            Duration::from_millis(1800),
+            3000
+        ));
+        assert!(renew_error_should_step_down(
+            Duration::from_millis(3000),
+            3000
+        ));
+        // Step-down always happens strictly before the lease can expire.
+        let lease_ms = 1000u64;
+        let step_down_at = (0..=lease_ms)
+            .find(|ms| renew_error_should_step_down(Duration::from_millis(*ms), lease_ms))
+            .unwrap();
+        assert!(step_down_at < lease_ms);
     }
 }

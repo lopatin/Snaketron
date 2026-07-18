@@ -50,6 +50,25 @@ impl TestEnvironment {
         }
         info!("Using unique table prefix for test: {}", unique_prefix);
 
+        // Each environment gets a fresh database, so game IDs REPEAT across
+        // tests — but Redis is shared and persistent. Without this flush,
+        // stale game:snapshot:{id} keys (300s TTL), singleton leases from
+        // dead test processes, and stream entries leak into later tests:
+        // joins serve a previous test's snapshot for a reused game ID, and
+        // executor takeover can resume a previous test's synthetic game.
+        // Tests are serialized (TEST_LOCK / --test-threads=1), so flushing
+        // the test database here is safe.
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")
+            .context("Failed to open Redis for test flush")?;
+        let mut redis_conn = redis_client
+            .get_multiplexed_async_connection()
+            .await
+            .context("Failed to connect to Redis for test flush")?;
+        let _: () = redis::cmd("FLUSHDB")
+            .query_async(&mut redis_conn)
+            .await
+            .context("Failed to flush test Redis database")?;
+
         // Create DynamoDB instance for testing
         let db = Arc::new(
             DynamoDatabase::new()

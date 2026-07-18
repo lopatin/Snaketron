@@ -5,7 +5,6 @@ use ::common::{
     CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameStatus, GameType,
 };
 use anyhow::Result;
-use redis::AsyncCommands;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
 
@@ -14,8 +13,8 @@ async fn test_solo_game() -> Result<()> {
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Clean up Redis before starting the test
-    let redis_client = redis::Client::open("redis://localhost:6379")?;
+    // Clean up the Redis test database (db 1, used by TestEnvironment) before starting
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
 
@@ -35,29 +34,27 @@ async fn test_solo_game() -> Result<()> {
 
     println!("Client authenticated");
 
-    // Queue for a solo match (max_players: 1)
+    // Queue for a solo match. Solo games have a dedicated GameType now;
+    // a FreeForAll queue never matches with a single player.
     client
         .send_message(WSMessage::QueueForMatch {
-            game_type: GameType::FreeForAll { max_players: 1 },
+            game_type: GameType::Solo,
             queue_mode: ::common::QueueMode::Quickmatch,
         })
         .await?;
 
     println!("Client queued for solo game");
 
-    // Wait for JoinGame message
-    let join_msg = timeout(Duration::from_secs(10), async {
-        client.receive_message().await
+    // Wait for JoinGame message, skipping unrelated messages (e.g. UserCountUpdate)
+    let game_id = timeout(Duration::from_secs(10), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::JoinGame(id) => break Ok::<u32, anyhow::Error>(id),
+                other => println!("Ignoring message while waiting for JoinGame: {:?}", other),
+            }
+        }
     })
     .await??;
-
-    println!("Client received: {:?}", join_msg);
-
-    // Verify client received JoinGame message
-    let game_id = match &join_msg {
-        WSMessage::JoinGame(id) => *id,
-        _ => panic!("Expected JoinGame message, got {:?}", join_msg),
-    };
 
     println!("Client joined game {}", game_id);
 
@@ -66,9 +63,19 @@ async fn test_solo_game() -> Result<()> {
 
     println!("Client acknowledged join");
 
-    // Now wait for game snapshot after joining
+    // Now wait for the game snapshot after joining, skipping unrelated messages
     let msg = timeout(Duration::from_secs(10), async {
-        client.receive_message().await
+        loop {
+            let msg = client.receive_message().await?;
+            match &msg {
+                WSMessage::GameEvent(event)
+                    if matches!(event.event, GameEvent::Snapshot { .. }) =>
+                {
+                    break Ok::<WSMessage, anyhow::Error>(msg);
+                }
+                other => println!("Ignoring message while waiting for snapshot: {:?}", other),
+            }
+        }
     })
     .await??;
 
@@ -149,6 +156,21 @@ async fn test_solo_game() -> Result<()> {
     let user_id = env.user_ids()[0] as u32;
     let mut sequence_number = 0;
 
+    // The game begins with a ~3s countdown (GAME_START_DELAY_MS) during which
+    // it stays at tick 0. Commands sent during the countdown are all scheduled
+    // for the same tick, so wait until ticking has actually started before
+    // sending the turn sequence.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let WSMessage::GameEvent(event) = client.receive_message().await? {
+                if event.tick >= 1 {
+                    break Ok::<(), anyhow::Error>(());
+                }
+            }
+        }
+    })
+    .await??;
+
     // If snake is going towards a wall, turn to avoid it
     // Based on the test_simple_game, snakes typically start in the middle going left or right
     if matches!(initial_direction, Direction::Left | Direction::Right) {
@@ -214,8 +236,9 @@ async fn test_solo_game() -> Result<()> {
     let mut death_tick = 0;
     let start_time = tokio::time::Instant::now();
 
-    // Run for up to 10 seconds to see the outcome
-    while start_time.elapsed() < Duration::from_secs(10) && !snake_died {
+    // Run for up to 10 seconds to see the outcome. Keep listening after the
+    // snake dies: the Complete status update arrives after the SnakeDied event.
+    while start_time.elapsed() < Duration::from_secs(10) {
         // Try to receive events
         match timeout(Duration::from_millis(100), client.receive_message()).await {
             Ok(Ok(WSMessage::GameEvent(event))) => {

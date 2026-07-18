@@ -76,6 +76,7 @@ async fn test_replay_with_tick_forward() -> Result<()> {
         game_id: 100,
         tick: 1,
         sequence: 1,
+        stream_seq: 0,
         user_id: Some(1),
         event: GameEvent::CommandScheduled { command_message: command_msg },
     });
@@ -84,6 +85,7 @@ async fn test_replay_with_tick_forward() -> Result<()> {
         game_id: 100,
         tick: 3,
         sequence: 2,
+        stream_seq: 0,
         user_id: None,
         event: GameEvent::SnakeTurned { snake_id: 0, direction: Direction::Up },
     });

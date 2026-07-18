@@ -30,6 +30,7 @@ interface UseGameWebSocketReturn {
   startCustomGame: () => void;
   spectateGame: (gameId: string, gameCode?: string | null) => void;
   sendGameCommand: (command: GameCommand) => void;
+  sendRequestResync: (gameId: string) => void;
   connected: boolean;
 }
 
@@ -413,6 +414,20 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     });
   }, [isConnected, isSessionAuthenticated, sendMessage]);
 
+  // Ask the game executor for a fresh snapshot when the engine detects
+  // a stream gap / hash divergence, matching WSMessage::RequestResync
+  const sendRequestResync = useCallback((gameId: string) => {
+    const numericGameId = parseInt(gameId, 10);
+    if (!Number.isFinite(numericGameId)) {
+      console.error('Cannot request resync for invalid game ID:', gameId);
+      return;
+    }
+    console.log('Sending RequestResync for game', numericGameId);
+    sendMessage({
+      RequestResync: { game_id: numericGameId }
+    });
+  }, [sendMessage]);
+
   const createSoloGame = useCallback(() => {
     console.log('Queueing for a solo game');
     serverAssignedGameRef.current = null;
@@ -515,6 +530,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     startCustomGame,
     spectateGame,
     sendGameCommand,
+    sendRequestResync,
     connected: isConnected,
   };
 };

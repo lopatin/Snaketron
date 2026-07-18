@@ -57,6 +57,10 @@ declare module 'wasm-snaketron' {
     getPredictedTick(): number;
     getGameId(): number;
     getSnakeIdForUser(userId: number): number | undefined;
+    getSyncStatusJson(): string;
+    getCommittedHash(): string;
+    clearNeedsResync(): void;
+    free(): void;
   }
 
   export class Game {

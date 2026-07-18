@@ -10,11 +10,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::db::Database;
+use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::{ActiveMatch, MatchStatus, MatchmakingManager, QueuedPlayer};
-use crate::pubsub_manager::PubSubManager;
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
@@ -669,7 +669,7 @@ fn find_ffa_combination(
 /// Main matchmaking loop
 pub async fn run_matchmaking_loop(
     mut matchmaking_manager: MatchmakingManager,
-    mut pubsub: PubSubManager,
+    bus: Arc<GameBus>,
     cancellation_token: CancellationToken,
     lobby_manager: Arc<LobbyManager>,
     db: Arc<dyn Database>,
@@ -735,7 +735,7 @@ pub async fn run_matchmaking_loop(
             // Try lobby-based matchmaking for quickmatch
             match create_lobby_matches(
                 &mut matchmaking_manager,
-                &mut pubsub,
+                &bus,
                 game_type.clone(),
                 common::QueueMode::Quickmatch,
                 lobby_manager.clone(),
@@ -763,7 +763,7 @@ pub async fn run_matchmaking_loop(
             // Try lobby-based matchmaking for competitive
             match create_lobby_matches(
                 &mut matchmaking_manager,
-                &mut pubsub,
+                &bus,
                 game_type.clone(),
                 common::QueueMode::Competitive,
                 lobby_manager.clone(),
@@ -865,7 +865,7 @@ fn filter_compatible_lobbies(
 /// Create matches from lobbies in the queue using advanced combination matching
 async fn create_lobby_matches(
     matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
+    bus: &GameBus,
     game_type: GameType,
     queue_mode: common::QueueMode,
     lobby_manager: Arc<LobbyManager>,
@@ -1007,7 +1007,7 @@ async fn create_lobby_matches(
         // Create game from this combination
         match create_game_from_lobbies(
             matchmaking_manager,
-            pubsub,
+            bus,
             &game_type,
             &queue_mode,
             &combination,
@@ -1071,7 +1071,7 @@ async fn create_lobby_matches(
 /// Create a game from a combination of lobbies with proper team assignments
 async fn create_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
+    bus: &GameBus,
     game_type: &GameType,
     queue_mode: &common::QueueMode,
     combination: &MatchmakingCombination,
@@ -1215,13 +1215,12 @@ async fn create_game_from_lobbies(
         game_state: game_state.clone(),
     };
 
-    pubsub
-        .publish_snapshot(partition_id, game_id, &game_state)
+    // stream_seq 0: the executor owning the game loop assigns the stream.
+    bus.publish_snapshot(partition_id, game_id, &game_state, 0)
         .await
         .context("Failed to publish initial game snapshot")?;
 
-    pubsub
-        .publish_command(partition_id, &event)
+    bus.publish_command(partition_id, &event)
         .await
         .context("Failed to publish GameCreated event")?;
 
@@ -1271,7 +1270,7 @@ async fn publish_lobby_match_notifications(
 /// Create a match from a specific set of players (for custom games)
 pub async fn create_custom_match(
     matchmaking_manager: &mut MatchmakingManager,
-    pubsub: &mut PubSubManager,
+    bus: &GameBus,
     db: &dyn Database,
     players: Vec<QueuedPlayer>,
     game_type: GameType,
@@ -1325,11 +1324,11 @@ pub async fn create_custom_match(
         game_state: game_state.clone(),
     };
 
-    pubsub
-        .publish_snapshot(partition_id, game_id, &game_state)
+    // stream_seq 0: the executor owning the game loop assigns the stream.
+    bus.publish_snapshot(partition_id, game_id, &game_state, 0)
         .await?;
 
-    pubsub.publish_command(partition_id, &event).await?;
+    bus.publish_command(partition_id, &event).await?;
 
     info!(
         game_id,

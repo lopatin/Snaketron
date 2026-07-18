@@ -20,6 +20,7 @@ fn main() {
                 direction: Direction::Up,
                 is_alive: true,
                 food: 0,
+                team_id: None,
             },
             Snake {
                 body: vec![
@@ -29,6 +30,7 @@ fn main() {
                 direction: Direction::Right,
                 is_alive: true,
                 food: 0,
+                team_id: None,
             },
             Snake {
                 body: vec![
@@ -38,6 +40,7 @@ fn main() {
                 direction: Direction::Down,
                 is_alive: true,
                 food: 0,
+                team_id: None,
             },
         ],
         food: vec![
@@ -45,6 +48,7 @@ fn main() {
             Position { x: 2, y: 2 },
             Position { x: 17, y: 8 },
         ],
+        team_zone_config: None,
     };
 
     println!("=== 1x1 Rendering (Classic) ===");

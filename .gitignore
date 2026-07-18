@@ -8,3 +8,6 @@ client/web/dist
 states
 .DS_Store
 replays/
+
+# Sync flight-recorder traces (see DEBUGGING.md)
+traces/

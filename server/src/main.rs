@@ -4,7 +4,6 @@ use server::api::jwt::{JwtManager, ProductionJwtVerifier};
 use server::db::{Database, dynamodb::DynamoDatabase};
 use server::game_server::{GameServer, GameServerConfig};
 use server::http_server::run_http_server;
-use server::pubsub_manager::PubSubManager;
 use server::redis_utils::create_connection_manager;
 use server::region_cache::RegionCache;
 use server::ws_server::TestJwtVerifier;

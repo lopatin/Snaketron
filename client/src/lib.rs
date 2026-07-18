@@ -134,6 +134,8 @@ impl GameClient {
             game_id: self.engine.game_id(),
             tick: game_state.current_tick(),
             sequence: game_state.event_sequence,
+            stream_seq: 0, // locally constructed, not from the transport
+
             user_id: None,
             event: GameEvent::Snapshot { game_state },
         };
@@ -190,6 +192,27 @@ impl GameClient {
     #[wasm_bindgen(js_name = getGameId)]
     pub fn get_game_id(&self) -> u32 {
         self.engine.game_id()
+    }
+
+    /// Get the engine's sync status (stream gaps, hash probes, needs_resync) as JSON
+    #[wasm_bindgen(js_name = getSyncStatusJson)]
+    pub fn get_sync_status_json(&self) -> Result<String, JsValue> {
+        self.engine
+            .sync_status_json()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Get the committed-state sync hash as a decimal string
+    /// (u64 exceeds JS safe-integer range, so it crosses the boundary as text)
+    #[wasm_bindgen(js_name = getCommittedHash)]
+    pub fn get_committed_hash(&self) -> String {
+        self.engine.committed_sync_hash().to_string()
+    }
+
+    /// Clear the needs_resync flag once a resync request has been sent
+    #[wasm_bindgen(js_name = clearNeedsResync)]
+    pub fn clear_needs_resync(&mut self) {
+        self.engine.clear_needs_resync();
     }
 
     /// Get the snake ID for a given user ID

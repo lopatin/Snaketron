@@ -11,6 +11,7 @@ import {
   User,
 } from '../types';
 import { clockSync } from '../utils/clockSync';
+import { record as recordTrace } from '../utils/syncTrace';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
 import {
@@ -117,6 +118,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
   const { user, getToken } = useAuth();
+  const hasEverConnectedRef = useRef(false);
   const authHandshakeRef = useRef(false);
   const lastAuthTokenRef = useRef<string | null>(null);
   const previousUserRef = useRef<User | null>(null);
@@ -262,6 +264,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
       ws.current.onopen = () => {
         console.log('WebSocket connected to:', url);
+        if (hasEverConnectedRef.current) {
+          recordTrace({ Note: { ts_ms: Date.now(), note: 'ws reconnected' } });
+        }
+        hasEverConnectedRef.current = true;
         setIsConnected(true);
         if (reconnectTimeout.current) {
           clearTimeout(reconnectTimeout.current);
@@ -293,6 +299,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
       ws.current.onclose = () => {
         console.log('WebSocket disconnected');
+        recordTrace({ Note: { ts_ms: Date.now(), note: 'ws disconnected, reconnect scheduled' } });
         setIsConnected(false);
         // Reset clock sync
         clockSync.reset();
@@ -983,8 +990,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           };
           return chatMessage;
         })
-        .filter((entry): entry is ChatMessage => entry !== null)
-        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+        .filter((entry: ChatMessage | null): entry is ChatMessage => entry !== null)
+        .sort((a: ChatMessage, b: ChatMessage) => a.timestamp.getTime() - b.timestamp.getTime());
 
       if (typeof lobbyId === 'number' && Number.isFinite(lobbyId)) {
         lobbyChatLobbyIdRef.current = lobbyId;
@@ -1151,8 +1158,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           };
           return chatMessage;
         })
-        .filter((entry): entry is ChatMessage => entry !== null)
-        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+        .filter((entry: ChatMessage | null): entry is ChatMessage => entry !== null)
+        .sort((a: ChatMessage, b: ChatMessage) => a.timestamp.getTime() - b.timestamp.getTime());
 
       if (typeof gameId === 'number' && Number.isFinite(gameId)) {
         gameChatIdRef.current = gameId;
