@@ -35,8 +35,9 @@ pub fn calculate_ai_move(
     possible_directions.retain(|&d| !current_direction.is_opposite(&d));
 
     // Determine target based on game mode and strategy
-    let target = if is_team_game(game_state) && snake.team_id.is_some() {
-        let team_id = snake.team_id.unwrap();
+    let target = if is_team_game(game_state)
+        && let Some(team_id) = snake.team_id
+    {
         let starting_length = get_starting_snake_length(&game_state.game_type);
 
         // Decide whether to return to base or collect more food
@@ -339,10 +340,10 @@ fn should_return_to_base(
     }
 
     // Check if already in own base - if so, exit to collect more food
-    if let Ok(head) = snake.head() {
-        if game_state.arena.is_in_team_base(head, team_id) {
-            return false; // Already home, go back out
-        }
+    if let Ok(head) = snake.head()
+        && game_state.arena.is_in_team_base(head, team_id)
+    {
+        return false; // Already home, go back out
     }
 
     // Calculate return score based on multiple factors

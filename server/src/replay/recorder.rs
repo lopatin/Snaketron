@@ -3,7 +3,6 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::fs;
 use std::io::Write;
-use tracing::info;
 
 pub struct GameReplayRecorder {
     game_id: u32,

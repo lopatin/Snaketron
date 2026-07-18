@@ -1,13 +1,11 @@
 use crate::db::Database;
-use crate::db::models::{LobbyMetadata, User};
+use crate::db::models::User;
 use crate::redis_keys::RedisKeys;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
 
 const EXPIRATION_SECONDS: u64 = 3600; // 1 hour
 

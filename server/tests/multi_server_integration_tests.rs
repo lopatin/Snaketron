@@ -1,4 +1,4 @@
-use ::common::{GameEvent, GameType};
+use ::common::GameEvent;
 use anyhow::Result;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
@@ -107,16 +107,16 @@ async fn test_server_load_distribution() -> Result<()> {
     let user_ids = env.user_ids();
 
     // 4 clients on server 1
-    for i in 0..4 {
+    for &user_id in user_ids.iter().take(4) {
         let mut client = TestClient::connect(&server1_addr).await?;
-        client.authenticate(user_ids[i]).await?;
+        client.authenticate(user_id).await?;
         clients_server1.push(client);
     }
 
     // 4 clients on server 2
-    for i in 4..8 {
+    for &user_id in user_ids.iter().skip(4).take(4) {
         let mut client = TestClient::connect(&server2_addr).await?;
-        client.authenticate(user_ids[i]).await?;
+        client.authenticate(user_id).await?;
         clients_server2.push(client);
     }
 
@@ -193,7 +193,7 @@ async fn test_cross_server_matchmaking() -> Result<()> {
     env.create_user().await?;
     env.create_user().await?;
     let server1_addr = env.ws_addr(0).expect("Server 1 should exist");
-    let server2_addr = env.ws_addr(1).expect("Server 2 should exist");
+    let _server2_addr = env.ws_addr(1).expect("Server 2 should exist");
 
     // Connect clients to the same server for now
     // TODO: Add proper session tracking to test true cross-server scenarios
@@ -401,14 +401,15 @@ async fn wait_for_game_start(client: &mut TestClient) -> Result<u32> {
     })?
 }
 
+#[allow(dead_code)] // test helper retained for future matchmaking assertions
 async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(10), async {
         loop {
             // With auto-joining, we now receive a game snapshot directly
-            if let Some(event) = client.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok(event.game_id);
-                }
+            if let Some(event) = client.receive_game_event().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok(event.game_id);
             }
         }
     })

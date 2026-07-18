@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState, GameStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -420,6 +420,8 @@ pub struct ReplicationManager {
 }
 
 /// API for querying replicated game states
+// Internal trait: callers never need extra auto trait bounds on the futures.
+#[allow(async_fn_in_trait)]
 pub trait GameStateReader: Send + Sync {
     /// Get a game state by ID
     async fn get_game_state(&self, game_id: u32) -> Option<GameState>;

@@ -1,31 +1,27 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use std::env;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::api::jwt::JwtManager;
 use crate::game_bus::{BusKind, GameBus};
 use crate::game_executor::PARTITION_COUNT;
-use crate::game_executor::StreamEvent;
 use crate::http_server::run_http_server;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_utils::create_connection_manager;
 use crate::region_cache::RegionCache;
-use crate::ws_server::discover_peers;
 use crate::{
     cluster_singleton::ClusterSingleton, db::Database, game_executor::run_game_executor,
-    grpc_server::run_game_relay_server, matchmaking::run_matchmaking_loop, redis_keys::RedisKeys,
-    redis_utils, replay::ReplayListener, replication::ReplicationManager, ws_server::JwtVerifier,
+    matchmaking::run_matchmaking_loop, redis_keys::RedisKeys, replication::ReplicationManager,
+    ws_server::JwtVerifier,
 };
-use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
+use redis::Client;
 use std::path::PathBuf;
 
 /// Configuration for a game server instance
@@ -102,7 +98,7 @@ impl GameServer {
             ws_url,
             jwt_manager,
             jwt_verifier,
-            replay_dir,
+            replay_dir: _,
             redis_url,
         } = config;
 

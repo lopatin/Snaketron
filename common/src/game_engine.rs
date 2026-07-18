@@ -103,9 +103,9 @@ impl GameEngine {
             GameType::Custom { settings } => (
                 settings.arena_width,
                 settings.arena_height,
-                settings.tick_duration_ms as u32,
+                settings.tick_duration_ms,
             ),
-            _ => (40, 40, DEFAULT_TICK_INTERVAL_MS as u32), // Default dimensions for non-custom games
+            _ => (40, 40, DEFAULT_TICK_INTERVAL_MS), // Default dimensions for non-custom games
         };
 
         GameEngine {
@@ -184,12 +184,11 @@ impl GameEngine {
         // snake would simply stop responding. Rapid inputs may legitimately
         // queue a few ticks ahead; beyond that margin the ratchet resets.
         const MAX_COMMAND_AHEAD_TICKS: u32 = 8;
-        if let Some(last_tick) = self.last_command_tick {
-            if predicted_tick <= last_tick
-                && last_tick < current_predicted_tick + MAX_COMMAND_AHEAD_TICKS
-            {
-                predicted_tick = last_tick + 1;
-            }
+        if let Some(last_tick) = self.last_command_tick
+            && predicted_tick <= last_tick
+            && last_tick < current_predicted_tick + MAX_COMMAND_AHEAD_TICKS
+        {
+            predicted_tick = last_tick + 1;
         }
 
         // Update the last command tick
@@ -291,10 +290,10 @@ impl GameEngine {
         }
 
         // Also schedule in predicted state if it exists
-        if let GameEvent::CommandScheduled { command_message: _ } = &event_message.event {
-            if let Some(predicted_state) = &mut self.predicted_state {
-                predicted_state.apply_event(event_message.event.clone(), None);
-            }
+        if let GameEvent::CommandScheduled { command_message: _ } = &event_message.event
+            && let Some(predicted_state) = &mut self.predicted_state
+        {
+            predicted_state.apply_event(event_message.event.clone(), None);
         }
 
         Ok(())
@@ -339,7 +338,7 @@ impl GameEngine {
         let needs_rebuild = self
             .predicted_state
             .as_ref()
-            .map_or(true, |state| predicted_target_tick > state.current_tick());
+            .is_none_or(|state| predicted_target_tick > state.current_tick());
 
         if needs_rebuild {
             // Clone committed state

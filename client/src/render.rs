@@ -62,7 +62,7 @@ pub fn render_game(
     let canvas_height = canvas.height() as f64;
 
     // Clear entire canvas with white background (including padding area)
-    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+    ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(0.0, 0.0, canvas_width, canvas_height);
 
     // Add 1px padding offset for all drawing operations
@@ -73,7 +73,7 @@ pub fn render_game(
     ctx.translate(padding, padding)?;
 
     // Fill the game area with white to ensure clean background
-    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+    ctx.set_fill_style_str("#ffffff");
     ctx.fill_rect(
         0.0,
         0.0,
@@ -122,11 +122,11 @@ pub fn render_game(
             90 => {
                 // 90° CW: left zone becomes top, right zone becomes bottom
                 // Top zone
-                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.set_fill_style_str(left_color);
                 ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
 
                 // Bottom zone
-                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.set_fill_style_str(right_color);
                 ctx.fill_rect(
                     0.0,
                     (height - end_zone_depth) * cell_size,
@@ -137,7 +137,7 @@ pub fn render_game(
             180 => {
                 // 180°: left zone becomes right, right zone becomes left
                 // Right zone (was left)
-                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.set_fill_style_str(left_color);
                 ctx.fill_rect(
                     (width - end_zone_depth) * cell_size,
                     0.0,
@@ -146,13 +146,13 @@ pub fn render_game(
                 );
 
                 // Left zone (was right)
-                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.set_fill_style_str(right_color);
                 ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
             }
             270 => {
                 // 270° CW: left zone becomes bottom, right zone becomes top
                 // Bottom zone (was left)
-                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.set_fill_style_str(left_color);
                 ctx.fill_rect(
                     0.0,
                     (height - end_zone_depth) * cell_size,
@@ -161,17 +161,17 @@ pub fn render_game(
                 );
 
                 // Top zone (was right)
-                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.set_fill_style_str(right_color);
                 ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
             }
             _ => {
                 // 0° or default: normal orientation
                 // Left zone
-                ctx.set_fill_style(&JsValue::from_str(left_color));
+                ctx.set_fill_style_str(left_color);
                 ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
 
                 // Right zone
-                ctx.set_fill_style(&JsValue::from_str(right_color));
+                ctx.set_fill_style_str(right_color);
                 ctx.fill_rect(
                     (width - end_zone_depth) * cell_size,
                     0.0,
@@ -183,7 +183,7 @@ pub fn render_game(
     }
 
     // Draw dots at grid intersections (like the background pattern)
-    ctx.set_fill_style(&JsValue::from_str("rgba(0, 0, 0, 0.3)")); // Same as background dots
+    ctx.set_fill_style_str("rgba(0, 0, 0, 0.3)"); // Same as background dots
 
     // Scale dot spacing with cell size to maintain consistent visual density
     let dot_spacing = cell_size;
@@ -221,18 +221,16 @@ pub fn render_game(
             arena["snakes"].as_array(),
         ) {
             for (user_id_str, player_val) in players {
-                if let Some(snake_id) = player_val["snake_id"].as_u64() {
-                    if let Some(snake) = snakes.get(snake_id as usize) {
-                        if let Some(team_id) = snake["team_id"].as_u64() {
-                            if (team_id as usize) < 2 {
-                                let username = username_map
-                                    .and_then(|map| map.get(user_id_str))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_else(|| user_id_str.as_str());
-                                team_names[team_id as usize].push(username.to_string());
-                            }
-                        }
-                    }
+                if let Some(snake_id) = player_val["snake_id"].as_u64()
+                    && let Some(snake) = snakes.get(snake_id as usize)
+                    && let Some(team_id) = snake["team_id"].as_u64()
+                    && (team_id as usize) < 2
+                {
+                    let username = username_map
+                        .and_then(|map| map.get(user_id_str))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(user_id_str.as_str());
+                    team_names[team_id as usize].push(username.to_string());
                 }
             }
         }
@@ -269,7 +267,7 @@ pub fn render_game(
             _ => local_name.clone(),
         };
 
-        let mut format_names = |names: &[String], fallback: &str| -> Vec<String> {
+        let format_names = |names: &[String], fallback: &str| -> Vec<String> {
             if names.is_empty() {
                 vec![fallback.to_string()]
             } else {
@@ -310,9 +308,9 @@ pub fn render_game(
             let size = font_size.min(compute_font_size(text, box_w, box_h));
             ctx.set_font(&format!("900 {}px Impact, 'Arial Black', sans-serif", size));
             ctx.set_line_width(size * 0.35);
-            ctx.set_stroke_style(&JsValue::from_str(bg_color));
+            ctx.set_stroke_style_str(bg_color);
             ctx.stroke_text(text, center_x, center_y)?;
-            ctx.set_fill_style(&JsValue::from_str(text_color));
+            ctx.set_fill_style_str(text_color);
             ctx.fill_text(text, center_x, center_y)?;
             Ok(())
         };
@@ -357,12 +355,16 @@ pub fn render_game(
                 };
 
             // Use the same font size for all labels in this zone: smallest that fits every label
-            let mut needed_size =
-                compute_font_size(names.get(0).map(|s| s.as_str()).unwrap_or(""), box_w, box_h);
-            if split_labels && names.len() > 1 {
-                if let Some(name) = names.get(1) {
-                    needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
-                }
+            let mut needed_size = compute_font_size(
+                names.first().map(|s| s.as_str()).unwrap_or(""),
+                box_w,
+                box_h,
+            );
+            if split_labels
+                && names.len() > 1
+                && let Some(name) = names.get(1)
+            {
+                needed_size = needed_size.min(compute_font_size(name, box_w, box_h));
             }
 
             for (i, name) in names.iter().take(centers.len()).enumerate() {
@@ -455,7 +457,7 @@ pub fn render_game(
     // Draw food
     if let Some(food_array) = arena["food"].as_array() {
         // First pass: Draw white squares to erase grid dots
-        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+        ctx.set_fill_style_str("#ffffff");
         for food in food_array {
             if let (Some(x), Some(y)) = (food["x"].as_i64(), food["y"].as_i64()) {
                 let (tx, ty) =
@@ -479,7 +481,7 @@ pub fn render_game(
                 let radius = cell_size / 2.0;
 
                 // Draw darker border
-                ctx.set_fill_style(&JsValue::from_str("#5e8a5e"));
+                ctx.set_fill_style_str("#5e8a5e");
                 ctx.begin_path();
                 ctx.arc(
                     center_x,
@@ -491,13 +493,13 @@ pub fn render_game(
                 ctx.fill();
 
                 // Draw food base
-                ctx.set_fill_style(&JsValue::from_str("#85b885"));
+                ctx.set_fill_style_str("#85b885");
                 ctx.begin_path();
                 ctx.arc(center_x, center_y, radius, 0.0, 2.0 * std::f64::consts::PI)?;
                 ctx.fill();
 
                 // Draw single light reflection in top-left
-                ctx.set_fill_style(&JsValue::from_str("#a0c8a0"));
+                ctx.set_fill_style_str("#a0c8a0");
                 ctx.begin_path();
                 ctx.arc(
                     center_x - radius * 0.35,
@@ -546,7 +548,7 @@ pub fn render_game(
                     }
                 };
 
-                ctx.set_fill_style(&JsValue::from_str(color));
+                ctx.set_fill_style_str(color);
 
                 // Draw snake body
                 if let Some(body) = snake["body"].as_array() {
@@ -556,65 +558,65 @@ pub fn render_game(
 
                     // Handle single-segment snake (just a head)
                     if body.len() == 1 {
-                        if let Some(head) = body.first() {
-                            if let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(head) = body.first()
+                            && let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                // Draw border
-                                ctx.set_fill_style(&JsValue::from_str(border_color));
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0 + 1.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
+                            // Draw border
+                            ctx.set_fill_style_str(border_color);
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0 + 1.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
 
-                                // Draw as a full circle
-                                ctx.set_fill_style(&JsValue::from_str(color));
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
+                            // Draw as a full circle
+                            ctx.set_fill_style_str(color);
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
 
-                                // Draw inner circle
-                                ctx.set_fill_style(&JsValue::from_str("#333"));
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size * 0.38,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
-                                ctx.set_fill_style(&JsValue::from_str(color));
-                            }
+                            // Draw inner circle
+                            ctx.set_fill_style_str("#333");
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size * 0.38,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
+                            ctx.set_fill_style_str(color);
                         }
                         continue;
                     }
 
                     // First pass: Fill with white rectangles to cover grid dots
-                    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                    ctx.set_fill_style_str("#ffffff");
 
                     // Fill white rectangles for body segments (expanded by 1px)
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -669,11 +671,11 @@ pub fn render_game(
                     }
 
                     // Second pass: Draw borders (1px larger)
-                    ctx.set_stroke_style(&JsValue::from_str(border_color));
+                    ctx.set_stroke_style_str(border_color);
 
                     // Draw border for body segments
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -714,40 +716,40 @@ pub fn render_game(
                     }
 
                     // Draw border for corner joints
-                    ctx.set_fill_style(&JsValue::from_str(border_color));
+                    ctx.set_fill_style_str(border_color);
                     for i in 1..body.len() - 1 {
-                        if let Some(point) = body.get(i) {
-                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(point) = body.get(i)
+                            && let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0 + 1.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
-                            }
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0 + 1.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
                         }
                     }
 
                     // Third pass: Draw the actual snake
-                    ctx.set_stroke_style(&JsValue::from_str(color));
-                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.set_stroke_style_str(color);
+                    ctx.set_fill_style_str(color);
 
                     // Draw main body segments
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -789,28 +791,28 @@ pub fn render_game(
 
                     // Draw corner joints as circles to create smooth turns
                     for i in 1..body.len() - 1 {
-                        if let Some(point) = body.get(i) {
-                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(point) = body.get(i)
+                            && let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
-                            }
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
                         }
                     }
 
@@ -833,7 +835,7 @@ pub fn render_game(
 
                     // Draw actual tail and head (no separate border circles needed)
                     // The round line caps already provide the border
-                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.set_fill_style_str(color);
 
                     // Draw tail as full circle
                     ctx.begin_path();
@@ -852,13 +854,13 @@ pub fn render_game(
                     let mut segment_distances = Vec::new();
 
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
                             let y2 = p2["y"].as_i64().unwrap_or(0) as f64;
 
-                            let segment_length = ((x2 - x1).abs() + (y2 - y1).abs()) as f64;
+                            let segment_length = (x2 - x1).abs() + (y2 - y1).abs();
                             segment_distances.push((cumulative_distance, segment_length));
                             cumulative_distance += segment_length;
                         }
@@ -871,7 +873,7 @@ pub fn render_game(
                     let mut seen_cells = HashSet::new();
 
                     for (seg_idx, window) in body.windows(2).enumerate() {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0);
                             let y1 = p1["y"].as_i64().unwrap_or(0);
                             let x2 = p2["x"].as_i64().unwrap_or(0);
@@ -933,10 +935,7 @@ pub fn render_game(
                     // Now draw all collected cells with their proper distances
                     for (x, y, distance) in cells_with_distance {
                         let opacity = (1.0 - distance / 10.0) * 0.3;
-                        ctx.set_fill_style(&JsValue::from_str(&format!(
-                            "rgba(255, 255, 255, {})",
-                            opacity
-                        )));
+                        ctx.set_fill_style_str(&format!("rgba(255, 255, 255, {})", opacity));
 
                         let (tx, ty) = transform_coords(
                             x as f64,
@@ -949,7 +948,7 @@ pub fn render_game(
                     }
 
                     // Draw head as full circle (after overlay for proper layering)
-                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.set_fill_style_str(color);
                     ctx.begin_path();
                     ctx.arc(
                         head_center_x,
@@ -961,7 +960,7 @@ pub fn render_game(
                     ctx.fill();
 
                     // Draw white overlay on head (strongest opacity)
-                    ctx.set_fill_style(&JsValue::from_str("rgba(255, 255, 255, 0.3)"));
+                    ctx.set_fill_style_str("rgba(255, 255, 255, 0.3)");
                     ctx.begin_path();
                     ctx.arc(
                         head_center_x,
@@ -973,7 +972,7 @@ pub fn render_game(
                     ctx.fill();
 
                     // Draw smaller inner circle in head with different color
-                    ctx.set_fill_style(&JsValue::from_str("#333"));
+                    ctx.set_fill_style_str("#333");
                     ctx.begin_path();
                     ctx.arc(
                         head_center_x,
@@ -989,7 +988,7 @@ pub fn render_game(
                 let color = "#f0f0f0"; // Light gray for dead snakes
                 let border_color = "#d0d0d0"; // Slightly darker border
 
-                ctx.set_fill_style(&JsValue::from_str(color));
+                ctx.set_fill_style_str(color);
 
                 // Draw snake body
                 if let Some(body) = snake["body"].as_array() {
@@ -999,65 +998,65 @@ pub fn render_game(
 
                     // Handle single-segment snake (just a head)
                     if body.len() == 1 {
-                        if let Some(head) = body.first() {
-                            if let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(head) = body.first()
+                            && let (Some(x), Some(y)) = (head["x"].as_i64(), head["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                // Draw border
-                                ctx.set_fill_style(&JsValue::from_str(border_color));
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0 + 1.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
+                            // Draw border
+                            ctx.set_fill_style_str(border_color);
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0 + 1.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
 
-                                // Draw as a full circle
-                                ctx.set_fill_style(&JsValue::from_str(color));
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
+                            // Draw as a full circle
+                            ctx.set_fill_style_str(color);
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
 
-                                // Draw X mark on head
-                                ctx.set_stroke_style(&JsValue::from_str("#666"));
-                                ctx.set_line_width(2.0);
-                                let x_size = cell_size * 0.3;
-                                ctx.begin_path();
-                                ctx.move_to(center_x - x_size, center_y - x_size);
-                                ctx.line_to(center_x + x_size, center_y + x_size);
-                                ctx.stroke();
-                                ctx.begin_path();
-                                ctx.move_to(center_x - x_size, center_y + x_size);
-                                ctx.line_to(center_x + x_size, center_y - x_size);
-                                ctx.stroke();
-                            }
+                            // Draw X mark on head
+                            ctx.set_stroke_style_str("#666");
+                            ctx.set_line_width(2.0);
+                            let x_size = cell_size * 0.3;
+                            ctx.begin_path();
+                            ctx.move_to(center_x - x_size, center_y - x_size);
+                            ctx.line_to(center_x + x_size, center_y + x_size);
+                            ctx.stroke();
+                            ctx.begin_path();
+                            ctx.move_to(center_x - x_size, center_y + x_size);
+                            ctx.line_to(center_x + x_size, center_y - x_size);
+                            ctx.stroke();
                         }
                         continue;
                     }
 
                     // First pass: Fill with white rectangles to cover grid dots
-                    ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+                    ctx.set_fill_style_str("#ffffff");
 
                     // Fill white rectangles for body segments (expanded by 1px)
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -1112,11 +1111,11 @@ pub fn render_game(
                     }
 
                     // Second pass: Draw borders (1px larger)
-                    ctx.set_stroke_style(&JsValue::from_str(border_color));
+                    ctx.set_stroke_style_str(border_color);
 
                     // Draw border for body segments
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -1157,40 +1156,40 @@ pub fn render_game(
                     }
 
                     // Draw border for corner joints
-                    ctx.set_fill_style(&JsValue::from_str(border_color));
+                    ctx.set_fill_style_str(border_color);
                     for i in 1..body.len() - 1 {
-                        if let Some(point) = body.get(i) {
-                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(point) = body.get(i)
+                            && let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0 + 1.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
-                            }
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0 + 1.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
                         }
                     }
 
                     // Third pass: Draw the actual snake
-                    ctx.set_stroke_style(&JsValue::from_str(color));
-                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.set_stroke_style_str(color);
+                    ctx.set_fill_style_str(color);
 
                     // Draw main body segments
                     for window in body.windows(2) {
-                        if let (Some(p1), Some(p2)) = (window.get(0), window.get(1)) {
+                        if let (Some(p1), Some(p2)) = (window.first(), window.get(1)) {
                             let x1 = p1["x"].as_i64().unwrap_or(0) as f64;
                             let y1 = p1["y"].as_i64().unwrap_or(0) as f64;
                             let x2 = p2["x"].as_i64().unwrap_or(0) as f64;
@@ -1232,28 +1231,28 @@ pub fn render_game(
 
                     // Draw corner joints as circles to create smooth turns
                     for i in 1..body.len() - 1 {
-                        if let Some(point) = body.get(i) {
-                            if let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64()) {
-                                let (tx, ty) = transform_coords(
-                                    x as f64,
-                                    y as f64,
-                                    game_width,
-                                    game_height,
-                                    rotation_int,
-                                );
-                                let center_x = tx * cell_size + cell_size / 2.0;
-                                let center_y = ty * cell_size + cell_size / 2.0;
+                        if let Some(point) = body.get(i)
+                            && let (Some(x), Some(y)) = (point["x"].as_i64(), point["y"].as_i64())
+                        {
+                            let (tx, ty) = transform_coords(
+                                x as f64,
+                                y as f64,
+                                game_width,
+                                game_height,
+                                rotation_int,
+                            );
+                            let center_x = tx * cell_size + cell_size / 2.0;
+                            let center_y = ty * cell_size + cell_size / 2.0;
 
-                                ctx.begin_path();
-                                ctx.arc(
-                                    center_x,
-                                    center_y,
-                                    cell_size / 2.0,
-                                    0.0,
-                                    2.0 * std::f64::consts::PI,
-                                )?;
-                                ctx.fill();
-                            }
+                            ctx.begin_path();
+                            ctx.arc(
+                                center_x,
+                                center_y,
+                                cell_size / 2.0,
+                                0.0,
+                                2.0 * std::f64::consts::PI,
+                            )?;
+                            ctx.fill();
                         }
                     }
 
@@ -1275,7 +1274,7 @@ pub fn render_game(
                     let tail_center_y = tail_ty * cell_size + cell_size / 2.0;
 
                     // Draw tail as full circle
-                    ctx.set_fill_style(&JsValue::from_str(color));
+                    ctx.set_fill_style_str(color);
                     ctx.begin_path();
                     ctx.arc(
                         tail_center_x,
@@ -1298,7 +1297,7 @@ pub fn render_game(
                     ctx.fill();
 
                     // Draw X mark on dead snake head
-                    ctx.set_stroke_style(&JsValue::from_str("#666"));
+                    ctx.set_stroke_style_str("#666");
                     ctx.set_line_width(2.0);
                     let x_size = cell_size * 0.3;
                     ctx.begin_path();
@@ -1339,7 +1338,7 @@ pub fn render_game(
                 let goal_x_end = (goal_center + goal_half_width).ceil();
 
                 // Top wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                ctx.set_fill_style_str(left_wall_color);
                 let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
 
                 if goal_x_start > 0.0 {
@@ -1355,7 +1354,7 @@ pub fn render_game(
                 }
 
                 // Bottom wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                ctx.set_fill_style_str(right_wall_color);
                 let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
 
                 if goal_x_start > 0.0 {
@@ -1378,7 +1377,7 @@ pub fn render_game(
                 let goal_y_end = (goal_center + goal_half_width).ceil();
 
                 // Right wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                ctx.set_fill_style_str(left_wall_color);
                 let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
 
                 if goal_y_start > 0.0 {
@@ -1394,7 +1393,7 @@ pub fn render_game(
                 }
 
                 // Left wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                ctx.set_fill_style_str(right_wall_color);
                 let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
 
                 if goal_y_start > 0.0 {
@@ -1417,7 +1416,7 @@ pub fn render_game(
                 let goal_x_end = (goal_center + goal_half_width).ceil();
 
                 // Bottom wall (was left wall)
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                ctx.set_fill_style_str(left_wall_color);
                 let wall_y = (height - end_zone_depth) * cell_size - wall_thickness / 2.0;
 
                 if goal_x_start > 0.0 {
@@ -1433,7 +1432,7 @@ pub fn render_game(
                 }
 
                 // Top wall (was right wall)
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                ctx.set_fill_style_str(right_wall_color);
                 let wall_y = end_zone_depth * cell_size - wall_thickness / 2.0;
 
                 if goal_x_start > 0.0 {
@@ -1456,7 +1455,7 @@ pub fn render_game(
                 let goal_y_end = (goal_center + goal_half_width).ceil();
 
                 // Left wall
-                ctx.set_fill_style(&JsValue::from_str(left_wall_color));
+                ctx.set_fill_style_str(left_wall_color);
                 let wall_x = end_zone_depth * cell_size - wall_thickness / 2.0;
 
                 if goal_y_start > 0.0 {
@@ -1472,7 +1471,7 @@ pub fn render_game(
                 }
 
                 // Right wall
-                ctx.set_fill_style(&JsValue::from_str(right_wall_color));
+                ctx.set_fill_style_str(right_wall_color);
                 let wall_x = (width - end_zone_depth) * cell_size - wall_thickness / 2.0;
 
                 if goal_y_start > 0.0 {
@@ -1491,7 +1490,7 @@ pub fn render_game(
     }
 
     // Draw game info
-    ctx.set_fill_style(&JsValue::from_str("#333"));
+    ctx.set_fill_style_str("#333");
     ctx.set_font("16px monospace");
     if let Some(tick) = game_state["tick"].as_u64() {
         ctx.fill_text(&format!("Tick: {}", tick), 10.0, canvas_height + 20.0)?;

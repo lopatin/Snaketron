@@ -108,11 +108,11 @@ fn find_solo_combination(
 
     // Allow larger lobbies by selecting the requesting user as the lone player and marking
     // everyone else as spectators.
-    for lobby in lobbies.iter().filter(|l| !l.members.is_empty()) {
+    if let Some(lobby) = lobbies.iter().find(|l| !l.members.is_empty()) {
         let requesting_idx = lobby
             .members
             .iter()
-            .position(|m| m.user_id as u32 == lobby.requesting_user_id)
+            .position(|m| m.user_id == lobby.requesting_user_id)
             .unwrap_or(0);
 
         let mut spectator_indices: Vec<usize> = (0..lobby.members.len()).collect();
@@ -159,7 +159,7 @@ fn find_team_combination(
 fn find_exact_team_match(
     lobbies: &[crate::matchmaking_manager::QueuedLobby],
     per_team: usize,
-    total_needed: usize,
+    _total_needed: usize,
 ) -> Option<MatchmakingCombination> {
     let mut team_a: Vec<(usize, Vec<usize>)> = Vec::new(); // (lobby_idx, member_indices)
     let mut team_b: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -355,7 +355,7 @@ fn find_single_lobby_split(
         let host_index = lobby
             .members
             .iter()
-            .position(|m| m.user_id as u32 == lobby.requesting_user_id);
+            .position(|m| m.user_id == lobby.requesting_user_id);
 
         let mut player_indices = Vec::with_capacity(total_needed);
 
@@ -424,7 +424,7 @@ fn find_team_match_with_spectators(
             let requesting_user_idx = lobby
                 .members
                 .iter()
-                .position(|m| m.user_id as u32 == lobby.requesting_user_id);
+                .position(|m| m.user_id == lobby.requesting_user_id);
 
             // Build player list: requesting user first, then others
             let mut player_indices = Vec::new();
@@ -528,17 +528,17 @@ fn find_ffa_combination(
             let requesting_idx = lobby
                 .members
                 .iter()
-                .position(|m| m.user_id as u32 == lobby.requesting_user_id);
+                .position(|m| m.user_id == lobby.requesting_user_id);
 
             let mut playing_indices = Vec::new();
 
-            if remaining_slots > 0 {
-                if let Some(idx) = requesting_idx {
-                    playing_indices.push(idx);
-                    remaining_slots -= 1;
-                    total_players += 1;
-                    total_mmr_weighted += lobby.avg_mmr;
-                }
+            if remaining_slots > 0
+                && let Some(idx) = requesting_idx
+            {
+                playing_indices.push(idx);
+                remaining_slots -= 1;
+                total_players += 1;
+                total_mmr_weighted += lobby.avg_mmr;
             }
 
             for idx in 0..lobby.members.len() {
@@ -592,6 +592,7 @@ fn find_ffa_combination(
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn backtrack_ffa(
         lobbies: &[crate::matchmaking_manager::QueuedLobby],
         max_players: usize,
@@ -920,7 +921,7 @@ async fn create_lobby_matches(
     }
 
     // Sort lobbies by wait time (longest waiting first) for priority matching
-    available_lobbies.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
+    available_lobbies.sort_by_key(|a| a.queued_at);
 
     let mut games_created = 0;
 
@@ -1133,13 +1134,13 @@ async fn create_game_from_lobbies(
                 if let Some(member) = lobby.members.get(member_idx) {
                     // Add player to game state with explicit team assignment
                     game_state.add_player_with_team(
-                        member.user_id as u32,
+                        member.user_id,
                         Some(member.username.clone()),
                         Some(assignment.team_id),
                     )?;
 
                     all_players.push(QueuedPlayer {
-                        user_id: member.user_id as u32,
+                        user_id: member.user_id,
                         mmr: combination.avg_mmr,
                         username: member.username.clone(),
                     });
@@ -1152,10 +1153,9 @@ async fn create_game_from_lobbies(
             if let Some(indices) = spectator_map.get(lobby.lobby_code.as_str()) {
                 for idx in indices {
                     if let Some(member) = lobby.members.get(*idx) {
-                        game_state
-                            .add_spectator(member.user_id as u32, Some(member.username.clone()));
+                        game_state.add_spectator(member.user_id, Some(member.username.clone()));
                         spectators.push(QueuedPlayer {
-                            user_id: member.user_id as u32,
+                            user_id: member.user_id,
                             mmr: combination.avg_mmr,
                             username: member.username.clone(),
                         });
@@ -1174,19 +1174,19 @@ async fn create_game_from_lobbies(
             for (idx, member) in lobby.members.iter().enumerate() {
                 // Skip spectators for solo queues that came from multi-member lobbies
                 if spectators_for_lobby.contains(&idx) {
-                    game_state.add_spectator(member.user_id as u32, Some(member.username.clone()));
+                    game_state.add_spectator(member.user_id, Some(member.username.clone()));
                     spectators.push(QueuedPlayer {
-                        user_id: member.user_id as u32,
+                        user_id: member.user_id,
                         mmr: combination.avg_mmr,
                         username: member.username.clone(),
                     });
                     continue;
                 }
 
-                game_state.add_player(member.user_id as u32, Some(member.username.clone()))?;
+                game_state.add_player(member.user_id, Some(member.username.clone()))?;
 
                 all_players.push(QueuedPlayer {
-                    user_id: member.user_id as u32,
+                    user_id: member.user_id,
                     mmr: combination.avg_mmr,
                     username: member.username.clone(),
                 });

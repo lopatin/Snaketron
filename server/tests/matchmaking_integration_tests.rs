@@ -504,10 +504,10 @@ async fn wait_for_match_with_timeout(
 async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(event) = client.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok(());
-                }
+            if let Some(event) = client.receive_game_event().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok(());
             }
         }
     })
@@ -863,8 +863,8 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
 
     // Queue clients in pairs to ensure proper MMR-based matching
     // Queue first pair (lowest MMR)
-    for i in 0..2 {
-        clients[i]
+    for (i, client) in clients.iter_mut().enumerate().take(2) {
+        client
             .send_message(WSMessage::QueueForMatch {
                 game_type: GameType::FreeForAll { max_players: 2 },
                 queue_mode: ::common::QueueMode::Quickmatch,
@@ -885,8 +885,8 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Queue second pair (medium MMR)
-    for i in 2..4 {
-        clients[i]
+    for (i, client) in clients.iter_mut().enumerate().skip(2).take(2) {
+        client
             .send_message(WSMessage::QueueForMatch {
                 game_type: GameType::FreeForAll { max_players: 2 },
                 queue_mode: ::common::QueueMode::Quickmatch,
@@ -907,8 +907,8 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Queue third pair (highest MMR)
-    for i in 4..6 {
-        clients[i]
+    for (i, client) in clients.iter_mut().enumerate().skip(4).take(2) {
+        client
             .send_message(WSMessage::QueueForMatch {
                 game_type: GameType::FreeForAll { max_players: 2 },
                 queue_mode: ::common::QueueMode::Quickmatch,

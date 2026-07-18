@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use redis::aio::{ConnectionManager, PubSub};
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -153,7 +153,9 @@ pub async fn send_queue_position_update(
 
 /// Handle matchmaking for WebSocket connections
 pub struct MatchmakingHandler {
+    #[allow(dead_code)] // retained for direct-queue operations
     matchmaking_manager: MatchmakingManager,
+    #[allow(dead_code)] // retained for direct-queue operations
     redis_conn: ConnectionManager,
     notification_rx: mpsc::Receiver<MatchNotification>,
     ws_tx: mpsc::Sender<WSMessage>,

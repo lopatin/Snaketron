@@ -20,6 +20,8 @@ impl CharDimensions {
     }
 }
 
+// Lib-facing API; the snaketron bin compiles these modules too and uses a subset.
+#[allow(dead_code)]
 pub struct CharGrid {
     grid: Vec<Vec<char>>,
     styles: Vec<Vec<Style>>,
@@ -28,6 +30,8 @@ pub struct CharGrid {
     char_dims: CharDimensions,
 }
 
+// Lib-facing API; the snaketron bin compiles these modules too and uses a subset.
+#[allow(dead_code)]
 impl CharGrid {
     pub fn new(logical_width: usize, logical_height: usize, char_dims: CharDimensions) -> Self {
         let physical_width = logical_width * char_dims.horizontal;
@@ -70,7 +74,7 @@ impl CharGrid {
     }
 
     pub fn into_styled_lines(self) -> Vec<(Vec<char>, Vec<Style>)> {
-        self.grid.into_iter().zip(self.styles.into_iter()).collect()
+        self.grid.into_iter().zip(self.styles).collect()
     }
 
     pub fn physical_width(&self) -> usize {
@@ -88,6 +92,8 @@ pub struct CharPattern {
     pub styles: Vec<Vec<Style>>,
 }
 
+// Lib-facing API; the snaketron bin compiles these modules too and uses a subset.
+#[allow(dead_code)]
 impl CharPattern {
     pub fn new(chars: Vec<Vec<char>>) -> Self {
         let height = chars.len();

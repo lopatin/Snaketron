@@ -60,7 +60,7 @@ async fn test_simple_game() -> Result<()> {
 
     // Create environment
     let mut env = TestEnvironment::new("test_simple_game").await?;
-    let (_, server_id) = env.add_server().await?;
+    let (_, _server_id) = env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
 
@@ -241,10 +241,10 @@ async fn test_simple_game() -> Result<()> {
     // started before turning.
     timeout(Duration::from_secs(10), async {
         loop {
-            if let WSMessage::GameEvent(event) = turning_player_client.receive_message().await? {
-                if event.tick >= 1 {
-                    break Ok::<(), anyhow::Error>(());
-                }
+            if let WSMessage::GameEvent(event) = turning_player_client.receive_message().await?
+                && event.tick >= 1
+            {
+                break Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -269,16 +269,14 @@ async fn test_simple_game() -> Result<()> {
     // turn, so the two turns land on different ticks.
     timeout(Duration::from_secs(10), async {
         loop {
-            if let WSMessage::GameEvent(event) = turning_player_client.receive_message().await? {
-                if let GameEvent::SnakeTurned {
+            if let WSMessage::GameEvent(event) = turning_player_client.receive_message().await?
+                && let GameEvent::SnakeTurned {
                     snake_id,
                     direction: Direction::Up,
                 } = event.event
-                {
-                    if snake_id == turning_snake_id {
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                }
+                && snake_id == turning_snake_id
+            {
+                break Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -373,7 +371,7 @@ async fn test_simple_game() -> Result<()> {
     );
 
     // Output the replay file location
-    if let Some(server) = env.server(0) {
+    if let Some(_server) = env.server(0) {
         // if let Some(replay_listener) = server.replay_listener() {
         //     // Wait a bit for the replay to be saved
         //     tokio::time::sleep(Duration::from_millis(500)).await;

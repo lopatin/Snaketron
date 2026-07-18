@@ -67,6 +67,8 @@ async fn persist_completed_game_with_retry(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("completed-game persistence failed")))
 }
 
+// Snapshot-bearing events are message envelopes; boxing would add churn without a win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
     GameCreated {
@@ -122,6 +124,7 @@ impl TickHashCadence {
 }
 
 /// Create a game engine and run the game loop for a specific game.
+#[allow(clippy::too_many_arguments)]
 async fn run_game(
     server_id: u64,
     game_id: u32,
@@ -325,7 +328,7 @@ async fn run_game(
                             // Establish the terminal grace-period cache before any Complete event
                             // can evict replicas. This keeps refreshes loadable while durable
                             // persistence retries outside the client-visible completion path.
-                            if let Err(e) = bus.store_snapshot(game_id, &game_state).await {
+                            if let Err(e) = bus.store_snapshot(game_id, game_state).await {
                                 error!(
                                     "Failed to store terminal reload snapshot for game {}: {:?}",
                                     game_id, e
@@ -473,8 +476,8 @@ async fn run_game(
 
                             // Replicas use this command as the durable-commit marker. Never evict
                             // the authoritative completed state when persistence did not succeed.
-                            if completion_is_durable {
-                                if let Err(e) = bus.publish_command(
+                            if completion_is_durable
+                                && let Err(e) = bus.publish_command(
                                     partition_id,
                                     &StreamEvent::StatusUpdated {
                                         game_id,
@@ -483,7 +486,6 @@ async fn run_game(
                                 ).await {
                                     warn!("Failed to publish game completion command for {}: {}", game_id, e);
                                 }
-                            }
 
                             // Persist XP to database
                             if !game_state.player_xp.is_empty() {
@@ -496,7 +498,7 @@ async fn run_game(
                             // Persist MMR changes to database
                             if !game_state.players.is_empty() {
                                 info!("Persisting MMR for {} players in game {}", game_state.players.len(), game_id);
-                                if let Err(e) = crate::mmr_persistence::persist_player_mmr(db.as_ref(), game_id, &game_state).await {
+                                if let Err(e) = crate::mmr_persistence::persist_player_mmr(db.as_ref(), game_id, game_state).await {
                                     error!("Failed to persist MMR for game {}: {:?}", game_id, e);
                                 }
                             }
@@ -750,7 +752,7 @@ pub async fn run_game_executor(
                 debug!("Received snapshot request for partition {}", request.partition_id);
                 // Forward to all games in this partition
                 if request.partition_id == partition_id {
-                    for (game_id, (_, snap_tx)) in game_channels.iter() {
+                    for (_, snap_tx) in game_channels.values() {
                         let _ = snap_tx.send(request.clone()).await;
                     }
                 }
@@ -790,13 +792,10 @@ pub async fn run_game_executor(
                         }
                     }
                     StreamEvent::StatusUpdated { game_id, status } => {
-                        match status {
-                            GameStatus::Complete { .. } => {
-                                // Game completed, remove channels
-                                game_channels.remove(&game_id);
-                                info!("Game {} completed", game_id);
-                            }
-                            _ => {}
+                        if let GameStatus::Complete { .. } = status {
+                            // Game completed, remove channels
+                            game_channels.remove(&game_id);
+                            info!("Game {} completed", game_id);
                         }
                     }
                     StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
@@ -810,9 +809,6 @@ pub async fn run_game_executor(
                         } else {
                             debug!("Received command for inactive game {}", game_id);
                         }
-                    }
-                    _ => {
-                        debug!("Received other event in partition executor: {:?}", command_data);
                     }
                 }
             }

@@ -1,19 +1,26 @@
 use crate::game_relay;
-use anyhow::{Context, Result};
+#[cfg(not(feature = "skip-proto"))]
+use anyhow::Context;
+use anyhow::Result;
 use game_relay::GameMessage;
-use game_relay::game_relay_server::{GameRelay, GameRelayServer};
+use game_relay::game_relay_server::GameRelay;
+#[cfg(not(feature = "skip-proto"))]
+use game_relay::game_relay_server::GameRelayServer;
 use std::pin::Pin;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status, Streaming, transport::Server};
+#[cfg(not(feature = "skip-proto"))]
+use tonic::transport::Server;
+use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
 type GameMessageStream = Pin<Box<dyn Stream<Item = Result<GameMessage, Status>> + Send>>;
 
 pub struct GameRelayService {
+    #[allow(dead_code)] // retained for relay diagnostics; not read yet
     server_id: String,
+    #[allow(dead_code)] // retained for relay diagnostics; not read yet
     grpc_addr: String,
 }
 
@@ -37,7 +44,7 @@ impl GameRelay for GameRelayService {
         let mut client_stream = request.into_inner();
         info!(client_address = ?client_addr, "New game relay connection");
 
-        let (response_tx, response_rx) = mpsc::channel(32);
+        let (_response_tx, response_rx) = mpsc::channel(32);
 
         // Handle incoming messages from remote server
         tokio::spawn(async move {
@@ -96,6 +103,9 @@ impl GameRelay for GameRelayService {
     }
 }
 
+// With skip-proto enabled the real server body is compiled out, leaving the
+// parameters unused in that configuration only.
+#[cfg_attr(feature = "skip-proto", allow(unused_variables))]
 pub async fn run_game_relay_server(
     addr: &str,
     server_id: String,
@@ -105,7 +115,7 @@ pub async fn run_game_relay_server(
     {
         info!("Game relay gRPC server skipped (proto compilation disabled)");
         cancellation_token.cancelled().await;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "skip-proto"))]

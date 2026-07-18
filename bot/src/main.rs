@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::Parser;
 use common::{
-    Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus,
-    GameType, QueueMode, calculate_ai_move,
+    GameCommand, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
+    QueueMode, calculate_ai_move,
 };
 use futures_util::{Sink, SinkExt, StreamExt};
 use reqwest::Client;
@@ -168,6 +168,7 @@ async fn run_bot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn play_single_game(
     idx: usize,
     game_idx: usize,
@@ -202,7 +203,7 @@ async fn play_single_game(
     let mut game_id: Option<u32> = None;
     let mut game_started = false;
     let mut game_completed = false;
-    let mut hang_timer = tokio::time::sleep(GAME_OVER_TIMEOUT);
+    let hang_timer = tokio::time::sleep(GAME_OVER_TIMEOUT);
     tokio::pin!(hang_timer);
 
     loop {
@@ -304,6 +305,7 @@ async fn play_single_game(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_message<S>(
     idx: usize,
     ws_msg: WSMessage,
@@ -400,6 +402,7 @@ where
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_game_event(
     idx: usize,
     event_msg: GameEventMessage,
@@ -515,7 +518,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     engine.rebuild_predicted_state(Utc::now().timestamp_millis())?;
-    let Some(predicted_state) = (&*engine).predicted_state() else {
+    let Some(predicted_state) = engine.predicted_state() else {
         return Ok(());
     };
 
@@ -607,16 +610,11 @@ fn normalize_base_url(raw: &str) -> Result<Url> {
         .context("Invalid base URL")?;
 
     // Handle production snaketron.io URLs - convert to regional endpoint
-    if let Some(host) = url.host_str() {
-        match host {
-            "snaketron.io" | "www.snaketron.io" => {
-                // Default to US region for WebSocket
-                url.set_host(Some("use1.snaketron.io"))
-                    .map_err(|_| anyhow!("Failed to set host"))?;
-                info!("Converted main site URL to US region endpoint: {}", url);
-            }
-            _ => {}
-        }
+    if let Some("snaketron.io" | "www.snaketron.io") = url.host_str() {
+        // Default to US region for WebSocket
+        url.set_host(Some("use1.snaketron.io"))
+            .map_err(|_| anyhow!("Failed to set host"))?;
+        info!("Converted main site URL to US region endpoint: {}", url);
     }
 
     Ok(url)

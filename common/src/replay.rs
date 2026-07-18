@@ -323,15 +323,15 @@ impl ServerReplay {
             }
         }
 
-        if first_divergence.is_none() {
-            if let Some((tick, sequence, event)) = emitted.pop_front() {
-                first_divergence = Some(Divergence {
-                    tick,
-                    kind: "extra_event".into(),
-                    expected: "<no further recorded events>".into(),
-                    actual: fmt_event(tick, sequence, &event),
-                });
-            }
+        if first_divergence.is_none()
+            && let Some((tick, sequence, event)) = emitted.pop_front()
+        {
+            first_divergence = Some(Divergence {
+                tick,
+                kind: "extra_event".into(),
+                expected: "<no further recorded events>".into(),
+                actual: fmt_event(tick, sequence, &event),
+            });
         }
 
         Ok(ReplayOutcome {
@@ -719,11 +719,11 @@ pub fn diff_traces(server: &[TraceRecord], client: &[TraceRecord]) -> Divergence
                 if msg.stream_seq > 0 {
                     server_seq_ticks.insert(msg.stream_seq, msg.tick);
                 }
-                if let GameEvent::CommandScheduled { command_message } = &msg.event {
-                    if let Some(server_id) = &command_message.command_id_server {
-                        server_assigned
-                            .insert(command_message.command_id_client.clone(), server_id.tick);
-                    }
+                if let GameEvent::CommandScheduled { command_message } = &msg.event
+                    && let Some(server_id) = &command_message.command_id_server
+                {
+                    server_assigned
+                        .insert(command_message.command_id_client.clone(), server_id.tick);
                 }
             }
             TraceRecord::CmdIn { ts_ms, cmd } => {
@@ -1095,12 +1095,12 @@ mod tests {
         // Corrupt the first recorded SnakeTurned event: flip its direction.
         let mut tampered_tick = None;
         for record in records.iter_mut() {
-            if let TraceRecord::EventOut { msg, .. } = record {
-                if let GameEvent::SnakeTurned { direction, .. } = &mut msg.event {
-                    *direction = Direction::Down;
-                    tampered_tick = Some(msg.tick);
-                    break;
-                }
+            if let TraceRecord::EventOut { msg, .. } = record
+                && let GameEvent::SnakeTurned { direction, .. } = &mut msg.event
+            {
+                *direction = Direction::Down;
+                tampered_tick = Some(msg.tick);
+                break;
             }
         }
         let tampered_tick = tampered_tick.expect("synthetic trace has a SnakeTurned event");

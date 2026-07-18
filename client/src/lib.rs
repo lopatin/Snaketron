@@ -1,7 +1,6 @@
 mod render;
 
 use common::{Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState};
-use serde_json;
 use wasm_bindgen::prelude::*;
 
 /// The main client-side game interface exposed to JavaScript.
@@ -124,7 +123,7 @@ impl GameClient {
     pub fn initialize_from_snapshot(
         &mut self,
         state_json: &str,
-        current_ts: i64,
+        _current_ts: i64,
     ) -> Result<(), JsValue> {
         let game_state: GameState =
             serde_json::from_str(state_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -220,12 +219,11 @@ impl GameClient {
     #[wasm_bindgen(js_name = getSnakeIdForUser)]
     pub fn get_snake_id_for_user(&self, user_id: u32) -> Option<u32> {
         // Get the predicted state and look up the player
-        if let Ok(state_json) = self.engine.get_predicted_state_json() {
-            if let Ok(state) = serde_json::from_str::<GameState>(&state_json) {
-                if let Some(player) = state.players.get(&user_id) {
-                    return Some(player.snake_id);
-                }
-            }
+        if let Ok(state_json) = self.engine.get_predicted_state_json()
+            && let Ok(state) = serde_json::from_str::<GameState>(&state_json)
+            && let Some(player) = state.players.get(&user_id)
+        {
+            return Some(player.snake_id);
         }
         None
     }

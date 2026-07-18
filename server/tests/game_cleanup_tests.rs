@@ -251,10 +251,10 @@ async fn wait_for_match(client: &mut TestClient) -> Result<u32> {
 async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(event) = client.receive_game_event().await? {
-                if matches!(event.event, GameEvent::Snapshot { .. }) {
-                    return Ok(());
-                }
+            if let Some(event) = client.receive_game_event().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok(());
             }
         }
     })

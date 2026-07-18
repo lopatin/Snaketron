@@ -4,7 +4,7 @@ use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager;
-use crate::lobby_manager::{LeaveLobbyResult, Lobby, LobbyJoinHandle, LobbyMember};
+use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
@@ -13,32 +13,24 @@ use crate::user_cache::UserCache;
 use crate::ws_matchmaking::remove_from_matchmaking_queue;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use common::{
-    DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameEvent, GameEventMessage, GameState,
-    GameStatus,
-};
-use futures_util::future::join_all;
-use futures_util::{SinkExt, Stream};
+use common::{GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus};
+use futures_util::SinkExt;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Sleep, sleep};
 use tokio_stream::StreamExt;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tungstenite::Utf8Bytes;
 
+// Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WSMessage {
     Token(String),
@@ -187,7 +179,7 @@ const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
 const CHAT_HISTORY_LIMIT: usize = 200;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct LobbyChatBroadcast {
+pub struct LobbyChatBroadcast {
     lobby_code: String,
     message_id: String,
     user_id: i32,
@@ -197,7 +189,7 @@ struct LobbyChatBroadcast {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct GameChatBroadcast {
+pub struct GameChatBroadcast {
     game_id: u32,
     message_id: String,
     user_id: i32,
@@ -241,7 +233,7 @@ async fn handle_guest_nickname_update(
         .remove_from_redis(metadata.user_id as u32)
         .await?;
 
-    if let (Some(lobby)) = lobby {
+    if let Some(lobby) = lobby {
         lobby_manager
             .publish_lobby_update(&lobby.lobby_code)
             .await?;
@@ -320,6 +312,7 @@ enum ConnectionState {
 }
 
 /// Handle WebSocket connection from Axum
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_websocket(
     socket: axum::extract::ws::WebSocket,
     db: Arc<dyn Database>,
@@ -360,6 +353,7 @@ pub async fn handle_websocket(
 }
 
 /// Internal function to handle the WebSocket connection logic
+#[allow(clippy::too_many_arguments)]
 async fn handle_websocket_connection(
     ws_stream: axum::extract::ws::WebSocket,
     db: Arc<dyn Database>,
@@ -410,7 +404,7 @@ async fn handle_websocket_connection(
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
     // Spawn task to forward messages from channel to WebSocket
-    let ws_tx_clone = ws_tx.clone();
+    let _ws_tx_clone = ws_tx.clone();
     let forward_task = tokio::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
             // Convert to Axum WebSocket message
@@ -494,7 +488,7 @@ async fn handle_websocket_connection(
                             axum::extract::ws::Message::Binary(bin) => Message::Binary(bin.into()),
                             axum::extract::ws::Message::Ping(data) => Message::Ping(data.into()),
                             axum::extract::ws::Message::Pong(data) => Message::Pong(data.into()),
-                            axum::extract::ws::Message::Close(frame) => {
+                            axum::extract::ws::Message::Close(_frame) => {
                                 info!("Client initiated close");
                                 break;
                             }
@@ -597,8 +591,8 @@ async fn handle_websocket_connection(
                                                 entering_game, entering_lobby, leaving_lobby, leaving_game);
 
                                             // Handle state transitions
-                                            if entering_game {
-                                                if let ConnectionState::Authenticated { game_id: Some(game_id), metadata, .. } = &new_state {
+                                            if entering_game
+                                                && let ConnectionState::Authenticated { game_id: Some(game_id), metadata, .. } = &new_state {
                                                     // Subscribe to game events if entering a game
                                                     if let Some(handle) = game_event_handle.take() {
                                                         handle.abort();
@@ -673,11 +667,10 @@ async fn handle_websocket_connection(
                                                         }
                                                     }
                                                 }
-                                            }
 
                                             // Handle lobby state transitions
-                                            if entering_lobby {
-                                                if let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
+                                            if entering_lobby
+                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
                                                     if let Some(handle) = lobby_update_handle.take() {
                                                         handle.abort();
                                                     }
@@ -749,8 +742,8 @@ async fn handle_websocket_connection(
                                                         let channel = crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby_code_for_match);
                                                         info!("Member subscribing to lobby match notifications on channel: {}", channel);
 
-                                                        if let Ok(client) = redis::Client::open(redis_url_clone_for_match.as_ref()) {
-                                                            if let Ok(mut pubsub) = client.get_async_pubsub().await {
+                                                        if let Ok(client) = redis::Client::open(redis_url_clone_for_match.as_ref())
+                                                            && let Ok(mut pubsub) = client.get_async_pubsub().await {
                                                                 if pubsub.subscribe(&channel).await.is_ok() {
                                                                     info!("Successfully subscribed to lobby match notifications for lobby '{}'", lobby_code_for_match);
 
@@ -793,7 +786,6 @@ async fn handle_websocket_connection(
                                                                     error!("Failed to subscribe to lobby channel {} for lobby '{}'", channel, lobby_code_for_match);
                                                                 }
                                                             }
-                                                        }
                                                     }));
 
                                                     // Subscribe to lobby chat
@@ -849,7 +841,6 @@ async fn handle_websocket_connection(
                                                         }
                                                     }
                                                 }
-                                            }
 
                                             // Abort lobby subscription when leaving lobby
                                             // BUT keep lobby_match_handle active if entering Authenticated with a lobby_code (for Play Again notifications)
@@ -862,12 +853,11 @@ async fn handle_websocket_connection(
                                                     }
 
                                                     // Only abort match notification if NOT entering game with lobby_id
-                                                    if !keep_match_subscription {
-                                                    if let Some(handle) = lobby_match_handle.take() {
+                                                    if !keep_match_subscription
+                                                    && let Some(handle) = lobby_match_handle.take() {
                                                         handle.abort();
                                                         debug!("Aborted lobby match notification subscription");
                                                     }
-                                                }
 
                                                 if let Some(handle) = lobby_chat_handle.take() {
                                                     handle.abort();
@@ -914,28 +904,26 @@ async fn handle_websocket_connection(
     // Cleanup
 
     // Leave lobby if still in one
-    match state {
-        ConnectionState::Authenticated {
-            lobby_handle: Some(mut lobby_handle),
-            ..
-        } => {
-            let lobby_code = lobby_handle.lobby_code.clone();
-            if let LeaveLobbyResult::LobbyDeleted = lobby_handle.close().await? {
-                let mut mm = matchmaking_manager.lock().await;
-                if let Err(e) = mm.remove_lobby_from_all_queues_by_code(&lobby_code).await {
-                    warn!(
-                        "Failed to remove empty lobby {} from matchmaking queues during cleanup: {}",
-                        lobby_code, e
-                    );
-                } else {
-                    info!(
-                        "Removed empty lobby {} from all matchmaking queues during cleanup",
-                        lobby_code
-                    );
-                }
+    if let ConnectionState::Authenticated {
+        lobby_handle: Some(mut lobby_handle),
+        ..
+    } = state
+    {
+        let lobby_code = lobby_handle.lobby_code.clone();
+        if let LeaveLobbyResult::LobbyDeleted = lobby_handle.close().await? {
+            let mut mm = matchmaking_manager.lock().await;
+            if let Err(e) = mm.remove_lobby_from_all_queues_by_code(&lobby_code).await {
+                warn!(
+                    "Failed to remove empty lobby {} from matchmaking queues during cleanup: {}",
+                    lobby_code, e
+                );
+            } else {
+                info!(
+                    "Removed empty lobby {} from all matchmaking queues during cleanup",
+                    lobby_code
+                );
             }
         }
-        _ => {}
     }
 
     // Note: Game subscriptions are now handled differently
@@ -1085,7 +1073,7 @@ async fn compute_lobby_avg_mmr(db: &Arc<dyn Database>, members: &[LobbyMember]) 
             "Unable to calculate lobby MMR - no valid members found"
         ))
     } else {
-        Ok(total / count as i32)
+        Ok(total / count)
     }
 }
 
@@ -1411,7 +1399,7 @@ async fn subscribe_to_game_events(
     // Send the snapshot, stamped with the replica's transport watermark so
     // the client's gap detection starts from the right point.
     let snapshot_event = GameEventMessage {
-        game_id: game_id,
+        game_id,
         tick: game_state.tick,
         sequence: 0,
         stream_seq: stream_watermark,
@@ -1756,6 +1744,7 @@ async fn subscribe_to_lobby_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: ConnectionState,
     ws_message: WSMessage,
@@ -1767,7 +1756,7 @@ async fn process_ws_message(
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
     redis: &ConnectionManager,
-    redis_url: &str,
+    _redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     websocket_id: &str,
     region: &str,
@@ -1881,12 +1870,12 @@ async fn process_ws_message(
             match ws_message {
                 WSMessage::UpdateNickname { nickname } => {
                     if let Err(e) = handle_guest_nickname_update(
-                        &db,
-                        &lobby_manager,
+                        db,
+                        lobby_manager,
                         user_cache.clone(),
                         &lobby,
                         &metadata,
-                        &ws_tx,
+                        ws_tx,
                         nickname,
                     )
                     .await
@@ -1939,11 +1928,11 @@ async fn process_ws_message(
                     if let Some(ref lobby_handle) = lobby {
                         if let Err(e) = queue_existing_lobby_for_game_types(
                             lobby_handle,
-                            &[game_type.clone()],
+                            std::slice::from_ref(&game_type),
                             &queue_mode,
-                            &db,
-                            &lobby_manager,
-                            &matchmaking_manager,
+                            db,
+                            lobby_manager,
+                            matchmaking_manager,
                             metadata.user_id as u32,
                         )
                         .await
@@ -2147,9 +2136,9 @@ async fn process_ws_message(
                             lobby_handle,
                             &game_types,
                             &queue_mode,
-                            &db,
-                            &lobby_manager,
-                            &matchmaking_manager,
+                            db,
+                            lobby_manager,
+                            matchmaking_manager,
                             metadata.user_id as u32,
                         )
                         .await
@@ -2412,7 +2401,7 @@ async fn process_ws_message(
                     // Remove from matchmaking queue using Redis-based matchmaking
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
                     match remove_from_matchmaking_queue(
-                        &mut *matchmaking_manager,
+                        &mut matchmaking_manager,
                         metadata.user_id as u32,
                     )
                     .await
@@ -2723,12 +2712,12 @@ async fn process_ws_message(
                                 let response = WSMessage::LeftLobby;
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
+                                Ok(ConnectionState::Authenticated {
                                     metadata,
                                     lobby_handle: None,
                                     game_id,
                                     websocket_id,
-                                });
+                                })
                             }
                             Err(e) => {
                                 error!(
@@ -2740,12 +2729,12 @@ async fn process_ws_message(
                                 };
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
+                                Ok(ConnectionState::Authenticated {
                                     metadata,
                                     lobby_handle: Some(lobby_handle),
                                     game_id,
                                     websocket_id,
-                                });
+                                })
                             }
                         }
                     } else {
@@ -2754,12 +2743,12 @@ async fn process_ws_message(
                         };
                         let json_msg = serde_json::to_string(&response)?;
                         ws_tx.send(Message::Text(json_msg.into())).await?;
-                        return Ok(ConnectionState::Authenticated {
+                        Ok(ConnectionState::Authenticated {
                             metadata,
                             lobby_handle: None,
                             game_id,
                             websocket_id,
-                        });
+                        })
                     }
                 }
                 WSMessage::Chat(message) => {
@@ -2979,6 +2968,7 @@ async fn subscribe_to_user_count_updates(
     Ok(())
 }
 
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 #[derive(Debug, Deserialize)]
 struct LobbyUpdatePayload {
     lobby_code: String,
@@ -2989,6 +2979,7 @@ struct LobbyUpdatePayload {
 }
 
 /// Subscribe to lobby updates and forward to WebSocket client
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 async fn subscribe_to_lobby_updates(
     lobby_code: String,
     pubsub_manager: Arc<PubSubManager>,
@@ -3114,6 +3105,7 @@ pub async fn discover_peers(db: &Arc<dyn Database>, region: &str) -> Result<Vec<
 }
 
 // Helper function to generate unique game codes
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 fn generate_game_code() -> String {
     use rand::{Rng, thread_rng};
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -3127,6 +3119,7 @@ fn generate_game_code() -> String {
         .collect()
 }
 
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str) -> Result<u32> {
     // Find the game by code
     let game = db
@@ -3169,11 +3162,13 @@ async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str)
     Ok(game_id as u32)
 }
 
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 async fn check_game_host(db: &Arc<dyn Database>, game_id: u32, user_id: i32) -> Result<bool> {
     let host_user_id = db.get_custom_lobby_host(game_id as i32).await?;
     Ok(host_user_id == Some(user_id))
 }
 
+#[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
 async fn spectate_game(
     db: &Arc<dyn Database>,
     user_id: i32,

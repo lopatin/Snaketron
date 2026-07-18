@@ -97,9 +97,7 @@ async fn joining_a_durably_saved_completed_game_returns_its_final_snapshot() -> 
     let mut stale_state = completed_game_state(user_id as u32)?;
     stale_state.tick = final_state.tick - 1;
     stale_state.event_sequence = final_state.event_sequence - 1;
-    stale_state.status = GameStatus::Started {
-        server_id: server_id as u64,
-    };
+    stale_state.status = GameStatus::Started { server_id };
     let _: () = redis
         .set_ex(
             RedisKeys::game_snapshot(game_id),
@@ -569,14 +567,14 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
 
     timeout(Duration::from_secs(20), async {
         loop {
-            if let Some(game) = env.db().get_game_by_id(game_id as i32).await? {
-                if let Some(game_state) = game.game_state {
-                    let persisted_state: GameState = serde_json::from_value(game_state)?;
-                    if persisted_state.start_ms == final_state.start_ms
-                        && matches!(persisted_state.status, GameStatus::Complete { .. })
-                    {
-                        return Ok::<_, anyhow::Error>(());
-                    }
+            if let Some(game) = env.db().get_game_by_id(game_id as i32).await?
+                && let Some(game_state) = game.game_state
+            {
+                let persisted_state: GameState = serde_json::from_value(game_state)?;
+                if persisted_state.start_ms == final_state.start_ms
+                    && matches!(persisted_state.status, GameStatus::Complete { .. })
+                {
+                    return Ok::<_, anyhow::Error>(());
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

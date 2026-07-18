@@ -148,6 +148,7 @@ type LobbyBroadcasters = RwLock<HashMap<String, LobbyBroadcaster>>;
 /// Manages lobby membership and presence using Redis heartbeats
 pub struct LobbyManager {
     redis: ConnectionManager,
+    #[allow(dead_code)] // kept alive for future lobby persistence
     db: Arc<dyn Database>,
     lobby_broadcasters: LobbyBroadcasters,
     user_cache: Arc<UserCache>,
@@ -237,13 +238,13 @@ impl LobbyManager {
                 .unwrap_or(0)
         );
 
-        if let Some(broadcaster) = broadcasters.get(&lobby_code) {
-            if let Err(err) = broadcaster.tx.send(lobby) {
-                error!(
-                    "Failed to forward lobby update for '{}' to local receivers: {}",
-                    lobby_code, err
-                );
-            }
+        if let Some(broadcaster) = broadcasters.get(&lobby_code)
+            && let Err(err) = broadcaster.tx.send(lobby)
+        {
+            error!(
+                "Failed to forward lobby update for '{}' to local receivers: {}",
+                lobby_code, err
+            );
         }
     }
 
@@ -345,7 +346,7 @@ impl LobbyManager {
         self: &Arc<Self>,
         lobby_code: Option<&str>,
         user_id: i32,
-        username: String,
+        _username: String,
         websocket_id: String,
         region: String,
         requested_preferences: Option<LobbyPreferences>,
@@ -611,7 +612,7 @@ impl LobbyManager {
     fn resolve_join_preferences(preferences: Option<&LobbyPreferences>) -> LobbyPreferences {
         preferences
             .map(Self::sanitize_lobby_preferences)
-            .unwrap_or_else(LobbyPreferences::default)
+            .unwrap_or_default()
     }
 
     fn sanitize_lobby_preferences(preferences: &LobbyPreferences) -> LobbyPreferences {
@@ -713,13 +714,12 @@ impl LobbyManager {
 
         let user_ids: Vec<u32> = members_with_scores
             .iter()
-            .map(|(member_value, score)| {
+            .filter_map(|(member_value, _score)| {
                 member_value
-                    .splitn(2, ':')
+                    .split(':')
                     .nth(0)
                     .and_then(|id_str| id_str.parse::<u32>().ok())
             })
-            .flatten()
             .collect();
 
         let users = self
@@ -736,10 +736,9 @@ impl LobbyManager {
 
         for (member_value, score) in members_with_scores {
             let user_id: Option<u32> = member_value
-                .splitn(2, ':')
+                .split(':')
                 .nth(0)
-                .map(|id_str| id_str.parse::<u32>().ok())
-                .flatten();
+                .and_then(|id_str| id_str.parse::<u32>().ok());
 
             if let Some(user_id) = user_id {
                 if let Some(user) = users.get(&user_id) {
@@ -906,6 +905,7 @@ impl LobbyManager {
     }
 
     /// Helper to remove a key from Redis
+    #[allow(dead_code)]
     async fn remove_from_redis(&mut self, key: &str) -> Result<()> {
         let _: () = self
             .redis

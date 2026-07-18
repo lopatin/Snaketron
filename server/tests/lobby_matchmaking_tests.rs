@@ -92,11 +92,8 @@ async fn create_lobby_and_queue(
     // Wait for LobbyCreated response and capture lobby_code
     let lobby_code = timeout(Duration::from_secs(5), async {
         loop {
-            match clients[0].receive_message().await? {
-                WSMessage::LobbyCreated { lobby_code } => {
-                    return Ok::<String, anyhow::Error>(lobby_code);
-                }
-                _ => {}
+            if let WSMessage::LobbyCreated { lobby_code } = clients[0].receive_message().await? {
+                return Ok::<String, anyhow::Error>(lobby_code);
             }
         }
     })
@@ -115,11 +112,8 @@ async fn create_lobby_and_queue(
             // Wait for JoinedLobby confirmation
             timeout(Duration::from_secs(5), async {
                 loop {
-                    match client.receive_message().await? {
-                        WSMessage::JoinedLobby { .. } => {
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                        _ => {}
+                    if let WSMessage::JoinedLobby { .. } = client.receive_message().await? {
+                        return Ok::<(), anyhow::Error>(());
                     }
                 }
             })
@@ -143,9 +137,8 @@ async fn wait_for_client_to_join_game(client: &mut TestClient) -> Result<u32> {
     timeout(Duration::from_secs(30), async {
         // First wait for JoinGame message
         let game_id = loop {
-            match client.receive_message().await? {
-                WSMessage::JoinGame(id) => break id,
-                _ => {}
+            if let WSMessage::JoinGame(id) = client.receive_message().await? {
+                break id;
             }
         };
 
@@ -153,13 +146,10 @@ async fn wait_for_client_to_join_game(client: &mut TestClient) -> Result<u32> {
 
         // Wait for snapshot to confirm game stream started
         loop {
-            match client.receive_message().await? {
-                WSMessage::GameEvent(event) => {
-                    if matches!(event.event, GameEvent::Snapshot { .. }) {
-                        return Ok::<u32, anyhow::Error>(game_id);
-                    }
-                }
-                _ => {}
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && matches!(event.event, GameEvent::Snapshot { .. })
+            {
+                return Ok::<u32, anyhow::Error>(game_id);
             }
         }
     })
@@ -174,11 +164,8 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
         let client_game_id = timeout(Duration::from_secs(30), async {
             // First wait for JoinGame message
             let gid = loop {
-                match client.receive_message().await? {
-                    WSMessage::JoinGame(id) => {
-                        break id;
-                    }
-                    _ => {}
+                if let WSMessage::JoinGame(id) = client.receive_message().await? {
+                    break id;
                 }
             };
 
@@ -187,13 +174,10 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
 
             // Wait for snapshot
             loop {
-                match client.receive_message().await? {
-                    WSMessage::GameEvent(event) => {
-                        if matches!(event.event, GameEvent::Snapshot { .. }) {
-                            return Ok::<u32, anyhow::Error>(event.game_id);
-                        }
-                    }
-                    _ => {}
+                if let WSMessage::GameEvent(event) = client.receive_message().await?
+                    && matches!(event.event, GameEvent::Snapshot { .. })
+                {
+                    return Ok::<u32, anyhow::Error>(event.game_id);
                 }
             }
         })
@@ -213,7 +197,8 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
 }
 
 // Helper to get team assignment for a player from game snapshot
-async fn get_player_team(client: &mut TestClient, user_id: u32) -> Result<Option<TeamId>> {
+#[allow(dead_code)] // test helper retained for future team assertions
+async fn get_player_team(_client: &mut TestClient, _user_id: u32) -> Result<Option<TeamId>> {
     // The client should have already received the snapshot
     // We'll peek at the last received snapshot in memory
     // For now, we'll send a simple query and parse the response
@@ -304,14 +289,11 @@ async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
     // Spectator should still get routed to the game (as a spectator)
     let spectator_game_id = timeout(Duration::from_secs(10), async {
         loop {
-            match spectator_client.receive_message().await? {
-                WSMessage::JoinGame(id) => {
-                    spectator_client
-                        .send_message(WSMessage::JoinGame(id))
-                        .await?;
-                    return Ok::<u32, anyhow::Error>(id);
-                }
-                _ => {}
+            if let WSMessage::JoinGame(id) = spectator_client.receive_message().await? {
+                spectator_client
+                    .send_message(WSMessage::JoinGame(id))
+                    .await?;
+                return Ok::<u32, anyhow::Error>(id);
             }
         }
     })
@@ -398,7 +380,7 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
     env.create_user().await?;
 
     // Create two separate single-player lobbies
-    let mut clients1 = create_lobby_and_queue(
+    let clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -407,7 +389,7 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
     )
     .await?;
 
-    let mut clients2 = create_lobby_and_queue(
+    let clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[1]],
@@ -451,11 +433,8 @@ async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
     // Should NOT receive a match (timeout expected)
     let result = timeout(Duration::from_secs(5), async {
         loop {
-            match clients[0].receive_message().await? {
-                WSMessage::JoinGame(_) => {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                _ => {}
+            if let WSMessage::JoinGame(_) = clients[0].receive_message().await? {
+                return Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -489,7 +468,7 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
     }
 
     // Create two 2-player lobbies
-    let mut clients1 = create_lobby_and_queue(
+    let clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
@@ -498,7 +477,7 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
     )
     .await?;
 
-    let mut clients2 = create_lobby_and_queue(
+    let clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[2], env.user_ids()[3]],
@@ -535,7 +514,7 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
     }
 
     // Create 3-player lobby
-    let mut clients1 = create_lobby_and_queue(
+    let clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1], env.user_ids()[2]],
@@ -545,7 +524,7 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
     .await?;
 
     // Create 1-player lobby
-    let mut clients2 = create_lobby_and_queue(
+    let clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[3]],
@@ -621,7 +600,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     }
 
     // Create lobbies with different sizes
-    let mut clients1 = create_lobby_and_queue(
+    let clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0], env.user_ids()[1]],
@@ -630,7 +609,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     )
     .await?;
 
-    let mut clients2 = create_lobby_and_queue(
+    let clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[2]],
@@ -639,7 +618,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
     )
     .await?;
 
-    let mut clients3 = create_lobby_and_queue(
+    let clients3 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[3]],
@@ -724,11 +703,8 @@ async fn test_ffa_minimum_players() -> Result<()> {
     // Should NOT receive a match (needs at least 2 players for FFA)
     let result = timeout(Duration::from_secs(5), async {
         loop {
-            match clients[0].receive_message().await? {
-                WSMessage::JoinGame(_) => {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                _ => {}
+            if let WSMessage::JoinGame(_) = clients[0].receive_message().await? {
+                return Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -872,11 +848,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
     // Neither should get matched together
     let result1 = timeout(Duration::from_secs(5), async {
         loop {
-            match clients1[0].receive_message().await? {
-                WSMessage::JoinGame(_) => {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                _ => {}
+            if let WSMessage::JoinGame(_) = clients1[0].receive_message().await? {
+                return Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -884,11 +857,8 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
 
     let result2 = timeout(Duration::from_secs(5), async {
         loop {
-            match clients2[0].receive_message().await? {
-                WSMessage::JoinGame(_) => {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                _ => {}
+            if let WSMessage::JoinGame(_) = clients2[0].receive_message().await? {
+                return Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -1197,7 +1167,7 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
 
     // For now, since WebSocket only supports single game type,
     // we'll queue two separate lobbies and they should match
-    let mut clients1 = create_lobby_and_queue(
+    let clients1 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[0]],
@@ -1206,7 +1176,7 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
     )
     .await?;
 
-    let mut clients2 = create_lobby_and_queue(
+    let clients2 = create_lobby_and_queue(
         &env,
         0,
         &[env.user_ids()[1]],
@@ -1253,7 +1223,7 @@ async fn test_cleanup_after_match_creation() -> Result<()> {
                 GameType::FreeForAll { max_players: 4 },
             ],
             QueueMode::Quickmatch,
-            i as u32,
+            i,
         )
         .await?;
     }
