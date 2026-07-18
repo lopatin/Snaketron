@@ -65,7 +65,8 @@ impl RedisKeys {
         "matchmaking:matches:active".to_string()
     }
 
-    /// Game ID counter
+    /// Legacy-only runtime game ID counter. New deployments allocate from a disjoint,
+    /// high DynamoDB namespace and deliberately leave this volatile counter untouched.
     pub fn game_id_counter() -> String {
         "game:id:counter".to_string()
     }
@@ -172,6 +173,11 @@ impl RedisKeys {
         format!("game:snapshot:{}", game_id)
     }
 
+    /// Short-lived acknowledgement that a partition executor accepted GameCreated.
+    pub fn game_creation_ack(game_id: u32) -> String {
+        format!("game:creation-ack:{}", game_id)
+    }
+
     // === Cluster Singleton Keys ===
 
     /// Lease key for a singleton service
@@ -210,6 +216,7 @@ mod tests {
             RedisKeys::partition_events(0),
             "snaketron:events:partition:0"
         );
+        assert_eq!(RedisKeys::game_creation_ack(123), "game:creation-ack:123");
 
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };

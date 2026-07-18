@@ -1,32 +1,40 @@
-import React, { useEffect, useRef, useState, useCallback, useReducer } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useReducer, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode } from '../types';
+import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode, GameLoadFailure } from '../types';
 import * as wasm from 'wasm-snaketron';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
 import { LobbyChat as ChatPanel } from './LobbyChat';
+import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 
 export default function GameArena() {
   const { gameId } = useParams();
   if (!gameId) {
     throw new Error('GameArena must be used with a gameId parameter');
   }
+  const routeGameId = parseU32GameId(gameId);
 
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const joinedGameIdRef = useRef<string | null>(null);
   const previousGameIdRef = useRef<string | null>(null);
+  const processedGameEventRef = useRef<any | null>(null);
   
   const {
     connected,
+    currentGameId,
     sendGameCommand,
     joinGame,
     lastGameEvent,
+    gameLoadFailure,
+    awaitingGameSnapshotForId,
+    isGameSnapshotSynchronized,
+    acknowledgeGameSnapshot,
     leaveGame,
     queueForMatch,
     queueForMatchMulti,
@@ -34,7 +42,14 @@ export default function GameArena() {
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
-  const { latencyMs, gameChatMessages, sendChatMessage, currentLobby, lobbyPreferences } = useWebSocket();
+  const {
+    latencyMs,
+    gameChatMessages,
+    sendChatMessage,
+    currentLobby,
+    lobbyPreferences,
+    isSessionAuthenticated,
+  } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
 
@@ -87,14 +102,65 @@ export default function GameArena() {
     joinedGameIdRef.current = null;
   }, [gameId, leaveGame, stopEngine]);
 
-  // Join game when user becomes available AND WebSocket is connected
+  // Join only after the token has been sent on this WebSocket connection. This keeps
+  // JoinGame ordered behind authentication during a cold page load or reconnect.
   useEffect(() => {
-    if (user && gameId && connected && joinedGameIdRef.current !== gameId) {
-      console.log('User authenticated and WebSocket connected, joining game:', gameId);
-      joinedGameIdRef.current = gameId;
-      joinGame(gameId);
+    if (!connected || !isSessionAuthenticated) {
+      // A new socket has no server-side game subscription, even if this component
+      // already joined on the previous connection.
+      joinedGameIdRef.current = null;
+      return;
     }
-  }, [user, gameId, connected, joinGame]);
+
+    if (
+      user &&
+      gameId &&
+      routeGameId !== null &&
+      joinedGameIdRef.current !== gameId
+    ) {
+      console.log('User and WebSocket session authenticated, joining game:', gameId);
+      joinedGameIdRef.current = joinGame(gameId) ? gameId : null;
+    }
+  }, [user, gameId, routeGameId, connected, isSessionAuthenticated, joinGame]);
+
+  const invalidRouteFailure = useMemo<GameLoadFailure | null>(() => (
+    routeGameId === null
+      ? {
+          gameId: null,
+          requestedGameId: gameId,
+          reason: INVALID_GAME_ID_REASON,
+        }
+      : null
+  ), [gameId, routeGameId]);
+  const currentGameLoadFailure =
+    invalidRouteFailure ??
+    (gameLoadFailure && gameLoadFailure.requestedGameId === gameId
+      ? gameLoadFailure
+      : null);
+  const isRequestForCurrentRoute =
+    routeGameId !== null && currentGameId === routeGameId.toString();
+  const isAwaitingCurrentSnapshot = awaitingGameSnapshotForId === gameId;
+  const isGameInteractionActive =
+    connected &&
+    isSessionAuthenticated &&
+    isRequestForCurrentRoute &&
+    isGameSnapshotSynchronized &&
+    !isAwaitingCurrentSnapshot &&
+    !currentGameLoadFailure &&
+    gameState !== null;
+
+  useEffect(() => {
+    if (currentGameLoadFailure) {
+      // Allow an explicit retry or a future authenticated reconnect to issue JoinGame again.
+      joinedGameIdRef.current = null;
+    }
+  }, [currentGameLoadFailure]);
+
+  useEffect(() => {
+    if (!isGameInteractionActive) {
+      stopEngine();
+    }
+  }, [isGameInteractionActive, stopEngine]);
 
 
   useEffect(() => {
@@ -282,7 +348,11 @@ export default function GameArena() {
         return;
       }
       
-      if (gameOver || !gameState) {
+      if (
+        gameOver ||
+        !gameState ||
+        !isGameInteractionActive
+      ) {
         return;
       }
       
@@ -316,7 +386,13 @@ export default function GameArena() {
     
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [sendCommand, gameOver, connected, gameState, rotation]);
+  }, [
+    sendCommand,
+    gameOver,
+    isGameInteractionActive,
+    gameState,
+    rotation,
+  ]);
   
   // Render game state
   useEffect(() => {
@@ -397,11 +473,27 @@ export default function GameArena() {
   
   // Process server events through game engine
   useEffect(() => {
-    if (lastGameEvent && processServerEvent) {
+    if (
+      lastGameEvent &&
+      processServerEvent &&
+      processedGameEventRef.current !== lastGameEvent
+    ) {
+      processedGameEventRef.current = lastGameEvent;
       console.log('Processing server event in GameArena:', lastGameEvent);
-      processServerEvent(lastGameEvent);
+      void processServerEvent(lastGameEvent).then((processed) => {
+        const event = lastGameEvent.event || lastGameEvent;
+        if (!processed || !event?.Snapshot) {
+          return;
+        }
+
+        const snapshotGameId = parseU32GameId(lastGameEvent.game_id);
+
+        if (snapshotGameId !== null) {
+          acknowledgeGameSnapshot(snapshotGameId);
+        }
+      });
     }
-  }, [lastGameEvent, processServerEvent]);
+  }, [lastGameEvent, processServerEvent, acknowledgeGameSnapshot]);
   
   // Update countdown display
   useEffect(() => {
@@ -422,16 +514,24 @@ export default function GameArena() {
   }, [gameState, committedState, forceUpdate]);
 
   const handleSendGameChat = useCallback((message: string) => {
-    if (!connected) {
+    if (!isGameInteractionActive) {
       return;
     }
     sendChatMessage('game', message);
-  }, [connected, sendChatMessage]);
+  }, [isGameInteractionActive, sendChatMessage]);
   
   // Calculate countdown from game start time or round start time
   const countdownState = gameState ?? committedState;
-  const isWaitingForSnapshot = !gameState;
-  const waitingMessage = isJoiningGame ? 'Joining game...' : 'Preparing arena...';
+  const isWaitingForSnapshot =
+    !isGameInteractionActive ||
+    !gameState;
+  const waitingMessage = !connected
+    ? 'Reconnecting...'
+    : !isSessionAuthenticated
+      ? 'Authenticating...'
+      : isJoiningGame || isAwaitingCurrentSnapshot
+        ? 'Joining game...'
+        : 'Preparing arena...';
   let timeUntilStart = countdownState ? countdownState.start_ms - Date.now() : 0;
 
   const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
@@ -456,6 +556,14 @@ export default function GameArena() {
     // Leave the game first, then navigate
     leaveGame();
     navigate('/');
+  };
+
+  const handleRetryGameLoad = () => {
+    if (!connected || !isSessionAuthenticated) {
+      return;
+    }
+
+    joinedGameIdRef.current = joinGame(gameId) ? gameId : null;
   };
   
   // Determine if user is in a lobby and is the host
@@ -545,8 +653,44 @@ export default function GameArena() {
                 border: 'none'
               }}
             />
-            {isWaitingForSnapshot && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-20">
+            {currentGameLoadFailure && (
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-30 px-6 text-center"
+                role="alert"
+                data-testid="game-load-failure"
+              >
+                <h2 className="text-xl font-black italic uppercase tracking-1 text-black-70 mb-3">
+                  Game unavailable
+                </h2>
+                <p className="text-sm text-gray-600 max-w-md mb-6">
+                  {currentGameLoadFailure.reason}
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  {routeGameId !== null && (
+                    <button
+                      type="button"
+                      onClick={handleRetryGameLoad}
+                      disabled={!connected || !isSessionAuthenticated}
+                      className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-black text-white hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Retry
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleBackToMenu}
+                    className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-white text-black hover:bg-gray-100 transition-colors"
+                  >
+                    Back to menu
+                  </button>
+                </div>
+              </div>
+            )}
+            {isWaitingForSnapshot && !currentGameLoadFailure && (
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-20"
+                data-testid="game-snapshot-loading"
+              >
                 <span className="w-6 h-6 border-2 border-gray-300 border-t-black rounded-full animate-spin mb-3" aria-hidden="true" />
                 <span className="text-gray-600 font-semibold uppercase tracking-1 text-xs">
                   {waitingMessage}
@@ -580,8 +724,8 @@ export default function GameArena() {
         messages={gameChatMessages}
         onSendMessage={handleSendGameChat}
         currentUsername={user?.username}
-        isActive={connected}
-        inactiveMessage="Game chat unavailable"
+        isActive={isGameInteractionActive}
+        inactiveMessage="Game chat unavailable while the game is synchronizing"
         initialExpanded={true}
         autoOpenEligible={false}
       />

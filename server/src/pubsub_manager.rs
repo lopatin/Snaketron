@@ -11,8 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const GAME_CREATION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+const GAME_CREATION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct ChannelReceiver {
     inner: tokio::sync::broadcast::Receiver<PushInfo>,
@@ -171,19 +175,29 @@ impl PubSubManager {
             .await
             .context("Failed to publish snapshot")?;
 
-        // Also store in Redis with TTL (5 minutes)
-        let key = RedisKeys::game_snapshot(game_id);
-        let snapshot_data =
-            serde_json::to_vec(snapshot).context("Failed to serialize snapshot for storage")?;
-        let _: () = redis
-            .set_ex(&key, snapshot_data, 300)
-            .await
-            .context("Failed to store snapshot")?;
+        self.store_snapshot(game_id, snapshot).await?;
 
         info!(
             "Published snapshot for game {} at tick {} to partition {}",
             game_id, snapshot.tick, partition_id
         );
+
+        Ok(())
+    }
+
+    /// Store a reload snapshot without broadcasting it.
+    ///
+    /// The executor uses this to establish the terminal Redis fallback before publishing
+    /// completion events and, once persistence succeeds, releasing the in-memory copy.
+    pub async fn store_snapshot(&self, game_id: u32, snapshot: &GameState) -> Result<()> {
+        let key = RedisKeys::game_snapshot(game_id);
+        let snapshot_data =
+            serde_json::to_vec(snapshot).context("Failed to serialize snapshot for storage")?;
+        let mut redis = self.redis.clone();
+        let _: () = redis
+            .set_ex(&key, snapshot_data, 300)
+            .await
+            .context("Failed to store snapshot")?;
 
         Ok(())
     }
@@ -236,21 +250,43 @@ impl PubSubManager {
         let (command_tx, command_rx) = mpsc::channel(2000);
         let (request_tx, request_rx) = mpsc::channel(2000);
 
-        // Spawn task to handle PubSub connection
-        let mut self_for_subscription = self.clone();
+        // Establish all Redis subscriptions before reporting readiness. Redis Pub/Sub is
+        // ephemeral, so returning while these SUBSCRIBE commands are still in flight can drop
+        // the first GameCreated command during server startup.
+        let events_handle = self
+            .spawn_channel_handler(
+                RedisKeys::partition_events(partition_id),
+                event_tx,
+                "Events",
+            )
+            .await?;
+        let commands_handle = self
+            .spawn_channel_handler(
+                RedisKeys::partition_commands(partition_id),
+                command_tx,
+                "Commands",
+            )
+            .await?;
+        let requests_handle = self
+            .spawn_channel_handler(
+                RedisKeys::snapshot_requests(partition_id),
+                request_tx,
+                "Requests",
+            )
+            .await?;
+
         tokio::spawn(async move {
-            if let Err(e) = self_for_subscription
-                .handle_partition_subscription(
-                    RedisKeys::partition_events(partition_id),
-                    RedisKeys::partition_commands(partition_id),
-                    RedisKeys::snapshot_requests(partition_id),
-                    event_tx,
-                    command_tx,
-                    request_tx,
-                )
-                .await
-            {
-                error!("Partition subscription handler failed: {}", e);
+            let (events_result, commands_result, requests_result) =
+                tokio::join!(events_handle, commands_handle, requests_handle);
+
+            if let Err(e) = events_result {
+                error!("Events task panicked: {}", e);
+            }
+            if let Err(e) = commands_result {
+                error!("Commands task panicked: {}", e);
+            }
+            if let Err(e) = requests_result {
+                error!("Requests task panicked: {}", e);
             }
         });
 
@@ -267,11 +303,44 @@ impl PubSubManager {
         let json = serde_json::to_string(&command).context("Failed to serialize command")?;
         let channel = RedisKeys::partition_commands(partition_id);
         let mut redis = self.redis.clone();
-        let _: () = redis
-            .publish(&channel, json)
-            .await
-            .context("Failed to publish command")?;
-        Ok(())
+
+        let StreamEvent::GameCreated { game_id, .. } = command else {
+            let _: () = redis
+                .publish(&channel, json)
+                .await
+                .context("Failed to publish command")?;
+            return Ok(());
+        };
+
+        // GameCreated cannot be fire-and-forget: Redis Pub/Sub drops messages published before
+        // the partition executor subscribes. Retry until the responsible executor confirms that
+        // it accepted this game, making startup and failover races visible to the caller.
+        let ack_key = RedisKeys::game_creation_ack(*game_id);
+        let _: usize = redis.del(&ack_key).await?;
+        let deadline = Instant::now() + GAME_CREATION_ACK_TIMEOUT;
+
+        loop {
+            let _: usize = redis
+                .publish(&channel, &json)
+                .await
+                .context("Failed to publish GameCreated command")?;
+
+            let acknowledged: bool = redis.exists(&ack_key).await?;
+            if acknowledged {
+                let _: usize = redis.del(&ack_key).await?;
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "Partition executor did not acknowledge game {} within {:?}",
+                    game_id,
+                    GAME_CREATION_ACK_TIMEOUT
+                ));
+            }
+
+            sleep(GAME_CREATION_RETRY_INTERVAL).await;
+        }
     }
 
     /// Spawn a task to handle messages from a single channel
@@ -324,44 +393,5 @@ impl PubSubManager {
         });
 
         Ok(handle)
-    }
-
-    /// Handle partition subscription in a separate task
-    async fn handle_partition_subscription(
-        &mut self,
-        event_channel: String,
-        command_channel: String,
-        request_channel: String,
-        event_tx: mpsc::Sender<GameEventMessage>,
-        command_tx: mpsc::Sender<StreamEvent>,
-        request_tx: mpsc::Sender<SnapshotRequest>,
-    ) -> Result<()> {
-        // Spawn all three channel handlers
-        let events_handle = self
-            .spawn_channel_handler(event_channel, event_tx, "Events")
-            .await?;
-        let commands_handle = self
-            .spawn_channel_handler(command_channel, command_tx, "Commands")
-            .await?;
-        let requests_handle = self
-            .spawn_channel_handler(request_channel, request_tx, "Requests")
-            .await?;
-
-        // Wait for all tasks to complete
-        let (events_result, commands_result, requests_result) =
-            tokio::join!(events_handle, commands_handle, requests_handle);
-
-        // Log task panics
-        if let Err(e) = events_result {
-            error!("Events task panicked: {}", e);
-        }
-        if let Err(e) = commands_result {
-            error!("Commands task panicked: {}", e);
-        }
-        if let Err(e) = requests_result {
-            error!("Requests task panicked: {}", e);
-        }
-
-        Ok(())
     }
 }

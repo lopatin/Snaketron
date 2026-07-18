@@ -8,8 +8,13 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 use crate::season::Season;
-use common::GameType;
+use common::GameState;
 use models::*;
+
+/// New DynamoDB-backed runtime IDs live in a namespace that legacy Redis-only allocators
+/// cannot reach during a rolling deployment. Keeping the namespaces disjoint is what makes
+/// Redis loss safe while old nodes are still present.
+pub const DURABLE_GAME_ID_FLOOR: i32 = 1_000_000_000;
 
 #[async_trait]
 pub trait Database: Send + Sync {
@@ -94,6 +99,11 @@ pub trait Database: Send + Sync {
     ) -> Result<Vec<HighScoreEntry>>;
 
     // Game operations
+    /// Allocate a globally unique game ID from durable storage.
+    ///
+    /// Runtime and database-created games use this high durable namespace. Legacy nodes
+    /// remain in the low Redis namespace during rollout, preventing cross-version reuse.
+    async fn allocate_game_id(&self) -> Result<i32>;
     async fn create_game(
         &self,
         server_id: i32,
@@ -105,6 +115,17 @@ pub trait Database: Send + Sync {
     async fn get_game_by_id(&self, game_id: i32) -> Result<Option<Game>>;
     async fn get_game_by_code(&self, game_code: &str) -> Result<Option<Game>>;
     async fn update_game_status(&self, game_id: i32, status: &str) -> Result<()>;
+    /// Persist the final authoritative state for a completed runtime game.
+    ///
+    /// Unlike `create_game`, this uses the ID already coordinated by the runtime's
+    /// durable/legacy-compatible allocator, so it can upsert a record that was not
+    /// previously created in DynamoDB.
+    async fn upsert_completed_game(
+        &self,
+        game_id: i32,
+        server_id: i32,
+        game_state: &GameState,
+    ) -> Result<()>;
     async fn add_player_to_game(&self, game_id: i32, user_id: i32, team_id: i32) -> Result<()>;
     async fn get_game_players(&self, game_id: i32) -> Result<Vec<GamePlayer>>;
     async fn get_player_count(&self, game_id: i32) -> Result<i64>;

@@ -1,11 +1,13 @@
 use crate::db::Database;
 use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotRequest};
+use crate::redis_keys::RedisKeys;
 use crate::xp_persistence;
 use anyhow::{Context, Result};
 use common::{
     EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
     GameState, GameStatus,
 };
+use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +18,50 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub const PARTITION_COUNT: u32 = 10;
+const COMPLETED_GAME_PERSIST_ATTEMPTS: usize = 12;
+const COMPLETED_GAME_PERSIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn persist_completed_game_with_retry(
+    db: Arc<dyn Database>,
+    game_id: i32,
+    server_id: i32,
+    game_state: GameState,
+) -> Result<()> {
+    let mut last_error = None;
+
+    for attempt in 1..=COMPLETED_GAME_PERSIST_ATTEMPTS {
+        match tokio::time::timeout(
+            COMPLETED_GAME_PERSIST_ATTEMPT_TIMEOUT,
+            db.upsert_completed_game(game_id, server_id, &game_state),
+        )
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "completed-game persistence attempt timed out after {:?}",
+                    COMPLETED_GAME_PERSIST_ATTEMPT_TIMEOUT
+                ));
+            }
+        }
+
+        if attempt < COMPLETED_GAME_PERSIST_ATTEMPTS {
+            let backoff_ms = (100_u64 << (attempt - 1).min(6)).min(5_000);
+            warn!(
+                "Completed game {} persistence attempt {}/{} failed; retrying in {}ms: {:?}",
+                game_id,
+                attempt,
+                COMPLETED_GAME_PERSIST_ATTEMPTS,
+                backoff_ms,
+                last_error.as_ref().expect("attempt recorded an error")
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("completed-game persistence failed")))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum StreamEvent {
@@ -148,6 +194,47 @@ async fn run_game(
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 match engine.run_until(now_ms) {
                     Ok(events) => {
+                        let game_state = engine.get_committed_state();
+                        let game_completed =
+                            matches!(game_state.status, GameStatus::Complete { .. });
+
+                        let completed_game_persistence = if game_completed {
+                            // Establish the terminal grace-period cache before any Complete event
+                            // can evict replicas. This keeps refreshes loadable while durable
+                            // persistence retries outside the client-visible completion path.
+                            if let Err(e) = pubsub.store_snapshot(game_id, &game_state).await {
+                                error!(
+                                    "Failed to store terminal reload snapshot for game {}: {:?}",
+                                    game_id, e
+                                );
+                            }
+
+                            match (i32::try_from(game_id), i32::try_from(server_id)) {
+                                (Ok(database_game_id), Ok(database_server_id)) => {
+                                    let persistence_db = db.clone();
+                                    let persistence_state = game_state.clone();
+                                    Some(tokio::spawn(async move {
+                                        persist_completed_game_with_retry(
+                                            persistence_db,
+                                            database_game_id,
+                                            database_server_id,
+                                            persistence_state,
+                                        )
+                                        .await
+                                    }))
+                                }
+                                _ => {
+                                    error!(
+                                        "Cannot persist final state for game {} on server {} because an ID exceeds the database range",
+                                        game_id, server_id
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         for (tick, sequence, event) in &events {
                             let event_msg = GameEventMessage {
                                 game_id,
@@ -164,8 +251,7 @@ async fn run_game(
                         }
 
                         // Check if game has completed
-                        let game_state = engine.get_committed_state();
-                        if matches!(game_state.status, GameStatus::Complete { .. }) {
+                        if game_completed {
                             info!("Game {} has completed, exiting game loop", game_id);
 
                             // Publish final snapshot
@@ -173,15 +259,43 @@ async fn run_game(
                                 warn!("Failed to publish final snapshot: {}", e);
                             }
 
-                            // Notify other executor instances that the game completed so they can clean up local state.
-                            if let Err(e) = pubsub.publish_command(
-                                partition_id,
-                                &StreamEvent::StatusUpdated {
-                                    game_id,
-                                    status: game_state.status.clone(),
-                                },
-                            ).await {
-                                warn!("Failed to publish game completion command for {}: {}", game_id, e);
+                            // Completion events and the final Redis snapshot are already visible
+                            // to clients. Wait for the bounded durable retry before tearing down the
+                            // executor, without holding up the game-over UI.
+                            let completion_is_durable = if let Some(persistence) = completed_game_persistence {
+                                match persistence.await {
+                                    Ok(Ok(())) => true,
+                                    Ok(Err(e)) => {
+                                        error!(
+                                            "Failed to persist final state for game {} after retries; retaining the replication cache: {:?}",
+                                            game_id, e
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Completed-game persistence task for game {} failed; retaining the replication cache: {:?}",
+                                            game_id, e
+                                        );
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+
+                            // Replicas use this command as the durable-commit marker. Never evict
+                            // the authoritative completed state when persistence did not succeed.
+                            if completion_is_durable {
+                                if let Err(e) = pubsub.publish_command(
+                                    partition_id,
+                                    &StreamEvent::StatusUpdated {
+                                        game_id,
+                                        status: game_state.status.clone(),
+                                    },
+                                ).await {
+                                    warn!("Failed to publish game completion command for {}: {}", game_id, e);
+                                }
                             }
 
                             // Persist XP to database
@@ -273,12 +387,12 @@ pub async fn run_game_executor(
                 game_id % PARTITION_COUNT,
                 partition_id
             );
-            return;
+            return false;
         }
 
         if game_channels.contains_key(&game_id) {
             debug!("Game {} is already running", game_id);
-            return;
+            return true;
         }
 
         info!("Partition {} will start game {}", partition_id, game_id);
@@ -303,6 +417,8 @@ pub async fn run_game_executor(
             .await;
             info!("Game {} has ended", game_id);
         });
+
+        true
     };
 
     loop {
@@ -343,7 +459,7 @@ pub async fn run_game_executor(
                         let pubsub_clone = pubsub_manager.clone();
                         let db_clone = db.clone();
                         let cancellation_token_clone = cancellation_token.clone();
-                        try_start_game(
+                        let accepted = try_start_game(
                             game_id,
                             game_state,
                             pubsub_clone,
@@ -351,6 +467,22 @@ pub async fn run_game_executor(
                             cancellation_token_clone,
                             &mut game_channels
                         );
+                        if accepted {
+                            let mut ack_redis = redis.clone();
+                            if let Err(e) = ack_redis
+                                .set_ex::<_, _, ()>(
+                                    RedisKeys::game_creation_ack(game_id),
+                                    server_id,
+                                    30,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to acknowledge GameCreated for game {}: {}",
+                                    game_id, e
+                                );
+                            }
+                        }
                     }
                     StreamEvent::StatusUpdated { game_id, status } => {
                         match status {

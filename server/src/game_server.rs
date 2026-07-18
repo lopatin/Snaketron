@@ -183,13 +183,19 @@ impl GameServer {
         let match_pubsub_manager = (*pubsub_manager).clone();
         let match_matchmaking_manager = matchmaking_manager.clone();
         let match_lobby_manager = lobby_manager.clone();
+        let match_db = db.clone();
         // TODO: Shouldn't this be a cluster singleton?
         handles.push(tokio::spawn(async move {
             let mm = match_matchmaking_manager.lock().await.clone();
             drop(match_matchmaking_manager); // Drop the lock
-            if let Err(e) =
-                run_matchmaking_loop(mm, match_pubsub_manager, match_token, match_lobby_manager)
-                    .await
+            if let Err(e) = run_matchmaking_loop(
+                mm,
+                match_pubsub_manager,
+                match_token,
+                match_lobby_manager,
+                match_db,
+            )
+            .await
             {
                 error!("Matchmaking loop error: {}", e);
             }

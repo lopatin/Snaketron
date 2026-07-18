@@ -1,3 +1,4 @@
+use crate::db::{DURABLE_GAME_ID_FLOOR, Database};
 use crate::redis_keys::RedisKeys;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -277,11 +278,21 @@ impl MatchmakingManager {
         Ok(None)
     }
 
-    /// Generate a new game ID atomically
-    pub async fn generate_game_id(&mut self) -> Result<u32> {
+    /// Allocate from the high durable namespace without modifying the legacy Redis counter.
+    /// During a rolling deployment, old nodes remain below the durable floor, so Redis loss
+    /// cannot make a new node reuse one of their runtime IDs.
+    pub async fn generate_game_id(&mut self, db: &dyn Database) -> Result<u32> {
         let counter_key = RedisKeys::game_id_counter();
-        let id: u32 = self.redis.incr(&counter_key, 1).await?;
-        Ok(id)
+        let legacy_counter: Option<i64> = self.redis.get(&counter_key).await?;
+        if legacy_counter.is_some_and(|counter| counter >= i64::from(DURABLE_GAME_ID_FLOOR)) {
+            return Err(anyhow!(
+                "Legacy Redis game ID counter has entered the reserved durable namespace at or above {}",
+                DURABLE_GAME_ID_FLOOR
+            ));
+        }
+
+        let durable_id = db.allocate_game_id().await?;
+        u32::try_from(durable_id).map_err(|_| anyhow!("Durable game ID was outside the u32 range"))
     }
 
     /// Health check for Redis connection

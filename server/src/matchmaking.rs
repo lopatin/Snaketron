@@ -9,6 +9,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
+use crate::db::Database;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager::LobbyManager;
@@ -671,6 +672,7 @@ pub async fn run_matchmaking_loop(
     mut pubsub: PubSubManager,
     cancellation_token: CancellationToken,
     lobby_manager: Arc<LobbyManager>,
+    db: Arc<dyn Database>,
 ) -> Result<()> {
     info!("Starting adaptive matchmaking loop");
 
@@ -737,6 +739,7 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Quickmatch,
                 lobby_manager.clone(),
+                db.clone(),
             )
             .await
             {
@@ -764,6 +767,7 @@ pub async fn run_matchmaking_loop(
                 game_type.clone(),
                 common::QueueMode::Competitive,
                 lobby_manager.clone(),
+                db.clone(),
             )
             .await
             {
@@ -865,6 +869,7 @@ async fn create_lobby_matches(
     game_type: GameType,
     queue_mode: common::QueueMode,
     lobby_manager: Arc<LobbyManager>,
+    db: Arc<dyn Database>,
 ) -> Result<usize> {
     // Get all queued lobbies for this game type and queue mode
     let mut available_lobbies = matchmaking_manager
@@ -1006,6 +1011,7 @@ async fn create_lobby_matches(
             &game_type,
             &queue_mode,
             &combination,
+            db.as_ref(),
         )
         .await
         {
@@ -1069,9 +1075,9 @@ async fn create_game_from_lobbies(
     game_type: &GameType,
     queue_mode: &common::QueueMode,
     combination: &MatchmakingCombination,
+    db: &dyn Database,
 ) -> Result<u32> {
-    // Generate game ID
-    let game_id = matchmaking_manager.generate_game_id().await?;
+    let game_id = matchmaking_manager.generate_game_id(db).await?;
     let partition_id = game_id % PARTITION_COUNT;
 
     // Create game state
@@ -1266,13 +1272,13 @@ async fn publish_lobby_match_notifications(
 pub async fn create_custom_match(
     matchmaking_manager: &mut MatchmakingManager,
     pubsub: &mut PubSubManager,
+    db: &dyn Database,
     players: Vec<QueuedPlayer>,
     game_type: GameType,
 ) -> Result<u32> {
     let _user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
 
-    // Generate game ID
-    let game_id = matchmaking_manager.generate_game_id().await?;
+    let game_id = matchmaking_manager.generate_game_id(db).await?;
     let partition_id = game_id % PARTITION_COUNT;
 
     // Create game state
