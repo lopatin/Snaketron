@@ -96,7 +96,21 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    
+
+      # DynamoDB via LocalStack: DynamoDatabase::new() reads AWS_ENDPOINT_URL
+      # and creates its own tables, so no init script is needed here.
+      localstack:
+        image: localstack/localstack:3.0
+        env:
+          SERVICES: dynamodb
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -145,6 +159,11 @@ jobs:
           DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
           TEST_DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/postgres
           REDIS_URL: redis://localhost:6379
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          DYNAMODB_TABLE_PREFIX: snaketron
           SNAKETRON_BUS: ${{ matrix.bus }}
           RUST_LOG: info
           RUST_BACKTRACE: 1
