@@ -216,9 +216,9 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             value={nickname}
             onChange={(e) => setNickname(e.target.value)}
             placeholder="Nickname"
-            className={`w-full px-4 py-3 text-base border-2 rounded-lg transition-colors ${
+            className={`w-full bg-white px-4 py-3 text-base border-2 rounded-lg transition-colors ${
               isAuthenticated
-                ? 'border-gray-300 bg-white cursor-default'
+                ? 'border-gray-300 cursor-default'
                 : 'border-gray-300 focus:outline-none focus:border-blue-500'
             }`}
             disabled={isLoading || isAuthenticated}

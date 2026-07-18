@@ -7,6 +7,7 @@ import { LobbyChat } from './LobbyChat';
 import { RegionSelector } from './RegionSelector';
 import { InviteFriendsModal } from './InviteFriendsModal';
 import JoinGameModal from './JoinGameModal';
+import { ArenaBackdrop } from './ArenaBackdrop';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
@@ -242,6 +243,8 @@ export const NewHome: React.FC = () => {
   return (
     <>
       <div className="home-page">
+        <ArenaBackdrop />
+
         <HomeHeader
           currentUser={user}
           lobbyMembers={lobbyMembers}

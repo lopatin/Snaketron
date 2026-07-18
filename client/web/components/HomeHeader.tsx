@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
+import { KeyIcon, LogoutIcon, UserPlusIcon } from './Icons';
 
 interface HomeHeaderProps {
   activePage?: 'play' | 'leaderboards';
@@ -120,7 +121,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                     disabled={isInviteDisabled}
                   >
                     <span>Invite friends</span>
-                    <span aria-hidden="true">↗</span>
+                    <UserPlusIcon className="home-social-action-icon" />
                   </button>
                   <button
                     type="button"
@@ -131,7 +132,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                     }}
                   >
                     <span>Join by code</span>
-                    <span aria-hidden="true">+</span>
+                    <KeyIcon className="home-social-action-icon" />
                   </button>
                   {hasLobby && (
                     <button
@@ -144,7 +145,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                       }}
                     >
                       <span>Leave lobby</span>
-                      <span aria-hidden="true">×</span>
+                      <LogoutIcon className="home-social-action-icon" />
                     </button>
                   )}
                 </div>
