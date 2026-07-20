@@ -158,10 +158,11 @@ gaps mean engine nondeterminism — page someone.
 
 ## Root causes found and fixed (2026-07)
 
-Thirteen distinct defects were confirmed by a multi-agent audit (each verified
-by an independent 3-lens panel against the code). The fixes landed together
-with this infrastructure; the chaos suite and the replay harness lock each one
-in:
+Fourteen distinct defects have been confirmed — the first thirteen by a
+multi-agent audit (each verified by an independent 3-lens panel against the
+code), the fourteenth from the enemy-snake respawn-desync report. The fixes
+landed together with this infrastructure; the chaos suite and the replay
+harness lock each one in:
 
 | Defect | Fix |
 |---|---|
@@ -176,6 +177,7 @@ in:
 | One clock spike poisoned `last_command_tick` forever — all later commands scheduled in the far future (snake stops responding) | Ratchet bounded to predicted + 8 ticks ([game_engine.rs](common/src/game_engine.rs)) |
 | `HashSet` iteration order made multi-death respawn processing nondeterministic across native/WASM | Deaths processed in sorted order ([game_state.rs](common/src/game_state.rs)) |
 | Redis PING timeout `?`-exited the cluster singleton without stopping the service — zombie executor + split-brain duplicate games | Timeout takes the step-down path ([cluster_singleton.rs](server/src/cluster_singleton.rs)) |
+| The web UI delivered every WS game event to the engine through a single-slot React state (`lastGameEvent`); React's last-write-wins batching silently dropped events whenever two frames landed in one commit. A crash tick is exactly such a burst (`SnakeDied` + `SnakeRespawned` + score updates as adjacent frames): with `SnakeRespawned` dropped, the delivered `SnakeDied` re-kills the snake the client's committed catch-up had already respawned locally, and nothing revives it until the stream-gap snapshot resync — the "enemy vanishes on crash, reappears mid-screen seconds later" report. Per-event full-state `console.log` serialization amplified the trigger by stalling the main thread | Game events now flow through a lossless ref-based FIFO drained strictly in order ([useGameWebSocket.ts](client/web/hooks/useGameWebSocket.ts), [GameArena.tsx](client/web/components/GameArena.tsx)); the state-serializing debug logging is gone ([useGameEngine.ts](client/web/hooks/useGameEngine.ts)); the failure shape (respawn lost, death delivered) is frozen in `lost_enemy_respawn_is_detected_and_healed_by_resync` ([sync_equivalence_test.rs](server/tests/sync_equivalence_test.rs)) |
 | Executor lease loss cancelled every in-flight game permanently; a lost `GameCreated` message meant a game that never started | Full failover path: 3 s lease with a 60 % grace window for *transient* renewal errors (a Redis blip no longer cancels games — safety proof in `renew_error_should_step_down`), Lua own-lease reclaim after blips, stored snapshots refreshed at TickHash cadence, and `resume_partition_games` on executor (re)start restarts every non-complete game from replica or stored-snapshot state. Snapshots re-anchor `stream_seq` watermarks at every hop (`FilteredEventReceiver`, replica, client), so a restarted executor's new stream is adopted instead of filtered as stale ([game_executor.rs](server/src/game_executor.rs), [cluster_singleton.rs](server/src/cluster_singleton.rs), [replication.rs](server/src/replication.rs)) |
 
 Known, intentionally unfixed (documented behavior):

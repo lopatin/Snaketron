@@ -23,14 +23,15 @@ export default function GameArena() {
   const containerRef = useRef<HTMLDivElement>(null);
   const joinedGameIdRef = useRef<string | null>(null);
   const previousGameIdRef = useRef<string | null>(null);
-  const processedGameEventRef = useRef<any | null>(null);
+  const drainingGameEventsRef = useRef(false);
   
   const {
     connected,
     currentGameId,
     sendGameCommand,
     joinGame,
-    lastGameEvent,
+    gameEventSignal,
+    takeGameEvents,
     gameLoadFailure,
     awaitingGameSnapshotForId,
     isGameSnapshotSynchronized,
@@ -478,29 +479,39 @@ export default function GameArena() {
     };
   }, [gameState, cellSize, rotation, user?.id]);
   
-  // Process server events through game engine
+  // Process server events through the game engine. Events arrive via a
+  // lossless queue (see useGameWebSocket): a single signal bump may cover
+  // several queued messages, so drain until empty, strictly in arrival
+  // order. Skipping or reordering even one message (e.g. the SnakeRespawned
+  // that follows a SnakeDied in the same tick) forks the committed state
+  // until a snapshot resync heals it.
   useEffect(() => {
-    if (
-      lastGameEvent &&
-      processServerEvent &&
-      processedGameEventRef.current !== lastGameEvent
-    ) {
-      processedGameEventRef.current = lastGameEvent;
-      console.log('Processing server event in GameArena:', lastGameEvent);
-      void processServerEvent(lastGameEvent).then((processed) => {
-        const event = lastGameEvent.event || lastGameEvent;
-        if (!processed || !event?.Snapshot) {
-          return;
-        }
-
-        const snapshotGameId = parseU32GameId(lastGameEvent.game_id);
-
-        if (snapshotGameId !== null) {
-          acknowledgeGameSnapshot(snapshotGameId);
-        }
-      });
+    if (!processServerEvent || drainingGameEventsRef.current) {
+      return;
     }
-  }, [lastGameEvent, processServerEvent, acknowledgeGameSnapshot]);
+    drainingGameEventsRef.current = true;
+    void (async () => {
+      try {
+        let events = takeGameEvents();
+        while (events.length > 0) {
+          for (const eventMessage of events) {
+            const processed = await processServerEvent(eventMessage);
+            const event = eventMessage.event || eventMessage;
+            if (processed && event?.Snapshot) {
+              const snapshotGameId = parseU32GameId(eventMessage.game_id);
+              if (snapshotGameId !== null) {
+                acknowledgeGameSnapshot(snapshotGameId);
+              }
+            }
+          }
+          // Pick up anything that arrived while we were processing.
+          events = takeGameEvents();
+        }
+      } finally {
+        drainingGameEventsRef.current = false;
+      }
+    })();
+  }, [gameEventSignal, takeGameEvents, processServerEvent, acknowledgeGameSnapshot]);
   
   // Update countdown display
   useEffect(() => {

@@ -111,72 +111,10 @@ export const useGameEngine = ({
       const clockDrift = getClockDrift();
       const now = BigInt(Date.now() - Math.round(clockDrift));
       
-      // Run engine until current time
-      const lastTick = engineRef.current.getPredictedTick()
+      // Run engine until current time. Keep this loop lean: main-thread
+      // stalls delay WS message handling and can batch several server
+      // events into one React commit.
       engineRef.current.rebuildPredictedState(now);
-      const currentTick = engineRef.current.getPredictedTick();
-
-      if (currentTick !== lastTick) {
-        console.log("predicted tick changed", lastTick, "→", currentTick);
-        console.log(JSON.parse(engineRef.current.getGameStateJson()).arena.snakes[0]);
-
-        // Get both committed and predicted states
-        const committedStateJson = engineRef.current.getCommittedStateJson();
-        const predictedStateJson = engineRef.current.getGameStateJson();
-        const eventLogJson = engineRef.current.getEventLogJson();
-
-        // Parse the states
-        const committedState = JSON.parse(committedStateJson);
-        const predictedState = JSON.parse(predictedStateJson);
-        const eventLog = JSON.parse(eventLogJson);
-        
-        // Extract snake positions (deep clone)
-        const committedSnakes = JSON.parse(JSON.stringify(
-          committedState.arena.snakes.map((snake: any, idx: number) => ({
-            index: idx,
-            is_alive: snake.is_alive,
-            direction: snake.direction,
-            body: snake.body.slice(0, 5), // First 5 positions for brevity
-            length: snake.body.length
-          }))
-        ));
-        
-        const predictedSnakes = JSON.parse(JSON.stringify(
-          predictedState.arena.snakes.map((snake: any, idx: number) => ({
-            index: idx,
-            is_alive: snake.is_alive,
-            direction: snake.direction,
-            body: snake.body.slice(0, 5), // First 5 positions for brevity
-            length: snake.body.length
-          }))
-        ));
-        
-        // Extract pending commands from event log
-        const pendingCommands = JSON.parse(JSON.stringify(
-          eventLog
-            .filter((event: any) => event.event.CommandScheduled)
-            .map((event: any) => ({
-              tick: event.tick,
-              user_id: event.user_id,
-              command: event.event.CommandScheduled.command_message.command
-            }))
-        ));
-        
-        // Log the detailed state
-        // console.log(
-        //   `${new Date().toISOString()} Game State Update\n` +
-        //   `Tick: ${lastTick} → ${currentTick}\n` +
-        //   `Now: ${(Number(now))} (clock drift: ${clockDrift} ms)\n` +
-        //   `\n--- COMMITTED STATE (tick ${committedState.tick}, start_ms ${committedState.start_ms}) ---\n` +
-        //   `Snakes: ${JSON.stringify(committedSnakes, null, 2)}\n` +
-        //   `Command queue: ${JSON.stringify(committedState.command_queue, null, 2)}\n` +
-        //   `\n--- PREDICTED STATE (tick ${predictedState.tick}, start_ms ${predictedState.start_ms}) ---\n` +
-        //   `Snakes: ${JSON.stringify(predictedSnakes, null, 2)}\n` +
-        //   `Command queue: ${JSON.stringify(predictedState.command_queue, null, 2)}\n` +
-        //   `\n--- PENDING COMMANDS ---\n` +
-        //   `${pendingCommands.length > 0 ? JSON.stringify(pendingCommands, null, 2) : 'None'}\n`
-        // );
-      }
 
       // Update game state
       const stateJson = engineRef.current.getGameStateJson();
@@ -482,24 +420,9 @@ export const useGameEngine = ({
       });
 
       if (engineRef.current) {
-        console.log('Processing server event:', fullEventMessage);
-
-        // // DEBUG: Log XPAwarded events specifically
-        // if (fullEventMessage.event && 'XPAwarded' in fullEventMessage.event) {
-        //   console.log('🎯 Received XPAwarded event:', fullEventMessage.event.XPAwarded);
-        // }
-
         if (!isSnapshot) {
           engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
         }
-
-        // DEBUG: Log state after processing XPAwarded
-        // if (fullEventMessage.event && 'XPAwarded' in fullEventMessage.event) {
-        //   const committedState = JSON.parse(engineRef.current.getCommittedStateJson());
-        //   console.log('🎯 After processing XPAwarded, committed state player_xp:', committedState.player_xp);
-        // }
-
-        console.log('Current game status:', engineRef.current.getCommittedStateJson());
 
         if (isSnapshot) {
           // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.

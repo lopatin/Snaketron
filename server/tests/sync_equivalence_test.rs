@@ -229,6 +229,14 @@ struct SimWorld {
     ever_needed_resync: bool,
     auto_resync: bool,
     resync_in_flight: bool,
+    /// When set, the first `SnakeRespawned` for snake 1 (the enemy from the
+    /// client's perspective) is dropped at publish time while still consuming
+    /// its stream_seq — modeling a failed executor publish or a client-side
+    /// delivery drop of exactly that message. The paired `SnakeDied` is
+    /// delivered normally.
+    drop_first_enemy_respawn: bool,
+    /// (tick, stream_seq) of the dropped respawn, once it happened.
+    dropped_respawn: Option<(u32, u64)>,
 }
 
 impl SimWorld {
@@ -270,6 +278,8 @@ impl SimWorld {
             ever_needed_resync: false,
             auto_resync: false,
             resync_in_flight: false,
+            drop_first_enemy_respawn: false,
+            dropped_respawn: None,
         };
 
         // Initial snapshot at t0, the way a client join does (stream_seq 1).
@@ -283,6 +293,13 @@ impl SimWorld {
 
     fn publish(&mut self, tick: u32, sequence: u64, event: GameEvent) {
         self.stream_seq += 1;
+        if self.drop_first_enemy_respawn
+            && self.dropped_respawn.is_none()
+            && matches!(event, GameEvent::SnakeRespawned { snake_id: 1, .. })
+        {
+            self.dropped_respawn = Some((tick, self.stream_seq));
+            return;
+        }
         if self.record_published {
             self.published.push((
                 tick,
@@ -707,6 +724,90 @@ async fn targeted_event_loss_detected_by_tickhash() -> Result<()> {
         assert!(
             status.needs_resync,
             "2 consecutive mismatches must request a resync"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// The enemy-respawn desync shape: at a TeamMatch crash tick the engine emits
+/// `SnakeDied` and `SnakeRespawned` as two adjacent messages. If exactly the
+/// respawn is lost (failed executor publish, or a client-side delivery drop),
+/// the delivered `SnakeDied` re-kills the snake the client's committed
+/// catch-up had already respawned locally — and nothing short of a snapshot
+/// ever revives it: the enemy stays dead on that client while it keeps
+/// playing on the server. The client must (a) detect the loss via the
+/// stream_seq gap and (b) fully converge after the resync snapshot.
+#[tokio::test]
+async fn lost_enemy_respawn_is_detected_and_healed_by_resync() -> Result<()> {
+    with_timeout(async {
+        let mut world = SimWorld::new(0xE5CA9E, TransportConfig::lossless());
+        world.drop_first_enemy_respawn = true;
+
+        // Passive snakes crash and respawn organically; run until the enemy's
+        // first respawn has been dropped at publish time.
+        let mut waited_ms = 0;
+        while world.dropped_respawn.is_none() && waited_ms < 60_000 {
+            world.run_for(1_000);
+            waited_ms += 1_000;
+        }
+        let (drop_tick, drop_seq) = world
+            .dropped_respawn
+            .expect("enemy snake should crash and respawn within 60 virtual seconds");
+
+        // Let the following messages arrive: the gap after the consumed
+        // stream_seq must be detected, and the divergence window — enemy
+        // alive on the server, dead on the client — must be observable.
+        world.run_for(1_000);
+        assert!(
+            world.server.committed_state().arena.snakes[1].is_alive,
+            "server-side enemy must be alive after its respawn at tick {drop_tick}"
+        );
+        assert!(
+            !world.client().committed_state().arena.snakes[1].is_alive,
+            "client-side enemy must be stranded dead after the lost respawn \
+             (seq {drop_seq}): the delivered SnakeDied re-kills the locally \
+             respawned snake and nothing else revives it"
+        );
+        let status = world.client().sync_status();
+        assert!(
+            status.stream_gap_count >= 1,
+            "the consumed-but-undelivered stream_seq must surface as a gap: {status:?}"
+        );
+        assert!(
+            status.needs_resync,
+            "a gap means the committed state can no longer be trusted: {status:?}"
+        );
+
+        // The resync protocol (debounced in the real UI) heals it.
+        let probes_before_resync = world.probe_log.len();
+        world.request_resync();
+        world.run_for(5_000);
+        world.drain_and_probe();
+
+        let status = world.client().sync_status();
+        assert!(
+            !status.needs_resync,
+            "snapshot must clear needs_resync: {status:?}"
+        );
+        let post_resync: Vec<ProbeResult> = world.probe_log[probes_before_resync..].to_vec();
+        assert!(
+            !post_resync.is_empty(),
+            "expected probes after the resync snapshot"
+        );
+        assert!(
+            post_resync.iter().all(|p| p.matched),
+            "probes after resync must match again: {post_resync:?}"
+        );
+        assert_eq!(
+            world.client().committed_state().arena.snakes[1].is_alive,
+            world.server.committed_state().arena.snakes[1].is_alive,
+            "enemy liveness must agree after the resync"
+        );
+        assert_eq!(
+            world.client().committed_sync_hash(),
+            world.server.committed_sync_hash(),
+            "resynced client must converge to the server state"
         );
         Ok(())
     })
