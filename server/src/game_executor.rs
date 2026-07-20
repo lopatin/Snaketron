@@ -67,6 +67,83 @@ async fn persist_completed_game_with_retry(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("completed-game persistence failed")))
 }
 
+const BUS_PUBLISH_ATTEMPTS: usize = 3;
+const BUS_PUBLISH_INITIAL_BACKOFF_MS: u64 = 25;
+
+/// Publish an event with a small bounded retry so a single transient bus error
+/// does not permanently drop the message for every consumer. Retries complete
+/// before the caller moves on to the next message, preserving publish order.
+/// A double-publish on ambiguous failure is safe: consumers skip stale and
+/// duplicate stream_seqs.
+async fn publish_event_with_retry(
+    bus: &GameBus,
+    partition_id: u32,
+    event: &GameEventMessage,
+) -> Result<()> {
+    let mut last_error = None;
+
+    for attempt in 1..=BUS_PUBLISH_ATTEMPTS {
+        match bus.publish_event(partition_id, event).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt < BUS_PUBLISH_ATTEMPTS {
+            let backoff_ms = BUS_PUBLISH_INITIAL_BACKOFF_MS << (attempt - 1);
+            warn!(
+                "Event publish attempt {}/{} for game {} stream_seq {} failed; retrying in {}ms: {:?}",
+                attempt,
+                BUS_PUBLISH_ATTEMPTS,
+                event.game_id,
+                event.stream_seq,
+                backoff_ms,
+                last_error.as_ref().expect("attempt recorded an error")
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("event publish failed")))
+}
+
+/// Snapshot counterpart of [`publish_event_with_retry`], with the same
+/// ordering and duplicate-safety guarantees.
+async fn publish_snapshot_with_retry(
+    bus: &GameBus,
+    partition_id: u32,
+    game_id: u32,
+    snapshot: &GameState,
+    stream_seq: u64,
+) -> Result<GameEventMessage> {
+    let mut last_error = None;
+
+    for attempt in 1..=BUS_PUBLISH_ATTEMPTS {
+        match bus
+            .publish_snapshot(partition_id, game_id, snapshot, stream_seq)
+            .await
+        {
+            Ok(snapshot_event) => return Ok(snapshot_event),
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt < BUS_PUBLISH_ATTEMPTS {
+            let backoff_ms = BUS_PUBLISH_INITIAL_BACKOFF_MS << (attempt - 1);
+            warn!(
+                "Snapshot publish attempt {}/{} for game {} stream_seq {} failed; retrying in {}ms: {:?}",
+                attempt,
+                BUS_PUBLISH_ATTEMPTS,
+                game_id,
+                stream_seq,
+                backoff_ms,
+                last_error.as_ref().expect("attempt recorded an error")
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("snapshot publish failed")))
+}
+
 // Snapshot-bearing events are message envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -184,12 +261,13 @@ async fn run_game(
             },
         };
 
-        let publish_result = bus.publish_event(partition_id, &status_event).await;
+        let publish_result = publish_event_with_retry(&bus, partition_id, &status_event).await;
         recorder.record(&TraceRecord::EventOut {
             ts_ms: now_ms,
             msg: Box::new(status_event),
         });
         if let Err(e) = publish_result {
+            // The initial snapshot published right below re-anchors consumers.
             error!("Failed to publish game started status: {}", e);
             recorder.note(format!("failed to publish game started status: {}", e));
         }
@@ -204,14 +282,14 @@ async fn run_game(
 
     // Publish initial snapshot
     stream_seq += 1;
-    match bus
-        .publish_snapshot(
-            partition_id,
-            game_id,
-            engine.get_committed_state(),
-            stream_seq,
-        )
-        .await
+    match publish_snapshot_with_retry(
+        &bus,
+        partition_id,
+        game_id,
+        engine.get_committed_state(),
+        stream_seq,
+    )
+    .await
     {
         Ok(snapshot_event) => {
             recorder.record(&TraceRecord::EventOut {
@@ -255,7 +333,7 @@ async fn run_game(
                         request.partition_id, request.requester_id
                     ));
                     stream_seq += 1;
-                    match bus.publish_snapshot(partition_id, game_id, engine.get_committed_state(), stream_seq).await {
+                    match publish_snapshot_with_retry(&bus, partition_id, game_id, engine.get_committed_state(), stream_seq).await {
                         Ok(snapshot_event) => {
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: chrono::Utc::now().timestamp_millis(),
@@ -298,7 +376,7 @@ async fn run_game(
                         };
 
                         // Publish event via PubSub
-                        let publish_result = bus.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                        let publish_result = publish_event_with_retry(&bus, partition_id, &event_msg).await;
                         recorder.record(&TraceRecord::EventOut {
                             ts_ms: now_ms,
                             msg: Box::new(event_msg),
@@ -306,6 +384,23 @@ async fn run_game(
                         if let Err(e) = publish_result {
                             warn!("Failed to publish command scheduled event: {}", e);
                             recorder.note(format!("failed to publish command scheduled event: {}", e));
+
+                            // The scheduled command is lost for every consumer;
+                            // re-anchor them with a fresh snapshot instead of
+                            // waiting for stream_seq gap detection.
+                            stream_seq += 1;
+                            match publish_snapshot_with_retry(&bus, partition_id, game_id, engine.get_committed_state(), stream_seq).await {
+                                Ok(snapshot_event) => {
+                                    recorder.record(&TraceRecord::EventOut {
+                                        ts_ms: now_ms,
+                                        msg: Box::new(snapshot_event),
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Failed to publish compensating snapshot: {}", e);
+                                    recorder.note(format!("failed to publish compensating snapshot: {}", e));
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -361,6 +456,7 @@ async fn run_game(
                             None
                         };
 
+                        let mut event_publish_failed = false;
                         for (tick, sequence, event) in &events {
                             stream_seq += 1;
                             let event_msg = GameEventMessage {
@@ -373,12 +469,13 @@ async fn run_game(
                             };
 
                             // Publish event via PubSub
-                            let publish_result = bus.publish_event(game_id % PARTITION_COUNT, &event_msg).await;
+                            let publish_result = publish_event_with_retry(&bus, partition_id, &event_msg).await;
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: now_ms,
                                 msg: Box::new(event_msg),
                             });
                             if let Err(e) = publish_result {
+                                event_publish_failed = true;
                                 warn!("Failed to publish game event: {}", e);
                                 recorder.note(format!("failed to publish game event: {}", e));
                             }
@@ -401,12 +498,13 @@ async fn run_game(
                                 user_id: None,
                                 event: GameEvent::TickHash { hash, server_ts_ms: now_ms },
                             };
-                            let publish_result = bus.publish_event(partition_id, &hash_msg).await;
+                            let publish_result = publish_event_with_retry(&bus, partition_id, &hash_msg).await;
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: now_ms,
                                 msg: Box::new(hash_msg),
                             });
                             if let Err(e) = publish_result {
+                                event_publish_failed = true;
                                 warn!("Failed to publish tick hash: {}", e);
                                 recorder.note(format!("failed to publish tick hash: {}", e));
                             }
@@ -430,13 +528,34 @@ async fn run_game(
                             }
                         }
 
+                        // A permanently lost event strands every consumer on a
+                        // stale committed state until stream_seq gap detection
+                        // kicks in; re-anchor them proactively with a fresh
+                        // snapshot. Skipped on completion because the final
+                        // snapshot below supersedes it.
+                        if event_publish_failed && !game_completed {
+                            stream_seq += 1;
+                            match publish_snapshot_with_retry(&bus, partition_id, game_id, engine.get_committed_state(), stream_seq).await {
+                                Ok(snapshot_event) => {
+                                    recorder.record(&TraceRecord::EventOut {
+                                        ts_ms: now_ms,
+                                        msg: Box::new(snapshot_event),
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Failed to publish compensating snapshot for game {}: {}", game_id, e);
+                                    recorder.note(format!("failed to publish compensating snapshot: {}", e));
+                                }
+                            }
+                        }
+
                         // Check if game has completed
                         if game_completed {
                             info!("Game {} has completed, exiting game loop", game_id);
 
                             // Publish final snapshot
                             stream_seq += 1;
-                            match bus.publish_snapshot(partition_id, game_id, game_state, stream_seq).await {
+                            match publish_snapshot_with_retry(&bus, partition_id, game_id, game_state, stream_seq).await {
                                 Ok(snapshot_event) => {
                                     recorder.record(&TraceRecord::EventOut {
                                         ts_ms: now_ms,
