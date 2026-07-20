@@ -2,10 +2,9 @@ use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode};
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use server::db::DURABLE_GAME_ID_FLOOR;
-use server::game_bus::{BusKind, GameBus};
+use server::game_bus::GameBus;
 use server::game_executor::{PARTITION_COUNT, StreamEvent, run_game_executor};
 use server::matchmaking_manager::MatchmakingManager;
-use server::pubsub_manager::PubSubManager;
 use server::redis_keys::RedisKeys;
 use server::redis_utils::create_connection_manager;
 use server::replication::ReplicationManager;
@@ -242,23 +241,16 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
     let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
     let redis_client = redis::Client::open(redis_url)?;
     let (push_tx, _) = broadcast::channel(16);
-    let publisher_connection =
-        create_connection_manager(redis_client.clone(), push_tx.clone()).await?;
-    // Publish on the same transport the test server's replicas subscribe to.
+    let publisher_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
     let publisher = GameBus::new(
-        BusKind::from_env(),
-        PubSubManager::new(
-            publisher_connection.clone(),
-            push_tx,
-            CancellationToken::new(),
-        ),
         publisher_connection,
         redis_client.clone(),
         CancellationToken::new(),
     );
     let partition_id = game_id % PARTITION_COUNT;
 
-    // Pub/Sub startup is asynchronous. Republish until this server's replica proves the live
+    // Replica reader startup is asynchronous (subscriptions anchor at the stream tail, so
+    // earlier entries are invisible). Republish until this server's replica proves the live
     // state is available to the same authorization path used by JoinGame.
     timeout(Duration::from_secs(10), async {
         loop {
@@ -343,16 +335,8 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
         .await?;
 
     let (push_tx, _) = broadcast::channel(16);
-    let publisher_connection =
-        create_connection_manager(redis_client.clone(), push_tx.clone()).await?;
-    // Publish on the same transport the test server's replicas subscribe to.
+    let publisher_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
     let publisher = GameBus::new(
-        BusKind::from_env(),
-        PubSubManager::new(
-            publisher_connection.clone(),
-            push_tx,
-            CancellationToken::new(),
-        ),
         publisher_connection,
         redis_client.clone(),
         CancellationToken::new(),
@@ -365,7 +349,7 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
 
     // The server sees the executor-stored Redis snapshot first and enters its bounded
     // readiness wait. Publishing shortly afterward models the replica consuming the initial
-    // snapshot after GameCreated was already acknowledged.
+    // snapshot a moment after the game was created.
     tokio::time::sleep(Duration::from_millis(200)).await;
     publisher
         .publish_snapshot(game_id % PARTITION_COUNT, game_id, &live_state, 0)
@@ -526,25 +510,15 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
     let redis_client = redis::Client::open(redis_url)?;
     let cancellation_token = CancellationToken::new();
     let (push_tx, _) = broadcast::channel(32);
-    let executor_connection =
-        create_connection_manager(redis_client.clone(), push_tx.clone()).await?;
-    let executor_pubsub = PubSubManager::new(
-        executor_connection.clone(),
-        push_tx.clone(),
-        cancellation_token.clone(),
-    );
-    // This test drives hand-built Pub/Sub publishers, so the executor's bus
-    // is pinned to pubsub independent of the SNAKETRON_BUS test matrix.
+    let executor_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
     let executor_bus = Arc::new(GameBus::new(
-        BusKind::PubSub,
-        executor_pubsub,
         executor_connection.clone(),
         redis_client.clone(),
         cancellation_token.clone(),
     ));
-    let publisher_pubsub = PubSubManager::new(
+    let publisher_bus = GameBus::new(
         executor_connection.clone(),
-        push_tx,
+        redis_client.clone(),
         cancellation_token.clone(),
     );
     let replication_manager = Arc::new(
@@ -552,7 +526,6 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
             vec![partition_id],
             cancellation_token.clone(),
             &std::env::var("SNAKETRON_REDIS_URL")?,
-            BusKind::PubSub,
         )
         .await?,
     );
@@ -571,18 +544,13 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
         .await
     });
 
-    // The acknowledged publisher retries across the executor's subscription startup window.
-    publisher_pubsub
-        .publish_command(
-            partition_id,
-            &StreamEvent::GameCreated {
-                game_id,
-                game_state: final_state.clone(),
-            },
-        )
-        .await
-        .context("executor did not acknowledge GameCreated")?;
-
+    // The executor's command subscription anchors at the stream tail, and that
+    // happens asynchronously after the spawn above — a GameCreated published
+    // before the anchor is never delivered. Re-publishing is idempotent while
+    // the game is running (the executor ignores GameCreated for a game it
+    // already started), so publish until the executor proves acceptance by
+    // persisting the completed game. Persistence is checked before each
+    // publish so the loop stops as soon as the game went through.
     timeout(Duration::from_secs(20), async {
         loop {
             if let Some(game) = env.db().get_game_by_id(game_id as i32).await?
@@ -595,6 +563,15 @@ async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Res
                     return Ok::<_, anyhow::Error>(());
                 }
             }
+            publisher_bus
+                .publish_command(
+                    partition_id,
+                    &StreamEvent::GameCreated {
+                        game_id,
+                        game_state: final_state.clone(),
+                    },
+                )
+                .await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })

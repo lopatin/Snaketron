@@ -62,16 +62,10 @@ jobs:
           cargo test --all --no-run
 
   test:
-    name: Run Tests (bus=${{ matrix.bus }})
+    name: Run Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # Both game-bus transports must pass the full suite (see
-        # STREAMS_MIGRATION.md).
-        bus: [pubsub, streams]
-    
+
     services:
       postgres:
         image: postgres:13.3
@@ -164,11 +158,10 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           DYNAMODB_TABLE_PREFIX: snaketron
-          SNAKETRON_BUS: ${{ matrix.bus }}
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |
-          echo "Running all tests with SNAKETRON_BUS=${{ matrix.bus }}..."
+          echo "Running all tests..."
           cargo test --all -- --nocapture --test-threads=1
           
       - name: Upload test results

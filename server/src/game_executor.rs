@@ -1,7 +1,5 @@
 use crate::db::Database;
-use crate::game_bus::GameBus;
-use crate::pubsub_manager::{PartitionSubscription, SnapshotRequest};
-use crate::redis_keys::RedisKeys;
+use crate::game_bus::{GameBus, PartitionSubscription, SnapshotRequest};
 use crate::replication::GameStateReader;
 use crate::sync_trace::GameTraceRecorder;
 use crate::xp_persistence;
@@ -11,7 +9,6 @@ use common::{
     EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
     GameState, GameStatus, TICK_HASH_INTERVAL_TICKS,
 };
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -375,7 +372,7 @@ async fn run_game(
                             event,
                         };
 
-                        // Publish event via PubSub
+                        // Publish event on the game bus
                         let publish_result = publish_event_with_retry(&bus, partition_id, &event_msg).await;
                         recorder.record(&TraceRecord::EventOut {
                             ts_ms: now_ms,
@@ -468,7 +465,7 @@ async fn run_game(
                                 event: event.clone(),
                             };
 
-                            // Publish event via PubSub
+                            // Publish event on the game bus
                             let publish_result = publish_event_with_retry(&bus, partition_id, &event_msg).await;
                             recorder.record(&TraceRecord::EventOut {
                                 ts_ms: now_ms,
@@ -733,11 +730,6 @@ pub async fn run_game_executor(
         server_id, partition_id
     );
 
-    // Create PubSub manager
-    // let mut pubsub = PubSubManager::new(&redis_url)
-    //     .await
-    //     .context("Failed to create PubSub manager")?;
-
     // Subscribe to partition commands and snapshot requests
     let partition_sub = bus
         .subscribe_to_partition(partition_id)
@@ -820,9 +812,10 @@ pub async fn run_game_executor(
     // replica state (event-current) wins over stored Redis snapshots
     // (refreshed at TickHash cadence, so <=~1s stale); snapshots cover games
     // this server's replica never saw, including games whose GameCreated
-    // pub/sub message was lost while no executor was listening. run_game
-    // re-anchors clients by publishing a fresh snapshot first, which resets
-    // stream_seq watermarks all the way down.
+    // command was published while no executor was subscribed (subscriptions
+    // anchor at the stream tail, so earlier entries are not replayed).
+    // run_game re-anchors clients by publishing a fresh snapshot first,
+    // which resets stream_seq watermarks all the way down.
     {
         let replica_games = replication_manager.get_partition_games(partition_id).await;
         let snapshot_games = load_stored_snapshots(&mut redis).await;
@@ -878,11 +871,11 @@ pub async fn run_game_executor(
                 break;
             }
 
-            // Process events from partition channel
+            // Process events from the partition's event stream
             Some(event) = event_receiver.recv() => {
-                // Events flow through to replication manager automatically via PubSub
-                // The replication manager is subscribed to the same partition channel
-                // We just need to publish snapshots to PubSub
+                // Events flow to the replication manager through its own
+                // subscription to the same partition streams; nothing to do
+                // here beyond draining.
                 if let GameEvent::Snapshot { .. } = &event.event {
                     debug!("Received snapshot event for game {} on partition {}", event.game_id, partition_id);
                 }
@@ -899,38 +892,19 @@ pub async fn run_game_executor(
                 }
             }
 
-            // Process commands from PubSub
+            // Process commands from the partition's command stream
             Some(command_data) = command_receiver.recv() => {
                 match command_data {
                     StreamEvent::GameCreated { game_id, game_state } => {
                         info!("Received GameCreated event for game {}", game_id);
-                        let bus_clone = bus.clone();
-                        let db_clone = db.clone();
-                        let cancellation_token_clone = cancellation_token.clone();
-                        let accepted = try_start_game(
+                        try_start_game(
                             game_id,
                             game_state,
-                            bus_clone,
-                            db_clone,
-                            cancellation_token_clone,
+                            bus.clone(),
+                            db.clone(),
+                            cancellation_token.clone(),
                             &mut game_channels
                         );
-                        if accepted {
-                            let mut ack_redis = redis.clone();
-                            if let Err(e) = ack_redis
-                                .set_ex::<_, _, ()>(
-                                    RedisKeys::game_creation_ack(game_id),
-                                    server_id,
-                                    30,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Failed to acknowledge GameCreated for game {}: {}",
-                                    game_id, e
-                                );
-                            }
-                        }
                     }
                     StreamEvent::StatusUpdated { game_id, status } => {
                         if let GameStatus::Complete { .. } = status {

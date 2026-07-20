@@ -3,7 +3,7 @@
 //! These tests run a fully in-process simulation of the production topology:
 //! an authoritative server-side `GameEngine` advanced on a virtual clock the
 //! way `game_executor::run_game` does, a deterministic transport with
-//! configurable latency/jitter/loss standing in for Redis pub/sub + WebSocket,
+//! configurable latency/jitter/loss standing in for the server bus + WebSocket,
 //! and a client-side `GameEngine` that sees only what the transport delivers.
 //! No network, no Redis, no sleeps — a 60-virtual-second game runs in
 //! milliseconds and is bit-for-bit reproducible from its seeds.
@@ -145,8 +145,9 @@ impl Transport {
     }
 
     fn send_to_client(&mut self, now_ms: i64, msg: GameEventMessage) {
-        // Snapshots are the reliable join/recovery path; everything else is
-        // at-most-once pub/sub and may be dropped.
+        // Snapshots are the reliable join/recovery path; everything else
+        // rides hops that can drop (broadcast lag, the WebSocket leg), so
+        // the simulation lets it be dropped.
         let droppable = !matches!(msg.event, GameEvent::Snapshot { .. });
         if droppable
             && self.cfg.drop_probability > 0.0

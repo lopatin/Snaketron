@@ -131,17 +131,7 @@ impl RedisKeys {
         "lobby-updates".to_string()
     }
 
-    // === PubSub Channels ===
-
-    /// Partition events channel
-    pub fn partition_events(partition_id: u32) -> String {
-        format!("snaketron:events:partition:{}", partition_id)
-    }
-
-    /// Partition commands channel
-    pub fn partition_commands(partition_id: u32) -> String {
-        format!("snaketron:commands:partition:{}", partition_id)
-    }
+    // === PubSub Channels (loss-tolerant fan-out) ===
 
     /// Lobby chat channel
     pub fn lobby_chat_channel(lobby_code: &str) -> String {
@@ -163,22 +153,12 @@ impl RedisKeys {
         format!("game:{}:chat:history", game_id)
     }
 
-    /// Snapshot requests channel
-    pub fn snapshot_requests(partition_id: u32) -> String {
-        format!("snaketron:snapshot-requests:partition:{}", partition_id)
-    }
-
     /// Game snapshot key
     pub fn game_snapshot(game_id: u32) -> String {
         format!("game:snapshot:{}", game_id)
     }
 
-    /// Short-lived acknowledgement that a partition executor accepted GameCreated.
-    pub fn game_creation_ack(game_id: u32) -> String {
-        format!("game:creation-ack:{}", game_id)
-    }
-
-    // === Game Bus Streams Keys (SNAKETRON_BUS=streams) ===
+    // === Game Bus Streams Keys ===
 
     /// Stream carrying game events for a partition
     pub fn stream_events(partition_id: u32) -> String {
@@ -229,11 +209,8 @@ mod tests {
             RedisKeys::matchmaking_user_status(123),
             "matchmaking:user:123"
         );
-        assert_eq!(
-            RedisKeys::partition_events(0),
-            "snaketron:events:partition:0"
-        );
-        assert_eq!(RedisKeys::game_creation_ack(123), "game:creation-ack:123");
+        assert_eq!(RedisKeys::stream_events(0), "snaketron:stream:events:0");
+        assert_eq!(RedisKeys::game_snapshot(123), "game:snapshot:123");
 
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };

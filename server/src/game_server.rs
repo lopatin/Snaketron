@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::api::jwt::JwtManager;
-use crate::game_bus::{BusKind, GameBus};
+use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::http_server::run_http_server;
 use crate::lobby_manager::LobbyManager;
@@ -142,21 +142,12 @@ impl GameServer {
         let redis = create_connection_manager(redis_client, pubsub_tx.clone()).await?;
         info!("Redis connection manager created successfully");
 
-        // Create the PubsubManager
-        let pubsub_manager = Arc::new(PubSubManager::new(
-            redis.clone(),
-            pubsub_tx.clone(),
-            cancellation_token.clone(),
-        ));
+        // Create the PubsubManager for loss-tolerant fan-out
+        // (chat/lobby/counters).
+        let pubsub_manager = Arc::new(PubSubManager::new(redis.clone(), pubsub_tx.clone()));
 
-        // Create the game-critical message bus (transport per SNAKETRON_BUS).
-        // Loss-tolerant fan-out (chat/lobby/counters) stays on the
-        // PubSubManager regardless of this setting.
-        let bus_kind = BusKind::from_env();
-        info!("Game bus transport: {:?}", bus_kind);
+        // Create the game-critical message bus (Redis Streams).
         let game_bus = Arc::new(GameBus::new(
-            bus_kind,
-            (*pubsub_manager).clone(),
             redis.clone(),
             Client::open(redis_url.clone())
                 .context("Failed to create Redis client for game bus")?,
@@ -220,7 +211,6 @@ impl GameServer {
                 replication_partitions,
                 cancellation_token.clone(),
                 &redis_url,
-                bus_kind,
             )
             .await
             .context("Failed to create replication manager")?,

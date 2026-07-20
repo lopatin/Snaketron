@@ -1,27 +1,19 @@
 # Valkey Streams Migration
 
-**Status: IMPLEMENTED — streams is the default.** The game-critical
-transport is configurable via `SNAKETRON_BUS=pubsub|streams` (default
-`streams`; set `pubsub` to fall back to the previous transport). The seam is
-`server/src/game_bus.rs` (`GameBus`); the full server suite passes under both
-configs (CI runs a matrix over both); dedicated streams tests cover zero-loss
-under a paused consumer, reconnect resume via CLIENT KILL, ordering, tail
-anchoring, and trimming; measured delivery latency is p50 ~1.3 ms / p99
-~3.6 ms — within ~0.2 ms of Pub/Sub and ~300x faster than the abandoned 2025
-implementation. The sections below record the assessment, the design rules,
-and the operational rollout guidance.
-
-## Rollout constraint: the flip is per-process, not per-fleet
-
-`SNAKETRON_BUS` selects the transport for one process. Publishers on one
-transport are invisible to consumers on the other, so a **mixed fleet during
-a rolling restart silently partitions cross-server traffic** (a pubsub-mode
-WS server's commands never reach a streams-mode executor). Flip the whole
-fleet at once: set the new value everywhere, then restart all servers
-together (a brief maintenance window), or scale to a single server for the
-flip. The failover/resume machinery (stored snapshots + resume-on-start)
-recovers in-flight games across the restart. If zero-downtime flips ever
-matter, add a transitional dual-publish mode first.
+**Status: COMPLETE — streams is the only transport.** The Pub/Sub game-bus
+backend and the `SNAKETRON_BUS` flag were removed after streams proved out
+(Phase 5 below); `server/src/game_bus.rs` (`GameBus`) is now a plain Streams
+implementation, and Pub/Sub remains only for loss-tolerant fan-out (chat,
+lobby updates, user counts) in `pubsub_manager.rs`. The pubsub-era
+workarounds went with it — most notably the GameCreated ack/retry handshake,
+which existed because Pub/Sub drops messages published before the executor
+subscribes (under streams, a GameCreated missed during an executor restart
+is recovered by the stored-snapshot resume path). Dedicated streams tests
+cover zero-loss under a paused consumer, reconnect resume via CLIENT KILL,
+ordering, tail anchoring, and trimming; measured delivery latency is p50
+~1.3 ms / p99 ~3.6 ms — within ~0.2 ms of Pub/Sub and ~300x faster than the
+abandoned 2025 implementation. The sections below are kept as the historical
+record of the assessment, the design rules, and the rollout.
 
 ## Why the old Streams implementation was slow (git archaeology)
 
@@ -183,7 +175,9 @@ then flip prod. After confidence: consider relaxing the stored-snapshot
 refresh cadence and demoting the gap-driven snapshot-request path to
 cold-start only. Keep the Pub/Sub backend as the escape hatch until Streams
 has weeks of clean counters; remove it only when the flag has become dead
-weight.
+weight. *(Done: the Pub/Sub backend, the `SNAKETRON_BUS` flag, the enum
+dispatch, and the GameCreated ack handshake have all been removed —
+`GameBus` is streams-only.)*
 
 ## Effort estimate
 

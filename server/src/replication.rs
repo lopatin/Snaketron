@@ -1,6 +1,5 @@
-use crate::game_bus::{BusKind, GameBus};
+use crate::game_bus::{GameBus, PartitionSubscription};
 use crate::game_executor::{PARTITION_COUNT, StreamEvent};
-use crate::pubsub_manager::{PartitionSubscription, PubSubManager};
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState, GameStatus};
 use std::collections::{HashMap, HashSet};
@@ -109,7 +108,7 @@ impl FilteredEventReceiver {
     }
 }
 
-/// PartitionReplica subscribes to partition events via PubSub and maintains game states
+/// PartitionReplica subscribes to partition events on the game bus and maintains game states
 pub struct PartitionReplica {
     partition_id: u32,
     bus: Arc<GameBus>,
@@ -134,7 +133,9 @@ impl PartitionReplica {
     ) -> Self {
         let status = Arc::new(RwLock::new(ReplicationStatus {
             partition_id,
-            is_ready: true, // With PubSub, we're immediately ready
+            // Immediately ready: the subscription anchors at the stream tail
+            // and initial state arrives via the snapshot request below.
+            is_ready: true,
         }));
 
         Self {
@@ -181,10 +182,13 @@ impl PartitionReplica {
             game_id, self.partition_id
         );
 
-        // Transport-integrity check. Redis pub/sub is at-most-once: a gap in
+        // Transport-integrity check, kept as defense-in-depth. The Streams
+        // bus itself doesn't drop, but a gap can still appear past it (trim
+        // horizon after a long outage, broadcast-lag downstream): a gap in
         // stream_seq means this replica lost messages and its state can no
         // longer be trusted, so ask the executor for fresh snapshots. Stale
-        // or duplicate messages are dropped instead of double-applied.
+        // or duplicate messages are dropped instead of double-applied. On a
+        // healthy system this path sits idle (see DEBUGGING.md).
         let is_snapshot = matches!(&event_msg.event, GameEvent::Snapshot { .. });
         if event_msg.stream_seq > 0 {
             let last = {
@@ -333,10 +337,11 @@ impl PartitionReplica {
             mut snapshot_request_receiver,
         } = subscription;
 
-        // Mark as ready immediately (no catch-up needed with PubSub)
+        // Mark as ready immediately (initial state arrives via the snapshot
+        // request above; there is no historical catch-up phase)
         self.status.write().await.is_ready = true;
 
-        // Events and commands use separate Redis channels, so the durable completion marker can
+        // Events and commands use separate Redis streams, so the durable completion marker can
         // arrive before the final snapshot even though the executor publishes the snapshot first.
         // Track both sides and evict only after this replica has processed (and broadcast) that
         // terminal snapshot.
@@ -400,7 +405,7 @@ impl PartitionReplica {
                 // Drain snapshot requests (processed by game executor, not used here)
                 Some(_) = snapshot_request_receiver.recv() => {
                     // Snapshot requests are handled by the game executor, we just drain them
-                    // to prevent the channel from filling up and blocking the PubSub handler
+                    // to prevent the channel from filling up and stalling the stream reader
                 }
             }
         }
@@ -449,7 +454,7 @@ impl GameStateReader for ReplicationManager {
     }
 
     async fn is_ready(&self) -> bool {
-        // With PubSub, we're always ready
+        // Replicas are ready from startup; see PartitionReplica::new
         true
     }
 }
@@ -515,7 +520,7 @@ impl ReplicationManager {
         seqs.get(&game_id).copied().unwrap_or(0)
     }
 
-    /// Get a game state, always ready with PubSub
+    /// Get a game state (replicas are always ready; no readiness gate)
     pub async fn get_game_state_when_ready(&self, game_id: u32) -> Option<GameState> {
         self.get_game_state(game_id).await
     }
@@ -569,7 +574,6 @@ impl ReplicationManager {
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
         redis_url: &str,
-        bus_kind: BusKind,
     ) -> Result<Self> {
         let game_states = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
@@ -577,19 +581,17 @@ impl ReplicationManager {
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
 
-        // The replication workers get their own Redis connection (and thus
-        // their own push firehose under pubsub), isolated from the main
-        // server's connection.
+        // The replication workers get their own Redis connection, isolated
+        // from the main server's connection. The push channel only satisfies
+        // the shared connection-manager config; nothing here subscribes to
+        // Pub/Sub pushes.
         let redis_client = redis::Client::open(redis_url)?;
         let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
         let redis =
             crate::redis_utils::create_connection_manager(redis_client.clone(), pubsub_tx.clone())
                 .await?;
 
-        let pubsub = PubSubManager::new(redis.clone(), pubsub_tx, cancellation_token.clone());
         let bus = Arc::new(GameBus::new(
-            bus_kind,
-            pubsub,
             redis,
             redis_client,
             cancellation_token.clone(),
@@ -632,7 +634,7 @@ impl ReplicationManager {
         self.game_states.clone()
     }
 
-    /// Check if all workers are ready (always true with PubSub)
+    /// Check if all workers are ready (always true; see PartitionReplica::new)
     pub async fn is_ready(&self) -> bool {
         true
     }
