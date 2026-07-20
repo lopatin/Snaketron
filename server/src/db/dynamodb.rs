@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::create_table::{CreateTableError, CreateTableOutput};
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndexAction,
     GlobalSecondaryIndex, GlobalSecondaryIndexUpdate, KeySchemaElement, KeyType, Projection,
@@ -153,6 +154,37 @@ impl DynamoDatabase {
             DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS,
             last_observation
         ))
+    }
+
+    /// Completes a CreateTable call. The describe-then-create pattern in the
+    /// create_*_table_if_not_exists functions can lose a race against another
+    /// process bootstrapping the same tables (servers booting together, parallel
+    /// tests); a lost race surfaces as ResourceInUseException and is treated as
+    /// success once the winner's table is ACTIVE.
+    async fn finish_table_creation(
+        &self,
+        table_name: &str,
+        result: Result<CreateTableOutput, SdkError<CreateTableError>>,
+    ) -> Result<()> {
+        match result {
+            Ok(_) => {
+                info!("Created DynamoDB table: {}", table_name);
+                Ok(())
+            }
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_resource_in_use_exception()) =>
+            {
+                debug!(
+                    "Table {} was created concurrently by another process",
+                    table_name
+                );
+                self.wait_for_table_active(table_name).await
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to create DynamoDB table {}", table_name)),
+        }
     }
 
     async fn ensure_main_table_ttl_enabled(&self) -> Result<()> {
@@ -423,7 +455,8 @@ impl DynamoDatabase {
             .build()?;
 
         // Create table
-        self.client
+        let result = self
+            .client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(pk_attr)
@@ -438,11 +471,8 @@ impl DynamoDatabase {
             .global_secondary_indexes(gsi2)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
-            .await
-            .context("Failed to create main table")?;
-
-        info!("Created DynamoDB table: {}", table_name);
-        Ok(())
+            .await;
+        self.finish_table_creation(&table_name, result).await
     }
 
     async fn create_usernames_table_if_not_exists(&self) -> Result<()> {
@@ -482,18 +512,16 @@ impl DynamoDatabase {
             .key_type(KeyType::Hash)
             .build()?;
 
-        self.client
+        let result = self
+            .client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(username_attr)
             .key_schema(username_key)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
-            .await
-            .context("Failed to create usernames table")?;
-
-        info!("Created DynamoDB table: {}", table_name);
-        Ok(())
+            .await;
+        self.finish_table_creation(&table_name, result).await
     }
 
     async fn create_game_codes_table_if_not_exists(&self) -> Result<()> {
@@ -533,18 +561,16 @@ impl DynamoDatabase {
             .key_type(KeyType::Hash)
             .build()?;
 
-        self.client
+        let result = self
+            .client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(game_code_attr)
             .key_schema(game_code_key)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
-            .await
-            .context("Failed to create game codes table")?;
-
-        info!("Created DynamoDB table: {}", table_name);
-        Ok(())
+            .await;
+        self.finish_table_creation(&table_name, result).await
     }
 
     async fn generate_id_for_entity(&self, entity_type: &str) -> Result<i32> {
@@ -2397,7 +2423,8 @@ impl DynamoDatabase {
             .build()
             .context("Failed to build GameTypeSeasonIndex GSI for rankings")?;
 
-        self.client
+        let result = self
+            .client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(pk_attr)
@@ -2408,11 +2435,8 @@ impl DynamoDatabase {
             .global_secondary_indexes(game_type_season_gsi)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
-            .await
-            .context("Failed to create rankings table")?;
-
-        info!("Successfully created rankings table: {}", table_name);
-        Ok(())
+            .await;
+        self.finish_table_creation(&table_name, result).await
     }
 
     async fn create_high_scores_table_if_not_exists(&self) -> Result<()> {
@@ -2583,7 +2607,8 @@ impl DynamoDatabase {
             .build()
             .context("Failed to build GameTypeSeasonIndex GSI")?;
 
-        self.client
+        let result = self
+            .client
             .create_table()
             .table_name(&table_name)
             .attribute_definitions(pk_attr)
@@ -2596,11 +2621,8 @@ impl DynamoDatabase {
             .global_secondary_indexes(game_type_season_gsi)
             .billing_mode(BillingMode::PayPerRequest)
             .send()
-            .await
-            .context("Failed to create high scores table")?;
-
-        info!("Successfully created high scores table: {}", table_name);
-        Ok(())
+            .await;
+        self.finish_table_creation(&table_name, result).await
     }
 }
 

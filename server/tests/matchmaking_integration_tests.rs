@@ -10,6 +10,11 @@ use tokio::time::{Duration, timeout};
 mod common;
 use self::common::{TestClient, TestEnvironment};
 
+// Serializes the tests in this binary: TestEnvironment::new() sets process-wide
+// env vars (DYNAMODB_TABLE_PREFIX, SNAKETRON_REDIS_URL) and flushes the shared
+// Redis test database, so concurrently running tests corrupt each other.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // #[tokio::test]
 #[allow(dead_code)]
 async fn test_minimal() -> Result<()> {
@@ -22,6 +27,7 @@ async fn test_minimal() -> Result<()> {
 
 #[tokio::test]
 async fn test_simple_two_player_match() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     // Set test environment
 
     // Clean up Redis before starting the test
@@ -129,6 +135,7 @@ async fn test_simple_two_player_match() -> Result<()> {
 
 #[tokio::test]
 async fn test_basic_matchmaking() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
     env.add_server().await?;
     env.create_user().await?;
@@ -174,6 +181,7 @@ async fn test_basic_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_leave_queue() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_leave_queue").await?;
     env.add_server().await?;
     env.create_user().await?;
@@ -209,6 +217,7 @@ async fn test_leave_queue() -> Result<()> {
 
 #[tokio::test]
 async fn test_team_matchmaking() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_team_matchmaking").await?;
     env.add_server().await?;
     for _ in 0..4 {
@@ -257,6 +266,7 @@ async fn test_team_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_matchmaking() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_concurrent_matchmaking").await?;
     env.add_server().await?;
 
@@ -339,6 +349,7 @@ async fn test_concurrent_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_disconnect_during_queue() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     // Clean up Redis before starting the test
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
@@ -401,6 +412,7 @@ async fn test_disconnect_during_queue() -> Result<()> {
 
 #[tokio::test]
 async fn test_rejoin_active_game() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     // Clean up Redis before starting the test
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
@@ -521,6 +533,7 @@ async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
 /// Test that two lobbies with similar MMR (both in silver range 500-600) match instantly
 #[tokio::test]
 async fn test_same_mmr_range_matches_instantly() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
@@ -595,6 +608,7 @@ async fn test_same_mmr_range_matches_instantly() -> Result<()> {
 /// Test that silver (600) and gold (900) lobbies match after ~10 seconds
 #[tokio::test]
 async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
@@ -672,6 +686,7 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
 /// Test that silver (600) and diamond (1500) lobbies match after ~30 seconds (max wait)
 #[tokio::test]
 async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
@@ -749,6 +764,7 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
 /// Test that extreme MMR differences still match within 30 seconds (max wait time)
 #[tokio::test]
 async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
@@ -822,6 +838,7 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
 
 #[tokio::test]
 async fn test_mmr_based_matchmaking() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     // Clean up Redis before starting the test
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
@@ -980,6 +997,7 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
 
 #[tokio::test]
 async fn test_matchmaking_load() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     // Clean up Redis before starting the test
     let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
