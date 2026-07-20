@@ -10,7 +10,10 @@ interface UseGameWebSocketReturn {
   currentGameId: string | null;
   customGameCode: string | null;
   isHost: boolean;
-  lastGameEvent: any | null;
+  /** Bumped whenever new game events are queued; consumers drain with takeGameEvents. */
+  gameEventSignal: number;
+  /** Returns every queued game event in arrival order and empties the queue. */
+  takeGameEvents: () => any[];
   gameLoadFailure: GameLoadFailure | null;
   awaitingGameSnapshotForId: string | null;
   isGameSnapshotSynchronized: boolean;
@@ -40,7 +43,14 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [customGameCode, setCustomGameCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
-  const [lastGameEvent, setLastGameEvent] = useState<any | null>(null);
+  // Game events are queued in a ref and drained by the consumer. Delivering
+  // them through a single useState slot loses events when React batches
+  // multiple WS frames into one commit (last write wins) — a crash tick's
+  // SnakeDied/SnakeRespawned burst is exactly such a case, and a dropped
+  // event forces a stream-gap resync. The state below is only a wake-up
+  // signal; the queue itself is lossless and ordered.
+  const gameEventQueueRef = useRef<any[]>([]);
+  const [gameEventSignal, setGameEventSignal] = useState(0);
   const [gameLoadFailure, setGameLoadFailure] = useState<GameLoadFailure | null>(null);
   const [awaitingGameSnapshotForId, setAwaitingGameSnapshotForId] = useState<string | null>(null);
   const [isGameSnapshotSynchronized, setIsGameSnapshotSynchronized] = useState(false);
@@ -61,6 +71,12 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     setIsGameSnapshotSynchronized(isSynchronized);
   }, []);
 
+  const takeGameEvents = useCallback(() => {
+    const events = gameEventQueueRef.current;
+    gameEventQueueRef.current = [];
+    return events;
+  }, []);
+
   // Handle game-specific messages
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
@@ -70,8 +86,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     // Game events (including game state updates)
     unsubscribers.push(
       onMessage('GameEvent', (message: any) => {
-        console.log('Received GameEvent message:', message);
-        
         // The message contains the full GameEventMessage from the server
         const eventMessage = message.GameEvent || message.data || message;
         
@@ -118,8 +132,11 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
         
-        // Store the full event message (including tick) for the game engine to process
-        setLastGameEvent(eventMessage);
+        // Queue the full event message (including tick) for the game engine
+        // to process, and wake the consumer. Never deliver via a state slot
+        // directly: coalesced commits would silently drop events.
+        gameEventQueueRef.current.push(eventMessage);
+        setGameEventSignal((n) => n + 1);
         
         // Handle different event types
         // if (event.Snapshot) {
@@ -338,7 +355,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     if (parsedGameId === null) {
       requestedGameRef.current = null;
       updateGameSnapshotSynchronization(false);
-      setLastGameEvent(null);
+      gameEventQueueRef.current = [];
       updateAwaitingGameSnapshot(null);
       setIsJoiningGame(false);
       setGameLoadFailure({
@@ -355,7 +372,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     };
     updateGameSnapshotSynchronization(false);
     setCurrentGameId(parsedGameId.toString());
-    setLastGameEvent(null);
+    gameEventQueueRef.current = [];
     setGameLoadFailure(null);
     updateAwaitingGameSnapshot(gameId);
     setIsJoiningGame(true);
@@ -471,7 +488,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     requestedGameRef.current = null;
     serverAssignedGameRef.current = null;
     updateGameSnapshotSynchronization(false);
-    setLastGameEvent(null);
+    gameEventQueueRef.current = [];
     updateAwaitingGameSnapshot(null);
     setCurrentGameId(null);
     setIsHost(false);
@@ -510,7 +527,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     currentGameId,
     customGameCode,
     isHost,
-    lastGameEvent,
+    gameEventSignal,
+    takeGameEvents,
     gameLoadFailure,
     awaitingGameSnapshotForId,
     isGameSnapshotSynchronized,
