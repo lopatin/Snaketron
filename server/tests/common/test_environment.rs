@@ -37,8 +37,9 @@ impl TestEnvironment {
                 .take(8)
                 .collect::<String>()
         );
-        // SAFETY: This is safe in tests because each test runs sequentially with TestEnvironment::new()
-        // being called at the start of the test before any other code accesses DYNAMODB_TABLE_PREFIX
+        // SAFETY: Tests using TestEnvironment must run serially (holding their
+        // binary's TEST_LOCK for the whole test, or --test-threads=1) so that no
+        // other thread reads or writes these process-wide env vars mid-test.
         unsafe {
             std::env::set_var("DYNAMODB_TABLE_PREFIX", &unique_prefix);
             // Use Redis database 1 for tests (tests flush database 1, so server should use it too)

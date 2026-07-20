@@ -14,18 +14,19 @@ use tokio::{
 mod common;
 use self::common::{TestClient, TestEnvironment};
 
-use std::sync::Once;
 use tracing_subscriber::{EnvFilter, fmt};
 
-static INIT_TRACING: Once = Once::new();
+// Serializes the tests in this binary: TestEnvironment::new() sets process-wide
+// env vars (DYNAMODB_TABLE_PREFIX, SNAKETRON_REDIS_URL) and flushes the shared
+// Redis test database, so concurrently running tests corrupt each other.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn init_tracing() {
-    INIT_TRACING.call_once(|| {
-        fmt()
-            // allow configuring via RUST_LOG, e.g. RUST_LOG=trace
-            .with_env_filter(EnvFilter::from_default_env())
-            .init();
-    });
+    // try_init: another test may have already installed the global subscriber.
+    let _ = fmt()
+        // allow configuring via RUST_LOG, e.g. RUST_LOG=trace
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
 }
 
 fn test_redis_url() -> String {
@@ -263,6 +264,7 @@ async fn age_single_queued_lobby(
 
 #[tokio::test]
 async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_multi_member_lobby_solo_host_only_player").await?;
@@ -340,6 +342,7 @@ async fn test_multi_member_lobby_queues_solo_host_only_player() -> Result<()> {
 
 #[tokio::test]
 async fn test_two_player_lobby_creates_1v1_with_split_teams() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_two_player_lobby_1v1_split").await?;
@@ -372,6 +375,7 @@ async fn test_two_player_lobby_creates_1v1_with_split_teams() -> Result<()> {
 
 #[tokio::test]
 async fn test_two_single_lobbies_create_1v1() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_two_single_lobbies_1v1").await?;
@@ -416,6 +420,7 @@ async fn test_two_single_lobbies_create_1v1() -> Result<()> {
 
 #[tokio::test]
 async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_single_lobby_waits_1v1").await?;
     env.add_server().await?;
@@ -460,6 +465,7 @@ async fn test_single_lobby_waits_for_1v1_match() -> Result<()> {
 
 #[tokio::test]
 async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_two_player_lobbies_2v2").await?;
     env.add_server().await?;
@@ -506,6 +512,7 @@ async fn test_two_player_lobbies_create_2v2_same_team() -> Result<()> {
 
 #[tokio::test]
 async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_three_plus_one_2v2").await?;
     env.add_server().await?;
@@ -551,6 +558,7 @@ async fn test_three_plus_one_lobbies_create_2v2() -> Result<()> {
 
 #[tokio::test]
 async fn test_four_player_lobby_creates_2v2() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_four_player_lobby_2v2").await?;
     env.add_server().await?;
@@ -592,6 +600,7 @@ async fn test_four_player_lobby_creates_2v2() -> Result<()> {
 
 #[tokio::test]
 async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_ffa_multiple_lobbies").await?;
     env.add_server().await?;
@@ -649,6 +658,7 @@ async fn test_ffa_multiple_lobbies_combine() -> Result<()> {
 
 #[tokio::test]
 async fn test_ffa_single_lobby() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     init_tracing();
 
     setup_test_redis().await?;
@@ -686,6 +696,7 @@ async fn test_ffa_single_lobby() -> Result<()> {
 
 #[tokio::test]
 async fn test_ffa_minimum_players() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_ffa_minimum_players").await?;
     env.add_server().await?;
@@ -726,6 +737,7 @@ async fn test_ffa_minimum_players() -> Result<()> {
 
 #[tokio::test]
 async fn test_ffa_two_player_lobby_matches_after_30_seconds() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env =
         TestEnvironment::new("test_ffa_two_player_lobby_matches_after_30_seconds").await?;
@@ -770,6 +782,7 @@ async fn test_ffa_two_player_lobby_matches_after_30_seconds() -> Result<()> {
 
 #[tokio::test]
 async fn test_ffa_three_player_lobby_matches_after_15_seconds() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env =
         TestEnvironment::new("test_ffa_three_player_lobby_matches_after_15_seconds").await?;
@@ -819,6 +832,7 @@ async fn test_ffa_three_player_lobby_matches_after_15_seconds() -> Result<()> {
 
 #[tokio::test]
 async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_queue_modes_dont_mix").await?;
     env.add_server().await?;
@@ -888,6 +902,7 @@ async fn test_quickmatch_and_competitive_dont_mix() -> Result<()> {
 /// Test that add_lobby_to_queue with multiple game types registers the lobby in all queues
 #[tokio::test]
 async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut mm = create_test_matchmaking_manager().await?;
 
@@ -945,6 +960,7 @@ async fn test_multi_type_lobby_appears_in_all_queues() -> Result<()> {
 /// Test that remove_lobby_from_all_queues removes lobby from all game type queues
 #[tokio::test]
 async fn test_remove_lobby_from_all_queues() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut mm = create_test_matchmaking_manager().await?;
 
@@ -1025,6 +1041,7 @@ async fn test_remove_lobby_from_all_queues() -> Result<()> {
 /// Test that get_queued_lobbies deduplicates lobbies appearing in multiple queues
 #[tokio::test]
 async fn test_get_queued_lobbies_deduplication() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut mm = create_test_matchmaking_manager().await?;
 
@@ -1074,6 +1091,7 @@ async fn test_get_queued_lobbies_deduplication() -> Result<()> {
 /// Test that when a lobby is matched in one queue, it doesn't get matched again in another
 #[tokio::test]
 async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
 
     let mut mm = create_test_matchmaking_manager().await?;
@@ -1158,6 +1176,7 @@ async fn test_multi_type_lobby_no_double_matching() -> Result<()> {
 /// Integration test: Two lobbies queued for [1v1, 2v2] should match for 1v1
 #[tokio::test]
 async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
     setup_test_redis().await?;
     let mut env = TestEnvironment::new("test_multi_type_1v1_match").await?;
@@ -1207,6 +1226,7 @@ async fn test_multi_type_lobbies_match_for_1v1() -> Result<()> {
 /// Test that a lobby in multiple queues gets properly cleaned up after matching
 #[tokio::test]
 async fn test_cleanup_after_match_creation() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     let mut mm = create_test_matchmaking_manager().await?;
 
