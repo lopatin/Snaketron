@@ -10,7 +10,7 @@ This file guides ChatGPT/Codex when working on the Snaketron repository. The int
 
 Key architectural decisions:
 - Service discovery and health: servers self-register in the DB and emit heartbeats.
-- Real-time links: WebSocket for clients; Valkey pub/sub for server-to-server.
+- Real-time links: WebSocket for clients; Valkey Streams for game-critical server-to-server traffic (`server/src/game_bus.rs`), plain pub/sub only for loss-tolerant fan-out (chat, lobby updates, user counts).
 - Cluster coordination: Valkey-backed singleton management for matchmaking and load distribution.
 - Game logic parity: the `common` crate ensures server and client stay in sync.
 - Containerization: Docker workflows for both development and production (AWS Fargate target).

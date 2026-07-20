@@ -1,26 +1,23 @@
 //! The game-critical message bus: partition-scoped events, commands, and
 //! snapshot requests between game executors, replicas, and WebSocket servers.
 //!
-//! Two interchangeable transports, selected by `SNAKETRON_BUS`:
-//!
-//! - `streams` (default): Redis/Valkey Streams — an ordered, trimmed,
-//!   replayable log per partition. Readers resume from their last-delivered
-//!   entry, so subscriber blips lose nothing and slow consumers get real
-//!   backpressure instead of drops. The `stream_seq`/resync machinery
-//!   remains as defense-in-depth and should sit idle on this transport.
-//! - `pubsub` (fallback): Redis Pub/Sub — push-based, at-most-once. Loss is
-//!   detected downstream via `stream_seq` gaps and healed with snapshot
-//!   resyncs (see DEBUGGING.md).
+//! Backed by Redis/Valkey Streams — an ordered, trimmed, replayable log per
+//! partition. Readers resume from their last-delivered entry, so subscriber
+//! blips lose nothing and slow consumers get real backpressure instead of
+//! drops. The `stream_seq`/resync machinery remains as defense-in-depth for
+//! the hops beyond this bus (broadcast fan-out, the WebSocket leg) and for
+//! trim-horizon loss after a long outage; its counters should sit at ~0
+//! (see DEBUGGING.md).
 //!
 //! Loss-tolerant fan-out (chat, lobby updates, user counts) is NOT routed
-//! through this bus — it stays on plain Pub/Sub under either setting
+//! through this bus — it stays on plain Pub/Sub
 //! (see `PubSubManager::subscribe_to_channel`).
 //!
 //! ## Streams latency rules (learned the hard way — see STREAMS_MIGRATION.md)
 //!
-//! The 2025 Streams implementation was abandoned for Pub/Sub because blocking
-//! `XREAD`s were multiplexed onto shared connections, adding 100–900 ms per
-//! event. The rules encoded here:
+//! The 2025 Streams implementation was abandoned because blocking `XREAD`s
+//! were multiplexed onto shared connections, adding 100–900 ms per event.
+//! The rules encoded here:
 //! 1. Every blocking reader owns a DEDICATED connection; publishers use the
 //!    shared non-blocking `ConnectionManager` and never queue behind a
 //!    parked read.
@@ -32,158 +29,43 @@
 //!    position.
 
 use crate::game_executor::StreamEvent;
-use crate::pubsub_manager::{PartitionSubscription, PubSubManager, SnapshotRequest};
 use crate::redis_keys::RedisKeys;
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamMaxlen, StreamReadOptions, StreamReadReply};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Which transport backs the game bus. Parsed from `SNAKETRON_BUS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusKind {
-    PubSub,
-    Streams,
+/// Snapshot request message for a partition
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SnapshotRequest {
+    pub partition_id: u32,
+    pub requester_id: Option<u64>, // Optional server ID of requester
 }
 
-impl BusKind {
-    pub fn from_env() -> Self {
-        Self::parse(std::env::var("SNAKETRON_BUS").ok().as_deref())
-    }
-
-    fn parse(value: Option<&str>) -> Self {
-        match value.map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) if v == "pubsub" => BusKind::PubSub,
-            Some(v) if v == "streams" || v.is_empty() => BusKind::Streams,
-            Some(other) => {
-                // Deliberately loud: a typo here silently changes which
-                // transport carries every game message.
-                tracing::error!(
-                    "Unknown SNAKETRON_BUS value {:?} (expected \"pubsub\" or \"streams\"); falling back to the streams default",
-                    other
-                );
-                BusKind::Streams
-            }
-            None => BusKind::Streams,
-        }
-    }
+/// A subscription to a partition's events, commands and requests
+pub struct PartitionSubscription {
+    pub partition_id: u32,
+    pub event_receiver: mpsc::Receiver<GameEventMessage>,
+    pub command_receiver: mpsc::Receiver<StreamEvent>,
+    pub snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
 }
 
-/// The configurable game-critical transport. All methods take `&self`;
-/// internal connections are cheaply cloneable handles.
-pub enum GameBus {
-    PubSub(PubSubManager),
-    Streams(StreamsTransport),
-}
-
-impl GameBus {
-    pub fn new(
-        kind: BusKind,
-        pubsub: PubSubManager,
-        redis: ConnectionManager,
-        redis_client: redis::Client,
-        cancellation_token: CancellationToken,
-    ) -> Self {
-        match kind {
-            BusKind::PubSub => GameBus::PubSub(pubsub),
-            BusKind::Streams => {
-                info!("Game bus: Redis Streams transport enabled");
-                GameBus::Streams(StreamsTransport {
-                    redis,
-                    redis_client,
-                    cancellation_token,
-                })
-            }
-        }
+impl PartitionSubscription {
+    pub async fn recv_event(&mut self) -> Option<GameEventMessage> {
+        self.event_receiver.recv().await
     }
 
-    pub fn kind(&self) -> BusKind {
-        match self {
-            GameBus::PubSub(_) => BusKind::PubSub,
-            GameBus::Streams(_) => BusKind::Streams,
-        }
+    pub async fn recv_command(&mut self) -> Option<StreamEvent> {
+        self.command_receiver.recv().await
     }
 
-    pub async fn publish_event(&self, partition_id: u32, event: &GameEventMessage) -> Result<()> {
-        match self {
-            GameBus::PubSub(manager) => {
-                let mut manager = manager.clone();
-                manager.publish_event(partition_id, event).await
-            }
-            GameBus::Streams(streams) => streams.publish_event(partition_id, event).await,
-        }
-    }
-
-    /// Publish a snapshot AND persist it under the game's snapshot key.
-    /// Returns the constructed message so callers can trace exactly what was
-    /// published.
-    pub async fn publish_snapshot(
-        &self,
-        partition_id: u32,
-        game_id: u32,
-        snapshot: &GameState,
-        stream_seq: u64,
-    ) -> Result<GameEventMessage> {
-        match self {
-            GameBus::PubSub(manager) => {
-                manager
-                    .publish_snapshot(partition_id, game_id, snapshot, stream_seq)
-                    .await
-            }
-            GameBus::Streams(streams) => {
-                streams
-                    .publish_snapshot(partition_id, game_id, snapshot, stream_seq)
-                    .await
-            }
-        }
-    }
-
-    pub async fn publish_command(&self, partition_id: u32, command: &StreamEvent) -> Result<()> {
-        match self {
-            GameBus::PubSub(manager) => manager.publish_command(partition_id, command).await,
-            GameBus::Streams(streams) => streams.publish_command(partition_id, command).await,
-        }
-    }
-
-    pub async fn request_partition_snapshots(&self, partition_id: u32) -> Result<()> {
-        match self {
-            GameBus::PubSub(manager) => {
-                let mut manager = manager.clone();
-                manager.request_partition_snapshots(partition_id).await
-            }
-            GameBus::Streams(streams) => streams.request_partition_snapshots(partition_id).await,
-        }
-    }
-
-    pub async fn subscribe_to_partition(&self, partition_id: u32) -> Result<PartitionSubscription> {
-        match self {
-            GameBus::PubSub(manager) => {
-                let mut manager = manager.clone();
-                manager.subscribe_to_partition(partition_id).await
-            }
-            GameBus::Streams(streams) => streams.subscribe_to_partition(partition_id).await,
-        }
-    }
-
-    pub async fn store_snapshot(&self, game_id: u32, snapshot: &GameState) -> Result<()> {
-        match self {
-            GameBus::PubSub(manager) => manager.store_snapshot(game_id, snapshot).await,
-            GameBus::Streams(streams) => streams.store_snapshot(game_id, snapshot).await,
-        }
-    }
-
-    pub async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
-        match self {
-            GameBus::PubSub(manager) => {
-                let mut manager = manager.clone();
-                manager.get_stored_snapshot(game_id).await
-            }
-            GameBus::Streams(streams) => streams.get_stored_snapshot(game_id).await,
-        }
+    pub async fn recv_snapshot_request(&mut self) -> Option<SnapshotRequest> {
+        self.snapshot_request_receiver.recv().await
     }
 }
 
@@ -204,13 +86,15 @@ const SNAPREQ_MAXLEN: usize = 64;
 const XREAD_BLOCK_MS: usize = 5_000;
 /// Max entries drained per XREAD round trip.
 const XREAD_COUNT: usize = 512;
-/// Capacity of the mpsc channels handed to subscribers (matches the pubsub
-/// transport). When full, the reader awaits — backpressure, not drops.
+/// Capacity of the mpsc channels handed to subscribers. When full, the
+/// reader awaits — backpressure, not drops.
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 2000;
 /// Backoff before rebuilding a failed reader connection.
 const READER_RECONNECT_BACKOFF_MS: u64 = 100;
 
-pub struct StreamsTransport {
+/// The game-critical transport. All methods take `&self`; internal
+/// connections are cheaply cloneable handles.
+pub struct GameBus {
     /// Shared non-blocking connection for XADD/KV. Never used for blocking
     /// reads (rule #1).
     redis: ConnectionManager,
@@ -219,7 +103,19 @@ pub struct StreamsTransport {
     cancellation_token: CancellationToken,
 }
 
-impl StreamsTransport {
+impl GameBus {
+    pub fn new(
+        redis: ConnectionManager,
+        redis_client: redis::Client,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        Self {
+            redis,
+            redis_client,
+            cancellation_token,
+        }
+    }
+
     async fn xadd(&self, key: &str, maxlen: usize, payload: Vec<u8>) -> Result<()> {
         let mut redis = self.redis.clone();
         let _: String = redis
@@ -229,7 +125,7 @@ impl StreamsTransport {
         Ok(())
     }
 
-    async fn publish_event(&self, partition_id: u32, event: &GameEventMessage) -> Result<()> {
+    pub async fn publish_event(&self, partition_id: u32, event: &GameEventMessage) -> Result<()> {
         let payload = serde_json::to_vec(event).context("Failed to serialize event")?;
         self.xadd(
             &RedisKeys::stream_events(partition_id),
@@ -244,7 +140,10 @@ impl StreamsTransport {
         Ok(())
     }
 
-    async fn publish_snapshot(
+    /// Publish a snapshot AND persist it under the game's snapshot key.
+    /// Returns the constructed message so callers can trace exactly what was
+    /// published.
+    pub async fn publish_snapshot(
         &self,
         partition_id: u32,
         game_id: u32,
@@ -278,7 +177,7 @@ impl StreamsTransport {
         Ok(event)
     }
 
-    async fn publish_command(&self, partition_id: u32, command: &StreamEvent) -> Result<()> {
+    pub async fn publish_command(&self, partition_id: u32, command: &StreamEvent) -> Result<()> {
         let payload = serde_json::to_vec(command).context("Failed to serialize command")?;
         self.xadd(
             &RedisKeys::stream_commands(partition_id),
@@ -288,7 +187,7 @@ impl StreamsTransport {
         .await
     }
 
-    async fn request_partition_snapshots(&self, partition_id: u32) -> Result<()> {
+    pub async fn request_partition_snapshots(&self, partition_id: u32) -> Result<()> {
         let request = SnapshotRequest {
             partition_id,
             requester_id: None,
@@ -303,7 +202,15 @@ impl StreamsTransport {
         .await
     }
 
-    async fn store_snapshot(&self, game_id: u32, snapshot: &GameState) -> Result<()> {
+    /// Store a game snapshot in Redis WITHOUT publishing it to subscribers.
+    ///
+    /// Two callers rely on this: the game loop refreshes it periodically so a
+    /// takeover executor can resume in-flight games from near-current state
+    /// (see game_executor::resume_partition_games), and the completion path
+    /// stores the terminal state as the reload fallback before publishing
+    /// completion events and releasing the in-memory copy. 5-minute TTL: a
+    /// game whose executor stays dead longer than that is not resumable.
+    pub async fn store_snapshot(&self, game_id: u32, snapshot: &GameState) -> Result<()> {
         let key = RedisKeys::game_snapshot(game_id);
         let data =
             serde_json::to_vec(snapshot).context("Failed to serialize snapshot for storage")?;
@@ -315,7 +222,7 @@ impl StreamsTransport {
         Ok(())
     }
 
-    async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
+    pub async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
         let mut redis = self.redis.clone();
         let data: Option<Vec<u8>> = redis
             .get(RedisKeys::game_snapshot(game_id))
@@ -329,7 +236,7 @@ impl StreamsTransport {
         }
     }
 
-    async fn subscribe_to_partition(&self, partition_id: u32) -> Result<PartitionSubscription> {
+    pub async fn subscribe_to_partition(&self, partition_id: u32) -> Result<PartitionSubscription> {
         let (event_tx, event_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let (request_tx, request_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
@@ -637,19 +544,7 @@ fn stream_id_less_than(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BusKind, stream_id_less_than};
-
-    #[test]
-    fn bus_kind_parse() {
-        assert_eq!(BusKind::parse(Some("streams")), BusKind::Streams);
-        assert_eq!(BusKind::parse(Some(" Streams ")), BusKind::Streams);
-        assert_eq!(BusKind::parse(Some("pubsub")), BusKind::PubSub);
-        assert_eq!(BusKind::parse(Some(" PubSub ")), BusKind::PubSub);
-        // Streams is the default: unset, empty, and unrecognized values.
-        assert_eq!(BusKind::parse(Some("")), BusKind::Streams);
-        assert_eq!(BusKind::parse(Some("nonsense")), BusKind::Streams);
-        assert_eq!(BusKind::parse(None), BusKind::Streams);
-    }
+    use super::stream_id_less_than;
 
     #[test]
     fn stream_id_ordering() {

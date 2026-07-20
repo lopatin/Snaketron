@@ -1169,8 +1169,8 @@ async fn authorize_game_join(
             return Err("This game is unavailable".to_string());
         }
         Ok(Some(cached_game_state)) => {
-            // GameCreated acknowledgement proves that the executor accepted the game, but the
-            // replica can consume its initial snapshot a moment later. A non-terminal Redis
+            // A stored Redis snapshot proves the game was created, but the replica can
+            // consume its initial snapshot a moment later. A non-terminal Redis
             // snapshot identifies that startup window, so wait briefly for the subscribable
             // in-memory state before treating the request as a durable reload.
             match replication_manager.wait_for_game(game_id, 1).await {
@@ -2845,7 +2845,6 @@ async fn process_ws_message(
                 }
                 WSMessage::GameCommand(command_message) => {
                     if let Some(game_id) = game_id {
-                        // Submit command via PubSub
                         let partition_id = game_id % PARTITION_COUNT;
 
                         let event = StreamEvent::GameCommandSubmitted {
@@ -2869,7 +2868,7 @@ async fn process_ws_message(
                                 })
                             }
                             Err(e) => {
-                                error!("Failed to submit command via PubSub: {}", e);
+                                error!("Failed to submit command via the game bus: {}", e);
                                 Ok(ConnectionState::Authenticated {
                                     metadata,
                                     lobby_handle: lobby,

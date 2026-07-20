@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use common::{GameState, GameStatus, GameType, QueueMode};
 use redis::AsyncCommands;
 use server::{
-    game_executor::PARTITION_COUNT, pubsub_manager::PubSubManager, redis_keys::RedisKeys,
+    game_bus::GameBus, game_executor::PARTITION_COUNT, redis_keys::RedisKeys,
     redis_utils::create_connection_manager,
 };
 use tokio::sync::broadcast;
@@ -20,17 +20,17 @@ fn redis_test_url() -> String {
     }
 }
 
-async fn test_pubsub_manager() -> Result<(PubSubManager, redis::aio::ConnectionManager)> {
+async fn test_game_bus() -> Result<(GameBus, redis::aio::ConnectionManager)> {
     let client = redis::Client::open(redis_test_url())
         .context("Redis is required for this integration test; start it with ./test-deps.sh")?;
     let (push_tx, _) = broadcast::channel(32);
-    let redis = create_connection_manager(client, push_tx.clone())
+    let redis = create_connection_manager(client.clone(), push_tx.clone())
         .await
         .context("Redis is required for this integration test; start it with ./test-deps.sh")?;
     let inspection_connection = redis.clone();
-    let manager = PubSubManager::new(redis, push_tx, CancellationToken::new());
+    let bus = GameBus::new(redis, client, CancellationToken::new());
 
-    Ok((manager, inspection_connection))
+    Ok((bus, inspection_connection))
 }
 
 fn unique_game_id() -> u32 {
@@ -59,16 +59,15 @@ fn completed_game_state() -> GameState {
 
 #[tokio::test]
 async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
-    let (mut manager, mut redis) = test_pubsub_manager().await?;
+    let (bus, mut redis) = test_game_bus().await?;
     let game_id = unique_game_id();
     let key = RedisKeys::game_snapshot(game_id);
     let expected = completed_game_state();
 
-    manager
-        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &expected, 0)
+    bus.publish_snapshot(game_id % PARTITION_COUNT, game_id, &expected, 0)
         .await?;
 
-    let actual = manager
+    let actual = bus
         .get_stored_snapshot(game_id)
         .await?
         .context("completed snapshot should be available for reload")?;
@@ -89,15 +88,14 @@ async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
 
 #[tokio::test]
 async fn terminal_snapshot_can_be_cached_before_completion_is_broadcast() -> Result<()> {
-    let (manager, mut redis) = test_pubsub_manager().await?;
+    let (bus, mut redis) = test_game_bus().await?;
     let game_id = unique_game_id();
     let key = RedisKeys::game_snapshot(game_id);
     let expected = completed_game_state();
 
-    manager.store_snapshot(game_id, &expected).await?;
+    bus.store_snapshot(game_id, &expected).await?;
 
-    let mut reader = manager.clone();
-    let actual = reader
+    let actual = bus
         .get_stored_snapshot(game_id)
         .await?
         .context("terminal snapshot should be cached before eviction")?;
@@ -110,23 +108,23 @@ async fn terminal_snapshot_can_be_cached_before_completion_is_broadcast() -> Res
 
 #[tokio::test]
 async fn missing_game_snapshot_returns_none() -> Result<()> {
-    let (mut manager, mut redis) = test_pubsub_manager().await?;
+    let (bus, mut redis) = test_game_bus().await?;
     let game_id = unique_game_id();
     let key = RedisKeys::game_snapshot(game_id);
     let _: usize = redis.del(&key).await?;
 
-    assert!(manager.get_stored_snapshot(game_id).await?.is_none());
+    assert!(bus.get_stored_snapshot(game_id).await?.is_none());
     Ok(())
 }
 
 #[tokio::test]
 async fn malformed_game_snapshot_returns_deserialization_error() -> Result<()> {
-    let (mut manager, mut redis) = test_pubsub_manager().await?;
+    let (bus, mut redis) = test_game_bus().await?;
     let game_id = unique_game_id();
     let key = RedisKeys::game_snapshot(game_id);
     let _: () = redis.set_ex(&key, b"not-json".as_slice(), 30).await?;
 
-    let error = manager
+    let error = bus
         .get_stored_snapshot(game_id)
         .await
         .expect_err("corrupt snapshots must not be treated as valid game state");

@@ -11,7 +11,8 @@ production report into a local failing test.
 
 The authoritative game runs in a server-side executor
 ([game_executor.rs](server/src/game_executor.rs)) that advances a shared
-`GameEngine` by wall clock and publishes every event over Redis pub/sub.
+`GameEngine` by wall clock and publishes every event over the Redis Streams
+game bus ([game_bus.rs](server/src/game_bus.rs)).
 WebSocket servers hold replicas ([replication.rs](server/src/replication.rs))
 that apply those events and forward them to clients. The client runs the same
 engine compiled to WASM: its **committed** state advances only when server
@@ -52,11 +53,15 @@ committed hash + server timestamp. This one small message does three jobs:
 
 The executor stamps every published message with a per-game, strictly
 monotonic sequence number. Every consumer (replica, client engine) checks
-contiguity: a gap means messages were lost (Redis pub/sub is at-most-once) and
-triggers an automatic snapshot resync instead of silent divergence. Duplicates
-and stale messages are skipped instead of double-applied. This replaces the
-expensive "send a full snapshot every few seconds" workaround with resyncs
-that happen only when something was actually lost.
+contiguity: a gap means messages were lost and triggers an automatic snapshot
+resync instead of silent divergence. Duplicates and stale messages are
+skipped instead of double-applied. The Streams bus itself doesn't drop, so
+gaps can only come from the hops past it (broadcast fan-out lag, the
+WebSocket leg) or trim-horizon loss after a long outage — the counters
+should sit at ~0, and this machinery is defense-in-depth rather than
+load-bearing. This replaces the expensive "send a full snapshot every few
+seconds" workaround with resyncs that happen only when something was
+actually lost.
 
 Client-side health lives in `GameEngine::sync_status()` (gap counts, missed
 messages, probe results, `needs_resync`) and is surfaced to the UI via
@@ -146,7 +151,7 @@ logs (server):
 | Signal | Meaning | Healthy |
 |---|---|---|
 | TickHash mismatch rate | real divergence happening in prod | ~0 |
-| stream gap incidents / game | Redis pub/sub or broadcast loss | ~0 |
+| stream gap incidents / game | broadcast/WebSocket-leg loss (the Streams bus itself doesn't drop) | ~0 |
 | resync requests / game | self-healing frequency (masking loss) | < 1 |
 | commands rescheduled (server tick > client tick) | inputs arriving past the lag window | rare |
 | watchdog activations | dead streams noticed by clients | ~0 |
@@ -205,11 +210,13 @@ way to notice it had diverged.**
    server. Locally RTT ≈ 0, so the window never expired — prod-only by
    construction. (Clock-sync error has the same effect via mis-stamped
    command ticks.)
-2. **Cumulative drift needing periodic snapshots** — Redis pub/sub is
-   at-most-once; the broadcast fan-out drops messages when a receiver lags
-   (and one error path ended forwarding entirely, silently); nothing checked
-   `sequence` contiguity, so every lost event became permanent divergence.
-   Periodic snapshots masked the loss instead of detecting it.
+2. **Cumulative drift needing periodic snapshots** — the game bus was Redis
+   pub/sub at the time, which is at-most-once; the broadcast fan-out drops
+   messages when a receiver lags (and one error path ended forwarding
+   entirely, silently); nothing checked `sequence` contiguity, so every lost
+   event became permanent divergence. Periodic snapshots masked the loss
+   instead of detecting it. (The bus has since moved to Redis Streams, which
+   removed the at-most-once hop entirely.)
 3. **Ghost games** — the predicted state free-ran on the local clock with no
    bound and no liveness check, so a dead backend looked like a live game.
 
@@ -250,4 +257,3 @@ every hop; traces make any surviving bug replayable offline.
 | `SNAKETRON_TRACE_DIR` | `./traces` | Where server + uploaded client traces go |
 | `SNAKETRON_TRACE_DISABLE` | unset | `1` disables the server flight recorder |
 | `SNAKETRON_TRACE_MAX_FILES` | `200` | Trace-dir rotation limit |
-| `SNAKETRON_BUS` | `streams` | Game-critical transport: `streams` (default) or `pubsub` fallback (see STREAMS_MIGRATION.md). On `streams`, the gap/resync counters should sit at ~0 — nonzero values there mean a transport bug |

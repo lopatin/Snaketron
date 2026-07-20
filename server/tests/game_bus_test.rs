@@ -1,4 +1,4 @@
-//! Integration tests for the Streams game-bus transport (SNAKETRON_BUS=streams).
+//! Integration tests for the Streams game bus.
 //!
 //! Run against the test-deps Redis (test-deps.sh). Isolation: these tests use
 //! partition ids far outside the live range (game partitions are 0..10) so
@@ -6,14 +6,14 @@
 //! the same Redis.
 //!
 //! The headline test is `paused_consumer_loses_nothing`: the exact scenario —
-//! a subscriber that stops draining for a while — where Pub/Sub drops
-//! messages (broadcast lag / at-most-once) and Streams must not.
+//! a subscriber that stops draining for a while — where the old Pub/Sub
+//! transport dropped messages (broadcast lag / at-most-once) and Streams
+//! must not.
 
 use anyhow::Result;
 use common::{GameEvent, GameEventMessage};
-use server::game_bus::{BusKind, GameBus};
+use server::game_bus::GameBus;
 use server::game_executor::StreamEvent;
-use server::pubsub_manager::PubSubManager;
 use server::redis_keys::RedisKeys;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -35,8 +35,7 @@ async fn streams_bus(token: CancellationToken) -> Result<GameBus> {
     let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(64);
     let redis =
         server::redis_utils::create_connection_manager(client.clone(), pubsub_tx.clone()).await?;
-    let pubsub = PubSubManager::new(redis.clone(), pubsub_tx, token.clone());
-    Ok(GameBus::new(BusKind::Streams, pubsub, redis, client, token))
+    Ok(GameBus::new(redis, client, token))
 }
 
 fn event(game_id: u32, stream_seq: u64) -> GameEventMessage {
@@ -77,7 +76,7 @@ async fn paused_consumer_loses_nothing() -> Result<()> {
         let game_id = partition;
 
         let mut sub = bus.subscribe_to_partition(partition).await?;
-        // Give the reader task a moment to issue its first XREAD ("$").
+        // Give the reader task a moment to issue its first XREAD.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Publish MORE messages than the subscriber channel holds (2000)
@@ -163,8 +162,9 @@ async fn subscription_starts_at_now_not_history() -> Result<()> {
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(3);
 
-        // History that must NOT be delivered: subscriptions anchor on
-        // snapshots (like the pubsub transport), not on stream history.
+        // History that must NOT be delivered: subscriptions start at the
+        // stream tail and rely on snapshots for initial state, not on
+        // replaying stream history.
         for seq in 1..=50u64 {
             bus.publish_event(partition, &event(partition, seq)).await?;
         }
@@ -348,44 +348,35 @@ async fn reader_reconnect_resumes_without_loss_or_duplicates() -> Result<()> {
     .await?
 }
 
-/// Manual A/B benchmark across both transports; ignored in normal runs.
-/// cargo test -p server --test game_bus_test bench_both -- --ignored --nocapture
+/// Manual latency benchmark; ignored in normal runs.
+/// cargo test -p server --test game_bus_test bench_streams -- --ignored --nocapture
 #[tokio::test]
 #[ignore]
-async fn bench_both_transports() -> Result<()> {
-    for kind in [BusKind::PubSub, BusKind::Streams] {
-        let token = CancellationToken::new();
-        let client = redis::Client::open(REDIS_URL)?;
-        let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(5000);
-        let redis =
-            server::redis_utils::create_connection_manager(client.clone(), pubsub_tx.clone())
-                .await?;
-        let pubsub = PubSubManager::new(redis.clone(), pubsub_tx, token.clone());
-        let bus = GameBus::new(kind, pubsub, redis, client, token.clone());
-        let partition = test_partition(6);
+async fn bench_streams() -> Result<()> {
+    let token = CancellationToken::new();
+    let bus = streams_bus(token.clone()).await?;
+    let partition = test_partition(6);
 
-        let mut sub = bus.subscribe_to_partition(partition).await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut sub = bus.subscribe_to_partition(partition).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut latencies_us: Vec<u128> = Vec::new();
-        for round in 0..200u64 {
-            let sent = Instant::now();
-            bus.publish_event(partition, &event(partition, round + 1))
-                .await?;
-            sub.recv_event().await.expect("stream ended");
-            latencies_us.push(sent.elapsed().as_micros());
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        latencies_us.sort_unstable();
-        println!(
-            "{:?}: p50={}us p90={}us p99={}us",
-            kind,
-            latencies_us[latencies_us.len() / 2],
-            latencies_us[latencies_us.len() * 90 / 100],
-            latencies_us[latencies_us.len() * 99 / 100],
-        );
-        token.cancel();
-        cleanup(partition).await;
+    let mut latencies_us: Vec<u128> = Vec::new();
+    for round in 0..200u64 {
+        let sent = Instant::now();
+        bus.publish_event(partition, &event(partition, round + 1))
+            .await?;
+        sub.recv_event().await.expect("stream ended");
+        latencies_us.push(sent.elapsed().as_micros());
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    latencies_us.sort_unstable();
+    println!(
+        "streams: p50={}us p90={}us p99={}us",
+        latencies_us[latencies_us.len() / 2],
+        latencies_us[latencies_us.len() * 90 / 100],
+        latencies_us[latencies_us.len() * 99 / 100],
+    );
+    token.cancel();
+    cleanup(partition).await;
     Ok(())
 }

@@ -45,7 +45,7 @@ pub struct HttpServerState {
     pub redis_url: String,
     /// PubSub manager for loss-tolerant fan-out (chat, lobby, counters)
     pub pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
-    /// Game-critical message bus (transport per SNAKETRON_BUS)
+    /// Game-critical message bus (Redis Streams)
     pub game_bus: Arc<GameBus>,
     /// Matchmaking manager for queue operations
     pub matchmaking_manager:

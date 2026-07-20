@@ -8,14 +8,14 @@
 //! store/scan path the production code uses.
 //!
 //! Isolation note: this test only writes/reads uniquely numbered
-//! game:snapshot:* keys — it publishes nothing on the shared pub/sub
-//! channels, so it cannot interfere with (or be affected by) a dev server
+//! game:snapshot:* keys — it publishes nothing on the shared partition
+//! streams, so it cannot interfere with (or be affected by) a dev server
 //! running against the same Redis.
 
 use anyhow::Result;
 use common::{GameState, GameStatus, GameType, QueueMode};
+use server::game_bus::GameBus;
 use server::game_executor::PARTITION_COUNT;
-use server::pubsub_manager::PubSubManager;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -52,17 +52,18 @@ async fn stored_snapshot_is_discoverable_for_resume() -> Result<()> {
         let redis_client = redis::Client::open(REDIS_URL)?;
         let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(64);
         let mut redis =
-            server::redis_utils::create_connection_manager(redis_client, pubsub_tx.clone()).await?;
+            server::redis_utils::create_connection_manager(redis_client.clone(), pubsub_tx.clone())
+                .await?;
 
         let token = CancellationToken::new();
-        let pubsub = PubSubManager::new(redis.clone(), pubsub_tx, token.clone());
+        let bus = GameBus::new(redis.clone(), redis_client, token.clone());
 
         let partition = 4;
         let game_id = unique_game_id(partition);
         let dead_executor_state = started_state(137);
 
         // The dying executor's last act: the TickHash-cadence snapshot store.
-        pubsub.store_snapshot(game_id, &dead_executor_state).await?;
+        bus.store_snapshot(game_id, &dead_executor_state).await?;
 
         // A takeover executor discovers it through the same scan path
         // run_game_executor uses, with an empty (cold) replica.
@@ -86,7 +87,7 @@ async fn stored_snapshot_is_discoverable_for_resume() -> Result<()> {
         complete_state.status = GameStatus::Complete {
             winning_snake_id: None,
         };
-        pubsub.store_snapshot(complete_id, &complete_state).await?;
+        bus.store_snapshot(complete_id, &complete_state).await?;
 
         let discovered = server::game_executor::load_stored_snapshots(&mut redis).await;
         let resumable =
