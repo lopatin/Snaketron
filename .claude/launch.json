@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-client",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "cd client/web && npx webpack-dev-server --port 3100"],
+      "port": 3100
+    }
+  ]
+}
