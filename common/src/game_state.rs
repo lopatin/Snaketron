@@ -2046,6 +2046,35 @@ mod tests {
         assert_eq!(cmd2.unwrap().tick(), 20);
     }
 
+    /// Two local commands stamped on the same tick (distinct client sequence
+    /// numbers) plus a server confirmation of the first: the tombstone must
+    /// hit only the matching local copy, leaving the second local command in
+    /// the queue.
+    #[test]
+    fn tombstone_hits_only_the_matching_same_tick_local_command() {
+        let mut queue = CommandQueue::new();
+
+        queue.push(create_command_message(10, 1, 1, false)); // local copy A
+        queue.push(create_command_message(10, 1, 2, false)); // local copy B
+
+        // Server confirmation of A (same client id, server id attached).
+        let mut server_a = create_command_message(10, 1, 1, false);
+        server_a.command_id_server = Some(create_command_id(10, 1, 0));
+        queue.push(server_a);
+
+        // Pop order by effective id: the server copy (seq 0) first; local A
+        // is tombstone-skipped; local B must survive.
+        let first = queue.pop(10).expect("server copy");
+        assert!(first.command_id_server.is_some());
+        assert_eq!(first.command_id_client.sequence_number, 1);
+
+        let second = queue.pop(10).expect("local copy B");
+        assert!(second.command_id_server.is_none());
+        assert_eq!(second.command_id_client.sequence_number, 2);
+
+        assert!(queue.pop(10).is_none());
+    }
+
     #[test]
     fn test_command_queue_tombstoning() {
         let mut queue = CommandQueue::new();

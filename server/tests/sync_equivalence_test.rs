@@ -958,6 +958,95 @@ async fn late_command_reschedules() -> Result<()> {
     .await
 }
 
+/// A timely double-tap: without the tick ratchet, both turns are stamped on
+/// the SAME client tick, distinguished only by their client sequence
+/// numbers. Arriving within the committed-lag window, the server schedules
+/// both at that client tick and the shared deferral rule spreads them —
+/// prediction and the authoritative schedule agree, so no divergence at all.
+#[tokio::test]
+async fn same_tick_stamped_double_turn_stays_in_sync() -> Result<()> {
+    fn clockwise(direction: Direction) -> Direction {
+        match direction {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
+
+    with_timeout(async {
+        let cfg = TransportConfig {
+            base_latency_ms: 100,
+            jitter_ms: 0,
+            ..TransportConfig::lossless()
+        };
+        let mut world = SimWorld::new(0xD0B1E, cfg);
+        world.auto_resync = true;
+
+        world.run_for(2_000);
+
+        let travel = world.server.committed_state().arena.snakes[0].direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+        let cmd1 = world.client_send_turn(first_turn);
+        let cmd2 = world.client_send_turn(second_turn);
+
+        // Ratchet-free stamping: same tick, ordered by client sequence.
+        assert_eq!(
+            cmd1.command_id_client.tick, cmd2.command_id_client.tick,
+            "a double-tap within one predicted tick shares the tick stamp"
+        );
+        assert!(
+            cmd2.command_id_client.sequence_number > cmd1.command_id_client.sequence_number,
+            "client sequence numbers must order the pair"
+        );
+
+        world.run_for(1_500);
+
+        // Timely arrival: the server honors the client tick for both — no
+        // rebase — and the deferral rule spreads them at execution time.
+        for cmd in [&cmd1, &cmd2] {
+            let confirmed = world
+                .confirmations
+                .iter()
+                .find(|c| c.command_id_client == cmd.command_id_client)
+                .expect("server confirmed the command");
+            assert_eq!(
+                confirmed
+                    .command_id_server
+                    .as_ref()
+                    .expect("server id")
+                    .tick,
+                cmd.command_id_client.tick,
+                "timely commands must keep their client tick"
+            );
+        }
+
+        let snake = &world.server.committed_state().arena.snakes[0];
+        assert!(snake.is_alive, "the snake must not reverse into itself");
+        assert_eq!(
+            snake.direction, second_turn,
+            "the deferred second turn must have applied"
+        );
+
+        world.run_for(10_000);
+        world.drain_and_probe();
+
+        let status = world.client().sync_status();
+        assert_eq!(
+            status.total_mismatches, 0,
+            "timely double-tap must produce no divergence at all: {status:?}"
+        );
+        assert_eq!(
+            world.client().committed_sync_hash(),
+            world.server.committed_sync_hash(),
+            "client and server must agree"
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// The 180-degree-reversal shape, end to end: a player double-taps a turn
 /// (two 90-degree turns in the same instant) and both commands arrive past
 /// the 500ms committed-lag window, so the server rebases them onto the SAME
