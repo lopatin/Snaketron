@@ -6,8 +6,8 @@ use crate::xp_persistence;
 use anyhow::{Context, Result};
 use common::trace::{TRACE_FORMAT_VERSION, TraceRecord, TraceSide};
 use common::{
-    EXECUTOR_POLL_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
-    GameState, GameStatus, TICK_HASH_INTERVAL_TICKS,
+    EXECUTOR_POLL_INTERVAL_MS, GameCommand, GameCommandMessage, GameEngine, GameEvent,
+    GameEventMessage, GameState, GameStatus, TICK_HASH_INTERVAL_TICKS,
 };
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,47 @@ pub enum StreamEvent {
     },
 }
 
+/// A client-submitted command paired with the authenticated user id of the
+/// WebSocket connection that submitted it (carried by `GameCommandSubmitted`).
+#[derive(Debug)]
+struct SubmittedCommand {
+    user_id: u32,
+    command: GameCommandMessage,
+}
+
+/// Gate between the transport and the engine. Every field of a
+/// `GameCommandMessage` is client-controlled — including the claimed user_id
+/// and the target snake_id — so nothing in it is trusted: a `Turn` must
+/// target the snake the authenticated user owns in `GameState::players`, and
+/// system commands are never accepted from a client connection. The claimed
+/// identity is rewritten to the authenticated one so everything downstream
+/// (command ordering, the spectator check in `schedule_command`, the
+/// broadcast `CommandScheduled` event) operates on the real submitter.
+fn authorize_game_command(
+    state: &GameState,
+    user_id: u32,
+    mut command: GameCommandMessage,
+) -> Result<GameCommandMessage, &'static str> {
+    match command.command {
+        GameCommand::Turn { snake_id, .. } => match state.players.get(&user_id) {
+            None => return Err("user is not a player in this game"),
+            Some(player) if player.snake_id != snake_id => {
+                return Err("snake is not owned by the submitting user");
+            }
+            Some(_) => {}
+        },
+        GameCommand::UpdateStatus { .. } => {
+            return Err("system command submitted over a client connection");
+        }
+    }
+
+    command.command_id_client.user_id = user_id;
+    // The server id is assigned by the engine in process_command; a
+    // client-supplied one is discarded rather than trusted.
+    command.command_id_server = None;
+    Ok(command)
+}
+
 /// Decides when to emit a TickHash heartbeat: every `interval_ticks` committed
 /// ticks, or the equivalent span of wall time when the committed tick is not
 /// advancing (pre-start, completion pending) so it doubles as a liveness
@@ -204,7 +245,7 @@ async fn run_game(
     game_id: u32,
     game_state: GameState,
     bus: Arc<GameBus>,
-    mut command_receiver: mpsc::Receiver<GameCommandMessage>,
+    mut command_receiver: mpsc::Receiver<SubmittedCommand>,
     mut snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
     db: Arc<dyn Database>,
     cancellation_token: CancellationToken,
@@ -346,9 +387,28 @@ async fn run_game(
             }
 
             // Process commands from the channel
-            Some(command) = command_receiver.recv() => {
-                debug!("Processing command for game {}. Command: {:?}",
-                    game_id, command);
+            Some(SubmittedCommand { user_id, command }) = command_receiver.recv() => {
+                debug!("Processing command for game {} from user {}. Command: {:?}",
+                    game_id, user_id, command);
+
+                // Rejected commands never reach the engine, so they are
+                // deliberately not recorded as CmdIn: the trace's command
+                // timeline must contain exactly what the engine executed for
+                // deterministic replay.
+                let command = match authorize_game_command(engine.get_committed_state(), user_id, command) {
+                    Ok(command) => command,
+                    Err(reason) => {
+                        warn!(
+                            "Dropping unauthorized command for game {} from user {}: {}",
+                            game_id, user_id, reason
+                        );
+                        recorder.note(format!(
+                            "dropped unauthorized command from user {}: {}",
+                            user_id, reason
+                        ));
+                        continue;
+                    }
+                };
 
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 recorder.record(&TraceRecord::CmdIn {
@@ -747,7 +807,7 @@ pub async fn run_game_executor(
     let mut game_channels: HashMap<
         u32,
         (
-            mpsc::Sender<GameCommandMessage>,
+            mpsc::Sender<SubmittedCommand>,
             mpsc::Sender<SnapshotRequest>,
         ),
     > = HashMap::new();
@@ -760,7 +820,7 @@ pub async fn run_game_executor(
                           game_channels: &mut HashMap<
         u32,
         (
-            mpsc::Sender<GameCommandMessage>,
+            mpsc::Sender<SubmittedCommand>,
             mpsc::Sender<SnapshotRequest>,
         ),
     >| {
@@ -913,10 +973,12 @@ pub async fn run_game_executor(
                             info!("Game {} completed", game_id);
                         }
                     }
-                    StreamEvent::GameCommandSubmitted { game_id, user_id: _, command } => {
-                        // Route command to the appropriate game
+                    StreamEvent::GameCommandSubmitted { game_id, user_id, command } => {
+                        // Route command to the appropriate game, keeping the
+                        // authenticated user_id attached so the game loop can
+                        // validate ownership before scheduling.
                         if let Some((cmd_tx, _)) = game_channels.get(&game_id) {
-                            if let Err(e) = cmd_tx.send(command).await {
+                            if let Err(e) = cmd_tx.send(SubmittedCommand { user_id, command }).await {
                                 warn!("Failed to send command to game {}: {}", game_id, e);
                                 // The game might have ended, remove from channels
                                 game_channels.remove(&game_id);
@@ -935,8 +997,11 @@ pub async fn run_game_executor(
 
 #[cfg(test)]
 mod tests {
-    use super::{PARTITION_COUNT, TickHashCadence, select_resumable_games};
-    use common::{GameState, GameStatus, GameType, QueueMode};
+    use super::{PARTITION_COUNT, TickHashCadence, authorize_game_command, select_resumable_games};
+    use common::{
+        CommandId, Direction, GameCommand, GameCommandMessage, GameState, GameStatus, GameType,
+        QueueMode,
+    };
 
     fn state(status: GameStatus, tick: u32) -> GameState {
         let mut s = GameState::new(
@@ -1044,5 +1109,114 @@ mod tests {
         assert!(!cadence.due(19, 1499));
         assert!(cadence.due(20, 600));
         assert!(cadence.due(19, 1500));
+    }
+
+    const USER_A: u32 = 11;
+    const USER_B: u32 = 22;
+
+    /// Two-player state; returns (state, snake_of_user_a, snake_of_user_b).
+    fn two_player_state() -> (GameState, u32, u32) {
+        let mut s = GameState::new(
+            30,
+            30,
+            GameType::FreeForAll { max_players: 4 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        let snake_a = s.add_player(USER_A, None).unwrap().snake_id;
+        let snake_b = s.add_player(USER_B, None).unwrap().snake_id;
+        (s, snake_a, snake_b)
+    }
+
+    fn turn_command(claimed_user_id: u32, snake_id: u32) -> GameCommandMessage {
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 5,
+                user_id: claimed_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn {
+                snake_id,
+                direction: Direction::Up,
+            },
+        }
+    }
+
+    #[test]
+    fn turn_for_unowned_snake_is_rejected() {
+        let (state, _snake_a, snake_b) = two_player_state();
+        // USER_A's connection targets USER_B's snake.
+        let result = authorize_game_command(&state, USER_A, turn_command(USER_A, snake_b));
+        assert!(result.is_err(), "turning another player's snake must fail");
+    }
+
+    #[test]
+    fn spoofed_user_id_cannot_drive_another_players_snake() {
+        let (state, _snake_a, snake_b) = two_player_state();
+        // USER_A's connection claims to be USER_B and targets USER_B's snake:
+        // the claimed identity is client-controlled, so ownership must be
+        // checked against the authenticated identity.
+        let result = authorize_game_command(&state, USER_A, turn_command(USER_B, snake_b));
+        assert!(result.is_err(), "identity spoofing must not grant control");
+    }
+
+    #[test]
+    fn turn_for_own_snake_is_authorized_with_authenticated_identity() {
+        let (state, snake_a, _snake_b) = two_player_state();
+        // Claimed identity (USER_B) differs from the authenticated one; the
+        // authorized command must carry the authenticated identity.
+        let mut command = turn_command(USER_B, snake_a);
+        command.command_id_server = Some(CommandId {
+            tick: 9999,
+            user_id: USER_B,
+            sequence_number: 7,
+        });
+
+        let authorized = authorize_game_command(&state, USER_A, command).unwrap();
+        assert_eq!(authorized.command_id_client.user_id, USER_A);
+        assert_eq!(
+            authorized.command_id_server, None,
+            "a client-supplied server command id must be discarded"
+        );
+        assert_eq!(
+            authorized.command,
+            GameCommand::Turn {
+                snake_id: snake_a,
+                direction: Direction::Up,
+            }
+        );
+    }
+
+    #[test]
+    fn turn_from_non_player_is_rejected() {
+        let (state, snake_a, _snake_b) = two_player_state();
+        let spectator = 99;
+        let result = authorize_game_command(&state, spectator, turn_command(spectator, snake_a));
+        assert!(result.is_err(), "spectators must not drive snakes");
+    }
+
+    #[test]
+    fn update_status_from_client_is_rejected() {
+        let (state, _snake_a, _snake_b) = two_player_state();
+        let command = GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: USER_A,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::UpdateStatus {
+                status: GameStatus::Complete {
+                    winning_snake_id: None,
+                },
+            },
+        };
+        let result = authorize_game_command(&state, USER_A, command);
+        assert!(
+            result.is_err(),
+            "system commands must never be accepted from clients"
+        );
     }
 }

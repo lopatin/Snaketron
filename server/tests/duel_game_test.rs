@@ -1,10 +1,16 @@
 mod common;
 
 use crate::common::{TestClient, TestEnvironment};
-use ::common::{GameEvent, GameStatus, GameType, TeamId};
+use ::common::{
+    CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameStatus, GameType, TeamId,
+};
 use anyhow::Result;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
+
+// TestEnvironment sets process-global env vars, so tests in this binary must
+// not run concurrently.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait for a JoinGame message, skipping unrelated messages (e.g. UserCountUpdate).
 async fn wait_for_join_game(client: &mut TestClient, label: &str) -> Result<u32> {
@@ -45,6 +51,8 @@ async fn wait_for_snapshot(client: &mut TestClient, label: &str) -> Result<WSMes
 
 #[tokio::test]
 async fn test_duel_game() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -325,6 +333,193 @@ async fn test_duel_game() -> Result<()> {
         }
         _ => panic!("Expected GameEvent messages, got {:?} and {:?}", msg1, msg2),
     };
+
+    env.shutdown().await?;
+    Ok(())
+}
+
+/// A Turn command targeting another player's snake must be ignored by the
+/// executor, even when the attacker also spoofs the victim's user_id in the
+/// client command id. The victim's own command (sent second, in the opposite
+/// direction) is the positive control proving the command pipeline is live.
+#[tokio::test]
+async fn test_turn_for_unowned_snake_is_ignored() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let redis_client = redis::Client::open("redis://localhost:6379/1")?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut env = TestEnvironment::new("test_turn_for_unowned_snake_is_ignored").await?;
+    let (_, _server_id) = env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+
+    let mut attacker = TestClient::connect(&server_addr).await?;
+    let mut victim = TestClient::connect(&server_addr).await?;
+
+    let attacker_user_id = env.user_ids()[0] as u32;
+    let victim_user_id = env.user_ids()[1] as u32;
+
+    attacker.authenticate(env.user_ids()[0]).await?;
+    victim.authenticate(env.user_ids()[1]).await?;
+
+    attacker
+        .send_message(WSMessage::QueueForMatch {
+            game_type: GameType::TeamMatch { per_team: 1 },
+            queue_mode: ::common::QueueMode::Quickmatch,
+        })
+        .await?;
+    victim
+        .send_message(WSMessage::QueueForMatch {
+            game_type: GameType::TeamMatch { per_team: 1 },
+            queue_mode: ::common::QueueMode::Quickmatch,
+        })
+        .await?;
+
+    let join_id1 = wait_for_join_game(&mut attacker, "Attacker").await?;
+    let join_id2 = wait_for_join_game(&mut victim, "Victim").await?;
+    assert_eq!(join_id1, join_id2, "Both clients should join the same game");
+    let game_id = join_id1;
+
+    attacker.join_game(game_id).await?;
+    victim.join_game(game_id).await?;
+
+    let snapshot_msg = wait_for_snapshot(&mut attacker, "Attacker").await?;
+    wait_for_snapshot(&mut victim, "Victim").await?;
+
+    let victim_snake_id = match &snapshot_msg {
+        WSMessage::GameEvent(event) => match &event.event {
+            GameEvent::Snapshot { game_state } => {
+                game_state
+                    .players
+                    .get(&victim_user_id)
+                    .expect("Victim should have a snake")
+                    .snake_id
+            }
+            other => panic!("Expected Snapshot event, got {:?}", other),
+        },
+        other => panic!("Expected GameEvent message, got {:?}", other),
+    };
+
+    // Wait until the countdown is over and the game is actually ticking, so
+    // both commands below execute promptly (and long before either snake can
+    // reach a wall — duel snakes spawn facing the length of the arena).
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let WSMessage::GameEvent(event) = attacker.receive_message().await?
+                && event.tick >= 1
+            {
+                break Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    // The attack: sent from the attacker's connection, targeting the victim's
+    // snake AND claiming the victim's user_id. Duel snakes face Left/Right,
+    // so Up and Down are both legal turns.
+    attacker
+        .send_message(WSMessage::GameCommand(GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: victim_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn {
+                snake_id: victim_snake_id,
+                direction: Direction::Up,
+            },
+        }))
+        .await?;
+
+    // Positive control, sent after the attack: the victim legitimately turns
+    // its own snake the other way.
+    victim
+        .send_message(WSMessage::GameCommand(GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: victim_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn {
+                snake_id: victim_snake_id,
+                direction: Direction::Down,
+            },
+        }))
+        .await?;
+
+    // The forged command was submitted first, so if the executor accepted it,
+    // its CommandScheduled { ..Up } would be published before the legitimate
+    // command's. Scan until the legitimate turn is executed, then keep
+    // scanning briefly for stragglers.
+    let mut legit_turn_executed = false;
+    let forbidden = |event: &GameEvent| match event {
+        GameEvent::SnakeTurned {
+            snake_id,
+            direction,
+        } => *snake_id == victim_snake_id && *direction == Direction::Up,
+        GameEvent::CommandScheduled { command_message } => {
+            command_message.command
+                == GameCommand::Turn {
+                    snake_id: victim_snake_id,
+                    direction: Direction::Up,
+                }
+        }
+        _ => false,
+    };
+
+    timeout(Duration::from_secs(10), async {
+        while !legit_turn_executed {
+            if let WSMessage::GameEvent(event) = attacker.receive_message().await? {
+                assert!(
+                    !forbidden(&event.event),
+                    "forged turn for another player's snake reached the engine: {:?}",
+                    event.event
+                );
+                if let GameEvent::SnakeTurned {
+                    snake_id,
+                    direction,
+                } = &event.event
+                    && *snake_id == victim_snake_id
+                    && *direction == Direction::Down
+                {
+                    legit_turn_executed = true;
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+
+    // Tail scan: nothing stemming from the forged command may show up late.
+    let tail_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < tail_deadline {
+        match timeout(Duration::from_millis(100), attacker.receive_message()).await {
+            Ok(Ok(WSMessage::GameEvent(event))) => {
+                assert!(
+                    !forbidden(&event.event),
+                    "forged turn surfaced after the legitimate one: {:?}",
+                    event.event
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {} // no message within 100ms; keep scanning until the deadline
+        }
+    }
+
+    println!(
+        "✅ Forged turn (attacker user {} -> snake {}) was ignored; legitimate turn executed",
+        attacker_user_id, victim_snake_id
+    );
 
     env.shutdown().await?;
     Ok(())
