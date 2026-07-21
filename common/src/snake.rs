@@ -62,6 +62,32 @@ impl Snake {
         self.body.last().context("Snake has no tail")
     }
 
+    /// The direction the snake actually traveled on its last movement step,
+    /// derived from the head and the point behind it. Unlike `direction`,
+    /// this cannot be flipped by a turn command that hasn't been stepped yet,
+    /// so it is the reference for 180-degree-turn validation when several
+    /// commands execute on one tick. Falls back to `direction` for bodies
+    /// that have no extent (e.g. a snake placed but not yet positioned).
+    pub fn travel_direction(&self) -> Direction {
+        if self.body.len() >= 2 {
+            let head = self.body[0];
+            let neck = self.body[1];
+            if head.x > neck.x {
+                return Direction::Right;
+            }
+            if head.x < neck.x {
+                return Direction::Left;
+            }
+            if head.y > neck.y {
+                return Direction::Down;
+            }
+            if head.y < neck.y {
+                return Direction::Up;
+            }
+        }
+        self.direction
+    }
+
     pub fn step_forward(&mut self) {
         if !self.is_alive || self.body.len() < 2 {
             return;
@@ -154,5 +180,87 @@ impl Snake {
             length += distance;
         }
         length + 1 // Add 1 for the head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snake_with_body(body: Vec<Position>, direction: Direction) -> Snake {
+        Snake {
+            body,
+            direction,
+            is_alive: true,
+            food: 0,
+            team_id: None,
+        }
+    }
+
+    /// Pins `travel_direction` to the engine's coordinate system, where y
+    /// grows downward: `step_forward` maps Up to y-1 and Down to y+1, so a
+    /// head with a LARGER y than its neck got there by moving Down.
+    #[test]
+    fn travel_direction_matches_step_forward_convention() {
+        for direction in [
+            Direction::Up,
+            Direction::Down,
+            Direction::Left,
+            Direction::Right,
+        ] {
+            // A straight snake facing `direction`, then stepped once: its
+            // geometry must report the direction it just moved in.
+            let mut snake = snake_with_body(
+                vec![Position { x: 10, y: 10 }, Position { x: 7, y: 10 }],
+                Direction::Right,
+            );
+            snake.step_forward(); // establish geometry along +x
+            snake.direction = direction;
+            // Turning up/down from horizontal travel is a legal 90-degree
+            // turn; stepping commits the new direction into the geometry.
+            if matches!(direction, Direction::Up | Direction::Down) {
+                snake.step_forward();
+            }
+            snake.direction = Direction::Left; // decoy: geometry must win
+            if matches!(direction, Direction::Up | Direction::Down) {
+                assert_eq!(
+                    snake.travel_direction(),
+                    direction,
+                    "vertical travel {direction:?} misreported"
+                );
+            }
+        }
+
+        // Explicit fixtures for all four axes.
+        let up = snake_with_body(
+            vec![Position { x: 5, y: 3 }, Position { x: 5, y: 6 }],
+            Direction::Left,
+        );
+        assert_eq!(up.travel_direction(), Direction::Up);
+
+        let down = snake_with_body(
+            vec![Position { x: 5, y: 6 }, Position { x: 5, y: 3 }],
+            Direction::Left,
+        );
+        assert_eq!(down.travel_direction(), Direction::Down);
+
+        let left = snake_with_body(
+            vec![Position { x: 2, y: 5 }, Position { x: 6, y: 5 }],
+            Direction::Up,
+        );
+        assert_eq!(left.travel_direction(), Direction::Left);
+
+        let right = snake_with_body(
+            vec![Position { x: 6, y: 5 }, Position { x: 2, y: 5 }],
+            Direction::Up,
+        );
+        assert_eq!(right.travel_direction(), Direction::Right);
+
+        // Degenerate body (no extent): falls back to `direction`.
+        let degenerate = snake_with_body(
+            vec![Position { x: 0, y: 0 }, Position { x: 0, y: 0 }],
+            Direction::Down,
+        );
+        assert_eq!(degenerate.travel_direction(), Direction::Down);
     }
 }

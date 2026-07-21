@@ -50,7 +50,11 @@ pub struct GameEngine {
     committed_state_lag_ms: u32,
     local_player_id: Option<u32>,
     command_counter: u32,
-    last_command_tick: Option<u32>,
+    /// Monotonic sequence for locally-issued commands. Makes every
+    /// `command_id_client` unique (tombstoning is keyed by it) and orders
+    /// same-tick local commands; the engine's one-turn-per-snake-per-tick
+    /// deferral turns that order into tick spacing at execution time.
+    local_command_seq: u32,
     sync_status: SyncStatus,
 }
 
@@ -78,7 +82,7 @@ impl GameEngine {
             committed_state_lag_ms: 500,
             local_player_id: None,
             command_counter: 0,
-            last_command_tick: None,
+            local_command_seq: 0,
             sync_status: SyncStatus::default(),
         }
     }
@@ -130,7 +134,7 @@ impl GameEngine {
             committed_state_lag_ms: 500,
             local_player_id: None,
             command_counter: 0,
-            last_command_tick: None,
+            local_command_seq: 0,
             sync_status: SyncStatus::default(),
         }
     }
@@ -147,7 +151,7 @@ impl GameEngine {
             committed_state_lag_ms: 500,
             local_player_id: None,
             command_counter: 0,
-            last_command_tick: None,
+            local_command_seq: 0,
             sync_status: SyncStatus::default(),
         }
     }
@@ -170,36 +174,26 @@ impl GameEngine {
             return Err(anyhow::anyhow!("Local player ID not set"));
         };
 
-        let current_predicted_tick = self
+        let predicted_tick = self
             .predicted_state
             .as_ref()
             .map(|s| s.current_tick())
             .unwrap_or(0);
-        let mut predicted_tick = current_predicted_tick;
 
-        // Ensure the tick is higher than the last command sent, but never let
-        // the ratchet run away from the present: if a clock spike once pushed
-        // last_command_tick far into the future, an unbounded ratchet would
-        // schedule every subsequent command at that far-future tick — the
-        // snake would simply stop responding. Rapid inputs may legitimately
-        // queue a few ticks ahead; beyond that margin the ratchet resets.
-        const MAX_COMMAND_AHEAD_TICKS: u32 = 8;
-        if let Some(last_tick) = self.last_command_tick
-            && predicted_tick <= last_tick
-            && last_tick < current_predicted_tick + MAX_COMMAND_AHEAD_TICKS
-        {
-            predicted_tick = last_tick + 1;
-        }
-
-        // Update the last command tick
-        self.last_command_tick = Some(predicted_tick);
-
-        // Create command with client ID
+        // Stamp the command at the current predicted tick with a monotonic
+        // local sequence number. Rapid inputs may share a tick: the sequence
+        // keeps their ids unique and their order well-defined, and the
+        // engine's one-turn-per-snake-per-tick deferral spreads them across
+        // ticks at execution time — the same rule the server applies, so
+        // prediction and the confirmed schedule stay aligned. (This replaced
+        // a stateful tick ratchet whose `last_command_tick` a clock spike
+        // could poison.)
+        self.local_command_seq += 1;
         let command_message = GameCommandMessage {
             command_id_client: CommandId {
                 tick: predicted_tick,
                 user_id: player_id,
-                sequence_number: 0, // Sequence number no longer needed
+                sequence_number: self.local_command_seq,
             },
             command_id_server: None,
             command,
@@ -490,5 +484,187 @@ impl GameEngine {
     /// every frame while the snapshot is in flight.
     pub fn clear_needs_resync(&mut self) {
         self.sync_status.needs_resync = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Direction;
+
+    fn clockwise(direction: Direction) -> Direction {
+        match direction {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
+
+    /// Local commands are stamped at the current predicted tick with a
+    /// monotonic sequence number: rapid inputs share a tick but never share
+    /// an id (tombstoning is keyed by the client id) and stay strictly
+    /// ordered. This replaced the stateful tick ratchet.
+    #[test]
+    fn local_commands_share_tick_with_unique_sequence_numbers() {
+        let mut state = GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.add_player(1, None).expect("add player");
+        let snake_id = state.players[&1].snake_id;
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        let mut engine = GameEngine::new_from_state(1, state);
+        engine.set_local_player_id(1);
+
+        // Advance prediction so commands are stamped mid-game.
+        engine
+            .rebuild_predicted_state(tick_ms * 5)
+            .expect("rebuild");
+        let predicted_tick = engine.get_predicted_tick();
+        assert!(predicted_tick > 0, "prediction should have advanced");
+
+        let cmd1 = engine
+            .process_local_command(GameCommand::Turn {
+                snake_id,
+                direction: Direction::Up,
+            })
+            .expect("command 1");
+        let cmd2 = engine
+            .process_local_command(GameCommand::Turn {
+                snake_id,
+                direction: Direction::Down,
+            })
+            .expect("command 2");
+
+        assert_eq!(cmd1.command_id_client.tick, predicted_tick);
+        assert_eq!(cmd2.command_id_client.tick, predicted_tick);
+        assert!(
+            cmd2.command_id_client.sequence_number > cmd1.command_id_client.sequence_number,
+            "local sequence must be strictly increasing"
+        );
+        assert_ne!(
+            cmd1.command_id_client, cmd2.command_id_client,
+            "same-tick local commands must have distinct ids"
+        );
+    }
+
+    /// The client-path double-tap: two turns issued within one predicted
+    /// tick. Both are stamped on the same tick, and the prediction replays
+    /// them through the shared deferral rule — the maneuver plays out as two
+    /// steps, never a reversal.
+    #[test]
+    fn local_double_tap_predicts_two_step_maneuver() {
+        let mut state = GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.add_player(1, None).expect("add player");
+        let snake_id = state.players[&1].snake_id;
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        let mut engine = GameEngine::new_from_state(1, state);
+        engine.set_local_player_id(1);
+
+        engine
+            .rebuild_predicted_state(tick_ms * 5)
+            .expect("rebuild");
+        let snake = &engine.predicted_state().expect("predicted").arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let length_before = snake.length();
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+
+        for direction in [first_turn, second_turn] {
+            engine
+                .process_local_command(GameCommand::Turn {
+                    snake_id,
+                    direction,
+                })
+                .expect("local command");
+        }
+
+        engine
+            .rebuild_predicted_state(tick_ms * 10)
+            .expect("rebuild");
+
+        let snake = &engine.predicted_state().expect("predicted").arena.snakes[snake_id as usize];
+        assert!(
+            snake.is_alive,
+            "predicted snake must not reverse into itself"
+        );
+        assert_eq!(
+            snake.direction, second_turn,
+            "prediction must play the double-tap as a two-step maneuver"
+        );
+        assert_eq!(snake.length(), length_before);
+    }
+
+    /// The prod path of the same-tick double-turn bug: two quick inputs are
+    /// stamped with client ticks the committed state has already passed (they
+    /// arrived later than the committed-lag window), so `process_command`
+    /// rebases both onto the same tick via `max(client_tick, current_tick)`.
+    /// The engine must not execute both before one movement step: the second
+    /// turn is deferred one tick, so the player's two-step maneuver completes
+    /// without ever reversing the snake.
+    #[test]
+    fn rebased_turns_on_same_tick_defer_instead_of_reversing() {
+        let mut state = GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.add_player(1, None).expect("add player");
+        let snake_id = state.players[&1].snake_id;
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        let mut engine = GameEngine::new_from_state(1, state);
+
+        // Advance the committed state past a few ticks (run_until lags the
+        // wall-clock target by the 500 ms committed-lag window).
+        engine.run_until(tick_ms * 10).expect("run_until");
+        let committed_tick = engine.current_tick();
+        assert!(committed_tick >= 2, "committed state should have advanced");
+
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+        let length_before = snake.length();
+
+        // Client ticks 1 and 2 are already in the committed past: both
+        // commands get rebased onto `committed_tick`.
+        for (client_tick, direction) in [(1, first_turn), (2, second_turn)] {
+            let scheduled = engine
+                .process_command(GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: client_tick,
+                        user_id: 1,
+                        sequence_number: 0,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::Turn {
+                        snake_id,
+                        direction,
+                    },
+                })
+                .expect("process_command");
+            // The premise of this test: rebasing collapses both commands
+            // onto the same tick. If scheduling ever changes to spread
+            // them out, this test is no longer exercising the deferral.
+            assert_eq!(
+                scheduled.command_id_server.expect("server id").tick,
+                committed_tick,
+                "rebasing must collapse the command onto the current tick"
+            );
+        }
+
+        // Advance a few more ticks so the rebased pair executes (first turn
+        // at `committed_tick`, deferred second turn one tick later).
+        engine.run_until(tick_ms * 13).expect("run_until");
+        assert!(engine.current_tick() > committed_tick + 1);
+
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(
+            snake.is_alive,
+            "snake must survive two turns rebased onto one tick"
+        );
+        assert_eq!(
+            snake.direction, second_turn,
+            "the deferred second turn must apply on the following tick"
+        );
+        assert_eq!(
+            snake.length(),
+            length_before,
+            "the maneuver must not corrupt the body geometry"
+        );
     }
 }

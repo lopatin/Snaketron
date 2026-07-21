@@ -179,7 +179,7 @@ harness lock each one in:
 | No loss detection anywhere (engine `sequence` was duplicated/fabricated and unusable) | Executor-assigned `stream_seq` + gap detection at replica and client + auto-resync |
 | Ghost games: prediction free-ran on wall clock forever; silent forward-loop exits; DB-fallback join with no live feed | Bounded prediction cap (engine), client liveness watchdog + reconnect overlay, loud logging + final snapshots on dead feeds |
 | `clockSync.reset()` on every WS close snapped the time base to zero drift until 3 new Pongs | `reset()` carries the last drift estimate forward ([clockSync.ts](client/web/utils/clockSync.ts)) |
-| One clock spike poisoned `last_command_tick` forever — all later commands scheduled in the far future (snake stops responding) | Ratchet bounded to predicted + 8 ticks ([game_engine.rs](common/src/game_engine.rs)) |
+| One clock spike poisoned `last_command_tick` forever — all later commands scheduled in the far future (snake stops responding) | First mitigated by bounding the ratchet to predicted + 8 ticks; the ratchet was later removed entirely: local commands are stamped at the current predicted tick with a monotonic client sequence number, and the engine's one-turn-per-snake-per-tick deferral derives the spacing deterministically on every replica ([game_engine.rs](common/src/game_engine.rs), [game_state.rs](common/src/game_state.rs)) |
 | `HashSet` iteration order made multi-death respawn processing nondeterministic across native/WASM | Deaths processed in sorted order ([game_state.rs](common/src/game_state.rs)) |
 | Redis PING timeout `?`-exited the cluster singleton without stopping the service — zombie executor + split-brain duplicate games | Timeout takes the step-down path ([cluster_singleton.rs](server/src/cluster_singleton.rs)) |
 | The web UI delivered every WS game event to the engine through a single-slot React state (`lastGameEvent`); React's last-write-wins batching silently dropped events whenever two frames landed in one commit. A crash tick is exactly such a burst (`SnakeDied` + `SnakeRespawned` + score updates as adjacent frames): with `SnakeRespawned` dropped, the delivered `SnakeDied` re-kills the snake the client's committed catch-up had already respawned locally, and nothing revives it until the stream-gap snapshot resync — the "enemy vanishes on crash, reappears mid-screen seconds later" report. Per-event full-state `console.log` serialization amplified the trigger by stalling the main thread | Game events now flow through a lossless ref-based FIFO drained strictly in order ([useGameWebSocket.ts](client/web/hooks/useGameWebSocket.ts), [GameArena.tsx](client/web/components/GameArena.tsx)); the state-serializing debug logging is gone ([useGameEngine.ts](client/web/hooks/useGameEngine.ts)); the failure shape (respawn lost, death delivered) is frozen in `lost_enemy_respawn_is_detected_and_healed_by_resync` ([sync_equivalence_test.rs](server/tests/sync_equivalence_test.rs)) |
@@ -229,8 +229,14 @@ Why tests never caught it:
   (Since repaired: all pass again, and CI runs `cargo test --all --no-run`
   so a test binary can never silently rot out of coverage again. Note:
   running these against a Redis shared with a live dev server causes
-  cross-talk — pub/sub channels are global across Redis DBs — so stop the
-  dev `snaketron-server` container before running them.)
+  cross-talk — the dev server registers in the shared service registry and
+  cluster singletons, so it literally forms a cluster with the test
+  processes: matchmaking can route test games to it and its executor can
+  claim test partitions. Symptoms: join snapshots stuck at `Stopped`,
+  matchmaking tests hitting their 30s timeouts — persisting for a short
+  while after shutdown until its heartbeat expires. Stop any local
+  `snaketron-server` (container or `cargo run`) before running these
+  binaries.)
 - All integration tests ran over **perfect in-memory transports** — the
   lossy/laggy paths (Redis reconnects, broadcast lag, ALB idle timeouts)
   never executed in CI.
