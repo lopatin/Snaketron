@@ -40,10 +40,12 @@ module.exports = {
   },
   mode: isProduction ? "production" : "development",
   plugins: [
-    new CopyWebpackPlugin([
-      'SnaketronLogo.png',
-      { from: 'public/images', to: 'images' }
-    ]),
+    new CopyWebpackPlugin({
+      patterns: [
+        'SnaketronLogo.png',
+        { from: 'public/images', to: 'images' }
+      ]
+    }),
     new HtmlWebpackPlugin({
       template: path.resolve(__dirname, 'index.html'),
       filename: 'index.html',
