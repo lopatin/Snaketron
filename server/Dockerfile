@@ -20,6 +20,7 @@ COPY server ./server
 COPY client ./client
 COPY terminal ./terminal
 COPY bot ./bot
+COPY loadtest ./loadtest
 
 # Build the server
 RUN cargo build --release --bin server
