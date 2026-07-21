@@ -16,6 +16,23 @@ use models::*;
 /// Redis loss safe while old nodes are still present.
 pub const DURABLE_GAME_ID_FLOOR: i32 = 1_000_000_000;
 
+/// How old a server heartbeat may be before that server no longer counts as
+/// alive. Shared by every consumer (region cache, load balancing, ws-url
+/// lookup) so a region is never advertised while its servers are considered
+/// ineligible, or vice versa.
+pub const SERVER_HEARTBEAT_FRESHNESS_SECONDS: i64 = 60;
+
+/// The metadata a server registers under; heartbeats re-assert it so a
+/// registration deleted out from under a live server (TTL reaper, manual
+/// cleanup) is transparently recreated on the next heartbeat.
+#[derive(Debug, Clone)]
+pub struct ServerRegistration {
+    pub grpc_address: String,
+    pub region: String,
+    pub origin: String,
+    pub ws_url: String,
+}
+
 // Several DB methods take a full column set as separate parameters by design.
 #[allow(clippy::too_many_arguments)]
 #[async_trait]
@@ -28,7 +45,11 @@ pub trait Database: Send + Sync {
         origin: &str,
         ws_url: &str,
     ) -> Result<i32>;
-    async fn update_server_heartbeat(&self, server_id: i32) -> Result<()>;
+    async fn update_server_heartbeat(
+        &self,
+        server_id: i32,
+        registration: &ServerRegistration,
+    ) -> Result<()>;
     async fn update_server_status(&self, server_id: i32, status: &str) -> Result<()>;
     async fn get_server_for_load_balancing(&self, region: &str) -> Result<i32>;
     async fn get_active_servers(&self, region: &str) -> Result<Vec<(i32, String)>>;
