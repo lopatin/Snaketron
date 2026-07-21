@@ -23,9 +23,13 @@ async fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
 
+    // Only emit ANSI color codes when stdout is a terminal; log collectors
+    // like CloudWatch render them as literal escape sequences.
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(use_ansi))
         .init();
 
     // Database setup - now using DynamoDB
