@@ -55,6 +55,17 @@ export const useGameEngine = ({
   const watchdogBackoffMsRef = useRef(WATCHDOG_BACKOFF_INITIAL_MS);
   const watchdogNextSendAtRef = useRef(0);
   const prevSyncStatusRef = useRef<any | null>(null);
+  // Byte-identity caches for the engine's per-frame JSON exports. The engine
+  // only changes on tick boundaries and server events, so most animation
+  // frames serialize to the exact same string; skipping parse + setState on
+  // those frames keeps React updates at tick cadence (~10/s) instead of rAF
+  // cadence (~60/s).
+  const lastGameStateJsonRef = useRef<string | null>(null);
+  const lastCommittedStateJsonRef = useRef<string | null>(null);
+  const lastSyncStatusJsonRef = useRef<string | null>(null);
+  // Latest parsed committed state, for per-frame logic (liveness watchdog)
+  // that must not wait for the next JSON change.
+  const parsedCommittedStateRef = useRef<GameState | null>(null);
 
   // console.log('useGameEngine called (initial state:', !!initialState);
 
@@ -98,6 +109,10 @@ export const useGameEngine = ({
     watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
     watchdogNextSendAtRef.current = 0;
     prevSyncStatusRef.current = null;
+    lastGameStateJsonRef.current = null;
+    lastCommittedStateJsonRef.current = null;
+    lastSyncStatusJsonRef.current = null;
+    parsedCommittedStateRef.current = null;
   }, [gameId]);
 
   const runGameLoop = useCallback(() => {
@@ -116,56 +131,75 @@ export const useGameEngine = ({
       // events into one React commit.
       engineRef.current.rebuildPredictedState(now);
 
-      // Update game state
+      // Update game state. Parse + setState only when the serialization
+      // actually changed: a fresh JSON.parse every frame would hand React a
+      // new object identity at rAF rate and re-render the arena tree (and
+      // re-run every gameState-keyed effect) even though nothing moved.
       const stateJson = engineRef.current.getGameStateJson();
-      const newState = JSON.parse(stateJson);
-      setGameState(newState);
+      if (stateJson !== lastGameStateJsonRef.current) {
+        lastGameStateJsonRef.current = stateJson;
+        setGameState(JSON.parse(stateJson));
+      }
 
       // Check if COMMITTED state is complete (for game over UI)
       const committedStateJson = engineRef.current.getCommittedStateJson();
-      const committedState = JSON.parse(committedStateJson);
-      setCommittedState(committedState);
-      if (typeof committedState.status === 'object' &&
-          committedState.status !== null &&
-          'Complete' in committedState.status) {
-        if (!isGameComplete) {
-          console.log('Committed state is complete, triggering game over UI');
-          setIsGameComplete(true);
+      if (committedStateJson !== lastCommittedStateJsonRef.current) {
+        lastCommittedStateJsonRef.current = committedStateJson;
+        const committedState = JSON.parse(committedStateJson);
+        parsedCommittedStateRef.current = committedState;
+        setCommittedState(committedState);
+        if (typeof committedState.status === 'object' &&
+            committedState.status !== null &&
+            'Complete' in committedState.status) {
+          if (!isGameComplete) {
+            console.log('Committed state is complete, triggering game over UI');
+            setIsGameComplete(true);
+          }
         }
       }
 
       // Sync health: watch the engine's stream/hash accounting for gaps and
       // divergence, and drive the resync + liveness watchdog paths.
       try {
-        const sync = JSON.parse(engineRef.current.getSyncStatusJson());
-        const prevSync = prevSyncStatusRef.current;
         const nowMs = Date.now();
+        // The sync counters only move when a server message is processed, so
+        // parse-on-change is safe for the delta detection below. The resync
+        // debounce and the watchdog are wall-clock driven and must keep
+        // running every frame — the watchdog fires precisely when messages
+        // stop, i.e. when this JSON stops changing.
+        const syncJson = engineRef.current.getSyncStatusJson();
+        if (syncJson !== lastSyncStatusJsonRef.current) {
+          lastSyncStatusJsonRef.current = syncJson;
+          const sync = JSON.parse(syncJson);
+          const prevSync = prevSyncStatusRef.current;
 
-        if (prevSync) {
-          if (sync.stream_gap_count > prevSync.stream_gap_count) {
-            recordTrace({
-              Note: {
-                ts_ms: nowMs,
-                note: `stream gap detected: gaps=${sync.stream_gap_count} missed=${sync.missed_messages} last_seq=${sync.last_stream_seq}`
-              }
-            });
-            autoUploadOnce('stream gap detected');
+          if (prevSync) {
+            if (sync.stream_gap_count > prevSync.stream_gap_count) {
+              recordTrace({
+                Note: {
+                  ts_ms: nowMs,
+                  note: `stream gap detected: gaps=${sync.stream_gap_count} missed=${sync.missed_messages} last_seq=${sync.last_stream_seq}`
+                }
+              });
+              autoUploadOnce('stream gap detected');
+            }
+            if (sync.total_mismatches > prevSync.total_mismatches) {
+              recordTrace({
+                Note: {
+                  ts_ms: nowMs,
+                  note: `hash mismatch at probe tick ${sync.last_probe_tick} (consecutive=${sync.consecutive_hash_mismatches}, total=${sync.total_mismatches})`
+                }
+              });
+            }
+            if (sync.consecutive_hash_mismatches >= 2 && prevSync.consecutive_hash_mismatches < 2) {
+              autoUploadOnce('2+ consecutive hash mismatches');
+            }
           }
-          if (sync.total_mismatches > prevSync.total_mismatches) {
-            recordTrace({
-              Note: {
-                ts_ms: nowMs,
-                note: `hash mismatch at probe tick ${sync.last_probe_tick} (consecutive=${sync.consecutive_hash_mismatches}, total=${sync.total_mismatches})`
-              }
-            });
-          }
-          if (sync.consecutive_hash_mismatches >= 2 && prevSync.consecutive_hash_mismatches < 2) {
-            autoUploadOnce('2+ consecutive hash mismatches');
-          }
+          prevSyncStatusRef.current = sync;
         }
-        prevSyncStatusRef.current = sync;
 
-        if (sync.needs_resync && nowMs - lastResyncSentAtRef.current >= RESYNC_DEBOUNCE_MS) {
+        const latestSync = prevSyncStatusRef.current;
+        if (latestSync?.needs_resync && nowMs - lastResyncSentAtRef.current >= RESYNC_DEBOUNCE_MS) {
           lastResyncSentAtRef.current = nowMs;
           onRequestResyncRef.current?.();
           engineRef.current.clearNeedsResync();
@@ -175,7 +209,7 @@ export const useGameEngine = ({
         // Liveness watchdog: the engine's bounded prediction freezes the
         // simulation when server messages stop; surface that to the UI and
         // nudge the server for a fresh snapshot with exponential backoff.
-        const committedStatus = committedState.status;
+        const committedStatus = parsedCommittedStateRef.current?.status;
         const isStarted =
           typeof committedStatus === 'object' &&
           committedStatus !== null &&
@@ -428,8 +462,15 @@ export const useGameEngine = ({
           // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.
           // This prevents a reconnect or retry from briefly revealing the stale pre-reconnect
           // arena between receipt and the next animation frame.
-          const nextGameState = JSON.parse(engineRef.current.getGameStateJson());
-          const nextCommittedState = JSON.parse(engineRef.current.getCommittedStateJson());
+          const nextGameStateJson = engineRef.current.getGameStateJson();
+          const nextCommittedStateJson = engineRef.current.getCommittedStateJson();
+          const nextGameState = JSON.parse(nextGameStateJson);
+          const nextCommittedState = JSON.parse(nextCommittedStateJson);
+          // Keep the loop's byte-identity caches coherent with the state
+          // pushed here, outside the loop.
+          lastGameStateJsonRef.current = nextGameStateJson;
+          lastCommittedStateJsonRef.current = nextCommittedStateJson;
+          parsedCommittedStateRef.current = nextCommittedState;
           const snapshotIsComplete =
             typeof nextCommittedState.status === 'object' &&
             nextCommittedState.status !== null &&
