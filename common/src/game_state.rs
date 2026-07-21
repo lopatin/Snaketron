@@ -1028,25 +1028,53 @@ impl GameState {
             ));
         }
 
-        // Exec commands in the queue until the only ones left are for after this tick
-        // debug!("tick_forward: Checking for commands at tick {}", self.tick);
-        // eprintln!("COMMON DEBUG: tick_forward checking commands at tick {}", self.tick);
+        // Exec commands in the queue until the only ones left are for after this tick.
+        //
+        // At most one turn per snake is APPLIED per tick: the snake moves once
+        // per tick, so a second applied turn would be validated against a
+        // direction the snake has not actually moved in yet, and a pair of
+        // 90-degree turns meant as a two-step maneuver would collapse into a
+        // single step. Extra turns are deferred to the next tick instead,
+        // preserving the player's intended turn sequence even when late inputs
+        // get rebased onto one tick. This is a deterministic rule of the shared
+        // engine — every replica derives the same deferral, so no event is
+        // needed to communicate it.
+        let mut turned_snake_ids: HashSet<u32> = HashSet::new();
+        let mut deferred_commands: Vec<GameCommandMessage> = Vec::new();
         while let Some(command_message) = self.command_queue.pop(self.tick) {
-            // debug!("tick_forward: Popped command from queue: {:?}", command_message);
-            // eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
+            if let GameCommand::Turn { snake_id, .. } = &command_message.command
+                && turned_snake_ids.contains(snake_id)
+            {
+                deferred_commands.push(command_message);
+                continue;
+            }
+
             match self.exec_command(command_message.command) {
                 Ok(events) => {
-                    // debug!("tick_forward: exec_command returned {} events", events.len());
-                    // eprintln!("COMMON DEBUG: exec_command returned {} events", events.len());
+                    for (_, event) in &events {
+                        if let GameEvent::SnakeTurned { snake_id, .. } = event {
+                            turned_snake_ids.insert(*snake_id);
+                        }
+                    }
                     out.extend(events);
                 }
                 Err(_e) => {
                     // debug!("tick_forward: exec_command failed with error: {:?}", e);
-                    // eprintln!("COMMON DEBUG: exec_command error: {:?}", e);
                 }
             }
         }
-        // debug!("tick_forward: Finished processing commands for tick {}", self.tick);
+        for mut command_message in deferred_commands {
+            // Reschedule one tick later on whichever id `CommandQueue` orders
+            // by (the server id when present). The original sequence number is
+            // kept so a deferred command still executes ahead of newer inputs
+            // that were scheduled for the same tick.
+            let next_tick = self.tick + 1;
+            match &mut command_message.command_id_server {
+                Some(id) => id.tick = next_tick,
+                None => command_message.command_id_client.tick = next_tick,
+            }
+            self.command_queue.push(command_message);
+        }
 
         // Take a snapshot of the existing snakes to rollback dead ones after movement
         let old_snakes = self.arena.snakes.clone();
@@ -1410,8 +1438,16 @@ impl GameState {
                 if snake.is_alive && snake.direction != direction {
                     // debug!("exec_command: Snake is alive and direction is different");
 
-                    // Always prevent 180-degree turns
-                    if snake.direction.is_opposite(&direction) {
+                    // Always prevent 180-degree turns. Check both the pending
+                    // direction and the direction the snake last actually
+                    // moved: several commands can execute on one tick (late
+                    // inputs get rebased onto the executor's current tick),
+                    // and a second turn validated only against the first's
+                    // pending direction would let the pair sum to a
+                    // 180-degree reversal in a single movement step.
+                    if snake.direction.is_opposite(&direction)
+                        || snake.travel_direction().is_opposite(&direction)
+                    {
                         // debug!("exec_command: Ignoring command - 180-degree turn attempted");
                         // eprintln!("COMMON DEBUG: Ignoring 180-degree turn");
                         // Ignore the command - cannot turn 180 degrees
@@ -1625,6 +1661,301 @@ mod tests {
             "expected snake to die after colliding with itself"
         );
         assert!(!game.arena.snakes[0].is_alive);
+    }
+
+    fn clockwise(direction: Direction) -> Direction {
+        match direction {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
+
+    fn step(position: Position, direction: Direction) -> Position {
+        match direction {
+            Direction::Up => Position {
+                x: position.x,
+                y: position.y - 1,
+            },
+            Direction::Down => Position {
+                x: position.x,
+                y: position.y + 1,
+            },
+            Direction::Left => Position {
+                x: position.x - 1,
+                y: position.y,
+            },
+            Direction::Right => Position {
+                x: position.x + 1,
+                y: position.y,
+            },
+        }
+    }
+
+    /// Two 90-degree turns can land on the same tick (inputs that arrive past
+    /// the committed-lag window are rebased onto the executor's current tick).
+    /// The snake moves once per tick, so executing both before that single
+    /// movement step would sum them into a 180-degree reversal. Instead the
+    /// engine applies the first turn this tick and defers the second to the
+    /// next tick — the player's intended two-step maneuver plays out one tick
+    /// stretched, and reversal stays structurally impossible.
+    #[test]
+    fn same_tick_double_turn_defers_second_turn_instead_of_reversing() {
+        let mut game = GameState::new(20, 20, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake_id = player.snake_id;
+
+        // Let the snake travel for a couple of ticks.
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+        let head_before = *snake.head().expect("head");
+        let length_before = snake.length();
+
+        let tick = game.current_tick();
+        for (seq, direction) in [(0, first_turn), (1, second_turn)] {
+            let id = create_command_id(tick, 1, seq);
+            game.schedule_command(&GameCommandMessage {
+                command_id_client: id.clone(),
+                command_id_server: Some(id),
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction,
+                },
+            });
+        }
+
+        // Tick 1: only the first turn applies; the second is deferred.
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive, "snake must survive a same-tick double turn");
+        assert_eq!(
+            snake.direction, first_turn,
+            "only the first turn may apply on the collapsed tick"
+        );
+        assert_eq!(
+            *snake.head().expect("head"),
+            step(head_before, first_turn),
+            "snake must move in the first turn's direction, not reverse"
+        );
+
+        // Tick 2: the deferred second turn applies — intent preserved.
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive, "snake must survive the deferred turn");
+        assert_eq!(
+            snake.direction, second_turn,
+            "the deferred second turn must apply on the following tick"
+        );
+        assert_eq!(
+            *snake.head().expect("head"),
+            step(step(head_before, first_turn), second_turn),
+            "the two-step maneuver must complete, one tick stretched"
+        );
+        assert_eq!(
+            snake.length(),
+            length_before,
+            "the maneuver must not corrupt the body geometry"
+        );
+    }
+
+    /// A burst of three turns on one tick executes one turn per tick, in
+    /// input order, without ever reversing the snake.
+    #[test]
+    fn three_same_tick_turns_execute_in_order_over_consecutive_ticks() {
+        let mut game = GameState::new(20, 20, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake_id = player.snake_id;
+
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let turns = [
+            clockwise(travel),
+            clockwise(clockwise(travel)),
+            clockwise(clockwise(clockwise(travel))),
+        ];
+        let length_before = snake.length();
+        let mut expected_head = *snake.head().expect("head");
+
+        let tick = game.current_tick();
+        for (seq, direction) in turns.iter().enumerate() {
+            let id = create_command_id(tick, 1, seq as u32);
+            game.schedule_command(&GameCommandMessage {
+                command_id_client: id.clone(),
+                command_id_server: Some(id),
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction: *direction,
+                },
+            });
+        }
+
+        for turn in turns {
+            game.tick_forward(true).expect("tick");
+            expected_head = step(expected_head, turn);
+            let snake = &game.arena.snakes[snake_id as usize];
+            assert!(snake.is_alive, "snake must survive the maneuver");
+            assert_eq!(snake.direction, turn, "turns must apply in input order");
+            assert_eq!(*snake.head().expect("head"), expected_head);
+        }
+
+        assert_eq!(game.arena.snakes[snake_id as usize].length(), length_before);
+    }
+
+    /// A deferred turn landing on a tick that already has its own scheduled
+    /// turn must execute FIRST: deferral keeps the command's original
+    /// sequence number, and the queue orders same-tick commands by sequence,
+    /// so input order is preserved — the tick's native command defers in
+    /// turn. Shape: turns A and B on tick t, turn C on tick t+1 must apply
+    /// as A@t, B@t+1, C@t+2.
+    #[test]
+    fn deferred_turn_executes_before_the_next_ticks_own_turn() {
+        let mut game = GameState::new(20, 20, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake_id = player.snake_id;
+
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let turns = [
+            clockwise(travel),
+            clockwise(clockwise(travel)),
+            clockwise(clockwise(clockwise(travel))),
+        ];
+        let mut expected_head = *snake.head().expect("head");
+
+        // Turns A and B on tick t (server receive order 0, 1), turn C on
+        // tick t+1 (receive order 2).
+        let tick = game.current_tick();
+        for (seq, (command_tick, direction)) in
+            [(tick, turns[0]), (tick, turns[1]), (tick + 1, turns[2])]
+                .into_iter()
+                .enumerate()
+        {
+            let id = create_command_id(command_tick, 1, seq as u32);
+            game.schedule_command(&GameCommandMessage {
+                command_id_client: id.clone(),
+                command_id_server: Some(id),
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction,
+                },
+            });
+        }
+
+        for turn in turns {
+            game.tick_forward(true).expect("tick");
+            expected_head = step(expected_head, turn);
+            let snake = &game.arena.snakes[snake_id as usize];
+            assert!(snake.is_alive, "snake must survive the maneuver");
+            assert_eq!(
+                snake.direction, turn,
+                "input order must be preserved across deferrals"
+            );
+            assert_eq!(*snake.head().expect("head"), expected_head);
+        }
+    }
+
+    /// A contradictory same-tick pair (left-turn then right-turn): the first
+    /// applies, the deferred second is then opposite the snake's new travel
+    /// direction and gets dropped by the 180-degree guard. First input wins;
+    /// the snake never reverses.
+    #[test]
+    fn contradictory_same_tick_pair_keeps_first_turn() {
+        let mut game = GameState::new(20, 20, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake_id = player.snake_id;
+
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(clockwise(first_turn)); // opposite of first_turn
+        let head_before = *snake.head().expect("head");
+
+        let tick = game.current_tick();
+        for (seq, direction) in [(0, first_turn), (1, second_turn)] {
+            let id = create_command_id(tick, 1, seq);
+            game.schedule_command(&GameCommandMessage {
+                command_id_client: id.clone(),
+                command_id_server: Some(id),
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction,
+                },
+            });
+        }
+
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive);
+        assert_eq!(
+            snake.direction, first_turn,
+            "the deferred contradictory turn must be dropped, not applied"
+        );
+        assert_eq!(
+            *snake.head().expect("head"),
+            step(step(head_before, first_turn), first_turn),
+            "snake must continue in the first turn's direction"
+        );
+    }
+
+    /// An outright reversal request is invalid input: it is dropped on the
+    /// spot, and — because it never applied — it must not consume the
+    /// one-turn-per-tick slot of a valid turn behind it.
+    #[test]
+    fn rejected_reversal_does_not_consume_the_turn_slot() {
+        let mut game = GameState::new(20, 20, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake_id = player.snake_id;
+
+        game.tick_forward(true).expect("tick");
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let reversal = clockwise(clockwise(travel));
+        let valid_turn = clockwise(travel);
+        let head_before = *snake.head().expect("head");
+
+        let tick = game.current_tick();
+        for (seq, direction) in [(0, reversal), (1, valid_turn)] {
+            let id = create_command_id(tick, 1, seq);
+            game.schedule_command(&GameCommandMessage {
+                command_id_client: id.clone(),
+                command_id_server: Some(id),
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction,
+                },
+            });
+        }
+
+        game.tick_forward(true).expect("tick");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive);
+        assert_eq!(
+            snake.direction, valid_turn,
+            "the valid turn must apply this tick; the dropped reversal must not defer it"
+        );
+        assert_eq!(*snake.head().expect("head"), step(head_before, valid_turn));
     }
 
     #[test]

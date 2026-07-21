@@ -492,3 +492,93 @@ impl GameEngine {
         self.sync_status.needs_resync = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Direction;
+
+    fn clockwise(direction: Direction) -> Direction {
+        match direction {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
+
+    /// The prod path of the same-tick double-turn bug: two quick inputs are
+    /// stamped with client ticks the committed state has already passed (they
+    /// arrived later than the committed-lag window), so `process_command`
+    /// rebases both onto the same tick via `max(client_tick, current_tick)`.
+    /// The engine must not execute both before one movement step: the second
+    /// turn is deferred one tick, so the player's two-step maneuver completes
+    /// without ever reversing the snake.
+    #[test]
+    fn rebased_turns_on_same_tick_defer_instead_of_reversing() {
+        let mut state = GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.add_player(1, None).expect("add player");
+        let snake_id = state.players[&1].snake_id;
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        let mut engine = GameEngine::new_from_state(1, state);
+
+        // Advance the committed state past a few ticks (run_until lags the
+        // wall-clock target by the 500 ms committed-lag window).
+        engine.run_until(tick_ms * 10).expect("run_until");
+        let committed_tick = engine.current_tick();
+        assert!(committed_tick >= 2, "committed state should have advanced");
+
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        let travel = snake.direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+        let length_before = snake.length();
+
+        // Client ticks 1 and 2 are already in the committed past: both
+        // commands get rebased onto `committed_tick`.
+        for (client_tick, direction) in [(1, first_turn), (2, second_turn)] {
+            let scheduled = engine
+                .process_command(GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: client_tick,
+                        user_id: 1,
+                        sequence_number: 0,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::Turn {
+                        snake_id,
+                        direction,
+                    },
+                })
+                .expect("process_command");
+            // The premise of this test: rebasing collapses both commands
+            // onto the same tick. If scheduling ever changes to spread
+            // them out, this test is no longer exercising the deferral.
+            assert_eq!(
+                scheduled.command_id_server.expect("server id").tick,
+                committed_tick,
+                "rebasing must collapse the command onto the current tick"
+            );
+        }
+
+        // Advance a few more ticks so the rebased pair executes (first turn
+        // at `committed_tick`, deferred second turn one tick later).
+        engine.run_until(tick_ms * 13).expect("run_until");
+        assert!(engine.current_tick() > committed_tick + 1);
+
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(
+            snake.is_alive,
+            "snake must survive two turns rebased onto one tick"
+        );
+        assert_eq!(
+            snake.direction, second_turn,
+            "the deferred second turn must apply on the following tick"
+        );
+        assert_eq!(
+            snake.length(),
+            length_before,
+            "the maneuver must not corrupt the body geometry"
+        );
+    }
+}

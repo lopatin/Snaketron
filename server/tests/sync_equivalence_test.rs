@@ -957,3 +957,94 @@ async fn late_command_reschedules() -> Result<()> {
     })
     .await
 }
+
+/// The 180-degree-reversal shape, end to end: a player double-taps a turn
+/// (two 90-degree turns in the same instant) and both commands arrive past
+/// the 500ms committed-lag window, so the server rebases them onto the SAME
+/// committed tick. The engine must apply the first turn on that tick and
+/// defer the second to the next — never summing them into a reversal — and
+/// the client's committed replica must derive the identical deferral.
+#[tokio::test]
+async fn rebased_double_turn_defers_and_stays_in_sync() -> Result<()> {
+    fn clockwise(direction: Direction) -> Direction {
+        match direction {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
+
+    with_timeout(async {
+        let cfg = TransportConfig {
+            base_latency_ms: 100,
+            jitter_ms: 0,
+            ..TransportConfig::lossless()
+        };
+        let mut world = SimWorld::new(0x5EED5, cfg);
+        world.auto_resync = true;
+
+        world.run_for(2_000);
+
+        // Double-tap: both turns leave in the same instant, both stuck in
+        // the network for 800ms.
+        let travel = world.server.committed_state().arena.snakes[0].direction;
+        let first_turn = clockwise(travel);
+        let second_turn = clockwise(first_turn); // opposite of `travel`
+        let cmd1 = world.client_send_turn_with_latency(first_turn, 800);
+        let cmd2 = world.client_send_turn_with_latency(second_turn, 800);
+        world.run_for(1_500);
+
+        let server_tick_of = |world: &SimWorld, cmd: &GameCommandMessage| {
+            world
+                .confirmations
+                .iter()
+                .find(|c| c.command_id_client == cmd.command_id_client)
+                .expect("server confirmed the command")
+                .command_id_server
+                .as_ref()
+                .expect("server assigned an id")
+                .tick
+        };
+        let tick1 = server_tick_of(&world, &cmd1);
+        let tick2 = server_tick_of(&world, &cmd2);
+        assert!(
+            tick1 > cmd1.command_id_client.tick,
+            "premise: the late pair must be rebased (client tick {}, server tick {tick1})",
+            cmd1.command_id_client.tick
+        );
+        assert_eq!(
+            tick1, tick2,
+            "premise: both turns must collapse onto one committed tick"
+        );
+
+        // Intent preserved on the authoritative state: the first turn applied
+        // on the collapsed tick, the deferred second one tick later.
+        let snake = &world.server.committed_state().arena.snakes[0];
+        assert!(snake.is_alive, "the snake must not reverse into itself");
+        assert_eq!(
+            snake.direction, second_turn,
+            "the deferred second turn must have applied"
+        );
+
+        // The client's committed replica derives the same deferral from the
+        // same CommandScheduled events: both sides stay in sync.
+        world.run_for(10_000);
+        world.drain_and_probe();
+
+        let status = world.client().sync_status();
+        assert_eq!(
+            status.last_probe_matched,
+            Some(true),
+            "final probe must match: {status:?}"
+        );
+        assert!(!status.needs_resync, "no pending resync at the end");
+        assert_eq!(
+            world.client().committed_sync_hash(),
+            world.server.committed_sync_hash(),
+            "client must converge to the server state"
+        );
+        Ok(())
+    })
+    .await
+}
