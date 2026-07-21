@@ -14,6 +14,10 @@ interface Color {
   blue: number;
 }
 
+// Kill switch for the backdrop during gameplay (/play/*), while investigating
+// rendering freezes and input delay. Flip to true to show it there again.
+export const SHOW_BACKDROP_DURING_GAMEPLAY = false;
+
 const FRAME_INTERVAL_MS = 1000 / 6;
 
 const INK: Color = { red: 71, green: 78, blue: 90 };

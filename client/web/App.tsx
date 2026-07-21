@@ -1,5 +1,5 @@
 import React from 'react';
-import { BrowserRouter, Route } from 'react-router-dom';
+import { BrowserRouter, Route, matchPath, useLocation } from 'react-router-dom';
 import './index.css';
 import Auth from './components/Auth';
 import CustomGameCreator from './components/CustomGameCreator';
@@ -10,7 +10,7 @@ import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
 import { NewHome } from './components/NewHome';
-import { ArenaBackdrop } from './components/ArenaBackdrop';
+import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
@@ -19,9 +19,13 @@ import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 
 function AppContent() {
+  const location = useLocation();
+  const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
+
   return (
     <div className="min-h-screen flex flex-col">
-      <ArenaBackdrop />
+      {showBackdrop && <ArenaBackdrop />}
       <MatchmakingBanner />
       <AnimatedRoutes>
         <Route path="/" element={<NewHome />} />
