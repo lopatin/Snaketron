@@ -172,10 +172,7 @@ export default function GameArena() {
 
 
   useEffect(() => {
-    // Hide background dots
-    document.body.classList.add('hide-background-dots');
-
-    // Trigger fade-in animation when component mounts and hide background dots
+    // Trigger fade-in animation when component mounts
     const timer = setTimeout(() => {
       setIsArenaVisible(true);
     }, 300); // Delay to ensure smooth transition after fade-out
@@ -184,8 +181,6 @@ export default function GameArena() {
 
     return () => {
       clearTimeout(timer);
-      // Restore background dots when leaving game view
-      document.body.classList.remove('hide-background-dots');
       console.log('GAME ARENA UNMOUNTED, initial state issue');
 
       joinedGameIdRef.current = null; // Reset for next mount

@@ -203,8 +203,11 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
       {/* Logo */}
-      <div className="flex justify-center mb-8">
+      <div className="flex flex-col items-center mb-8">
         <img src="/SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
+        <p className="mt-3 text-xs font-bold italic uppercase tracking-1 text-gray-500">
+          Competitive multiplayer Snake
+        </p>
       </div>
 
       <div className="p-8">

@@ -20,6 +20,10 @@
   --text-underline-offset-6: 6px;
 }
 
+body {
+  background: #fff;
+}
+
 /* Home page layout: visually keyed to the existing game start form. */
 .home-page {
   position: relative;
@@ -27,10 +31,10 @@
   min-height: 100svh;
   flex-direction: column;
   overflow-x: hidden;
-  background: #fff;
   isolation: isolate;
 }
 
+/* Site-wide dotted backdrop, mounted once at the app root behind all routes. */
 .home-arena-backdrop {
   position: fixed;
   inset: 0;

@@ -14,6 +14,8 @@ interface Color {
   blue: number;
 }
 
+const FRAME_INTERVAL_MS = 1000 / 6;
+
 const INK: Color = { red: 71, green: 78, blue: 90 };
 const SKY: Color = { red: 91, green: 184, blue: 224 };
 const CORAL: Color = { red: 246, green: 112, blue: 123 };
@@ -178,8 +180,15 @@ export const ArenaBackdrop: React.FC = () => {
     };
 
     const draw = (timestamp: number): void => {
+      // The dots drift slowly, so redrawing at ~6fps is indistinguishable
+      // from 60fps and keeps the backdrop cheap, including during gameplay.
+      if (previousTimestamp && timestamp - previousTimestamp < FRAME_INTERVAL_MS) {
+        frameId = window.requestAnimationFrame(draw);
+        return;
+      }
+
       const elapsedSeconds = previousTimestamp
-        ? clamp((timestamp - previousTimestamp) / 1000, 0, 0.05)
+        ? clamp((timestamp - previousTimestamp) / 1000, 0, 0.25)
         : 1 / 60;
       previousTimestamp = timestamp;
 
