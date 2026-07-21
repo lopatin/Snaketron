@@ -34,7 +34,7 @@ function AnimatedRoutes({ children }: AnimatedRoutesProps) {
   const transitionDuration = isGameRoute ? 'duration-300' : 'duration-100';
 
   return (
-    <div className={`flex-1 transition-opacity ${transitionDuration} ease-in-out ${
+    <div className={`relative flex-1 transition-opacity ${transitionDuration} ease-in-out ${
       isAnimating ? 'opacity-0' : 'opacity-100'
     }`}>
       <Routes location={displayLocation}>

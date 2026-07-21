@@ -10,6 +10,7 @@ import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
 import { NewHome } from './components/NewHome';
+import { ArenaBackdrop } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
@@ -20,6 +21,7 @@ import { LatencyProvider } from './contexts/LatencyContext';
 function AppContent() {
   return (
     <div className="min-h-screen flex flex-col">
+      <ArenaBackdrop />
       <MatchmakingBanner />
       <AnimatedRoutes>
         <Route path="/" element={<NewHome />} />
