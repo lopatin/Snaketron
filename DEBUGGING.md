@@ -229,8 +229,14 @@ Why tests never caught it:
   (Since repaired: all pass again, and CI runs `cargo test --all --no-run`
   so a test binary can never silently rot out of coverage again. Note:
   running these against a Redis shared with a live dev server causes
-  cross-talk — pub/sub channels are global across Redis DBs — so stop the
-  dev `snaketron-server` container before running them.)
+  cross-talk — the dev server registers in the shared service registry and
+  cluster singletons, so it literally forms a cluster with the test
+  processes: matchmaking can route test games to it and its executor can
+  claim test partitions. Symptoms: join snapshots stuck at `Stopped`,
+  matchmaking tests hitting their 30s timeouts — persisting for a short
+  while after shutdown until its heartbeat expires. Stop any local
+  `snaketron-server` (container or `cargo run`) before running these
+  binaries.)
 - All integration tests ran over **perfect in-memory transports** — the
   lossy/laggy paths (Redis reconnects, broadcast lag, ALB idle timeouts)
   never executed in CI.
