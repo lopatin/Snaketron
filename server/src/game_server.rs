@@ -17,8 +17,12 @@ use crate::pubsub_manager::PubSubManager;
 use crate::redis_utils::create_connection_manager;
 use crate::region_cache::RegionCache;
 use crate::{
-    cluster_singleton::ClusterSingleton, db::Database, game_executor::run_game_executor,
-    matchmaking::run_matchmaking_loop, redis_keys::RedisKeys, replication::ReplicationManager,
+    cluster_singleton::ClusterSingleton,
+    db::{Database, ServerRegistration},
+    game_executor::run_game_executor,
+    matchmaking::run_matchmaking_loop,
+    redis_keys::RedisKeys,
+    replication::ReplicationManager,
     ws_server::JwtVerifier,
 };
 use redis::Client;
@@ -117,8 +121,20 @@ impl GameServer {
         // Start heartbeat loop to keep server registration alive
         let heartbeat_db = db.clone();
         let heartbeat_token = cancellation_token.clone();
+        let heartbeat_registration = ServerRegistration {
+            grpc_address: grpc_addr.clone(),
+            region: region.clone(),
+            origin: origin.clone(),
+            ws_url: ws_url.clone(),
+        };
         handles.push(tokio::spawn(async move {
-            run_heartbeat_loop(heartbeat_db, server_id, heartbeat_token).await;
+            run_heartbeat_loop(
+                heartbeat_db,
+                server_id,
+                heartbeat_registration,
+                heartbeat_token,
+            )
+            .await;
         }));
 
         // Create the broadcast channel for Redis Pub/Sub
@@ -169,8 +185,7 @@ impl GameServer {
         ));
 
         // Create RegionCache for dynamic region discovery
-        let aws_config = aws_config::load_from_env().await;
-        let dynamodb_client = aws_sdk_dynamodb::Client::new(&aws_config);
+        let dynamodb_client = crate::db::dynamodb::dynamodb_client().await;
         let table_prefix =
             env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
         let region_cache = Arc::new(RegionCache::new(dynamodb_client, table_prefix));
@@ -499,10 +514,16 @@ pub fn get_available_port() -> u16 {
     port
 }
 
+/// Each heartbeat write must be bounded: a single hung request would otherwise
+/// silently block every later heartbeat until the region drops out of the
+/// region cache. Kept below the 5s interval so a stall never delays the next tick.
+const HEARTBEAT_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Run a loop to update last_heartbeat in the database
 pub async fn run_heartbeat_loop(
     db: Arc<dyn Database>,
     server_id: u64,
+    registration: ServerRegistration,
     cancellation_token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -517,12 +538,24 @@ pub async fn run_heartbeat_loop(
             }
 
             _ = interval.tick() => {
-                match db.update_server_heartbeat(server_id as i32).await {
-                    Ok(()) => {
+                match tokio::time::timeout(
+                    HEARTBEAT_WRITE_TIMEOUT,
+                    db.update_server_heartbeat(server_id as i32, &registration),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
                         trace!(?server_id, "Heartbeat sent successfully.");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!(?server_id, error = %e, "Failed to send heartbeat");
+                    }
+                    Err(_) => {
+                        error!(
+                            ?server_id,
+                            timeout_secs = HEARTBEAT_WRITE_TIMEOUT.as_secs(),
+                            "Heartbeat write timed out"
+                        );
                     }
                 }
             }

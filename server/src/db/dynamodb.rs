@@ -16,7 +16,9 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::models::*;
-use super::{DURABLE_GAME_ID_FLOOR, Database};
+use super::{
+    DURABLE_GAME_ID_FLOOR, Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration,
+};
 use crate::season::Season;
 
 pub struct DynamoDatabase {
@@ -30,10 +32,30 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// How long a SERVER registration item lives past its last heartbeat before
+/// DynamoDB TTL reaps it. Deliberately generous: staleness is already handled
+/// by heartbeat-freshness cutoffs at read time, so TTL is pure registry
+/// hygiene, and the wide margin ensures expiry can never race a live server
+/// whose heartbeats are temporarily failing.
+const SERVER_REGISTRATION_TTL_SECONDS: i64 = 3600;
+
+/// Build a DynamoDB client with explicit timeouts. The SDK ships with no
+/// response timeout, so a hung request would otherwise stall its caller
+/// indefinitely without ever erroring. Every DynamoDB client in the server
+/// must be built through this function.
+pub async fn dynamodb_client() -> Client {
+    let timeouts = aws_config::timeout::TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .operation_attempt_timeout(Duration::from_secs(5))
+        .operation_timeout(Duration::from_secs(15))
+        .build();
+    let config = aws_config::from_env().timeout_config(timeouts).load().await;
+    Client::new(&config)
+}
+
 impl DynamoDatabase {
     pub async fn new() -> Result<Self> {
-        let config = aws_config::load_from_env().await;
-        let client = Client::new(&config);
+        let client = dynamodb_client().await;
 
         let table_prefix =
             std::env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
@@ -798,6 +820,10 @@ impl Database for DynamoDatabase {
         item.insert("status".to_string(), Self::av_s("active"));
         item.insert("currentGameCount".to_string(), Self::av_n(0));
         item.insert("maxGameCapacity".to_string(), Self::av_n(100));
+        item.insert(
+            "ttl".to_string(),
+            Self::av_n(now.timestamp() + SERVER_REGISTRATION_TTL_SECONDS),
+        );
 
         self.client
             .put_item()
@@ -811,21 +837,54 @@ impl Database for DynamoDatabase {
         Ok(server_id)
     }
 
-    async fn update_server_heartbeat(&self, server_id: i32) -> Result<()> {
+    async fn update_server_heartbeat(
+        &self,
+        server_id: i32,
+        registration: &ServerRegistration,
+    ) -> Result<()> {
         let now = Utc::now();
 
+        // A full upsert rather than a bare timestamp bump: if the registration
+        // item was deleted out from under a live server (TTL reaper, manual
+        // cleanup), this recreates it whole instead of leaving a partial item
+        // or failing forever. if_not_exists preserves mutable counters.
         self.client
             .update_item()
             .table_name(self.main_table())
             .key("pk", Self::av_s(format!("SERVER#{}", server_id)))
             .key("sk", Self::av_s("META"))
-            .update_expression("SET lastHeartbeat = :now, gsi1sk = :gsi1sk, gsi2sk = :gsi2sk")
+            .update_expression(
+                "SET lastHeartbeat = :now, gsi1sk = :gsi1sk, gsi2sk = :gsi2sk, #ttl = :ttl, \
+                 gsi1pk = :gsi1pk, gsi2pk = :gsi2pk, id = :id, grpcAddress = :grpc, \
+                 #region = :region, origin = :origin, wsUrl = :ws_url, \
+                 createdAt = if_not_exists(createdAt, :now), \
+                 #status = if_not_exists(#status, :active), \
+                 currentGameCount = if_not_exists(currentGameCount, :zero), \
+                 maxGameCapacity = if_not_exists(maxGameCapacity, :max_capacity)",
+            )
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_names("#region", "region")
+            .expression_attribute_names("#status", "status")
             .expression_attribute_values(":now", Self::av_s(now.to_rfc3339()))
             .expression_attribute_values(":gsi1sk", Self::av_s(now.to_rfc3339()))
             .expression_attribute_values(
                 ":gsi2sk",
                 Self::av_s(format!("{}#SERVER#{}", now.to_rfc3339(), server_id)),
             )
+            .expression_attribute_values(
+                ":ttl",
+                Self::av_n(now.timestamp() + SERVER_REGISTRATION_TTL_SECONDS),
+            )
+            .expression_attribute_values(":gsi1pk", Self::av_s("SERVER"))
+            .expression_attribute_values(":gsi2pk", Self::av_s(&registration.region))
+            .expression_attribute_values(":id", Self::av_n(server_id))
+            .expression_attribute_values(":grpc", Self::av_s(&registration.grpc_address))
+            .expression_attribute_values(":region", Self::av_s(&registration.region))
+            .expression_attribute_values(":origin", Self::av_s(&registration.origin))
+            .expression_attribute_values(":ws_url", Self::av_s(&registration.ws_url))
+            .expression_attribute_values(":active", Self::av_s("active"))
+            .expression_attribute_values(":zero", Self::av_n(0))
+            .expression_attribute_values(":max_capacity", Self::av_n(100))
             .send()
             .await
             .context("Failed to update server heartbeat")?;
@@ -835,14 +894,21 @@ impl Database for DynamoDatabase {
     }
 
     async fn update_server_status(&self, server_id: i32, status: &str) -> Result<()> {
+        // Also stamp ttl so an item this upsert might create (e.g. status write
+        // racing a TTL reap) is itself reaped instead of lingering forever.
         self.client
             .update_item()
             .table_name(self.main_table())
             .key("pk", Self::av_s(format!("SERVER#{}", server_id)))
             .key("sk", Self::av_s("META"))
-            .update_expression("SET #status = :status")
+            .update_expression("SET #status = :status, #ttl = :ttl")
             .expression_attribute_names("#status", "status")
+            .expression_attribute_names("#ttl", "ttl")
             .expression_attribute_values(":status", Self::av_s(status))
+            .expression_attribute_values(
+                ":ttl",
+                Self::av_n(Utc::now().timestamp() + SERVER_REGISTRATION_TTL_SECONDS),
+            )
             .send()
             .await
             .context("Failed to update server status")?;
@@ -852,7 +918,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn get_server_for_load_balancing(&self, region: &str) -> Result<i32> {
-        let thirty_seconds_ago = Utc::now() - chrono::Duration::seconds(30);
+        let cutoff = Utc::now() - chrono::Duration::seconds(SERVER_HEARTBEAT_FRESHNESS_SECONDS);
 
         let response = self
             .client
@@ -861,7 +927,7 @@ impl Database for DynamoDatabase {
             .index_name("GSI2")
             .key_condition_expression("gsi2pk = :region AND gsi2sk > :cutoff")
             .expression_attribute_values(":region", Self::av_s(region))
-            .expression_attribute_values(":cutoff", Self::av_s(thirty_seconds_ago.to_rfc3339()))
+            .expression_attribute_values(":cutoff", Self::av_s(cutoff.to_rfc3339()))
             .projection_expression("id, currentGameCount")
             .send()
             .await
@@ -884,7 +950,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn get_active_servers(&self, region: &str) -> Result<Vec<(i32, String)>> {
-        let thirty_seconds_ago = Utc::now() - chrono::Duration::seconds(30);
+        let cutoff = Utc::now() - chrono::Duration::seconds(SERVER_HEARTBEAT_FRESHNESS_SECONDS);
 
         let response = self
             .client
@@ -893,7 +959,7 @@ impl Database for DynamoDatabase {
             .index_name("GSI2")
             .key_condition_expression("gsi2pk = :region AND gsi2sk > :cutoff")
             .expression_attribute_values(":region", Self::av_s(region))
-            .expression_attribute_values(":cutoff", Self::av_s(thirty_seconds_ago.to_rfc3339()))
+            .expression_attribute_values(":cutoff", Self::av_s(cutoff.to_rfc3339()))
             .projection_expression("id, grpcAddress")
             .send()
             .await
@@ -914,7 +980,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn get_region_ws_url(&self, region: &str) -> Result<Option<String>> {
-        let thirty_seconds_ago = Utc::now() - chrono::Duration::seconds(30);
+        let cutoff = Utc::now() - chrono::Duration::seconds(SERVER_HEARTBEAT_FRESHNESS_SECONDS);
 
         let response = self
             .client
@@ -923,7 +989,7 @@ impl Database for DynamoDatabase {
             .index_name("GSI2")
             .key_condition_expression("gsi2pk = :region AND gsi2sk > :cutoff")
             .expression_attribute_values(":region", Self::av_s(region))
-            .expression_attribute_values(":cutoff", Self::av_s(thirty_seconds_ago.to_rfc3339()))
+            .expression_attribute_values(":cutoff", Self::av_s(cutoff.to_rfc3339()))
             .projection_expression("wsUrl")
             .limit(1) // We only need one server's WS URL
             .send()
