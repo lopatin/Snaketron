@@ -2,8 +2,8 @@
 
 use crate::config::{CommandProfile, Population};
 use crate::report::{
-    HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord, SessionOutcome,
-    SessionPhase, SessionRecord, unix_time_ms,
+    HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord, SessionMetrics,
+    SessionOutcome, SessionPhase, SessionRecord, unix_time_ms,
 };
 use crate::target::BackendHintRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -16,6 +16,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt, future::join_all};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use server::lobby_manager::LobbyPreferences;
+use server::recovery::CommandOutcome;
 use server::ws_server::WSMessage;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -160,6 +161,12 @@ struct GuestUser {
     username: String,
 }
 
+struct PendingCommand {
+    message: GameCommandMessage,
+    sent_at_unix_ms: u64,
+    sent_at: Instant,
+}
+
 struct LiveSession {
     record: SessionRecord,
     user_id: u32,
@@ -181,7 +188,7 @@ struct LiveSession {
     reconnects: u32,
     client_game_session_id: String,
     next_command_sequence: u64,
-    pending_commands: BTreeMap<u64, GameCommandMessage>,
+    pending_commands: BTreeMap<u64, PendingCommand>,
     server_capabilities: BTreeSet<String>,
     activity_lease: SessionActivityLease,
 }
@@ -3733,19 +3740,57 @@ async fn drive_ai(
         .map_err(|error| {
             DriveAiError::Transport(error.context("sending AI game command over WebSocket"))
         })?;
-    session.record.metrics.commands_sent = session.record.metrics.commands_sent.saturating_add(1);
-    let sent_at_second = unix_time_ms() / 1_000;
-    let commands_in_second = session
-        .record
-        .metrics
-        .command_counts_by_unix_second
-        .entry(sent_at_second)
-        .or_default();
-    *commands_in_second = commands_in_second.saturating_add(1);
     if !command_profile.sends_unchanged_turns() {
         *pending_direction = Some(direction);
     }
     Ok(())
+}
+
+fn record_pending_command_resolution(
+    pending_commands: &mut BTreeMap<u64, PendingCommand>,
+    metrics: &mut SessionMetrics,
+    sequence: u64,
+) -> Option<u64> {
+    let command = pending_commands.remove(&sequence)?;
+    let sent_second = command.sent_at_unix_ms / 1_000;
+    let count = metrics
+        .command_outcome_counts_by_sent_unix_second
+        .entry(sent_second)
+        .or_default();
+    *count = count.saturating_add(1);
+    let maximum = metrics
+        .command_outcome_max_latency_ms_by_sent_unix_second
+        .entry(sent_second)
+        .or_default();
+    *maximum = (*maximum).max(elapsed_ms(command.sent_at));
+    Some(sent_second)
+}
+
+fn record_all_pending_command_resolutions(
+    pending_commands: &mut BTreeMap<u64, PendingCommand>,
+    metrics: &mut SessionMetrics,
+) {
+    let sequences: Vec<u64> = pending_commands.keys().copied().collect();
+    for sequence in sequences {
+        record_pending_command_resolution(pending_commands, metrics, sequence);
+    }
+}
+
+fn record_scheduled_pending_command_resolution(
+    pending_commands: &mut BTreeMap<u64, PendingCommand>,
+    metrics: &mut SessionMetrics,
+    sequence: u64,
+) -> bool {
+    let Some(sent_second) = record_pending_command_resolution(pending_commands, metrics, sequence)
+    else {
+        return false;
+    };
+    let total = metrics
+        .scheduled_command_counts_by_sent_unix_second
+        .entry(sent_second)
+        .or_default();
+    *total = total.saturating_add(1);
+    true
 }
 
 impl LiveSession {
@@ -3766,7 +3811,26 @@ impl LiveSession {
             client_game_session_id: self.client_game_session_id.clone(),
             sequence,
         };
-        self.pending_commands.insert(sequence, command.clone());
+        let sent_at_unix_ms = unix_time_ms();
+        self.pending_commands.insert(
+            sequence,
+            PendingCommand {
+                message: command.clone(),
+                sent_at_unix_ms,
+                sent_at: Instant::now(),
+            },
+        );
+        // This is one logical client submission even when the socket write is
+        // ambiguous. Recovery resends the same identity, so counting only a
+        // successful first write would make its eventual outcome unmatched.
+        self.record.metrics.commands_sent = self.record.metrics.commands_sent.saturating_add(1);
+        let commands_in_second = self
+            .record
+            .metrics
+            .command_counts_by_unix_second
+            .entry(sent_at_unix_ms / 1_000)
+            .or_default();
+        *commands_in_second = commands_in_second.saturating_add(1);
         self.send(WSMessage::GameCommandV2 {
             command_id,
             command,
@@ -3778,7 +3842,7 @@ impl LiveSession {
         let pending: Vec<_> = self
             .pending_commands
             .iter()
-            .map(|(sequence, command)| (*sequence, command.clone()))
+            .map(|(sequence, command)| (*sequence, command.message.clone()))
             .collect();
         for (sequence, command) in pending {
             self.send(WSMessage::GameCommandV2 {
@@ -3808,6 +3872,29 @@ impl LiveSession {
         self.remember(format!("sent:{kind}"));
     }
 
+    fn record_command_resolution(&mut self, sequence: u64) -> Option<u64> {
+        record_pending_command_resolution(
+            &mut self.pending_commands,
+            &mut self.record.metrics,
+            sequence,
+        )
+    }
+
+    fn record_terminal_game_resolutions(&mut self) {
+        record_all_pending_command_resolutions(
+            &mut self.pending_commands,
+            &mut self.record.metrics,
+        );
+    }
+
+    fn record_scheduled_command_resolution(&mut self, sequence: u64) -> bool {
+        record_scheduled_pending_command_resolution(
+            &mut self.pending_commands,
+            &mut self.record.metrics,
+            sequence,
+        )
+    }
+
     fn observe_received(&mut self, message: &WSMessage) {
         self.record.metrics.messages_received =
             self.record.metrics.messages_received.saturating_add(1);
@@ -3832,33 +3919,33 @@ impl LiveSession {
         }
         match message {
             WSMessage::GameEvent(event) => {
-                clear_pending_after_terminal_event(
-                    &mut self.pending_commands,
+                if terminal_event_completes_current_game(
                     self.record.game_id,
                     event.game_id,
                     &event.event,
-                );
+                ) {
+                    self.record_terminal_game_resolutions();
+                }
                 match &event.event {
                     GameEvent::CommandScheduledV2 { command_id, .. }
                         if command_id.user_id == self.user_id
                             && command_id.client_game_session_id == self.client_game_session_id =>
                     {
-                        if self.pending_commands.remove(&command_id.sequence).is_some() {
-                            let received_at_second = unix_time_ms() / 1_000;
-                            let total = self
+                        if self.record_scheduled_command_resolution(command_id.sequence) {
+                            let received_total = self
                                 .record
                                 .metrics
                                 .scheduled_command_counts_by_unix_second
-                                .entry(received_at_second)
+                                .entry(unix_time_ms() / 1_000)
                                 .or_default();
-                            *total = total.saturating_add(1);
+                            *received_total = received_total.saturating_add(1);
                         }
                     }
                     GameEvent::CommandRejected { command_id, .. }
                         if command_id.user_id == self.user_id
                             && command_id.client_game_session_id == self.client_game_session_id =>
                     {
-                        self.pending_commands.remove(&command_id.sequence);
+                        self.record_command_resolution(command_id.sequence);
                     }
                     _ => {}
                 }
@@ -3869,9 +3956,25 @@ impl LiveSession {
                 contiguous_through,
                 outcomes,
             } if client_game_session_id == &self.client_game_session_id => {
-                self.pending_commands.retain(|sequence, _| {
-                    *sequence > *contiguous_through && !outcomes.contains_key(sequence)
-                });
+                let resolved: Vec<u64> = self
+                    .pending_commands
+                    .keys()
+                    .copied()
+                    .filter(|sequence| {
+                        *sequence <= *contiguous_through || outcomes.contains_key(sequence)
+                    })
+                    .collect();
+                for sequence in resolved {
+                    let scheduled = matches!(
+                        outcomes.get(&sequence),
+                        Some(CommandOutcome::Scheduled { .. })
+                    );
+                    if scheduled {
+                        self.record_scheduled_command_resolution(sequence);
+                    } else {
+                        self.record_command_resolution(sequence);
+                    }
+                }
             }
             _ => {}
         }
@@ -4107,22 +4210,19 @@ impl LiveSession {
     }
 }
 
-fn clear_pending_after_terminal_event<T>(
-    pending_commands: &mut BTreeMap<u64, T>,
+fn terminal_event_completes_current_game(
     current_game_id: Option<u32>,
     event_game_id: u32,
     event: &GameEvent,
-) {
+) -> bool {
     let status = match event {
         GameEvent::Snapshot { game_state } => &game_state.status,
         GameEvent::StatusUpdated { status } => status,
-        _ => return,
+        _ => return false,
     };
-    if current_game_id == Some(event_game_id) && matches!(status, GameStatus::Complete { .. }) {
-        // Terminal authoritative state makes every unresolved command for this
-        // game a definitive no-op, including after reconnect snapshot replay.
-        pending_commands.clear();
-    }
+    // Terminal authoritative state makes every unresolved command for this
+    // game a definitive no-op, including after reconnect snapshot replay.
+    current_game_id == Some(event_game_id) && matches!(status, GameStatus::Complete { .. })
 }
 
 async fn create_guest(
@@ -4476,39 +4576,119 @@ mod tests {
     }
 
     #[test]
-    fn only_current_game_terminal_events_clear_pending_commands() {
-        let mut pending = BTreeMap::from([(1, ()), (2, ())]);
+    fn only_current_game_terminal_events_resolve_pending_commands() {
         let nonterminal = GameEvent::Snapshot {
             game_state: duel_snapshot(&[7, 8]),
         };
-        clear_pending_after_terminal_event(&mut pending, Some(42), 42, &nonterminal);
-        assert_eq!(pending.len(), 2);
+        assert!(!terminal_event_completes_current_game(
+            Some(42),
+            42,
+            &nonterminal
+        ));
 
         let terminal_status = GameEvent::StatusUpdated {
             status: GameStatus::Complete {
                 winning_snake_id: None,
             },
         };
-        clear_pending_after_terminal_event(&mut pending, Some(42), 99, &terminal_status);
-        assert_eq!(pending.len(), 2);
+        assert!(!terminal_event_completes_current_game(
+            Some(42),
+            99,
+            &terminal_status
+        ));
+        assert!(terminal_event_completes_current_game(
+            Some(42),
+            42,
+            &terminal_status
+        ));
 
-        clear_pending_after_terminal_event(&mut pending, Some(42), 42, &terminal_status);
-        assert!(pending.is_empty());
-
-        pending.insert(3, ());
         let mut terminal_snapshot = duel_snapshot(&[7, 8]);
         terminal_snapshot.status = GameStatus::Complete {
             winning_snake_id: None,
         };
-        clear_pending_after_terminal_event(
-            &mut pending,
+        assert!(terminal_event_completes_current_game(
             Some(42),
             42,
             &GameEvent::Snapshot {
                 game_state: terminal_snapshot,
             },
+        ));
+    }
+
+    #[test]
+    fn command_resolution_is_exactly_once_and_terminal_bulk_drains_remaining() {
+        use common::CommandId;
+
+        let message = GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 1,
+                user_id: 7,
+                sequence_number: 1,
+            },
+            command_id_server: None,
+            command: GameCommand::Turn {
+                snake_id: 0,
+                direction: Direction::Up,
+            },
+        };
+        let sent_at = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .unwrap();
+        let mut pending_commands = BTreeMap::from([
+            (
+                1,
+                PendingCommand {
+                    message: message.clone(),
+                    sent_at_unix_ms: 123_456,
+                    sent_at,
+                },
+            ),
+            (
+                2,
+                PendingCommand {
+                    message: message.clone(),
+                    sent_at_unix_ms: 123_456,
+                    sent_at,
+                },
+            ),
+            (
+                3,
+                PendingCommand {
+                    message,
+                    sent_at_unix_ms: 123_456,
+                    sent_at,
+                },
+            ),
+        ]);
+        let mut metrics = SessionMetrics::default();
+
+        assert!(record_scheduled_pending_command_resolution(
+            &mut pending_commands,
+            &mut metrics,
+            1,
+        ));
+        assert!(!record_scheduled_pending_command_resolution(
+            &mut pending_commands,
+            &mut metrics,
+            1,
+        ));
+        assert_eq!(
+            metrics.command_outcome_counts_by_sent_unix_second,
+            BTreeMap::from([(123, 1)])
         );
-        assert!(pending.is_empty());
+        assert_eq!(
+            metrics.scheduled_command_counts_by_sent_unix_second,
+            BTreeMap::from([(123, 1)])
+        );
+
+        record_all_pending_command_resolutions(&mut pending_commands, &mut metrics);
+        record_all_pending_command_resolutions(&mut pending_commands, &mut metrics);
+        assert!(pending_commands.is_empty());
+        assert_eq!(
+            metrics.command_outcome_counts_by_sent_unix_second,
+            BTreeMap::from([(123, 3)])
+        );
+        assert!(metrics.command_outcome_max_latency_ms_by_sent_unix_second[&123] >= 5);
     }
 
     #[test]
@@ -5328,7 +5508,14 @@ mod tests {
             reconnects: 0,
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 2,
-            pending_commands: BTreeMap::from([(1, pending)]),
+            pending_commands: BTreeMap::from([(
+                1,
+                PendingCommand {
+                    message: pending,
+                    sent_at_unix_ms: unix_time_ms(),
+                    sent_at: Instant::now(),
+                },
+            )]),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_owned())
@@ -5374,6 +5561,33 @@ mod tests {
                 .values()
                 .sum::<u64>()
                 > 0
+        );
+        assert!(
+            session
+                .record
+                .metrics
+                .scheduled_command_counts_by_sent_unix_second
+                .values()
+                .sum::<u64>()
+                > 0
+        );
+        assert!(
+            session
+                .record
+                .metrics
+                .command_outcome_counts_by_sent_unix_second
+                .values()
+                .sum::<u64>()
+                > 0
+        );
+        assert!(
+            session
+                .record
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second
+                .values()
+                .next()
+                .is_some()
         );
         assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
         assert_eq!(

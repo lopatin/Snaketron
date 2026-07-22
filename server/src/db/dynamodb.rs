@@ -33,6 +33,7 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
+const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
 
 /// How long a SERVER registration item lives past its last heartbeat before
 /// DynamoDB TTL reaps it. Deliberately generous: staleness is already handled
@@ -45,13 +46,27 @@ const SERVER_REGISTRATION_TTL_SECONDS: i64 = 3600;
 /// response timeout, so a hung request would otherwise stall its caller
 /// indefinitely without ever erroring. Every DynamoDB client in the server
 /// must be built through this function.
+fn dynamodb_retry_config() -> aws_config::retry::RetryConfig {
+    aws_config::retry::RetryConfig::standard().with_max_attempts(DYNAMODB_RUNTIME_MAX_ATTEMPTS)
+}
+
 pub async fn dynamodb_client() -> Client {
     let timeouts = aws_config::timeout::TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(2))
         .operation_attempt_timeout(Duration::from_secs(5))
         .operation_timeout(Duration::from_secs(15))
         .build();
-    let config = aws_config::from_env().timeout_config(timeouts).load().await;
+    // Completion waves can briefly consume a fresh table key range. Keep
+    // admission and task registration on the SDK's operation-safe retry path:
+    // each retry replays the same request, while counter ambiguity can only
+    // leave an unused ID. The default is three attempts, which proved too
+    // short during the fixed autoscaling envelope.
+    let retries = dynamodb_retry_config();
+    let config = aws_config::from_env()
+        .timeout_config(timeouts)
+        .retry_config(retries)
+        .load()
+        .await;
     Client::new(&config)
 }
 
@@ -3367,6 +3382,14 @@ impl DynamoDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_dynamodb_standard_retry_policy_is_capped_at_five_attempts() {
+        assert_eq!(
+            dynamodb_retry_config().max_attempts(),
+            DYNAMODB_RUNTIME_MAX_ATTEMPTS
+        );
+    }
 
     #[test]
     fn completed_game_retention_uses_configured_positive_days() {

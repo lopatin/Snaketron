@@ -543,7 +543,7 @@ Timing is an operational objective, never a substitute for fencing or durability
 
 | Measure | Initial release target |
 | --- | --- |
-| Planned partition handoff | Under the transition envelope, continuously submitted commands all reach a terminal outcome, deterministic fingerprints match, and the three-second stale overlay never activates. |
+| Planned partition handoff | Under the transition envelope, continuously submitted commands all reach a terminal outcome within one second of their original send, deterministic fingerprints match, and the predictive client never freezes or activates the three-second stale overlay. |
 | Planned WebSocket drain | Zero measured interval without either old or replacement authenticated, game-ready socket for supported clients; completion within the 20-second client handoff window and 45-second application deadline. |
 | Crash takeover with another ready task and healthy Valkey | p99 first fresh authoritative output within five seconds. |
 | Hard gateway crash with survivor and healthy ingress | Automatic authenticated game resume p99 within ten seconds; uninterrupted transport is not promised. |
@@ -569,7 +569,7 @@ Required metrics:
 - checkpoint age/size/failures and active-game index parity;
 - recovered games, replay count, and deterministic fingerprint divergence;
 - active WebSockets and planned-drain failures;
-- load-test reconnect, authentication, rejoin, snapshot, command-outcome barrier, usable-session-gap, and socket-generation evidence, combined with real-browser Playwright stale-overlay evidence;
+- load-test reconnect, authentication, rejoin, snapshot, per-command terminal-outcome latency, command-outcome barrier, usable-session-gap, and socket-generation evidence, combined with real-browser Playwright stale-overlay evidence;
 - match claim conflicts and prevented duplicate completion effects;
 - ECS CPU/memory and staging evidence for Valkey latency and functional shared
   Traefik/NAT capacity through connection success, admission latency/errors,
@@ -593,8 +593,8 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 
 | Test | Pass criteria |
 | --- | --- |
-| Scale `1 -> 10` under the fixed one-task-safe continuity load while games receive commands | Exactly nine partitions move, owner counts become one each, no active WebSocket hard-reconnect occurs, every submitted command reaches a terminal outcome, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
-| Scale `10 -> 1` under the same continuity load with games, lobbies, matchmaking, and idle clients distributed across the service | Exactly nine partitions move; every observed drain handoff has zero usable-session gap and one command owner; no active socket hard-reconnects; four newly started low-CPU sessions per second each reach a ready backend, with p99 initial WebSocket authentication within ten seconds and no terminal error; no game completion is awaited. |
+| Scale `1 -> 10` under the fixed one-task-safe continuity load while games receive commands | Exactly nine partitions move, owner counts become one each, no active WebSocket hard-reconnect occurs, every full transition second resolves exactly its submitted commands with no terminal outcome taking more than one second from original send, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
+| Scale `10 -> 1` under the same continuity load with games, lobbies, matchmaking, and idle clients distributed across the service | Exactly nine partitions move; every observed drain handoff has zero usable-session gap and one command owner; every full transition second resolves exactly its submitted commands with no terminal outcome taking more than one second; no active socket hard-reconnects; four newly started low-CPU sessions per second each reach a ready backend, with p99 initial WebSocket authentication within ten seconds and no terminal error; no game completion is awaited. |
 | Kill after command `XADD`, before group delivery | Successor reads it as new work and applies one logical result. |
 | Kill after delivery into pending, before schedule | `XAUTOCLAIM` recovers it and applies one logical result. |
 | Kill after schedule, before checkpoint | Replay does not lose or double-apply the command. |
@@ -630,7 +630,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
 | Run the fixed 64-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. |
-| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; no Valkey eviction/write failure, zero-ready interval, ECS health failure, or Traefik health failure occurs. |
+| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; no Valkey eviction/write failure, zero-ready interval, ECS health failure, or Traefik health failure occurs. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan

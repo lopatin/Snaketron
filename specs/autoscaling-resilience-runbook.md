@@ -304,7 +304,7 @@ SNAKETRON_TRAEFIK_METRICS_CONTROL_URL=http://127.0.0.1:19090/metrics \
 ./run_autoscaling_resilience_tests.sh --staging-crash
 ```
 
-The “Ephemeral Development Certification” workflow provisions one isolated
+The “Ephemeral Development Certification” workflow provisions one short-lived
 development environment, opens both SSM tunnels, runs those commands in that
 order, uploads both evidence directories, and always destroys and verifies the
 absence of the ephemeral stacks afterward. It does not preserve or transition
@@ -318,7 +318,8 @@ advance, the assignment's eligible-member set exactly equals active membership,
 and each staircase leg moves the minimum nine partitions. A fresh ten-task
 membership/ECS-health pair is captured immediately before scale-in. These
 snapshots complement continuous unowned-duration and fencing metrics. It also
-writes `scale-in-window.json`; report schema 9 includes each session's launch
+records the automatic, reset, forced scale-out, and forced scale-in windows;
+report schema 10 includes each session's launch
 wave, start time, and bounded initial admission-ready duration so the admission
 assertion is phase-specific.
 
@@ -327,7 +328,9 @@ Scaling evidence has four deliberately distinct parts:
 1. With policy writes enabled, fixed Run A load must cause an AWS-observed
    desired/running count above one and a successful target-tracking scaling
    activity. The runner fails immediately if Run A exits first. This is the
-   automatic scale-out proof.
+   automatic scale-out proof. Its strict continuity window begins at the first
+   successful scaling activity, excluding only the preceding client ramp when
+   no ownership transition exists.
 2. Policy writes are temporarily suspended only for the deterministic forced
    1-to-10-to-1 ownership staircase under Run A and its companion/admission
    probes. The settled control-plane snapshots prove that leg's exact ownership
@@ -341,11 +344,16 @@ Scaling evidence has four deliberately distinct parts:
    target-tracking activity. This observation is separate from the forced
    staircase.
 
-Report schema 9 records coordinator-observed, server-confirmed peak
+Report schema 10 records coordinator-observed, server-confirmed peak
 authentication concurrency, fully joined active-game concurrency, lifecycle
 timestamps, exact initial task boot identity, planned-handoff evidence, and a
-per-second aggregate of successful command writes plus first-seen authoritative
-scheduled outcomes by partition. It also retains each successful hard recovery's
+per-second aggregate of logical command submissions, receipt-time scheduled
+outcomes by partition, and accepted/scheduled outcomes by original send second.
+It also records every terminal command outcome by original send second and that
+second's maximum end-to-end latency. Every
+full second under executor movement and capacity load must resolve exactly its
+sent-command count with no result taking more than one second; this prevents a
+catch-up burst from hiding an authoritative pause. The report retains each successful hard recovery's
 old/new task identity and socket generation, detection/ready timestamps, fresh
 snapshot proof, and pending-command counts before and after the outcome barrier.
 The count after the initial barrier is diagnostic, not a zero gate: a command
@@ -362,9 +370,10 @@ idle admission report proves uninterrupted four-session waves and ten-second
 p99 readiness through the scale-in window. Exact task identities must cover the
 settled ten-task membership in both the continuity and capacity phases.
 
-The runner derives the Traefik service label from the verified ECS task
-definition, continuously scrapes its service-server-up gauge, and fails on
-any scrape error or zero-healthy-backend sample. Settled ECS phase snapshots
+The runner continuously scrapes Traefik's service-server-up gauge, accepts its
+opaque per-task service IDs, and matches settled tasks by exact private-IP
+`:8080` URL. It fails on any scrape error or zero-healthy-backend sample.
+Settled ECS phase snapshots
 require every running task to be healthy. After CloudWatch ingestion settles,
 the runner requires complete time-bucket coverage for ECS CPU/memory, ElastiCache
 CPU/memory/connections/evictions, Traefik-host CPU/network, and resilience

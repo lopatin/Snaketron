@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 9;
+pub const REPORT_SCHEMA_VERSION: u32 = 10;
 
 /// Milliseconds since the Unix epoch, suitable for report timestamps.
 pub fn unix_time_ms() -> u64 {
@@ -238,8 +238,8 @@ pub struct SessionMetrics {
     /// terminal event on the old socket.
     #[serde(default)]
     pub planned_handoff_continuity_proofs: u64,
-    /// AI game commands successfully written to the old socket while planned
-    /// candidates were being prepared.
+    /// Logical AI game-command submissions made while planned candidates were
+    /// being prepared.
     #[serde(default)]
     pub planned_handoff_commands_sent: u64,
     #[serde(default)]
@@ -250,16 +250,28 @@ pub struct SessionMetrics {
     pub messages_received: u64,
     pub game_events_received: u64,
     pub commands_sent: u64,
-    /// Successful initial command writes grouped by the load generator's wall
-    /// clock second. This keeps long certification reports bounded while still
-    /// proving that the configured command profile remained active throughout
-    /// a measured scaling window.
+    /// Logical command submissions grouped by their original wall-clock send
+    /// second. Ambiguous first writes retain this bucket across stable-identity
+    /// resends.
     #[serde(default)]
     pub command_counts_by_unix_second: BTreeMap<u64, u64>,
-    /// First-seen authoritative CommandScheduledV2 outcomes grouped by the load
+    /// First-seen authoritative scheduled outcomes grouped by the load
     /// generator's receipt second.
     #[serde(default)]
     pub scheduled_command_counts_by_unix_second: BTreeMap<u64, u64>,
+    /// First-seen accepted/scheduled outcomes grouped by the command's
+    /// original send second, including exact outcomes replayed after recovery.
+    #[serde(default)]
+    pub scheduled_command_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Every first terminal executor outcome, grouped by the command's
+    /// original send second. This includes scheduled, rejected, and commands
+    /// made definitive no-ops by terminal game state.
+    #[serde(default)]
+    pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Worst original-send-to-terminal-outcome latency for each send second.
+    /// Resends retain the original timestamp.
+    #[serde(default)]
+    pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
     pub disconnects: u64,
     pub reconnects: u64,
 }
@@ -565,6 +577,20 @@ pub struct AggregateMetrics {
     /// Game IDs map to partitions with `game_id % 10`.
     #[serde(default)]
     pub scheduled_command_counts_by_partition_and_unix_second: BTreeMap<u32, BTreeMap<u64, u64>>,
+    /// Sum of first-seen accepted/scheduled outcomes keyed by original send
+    /// second. This is the causal liveness companion to the terminal-outcome
+    /// count and latency maps.
+    #[serde(default)]
+    pub scheduled_command_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Sum of all first terminal command outcomes, keyed by original send
+    /// second. Together with the send histogram this proves eventual semantic
+    /// resolution without confusing receipt-time bucket boundaries.
+    #[serde(default)]
+    pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Maximum first-send-to-terminal-outcome latency observed in each send
+    /// second across every session.
+    #[serde(default)]
+    pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -706,6 +732,9 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut command_counts_by_unix_second = BTreeMap::<u64, u64>::new();
     let mut scheduled_command_counts_by_partition_and_unix_second =
         BTreeMap::<u32, BTreeMap<u64, u64>>::new();
+    let mut scheduled_command_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut command_outcome_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::<u64, u64>::new();
 
     let sessions = run
         .sessions
@@ -796,6 +825,27 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
                         .or_default();
                     *partition_total = partition_total.saturating_add(*count);
                 }
+            }
+            for (second, count) in &session.metrics.scheduled_command_counts_by_sent_unix_second {
+                let total = scheduled_command_counts_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *total = total.saturating_add(*count);
+            }
+            for (second, count) in &session.metrics.command_outcome_counts_by_sent_unix_second {
+                let total = command_outcome_counts_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *total = total.saturating_add(*count);
+            }
+            for (second, latency_ms) in &session
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second
+            {
+                let maximum = command_outcome_max_latency_ms_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *maximum = (*maximum).max(*latency_ms);
             }
             traffic.disconnects = traffic
                 .disconnects
@@ -955,6 +1005,9 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             traffic,
             command_counts_by_unix_second,
             scheduled_command_counts_by_partition_and_unix_second,
+            scheduled_command_counts_by_sent_unix_second,
+            command_outcome_counts_by_sent_unix_second,
+            command_outcome_max_latency_ms_by_sent_unix_second,
         },
         failures_by_phase,
         failures_by_message,
@@ -1617,6 +1670,14 @@ mod tests {
         first.metrics.game_events_received = 8;
         first.metrics.command_counts_by_unix_second = BTreeMap::from([(10, 4), (11, 3)]);
         first.metrics.scheduled_command_counts_by_unix_second = BTreeMap::from([(10, 3), (11, 3)]);
+        first.metrics.scheduled_command_counts_by_sent_unix_second =
+            BTreeMap::from([(10, 2), (11, 3)]);
+        first.metrics.command_outcome_counts_by_sent_unix_second =
+            BTreeMap::from([(10, 4), (11, 2)]);
+        first
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second =
+            BTreeMap::from([(10, 90), (11, 110)]);
         first.game_id = Some(21);
         first.record_lifecycle(
             SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, 1)
@@ -1661,6 +1722,11 @@ mod tests {
         second.metrics.messages_sent = 11;
         second.metrics.command_counts_by_unix_second = BTreeMap::from([(10, 2)]);
         second.metrics.scheduled_command_counts_by_unix_second = BTreeMap::from([(10, 1)]);
+        second.metrics.scheduled_command_counts_by_sent_unix_second = BTreeMap::from([(10, 1)]);
+        second.metrics.command_outcome_counts_by_sent_unix_second = BTreeMap::from([(10, 2)]);
+        second
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::from([(10, 120)]);
         second.game_id = Some(32);
         second.record_lifecycle(SessionLifecycleRecord::new(
             SessionPhase::WebSocketAuthentication,
@@ -1704,7 +1770,7 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
-        assert_eq!(report.schema_version, 9);
+        assert_eq!(report.schema_version, 10);
         assert_eq!(report.sessions[0].started_at_unix_ms, 0);
         assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
         assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
@@ -1779,6 +1845,20 @@ mod tests {
                 (2, BTreeMap::from([(10, 1)])),
             ])
         );
+        assert_eq!(
+            report.metrics.scheduled_command_counts_by_sent_unix_second,
+            BTreeMap::from([(10, 3), (11, 3)])
+        );
+        assert_eq!(
+            report.metrics.command_outcome_counts_by_sent_unix_second,
+            BTreeMap::from([(10, 6), (11, 2)])
+        );
+        assert_eq!(
+            report
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second,
+            BTreeMap::from([(10, 120), (11, 110)])
+        );
         let report_json = serde_json::to_value(&report).expect("aggregate report serializes");
         assert_eq!(
             report_json.pointer("/metrics/command_counts_by_unix_second/10"),
@@ -1788,6 +1868,10 @@ mod tests {
             report_json
                 .pointer("/metrics/scheduled_command_counts_by_partition_and_unix_second/1/11"),
             Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/command_outcome_max_latency_ms_by_sent_unix_second/10"),
+            Some(&serde_json::json!(120))
         );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);

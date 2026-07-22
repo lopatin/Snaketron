@@ -1111,11 +1111,42 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
             redis
                 .xlen::<_, usize>(namespace.command_quarantine(partition))
                 .await?,
-            1
+            0,
+            "a replyable rejection is a normal terminal outcome, not poison"
+        );
+        let poison_id = bus.publish_command_fenced(&guard, &command).await?;
+        let poison_deliveries = consumer.read_new_blocking().await?;
+        assert!(
+            poison_deliveries
+                .iter()
+                .any(|delivery| delivery.stream_id == poison_id)
+        );
+        bus.quarantine_and_ack_fenced(
+            &guard,
+            &poison_id,
+            b"malformed-fixture",
+            "fixture cannot receive a terminal outcome",
+        )
+        .await?;
+        assert_eq!(
+            bus.xack_fenced(&guard, std::slice::from_ref(&poison_id))
+                .await?,
+            0,
+            "the quarantine transaction must already have ACKed the poison entry"
+        );
+        assert_eq!(
+            redis
+                .xlen::<_, usize>(namespace.command_quarantine(partition))
+                .await?,
+            1,
+            "unreplyable poison must remain quarantined for diagnosis"
         );
 
         let _: usize = redis
-            .xdel(RedisKeys::stream_commands(partition), &[&stream_id])
+            .xdel(
+                RedisKeys::stream_commands(partition),
+                &[&stream_id, &poison_id],
+            )
             .await?;
         let _: usize = redis
             .xdel(RedisKeys::stream_events(partition), &[&rejection_stream_id])

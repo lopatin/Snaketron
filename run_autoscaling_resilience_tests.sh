@@ -22,6 +22,8 @@ lobby_population_pid=""
 matchmaking_population_pid=""
 traefik_monitor_pid=""
 traefik_monitor_dir=""
+ecs_runtime_monitor_pid=""
+ecs_runtime_monitor_dir=""
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -32,6 +34,56 @@ require_command() {
 
 unix_time_ms() {
   jq -nr 'now * 1000 | floor'
+}
+
+traefik_sample_has_healthy_backend() {
+  local sample="$1"
+  awk '
+    /^traefik_service_server_up{/ {
+      if ($0 ~ /url="http:\/\/[^\"]+:8080"/ && ($NF + 0) > 0) {
+        found = 1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$sample"
+}
+
+traefik_sample_has_healthy_task() {
+  local sample="$1"
+  local private_ipv4="$2"
+  awk -v ip="$private_ipv4" '
+    index($0, "traefik_service_server_up{") == 1 {
+      if (index($0, "url=\"http://" ip ":8080\"") && ($NF + 0) > 0) {
+        found = 1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$sample"
+}
+
+command_outcomes_meet_window_budget() {
+  local summary="$1"
+  local window="$2"
+  local max_latency_ms="${3:-1000}"
+  jq -e \
+    --argjson max_latency_ms "$max_latency_ms" \
+    --slurpfile window "$window" '
+      . as $report
+      | (($window[0].started_at_unix_ms / 1000) | ceil) as $first_second
+      | (($window[0].finished_at_unix_ms / 1000) | floor) as $after_last_second
+      | ($after_last_second - $first_second) >= 1
+        and all(range($first_second; $after_last_second);
+          . as $second
+          | ($report.metrics.command_counts_by_unix_second
+              [($second | tostring)] // 0) as $sent
+          | $sent > 0
+            and ($report.metrics.command_outcome_counts_by_sent_unix_second
+              [($second | tostring)] // 0) == $sent
+            and ($report.metrics.command_outcome_max_latency_ms_by_sent_unix_second
+              [($second | tostring)] // ($max_latency_ms + 1)) <= $max_latency_ms
+            and ($report.metrics.scheduled_command_counts_by_sent_unix_second
+              [($second | tostring)] // 0) > 0)
+    ' "$summary" >/dev/null
 }
 
 sanitize_task_definition_evidence() {
@@ -260,9 +312,87 @@ test_live_task_definition_gate() {
   done
 }
 
+test_traefik_server_up_parser() {
+  local fixture
+  fixture="$(mktemp)"
+  printf '%s\n' \
+    '# TYPE traefik_service_server_up gauge' \
+    'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 1' \
+    'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 0' \
+    >"$fixture"
+
+  local result=0
+  traefik_sample_has_healthy_backend "$fixture" || result=1
+  traefik_sample_has_healthy_task "$fixture" 10.0.1.10 || result=1
+  if traefik_sample_has_healthy_task "$fixture" 10.0.2.20; then
+    result=1
+  fi
+  if traefik_sample_has_healthy_task "$fixture" 10.0.3.30; then
+    result=1
+  fi
+  rm -f "$fixture"
+
+  if (( result != 0 )); then
+    echo "Traefik server-up parser accepted an unhealthy task or rejected a healthy opaque service" >&2
+    return 1
+  fi
+}
+
+test_command_outcome_window_gate() {
+  local fixture_dir
+  fixture_dir="$(mktemp -d)"
+  local summary="$fixture_dir/summary.json"
+  local window="$fixture_dir/window.json"
+  local invalid="$fixture_dir/invalid.json"
+  jq -n '{
+    metrics: {
+      command_counts_by_unix_second: {"10": 5, "11": 6},
+      scheduled_command_counts_by_sent_unix_second: {"10": 4, "11": 5},
+      command_outcome_counts_by_sent_unix_second: {"10": 5, "11": 6},
+      command_outcome_max_latency_ms_by_sent_unix_second: {"10": 999, "11": 1000}
+    }
+  }' >"$summary"
+  jq -n '{started_at_unix_ms: 9500, finished_at_unix_ms: 12000}' >"$window"
+
+  local result=0
+  command_outcomes_meet_window_budget "$summary" "$window" || result=1
+  jq '.metrics.command_outcome_max_latency_ms_by_sent_unix_second["11"] = 1001' \
+    "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq '.metrics.command_outcome_counts_by_sent_unix_second["10"] = 4' \
+    "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq '.metrics.command_counts_by_unix_second["11"] = 0' \
+    "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq '.metrics.scheduled_command_counts_by_sent_unix_second["11"] = 0' \
+    "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq -n '{started_at_unix_ms: 8500, finished_at_unix_ms: 12000}' >"$invalid"
+  if command_outcomes_meet_window_budget "$summary" "$invalid"; then
+    result=1
+  fi
+  rm -rf "$fixture_dir"
+
+  if (( result != 0 )); then
+    echo "Command-outcome window gate accepted a stall or rejected valid continuity" >&2
+    return 1
+  fi
+}
+
 test_evidence_safety_helpers() {
   test_task_definition_evidence_sanitizer
   test_live_task_definition_gate
+  test_traefik_server_up_parser
+  test_command_outcome_window_gate
 }
 
 run_offline_cdk_synth() {
@@ -982,6 +1112,84 @@ wait_for_automatic_scale_in() {
   return 1
 }
 
+capture_stopped_tasks_snapshot() {
+  local output="$1"
+  local pending="$output.pending"
+  local task_list="$output.task-list.pending"
+  local stopped_arns
+  aws ecs list-tasks \
+    --region "$SNAKETRON_AWS_REGION" \
+    --cluster "$SNAKETRON_ECS_CLUSTER" \
+    --service-name "$SNAKETRON_ECS_SERVICE" \
+    --desired-status STOPPED >"$task_list" || {
+      rm -f "$task_list" "$pending"
+      return 1
+    }
+  stopped_arns="$(jq -r '.taskArns[]?' "$task_list" | tr '\n' ' ')"
+  rm -f "$task_list"
+  if [[ -n "$stopped_arns" ]]; then
+    # ECS task ARNs contain no whitespace. Intentional splitting supplies the
+    # AWS CLI's variadic --tasks argument.
+    aws ecs describe-tasks \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --tasks $stopped_arns >"$pending" || {
+        rm -f "$pending"
+        return 1
+      }
+  else
+    jq -n '{tasks: [], failures: []}' >"$pending"
+  fi
+  mv "$pending" "$output"
+}
+
+start_ecs_runtime_monitor() {
+  ecs_runtime_monitor_dir="$1/ecs-runtime-observations"
+  mkdir -p "$ecs_runtime_monitor_dir"
+  jq -n '{tasks: [], failures: []}' \
+    >"$ecs_runtime_monitor_dir/000000.json"
+  (
+    local sequence=0
+    while true; do
+      sequence=$((sequence + 1))
+      local sample
+      printf -v sample '%s/%06d.json' "$ecs_runtime_monitor_dir" "$sequence"
+      capture_stopped_tasks_snapshot "$sample" || true
+      sleep 30
+    done
+  ) &
+  ecs_runtime_monitor_pid=$!
+}
+
+stop_ecs_runtime_monitor() {
+  local monitor_pid="${ecs_runtime_monitor_pid:-}"
+  if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+    kill -TERM "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+  ecs_runtime_monitor_pid=""
+}
+
+collect_observed_stopped_tasks() {
+  local output="$1"
+  local final_sample="$ecs_runtime_monitor_dir/final.json"
+  capture_stopped_tasks_snapshot "$final_sample"
+  jq -s '
+    ([.[] | .tasks[]?]
+      | group_by(.taskArn)
+      | map(. as $versions
+        | (($versions | map(select(.stoppedAt != null)) | last)
+          // ($versions | last)))) as $tasks
+    | {
+        tasks: $tasks,
+        failures: ([.[] | .failures[]?]
+          | unique_by([.arn, .reason, .detail])
+          | map(select(.arn as $arn
+            | ($tasks | any(.taskArn == $arn) | not))))
+      }
+  ' "$ecs_runtime_monitor_dir"/*.json >"$output"
+}
+
 start_traefik_monitor() {
   traefik_monitor_dir="$1/traefik"
   mkdir -p "$traefik_monitor_dir"
@@ -1022,11 +1230,11 @@ assert_traefik_monitor() {
   for sample in "$traefik_monitor_dir"/*.prom; do
     [[ -e "$sample" ]] || continue
     sample_count=$((sample_count + 1))
-    if ! grep -F "service=\"$staging_traefik_service_label\"" "$sample" \
-      | awk '
-          /^traefik_service_server_up{/ && ($NF + 0) > 0 { healthy = 1 }
-          END { exit(healthy ? 0 : 1) }
-        '; then
+    # Traefik's per-server metric uses an opaque service id even though its
+    # router metrics use the configured service name. This dedicated proxy has
+    # only the Snaketron ECS provider, so any healthy :8080 backend proves that
+    # public routing retained an available server.
+    if ! traefik_sample_has_healthy_backend "$sample"; then
       zero_ready_count=$((zero_ready_count + 1))
     fi
   done
@@ -1206,15 +1414,7 @@ wait_for_traefik_task_readiness() {
         if grep -Fq "\"task_id\":\"$task_id\"" "$observations"; then
           continue
         fi
-        if awk \
-          -v service="$staging_traefik_service_label" \
-          -v ip="$private_ipv4" '
-            index($0, "traefik_service_server_up{") == 1
-              && index($0, "service=\"" service "\"")
-              && index($0, "url=\"http://" ip ":8080")
-              && ($NF + 0) > 0 { found = 1 }
-            END { exit(found ? 0 : 1) }
-          ' "$sample"; then
+        if traefik_sample_has_healthy_task "$sample" "$private_ipv4"; then
           jq -cn \
             --arg task_id "$task_id" \
             --arg private_ipv4 "$private_ipv4" \
@@ -1275,22 +1475,7 @@ collect_ecs_runtime_evidence() {
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --services "$SNAKETRON_ECS_SERVICE" >"$ecs_dir/service.json"
-  local stopped_arns
-  stopped_arns="$(aws ecs list-tasks \
-    --region "$SNAKETRON_AWS_REGION" \
-    --cluster "$SNAKETRON_ECS_CLUSTER" \
-    --service-name "$SNAKETRON_ECS_SERVICE" \
-    --desired-status STOPPED \
-    --query 'taskArns[]' --output text)"
-  if [[ -n "$stopped_arns" ]]; then
-    # See capture_ecs_health: ARN whitespace splitting is intentional.
-    aws ecs describe-tasks \
-      --region "$SNAKETRON_AWS_REGION" \
-      --cluster "$SNAKETRON_ECS_CLUSTER" \
-      --tasks $stopped_arns >"$ecs_dir/stopped-tasks.json"
-  else
-    jq -n '{tasks: [], failures: []}' >"$ecs_dir/stopped-tasks.json"
-  fi
+  collect_observed_stopped_tasks "$ecs_dir/stopped-tasks.json"
 
   jq -e --argjson started "$evidence_started_epoch" '
     def epoch:
@@ -1298,13 +1483,14 @@ collect_ecs_runtime_evidence() {
       | sub("\\.[0-9]+Z$"; "Z")
       | sub("\\+00:00$"; "Z")
       | fromdateiso8601;
-    [.tasks[] |
+    (.failures | length) == 0
+    and ([.tasks[] |
       select((.stoppedAt | epoch) >= $started)
       | select(
-          .stopCode == "EssentialContainerExited"
+          .stopCode != "ServiceSchedulerInitiated"
           or ((.stoppedReason // "") | test("unhealthy|out.of.memory|failed"; "i"))
         )
-    ] | length == 0
+    ] | length == 0)
   ' "$ecs_dir/stopped-tasks.json" >/dev/null \
     && jq -e \
       --argjson started "$evidence_started_epoch" \
@@ -1324,7 +1510,7 @@ collect_ecs_runtime_evidence() {
         | select(.message | test("unhealthy|failed to|was unable|insufficient"; "i"))
       ] | length) == 0
     ' "$ecs_dir/service.json" >/dev/null || {
-      echo "ECS recorded an unhealthy/failed task or scheduler failure during the measured run" >&2
+      echo "ECS recorded an unexpected task stop or scheduler failure during the measured run" >&2
       return 1
     }
 
@@ -1903,23 +2089,10 @@ collect_crash_ecs_runtime_evidence() {
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --services "$SNAKETRON_ECS_SERVICE" >"$ecs_dir/service.json"
-  local stopped_arns
-  stopped_arns="$(aws ecs list-tasks \
-    --region "$SNAKETRON_AWS_REGION" \
-    --cluster "$SNAKETRON_ECS_CLUSTER" \
-    --service-name "$SNAKETRON_ECS_SERVICE" \
-    --desired-status STOPPED \
-    --query 'taskArns[]' --output text)"
-  if [[ -n "$stopped_arns" ]]; then
-    aws ecs describe-tasks \
-      --region "$SNAKETRON_AWS_REGION" \
-      --cluster "$SNAKETRON_ECS_CLUSTER" \
-      --tasks $stopped_arns >"$ecs_dir/stopped-tasks.json"
-  else
-    jq -n '{tasks: [], failures: []}' >"$ecs_dir/stopped-tasks.json"
-  fi
+  collect_observed_stopped_tasks "$ecs_dir/stopped-tasks.json"
   jq -e \
     --arg task_definition "$staging_task_definition_arn" \
+    --argjson started "$evidence_started_epoch" \
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" '
       def epoch:
         sub("\\.[0-9]+\\+00:00$"; "Z")
@@ -1931,13 +2104,14 @@ collect_crash_ecs_runtime_evidence() {
           | select(.taskArn == $manifest[0].task_arn)
           | select((.stoppedAt | epoch) >= $kill_epoch)] as $expected
       | [.tasks[]
-          | select((.stoppedAt | epoch) >= $kill_epoch)
+          | select((.stoppedAt | epoch) >= $started)
           | select(.taskArn != $manifest[0].task_arn)
           | select(
-              .stopCode == "EssentialContainerExited"
+              .stopCode != "ServiceSchedulerInitiated"
               or ((.stoppedReason // "") | test("unhealthy|out.of.memory|failed"; "i"))
             )] as $unexpected
-      | ($expected | length) == 1
+      | (.failures | length) == 0
+        and ($expected | length) == 1
         and $expected[0].taskDefinitionArn == $task_definition
         and $expected[0].stopCode == "EssentialContainerExited"
         and ([ $expected[0].containers[]
@@ -2038,7 +2212,7 @@ assert_hard_crash_report() {
             else (($first_output_second + 1) * 1000) - $kill
             end),
           passed: (
-            $r.schema_version >= 9
+            $r.schema_version >= 10
             and $r.metadata.threshold_result == "passed"
             and $r.configured_max_concurrency == 272
             and $r.metadata.mode == "duel"
@@ -2192,6 +2366,8 @@ run_staging_suite() {
   matchmaking_population_pid=""
   traefik_monitor_pid=""
   traefik_monitor_dir=""
+  ecs_runtime_monitor_pid=""
+  ecs_runtime_monitor_dir=""
 
   set_scaling_suspended() {
     local value="$1"
@@ -2213,6 +2389,7 @@ run_staging_suite() {
     set +e
     local cleanup_ok=true
     stop_traefik_monitor
+    stop_ecs_runtime_monitor
     local population_pid
     for population_pid in \
       "$load_pid" \
@@ -2324,6 +2501,35 @@ run_staging_suite() {
     return 1
   }
 
+  wait_for_executor_drain() {
+    local label="$1"
+    local expected_tasks="$2"
+    local snapshot="$report_dir/control-plane-$label.json"
+    local candidate="$snapshot.pending"
+    local deadline=$((SECONDS + 180))
+    while (( SECONDS < deadline )); do
+      if capture_control_status "$candidate" 2>/dev/null \
+        && jq -e --argjson expected "$expected_tasks" '
+          ([.live_members[] | select(.lifecycle == "ACTIVE")] | length) == $expected
+          and .assignment != null
+          and (.runtime_partitions | length) == 10
+          and all(.runtime_partitions[];
+            .consumer_group_exists
+            and .owner_matches
+            and .pending_count == 0
+            and .pending_completion_count == 0
+            and .quarantined_command_count == 0)
+        ' "$candidate" >/dev/null; then
+        mv "$candidate" "$snapshot"
+        return 0
+      fi
+      sleep 1
+    done
+    echo "One or more executor partitions did not fully drain for $label" >&2
+    [[ -f "$candidate" ]] && mv "$candidate" "$snapshot"
+    return 1
+  }
+
   wait_for_control_plane initial 1
   wait_for_ecs_health "$report_dir" initial 1
   if [[ "$crash_mode" == true ]]; then
@@ -2334,6 +2540,7 @@ run_staging_suite() {
   evidence_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   evidence_started_epoch="$(date -u +%s)"
   start_traefik_monitor "$report_dir"
+  start_ecs_runtime_monitor "$report_dir"
   # Keep the one-task continuity/staircase load separate from the supported
   # 272-session capacity load. Target-tracking latency must never leave the
   # complete capacity envelope on the initial 0.5-vCPU task.
@@ -2589,38 +2796,17 @@ run_staging_suite() {
     wait_for_running_count 10
     wait_for_ecs_health "$report_dir" hard-crash-replacement-10 10
     wait_for_traefik_task_readiness "$report_dir" hard-crash-replacement-10
+    wait_for_control_plane hard-crash-replacement-10 10
     require_load_running
     wait "$load_pid"
     load_pid=""
 
-    local final_control="$report_dir/control-plane-hard-crash-final-10.json"
-    local final_candidate="$final_control.pending"
-    local final_deadline=$((SECONDS + 60))
-    while (( SECONDS < final_deadline )); do
-      if capture_control_status "$final_candidate" 2>/dev/null \
-        && jq -e '
-            ([.live_members[] | select(.lifecycle == "ACTIVE")] | length) == 10
-            and .assignment != null
-            and all(.runtime_partitions[];
-              .consumer_group_exists
-              and .owner_matches
-              and .pending_count == 0
-              and .pending_completion_count == 0
-              and .quarantined_command_count == 0)
-          ' "$final_candidate" >/dev/null; then
-        mv "$final_candidate" "$final_control"
-        break
-      fi
-      sleep 0.2
-    done
-    if [[ ! -f "$final_control" ]]; then
-      echo "Executor partitions did not fully drain after hard-crash load completion" >&2
-      return 1
-    fi
+    wait_for_executor_drain hard-crash-final-10 10
 
     local load_summary="$report_dir/$run_id/summary.json"
     local evidence_finished_at
     evidence_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    stop_ecs_runtime_monitor
     collect_crash_ecs_runtime_evidence "$report_dir"
     stop_traefik_monitor
     assert_traefik_monitor "$report_dir"
@@ -2650,6 +2836,7 @@ run_staging_suite() {
     --run-id "$continuity_run_id" \
     --report-dir "$report_dir"
   )
+  local automatic_scale_out_started_ms
   "${continuity_command[@]}" &
   load_pid=$!
   # Sixty-four sessions are the first evidence-backed calibration. Failure to
@@ -2657,6 +2844,25 @@ run_staging_suite() {
   # escalate the initial task to the full capacity envelope.
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
+  # The load ramp is not itself an ownership transition. Start the strict
+  # continuity window at the first successful target-tracking action so every
+  # full second of the actual scale-out is required to carry command traffic.
+  automatic_scale_out_started_ms="$(jq -er \
+    --argjson started "$evidence_started_epoch" '
+      def epoch:
+        sub("\\.[0-9]+\\+00:00$"; "Z")
+        | sub("\\.[0-9]+Z$"; "Z")
+        | sub("\\+00:00$"; "Z")
+        | fromdateiso8601;
+      [.ScalingActivities[] as $activity
+        | ($activity.StartTime | epoch) as $at
+        | select(
+            $activity.StatusCode == "Successful"
+            and $at >= $started
+            and ($activity.Cause | test("alarm|target.tracking"; "i")))
+        | (($at * 1000) | floor)]
+      | min
+    ' "$report_dir/automatic-scale-out-activities.json")"
 
   # Freeze policy writes only for the deterministic ownership staircase. This
   # keeps the autoscaler from undoing the forced ten-to-one leg while commands
@@ -2680,10 +2886,23 @@ run_staging_suite() {
     "$report_dir" "$automatic_scale_out_label" "$automatic_scale_out_count"
   wait_for_traefik_task_readiness "$report_dir" "$automatic_scale_out_label"
   wait_for_control_plane "$automatic_scale_out_label" "$automatic_scale_out_count"
+  local automatic_scale_out_finished_ms
+  automatic_scale_out_finished_ms="$(unix_time_ms)"
+  jq -n \
+    --argjson started_at_unix_ms "$automatic_scale_out_started_ms" \
+    --argjson finished_at_unix_ms "$automatic_scale_out_finished_ms" '
+      {
+        started_at_unix_ms: $started_at_unix_ms,
+        finished_at_unix_ms: $finished_at_unix_ms,
+        duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
+      }
+    ' >"$report_dir/automatic-scale-out-window.json"
   require_load_running
   # Automatic scale-out may have stopped at any count from two through ten.
   # Return to a measured one-task baseline before calling the next phase a
   # deterministic 1 -> 10 -> 1 staircase.
+  local reset_to_one_started_ms
+  reset_to_one_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
@@ -2692,6 +2911,17 @@ run_staging_suite() {
   wait_for_running_count 1
   wait_for_control_plane forced-initial-1 1
   wait_for_ecs_health "$report_dir" forced-initial-1 1
+  local reset_to_one_finished_ms
+  reset_to_one_finished_ms="$(unix_time_ms)"
+  jq -n \
+    --argjson started_at_unix_ms "$reset_to_one_started_ms" \
+    --argjson finished_at_unix_ms "$reset_to_one_finished_ms" '
+      {
+        started_at_unix_ms: $started_at_unix_ms,
+        finished_at_unix_ms: $finished_at_unix_ms,
+        duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
+      }
+    ' >"$report_dir/reset-to-one-window.json"
   require_load_running
   local scale_out_started_ms
   scale_out_started_ms="$(unix_time_ms)"
@@ -2881,17 +3111,9 @@ run_staging_suite() {
   local matchmaking_summary="$report_dir/$matchmaking_run_id/summary.json"
   local admission_summary="$report_dir/$admission_run_id/summary.json"
   jq -e \
-    --slurpfile scale_out "$report_dir/scale-out-window.json" \
     --slurpfile scale_in "$report_dir/scale-in-window.json" '
-      def scheduled_at($report; $second):
-        [range(0; 10) as $partition
-          | ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
-              [($partition | tostring)][($second | tostring)] // 0)]
-        | add // 0;
       . as $report
-      | (($scale_out[0].started_at_unix_ms / 1000) | ceil) as $scale_out_first_second
-      | (($scale_out[0].finished_at_unix_ms / 1000) | floor) as $scale_out_after_last_second
-      | .schema_version >= 9
+      | .schema_version >= 10
       and .metadata.threshold_result == "passed"
       and .configured_max_concurrency == 64
       and .metadata.mode == "duel"
@@ -2911,6 +3133,8 @@ run_staging_suite() {
       and .metrics.traffic.reconnects == 0
       and ([.metrics.command_counts_by_unix_second[]] | add)
         == .metrics.traffic.commands_sent
+      and ([.metrics.command_outcome_counts_by_sent_unix_second[]] | add)
+        == .metrics.traffic.commands_sent
       and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
       and .metrics.planned_handoffs.attempts > 0
       and .metrics.planned_handoffs.failures == 0
@@ -2918,15 +3142,6 @@ run_staging_suite() {
       and .metrics.planned_handoffs.outcome_barriers > 0
       and .metrics.planned_handoff_duration_ms.max_ms <= 20000
       and .metrics.planned_handoffs.pending_commands_at_finish == 0
-      # Scale-up moves executor authority but shuts down no gateway. Prove
-      # continuous submitted and authoritative command flow; do not invent a
-      # WebSocket Drain requirement for a task that remains alive.
-      and ($scale_out_after_last_second - $scale_out_first_second) >= 1
-      and all(range($scale_out_first_second; $scale_out_after_last_second);
-        . as $second
-        | (($report.metrics.command_counts_by_unix_second
-              [($second | tostring)] // 0) > 0)
-          and scheduled_at($report; $second) > 0)
       and any(.sessions[];
         any(.planned_game_handoff_at_unix_ms[];
           . >= $scale_in[0].started_at_unix_ms
@@ -2935,9 +3150,27 @@ run_staging_suite() {
       and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
       and ([.metrics.scheduled_command_counts_by_partition_and_unix_second[] | .[]] | add) > 0
     ' "$continuity_summary" >/dev/null || {
-      echo "Continuity load did not prove the active-game 1 -> 10 -> 1 ownership and zero-gap handoff path" >&2
+      echo "Continuity load did not satisfy the active-game transition invariants" >&2
       exit 1
     }
+
+  # Cover automatic scale-out as well as both directions of the forced
+  # staircase. Receipt-time bucket counts alone can hide a one-second
+  # executor stall followed by a catch-up burst. One second is a deliberately
+  # strict user-continuity budget: the predictive client remains smooth while
+  # every input still receives a prompt authoritative result.
+  local movement_window
+  for movement_window in \
+    "$report_dir/automatic-scale-out-window.json" \
+    "$report_dir/reset-to-one-window.json" \
+    "$report_dir/scale-out-window.json" \
+    "$report_dir/scale-in-window.json"; do
+    command_outcomes_meet_window_budget \
+      "$continuity_summary" "$movement_window" 1000 || {
+        echo "Command outcomes exceeded the continuity budget in $movement_window" >&2
+        exit 1
+      }
+  done
 
   jq -e --slurpfile scale_in "$report_dir/scale-in-window.json" '
     def p99:
@@ -2958,7 +3191,7 @@ run_staging_suite() {
             sessions: .
           })
         | sort_by(.started_at_unix_ms)) as $admission_waves
-    | .schema_version >= 9
+    | .schema_version >= 10
     and .metadata.threshold_result == "passed"
     and .metadata.population == "idle"
     and .configured_max_concurrency == 208
@@ -3020,7 +3253,7 @@ run_staging_suite() {
       --slurpfile pre_scale_in "$report_dir/control-plane-pre-scale-in-10.json" '
         ($pre_scale_in[0].live_members
           | map(select(.lifecycle == "ACTIVE") | "\(.server_id):\(.boot_id)")) as $eligible_boot_ids
-        | .schema_version >= 9
+        | .schema_version >= 10
         and .metadata.threshold_result == "passed"
         and .metadata.population == $population
         and .configured_max_concurrency == $expected_concurrency
@@ -3239,7 +3472,7 @@ run_staging_suite() {
     | (($hold_started_at_ms / 1000) | ceil) as $hold_first_second
     | (($hold_finished_at_ms / 1000) | floor) as $hold_after_last_second
     | 1280 as $minimum_commands_per_second
-    | .schema_version >= 9
+    | .schema_version >= 10
     and .metadata.threshold_result == "passed"
     and .configured_max_concurrency == 272
     and .metadata.mode == "duel"
@@ -3266,8 +3499,13 @@ run_staging_suite() {
               and .authenticated_at_unix_ms <= $midpoint
               and .finished_at_unix_ms > $midpoint)] | length) >= 256
         and fully_joined_duels_at($report; $midpoint) >= 128
-        and (($report.metrics.command_counts_by_unix_second[($second | tostring)] // 0)
-          >= $minimum_commands_per_second)
+        and (($report.metrics.command_counts_by_unix_second
+            [($second | tostring)] // 0) as $sent
+          | $sent >= $minimum_commands_per_second
+            and ($report.metrics.command_outcome_counts_by_sent_unix_second
+              [($second | tostring)] // 0) == $sent
+            and ($report.metrics.command_outcome_max_latency_ms_by_sent_unix_second
+              [($second | tostring)] // 1001) <= 1000)
         and all(range(0; 10);
           . as $partition
           | (($report.metrics.scheduled_command_counts_by_partition_and_unix_second
@@ -3276,6 +3514,8 @@ run_staging_suite() {
     and .metrics.traffic.reconnects == 0
     and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
     and ([.metrics.command_counts_by_unix_second[]] | add)
+      == .metrics.traffic.commands_sent
+    and ([.metrics.command_outcome_counts_by_sent_unix_second[]] | add)
       == .metrics.traffic.commands_sent
     and .metrics.planned_handoffs.pending_commands_at_finish == 0
     and (.metrics.initial_admission_ready_ms.p99_ms // 10001) <= 10000
@@ -3345,6 +3585,8 @@ run_staging_suite() {
   wait_for_automatic_scale_in "$report_dir" "$automatic_scale_in_started_epoch"
   wait_for_control_plane automatic-final-1 1
   wait_for_ecs_health "$report_dir" automatic-final-1 1
+  wait_for_executor_drain automatic-final-drained-1 1
+  stop_ecs_runtime_monitor
   collect_ecs_runtime_evidence "$report_dir"
   jq -n \
     --slurpfile automatic_out "$report_dir/automatic-scale-out.json" \

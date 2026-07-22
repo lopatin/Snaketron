@@ -92,8 +92,8 @@ impl PartitionSubscription {
 /// keeping memory strictly bounded (the old implementation never trimmed).
 const EVENTS_MAXLEN: usize = 8192;
 const SNAPREQ_MAXLEN: usize = 64;
-/// Poison/rejection entries are operational evidence, not an unbounded
-/// correctness log. The terminal outcome is independently durable before ACK.
+/// Poison entries are operational evidence, not an unbounded correctness log.
+/// Valid commands receive a durable terminal outcome instead of quarantine.
 const COMMAND_QUARANTINE_MAXLEN: usize = 8192;
 
 /// How long one XREAD parks before returning empty. Purely a liveness /
@@ -819,10 +819,11 @@ impl GameBus {
     }
 
     /// Durably resolves a syntactically valid v2 command that cannot be
-    /// incorporated by an actor. The client-visible rejection, diagnostic
-    /// quarantine entry, and consumer-group ACK share one fenced transaction,
-    /// so an executor crash can never retire the command without first making
-    /// its terminal outcome replayable from the event stream.
+    /// incorporated by an actor. The client-visible rejection and
+    /// consumer-group ACK share one fenced transaction, so an executor crash
+    /// can never retire the command without first making its terminal outcome
+    /// replayable from the event stream. Quarantine is reserved for malformed
+    /// or internally inconsistent entries that cannot receive such an outcome.
     pub async fn reject_and_ack_fenced(
         &self,
         guard: &PartitionLeaseGuard,
@@ -853,34 +854,27 @@ impl GameBus {
             let script = redis::Script::new(
                 r#"
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {-1, ''} end
-            local journal_type = redis.call('TYPE', KEYS[5])
+            local journal_type = redis.call('TYPE', KEYS[4])
             if type(journal_type) == 'table' then journal_type = journal_type.ok end
             if journal_type ~= 'none' and journal_type ~= 'hash' then return {-2, ''} end
-            redis.call(
-                'XADD', KEYS[2], 'MAXLEN', '~', ARGV[7], '*',
-                'source_id', ARGV[2], 'raw', '', 'reason', ARGV[3]
-            )
             local event_id = redis.call(
-                'XADD', KEYS[4], 'MAXLEN', '~', ARGV[5], '*', 'data', ARGV[6]
+                'XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*', 'data', ARGV[5]
             )
-            redis.call('XACK', KEYS[3], ARGV[4], ARGV[2])
-            redis.call('HDEL', KEYS[5], ARGV[2])
+            redis.call('XACK', KEYS[2], ARGV[3], ARGV[2])
+            redis.call('HDEL', KEYS[4], ARGV[2])
             return {1, event_id}
                 "#,
             );
             script
                 .key(guard.lease_key())
-                .key(guard.namespace().command_quarantine(guard.partition()))
                 .key(RedisKeys::stream_commands(guard.partition()))
                 .key(RedisKeys::stream_events(guard.partition()))
                 .key(guard.namespace().command_decisions(guard.partition()))
                 .arg(guard.encoded_token())
                 .arg(stream_id)
-                .arg(reason)
                 .arg(guard.namespace().command_group(guard.partition()))
                 .arg(EVENTS_MAXLEN)
                 .arg(payload)
-                .arg(COMMAND_QUARANTINE_MAXLEN)
                 .invoke_async(&mut redis)
                 .await
         };
