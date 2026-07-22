@@ -150,6 +150,10 @@ pub async fn run_http_server(
     let region_routes = Router::new()
         .route("/api/regions", get(regions::list_regions))
         .route("/api/regions/user-counts", get(regions::get_user_counts))
+        .route(
+            "/api/regions/server-counts",
+            get(regions::get_server_counts),
+        )
         .with_state(state.clone());
 
     // Debug/observability routes: clients upload their sync trace (flight

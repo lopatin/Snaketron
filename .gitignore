@@ -11,3 +11,4 @@ replays/
 
 # Sync flight-recorder traces (see DEBUGGING.md)
 traces/
+loadtest-reports/

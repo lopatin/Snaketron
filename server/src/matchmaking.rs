@@ -578,6 +578,22 @@ fn find_ffa_combination(
         }
     }
 
+    // Keep a complete party intact even when older partial lobbies are also
+    // waiting. Without this fast path, the include-first backtracking below can
+    // fill the first slots from a partial lobby and turn members of the complete
+    // lobby into spectators.
+    if let Some((lobby_idx, _)) = lobbies
+        .iter()
+        .enumerate()
+        .find(|(_, lobby)| lobby.members.len() == max_players)
+    {
+        return Some(build_ffa_combination_from_selection(
+            lobbies,
+            &[lobby_idx],
+            max_players,
+        ));
+    }
+
     // Fast path: single-lobby decision based on wait thresholds
     if lobbies.len() == 1 {
         let lobby = &lobbies[0];
@@ -1347,10 +1363,54 @@ mod tests {
     use crate::matchmaking_manager::QueuedLobby;
     use common::{QueueMode, TeamId};
 
+    fn ffa_lobby(code: &str, user_ids: &[u32], queued_at: i64) -> QueuedLobby {
+        QueuedLobby {
+            lobby_code: code.to_string(),
+            members: user_ids
+                .iter()
+                .map(|user_id| LobbyMember {
+                    user_id: *user_id,
+                    username: format!("player_{user_id}"),
+                    ts: queued_at as f64,
+                })
+                .collect(),
+            avg_mmr: 1000,
+            game_types: vec![GameType::FreeForAll { max_players: 4 }],
+            queue_mode: QueueMode::Quickmatch,
+            queued_at,
+            requesting_user_id: user_ids[0],
+        }
+    }
+
     #[tokio::test]
     async fn test_match_creation_logic() {
         // Test the match creation logic
         // This would require mocking Redis and PubSub
+    }
+
+    #[test]
+    fn one_player_lobby_forms_a_solo_match() {
+        let lobby = QueuedLobby {
+            lobby_code: "SOLO1".to_string(),
+            members: vec![LobbyMember {
+                user_id: 5,
+                username: "solo_player".to_string(),
+                ts: 100.0,
+            }],
+            avg_mmr: 1000,
+            game_types: vec![GameType::Solo],
+            queue_mode: QueueMode::Quickmatch,
+            queued_at: 0,
+            requesting_user_id: 5,
+        };
+
+        let combo = find_best_lobby_combination(&[lobby], &GameType::Solo)
+            .expect("a one-player lobby should form one solo match");
+
+        assert_eq!(combo.total_players, 1);
+        assert_eq!(combo.lobbies.len(), 1);
+        assert!(combo.team_assignments.is_empty());
+        assert!(combo.spectators.is_empty());
     }
 
     #[test]
@@ -1396,5 +1456,67 @@ mod tests {
 
         assert_eq!(team_a_indices, vec![0]);
         assert_eq!(team_b_indices, vec![1]);
+    }
+
+    #[test]
+    fn four_player_lobby_splits_into_two_v_two_without_spectators() {
+        let lobby = QueuedLobby {
+            lobby_code: "TEAM4".to_string(),
+            members: (20..24)
+                .map(|user_id| LobbyMember {
+                    user_id,
+                    username: format!("player_{user_id}"),
+                    ts: f64::from(user_id),
+                })
+                .collect(),
+            avg_mmr: 1200,
+            game_types: vec![GameType::TeamMatch { per_team: 2 }],
+            queue_mode: QueueMode::Quickmatch,
+            queued_at: 0,
+            requesting_user_id: 20,
+        };
+
+        let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 2 })
+            .expect("a four-player lobby should form one 2v2 match");
+
+        assert_eq!(combo.total_players, 4);
+        assert_eq!(combo.lobbies.len(), 1);
+        assert!(combo.spectators.is_empty());
+        assert_eq!(combo.team_assignments.len(), 2);
+        assert!(
+            combo
+                .team_assignments
+                .iter()
+                .all(|assignment| assignment.member_indices.len() == 2)
+        );
+    }
+
+    #[test]
+    fn ffa_prefers_full_lobby_over_older_partial_lobby() {
+        let now = Utc::now().timestamp_millis();
+        let partial = ffa_lobby("PARTIAL", &[1], now - 1_000);
+        let full = ffa_lobby("FULL", &[10, 11, 12, 13], now);
+
+        let combo = find_ffa_combination(&[partial, full], 4)
+            .expect("a complete four-player FFA lobby should match");
+
+        assert_eq!(combo.total_players, 4);
+        assert_eq!(combo.lobbies.len(), 1);
+        assert_eq!(combo.lobbies[0].lobby_code, "FULL");
+        assert!(combo.spectators.is_empty());
+    }
+
+    #[test]
+    fn ffa_still_combines_partial_lobbies_when_no_full_lobby_exists() {
+        let now = Utc::now().timestamp_millis();
+        let first = ffa_lobby("FIRST", &[1, 2], now);
+        let second = ffa_lobby("SECOND", &[3, 4], now);
+
+        let combo = find_ffa_combination(&[first, second], 4)
+            .expect("two fresh two-player lobbies should form a four-player FFA");
+
+        assert_eq!(combo.total_players, 4);
+        assert_eq!(combo.lobbies.len(), 2);
+        assert!(combo.spectators.is_empty());
     }
 }

@@ -72,10 +72,17 @@ RUST_LOG=info cargo test -p server -- --nocapture
 ```
 
 
-### Run load test
+### Run a coordinated autoscaling load test
 ```bash
-cargo run -p bot -- --url http://localhost:8080 --mode duel --bots 40 --games 10 --queue-mode quickmatch
+cargo run --release -p loadtest -- \
+  --target https://snaketron.io \
+  --confirm-production \
+  --require-scale-out \
+  --mode duel \
+  --queue-mode competitive
 ```
+
+The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-party multiplayer lobbies; plays with the shared Rust/WASM game engine and AI; ramps to 256 maintained sessions by default; and writes an HTML/JSON report with per-failure details. See [loadtest/README.md](loadtest/README.md) for profiles, safety controls, and report semantics.
 
 ### Project Structure
 
@@ -83,6 +90,7 @@ cargo run -p bot -- --url http://localhost:8080 --mode duel --bots 40 --games 10
 - `server/` - Game server with WebSocket and gRPC support
 - `client/` - WebAssembly client module
 - `terminal/` - Terminal-based game viewer and replay player
+- `loadtest/` - Coordinated AI load generator and aggregate reporting
 - `specs/` - TLA+ specifications for distributed systems design
 
 ## Production Deployment
