@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use common::GameEventMessage;
+use common::{ClientCommandIdentityV2, GameCommandMessage, GameEventMessage};
 use futures_util::{SinkExt, StreamExt};
 use server::ws_server::WSMessage;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -11,6 +11,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 pub struct TestClient {
     ws: WebSocketStream<MaybeTlsStream<TokioTcpStream>>,
     pub user_id: Option<i32>,
+    command_session_id: String,
+    next_command_sequence: u64,
 }
 
 impl TestClient {
@@ -19,6 +21,8 @@ impl TestClient {
         Ok(TestClient {
             ws: ws_stream,
             user_id: None,
+            command_session_id: uuid::Uuid::new_v4().to_string(),
+            next_command_sequence: 1,
         })
     }
 
@@ -30,11 +34,18 @@ impl TestClient {
     }
 
     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
-        // Send the exact token string - useful for testing specific JWT tokens
+        // Send the exact token string and wait for the server-side verification
+        // boundary. Merely writing a token is not authentication.
         self.send_message(WSMessage::Token(token.to_string()))
             .await?;
-        // In a real test, we'd wait for a response or check connection state
-        Ok(())
+        let response = self.receive_message().await?;
+        match response {
+            WSMessage::Authenticated { .. } => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "Expected Authenticated response, got {:?}",
+                other
+            )),
+        }
     }
 
     pub async fn send_ping(&mut self) -> Result<()> {
@@ -52,6 +63,29 @@ impl TestClient {
 
     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
         self.send_message(WSMessage::JoinGame(game_id)).await
+    }
+
+    pub async fn send_game_command(
+        &mut self,
+        game_id: u32,
+        command: GameCommandMessage,
+    ) -> Result<()> {
+        let user_id = u32::try_from(
+            self.user_id
+                .ok_or_else(|| anyhow::anyhow!("test client is not authenticated"))?,
+        )?;
+        let sequence = self.next_command_sequence;
+        self.next_command_sequence = self.next_command_sequence.saturating_add(1);
+        self.send_message(WSMessage::GameCommandV2 {
+            command_id: ClientCommandIdentityV2 {
+                game_id,
+                user_id,
+                client_game_session_id: self.command_session_id.clone(),
+                sequence,
+            },
+            command,
+        })
+        .await
     }
 
     pub async fn send_message(&mut self, msg: WSMessage) -> Result<()> {

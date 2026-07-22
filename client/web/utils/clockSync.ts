@@ -3,21 +3,39 @@
  * between client and server to compensate for clock drift.
  */
 
-import { record as recordTrace } from './syncTrace';
-
 interface SyncMeasurement {
   offset: number;
   rtt: number;
   timestamp: number;
 }
 
-class ClockSync {
+type ClockSyncTimeout = ReturnType<typeof setTimeout>;
+
+export interface ClockSyncOptions {
+  now?: () => number;
+  scheduleTimeout?: (callback: () => void, delayMs: number) => ClockSyncTimeout;
+  cancelTimeout?: (timeout: ClockSyncTimeout) => void;
+}
+
+export class ClockSync {
   private measurements: SyncMeasurement[] = [];
   private maxMeasurements = 3;
   private initialSyncCount = 3;
   private syncsSent = 0;
   private syncInterval = 5000; // 5 seconds
   private onSyncRequest: ((clientTime: number) => void) | null = null;
+  private timeout: ClockSyncTimeout | null = null;
+  private readonly now: () => number;
+  private readonly scheduleTimeout: (callback: () => void, delayMs: number) => ClockSyncTimeout;
+  private readonly cancelTimeout: (timeout: ClockSyncTimeout) => void;
+
+  constructor(options: ClockSyncOptions = {}) {
+    this.now = options.now ?? (() => Date.now());
+    this.scheduleTimeout = options.scheduleTimeout ?? ((callback, delayMs) => (
+      setTimeout(callback, delayMs)
+    ));
+    this.cancelTimeout = options.cancelTimeout ?? ((timeout) => clearTimeout(timeout));
+  }
 
   /**
    * Set the callback to send sync requests
@@ -30,8 +48,18 @@ class ClockSync {
    * Start the synchronization process
    */
   start() {
+    // Reconnects and planned promotions may both start synchronization. Own a
+    // single timeout chain so each new active socket replaces the old one.
+    this.stop();
     this.syncsSent = 0;
     this.sendSyncRequest();
+  }
+
+  stop() {
+    if (this.timeout !== null) {
+      this.cancelTimeout(this.timeout);
+      this.timeout = null;
+    }
   }
 
   /**
@@ -40,19 +68,18 @@ class ClockSync {
   private sendSyncRequest() {
     if (!this.onSyncRequest) return;
 
-    const t1 = Date.now();
+    const t1 = this.now();
     this.onSyncRequest(t1);
 
     // Schedule next sync
-    if (this.syncsSent < this.initialSyncCount - 1) {
-      // During initial sync, send requests immediately
-      setTimeout(() => this.sendSyncRequest(), 100);
-    } else {
-      // After initial sync, send every 5 seconds
-      setTimeout(() => this.sendSyncRequest(), this.syncInterval);
-    }
-    
+    const delayMs = this.syncsSent < this.initialSyncCount - 1
+      ? 100
+      : this.syncInterval;
     this.syncsSent++;
+    this.timeout = this.scheduleTimeout(() => {
+      this.timeout = null;
+      this.sendSyncRequest();
+    }, delayMs);
   }
 
   /**
@@ -61,7 +88,7 @@ class ClockSync {
    * @param t2 Server receive timestamp
    * @param t3 Client receive timestamp (now)
    */
-  processSyncResponse(t1: number, t2: number, t3: number = Date.now()) {
+  processSyncResponse(t1: number, t2: number, t3: number = this.now()) {
     const rtt = t3 - t1;
     const offset = t2 - t1 - (rtt / 2);
 
@@ -77,18 +104,18 @@ class ClockSync {
       this.measurements.shift();
     }
 
-    recordTrace({ Clock: { ts_ms: t3, drift_ms: offset, rtt_ms: rtt } });
-
     console.log(`Clock sync - RTT: ${rtt}ms, Offset: ${offset.toFixed(1)}ms, Total measurements: ${this.measurements.length}`);
+    return measurement;
   }
 
   /**
-   * Get the current clock drift (median of recent measurements)
-   * @returns Clock drift in milliseconds (positive means client is ahead)
+   * Median server-minus-client clock offset from recent measurements.
+   * A positive value means the server clock is ahead, so synchronized client
+   * time is `clientTime + offset`.
    */
-  getClockDrift(): number {
+  getServerClockOffsetMs(): number | null {
     if (this.measurements.length === 0) {
-      return 0;
+      return null;
     }
 
     // Sort measurements by offset to find median
@@ -119,12 +146,12 @@ class ClockSync {
       };
     }
 
-    const drift = this.getClockDrift();
+    const serverClockOffsetMs = this.getServerClockOffsetMs() ?? 0;
     const avgRtt = this.measurements.reduce((sum, m) => sum + m.rtt, 0) / this.measurements.length;
     const lastSync = this.measurements[this.measurements.length - 1].timestamp;
 
     return {
-      drift,
+      drift: serverClockOffsetMs,
       avgRtt,
       measurementCount: this.measurements.length,
       lastSync
@@ -132,9 +159,9 @@ class ClockSync {
   }
 
   /**
-   * Reset for a new connection, carrying the last known drift forward.
+   * Reset for a new connection, carrying the last known offset forward.
    *
-   * Wiping measurements entirely would make getClockDrift() return 0 until
+   * Wiping measurements entirely would remove the server-clock estimate until
    * several new Pongs arrive — snapping the game-loop time base by the full
    * true drift on every reconnect. That spike used to mis-stamp command
    * ticks (the snake stops responding right after a reconnect). The real
@@ -142,9 +169,10 @@ class ClockSync {
    * with the previous estimate and let fresh measurements displace it.
    */
   reset() {
-    const carriedDrift = this.getClockDrift();
-    this.measurements = this.measurements.length > 0
-      ? [{ offset: carriedDrift, rtt: 0, timestamp: Date.now() }]
+    const carriedOffset = this.getServerClockOffsetMs();
+    this.stop();
+    this.measurements = carriedOffset !== null
+      ? [{ offset: carriedOffset, rtt: 0, timestamp: this.now() }]
       : [];
     this.syncsSent = 0;
   }
@@ -154,4 +182,4 @@ class ClockSync {
 const clockSyncInstance = new ClockSync();
 
 export const clockSync = clockSyncInstance;
-export const getClockDrift = () => clockSyncInstance.getClockDrift();
+export const getServerClockOffsetMs = () => clockSyncInstance.getServerClockOffsetMs();

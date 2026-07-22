@@ -1,14 +1,15 @@
-use crate::db::{DURABLE_GAME_ID_FLOOR, Database};
+use crate::db::Database;
 use crate::redis_keys::RedisKeys;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use common::GameType;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Data structures for Redis storage
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -21,6 +22,7 @@ pub struct QueuedPlayer {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueuedLobby {
     pub lobby_code: String,
+    pub queue_token: String,
     pub members: Vec<crate::lobby_manager::LobbyMember>,
     pub avg_mmr: i32,
     pub game_types: Vec<GameType>, // Lobbies can queue for multiple game types
@@ -30,19 +32,11 @@ pub struct QueuedLobby {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserQueueStatus {
-    pub game_type: GameType,
-    pub queue_mode: common::QueueMode,
-    pub request_time: i64,
-    pub mmr: i32,
-    pub username: String,
-    pub matched_game_id: Option<u32>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActiveMatch {
     pub players: Vec<QueuedPlayer>,
     pub spectators: Vec<QueuedPlayer>,
+    /// Stable reverse identity used by fenced completion cleanup.
+    pub lobby_codes: Vec<String>,
     pub game_type: GameType,
     pub status: MatchStatus,
     pub partition_id: u32,
@@ -56,20 +50,335 @@ pub enum MatchStatus {
     Finished,
 }
 
-// Match notification sent via Pub/Sub
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum MatchNotification {
-    MatchFound {
-        game_id: u32,
-        partition_id: u32,
-        players: Vec<QueuedPlayer>,
-    },
-    QueueJoined {
-        position: usize,
-        estimated_wait_seconds: u32,
-    },
-    QueueLeft,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchCommitOutcome {
+    Committed { stream_id: String },
+    AlreadyCommitted,
+    Conflict { reason: String },
 }
+
+#[derive(Serialize)]
+struct MatchCommitQueuePair {
+    queue_key: String,
+    mmr_key: String,
+}
+
+#[derive(Serialize)]
+struct MatchCommitLobby {
+    lobby_code: String,
+    member_json: String,
+    active_game_key: String,
+    metadata_key: String,
+    queue_identity_key: String,
+    queue_pairs: Vec<MatchCommitQueuePair>,
+}
+
+#[derive(Serialize)]
+struct MatchCommitUser {
+    active_game_key: String,
+    queue_status_key: String,
+    queue_identity_key: String,
+    queue_identity_value: String,
+}
+
+#[derive(Serialize)]
+struct MatchCommitPlan {
+    active_matches_key: String,
+    command_stream_key: String,
+    game_id: String,
+    active_match_json: String,
+    game_created_payload: String,
+    lobbies: Vec<MatchCommitLobby>,
+    users: Vec<MatchCommitUser>,
+    notifications: Vec<MatchCommitNotification>,
+}
+
+#[derive(Serialize)]
+struct MatchCommitNotification {
+    channel: String,
+    payload: String,
+}
+
+#[derive(Serialize)]
+struct LobbyAdmissionPlan {
+    lobby_active_game_key: String,
+    lobby_metadata_key: String,
+    queue_identity_key: String,
+    user_active_game_keys: Vec<String>,
+    user_queue_claims: Vec<QueueIdentityClaim>,
+    member_json: String,
+    queued_at: i64,
+    avg_mmr: i32,
+    queue_pairs: Vec<MatchCommitQueuePair>,
+}
+
+#[derive(Serialize)]
+struct LobbyRemovalPlan {
+    lobby_active_game_key: String,
+    lobby_metadata_key: String,
+    queue_identity_key: String,
+    member_json: String,
+    user_queue_claims: Vec<QueueIdentityClaim>,
+    queue_pairs: Vec<MatchCommitQueuePair>,
+}
+
+#[derive(Serialize)]
+struct QueueIdentityClaim {
+    key: String,
+    value: String,
+}
+
+fn lobby_queue_claim(lobby: &QueuedLobby) -> String {
+    format!("{}:{}", lobby.lobby_code, lobby.queue_token)
+}
+
+/// Atomically reject admission for an already-matched lobby or member before
+/// adding every queue identity. This is the same durable mapping checked by
+/// the match commit, so reconnect and concurrent matchmakers agree.
+const ADMIT_LOBBY_SCRIPT: &str = r#"
+local plan = cjson.decode(ARGV[1])
+
+local function key_type(key)
+    local response = redis.call('TYPE', key)
+    if type(response) == 'table' then return response['ok'] end
+    return response
+end
+
+local lobby_mapping_type = key_type(plan.lobby_active_game_key)
+if lobby_mapping_type ~= 'none' and lobby_mapping_type ~= 'string' then
+    return {0, 'lobby-mapping-wrong-type'}
+end
+if redis.call('GET', plan.lobby_active_game_key) then
+    return {0, 'lobby-already-matched'}
+end
+if key_type(plan.lobby_metadata_key) ~= 'hash' then
+    return {0, 'lobby-metadata-missing-or-wrong-type'}
+end
+for _, key in ipairs(plan.user_active_game_keys) do
+    local mapping_type = key_type(key)
+    if mapping_type ~= 'none' and mapping_type ~= 'string' then
+        return {0, 'user-mapping-wrong-type'}
+    end
+    if redis.call('GET', key) then return {0, 'user-already-matched'} end
+end
+
+local identity_type = key_type(plan.queue_identity_key)
+if identity_type ~= 'none' and identity_type ~= 'string' then
+    return {0, 'queue-identity-wrong-type'}
+end
+local existing_identity = redis.call('GET', plan.queue_identity_key)
+if existing_identity and existing_identity ~= plan.member_json then
+    redis.call('HSET', plan.lobby_metadata_key, 'state', 'queued')
+    return {2, 'already-queued'}
+end
+
+for _, claim in ipairs(plan.user_queue_claims) do
+    local claim_type = key_type(claim.key)
+    if claim_type ~= 'none' and claim_type ~= 'string' then
+        return {0, 'user-queue-identity-wrong-type'}
+    end
+    local existing_claim = redis.call('GET', claim.key)
+    if existing_claim and existing_claim ~= claim.value then
+        return {0, 'user-already-queued'}
+    end
+end
+
+for _, pair in ipairs(plan.queue_pairs) do
+    local queue_type = key_type(pair.queue_key)
+    local mmr_type = key_type(pair.mmr_key)
+    if queue_type ~= 'none' and queue_type ~= 'zset' then
+        return {0, 'queue-wrong-type'}
+    end
+    if mmr_type ~= 'none' and mmr_type ~= 'zset' then
+        return {0, 'mmr-index-wrong-type'}
+    end
+end
+
+for _, pair in ipairs(plan.queue_pairs) do
+    redis.call('ZADD', pair.queue_key, plan.queued_at, plan.member_json)
+    redis.call('ZADD', pair.mmr_key, plan.avg_mmr, plan.member_json)
+end
+redis.call('SET', plan.queue_identity_key, plan.member_json)
+for _, claim in ipairs(plan.user_queue_claims) do
+    redis.call('SET', claim.key, claim.value)
+end
+redis.call('HSET', plan.lobby_metadata_key, 'state', 'queued')
+return {1, 'queued'}
+"#;
+
+/// Remove only the queue generation the caller observed. A stale cancellation
+/// must not delete a later admission for the same lobby code.
+const REMOVE_LOBBY_SCRIPT: &str = r#"
+local plan = cjson.decode(ARGV[1])
+
+local function key_type(key)
+    local response = redis.call('TYPE', key)
+    if type(response) == 'table' then return response['ok'] end
+    return response
+end
+
+local identity_type = key_type(plan.queue_identity_key)
+if identity_type ~= 'none' and identity_type ~= 'string' then
+    return {0, 'queue-identity-wrong-type'}
+end
+local active_mapping_type = key_type(plan.lobby_active_game_key)
+if active_mapping_type ~= 'none' and active_mapping_type ~= 'string' then
+    return {0, 'lobby-mapping-wrong-type'}
+end
+local metadata_type = key_type(plan.lobby_metadata_key)
+if metadata_type ~= 'none' and metadata_type ~= 'hash' then
+    return {0, 'lobby-metadata-wrong-type'}
+end
+local existing_identity = redis.call('GET', plan.queue_identity_key)
+if not existing_identity then
+    if not redis.call('GET', plan.lobby_active_game_key) and metadata_type == 'hash' then
+        redis.call('HSET', plan.lobby_metadata_key, 'state', 'waiting')
+    end
+    return {2, 'not-queued'}
+end
+if existing_identity ~= plan.member_json then return {2, 'queue-entry-changed'} end
+
+for _, claim in ipairs(plan.user_queue_claims) do
+    local claim_type = key_type(claim.key)
+    if claim_type ~= 'none' and claim_type ~= 'string' then
+        return {0, 'user-queue-identity-wrong-type'}
+    end
+end
+
+for _, pair in ipairs(plan.queue_pairs) do
+    local queue_type = key_type(pair.queue_key)
+    local mmr_type = key_type(pair.mmr_key)
+    if queue_type ~= 'none' and queue_type ~= 'zset' then
+        return {0, 'queue-wrong-type'}
+    end
+    if mmr_type ~= 'none' and mmr_type ~= 'zset' then
+        return {0, 'mmr-index-wrong-type'}
+    end
+end
+
+for _, pair in ipairs(plan.queue_pairs) do
+    redis.call('ZREM', pair.queue_key, plan.member_json)
+    redis.call('ZREM', pair.mmr_key, plan.member_json)
+end
+redis.call('DEL', plan.queue_identity_key)
+for _, claim in ipairs(plan.user_queue_claims) do
+    if redis.call('GET', claim.key) == claim.value then
+        redis.call('DEL', claim.key)
+    end
+end
+if not redis.call('GET', plan.lobby_active_game_key) and metadata_type == 'hash' then
+    redis.call('HSET', plan.lobby_metadata_key, 'state', 'waiting')
+end
+return {1, 'removed'}
+"#;
+
+// Redis scripts are isolated but do not roll back commands that precede a
+// runtime script error. Validate every key type and every claim predicate
+// before issuing the first write; with the service's non-evicting Valkey
+// policy, the write phase then consists only of type-safe commands.
+const COMMIT_MATCH_SCRIPT: &str = r#"
+local plan = cjson.decode(ARGV[1])
+
+local function key_type(key)
+    local response = redis.call('TYPE', key)
+    if type(response) == 'table' then
+        return response['ok']
+    end
+    return response
+end
+
+local active_type = key_type(plan.active_matches_key)
+if active_type ~= 'none' and active_type ~= 'hash' then
+    return {0, 'active-matches-wrong-type'}
+end
+
+local stream_type = key_type(plan.command_stream_key)
+if stream_type ~= 'none' and stream_type ~= 'stream' then
+    return {0, 'command-stream-wrong-type'}
+end
+
+local existing = redis.call('HGET', plan.active_matches_key, plan.game_id)
+if existing then
+    if existing == plan.active_match_json then
+        return {2, 'already-committed'}
+    end
+    return {0, 'game-id-already-committed'}
+end
+
+for _, lobby in ipairs(plan.lobbies) do
+    local mapping_type = key_type(lobby.active_game_key)
+    if mapping_type ~= 'none' and mapping_type ~= 'string' then
+        return {0, 'lobby-mapping-wrong-type:' .. lobby.lobby_code}
+    end
+    if redis.call('GET', lobby.active_game_key) then
+        return {0, 'lobby-already-matched:' .. lobby.lobby_code}
+    end
+
+    if key_type(lobby.queue_identity_key) ~= 'string' then
+        return {0, 'queue-identity-missing-or-wrong-type:' .. lobby.lobby_code}
+    end
+    if redis.call('GET', lobby.queue_identity_key) ~= lobby.member_json then
+        return {0, 'queue-entry-changed:' .. lobby.lobby_code}
+    end
+
+    for _, pair in ipairs(lobby.queue_pairs) do
+        if key_type(pair.queue_key) ~= 'zset' or key_type(pair.mmr_key) ~= 'zset' then
+            return {0, 'queue-missing-or-wrong-type:' .. lobby.lobby_code}
+        end
+        if not redis.call('ZSCORE', pair.queue_key, lobby.member_json) then
+            return {0, 'queue-entry-changed:' .. lobby.lobby_code}
+        end
+        if not redis.call('ZSCORE', pair.mmr_key, lobby.member_json) then
+            return {0, 'mmr-entry-changed:' .. lobby.lobby_code}
+        end
+    end
+end
+
+for _, user in ipairs(plan.users) do
+    local mapping_type = key_type(user.active_game_key)
+    if mapping_type ~= 'none' and mapping_type ~= 'string' then
+        return {0, 'user-mapping-wrong-type'}
+    end
+    if redis.call('GET', user.active_game_key) then
+        return {0, 'user-already-matched'}
+    end
+    if key_type(user.queue_identity_key) ~= 'string' then
+        return {0, 'user-queue-identity-missing-or-wrong-type'}
+    end
+    if redis.call('GET', user.queue_identity_key) ~= user.queue_identity_value then
+        return {0, 'user-queue-entry-changed'}
+    end
+end
+
+for _, lobby in ipairs(plan.lobbies) do
+    for _, pair in ipairs(lobby.queue_pairs) do
+        redis.call('ZREM', pair.queue_key, lobby.member_json)
+        redis.call('ZREM', pair.mmr_key, lobby.member_json)
+    end
+    redis.call('DEL', lobby.queue_identity_key)
+end
+
+redis.call('HSET', plan.active_matches_key, plan.game_id, plan.active_match_json)
+for _, lobby in ipairs(plan.lobbies) do
+    redis.call('SET', lobby.active_game_key, plan.game_id)
+    if key_type(lobby.metadata_key) == 'hash' then
+        redis.call('HSET', lobby.metadata_key, 'state', 'matched')
+    end
+end
+for _, user in ipairs(plan.users) do
+    redis.call('SET', user.active_game_key, plan.game_id)
+    redis.call('DEL', user.queue_status_key)
+    redis.call('DEL', user.queue_identity_key)
+end
+
+local stream_id = redis.call(
+    'XADD', plan.command_stream_key, '*', 'data', plan.game_created_payload
+)
+for _, notification in ipairs(plan.notifications) do
+    redis.call('PUBLISH', notification.channel, notification.payload)
+end
+return {1, stream_id}
+"#;
 
 /// Redis-based matchmaking manager
 #[derive(Clone)]
@@ -107,6 +416,7 @@ impl MatchmakingManager {
 
         let lobby = QueuedLobby {
             lobby_code: lobby_code.to_string(),
+            queue_token: uuid::Uuid::new_v4().to_string(),
             members,
             avg_mmr,
             game_types: game_types.clone(),
@@ -116,32 +426,52 @@ impl MatchmakingManager {
         };
 
         let lobby_json = serde_json::to_string(&lobby)?;
+        let queue_claim = lobby_queue_claim(&lobby);
 
-        // Start a transaction to add lobby to all game type queues
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        let plan = LobbyAdmissionPlan {
+            lobby_active_game_key: RedisKeys::matchmaking_lobby_active_game(lobby_code),
+            lobby_metadata_key: RedisKeys::lobby_metadata(lobby_code),
+            queue_identity_key: RedisKeys::matchmaking_lobby_queue_identity(lobby_code),
+            user_active_game_keys: lobby
+                .members
+                .iter()
+                .map(|member| RedisKeys::matchmaking_user_active_game(member.user_id))
+                .collect(),
+            user_queue_claims: lobby
+                .members
+                .iter()
+                .map(|member| QueueIdentityClaim {
+                    key: RedisKeys::matchmaking_user_queue_identity(member.user_id),
+                    value: queue_claim.clone(),
+                })
+                .collect(),
+            member_json: lobby_json,
+            queued_at: timestamp,
+            avg_mmr,
+            queue_pairs: game_types
+                .iter()
+                .map(|game_type| MatchCommitQueuePair {
+                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &queue_mode),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &queue_mode),
+                })
+                .collect(),
+        };
+        let plan_json = serde_json::to_string(&plan)?;
+        let script = redis::Script::new(ADMIT_LOBBY_SCRIPT);
 
-        // Add to each game type's queue
-        for game_type in &game_types {
-            let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &queue_mode);
-            let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &queue_mode);
-
-            // Add to lobby queue sorted set (score = timestamp for FIFO)
-            pipe.zadd(&lobby_queue_key, &lobby_json, timestamp);
-
-            // Add to MMR index (score = average MMR for range queries)
-            // Store full lobby JSON to enable efficient retrieval by MMR
-            pipe.zadd(&lobby_mmr_key, &lobby_json, avg_mmr);
-        }
-
-        // Execute transaction with retries
+        // Retrying the immutable queue identity is safe after an ambiguous
+        // response because ZADD overwrites the same member.
         let mut attempts = 0;
         let mut delay = self.retry_delay;
 
-        loop {
+        let (code, detail) = loop {
             attempts += 1;
-            match pipe.clone().query_async(&mut self.redis).await {
-                Ok(()) => break,
+            match script
+                .arg(&plan_json)
+                .invoke_async::<(i64, String)>(&mut self.redis)
+                .await
+            {
+                Ok(result) => break result,
                 Err(e) if attempts < self.max_retries => {
                     warn!(
                         "Failed to add lobby to queue (attempt {}/{}): {}",
@@ -158,139 +488,35 @@ impl MatchmakingManager {
                     return Err(anyhow!("Failed to add lobby to queue: {}", e));
                 }
             }
+        };
+        match code {
+            1 => {
+                info!(
+                    "Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
+                    lobby_code,
+                    game_types,
+                    lobby.members.len(),
+                    avg_mmr
+                );
+            }
+            2 => {
+                info!(
+                    lobby_code,
+                    "Lobby already had an admitted queue identity; kept the first request"
+                );
+            }
+            0 => return Err(anyhow!("Lobby admission was rejected: {detail}")),
+            other => {
+                return Err(anyhow!(
+                    "Lobby admission returned unknown status {other}: {detail}"
+                ));
+            }
         }
-
-        info!(
-            "Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
-            lobby_code,
-            game_types,
-            lobby.members.len(),
-            avg_mmr
-        );
         Ok(())
     }
 
-    /// Renew a player's position in queue (update timestamp to prevent expiration)
-    pub async fn renew_queue_position(&mut self, user_id: u32) -> Result<bool> {
-        let user_key = RedisKeys::matchmaking_user_status(user_id);
-
-        // Get user status to find their game type
-        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
-
-        if let Some(json) = status_json {
-            let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = RedisKeys::matchmaking_queue(&status.game_type, &status.queue_mode);
-
-            // Find the player's entry in the queue
-            let members: Vec<(String, f64)> =
-                self.redis.zrange_withscores(&queue_key, 0, -1).await?;
-
-            for (member_json, _old_score) in members {
-                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
-                    && player.user_id == user_id
-                {
-                    // Update timestamp to current time
-                    let new_timestamp = Utc::now().timestamp_millis();
-                    let _: () = self
-                        .redis
-                        .zadd(&queue_key, &member_json, new_timestamp)
-                        .await?;
-
-                    debug!("Renewed queue position for user {}", user_id);
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// Remove a player from the matchmaking queue
-    pub async fn remove_from_queue(&mut self, user_id: u32) -> Result<Option<GameType>> {
-        let user_key = RedisKeys::matchmaking_user_status(user_id);
-
-        // Get user status to find their game type
-        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
-
-        if let Some(json) = status_json {
-            let status: UserQueueStatus = serde_json::from_str(&json)?;
-            let queue_key = RedisKeys::matchmaking_queue(&status.game_type, &status.queue_mode);
-            let mmr_key = RedisKeys::matchmaking_mmr_index(&status.game_type, &status.queue_mode);
-
-            // Find and remove the player from queue
-            let members: Vec<(String, f64)> =
-                self.redis.zrange_withscores(&queue_key, 0, -1).await?;
-
-            for (member_json, _score) in members {
-                if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
-                    && player.user_id == user_id
-                {
-                    // Remove from queue and MMR index
-                    let mut pipe = redis::pipe();
-                    pipe.atomic();
-                    pipe.zrem(&queue_key, &member_json);
-                    pipe.zrem(&mmr_key, user_id.to_string());
-                    pipe.del(&user_key);
-
-                    let _: () = pipe.query_async(&mut self.redis).await?;
-
-                    info!("Removed user {} from matchmaking queue", user_id);
-                    return Ok(Some(status.game_type));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Check if a user is in queue and get their status
-    pub async fn get_queue_status(&mut self, user_id: u32) -> Result<Option<UserQueueStatus>> {
-        let user_key = RedisKeys::matchmaking_user_status(user_id);
-
-        let status_json: Option<String> = self.redis.hget(&user_key, "status").await?;
-
-        match status_json {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Get queue position for a user
-    pub async fn get_queue_position(
-        &mut self,
-        user_id: u32,
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-    ) -> Result<Option<usize>> {
-        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
-
-        // Get all queued players
-        let members: Vec<String> = self.redis.zrange(&queue_key, 0, -1).await?;
-
-        for (position, member_json) in members.iter().enumerate() {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(member_json)
-                && player.user_id == user_id
-            {
-                return Ok(Some(position + 1)); // 1-indexed position
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Allocate from the high durable namespace without modifying the legacy Redis counter.
-    /// During a rolling deployment, old nodes remain below the durable floor, so Redis loss
-    /// cannot make a new node reuse one of their runtime IDs.
+    /// Allocate every authoritative game ID from the durable database.
     pub async fn generate_game_id(&mut self, db: &dyn Database) -> Result<u32> {
-        let counter_key = RedisKeys::game_id_counter();
-        let legacy_counter: Option<i64> = self.redis.get(&counter_key).await?;
-        if legacy_counter.is_some_and(|counter| counter >= i64::from(DURABLE_GAME_ID_FLOOR)) {
-            return Err(anyhow!(
-                "Legacy Redis game ID counter has entered the reserved durable namespace at or above {}",
-                DURABLE_GAME_ID_FLOOR
-            ));
-        }
-
         let durable_id = db.allocate_game_id().await?;
         u32::try_from(durable_id).map_err(|_| anyhow!("Durable game ID was outside the u32 range"))
     }
@@ -309,82 +535,6 @@ impl MatchmakingManager {
         } else {
             Err(anyhow!("Health check failed: unexpected response"))
         }
-    }
-
-    /// Clean up expired queue entries (maintenance task)
-    /// More efficient version that processes in batches and stops at first non-expired entry
-    pub async fn cleanup_expired_entries(
-        &mut self,
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-        max_age_seconds: i64,
-    ) -> Result<usize> {
-        let cutoff_time = Utc::now().timestamp_millis() - (max_age_seconds * 1000);
-        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
-        let mmr_key = RedisKeys::matchmaking_mmr_index(game_type, queue_mode);
-
-        let mut removed_count = 0;
-        let mut offset = 0;
-        const BATCH_SIZE: isize = 100; // Process 100 entries at a time
-
-        loop {
-            // Get a batch of queued players with their timestamps
-            // Since the sorted set is ordered by timestamp, older entries come first
-            let members: Vec<(String, f64)> = self
-                .redis
-                .zrange_withscores(&queue_key, offset, offset + BATCH_SIZE - 1)
-                .await?;
-
-            if members.is_empty() {
-                break; // No more entries
-            }
-
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            let mut batch_removed = 0;
-            let mut found_non_expired = false;
-
-            for (member_json, timestamp) in members {
-                // Check if entry is expired (timestamp is in milliseconds)
-                if timestamp < cutoff_time as f64 {
-                    if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json) {
-                        // Remove from queue and MMR index
-                        pipe.zrem(&queue_key, &member_json);
-                        pipe.zrem(&mmr_key, player.user_id.to_string());
-                        pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
-                        batch_removed += 1;
-
-                        // This is a warning because websockets should really be renewing
-                        // or cleaning up their own entries.
-                        warn!("Removing expired queue entry for user {}", player.user_id);
-                    }
-                } else {
-                    // Found a non-expired entry, stop processing
-                    found_non_expired = true;
-                    break;
-                }
-            }
-
-            if batch_removed > 0 {
-                let _: () = pipe.query_async(&mut self.redis).await?;
-                removed_count += batch_removed;
-            }
-
-            if found_non_expired {
-                // All remaining entries are non-expired (since sorted by timestamp)
-                break;
-            }
-
-            // Move to next batch
-            // Note: we don't increment offset since removed items shift the indices
-            // We always start from 0 after removals
-            if batch_removed == 0 {
-                // No items were removed in this batch, move to the next
-                offset += BATCH_SIZE;
-            }
-        }
-
-        Ok(removed_count)
     }
 
     /// Get strategic subset of lobbies in queue for a game type
@@ -471,148 +621,264 @@ impl MatchmakingManager {
         Ok(unique_lobbies)
     }
 
-    /// Remove a lobby from the matchmaking queue for a single game type
-    pub async fn remove_lobby_from_queue(
-        &mut self,
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-        lobby_code: &str,
-    ) -> Result<()> {
-        let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
-        let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
-
-        // Get all lobby members to find the one to remove
-        let members: Vec<(String, f64)> = self
-            .redis
-            .zrange_withscores(&lobby_queue_key, 0, -1)
-            .await?;
-
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-
-        for (member_json, _score) in members {
-            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
-                && lobby.lobby_code == lobby_code
-            {
-                // Remove from both sorted sets using the same lobby JSON
-                pipe.zrem(&lobby_queue_key, &member_json);
-                pipe.zrem(&lobby_mmr_key, &member_json);
-                break;
-            }
-        }
-
-        let _: () = pipe.query_async(&mut self.redis).await?;
-
-        info!(
-            "Removed lobby {} from matchmaking queue for game type {:?}",
-            lobby_code, game_type
-        );
-        Ok(())
-    }
-
-    /// Locate a queued lobby by code across all matchmaking queues
+    /// Locate the one queue identity admitted for a lobby code.
     pub async fn get_queued_lobby_by_code(
         &mut self,
         lobby_code: &str,
     ) -> Result<Option<QueuedLobby>> {
-        let mut cursor: u64 = 0;
-
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg("matchmaking:lobby:queue:*")
-                .arg("COUNT")
-                .arg(50)
-                .query_async(&mut self.redis)
-                .await?;
-
-            for key in keys {
-                let member_entries: Vec<String> = self.redis.zrange(&key, 0, -1).await?;
-
-                for member_json in member_entries {
-                    if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
-                        && lobby.lobby_code == lobby_code
-                    {
-                        return Ok(Some(lobby));
-                    }
+        let identity_key = RedisKeys::matchmaking_lobby_queue_identity(lobby_code);
+        let member_json: Option<String> = self.redis.get(&identity_key).await?;
+        member_json
+            .map(|member_json| {
+                let lobby: QueuedLobby = serde_json::from_str(&member_json).with_context(|| {
+                    format!("Malformed lobby queue identity at Redis key {identity_key}")
+                })?;
+                if lobby.lobby_code != lobby_code {
+                    return Err(anyhow!(
+                        "Lobby queue identity {} belongs to {}",
+                        identity_key,
+                        lobby.lobby_code
+                    ));
                 }
-            }
-
-            if next_cursor == 0 {
-                break;
-            }
-
-            cursor = next_cursor;
-        }
-
-        Ok(None)
+                Ok(lobby)
+            })
+            .transpose()
     }
 
     /// Remove a lobby from every queue it is present in, returning whether a lobby was removed
     pub async fn remove_lobby_from_all_queues_by_code(&mut self, lobby_code: &str) -> Result<bool> {
         if let Some(lobby) = self.get_queued_lobby_by_code(lobby_code).await? {
-            self.remove_lobby_from_all_queues(&lobby).await?;
-            return Ok(true);
+            return self.remove_exact_lobby_identity(&lobby).await;
         }
 
-        Ok(false)
+        self.execute_lobby_removal(LobbyRemovalPlan {
+            lobby_active_game_key: RedisKeys::matchmaking_lobby_active_game(lobby_code),
+            lobby_metadata_key: RedisKeys::lobby_metadata(lobby_code),
+            queue_identity_key: RedisKeys::matchmaking_lobby_queue_identity(lobby_code),
+            member_json: String::new(),
+            user_queue_claims: Vec::new(),
+            queue_pairs: Vec::new(),
+        })
+        .await
     }
 
     /// Remove a lobby from all matchmaking queues it was queued for
     /// This is used when a lobby is matched to prevent it from being matched again
     pub async fn remove_lobby_from_all_queues(&mut self, lobby: &QueuedLobby) -> Result<()> {
-        // Build a single atomic transaction to remove from all queues
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-
-        // For each game type the lobby was queued for, remove it from that queue
-        for game_type in &lobby.game_types {
-            let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode);
-            let lobby_mmr_key =
-                RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode);
-
-            // We need to find the exact JSON string to remove
-            // Since the lobby JSON is stored in Redis, we'll fetch and match
-            let members: Vec<String> = self.redis.zrange(&lobby_queue_key, 0, -1).await?;
-
-            for member_json in members {
-                if let Ok(queued_lobby) = serde_json::from_str::<QueuedLobby>(&member_json)
-                    && queued_lobby.lobby_code == lobby.lobby_code
-                {
-                    // Remove from both sorted sets using the same lobby JSON
-                    pipe.zrem(&lobby_queue_key, &member_json);
-                    pipe.zrem(&lobby_mmr_key, &member_json);
-                    break;
-                }
-            }
+        if self.remove_exact_lobby_identity(lobby).await? {
+            info!(
+                "Removed lobby {} from all matchmaking queues (was queued for {:?})",
+                lobby.lobby_code, lobby.game_types
+            );
         }
-
-        // Execute the transaction
-        let _: () = pipe.query_async(&mut self.redis).await?;
-
-        info!(
-            "Removed lobby {} from all matchmaking queues (was queued for {:?})",
-            lobby.lobby_code, lobby.game_types
-        );
         Ok(())
     }
 
-    /// Store active match information
-    pub async fn store_active_match(
+    async fn remove_exact_lobby_identity(&mut self, lobby: &QueuedLobby) -> Result<bool> {
+        let queue_claim = lobby_queue_claim(lobby);
+        let plan = LobbyRemovalPlan {
+            lobby_active_game_key: RedisKeys::matchmaking_lobby_active_game(&lobby.lobby_code),
+            lobby_metadata_key: RedisKeys::lobby_metadata(&lobby.lobby_code),
+            queue_identity_key: RedisKeys::matchmaking_lobby_queue_identity(&lobby.lobby_code),
+            member_json: serde_json::to_string(lobby)?,
+            user_queue_claims: lobby
+                .members
+                .iter()
+                .map(|member| QueueIdentityClaim {
+                    key: RedisKeys::matchmaking_user_queue_identity(member.user_id),
+                    value: queue_claim.clone(),
+                })
+                .collect(),
+            queue_pairs: lobby
+                .game_types
+                .iter()
+                .map(|game_type| MatchCommitQueuePair {
+                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode),
+                })
+                .collect(),
+        };
+        self.execute_lobby_removal(plan).await
+    }
+
+    async fn execute_lobby_removal(&mut self, plan: LobbyRemovalPlan) -> Result<bool> {
+        let plan_json = serde_json::to_string(&plan)?;
+        let (code, detail): (i64, String) = redis::Script::new(REMOVE_LOBBY_SCRIPT)
+            .arg(plan_json)
+            .invoke_async(&mut self.redis)
+            .await
+            .context("Failed to atomically remove lobby queue identity")?;
+        match code {
+            1 => Ok(true),
+            2 => Ok(false),
+            0 => Err(anyhow!("Lobby queue removal was rejected: {detail}")),
+            other => Err(anyhow!(
+                "Lobby queue removal returned unknown status {other}: {detail}"
+            )),
+        }
+    }
+
+    /// Atomically claim queued lobbies and publish their complete GameCreated
+    /// command. Selection/scoring stays in Rust; this operation is only the
+    /// compare-and-commit boundary shared by every matchmaker task.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_match(
         &mut self,
         game_id: u32,
-        match_info: ActiveMatch,
-    ) -> Result<()> {
-        let matches_key = RedisKeys::matchmaking_active_matches();
-        let match_json = serde_json::to_string(&match_info)?;
+        partition_id: u32,
+        selected_game_type: &GameType,
+        selected_queue_mode: &common::QueueMode,
+        match_info: &ActiveMatch,
+        game_created_payload: &str,
+        lobbies: &[QueuedLobby],
+    ) -> Result<MatchCommitOutcome> {
+        if lobbies.is_empty() {
+            return Err(anyhow!("Cannot commit a match without lobbies"));
+        }
+        if game_created_payload.is_empty() {
+            return Err(anyhow!("Cannot commit a match without GameCreated payload"));
+        }
 
-        let _: () = self
-            .redis
-            .hset(&matches_key, game_id.to_string(), match_json)
-            .await?;
+        let mut lobby_codes = HashSet::new();
+        let mut user_ids = HashSet::new();
+        let mut commit_lobbies = Vec::with_capacity(lobbies.len());
+        let mut commit_users = Vec::new();
 
-        Ok(())
+        for lobby in lobbies {
+            if lobby.game_types.is_empty() {
+                return Err(anyhow!(
+                    "Lobby {} has no queue identities to claim",
+                    lobby.lobby_code
+                ));
+            }
+            if lobby.queue_mode != *selected_queue_mode
+                || !lobby.game_types.contains(selected_game_type)
+            {
+                return Err(anyhow!(
+                    "Lobby {} no longer identifies the selected queue",
+                    lobby.lobby_code
+                ));
+            }
+            if !lobby_codes.insert(lobby.lobby_code.clone()) {
+                return Err(anyhow!(
+                    "Lobby {} appears more than once in one match",
+                    lobby.lobby_code
+                ));
+            }
+
+            let member_json = serde_json::to_string(lobby)?;
+            let queue_pairs = lobby
+                .game_types
+                .iter()
+                .map(|game_type| MatchCommitQueuePair {
+                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode),
+                })
+                .collect();
+
+            let queue_identity_value = lobby_queue_claim(lobby);
+            for member in &lobby.members {
+                if !user_ids.insert(member.user_id) {
+                    return Err(anyhow!(
+                        "User {} appears more than once in one match",
+                        member.user_id
+                    ));
+                }
+                commit_users.push(MatchCommitUser {
+                    active_game_key: RedisKeys::matchmaking_user_active_game(member.user_id),
+                    queue_status_key: RedisKeys::matchmaking_user_status(member.user_id),
+                    queue_identity_key: RedisKeys::matchmaking_user_queue_identity(member.user_id),
+                    queue_identity_value: queue_identity_value.clone(),
+                });
+            }
+
+            commit_lobbies.push(MatchCommitLobby {
+                lobby_code: lobby.lobby_code.clone(),
+                member_json,
+                active_game_key: RedisKeys::matchmaking_lobby_active_game(&lobby.lobby_code),
+                metadata_key: RedisKeys::lobby_metadata(&lobby.lobby_code),
+                queue_identity_key: RedisKeys::matchmaking_lobby_queue_identity(&lobby.lobby_code),
+                queue_pairs,
+            });
+        }
+
+        let active_match_json = serde_json::to_string(match_info)?;
+        let notification_payload = serde_json::json!({
+            "type": "MatchFound",
+            "game_id": game_id,
+            "partition_id": partition_id,
+        })
+        .to_string();
+        let notifications = lobbies
+            .iter()
+            .map(|lobby| MatchCommitNotification {
+                channel: RedisKeys::matchmaking_lobby_notification_channel(&lobby.lobby_code),
+                payload: notification_payload.clone(),
+            })
+            .collect();
+        let plan = MatchCommitPlan {
+            active_matches_key: RedisKeys::matchmaking_active_matches(),
+            command_stream_key: RedisKeys::stream_commands(partition_id),
+            game_id: game_id.to_string(),
+            active_match_json: active_match_json.clone(),
+            game_created_payload: game_created_payload.to_string(),
+            lobbies: commit_lobbies,
+            users: commit_users,
+            notifications,
+        };
+        let plan_json = serde_json::to_string(&plan)?;
+        let script = redis::Script::new(COMMIT_MATCH_SCRIPT);
+        let mut attempts = 0;
+        let mut delay = self.retry_delay;
+        let (code, detail) = loop {
+            attempts += 1;
+            match script
+                .arg(&plan_json)
+                .invoke_async::<(i64, String)>(&mut self.redis)
+                .await
+            {
+                Ok(result) => break result,
+                Err(error) if attempts < self.max_retries => {
+                    warn!(
+                        game_id,
+                        attempt = attempts,
+                        max_attempts = self.max_retries,
+                        error = %error,
+                        "Atomic match commit response was ambiguous; retrying the same claim"
+                    );
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(10));
+                }
+                Err(error) => {
+                    // A connection can fail after Valkey has committed the script. A
+                    // strong read through the same regional primary distinguishes that
+                    // success whenever connectivity has recovered; otherwise the durable
+                    // mappings still let reconnect recover a missed Pub/Sub notification.
+                    let existing: redis::RedisResult<Option<String>> = self
+                        .redis
+                        .hget(RedisKeys::matchmaking_active_matches(), game_id.to_string())
+                        .await;
+                    if matches!(existing, Ok(Some(ref value)) if value == &active_match_json) {
+                        return Ok(MatchCommitOutcome::AlreadyCommitted);
+                    }
+                    return Err(error).context("Failed to atomically commit matchmaking claim");
+                }
+            }
+        };
+
+        match code {
+            1 => Ok(MatchCommitOutcome::Committed { stream_id: detail }),
+            2 => Ok(MatchCommitOutcome::AlreadyCommitted),
+            0 => {
+                crate::resilience_metrics::record_match_claim_conflicts(1);
+                Ok(MatchCommitOutcome::Conflict { reason: detail })
+            }
+            other => Err(anyhow!(
+                "Atomic matchmaking script returned unknown status {} ({})",
+                other,
+                detail
+            )),
+        }
     }
 
     /// Get active match information
@@ -627,35 +893,30 @@ impl MatchmakingManager {
         }
     }
 
-    /// Remove players from queue (for match creation)
-    pub async fn remove_players_from_queue(
-        &mut self,
-        game_type: &GameType,
-        queue_mode: &common::QueueMode,
-        user_ids: &[u32],
-    ) -> Result<()> {
-        let queue_key = RedisKeys::matchmaking_queue(game_type, queue_mode);
-        let mmr_key = RedisKeys::matchmaking_mmr_index(game_type, queue_mode);
+    /// Resolve a committed match without relying on best-effort Pub/Sub.
+    pub async fn get_user_active_game(&mut self, user_id: u32) -> Result<Option<u32>> {
+        self.get_active_game_mapping(RedisKeys::matchmaking_user_active_game(user_id), "user")
+            .await
+    }
 
-        // Get all members to find which ones to remove
-        let members: Vec<(String, f64)> = self.redis.zrange_withscores(&queue_key, 0, -1).await?;
+    /// Resolve a committed lobby match without relying on best-effort Pub/Sub.
+    pub async fn get_lobby_active_game(&mut self, lobby_code: &str) -> Result<Option<u32>> {
+        self.get_active_game_mapping(
+            RedisKeys::matchmaking_lobby_active_game(lobby_code),
+            "lobby",
+        )
+        .await
+    }
 
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-
-        for (member_json, _score) in members {
-            if let Ok(player) = serde_json::from_str::<QueuedPlayer>(&member_json)
-                && user_ids.contains(&player.user_id)
-            {
-                pipe.zrem(&queue_key, &member_json);
-                pipe.zrem(&mmr_key, player.user_id.to_string());
-                pipe.del(RedisKeys::matchmaking_user_status(player.user_id));
-            }
-        }
-
-        let _: () = pipe.query_async(&mut self.redis).await?;
-
-        Ok(())
+    async fn get_active_game_mapping(&mut self, key: String, kind: &str) -> Result<Option<u32>> {
+        let game_id: Option<String> = self.redis.get(&key).await?;
+        game_id
+            .map(|value| {
+                value.parse::<u32>().with_context(|| {
+                    format!("Malformed {kind} active-game mapping at Redis key {key}")
+                })
+            })
+            .transpose()
     }
 }
 

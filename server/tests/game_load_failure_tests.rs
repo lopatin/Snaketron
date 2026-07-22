@@ -1,23 +1,75 @@
-use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode};
+use ::common::{GameEvent, GameEventMessage, GameState, GameStatus, GameType, QueueMode};
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
-use server::db::DURABLE_GAME_ID_FLOOR;
-use server::game_bus::GameBus;
-use server::game_executor::{PARTITION_COUNT, StreamEvent, run_game_executor};
-use server::matchmaking_manager::MatchmakingManager;
+use server::cluster_membership::ClusterNamespace;
+use server::game_executor::PARTITION_COUNT;
+use server::recovery::{
+    PUBLIC_UNRECOVERABLE_GAME_REASON, RECOVERY_FAILURE_SCHEMA_VERSION, RecoveryFailureV1,
+};
 use server::redis_keys::RedisKeys;
-use server::redis_utils::create_connection_manager;
-use server::replication::ReplicationManager;
 use server::ws_server::WSMessage;
-use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::time::{Duration, timeout};
-use tokio_util::sync::CancellationToken;
+use tokio::time::{Duration, Instant, timeout};
 
 mod common;
 use self::common::{TestClient, TestEnvironment};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn publish_snapshot_for_test(
+    redis: &mut redis::aio::MultiplexedConnection,
+    partition_id: u32,
+    game_id: u32,
+    snapshot: &GameState,
+) -> Result<()> {
+    let event = GameEventMessage {
+        game_id,
+        tick: snapshot.tick,
+        sequence: snapshot.event_sequence,
+        stream_seq: 0,
+        user_id: None,
+        event: GameEvent::Snapshot {
+            game_state: snapshot.clone(),
+        },
+    };
+    let _: String = redis::cmd("XADD")
+        .arg(RedisKeys::stream_events(partition_id))
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(8192)
+        .arg("*")
+        .arg("data")
+        .arg(serde_json::to_vec(&event)?)
+        .query_async(&mut *redis)
+        .await?;
+    let _: () = redis
+        .set_ex(
+            RedisKeys::game_snapshot(game_id),
+            serde_json::to_vec(snapshot)?,
+            300,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn wait_for_replica(env: &TestEnvironment, server_index: usize, game_id: u32) -> Result<()> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if env
+                .server(server_index)
+                .expect("test gateway should be running")
+                .replication_manager()
+                .get_game_state_when_ready(game_id)
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("gateway did not consume the live snapshot")
+}
 
 #[tokio::test]
 async fn joining_an_unknown_game_returns_an_explicit_load_failure_and_can_retry() -> Result<()> {
@@ -196,6 +248,21 @@ async fn completed_game_snapshots_are_denied_to_non_players_in_redis_and_dynamo(
         "denied connection appended to completed-game chat history"
     );
 
+    // A stale active reload cache must not hide the durable terminal record,
+    // but the terminal record must still enforce its own participant list.
+    let mut stale_active_state = final_state.clone();
+    stale_active_state.status = GameStatus::Started { server_id };
+    stale_active_state.tick = stale_active_state.tick.saturating_sub(1);
+    stale_active_state.event_sequence = stale_active_state.event_sequence.saturating_sub(1);
+    let _: () = redis
+        .set_ex(&snapshot_key, serde_json::to_vec(&stale_active_state)?, 300)
+        .await?;
+    client.join_game(game_id).await?;
+
+    let stale_cache_failure = receive_load_failure_without_game_chat(&mut client, game_id).await?;
+    assert_eq!(stale_cache_failure.0, game_id);
+    assert_eq!(stale_cache_failure.1, "This game is unavailable");
+
     // Remove the grace-period cache and retry on the same socket to exercise the durable
     // fallback independently. The requesting user is still absent from GameState.players.
     let _: () = redis.del(&snapshot_key).await?;
@@ -240,13 +307,7 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
 
     let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
     let redis_client = redis::Client::open(redis_url)?;
-    let (push_tx, _) = broadcast::channel(16);
-    let publisher_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
-    let publisher = GameBus::new(
-        publisher_connection,
-        redis_client.clone(),
-        CancellationToken::new(),
-    );
+    let mut publisher = redis_client.get_multiplexed_async_connection().await?;
     let partition_id = game_id % PARTITION_COUNT;
 
     // Replica reader startup is asynchronous (subscriptions anchor at the stream tail, so
@@ -254,9 +315,7 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
     // state is available to the same authorization path used by JoinGame.
     timeout(Duration::from_secs(10), async {
         loop {
-            publisher
-                .publish_snapshot(partition_id, game_id, &live_state, 0)
-                .await?;
+            publish_snapshot_for_test(&mut publisher, partition_id, game_id, &live_state).await?;
             if env
                 .server(0)
                 .expect("test server should be running")
@@ -334,14 +393,6 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
         .set_ex(&snapshot_key, serde_json::to_vec(&live_state)?, 300)
         .await?;
 
-    let (push_tx, _) = broadcast::channel(16);
-    let publisher_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
-    let publisher = GameBus::new(
-        publisher_connection,
-        redis_client.clone(),
-        CancellationToken::new(),
-    );
-
     let server_addr = env.ws_addr(0).expect("test server should be running");
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(player_user_id).await?;
@@ -351,9 +402,7 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
     // readiness wait. Publishing shortly afterward models the replica consuming the initial
     // snapshot a moment after the game was created.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    publisher
-        .publish_snapshot(game_id % PARTITION_COUNT, game_id, &live_state, 0)
-        .await?;
+    publish_snapshot_for_test(&mut redis, game_id % PARTITION_COUNT, game_id, &live_state).await?;
 
     let loaded_state = receive_snapshot(&mut client).await?;
     assert_eq!(loaded_state.start_ms, live_state.start_ms);
@@ -374,6 +423,212 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
     );
 
     let _: usize = redis.del(snapshot_key).await?;
+    client.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn newly_ready_cold_gateway_waits_for_delayed_live_snapshot_within_authorization_deadline()
+-> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("cold_gateway_delayed_snapshot").await?;
+    let player_user_id = env.create_user().await?;
+    let (_, server_id) = env.add_server().await?;
+    let game_id = unique_runtime_game_id();
+
+    let mut live_state = completed_game_state(player_user_id as u32)?;
+    live_state.status = GameStatus::Started { server_id };
+    live_state.event_sequence = 17;
+    live_state.start_ms = chrono::Utc::now().timestamp_millis();
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    let partition_id = game_id % PARTITION_COUNT;
+
+    // Establish an active game before the replacement gateway starts. Its
+    // stream reader anchors at the tail, so this original snapshot must not
+    // warm the new gateway's local replica.
+    publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
+    wait_for_replica(&env, 0, game_id).await?;
+
+    let (cold_gateway_index, _) = env.add_server().await?;
+    assert!(
+        env.server(cold_gateway_index)
+            .expect("cold gateway should be running")
+            .replication_manager()
+            .get_game_state_when_ready(game_id)
+            .await
+            .is_none(),
+        "newly ready gateway unexpectedly inherited another task's in-memory replica"
+    );
+
+    let cold_gateway_addr = env
+        .ws_addr(cold_gateway_index)
+        .expect("cold gateway should be running");
+    let mut client = TestClient::connect(&cold_gateway_addr).await?;
+    client.authenticate(player_user_id).await?;
+
+    let joined_at = Instant::now();
+    client.join_game(game_id).await?;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
+
+    let loaded_state = receive_snapshot_without_join_failure(&mut client, game_id).await?;
+    let elapsed = joined_at.elapsed();
+    assert_eq!(loaded_state.start_ms, live_state.start_ms);
+    assert!(
+        elapsed >= Duration::from_millis(350),
+        "join did not exercise delayed replica warming: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "cold-gateway join exceeded the six-second authorization deadline: {elapsed:?}"
+    );
+
+    client.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_withheld() -> Result<()>
+{
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("cold_gateway_withheld_snapshot").await?;
+    let player_user_id = env.create_user().await?;
+    let (_, server_id) = env.add_server().await?;
+    let game_id = unique_runtime_game_id();
+
+    let mut live_state = completed_game_state(player_user_id as u32)?;
+    live_state.status = GameStatus::Started { server_id };
+    live_state.event_sequence = 21;
+    live_state.start_ms = chrono::Utc::now().timestamp_millis();
+
+    let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    let partition_id = game_id % PARTITION_COUNT;
+    publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
+    wait_for_replica(&env, 0, game_id).await?;
+
+    let (cold_gateway_index, _) = env.add_server().await?;
+    assert!(
+        env.server(cold_gateway_index)
+            .expect("cold gateway should be running")
+            .replication_manager()
+            .get_game_state_when_ready(game_id)
+            .await
+            .is_none(),
+        "newly ready gateway unexpectedly consumed the pre-start snapshot"
+    );
+
+    let cold_gateway_addr = env
+        .ws_addr(cold_gateway_index)
+        .expect("cold gateway should be running");
+    let mut client = TestClient::connect(&cold_gateway_addr).await?;
+    client.authenticate(player_user_id).await?;
+
+    let joined_at = Instant::now();
+    client.join_game(game_id).await?;
+    let retry_after_ms = timeout(Duration::from_secs(6), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameWarming {
+                    game_id: warmed_game_id,
+                    retry_after_ms,
+                } if warmed_game_id == game_id => {
+                    return Ok::<_, anyhow::Error>(retry_after_ms);
+                }
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "cold live game was falsely reported missing: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("cold-gateway join did not return a result before the authorization deadline")??;
+    let elapsed = joined_at.elapsed();
+
+    assert_eq!(retry_after_ms, 500);
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "retryable warm-up exceeded the six-second authorization deadline: {elapsed:?}"
+    );
+
+    client.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_recovery_marker_returns_public_unrecoverable_outcome_without_snapshot()
+-> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("expired_recovery_public_outcome").await?;
+    let user_id = env.create_user().await?;
+    let (server_index, _) = env.add_server().await?;
+    let game_id = unique_runtime_game_id();
+
+    let namespace = ClusterNamespace::new("test-region")?;
+    let marker = RecoveryFailureV1 {
+        schema_version: RECOVERY_FAILURE_SCHEMA_VERSION,
+        game_id,
+        partition_id: game_id % PARTITION_COUNT,
+        detected_at_ms: chrono::Utc::now().timestamp_millis(),
+        diagnostic: "acceptance-test retention expired".to_owned(),
+    };
+    let redis_client = redis::Client::open(std::env::var("SNAKETRON_REDIS_URL")?)?;
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    let marker_key = namespace.recovery_failure(game_id);
+    let _: () = redis.set(&marker_key, serde_json::to_vec(&marker)?).await?;
+
+    let server_addr = env
+        .ws_addr(server_index)
+        .expect("test gateway should be running");
+    let mut client = TestClient::connect(&server_addr).await?;
+    client.authenticate(user_id).await?;
+    client.join_game(game_id).await?;
+
+    timeout(Duration::from_secs(6), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    assert_eq!(reason, PUBLIC_UNRECOVERABLE_GAME_REASON);
+                    return Ok::<_, anyhow::Error>(());
+                }
+                WSMessage::GameEvent(event) if event.game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "expired game fabricated an authoritative event: {:?}",
+                        event.event
+                    ));
+                }
+                WSMessage::GameWarming {
+                    game_id: warming_game_id,
+                    ..
+                } if warming_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "expired game returned retryable warming instead of a terminal outcome"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("gateway did not return the unrecoverable outcome")??;
+
+    let _: usize = redis.del(marker_key).await?;
     client.disconnect().await?;
     env.shutdown().await?;
     Ok(())
@@ -445,166 +700,6 @@ async fn durable_allocator_skips_retained_ids_and_completion_upsert_rejects_coll
     Ok(())
 }
 
-#[tokio::test]
-async fn durable_allocator_stays_disjoint_from_legacy_ids_across_redis_loss() -> Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let env = TestEnvironment::new("mixed_allocator_rollout_safety").await?;
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
-    let redis_client = redis::Client::open(redis_url)?;
-    let mut legacy_connection = redis_client.get_multiplexed_async_connection().await?;
-    let (push_tx, _) = broadcast::channel(16);
-    let manager_connection = create_connection_manager(redis_client, push_tx).await?;
-    let mut matchmaking_manager = MatchmakingManager::new(manager_connection)?;
-    let counter_key = RedisKeys::game_id_counter();
-
-    let _: usize = legacy_connection.del(&counter_key).await?;
-    let legacy_before: i32 = legacy_connection.incr(&counter_key, 1).await?;
-    let durable_before = matchmaking_manager
-        .generate_game_id(env.db().as_ref())
-        .await?;
-    let legacy_after: i32 = legacy_connection.incr(&counter_key, 1).await?;
-
-    assert!(legacy_before < DURABLE_GAME_ID_FLOOR);
-    assert_eq!(legacy_after, legacy_before + 1);
-    assert!(durable_before >= DURABLE_GAME_ID_FLOOR as u32);
-
-    // Losing Redis can rewind a legacy allocator, but it cannot rewind or overlap the
-    // disjoint DynamoDB epoch used by new nodes.
-    let _: usize = legacy_connection.del(&counter_key).await?;
-    let legacy_after_reset: i32 = legacy_connection.incr(&counter_key, 1).await?;
-    let durable_after_reset = matchmaking_manager
-        .generate_game_id(env.db().as_ref())
-        .await?;
-
-    assert!(legacy_after_reset < DURABLE_GAME_ID_FLOOR);
-    assert!(durable_after_reset > durable_before);
-    assert_ne!(durable_after_reset, legacy_after_reset as u32);
-    let legacy_counter_after_new_allocation: i32 = legacy_connection.get(&counter_key).await?;
-    assert_eq!(legacy_counter_after_new_allocation, legacy_after_reset);
-
-    // If the rollout precondition is violated, fail rather than silently sharing a namespace.
-    let _: () = legacy_connection
-        .set(&counter_key, DURABLE_GAME_ID_FLOOR)
-        .await?;
-    let error = matchmaking_manager
-        .generate_game_id(env.db().as_ref())
-        .await
-        .expect_err("legacy counter entering the durable epoch must fail fast");
-    assert!(error.to_string().contains("reserved durable namespace"));
-    let _: usize = legacy_connection.del(&counter_key).await?;
-
-    env.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn executor_persists_a_completed_game_for_reload_after_cache_loss() -> Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut env = TestEnvironment::new("executor_completed_game_persistence").await?;
-    let user_id = env.create_user().await?;
-    let game_id = env.db().allocate_game_id().await? as u32;
-    let final_state = completed_game_state(user_id as u32)?;
-    let partition_id = game_id % PARTITION_COUNT;
-
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")?;
-    let redis_client = redis::Client::open(redis_url)?;
-    let cancellation_token = CancellationToken::new();
-    let (push_tx, _) = broadcast::channel(32);
-    let executor_connection = create_connection_manager(redis_client.clone(), push_tx).await?;
-    let executor_bus = Arc::new(GameBus::new(
-        executor_connection.clone(),
-        redis_client.clone(),
-        cancellation_token.clone(),
-    ));
-    let publisher_bus = GameBus::new(
-        executor_connection.clone(),
-        redis_client.clone(),
-        cancellation_token.clone(),
-    );
-    let replication_manager = Arc::new(
-        ReplicationManager::new(
-            vec![partition_id],
-            cancellation_token.clone(),
-            &std::env::var("SNAKETRON_REDIS_URL")?,
-        )
-        .await?,
-    );
-    let executor_db = env.db();
-    let executor_token = cancellation_token.clone();
-    let executor_task = tokio::spawn(async move {
-        run_game_executor(
-            4242,
-            partition_id,
-            executor_connection,
-            executor_bus,
-            executor_db,
-            replication_manager,
-            executor_token,
-        )
-        .await
-    });
-
-    // The executor's command subscription anchors at the stream tail, and that
-    // happens asynchronously after the spawn above — a GameCreated published
-    // before the anchor is never delivered. Re-publishing is idempotent while
-    // the game is running (the executor ignores GameCreated for a game it
-    // already started), so publish until the executor proves acceptance by
-    // persisting the completed game. Persistence is checked before each
-    // publish so the loop stops as soon as the game went through.
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if let Some(game) = env.db().get_game_by_id(game_id as i32).await?
-                && let Some(game_state) = game.game_state
-            {
-                let persisted_state: GameState = serde_json::from_value(game_state)?;
-                if persisted_state.start_ms == final_state.start_ms
-                    && matches!(persisted_state.status, GameStatus::Complete { .. })
-                {
-                    return Ok::<_, anyhow::Error>(());
-                }
-            }
-            publisher_bus
-                .publish_command(
-                    partition_id,
-                    &StreamEvent::GameCreated {
-                        game_id,
-                        game_state: final_state.clone(),
-                    },
-                )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .context("executor did not persist the completed game in time")??;
-
-    cancellation_token.cancel();
-    timeout(Duration::from_secs(5), executor_task)
-        .await
-        .context("direct game executor did not stop in time")?
-        .context("direct game executor task panicked")??;
-
-    // Remove the grace-period cache so the reload proves the executor wrote DynamoDB.
-    let mut redis = redis_client.get_multiplexed_async_connection().await?;
-    let _: usize = redis.del(RedisKeys::game_snapshot(game_id)).await?;
-
-    // A newly started server has neither the old in-memory replica nor the deleted Redis
-    // snapshot, so its successful reload necessarily comes from DynamoDB.
-    let (reload_server_index, _) = env.add_server().await?;
-    let server_addr = env
-        .ws_addr(reload_server_index)
-        .expect("reload test server should be running");
-    let mut client = TestClient::connect(&server_addr).await?;
-    client.authenticate(user_id).await?;
-    client.join_game(game_id).await?;
-    let loaded_state = receive_snapshot(&mut client).await?;
-    assert_eq!(loaded_state.status, final_state.status);
-
-    client.disconnect().await?;
-    env.shutdown().await?;
-    Ok(())
-}
-
 async fn receive_snapshot(client: &mut TestClient) -> Result<GameState> {
     timeout(Duration::from_secs(10), async {
         loop {
@@ -623,6 +718,36 @@ async fn receive_snapshot(client: &mut TestClient) -> Result<GameState> {
     })
     .await
     .context("timed out waiting for a game snapshot")?
+}
+
+async fn receive_snapshot_without_join_failure(
+    client: &mut TestClient,
+    expected_game_id: u32,
+) -> Result<GameState> {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) if event.game_id == expected_game_id => {
+                    if let GameEvent::Snapshot { game_state } = event.event {
+                        return Ok::<_, anyhow::Error>(game_state);
+                    }
+                }
+                WSMessage::GameWarming { game_id, .. } if game_id == expected_game_id => {
+                    return Err(anyhow::anyhow!(
+                        "delayed live snapshot incorrectly returned GameWarming"
+                    ));
+                }
+                WSMessage::GameLoadFailed { game_id, reason } if game_id == expected_game_id => {
+                    return Err(anyhow::anyhow!(
+                        "delayed live snapshot incorrectly failed to load: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for a delayed cold-gateway snapshot")?
 }
 
 async fn receive_load_failure_without_game_chat(

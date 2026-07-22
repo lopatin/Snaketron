@@ -47,6 +47,14 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = QueueMode::Quickmatch)]
     pub queue_mode: QueueMode,
 
+    /// Lifecycle state held by each virtual user.
+    ///
+    /// `game` is the normal AI-driven load. The other values are staging
+    /// probes that deliberately remain authenticated, in a lobby, or queued
+    /// without entering a game.
+    #[arg(long, value_enum, default_value_t = Population::Game)]
+    pub population: Population,
+
     /// Comma-separated target concurrency and ramp duration stages.
     ///
     /// Example: `4@30s,8@1m` gives the 4-session ramp/hold 30 seconds, then
@@ -106,9 +114,10 @@ pub struct Args {
     )]
     pub drain_timeout: Duration,
 
-    /// How long a healthy Solo/FFA session plays before leaving successfully.
+    /// How long a healthy Solo/FFA session plays, or a non-game population
+    /// probe holds its lifecycle state, before leaving successfully.
     ///
-    /// Those modes have no authoritative server time limit. A timeboxed leave
+    /// Solo/FFA have no authoritative server time limit. Their timeboxed leave
     /// is reported separately from an authoritatively completed game.
     #[arg(
         long,
@@ -140,6 +149,13 @@ pub struct Args {
     /// above its preflight baseline.
     #[arg(long)]
     pub require_scale_out: bool,
+
+    /// Fail unless at least one planned drain completes make-before-break,
+    /// every such handoff has an old/new continuity proof, and no usable gap is
+    /// measured. Game populations additionally require the command-outcome
+    /// barrier. Intended for the staged scale-down certification runner.
+    #[arg(long)]
+    pub require_planned_handoff: bool,
 }
 
 impl Args {
@@ -194,6 +210,47 @@ pub enum QueueMode {
     Quickmatch,
     #[value(name = "competitive")]
     Competitive,
+}
+
+/// Lifecycle population exercised by a load-test process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Population {
+    /// Create deterministic matches and drive them with the configured AI.
+    #[value(name = "game")]
+    Game,
+    /// Authenticate a WebSocket and otherwise remain idle.
+    #[value(name = "idle")]
+    Idle,
+    /// Create a lobby and remain in it without entering matchmaking.
+    #[value(name = "lobby")]
+    Lobby,
+    /// Create a one-player lobby and remain queued without being matched.
+    #[value(name = "matchmaking")]
+    Matchmaking,
+}
+
+impl Population {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Game => "game",
+            Self::Idle => "idle",
+            Self::Lobby => "lobby",
+            Self::Matchmaking => "matchmaking",
+        }
+    }
+
+    pub const fn sessions_per_group(self, mode: GameMode) -> usize {
+        match self {
+            Self::Game => mode.players_per_game(),
+            Self::Idle | Self::Lobby | Self::Matchmaking => 1,
+        }
+    }
+}
+
+impl fmt::Display for Population {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl QueueMode {
@@ -374,6 +431,7 @@ pub struct Config {
     pub ws_url: Option<Url>,
     pub mode: GameMode,
     pub queue_mode: QueueMode,
+    pub population: Population,
     pub stages: StagePlan,
     pub spawn_rate: usize,
     pub max_total_sessions: usize,
@@ -387,11 +445,19 @@ pub struct Config {
     pub command_profile: CommandProfile,
     pub production_confirmed: bool,
     pub require_scale_out: bool,
+    pub require_planned_handoff: bool,
 }
 
 impl Config {
-    pub const fn players_per_game(&self) -> usize {
-        self.mode.players_per_game()
+    pub const fn sessions_per_group(&self) -> usize {
+        self.population.sessions_per_group(self.mode)
+    }
+
+    pub const fn expected_games(&self, launched_sessions: usize) -> usize {
+        match self.population {
+            Population::Game => launched_sessions / self.mode.players_per_game(),
+            Population::Idle | Population::Lobby | Population::Matchmaking => 0,
+        }
     }
 
     pub fn max_concurrency(&self) -> usize {
@@ -420,11 +486,12 @@ impl TryFrom<Args> for Config {
 
         let region = args.region.map(validate_region).transpose()?;
 
-        validate_stages(&args.stages, args.mode)?;
-        if args.spawn_rate < args.mode.players_per_game() {
+        let sessions_per_group = args.population.sessions_per_group(args.mode);
+        validate_stages(&args.stages, sessions_per_group)?;
+        if args.spawn_rate < sessions_per_group {
             return Err(ConfigError::SpawnRateBelowMatchSize {
                 spawn_rate: args.spawn_rate,
-                players_per_game: args.mode.players_per_game(),
+                players_per_game: sessions_per_group,
             });
         }
         if args.max_total_sessions < args.stages.max_concurrency() {
@@ -458,6 +525,7 @@ impl TryFrom<Args> for Config {
             ws_url,
             mode: args.mode,
             queue_mode: args.queue_mode,
+            population: args.population,
             stages: args.stages,
             spawn_rate: args.spawn_rate,
             max_total_sessions: args.max_total_sessions,
@@ -471,6 +539,7 @@ impl TryFrom<Args> for Config {
             command_profile: args.command_profile,
             production_confirmed: args.confirm_production,
             require_scale_out: args.require_scale_out,
+            require_planned_handoff: args.require_planned_handoff,
         })
     }
 }
@@ -691,12 +760,11 @@ fn validate_region(region: String) -> Result<String, ConfigError> {
     Ok(region)
 }
 
-fn validate_stages(stages: &StagePlan, mode: GameMode) -> Result<(), ConfigError> {
+fn validate_stages(stages: &StagePlan, sessions_per_group: usize) -> Result<(), ConfigError> {
     if stages.is_empty() {
         return Err(ConfigError::EmptyStages);
     }
 
-    let players_per_game = mode.players_per_game();
     let mut previous_target = 0;
     for (stage_index, stage) in stages.iter().enumerate() {
         if stage.target_concurrency == 0 {
@@ -711,11 +779,11 @@ fn validate_stages(stages: &StagePlan, mode: GameMode) -> Result<(), ConfigError
                 reason: "duration must be greater than zero".to_string(),
             });
         }
-        if stage.target_concurrency % players_per_game != 0 {
+        if stage.target_concurrency % sessions_per_group != 0 {
             return Err(ConfigError::StageConcurrencyMisaligned {
                 stage_index,
                 target_concurrency: stage.target_concurrency,
-                players_per_game,
+                players_per_game: sessions_per_group,
             });
         }
         if stage_index > 0 && stage.target_concurrency <= previous_target {
@@ -791,6 +859,7 @@ mod tests {
             ws_url: None,
             mode: GameMode::Duel,
             queue_mode: QueueMode::Quickmatch,
+            population: Population::Game,
             stages: DEFAULT_STAGES.parse().unwrap(),
             spawn_rate: DEFAULT_SPAWN_RATE,
             max_total_sessions: DEFAULT_MAX_TOTAL_SESSIONS,
@@ -804,6 +873,7 @@ mod tests {
             command_profile: CommandProfile::Realistic,
             confirm_production: false,
             require_scale_out: false,
+            require_planned_handoff: false,
         }
     }
 
@@ -856,6 +926,14 @@ mod tests {
     }
 
     #[test]
+    fn non_game_populations_use_one_session_groups() {
+        for population in [Population::Idle, Population::Lobby, Population::Matchmaking] {
+            assert_eq!(population.sessions_per_group(GameMode::TwoVTwo), 1);
+        }
+        assert_eq!(Population::Game.sessions_per_group(GameMode::TwoVTwo), 4);
+    }
+
+    #[test]
     fn parses_every_supported_game_mode() {
         for value in ["solo", "duel", "2v2", "ffa"] {
             let args = Args::try_parse_from(["loadtest", "--mode", value]).unwrap();
@@ -867,7 +945,7 @@ mod tests {
     fn accepts_aligned_increasing_duel_stages() {
         let config = test_args().into_config().unwrap();
 
-        assert_eq!(config.players_per_game(), 2);
+        assert_eq!(config.sessions_per_group(), 2);
         assert_eq!(config.max_concurrency(), 256);
         assert!(!config.is_production());
     }
@@ -886,6 +964,19 @@ mod tests {
                 players_per_game: 4,
             }
         );
+    }
+
+    #[test]
+    fn one_session_probe_population_does_not_require_game_size_alignment() {
+        let mut args = test_args();
+        args.mode = GameMode::TwoVTwo;
+        args.population = Population::Matchmaking;
+        args.stages = "3@10s".parse().unwrap();
+        args.spawn_rate = 1;
+
+        let config = args.into_config().unwrap();
+        assert_eq!(config.sessions_per_group(), 1);
+        assert_eq!(config.expected_games(3), 0);
     }
 
     #[test]

@@ -26,6 +26,19 @@ import {
   persistStoredLobbyPreferences,
   sanitizeClientLobbyPreferences,
 } from '../utils/lobbyPreferencesStorage';
+import {
+  advanceCandidateGameWatermark,
+  candidateDeadlineDelayMs,
+  activeGameIdFromPath,
+  isCommandOwner,
+  isSnapshotForGame,
+  isTerminalSnapshotForGame,
+  missingRequiredServerCapabilities,
+  plannedDrainRemainingMs,
+  reconnectDelayMs,
+  replacementFailureAction,
+  replacementReadyForPromotion,
+} from '../services/websocketLifecycle';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -33,6 +46,32 @@ interface WebSocketProviderProps {
 
 interface MessageHandler {
   (message: { type: string; data: any }): void;
+}
+
+type SocketRole = 'active' | 'candidate' | 'retired';
+
+interface SocketSlot {
+  socket: WebSocket;
+  generation: number;
+  role: SocketRole;
+  url: string;
+  authenticated: boolean;
+  capabilities: string[];
+  authTokenSent: string | null;
+  bufferedMessages: any[];
+  expectedLobbyCode: string | null;
+  expectedGameId: number | null;
+  lobbyReady: boolean;
+  gameReady: boolean;
+  gameComplete: boolean;
+  gameStreamWatermark: number | null;
+  commandOutcomesReady: boolean;
+  drainDeadlineMs: number | null;
+  candidateAttempt: number;
+  authStartedAtMs: number | null;
+  authTimeoutId: ReturnType<typeof setTimeout> | null;
+  gameWarmRetryTimeoutId: ReturnType<typeof setTimeout> | null;
+  contextRestoreStartedAtMs: number | null;
 }
 
 // Extend window interface for testing
@@ -49,6 +88,36 @@ const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
 const MAX_CHAT_HISTORY = 200;
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
+const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
+const AUTHENTICATION_TIMEOUT_MS = 5_000;
+
+const clearAuthenticationTimeout = (slot: SocketSlot) => {
+  if (slot.authTimeoutId !== null) {
+    clearTimeout(slot.authTimeoutId);
+    slot.authTimeoutId = null;
+  }
+};
+
+const clearGameWarmRetryTimeout = (slot: SocketSlot) => {
+  if (slot.gameWarmRetryTimeoutId !== null) {
+    clearTimeout(slot.gameWarmRetryTimeoutId);
+    slot.gameWarmRetryTimeoutId = null;
+  }
+};
+
+const boundedMetricDuration = (startedAtMs: number, nowMs: number = Date.now()): number =>
+  Math.max(0, Math.min(MAX_RECOVERY_METRIC_MS, Math.round(nowMs - startedAtMs)));
+
+const recordWsMetric = (
+  name: string,
+  fields: Record<string, string | number>,
+  nowMs: number = Date.now(),
+) => {
+  const details = Object.entries(fields)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ');
+  recordTrace({ Note: { ts_ms: nowMs, note: `ws_metric name=${name} ${details}` } });
+};
 
 const normalizeLobbyPreferences = (payload: any): LobbyPreferences => {
   const rawModes = Array.isArray(payload.selected_modes ?? payload.selectedModes)
@@ -103,11 +172,24 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences | null>(storedPreferences);
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
+  const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
   const currentLobbyRef = useRef<Lobby | null>(null);
   const desiredLobbyPreferencesRef = useRef<LobbyPreferences | null>(storedPreferences);
   const ws = useRef<WebSocket | null>(null);
+  const activeSlotRef = useRef<SocketSlot | null>(null);
+  const candidateSlotRef = useRef<SocketSlot | null>(null);
+  const nextGenerationRef = useRef(0);
+  const reconnectAttemptRef = useRef(0);
+  const candidateAttemptRef = useRef(0);
+  const candidateRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const candidateDeadlineTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectEnabledRef = useRef(true);
+  const openActiveRef = useRef<(url: string, onConnect?: () => void) => void>(() => {});
+  const startCandidateRef = useRef<(deadlineMs: number) => void>(() => {});
   const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const inFlightRequestsByGenerationRef = useRef<Map<number, number>>(new Map());
+  const latestGameStreamSeqRef = useRef<Map<number, number>>(new Map());
   const onConnectCallback = useRef<(() => void) | null>(null);
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
   const isInitializingRef = useRef(false);
@@ -117,11 +199,19 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const lobbyChatLobbyIdRef = useRef<number | null>(null);
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
+  const latencySettingsRef = useRef(latencySettings);
   const { user, getToken } = useAuth();
   const hasEverConnectedRef = useRef(false);
   const authHandshakeRef = useRef(false);
   const lastAuthTokenRef = useRef<string | null>(null);
   const previousUserRef = useRef<User | null>(null);
+  const plannedHandoffStartedAtRef = useRef<number | null>(null);
+  const recoveryStartedAtRef = useRef<number | null>(null);
+  const usableGapStartedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    latencySettingsRef.current = latencySettings;
+  }, [latencySettings]);
 
   useEffect(() => {
     if (lobbyPreferences) {
@@ -156,6 +246,46 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (authHandshakeRef.current !== value) {
       authHandshakeRef.current = value;
       setIsSessionAuthenticated(value);
+    }
+  }, []);
+
+  const recordPlannedHandoffFailure = useCallback((reason: string, nowMs: number = Date.now()) => {
+    const startedAtMs = plannedHandoffStartedAtRef.current;
+    if (startedAtMs === null) {
+      return;
+    }
+    recordWsMetric('planned_handoff_failure', {
+      count: 1,
+      duration_ms: boundedMetricDuration(startedAtMs, nowMs),
+      reason,
+    }, nowMs);
+    plannedHandoffStartedAtRef.current = null;
+  }, []);
+
+  const completeActiveRecovery = useCallback((slot: SocketSlot, nowMs: number = Date.now()) => {
+    if (
+      activeSlotRef.current !== slot ||
+      slot.role !== 'active' ||
+      !slot.authenticated ||
+      !slot.lobbyReady ||
+      !slot.gameReady ||
+      !slot.commandOutcomesReady
+    ) {
+      return;
+    }
+    const recoveryStartedAtMs = recoveryStartedAtRef.current;
+    if (recoveryStartedAtMs !== null) {
+      recordWsMetric('reconnect_duration_ms', {
+        value: boundedMetricDuration(recoveryStartedAtMs, nowMs),
+      }, nowMs);
+      recoveryStartedAtRef.current = null;
+    }
+    const gapStartedAtMs = usableGapStartedAtRef.current;
+    if (gapStartedAtMs !== null) {
+      recordWsMetric('usable_session_gap_ms', {
+        value: boundedMetricDuration(gapStartedAtMs, nowMs),
+      }, nowMs);
+      usableGapStartedAtRef.current = null;
     }
   }, []);
 
@@ -247,162 +377,742 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     );
   }, []);
 
-  const connect = useCallback((url: string, onConnect?: () => void) => {
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      console.log('WebSocket already connected');
+  const dispatchRawMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
+    if (activeSlotRef.current !== slot || slot.role !== 'active') {
       return;
     }
 
-    // Store the onConnect callback
-    if (onConnect) {
-      onConnectCallback.current = onConnect;
+    console.log('WebSocket message received:', rawMessage);
+    const gameId = Number(rawMessage?.GameEvent?.game_id);
+    if (Number.isSafeInteger(gameId)) {
+      const nextWatermark = advanceCandidateGameWatermark(
+        latestGameStreamSeqRef.current.get(gameId) ?? null,
+        rawMessage,
+        gameId,
+      );
+      if (nextWatermark !== null) {
+        // A takeover snapshot may legitimately re-anchor below events the old
+        // owner published after its last checkpoint. Keeping Math.max here
+        // would preserve a watermark from the retired authority and could
+        // prevent a later healthy replacement socket from ever promoting.
+        latestGameStreamSeqRef.current.set(gameId, nextWatermark);
+      }
+    }
+    const nowMs = Date.now();
+    if (
+      !slot.lobbyReady &&
+      slot.expectedLobbyCode &&
+      (rawMessage?.JoinedLobby?.lobby_code?.toUpperCase() === slot.expectedLobbyCode ||
+        rawMessage?.LobbyUpdate?.lobby_code?.toUpperCase() === slot.expectedLobbyCode)
+    ) {
+      slot.lobbyReady = true;
+      if (slot.contextRestoreStartedAtMs !== null) {
+        recordWsMetric('lobby_rejoin_latency_ms', {
+          value: boundedMetricDuration(slot.contextRestoreStartedAtMs, nowMs),
+          role: slot.role,
+        }, nowMs);
+      }
+    }
+    if (
+      !slot.gameReady &&
+      slot.expectedGameId !== null &&
+      isSnapshotForGame(rawMessage, slot.expectedGameId)
+    ) {
+      slot.gameReady = true;
+      if (slot.contextRestoreStartedAtMs !== null) {
+        recordWsMetric('snapshot_rejoin_latency_ms', {
+          value: boundedMetricDuration(slot.contextRestoreStartedAtMs, nowMs),
+          role: slot.role,
+        }, nowMs);
+      }
+    }
+    if (
+      !slot.commandOutcomesReady &&
+      slot.expectedGameId !== null &&
+      Number(rawMessage?.CommandOutcomesComplete?.game_id) === slot.expectedGameId
+    ) {
+      slot.commandOutcomesReady = true;
+    }
+    completeActiveRecovery(slot, nowMs);
+    if (rawMessage?.Pong) {
+      const { client_time, server_time } = rawMessage.Pong;
+      const t1 = syncRequestTimes.current.get(client_time);
+      if (t1) {
+        syncRequestTimes.current.delete(client_time);
+        const t3 = Date.now();
+        const measurement = clockSync.processSyncResponse(t1, server_time, t3);
+        recordTrace({
+          Clock: {
+            ts_ms: t3,
+            drift_ms: measurement.offset,
+            rtt_ms: measurement.rtt,
+          },
+        });
+        setLatencyMs(Math.round((t3 - t1) / 2));
+      }
+      return;
     }
 
-    try {
-      ws.current = new WebSocket(url);
-      setCurrentRegionUrl(url);
+    let messageType: string | null = null;
+    let messageData: any = undefined;
+    if (typeof rawMessage === 'string') {
+      messageType = rawMessage;
+      messageData = null;
+    } else if (rawMessage && typeof rawMessage === 'object') {
+      const keys = Object.keys(rawMessage);
+      if (keys.length === 1) {
+        messageType = keys[0];
+        messageData = rawMessage[messageType];
+      }
+    }
+    if (!messageType) {
+      console.warn('Unexpected WebSocket message shape', rawMessage);
+      return;
+    }
+    const handlers = [...(messageHandlers.current.get(messageType) || [])];
+    handlers.forEach((handler: MessageHandler) => {
+      try {
+        handler({ type: messageType!, data: messageData });
+      } catch (error) {
+        console.error(`WebSocket ${messageType} handler failed:`, error);
+      }
+    });
+  }, [completeActiveRecovery]);
 
-      ws.current.onopen = () => {
-        console.log('WebSocket connected to:', url);
+  const configureClockSync = useCallback((slot: SocketSlot) => {
+    clockSync.setOnSyncRequest((clientTime) => {
+      if (
+        activeSlotRef.current === slot &&
+        slot.role === 'active' &&
+        slot.socket.readyState === WebSocket.OPEN
+      ) {
+        syncRequestTimes.current.set(clientTime, clientTime);
+        slot.socket.send(JSON.stringify({ Ping: { client_time: clientTime } }));
+      }
+    });
+    clockSync.start();
+  }, []);
+
+  const promoteCandidate = useCallback((candidate: SocketSlot) => {
+    if (candidateSlotRef.current !== candidate) {
+      return;
+    }
+    const previous = activeSlotRef.current;
+    const inFlightRequestCount = previous &&
+      previous.role === 'active' &&
+      previous.socket.readyState === WebSocket.OPEN
+      ? inFlightRequestsByGenerationRef.current.get(previous.generation) ?? 0
+      : 0;
+    const desiredLobbyCode = (
+      currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null
+    )?.toUpperCase() ?? null;
+    const desiredGameId = typeof window === 'undefined'
+      ? null
+      : activeGameIdFromPath(window.location.pathname);
+    if (
+      candidate.expectedLobbyCode !== desiredLobbyCode ||
+      candidate.expectedGameId !== desiredGameId
+    ) {
+      candidate.socket.close(1000, 'client context changed during handoff');
+      return;
+    }
+    if (!replacementReadyForPromotion({
+      socketOpen: candidate.socket.readyState === WebSocket.OPEN,
+      authenticated: candidate.authenticated,
+      inFlightRequestCount,
+      lobbyReady: candidate.lobbyReady,
+      gameReady: candidate.gameReady,
+      gameComplete: candidate.gameComplete,
+      commandOutcomesReady: candidate.commandOutcomesReady,
+      expectsGame: candidate.expectedGameId !== null,
+      gameStreamWatermark: candidate.gameStreamWatermark,
+    }, candidate.expectedGameId === null
+      ? null
+      : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null)) {
+      return;
+    }
+
+    const previousWasUsable = Boolean(
+      previous &&
+      previous.role === 'active' &&
+      previous.authenticated &&
+      previous.socket.readyState === WebSocket.OPEN,
+    );
+    const nowMs = Date.now();
+    clearGameWarmRetryTimeout(candidate);
+    candidate.role = 'active';
+    candidateSlotRef.current = null;
+    activeSlotRef.current = candidate;
+    ws.current = candidate.socket;
+    setServerCapabilities(new Set(candidate.capabilities));
+    reconnectAttemptRef.current = 0;
+    candidateAttemptRef.current = 0;
+    if (candidateDeadlineTimeoutRef.current) {
+      clearTimeout(candidateDeadlineTimeoutRef.current);
+      candidateDeadlineTimeoutRef.current = null;
+    }
+    if (candidateRetryTimeoutRef.current) {
+      clearTimeout(candidateRetryTimeoutRef.current);
+      candidateRetryTimeoutRef.current = null;
+    }
+    setCurrentRegionUrl(candidate.url);
+    setIsConnected(true);
+    setAuthHandshakeState(true);
+    configureClockSync(candidate);
+    if (typeof window !== 'undefined') {
+      window.__wsInstance = candidate.socket;
+    }
+
+    const buffered = candidate.bufferedMessages.splice(0);
+    buffered.forEach((message) => dispatchRawMessage(candidate, message));
+
+    if (previous && previous !== candidate) {
+      previous.role = 'retired';
+      inFlightRequestsByGenerationRef.current.delete(previous.generation);
+      try {
+        previous.socket.close(1000, 'planned gateway handoff complete');
+      } catch {
+        // The server may have reached its drain deadline concurrently.
+      }
+    }
+    const plannedStartedAtMs = plannedHandoffStartedAtRef.current;
+    if (plannedStartedAtMs !== null) {
+      if (previousWasUsable) {
+        recordWsMetric('planned_handoff_success', {
+          count: 1,
+          duration_ms: boundedMetricDuration(plannedStartedAtMs, nowMs),
+          usable_session_gap_ms: 0,
+        }, nowMs);
+        plannedHandoffStartedAtRef.current = null;
+      } else {
+        recordPlannedHandoffFailure('old_socket_not_usable_at_promotion', nowMs);
+        recoveryStartedAtRef.current ??= nowMs;
+        usableGapStartedAtRef.current ??= nowMs;
+      }
+    }
+    completeActiveRecovery(candidate, nowMs);
+    recordTrace({ Note: { ts_ms: nowMs, note: `ws drain promoted generation ${candidate.generation}` } });
+  }, [completeActiveRecovery, configureClockSync, dispatchRawMessage, recordPlannedHandoffFailure, setAuthHandshakeState]);
+
+  const restoreCandidateContext = useCallback((candidate: SocketSlot) => {
+    clearGameWarmRetryTimeout(candidate);
+    candidate.contextRestoreStartedAtMs = Date.now();
+    const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
+    const gameId = typeof window === 'undefined' ? null : activeGameIdFromPath(window.location.pathname);
+    candidate.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
+    candidate.expectedGameId = gameId;
+    candidate.lobbyReady = candidate.expectedLobbyCode === null;
+    candidate.gameReady = candidate.expectedGameId === null;
+    candidate.gameComplete = false;
+    candidate.gameStreamWatermark = null;
+    candidate.commandOutcomesReady = candidate.expectedGameId === null;
+
+    if (candidate.expectedLobbyCode) {
+      const preferences = buildInitialLobbyPreferences();
+      candidate.socket.send(JSON.stringify({
+        JoinLobby: {
+          lobby_code: candidate.expectedLobbyCode,
+          preferences: {
+            selected_modes: preferences.selectedModes,
+            competitive: preferences.competitive,
+          },
+        },
+      }));
+    }
+    if (candidate.expectedGameId !== null) {
+      candidate.socket.send(JSON.stringify({ JoinGame: candidate.expectedGameId }));
+    }
+    promoteCandidate(candidate);
+  }, [buildInitialLobbyPreferences, promoteCandidate]);
+
+  const recoverAfterCandidateFailure = useCallback((candidate: SocketSlot) => {
+    clearGameWarmRetryTimeout(candidate);
+    if (candidateDeadlineTimeoutRef.current) {
+      clearTimeout(candidateDeadlineTimeoutRef.current);
+      candidateDeadlineTimeoutRef.current = null;
+    }
+    const active = activeSlotRef.current;
+    const hasUsableActive = Boolean(
+      active &&
+      active.role === 'active' &&
+      (active.socket.readyState === WebSocket.OPEN ||
+        active.socket.readyState === WebSocket.CONNECTING),
+    );
+    const action = replacementFailureAction(
+      hasUsableActive,
+      reconnectEnabledRef.current,
+      candidate.drainDeadlineMs,
+      Date.now(),
+    );
+    if (action === 'retry-candidate' && candidate.drainDeadlineMs !== null) {
+      const attempt = candidateAttemptRef.current++;
+      candidateRetryTimeoutRef.current = setTimeout(
+        () => startCandidateRef.current(candidate.drainDeadlineMs!),
+        reconnectDelayMs(attempt),
+      );
+    } else if (action === 'reconnect-active') {
+      const attempt = reconnectAttemptRef.current++;
+      reconnectTimeout.current = setTimeout(
+        () => openActiveRef.current(candidate.url, onConnectCallback.current || undefined),
+        reconnectDelayMs(attempt),
+      );
+    }
+  }, []);
+
+  const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
+    if (slot.role === 'retired') {
+      return;
+    }
+
+    if (rawMessage?.Authenticated) {
+      const nowMs = Date.now();
+      const payload = rawMessage.Authenticated;
+      slot.capabilities = Array.isArray(payload?.capabilities)
+        ? payload.capabilities.filter((value: unknown): value is string => typeof value === 'string')
+        : [];
+      const missingCapabilities = missingRequiredServerCapabilities(slot.capabilities);
+      if (missingCapabilities.length > 0) {
+        console.error('Server is missing required WebSocket capabilities:', missingCapabilities);
+        clearAuthenticationTimeout(slot);
+        slot.authenticated = false;
+        slot.socket.close(1002, 'unsupported server protocol');
+        return;
+      }
+      clearAuthenticationTimeout(slot);
+      slot.authenticated = true;
+      if (slot.authStartedAtMs !== null) {
+        recordWsMetric('auth_latency_ms', {
+          value: boundedMetricDuration(slot.authStartedAtMs, nowMs),
+          role: slot.role,
+        }, nowMs);
+        slot.authStartedAtMs = null;
+      }
+      if (slot.role === 'active' && activeSlotRef.current === slot) {
+        reconnectAttemptRef.current = 0;
+        setServerCapabilities(new Set(slot.capabilities));
+        setAuthHandshakeState(true);
+        const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
+        const gameId = typeof window === 'undefined'
+          ? null
+          : activeGameIdFromPath(window.location.pathname);
+        slot.contextRestoreStartedAtMs = nowMs;
+        slot.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
+        slot.expectedGameId = gameId;
+        slot.lobbyReady = slot.expectedLobbyCode === null;
+        slot.gameReady = slot.expectedGameId === null;
+        slot.commandOutcomesReady = slot.expectedGameId === null;
+        if (lobbyCode) {
+          const preferences = buildInitialLobbyPreferences();
+          slot.socket.send(JSON.stringify({
+            JoinLobby: {
+              lobby_code: lobbyCode.toUpperCase(),
+              preferences: {
+                selected_modes: preferences.selectedModes,
+                competitive: preferences.competitive,
+              },
+            },
+          }));
+        }
+        dispatchRawMessage(slot, rawMessage);
+        completeActiveRecovery(slot, nowMs);
+      } else if (slot.role === 'candidate' && candidateSlotRef.current === slot) {
+        restoreCandidateContext(slot);
+      }
+      return;
+    }
+
+    if (rawMessage?.Drain) {
+      if (slot.role === 'active' && activeSlotRef.current === slot) {
+        const serverDeadlineMs = Number(rawMessage.Drain.deadline_unix_ms);
+        const nowMs = Date.now();
+        const remainingMs = plannedDrainRemainingMs(
+          serverDeadlineMs,
+          nowMs,
+          clockSync.getServerClockOffsetMs(),
+        );
+        if (remainingMs !== null) {
+          if (plannedHandoffStartedAtRef.current === null) {
+            plannedHandoffStartedAtRef.current = nowMs;
+            recordWsMetric('planned_handoff_attempt', { count: 1 }, nowMs);
+          }
+          candidateAttemptRef.current = 0;
+          if (candidateRetryTimeoutRef.current) {
+            clearTimeout(candidateRetryTimeoutRef.current);
+            candidateRetryTimeoutRef.current = null;
+          }
+          // Candidate retry/timer code uses the browser clock, so translate
+          // the server deadline once instead of mixing the two clock domains.
+          startCandidateRef.current(nowMs + remainingMs);
+        }
+      } else if (slot.role === 'candidate' && candidateSlotRef.current === slot) {
+        slot.role = 'retired';
+        candidateSlotRef.current = null;
+        slot.socket.close(1012, 'candidate backend is draining');
+        recoverAfterCandidateFailure(slot);
+      }
+      return;
+    }
+
+    if (slot.role === 'candidate' && candidateSlotRef.current === slot) {
+      if (
+        rawMessage?.GameWarming &&
+        Number(rawMessage.GameWarming.game_id) === slot.expectedGameId
+      ) {
+        // The gateway is healthy and authenticated; only its local replica is
+        // still catching up. Reuse this socket instead of repeating TCP, WS,
+        // authentication, and lobby restoration on every warming response.
+        clearGameWarmRetryTimeout(slot);
+        const retryAfterMs = Math.max(
+          100,
+          Math.min(2000, Number(rawMessage.GameWarming.retry_after_ms) || 500),
+        );
+        slot.gameWarmRetryTimeoutId = setTimeout(() => {
+          slot.gameWarmRetryTimeoutId = null;
+          if (
+            candidateSlotRef.current === slot &&
+            slot.role === 'candidate' &&
+            slot.authenticated &&
+            slot.expectedGameId !== null &&
+            slot.socket.readyState === WebSocket.OPEN &&
+            (slot.drainDeadlineMs === null || Date.now() < slot.drainDeadlineMs)
+          ) {
+            slot.socket.send(JSON.stringify({ JoinGame: slot.expectedGameId }));
+          }
+        }, retryAfterMs);
+        return;
+      }
+      if (rawMessage?.AccessDenied || rawMessage?.GameLoadFailed) {
+        slot.role = 'retired';
+        candidateSlotRef.current = null;
+        slot.socket.close(1008, 'replacement context restore rejected');
+        recoverAfterCandidateFailure(slot);
+        return;
+      }
+      slot.bufferedMessages.push(rawMessage);
+      if (slot.expectedGameId !== null) {
+        slot.gameStreamWatermark = advanceCandidateGameWatermark(
+          slot.gameStreamWatermark,
+          rawMessage,
+          slot.expectedGameId,
+        );
+      }
+      if (
+        slot.expectedLobbyCode &&
+        (rawMessage?.JoinedLobby?.lobby_code?.toUpperCase() === slot.expectedLobbyCode ||
+          rawMessage?.LobbyUpdate?.lobby_code?.toUpperCase() === slot.expectedLobbyCode)
+      ) {
+        if (!slot.lobbyReady && slot.contextRestoreStartedAtMs !== null) {
+          const nowMs = Date.now();
+          recordWsMetric('lobby_rejoin_latency_ms', {
+            value: boundedMetricDuration(slot.contextRestoreStartedAtMs, nowMs),
+            role: slot.role,
+          }, nowMs);
+        }
+        slot.lobbyReady = true;
+      }
+      if (
+        slot.expectedGameId !== null &&
+        isSnapshotForGame(rawMessage, slot.expectedGameId)
+      ) {
+        clearGameWarmRetryTimeout(slot);
+        if (!slot.gameReady && slot.contextRestoreStartedAtMs !== null) {
+          const nowMs = Date.now();
+          recordWsMetric('snapshot_rejoin_latency_ms', {
+            value: boundedMetricDuration(slot.contextRestoreStartedAtMs, nowMs),
+            role: slot.role,
+          }, nowMs);
+        }
+        slot.gameReady = true;
+        slot.gameComplete = isTerminalSnapshotForGame(rawMessage, slot.expectedGameId);
+      }
+      if (
+        slot.expectedGameId !== null &&
+        Number(rawMessage?.CommandOutcomesComplete?.game_id) === slot.expectedGameId
+      ) {
+        slot.commandOutcomesReady = true;
+      }
+      promoteCandidate(slot);
+      return;
+    }
+
+    dispatchRawMessage(slot, rawMessage);
+  }, [buildInitialLobbyPreferences, completeActiveRecovery, dispatchRawMessage, promoteCandidate, recoverAfterCandidateFailure, restoreCandidateContext, setAuthHandshakeState]);
+
+  const attachSocketHandlers = useCallback((slot: SocketSlot, onConnect?: () => void) => {
+    slot.socket.onopen = () => {
+      if (
+        (slot.role === 'active' && activeSlotRef.current !== slot) ||
+        (slot.role === 'candidate' && candidateSlotRef.current !== slot) ||
+        slot.role === 'retired'
+      ) {
+        slot.socket.close();
+        return;
+      }
+      const token = getToken();
+      clearAuthenticationTimeout(slot);
+      slot.authTimeoutId = setTimeout(() => {
+        if (
+          slot.authenticated ||
+          slot.role === 'retired' ||
+          (slot.role === 'active' && activeSlotRef.current !== slot) ||
+          (slot.role === 'candidate' && candidateSlotRef.current !== slot)
+        ) {
+          return;
+        }
+        slot.authTimeoutId = null;
+        slot.socket.close(1013, 'authentication timed out');
+      }, AUTHENTICATION_TIMEOUT_MS);
+      if (token) {
+        slot.authStartedAtMs = Date.now();
+        slot.authTokenSent = token;
+        slot.socket.send(JSON.stringify({ Token: token }));
+        lastAuthTokenRef.current = token;
+      }
+
+      if (slot.role === 'active') {
+        console.log('WebSocket connected to:', slot.url, 'generation:', slot.generation);
         if (hasEverConnectedRef.current) {
           recordTrace({ Note: { ts_ms: Date.now(), note: 'ws reconnected' } });
         }
         hasEverConnectedRef.current = true;
         setIsConnected(true);
+        setAuthHandshakeState(false);
+        configureClockSync(slot);
         if (reconnectTimeout.current) {
           clearTimeout(reconnectTimeout.current);
           reconnectTimeout.current = null;
         }
-        // Expose for testing
         if (typeof window !== 'undefined') {
-          window.__wsInstance = ws.current || undefined;
+          window.__wsInstance = slot.socket;
         }
-        
-        // Set up clock sync callback
-        clockSync.setOnSyncRequest((clientTime) => {
-          if (ws.current?.readyState === WebSocket.OPEN) {
-            syncRequestTimes.current.set(clientTime, clientTime);
-            ws.current.send(JSON.stringify({
-              Ping: { client_time: clientTime }
-            }));
-          }
-        });
+        onConnect?.();
+      }
+    };
 
-        // Start clock synchronization
-        clockSync.start();
-        
-        // Call the onConnect callback if provided
-        if (onConnectCallback.current) {
-          onConnectCallback.current();
+    slot.socket.onmessage = (event: MessageEvent) => {
+      const processMessage = () => {
+        if (slot.role === 'retired') {
+          return;
+        }
+        try {
+          handleParsedMessage(slot, JSON.parse(event.data));
+        } catch (error) {
+          console.error('Failed to parse WebSocket message:', error);
         }
       };
+      const settings = latencySettingsRef.current;
+      if (settings.enabled && settings.receiveDelayMs > 0) {
+        setTimeout(processMessage, settings.receiveDelayMs);
+      } else {
+        processMessage();
+      }
+    };
 
-      ws.current.onclose = () => {
-        console.log('WebSocket disconnected');
-        recordTrace({ Note: { ts_ms: Date.now(), note: 'ws disconnected, reconnect scheduled' } });
-        setIsConnected(false);
-        // Reset clock sync
-        clockSync.reset();
-        syncRequestTimes.current.clear();
-        // Auto-reconnect after 2 seconds
-        reconnectTimeout.current = setTimeout(() => {
-          console.log('Attempting to reconnect...');
-          connect(url, onConnect);
-        }, 2000);
-      };
-
-      ws.current.onerror = (error: Event) => {
+    slot.socket.onerror = (error: Event) => {
+      if (slot.role !== 'retired') {
         console.error('WebSocket error:', error);
-      };
+      }
+    };
 
-      ws.current.onmessage = (event: MessageEvent) => {
-        // Apply artificial receive delay if enabled
-        const processMessage = () => {
-          try {
-            const rawMessage = JSON.parse(event.data);
-            console.log('WebSocket message received:', rawMessage);
-
-            // Handle Pong response carrying clock synchronization data
-            if (rawMessage?.Pong) {
-              const { client_time, server_time } = rawMessage.Pong;
-              const t1 = syncRequestTimes.current.get(client_time);
-              if (t1) {
-                syncRequestTimes.current.delete(client_time);
-                const t3 = Date.now();
-                clockSync.processSyncResponse(t1, server_time, t3);
-                const rtt = t3 - t1;
-                setLatencyMs(Math.round(rtt / 2));
-              }
-              return;
-            }
-
-            let messageType: string | null = null;
-            let messageData: any = undefined;
-
-            if (typeof rawMessage === 'string') {
-              messageType = rawMessage;
-              messageData = null;
-            } else if (rawMessage && typeof rawMessage === 'object') {
-              const keys = Object.keys(rawMessage);
-              if (keys.length === 1) {
-                messageType = keys[0];
-                messageData = rawMessage[messageType];
-              }
-            }
-
-            if (!messageType) {
-              console.warn('Unexpected WebSocket message shape', rawMessage);
-              return;
-            }
-
-            const resolvedType = messageType as string;
-            const handlers = messageHandlers.current.get(resolvedType) || [];
-            handlers.forEach((handler: MessageHandler) => handler({ type: resolvedType, data: messageData }));
-          } catch (error) {
-            console.error('Failed to parse WebSocket message:', error);
-          }
-        };
-
-        if (latencySettings.enabled && latencySettings.receiveDelayMs > 0) {
-          console.log(`Applying artificial receive delay: ${latencySettings.receiveDelayMs}ms`);
-          setTimeout(processMessage, latencySettings.receiveDelayMs);
-        } else {
-          processMessage();
+    slot.socket.onclose = () => {
+      clearAuthenticationTimeout(slot);
+      clearGameWarmRetryTimeout(slot);
+      if (slot.role === 'retired') {
+        return;
+      }
+      if (slot.role === 'candidate') {
+        if (candidateSlotRef.current !== slot) {
+          return;
         }
-      };
+        candidateSlotRef.current = null;
+        recoverAfterCandidateFailure(slot);
+        return;
+      }
+      if (activeSlotRef.current !== slot) {
+        return;
+      }
+
+      const nowMs = Date.now();
+      recordPlannedHandoffFailure('active_closed_before_promotion', nowMs);
+      recoveryStartedAtRef.current = nowMs;
+      usableGapStartedAtRef.current = nowMs;
+      inFlightRequestsByGenerationRef.current.delete(slot.generation);
+      activeSlotRef.current = null;
+      ws.current = null;
+      setIsConnected(false);
+      setAuthHandshakeState(false);
+      setServerCapabilities(new Set());
+      lastAuthTokenRef.current = null;
+      clockSync.reset();
+      syncRequestTimes.current.clear();
+      // A transport loss is not a request to leave. Keep the in-memory and
+      // persisted lobby identity so the next authenticated socket can rejoin.
+      recordTrace({ Note: { ts_ms: nowMs, note: 'ws disconnected, reconnect scheduled' } });
+      if (!reconnectEnabledRef.current || candidateSlotRef.current) {
+        return;
+      }
+      const attempt = reconnectAttemptRef.current++;
+      const delay = reconnectDelayMs(attempt);
+      reconnectTimeout.current = setTimeout(() => {
+        openActiveRef.current(slot.url, onConnect);
+      }, delay);
+    };
+  }, [configureClockSync, getToken, handleParsedMessage, recordPlannedHandoffFailure, recoverAfterCandidateFailure, setAuthHandshakeState]);
+
+  const createSlot = useCallback((url: string, role: SocketRole): SocketSlot => {
+    const socket = new WebSocket(url);
+    return {
+      socket,
+      generation: ++nextGenerationRef.current,
+      role,
+      url,
+      authenticated: false,
+      capabilities: [],
+      authTokenSent: null,
+      bufferedMessages: [],
+      expectedLobbyCode: null,
+      expectedGameId: null,
+      lobbyReady: false,
+      gameReady: false,
+      gameComplete: false,
+      gameStreamWatermark: null,
+      commandOutcomesReady: false,
+      drainDeadlineMs: null,
+      candidateAttempt: 0,
+      authStartedAtMs: null,
+      authTimeoutId: null,
+      gameWarmRetryTimeoutId: null,
+      contextRestoreStartedAtMs: null,
+    };
+  }, []);
+
+  const openActive = useCallback((url: string, onConnect?: () => void) => {
+    if (!reconnectEnabledRef.current) {
+      return;
+    }
+    const existing = activeSlotRef.current;
+    if (
+      existing &&
+      (existing.socket.readyState === WebSocket.OPEN ||
+        existing.socket.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+    try {
+      const slot = createSlot(url, 'active');
+      activeSlotRef.current = slot;
+      ws.current = slot.socket;
+      setCurrentRegionUrl(url);
+      attachSocketHandlers(slot, onConnect);
     } catch (error) {
       console.error('Failed to create WebSocket:', error);
+      if (reconnectEnabledRef.current) {
+        const attempt = reconnectAttemptRef.current++;
+        reconnectTimeout.current = setTimeout(
+          () => openActiveRef.current(url, onConnect),
+          reconnectDelayMs(attempt),
+        );
+      }
     }
+  }, [attachSocketHandlers, createSlot]);
+  openActiveRef.current = openActive;
+
+  const startCandidate = useCallback((deadlineMs: number) => {
+    if (!reconnectEnabledRef.current || candidateSlotRef.current || Date.now() >= deadlineMs) {
+      return;
+    }
+    const url = activeSlotRef.current?.url ?? currentRegionUrl;
+    if (!url) {
+      return;
+    }
+    try {
+      const slot = createSlot(url, 'candidate');
+      slot.drainDeadlineMs = deadlineMs;
+      slot.candidateAttempt = candidateAttemptRef.current;
+      candidateSlotRef.current = slot;
+      attachSocketHandlers(slot);
+      const remainingMs = candidateDeadlineDelayMs(deadlineMs, Date.now());
+      candidateDeadlineTimeoutRef.current = setTimeout(() => {
+        if (candidateSlotRef.current !== slot || slot.role !== 'candidate') {
+          return;
+        }
+        slot.role = 'retired';
+        candidateSlotRef.current = null;
+        clearGameWarmRetryTimeout(slot);
+        recordPlannedHandoffFailure('candidate_deadline', Date.now());
+        try {
+          slot.socket.close(1013, 'planned handoff deadline reached');
+        } finally {
+          recoverAfterCandidateFailure(slot);
+        }
+      }, remainingMs);
+    } catch (error) {
+      console.error('Failed to create replacement WebSocket:', error);
+      const attempt = candidateAttemptRef.current++;
+      candidateRetryTimeoutRef.current = setTimeout(
+        () => startCandidateRef.current(deadlineMs),
+        reconnectDelayMs(attempt),
+      );
+    }
+  }, [attachSocketHandlers, createSlot, currentRegionUrl, recordPlannedHandoffFailure, recoverAfterCandidateFailure]);
+  startCandidateRef.current = startCandidate;
+
+  const connect = useCallback((url: string, onConnect?: () => void) => {
+    reconnectEnabledRef.current = true;
+    if (onConnect) {
+      onConnectCallback.current = onConnect;
+    }
+    openActiveRef.current(url, onConnect);
   }, []);
 
   const disconnect = useCallback(() => {
+    reconnectEnabledRef.current = false;
+    clockSync.stop();
     if (reconnectTimeout.current) {
       clearTimeout(reconnectTimeout.current);
       reconnectTimeout.current = null;
     }
-    syncRequestTimes.current.clear();
-    if (ws.current) {
-      ws.current.close();
-      ws.current = null;
+    if (candidateRetryTimeoutRef.current) {
+      clearTimeout(candidateRetryTimeoutRef.current);
+      candidateRetryTimeoutRef.current = null;
     }
-  }, []);
+    if (candidateDeadlineTimeoutRef.current) {
+      clearTimeout(candidateDeadlineTimeoutRef.current);
+      candidateDeadlineTimeoutRef.current = null;
+    }
+    syncRequestTimes.current.clear();
+    const active = activeSlotRef.current;
+    const candidate = candidateSlotRef.current;
+    activeSlotRef.current = null;
+    candidateSlotRef.current = null;
+    ws.current = null;
+    if (active) {
+      active.role = 'retired';
+      inFlightRequestsByGenerationRef.current.delete(active.generation);
+      clearAuthenticationTimeout(active);
+      clearGameWarmRetryTimeout(active);
+      active.socket.close();
+    }
+    if (candidate) {
+      candidate.role = 'retired';
+      inFlightRequestsByGenerationRef.current.delete(candidate.generation);
+      clearAuthenticationTimeout(candidate);
+      clearGameWarmRetryTimeout(candidate);
+      candidate.socket.close();
+    }
+    setIsConnected(false);
+    setAuthHandshakeState(false);
+    setServerCapabilities(new Set());
+    plannedHandoffStartedAtRef.current = null;
+    recoveryStartedAtRef.current = null;
+    usableGapStartedAtRef.current = null;
+  }, [setAuthHandshakeState]);
 
   const connectToRegion = useCallback((wsUrl: string, options?: { regionId?: string; origin?: string }) => {
     console.log('Switching to region:', wsUrl);
-
-    // Disconnect existing connection
-    if (ws.current) {
-      console.log('Closing existing WebSocket connection');
-      ws.current.close();
-      ws.current = null;
-    }
-
-    // Clear any pending reconnection
-    if (reconnectTimeout.current) {
-      clearTimeout(reconnectTimeout.current);
-      reconnectTimeout.current = null;
-    }
-
+    disconnect();
+    reconnectEnabledRef.current = true;
+    reconnectAttemptRef.current = 0;
     if (options?.regionId) {
       saveRegionPreference({
         regionId: options.regionId,
@@ -411,23 +1121,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         timestamp: Date.now(),
       });
     }
-
-    // Connect to new region. Authentication is handled automatically on connection.
     connect(wsUrl, onConnectCallback.current || undefined);
-  }, [connect]);
+  }, [connect, disconnect]);
 
   const sendMessage = useCallback((message: any) => {
+    const target = activeSlotRef.current;
     const doSend = () => {
-      if (ws.current?.readyState === WebSocket.OPEN) {
-        ws.current.send(JSON.stringify(message));
-        console.log('WebSocket message sent:', message);
+      if (
+        target &&
+        isCommandOwner(
+          activeSlotRef.current?.generation ?? null,
+          target.generation,
+          target.role,
+          target.socket.readyState,
+        )
+      ) {
+        target.socket.send(JSON.stringify(message));
+        console.log('WebSocket message sent:', message, 'generation:', target.generation);
       } else {
         console.error('WebSocket is not connected');
       }
     };
-
     if (latencySettings.enabled && latencySettings.sendDelayMs > 0) {
-      console.log(`Applying artificial send delay: ${latencySettings.sendDelayMs}ms`);
       setTimeout(doSend, latencySettings.sendDelayMs);
     } else {
       doSend();
@@ -435,26 +1150,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [latencySettings]);
 
   const authenticateConnection = useCallback(() => {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+    const slot = activeSlotRef.current;
+    if (!slot || slot.socket.readyState !== WebSocket.OPEN) {
       return false;
     }
-
     const token = getToken();
     if (!token) {
-      console.warn('No auth token available for WebSocket authentication');
       return false;
     }
-
-    if (authHandshakeRef.current && lastAuthTokenRef.current === token) {
+    if (slot.authenticated && slot.authTokenSent === token) {
       return true;
     }
-
-    console.log('Authenticating WebSocket connection');
-    sendMessage({ Token: token });
-    lastAuthTokenRef.current = token;
-    setAuthHandshakeState(true);
-    return true;
-  }, [getToken, sendMessage, setAuthHandshakeState]);
+    if (slot.authTokenSent !== token) {
+      slot.authStartedAtMs = Date.now();
+      slot.authTokenSent = token;
+      slot.socket.send(JSON.stringify({ Token: token }));
+      lastAuthTokenRef.current = token;
+    }
+    return slot.authenticated;
+  }, [getToken]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
     const trimmed = message.trim();
@@ -465,6 +1179,32 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     console.log(`Sending ${scope} chat message`, trimmed);
     sendMessage({ Chat: trimmed });
   }, [sendMessage]);
+
+  const beginResponseTrackedRequest = useCallback(() => {
+    const generation = activeSlotRef.current?.generation;
+    if (generation === undefined) {
+      return () => {};
+    }
+    const requests = inFlightRequestsByGenerationRef.current;
+    requests.set(generation, (requests.get(generation) ?? 0) + 1);
+    let finished = false;
+    return () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      const remaining = Math.max(0, (requests.get(generation) ?? 0) - 1);
+      if (remaining === 0) {
+        requests.delete(generation);
+      } else {
+        requests.set(generation, remaining);
+      }
+      const candidate = candidateSlotRef.current;
+      if (candidate) {
+        promoteCandidate(candidate);
+      }
+    };
+  }, [promoteCandidate]);
 
   const onMessage = useCallback((messageType: string, handler: MessageHandler) => {
     if (!messageHandlers.current.has(messageType)) {
@@ -509,14 +1249,24 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       console.log('Auth token changed, reconnecting WebSocket');
       previousUserRef.current = user;
       setAuthHandshakeState(false);
+      const url = activeSlotRef.current?.url ?? currentRegionUrl;
       disconnect();
+      if (url) {
+        reconnectEnabledRef.current = true;
+        connect(url, onConnectCallback.current || undefined);
+      }
       return;
     }
 
     if (previous?.isGuest && user && !user.isGuest) {
       console.log('Guest transitioned to full user, reconnecting WebSocket');
       previousUserRef.current = user;
+      const url = activeSlotRef.current?.url ?? currentRegionUrl;
       disconnect();
+      if (url) {
+        reconnectEnabledRef.current = true;
+        connect(url, onConnectCallback.current || undefined);
+      }
       return;
     }
 
@@ -531,11 +1281,34 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       setAuthHandshakeState(false);
       authenticateConnection();
     }
-  }, [user, isConnected, isSessionAuthenticated, disconnect, getToken, authenticateConnection, setAuthHandshakeState]);
+  }, [
+    user,
+    isConnected,
+    isSessionAuthenticated,
+    currentRegionUrl,
+    connect,
+    disconnect,
+    getToken,
+    authenticateConnection,
+    setAuthHandshakeState,
+  ]);
 
   // Auto-connect to the preferred or closest region on mount
   useEffect(() => {
     let cancelled = false;
+    let detectionAttempt = 0;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleRetry = () => {
+      if (cancelled || retryTimeout !== null) {
+        return;
+      }
+      const delay = reconnectDelayMs(detectionAttempt++);
+      retryTimeout = setTimeout(() => {
+        retryTimeout = null;
+        void ensureConnected();
+      }, delay);
+    };
 
     const ensureConnected = async () => {
       if (typeof window === 'undefined') {
@@ -594,7 +1367,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
             regionId: detected.preference.regionId,
             origin: detected.preference.origin,
           });
+          return;
         }
+        scheduleRetry();
       } finally {
         isInitializingRef.current = false;
       }
@@ -604,6 +1379,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     return () => {
       cancelled = true;
+      if (retryTimeout !== null) {
+        clearTimeout(retryTimeout);
+      }
     };
   }, [connectToRegion]);
 
@@ -621,6 +1399,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
 
+      const finishRequest = beginResponseTrackedRequest();
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
@@ -646,6 +1425,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         persistLobby({ id: lobby_id, code: normalizedCode });
 
         if (initialPreferencesClone.selectedModes.length > 0) {
+          desiredLobbyPreferencesRef.current = initialPreferencesClone;
           setLobbyPreferences(initialPreferencesClone);
           sendMessage({
             UpdateLobbyPreferences: {
@@ -655,16 +1435,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           });
         }
 
+        settled = true;
         cleanup();
         if (timeoutId) {
           clearTimeout(timeoutId);
         }
-        settled = true;
+        finishRequest();
         resolve();
       });
 
       // Send CreateLobby message
-      sendMessage('CreateLobby');
+      try {
+        sendMessage('CreateLobby');
+      } catch (error) {
+        settled = true;
+        cleanup();
+        finishRequest();
+        reject(error);
+        return;
+      }
 
       // Timeout after 5 seconds
       timeoutId = setTimeout(() => {
@@ -673,10 +1462,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         settled = true;
         cleanup();
+        finishRequest();
         reject(new Error('Timeout waiting for lobby creation'));
       }, 5000);
     });
-  }, [onMessage, sendMessage, persistLobby, user?.id, buildInitialLobbyPreferences]);
+  }, [
+    beginResponseTrackedRequest,
+    onMessage,
+    sendMessage,
+    persistLobby,
+    user?.id,
+    buildInitialLobbyPreferences,
+  ]);
 
   const joinLobby = useCallback(async (lobbyCode: string) => {
     const normalizedCode = lobbyCode.trim().toUpperCase();
@@ -687,6 +1484,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
 
+      const finishRequest = beginResponseTrackedRequest();
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
@@ -719,6 +1517,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         persistLobby({ id: lobbyId, code: normalizedCode });
         cleanupHandlers();
+        finishRequest();
         resolve();
       };
 
@@ -747,6 +1546,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         settled = true;
         cleanupHandlers();
+        finishRequest();
         reject(new Error(reason || 'Access denied'));
       });
 
@@ -759,7 +1559,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
 
         // Clean up handlers before reconnecting
+        settled = true;
         cleanupHandlers();
+        finishRequest();
 
         // Reconnect to the correct region
         connectToRegion(ws_url, { regionId: target_region });
@@ -786,20 +1588,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         settled = true;
         cleanupHandlers();
+        finishRequest();
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
 
-      sendMessage({
-        JoinLobby: {
-          lobby_code: normalizedCode,
-          preferences: {
-            selected_modes: joinPreferences.selectedModes,
-            competitive: joinPreferences.competitive,
+      try {
+        sendMessage({
+          JoinLobby: {
+            lobby_code: normalizedCode,
+            preferences: {
+              selected_modes: joinPreferences.selectedModes,
+              competitive: joinPreferences.competitive,
+            },
           },
-        },
-      });
+        });
+      } catch (error) {
+        settled = true;
+        cleanupHandlers();
+        finishRequest();
+        reject(error);
+      }
     });
   }, [
+    beginResponseTrackedRequest,
     onMessage,
     sendMessage,
     connectToRegion,
@@ -816,6 +1627,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
 
+      const finishRequest = beginResponseTrackedRequest();
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
@@ -830,11 +1642,20 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           clearTimeout(timeoutId);
         }
         settled = true;
+        finishRequest();
         resolve();
       });
 
       // Send LeaveLobby message
-      sendMessage('LeaveLobby');
+      try {
+        sendMessage('LeaveLobby');
+      } catch (error) {
+        settled = true;
+        cleanup();
+        finishRequest();
+        reject(error);
+        return;
+      }
 
       // Timeout after 5 seconds
       timeoutId = setTimeout(() => {
@@ -843,14 +1664,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         settled = true;
         cleanup();
+        finishRequest();
         reject(new Error('Timeout waiting to leave lobby'));
       }, 5000);
     });
-  }, [onMessage, sendMessage, resetLobbyState]);
+  }, [beginResponseTrackedRequest, onMessage, sendMessage, resetLobbyState]);
 
   const updateLobbyPreferences = useCallback(
     (preferences: LobbyPreferences) => {
       // console.log('setLobbyPreferences', preferences);
+      desiredLobbyPreferencesRef.current = preferences;
       setLobbyPreferences(preferences);
 
       if (!currentLobbyRef.current) {
@@ -1382,6 +2205,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const value: WebSocketContextType = {
     isConnected,
     isSessionAuthenticated,
+    serverCapabilities,
     sendMessage,
     onMessage,
     connect,

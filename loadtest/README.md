@@ -30,6 +30,15 @@ The default staircase targets 4, 16, 64, 128, then 256 concurrent sessions for p
 
 Supported modes are `solo`, `duel`, `2v2`, and `ffa`. Every target must be a multiple of the match size: 1 for solo, 2 for duel, and 4 for 2v2/FFA. Solo uses one player per lobby; duel, 2v2, and FFA put the complete 2- or 4-player party in one lobby, deliberately covering multi-user lobby create/join/update behavior. The FFA matchmaker prefers a complete party over older partial public lobbies so test membership remains deterministic.
 
+The default `--population game` runs that full lifecycle. Staging
+certification can instead hold one-session groups at `idle`, `lobby`, or
+`matchmaking`. Those probes use normal guest and WebSocket APIs, keep the old
+socket usable until a replacement authenticates and restores its exact
+context, and fail if a planned handoff has a usable gap or falls back to a hard
+reconnect. A matchmaking probe should select a mode for which the cohort is
+too small to form a match; the autoscaling runner uses three one-player `2v2`
+lobbies. `--untimed-play-duration` is the hold time for these non-game probes.
+
 Duel and 2v2 use the authoritative server game limit. Solo and FFA have no server time limit, so they play with the AI for two minutes by default, send `LeaveGame`, and confirm that the server processed it with an ordered ping. Natural completion before that window remains authoritative. Override the window with `--untimed-play-duration 5m`; when increasing it, also leave enough `--drain-timeout` for authentication, lobby setup, matchmaking, and the complete play window.
 
 `--max-total-sessions 4096` is a hard default safety ceiling across replacements. Production targets require `--confirm-production`; the check is repeated against the region origin and effective WebSocket URL returned by discovery. TLS certificate and hostname checks are never disabled.
@@ -58,7 +67,7 @@ Each virtual user performs the production lifecycle:
 6. Receive `JoinGame`, join the assigned game, and initialize the shared `GameEngine` from its snapshot.
 7. Verify that the snapshot contains exactly the intended lobby members.
 8. Reconcile authoritative events, calculate AI moves once per predicted tick, and send normal game commands until authoritative completion. For an untimed Solo/FFA game, play until `--untimed-play-duration`, then leave successfully.
-9. Send application pings, measure RTT/clock offset, and reconnect up to twice using the browser client's two-second delay.
+9. Send application pings, measure RTT/clock offset, retry only an explicit WebSocket HTTP 503 with the same guest token inside one connection-to-pong budget, use make-before-break on a planned drain, and reconnect up to twice after an abrupt transport failure.
 
 A complete duel/2v2 lobby is split across the opposing teams by the existing matchmaker; a complete FFA lobby is selected intact. These choices isolate intended games from unrelated public queue participants. Snapshot membership validation turns any unexpected pairing into an explicit session failure.
 
@@ -69,10 +78,10 @@ A complete duel/2v2 lobby is split across the opposing teams by the existing mat
 Artifacts are written to `loadtest-reports/<run-id>/` by default:
 
 - `index.html` — aggregate session, authoritative/timeboxed game, latency, traffic, ramp, and infrastructure overview.
-- `summary.json` — the machine-readable aggregate plus compact status and completion kind for every session.
+- `summary.json` — the machine-readable aggregate plus compact status and completion kind for every session. Schema 8 records initial admission readiness, aggregates successful game-command writes by Unix second, and aggregates first-seen authoritative `CommandScheduledV2` outcomes by partition and second without logging command payloads.
 - `failures/*.json` — complete lifecycle, metrics, failure context, and recent protocol events for every failed, cancelled, or incomplete session; the HTML report links to these files.
 
-The command exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never observed as concurrent logical sessions that have sent their authentication tokens, a session is lost from coordinator accounting, a stage misses that token-sent session target, a launched game is never observed, or deterministic pairing validation fails. Logical session concurrency continues across short reconnect gaps and does not claim every transport socket remains continuously open. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
+The command exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never acknowledged by the server as authenticated, a session is lost from coordinator accounting, a stage misses its target, a launched game is never observed, or deterministic pairing validation fails. Reports measure initial admission from the first WebSocket attempt through the authenticated ordered pong and retain first-seen `CommandScheduledV2` counts by game partition. With `--require-planned-handoff`, every observed drain must promote a ready candidate with an old/new continuity proof and zero measured usable gap. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
 
 Autoscaling evidence is reported separately. The harness samples regional user counts and active regional server counts throughout the run. Backend-cookie aliases, when present, remain a secondary in-band routing hint.
 

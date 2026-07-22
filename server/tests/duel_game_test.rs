@@ -425,35 +425,41 @@ async fn test_turn_for_unowned_snake_is_ignored() -> Result<()> {
     // snake AND claiming the victim's user_id. Duel snakes face Left/Right,
     // so Up and Down are both legal turns.
     attacker
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: victim_user_id,
-                sequence_number: 0,
+        .send_game_command(
+            game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: victim_user_id,
+                    sequence_number: 0,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: victim_snake_id,
+                    direction: Direction::Up,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id: victim_snake_id,
-                direction: Direction::Up,
-            },
-        }))
+        )
         .await?;
 
     // Positive control, sent after the attack: the victim legitimately turns
     // its own snake the other way.
     victim
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: victim_user_id,
-                sequence_number: 0,
+        .send_game_command(
+            game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: victim_user_id,
+                    sequence_number: 0,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: victim_snake_id,
+                    direction: Direction::Down,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id: victim_snake_id,
-                direction: Direction::Down,
-            },
-        }))
+        )
         .await?;
 
     // The forged command was submitted first, so if the executor accepted it,

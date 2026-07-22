@@ -99,6 +99,14 @@ impl LobbyJoinHandle {
             .await
     }
 
+    /// Stop this transport's heartbeat without interpreting transport loss as
+    /// an explicit user intent to leave. The Redis presence lease expires on
+    /// its own unless a replacement socket refreshes a newer presence.
+    pub fn detach_transport(mut self) {
+        self.heartbeat_task.abort();
+        self.return_to_manager();
+    }
+
     fn return_to_manager(&mut self) {
         let mut returned = self.returned.write().unwrap();
         if !*returned {
@@ -654,16 +662,30 @@ impl LobbyManager {
         &self,
         lobby_code: &str,
         user_id: i32,
-        websocket_id: &str,
+        _websocket_id: &str,
     ) -> Result<LeaveLobbyResult> {
         let mut redis = self.redis.clone();
 
         let members_key = RedisKeys::lobby_members_set(lobby_code);
-        let member_value = format!("{}:{}", user_id, websocket_id);
-        redis
-            .zrem::<_, _, ()>(&members_key, &member_value)
+        // Explicit user intent supersedes every transport generation. During
+        // make-before-break both the retired and replacement websocket may
+        // have a short-lived presence entry; removing only the newest one
+        // would leave a ghost member until its lease expired.
+        let members: Vec<String> = redis
+            .zrange(&members_key, 0, -1)
             .await
-            .context("Failed to remove lobby member from Redis")?;
+            .context("Failed to list lobby transports before explicit leave")?;
+        let user_prefix = format!("{user_id}:");
+        let user_transports: Vec<String> = members
+            .into_iter()
+            .filter(|member| member.starts_with(&user_prefix))
+            .collect();
+        if !user_transports.is_empty() {
+            redis
+                .zrem::<_, _, ()>(&members_key, user_transports)
+                .await
+                .context("Failed to remove lobby member transports from Redis")?;
+        }
 
         // Drop any expired members before checking if the lobby is empty
         let now = chrono::Utc::now().timestamp_millis();

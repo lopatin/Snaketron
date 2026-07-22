@@ -178,18 +178,21 @@ async fn test_solo_game() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         client
-            .send_message(WSMessage::GameCommand(GameCommandMessage {
-                command_id_client: CommandId {
-                    tick: 0,
-                    user_id,
-                    sequence_number,
+            .send_game_command(
+                _game_id,
+                GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: 0,
+                        user_id,
+                        sequence_number,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::Turn {
+                        snake_id,
+                        direction: Direction::Up,
+                    },
                 },
-                command_id_server: None,
-                command: GameCommand::Turn {
-                    snake_id,
-                    direction: Direction::Up,
-                },
-            }))
+            )
             .await?;
         sequence_number += 1;
 
@@ -197,18 +200,21 @@ async fn test_solo_game() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         client
-            .send_message(WSMessage::GameCommand(GameCommandMessage {
-                command_id_client: CommandId {
-                    tick: 0,
-                    user_id,
-                    sequence_number,
+            .send_game_command(
+                _game_id,
+                GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: 0,
+                        user_id,
+                        sequence_number,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::Turn {
+                        snake_id,
+                        direction: Direction::Right,
+                    },
                 },
-                command_id_server: None,
-                command: GameCommand::Turn {
-                    snake_id,
-                    direction: Direction::Right,
-                },
-            }))
+            )
             .await?;
         sequence_number += 1;
 
@@ -216,18 +222,21 @@ async fn test_solo_game() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         client
-            .send_message(WSMessage::GameCommand(GameCommandMessage {
-                command_id_client: CommandId {
-                    tick: 0,
-                    user_id,
-                    sequence_number,
+            .send_game_command(
+                _game_id,
+                GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: 0,
+                        user_id,
+                        sequence_number,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::Turn {
+                        snake_id,
+                        direction: Direction::Down,
+                    },
                 },
-                command_id_server: None,
-                command: GameCommand::Turn {
-                    snake_id,
-                    direction: Direction::Down,
-                },
-            }))
+            )
             .await?;
     }
 
@@ -236,12 +245,14 @@ async fn test_solo_game() -> Result<()> {
     let mut death_tick = 0;
     let start_time = tokio::time::Instant::now();
 
-    // Run for up to 10 seconds to see the outcome. Keep listening after the
-    // snake dies: the Complete status update arrives after the SnakeDied event.
+    // Run for up to 10 seconds to see the outcome. The fenced terminal
+    // snapshot may supersede the final SnakeDied event, so final state is also
+    // authoritative for whether and when the solo snake died.
     while start_time.elapsed() < Duration::from_secs(10) {
         // Try to receive events
         match timeout(Duration::from_millis(100), client.receive_message()).await {
             Ok(Ok(WSMessage::GameEvent(event))) => {
+                let mut terminal_winning_snake_id = None;
                 match &event.event {
                     GameEvent::SnakeDied { snake_id: died_id } => {
                         if *died_id == snake_id {
@@ -253,33 +264,25 @@ async fn test_solo_game() -> Result<()> {
                     GameEvent::StatusUpdated { status } => {
                         println!("Game status updated to {:?}", status);
                         if let GameStatus::Complete { winning_snake_id } = status {
-                            println!("Solo game complete! Final result: {:?}", winning_snake_id);
-                            // In a solo game:
-                            // - If the snake died, there should be no winner (None)
-                            // - If the snake is still alive when game ends, it's the winner
-                            if snake_died {
-                                assert_eq!(
-                                    *winning_snake_id, None,
-                                    "Solo game with dead snake should end with no winner"
-                                );
-                                // Verify the snake survived for a reasonable amount of time
-                                assert!(
-                                    death_tick > 10,
-                                    "Snake should survive for more than 10 ticks before dying"
-                                );
-                                println!("Snake survived for {} ticks before dying", death_tick);
-                            } else {
-                                // Game ended but snake didn't die (maybe time limit or other reason)
-                                assert_eq!(
-                                    *winning_snake_id,
-                                    Some(snake_id),
-                                    "Solo game with alive snake should have that snake as winner"
-                                );
-                                println!("Game ended with snake still alive");
+                            terminal_winning_snake_id = Some(*winning_snake_id);
+                        }
+                    }
+                    GameEvent::Snapshot { game_state } => {
+                        // Terminal state is intentionally exposed only by the
+                        // fenced completion transaction's final snapshot.
+                        if let GameStatus::Complete { winning_snake_id } = &game_state.status {
+                            if game_state
+                                .arena
+                                .snakes
+                                .get(snake_id as usize)
+                                .is_some_and(|snake| !snake.is_alive)
+                            {
+                                snake_died = true;
+                                if death_tick == 0 {
+                                    death_tick = game_state.tick;
+                                }
                             }
-
-                            env.shutdown().await?;
-                            return Ok(());
+                            terminal_winning_snake_id = Some(*winning_snake_id);
                         }
                     }
                     GameEvent::FoodEaten {
@@ -299,6 +302,36 @@ async fn test_solo_game() -> Result<()> {
                             event.tick, event.event
                         );
                     }
+                }
+
+                if let Some(winning_snake_id) = terminal_winning_snake_id {
+                    println!("Solo game complete! Final result: {:?}", winning_snake_id);
+                    // In a solo game:
+                    // - If the snake died, there should be no winner (None)
+                    // - If the snake is still alive when game ends, it's the winner
+                    if snake_died {
+                        assert_eq!(
+                            winning_snake_id, None,
+                            "Solo game with dead snake should end with no winner"
+                        );
+                        // Verify the snake survived for a reasonable amount of time
+                        assert!(
+                            death_tick > 10,
+                            "Snake should survive for more than 10 ticks before dying"
+                        );
+                        println!("Snake survived for {} ticks before dying", death_tick);
+                    } else {
+                        // Game ended but snake didn't die (maybe time limit or other reason)
+                        assert_eq!(
+                            winning_snake_id,
+                            Some(snake_id),
+                            "Solo game with alive snake should have that snake as winner"
+                        );
+                        println!("Game ended with snake still alive");
+                    }
+
+                    env.shutdown().await?;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {

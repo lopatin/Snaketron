@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    body::Body,
     extract::{State, ws::WebSocketUpgrade},
-    http::StatusCode,
+    http::{Request, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, options, post},
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -18,8 +22,10 @@ use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::auth_middleware;
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
+use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::game_bus::GameBus;
+use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
@@ -29,6 +35,91 @@ use crate::ws_server::{JwtVerifier, handle_websocket};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A dependency-free listener that serves liveness immediately and installs
+/// the full application router once Redis-dependent bootstrap has converged.
+/// The listener is never rebound, so cold recovery introduces no port gap.
+#[derive(Clone)]
+pub struct DeferredHttpServer {
+    application: Arc<RwLock<Option<Router>>>,
+}
+
+#[derive(Clone)]
+struct DeferredHttpState {
+    lifecycle: TaskLifecycle,
+    application: Arc<RwLock<Option<Router>>>,
+}
+
+impl DeferredHttpServer {
+    pub async fn bind(
+        addr: &str,
+        lifecycle: TaskLifecycle,
+        cancellation: CancellationToken,
+    ) -> Result<(Self, JoinHandle<Result<()>>)> {
+        let application = Arc::new(RwLock::new(None));
+        let state = DeferredHttpState {
+            lifecycle: lifecycle.clone(),
+            application: application.clone(),
+        };
+        let app = Router::new()
+            .route("/health", get(health_live))
+            .route("/health/live", get(health_live))
+            .route("/health/ready", get(health_ready))
+            .fallback(deferred_application)
+            .with_state(state);
+
+        let listener = TcpListener::bind(addr).await?;
+        lifecycle.mark_listener_bound();
+        info!("HTTP liveness listener bound on {}", addr);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    info!("HTTP server received shutdown signal");
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("HTTP server error: {error}"))
+        });
+        Ok((Self { application }, task))
+    }
+
+    fn install(&self, application: Router) -> Result<()> {
+        let mut current = self
+            .application
+            .write()
+            .map_err(|_| anyhow::anyhow!("deferred HTTP router lock poisoned"))?;
+        *current = Some(application);
+        Ok(())
+    }
+}
+
+async fn deferred_application(
+    State(state): State<DeferredHttpState>,
+    request: Request<Body>,
+) -> Response {
+    let application = match state.application.read() {
+        Ok(application) => application.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application router unavailable",
+            )
+                .into_response();
+        }
+    };
+    let Some(application) = application else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "task is warming",
+        )
+            .into_response();
+    };
+    application
+        .oneshot(request)
+        .await
+        .expect("Axum Router service is infallible")
+}
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
 #[derive(Clone)]
@@ -66,12 +157,17 @@ pub struct HttpServerState {
     pub lobby_manager: Arc<LobbyManager>,
     /// User cache for quick user lookups
     pub user_cache: UserCache,
+    /// Process lifecycle used for truthful readiness and planned drain.
+    pub lifecycle: TaskLifecycle,
+    /// Region-scoped authoritative recovery namespace.
+    pub cluster_namespace: ClusterNamespace,
 }
 
-/// Run the combined HTTP server with both API and WebSocket endpoints
+/// Install the combined API and WebSocket application behind the already-bound
+/// liveness listener.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_http_server(
-    addr: &str,
+pub async fn install_http_application(
+    deferred: &DeferredHttpServer,
     db: Arc<dyn Database>,
     jwt_manager: Arc<JwtManager>,
     jwt_verifier: Arc<dyn JwtVerifier>,
@@ -86,6 +182,8 @@ pub async fn run_http_server(
     region: String,
     region_cache: Arc<RegionCache>,
     lobby_manager: Arc<LobbyManager>,
+    lifecycle: TaskLifecycle,
+    cluster_namespace: ClusterNamespace,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -108,6 +206,8 @@ pub async fn run_http_server(
         region_cache,
         lobby_manager,
         user_cache,
+        lifecycle: lifecycle.clone(),
+        cluster_namespace,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -202,10 +302,9 @@ pub async fn run_http_server(
         .merge(debug_routes)
         .with_state(auth_state);
 
-    // Build main router combining API and WebSocket endpoints
+    // Health routes live in the dependency-free outer router so liveness
+    // remains available before this application is installed.
     let app = Router::new()
-        // Health check endpoint
-        .route("/health", get(health_check))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
         // Nest API routes
@@ -213,18 +312,9 @@ pub async fn run_http_server(
         .layer(cors)
         .with_state(state);
 
-    // Start server
-    let listener = TcpListener::bind(addr).await?;
-    info!("HTTP server (API + WebSocket) listening on {}", addr);
-
-    // Serve with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            cancellation_token.cancelled().await;
-            info!("HTTP server received shutdown signal");
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
+    deferred.install(app)?;
+    info!("HTTP API and WebSocket routes installed");
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -292,14 +382,27 @@ async fn upload_client_trace(
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpServerState>,
-) -> impl IntoResponse {
-    // Increment connection count
-    let count = state.connection_count.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::debug!("WebSocket connection opened, total connections: {}", count);
+) -> axum::response::Response {
+    if !state.lifecycle.is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "task is not ready for new WebSocket sessions",
+        )
+            .into_response();
+    }
 
     let connection_count = state.connection_count.clone();
+    let lifecycle = state.lifecycle.clone();
 
     ws.on_upgrade(move |socket| async move {
+        // Count only upgrades that actually became WebSockets. Incrementing in
+        // the HTTP handler leaks the drain counter when a client disappears
+        // after the 101 response is prepared but before Axum runs this future.
+        let count = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        lifecycle.websocket_opened();
+        tracing::debug!("WebSocket connection opened, total connections: {}", count);
+
         // Handle the WebSocket connection
         handle_websocket(
             socket,
@@ -315,18 +418,37 @@ async fn websocket_handler(
             state.cancellation_token,
             state.lobby_manager,
             state.region,
+            lifecycle.clone(),
+            state.cluster_namespace,
         )
         .await;
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        lifecycle.websocket_closed();
         tracing::debug!("WebSocket connection closed, total connections: {}", count);
     })
+    .into_response()
 }
 
-/// Health check handler
-async fn health_check() -> &'static str {
-    "OK"
+/// ECS liveness: a Valkey outage must not create a task replacement storm.
+async fn health_live(State(state): State<DeferredHttpState>) -> impl IntoResponse {
+    debug_assert!(state.lifecycle.is_live());
+    (StatusCode::OK, "OK")
+}
+
+/// Traefik readiness: only admit new users after local dependencies have
+/// converged, and withdraw the task immediately when drain begins.
+async fn health_ready(State(state): State<DeferredHttpState>) -> impl IntoResponse {
+    let application_installed = state
+        .application
+        .read()
+        .is_ok_and(|application| application.is_some());
+    if application_installed && state.lifecycle.is_ready() {
+        (StatusCode::OK, "READY")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "NOT_READY")
+    }
 }
 
 /// Background task to update Redis metrics every 5 seconds
@@ -467,4 +589,68 @@ async fn broadcast_user_counts(mut redis: ConnectionManager) -> Result<()> {
 
     tracing::trace!("Broadcasted user counts: {:?}", region_counts);
     Ok(())
+}
+
+#[cfg(test)]
+mod deferred_http_tests {
+    use super::*;
+    use axum::routing::get;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cold_boot_is_live_unready_then_installs_application_without_rebind() -> Result<()> {
+        let port = crate::game_server::get_available_port();
+        let address = format!("127.0.0.1:{port}");
+        let lifecycle = TaskLifecycle::new("cold-boot-test");
+        let cancellation = CancellationToken::new();
+        let (deferred, task) =
+            DeferredHttpServer::bind(&address, lifecycle.clone(), cancellation.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()?;
+
+        let live = client
+            .get(format!("http://{address}/health/live"))
+            .send()
+            .await?;
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
+        let ready = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let warming = client.get(format!("http://{address}/probe")).send().await?;
+        assert_eq!(warming.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!task.is_finished());
+
+        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_assignment_ready(true);
+        lifecycle.mark_membership_ready(true);
+        lifecycle.mark_redis_success_now();
+        lifecycle.activate();
+        let no_application = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(
+            no_application.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        deferred
+            .install(Router::new().route("/probe", get(|| async { StatusCode::NO_CONTENT })))?;
+
+        let ready = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(ready.status(), reqwest::StatusCode::OK);
+        let installed = client.get(format!("http://{address}/probe")).send().await?;
+        assert_eq!(installed.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await??;
+        Ok(())
+    }
 }

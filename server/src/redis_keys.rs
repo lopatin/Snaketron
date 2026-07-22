@@ -5,6 +5,10 @@ use std::hash::{Hash, Hasher};
 pub struct RedisKeys;
 
 impl RedisKeys {
+    pub const MATCHMAKING_USER_ACTIVE_GAME_PREFIX: &'static str = "matchmaking:user:";
+    pub const MATCHMAKING_LOBBY_ACTIVE_GAME_PREFIX: &'static str = "matchmaking:lobby:";
+    pub const MATCHMAKING_ACTIVE_GAME_SUFFIX: &'static str = ":active-game";
+
     // === Matchmaking Keys ===
 
     /// Hash a game type to a consistent identifier
@@ -13,46 +17,6 @@ impl RedisKeys {
         let json = serde_json::to_string(game_type).unwrap_or_default();
         json.hash(&mut hasher);
         hasher.finish()
-    }
-
-    /// Queue for a specific game type (by hash)
-    pub fn matchmaking_queue_hash(game_type_hash: u64) -> String {
-        format!("matchmaking:queue:{}", game_type_hash)
-    }
-
-    /// Queue for a specific game type and queue mode
-    pub fn matchmaking_queue(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
-        let hash = Self::hash_game_type(game_type);
-        let mode_str = match queue_mode {
-            common::QueueMode::Quickmatch => "quick",
-            common::QueueMode::Competitive => "comp",
-        };
-        format!("matchmaking:queue:{}:{}", mode_str, hash)
-    }
-
-    /// Queue for a specific game type (default to quickmatch for backward compatibility)
-    pub fn matchmaking_queue_default(game_type: &GameType) -> String {
-        Self::matchmaking_queue(game_type, &common::QueueMode::Quickmatch)
-    }
-
-    /// MMR index for a game type (by hash)
-    pub fn matchmaking_mmr_index_hash(game_type_hash: u64) -> String {
-        format!("matchmaking:mmr:{}", game_type_hash)
-    }
-
-    /// MMR index for a game type and queue mode
-    pub fn matchmaking_mmr_index(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
-        let hash = Self::hash_game_type(game_type);
-        let mode_str = match queue_mode {
-            common::QueueMode::Quickmatch => "quick",
-            common::QueueMode::Competitive => "comp",
-        };
-        format!("matchmaking:mmr:{}:{}", mode_str, hash)
-    }
-
-    /// MMR index for a game type (default to quickmatch for backward compatibility)
-    pub fn matchmaking_mmr_index_default(game_type: &GameType) -> String {
-        Self::matchmaking_mmr_index(game_type, &common::QueueMode::Quickmatch)
     }
 
     /// User status in matchmaking
@@ -65,15 +29,40 @@ impl RedisKeys {
         "matchmaking:matches:active".to_string()
     }
 
-    /// Legacy-only runtime game ID counter. New deployments allocate from a disjoint,
-    /// high DynamoDB namespace and deliberately leave this volatile counter untouched.
-    pub fn game_id_counter() -> String {
-        "game:id:counter".to_string()
+    /// Durable pointer used to recover a committed match when Pub/Sub delivery is missed.
+    pub fn matchmaking_user_active_game(user_id: u32) -> String {
+        format!(
+            "{}{}{}",
+            Self::MATCHMAKING_USER_ACTIVE_GAME_PREFIX,
+            user_id,
+            Self::MATCHMAKING_ACTIVE_GAME_SUFFIX
+        )
     }
 
-    /// Match notification channel for a user
-    pub fn matchmaking_notification_channel(user_id: u32) -> String {
-        format!("matchmaking:notification:{}", user_id)
+    /// Durable pointer used to recover a committed match for every member of a lobby.
+    pub fn matchmaking_lobby_active_game(lobby_code: &str) -> String {
+        format!(
+            "{}{}{}",
+            Self::MATCHMAKING_LOBBY_ACTIVE_GAME_PREFIX,
+            lobby_code,
+            Self::MATCHMAKING_ACTIVE_GAME_SUFFIX
+        )
+    }
+
+    /// Exact serialized queue entry currently admitted for a lobby.
+    pub fn matchmaking_lobby_queue_identity(lobby_code: &str) -> String {
+        format!("matchmaking:lobby:{}:queue-identity", lobby_code)
+    }
+
+    /// Exact lobby admission currently reserving a user for matchmaking.
+    pub fn matchmaking_user_queue_identity(user_id: u32) -> String {
+        format!("matchmaking:user:{}:queue-identity", user_id)
+    }
+
+    /// Short-lived write canary used by task readiness. It is scoped to one
+    /// boot so concurrent tasks never contend and disappears automatically.
+    pub fn readiness_write_canary(region: &str, task_boot_id: &str) -> String {
+        format!("snaketron:readiness:{region}:{task_boot_id}")
     }
 
     /// Lobby queue for a specific game type and queue mode
@@ -165,7 +154,7 @@ impl RedisKeys {
         format!("snaketron:stream:events:{}", partition_id)
     }
 
-    /// Stream carrying commands (GameCreated, GameCommandSubmitted, ...) for a partition
+    /// Stream carrying authoritative commands for a partition.
     pub fn stream_commands(partition_id: u32) -> String {
         format!("snaketron:stream:commands:{}", partition_id)
     }
@@ -175,21 +164,66 @@ impl RedisKeys {
         format!("snaketron:stream:snapreq:{}", partition_id)
     }
 
-    // === Cluster Singleton Keys ===
+    // === Region-scoped executor-v2 protocol keys ===
 
-    /// Lease key for a singleton service
-    pub fn singleton_lease(service_name: &str) -> String {
-        format!("singleton:lease:{}", service_name)
+    pub fn cluster_members(region: &str) -> String {
+        format!("snaketron:cluster:{region}:members:v2")
     }
 
-    /// Matchmaking singleton lease
-    pub fn matchmaking_singleton_lease() -> String {
-        Self::singleton_lease("matchmaking")
+    pub fn cluster_member(region: &str, boot_id: &str) -> String {
+        format!("snaketron:cluster:{region}:member:v2:{boot_id}")
     }
 
-    /// Partition executor singleton lease
-    pub fn partition_executor_lease(partition_id: u32) -> String {
-        Self::singleton_lease(&format!("partition:{}", partition_id))
+    pub fn cluster_assignment(region: &str) -> String {
+        format!("snaketron:cluster:{region}:assignment:v2")
+    }
+
+    pub fn cluster_assignment_lease(region: &str) -> String {
+        format!("snaketron:cluster:{region}:assignment:lease:v2")
+    }
+
+    pub fn cluster_partition_lease(region: &str, partition: u32) -> String {
+        format!("snaketron:cluster:{region}:partition:{partition}:lease:v2")
+    }
+
+    pub fn cluster_active_games(region: &str, partition: u32) -> String {
+        format!("snaketron:cluster:{region}:partition:{partition}:active-games:v2")
+    }
+
+    pub fn cluster_recovery(region: &str, game_id: u32) -> String {
+        format!("snaketron:cluster:{region}:game:{game_id}:recovery:v2")
+    }
+
+    pub fn cluster_recovery_failure(region: &str, game_id: u32) -> String {
+        format!("snaketron:cluster:{region}:game:{game_id}:recovery-failure:v1")
+    }
+
+    pub fn executor_command_group(region: &str, partition: u32) -> String {
+        format!("snaketron-executor-v2:{region}:{partition}")
+    }
+
+    pub fn cluster_command_quarantine(region: &str, partition: u32) -> String {
+        format!("snaketron:cluster:{region}:partition:{partition}:command-quarantine:v2")
+    }
+
+    pub fn cluster_command_decisions(region: &str, partition: u32) -> String {
+        format!("snaketron:cluster:{region}:partition:{partition}:command-decisions:v1")
+    }
+
+    pub fn cluster_completion(region: &str, game_id: u32) -> String {
+        format!("snaketron:cluster:{region}:game:{game_id}:completion:v1")
+    }
+
+    pub fn cluster_pending_completions(region: &str, partition: u32) -> String {
+        format!("snaketron:cluster:{region}:partition:{partition}:pending-completions:v1")
+    }
+
+    pub fn cluster_completion_effects_done(region: &str, game_id: u32) -> String {
+        format!("snaketron:cluster:{region}:game:{game_id}:completion-effects-done:v1")
+    }
+
+    pub fn cluster_completion_terminal_notified(region: &str, game_id: u32) -> String {
+        format!("snaketron:cluster:{region}:game:{game_id}:completion:terminal-notified:v1")
     }
 }
 
@@ -200,7 +234,6 @@ mod tests {
     #[test]
     fn test_key_generation() {
         // Test that keys are generated correctly without prefixes
-        assert_eq!(RedisKeys::game_id_counter(), "game:id:counter");
         assert_eq!(
             RedisKeys::matchmaking_active_matches(),
             "matchmaking:matches:active"
@@ -209,12 +242,25 @@ mod tests {
             RedisKeys::matchmaking_user_status(123),
             "matchmaking:user:123"
         );
+        assert_eq!(
+            RedisKeys::matchmaking_user_active_game(123),
+            "matchmaking:user:123:active-game"
+        );
+        assert_eq!(
+            RedisKeys::matchmaking_lobby_active_game("ABC123"),
+            "matchmaking:lobby:ABC123:active-game"
+        );
+        assert_eq!(
+            RedisKeys::readiness_write_canary("use1", "task:boot"),
+            "snaketron:readiness:use1:task:boot"
+        );
         assert_eq!(RedisKeys::stream_events(0), "snaketron:stream:events:0");
         assert_eq!(RedisKeys::game_snapshot(123), "game:snapshot:123");
 
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };
-        let queue_key = RedisKeys::matchmaking_queue(&game_type, &common::QueueMode::Quickmatch);
-        assert!(queue_key.starts_with("matchmaking:queue:"));
+        let queue_key =
+            RedisKeys::matchmaking_lobby_queue(&game_type, &common::QueueMode::Quickmatch);
+        assert!(queue_key.starts_with("matchmaking:lobby:queue:"));
     }
 }

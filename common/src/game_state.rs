@@ -19,6 +19,16 @@ pub enum GameCommand {
     UpdateStatus { status: GameStatus },
 }
 
+/// Stable identity for the at-least-once command protocol. Unlike the engine's
+/// tick-scoped `CommandId`, this survives reconstruction and WebSocket reconnect.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientCommandIdentityV2 {
+    pub game_id: u32,
+    pub user_id: u32,
+    pub client_game_session_id: String,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GameEventMessage {
     pub game_id: u32,
@@ -27,7 +37,8 @@ pub struct GameEventMessage {
     /// Transport-level sequence, assigned by the publishing game executor and
     /// strictly monotonic per game across ALL published messages (events,
     /// snapshots, tick hashes). Receivers detect lost messages by checking
-    /// contiguity. 0 means "unassigned" (legacy or locally constructed).
+    /// contiguity. 0 is reserved for locally constructed or explicitly
+    /// out-of-band messages that do not advance replicated state.
     #[serde(default)]
     pub stream_seq: u64,
     pub user_id: Option<u32>,
@@ -59,6 +70,20 @@ pub enum GameEvent {
     },
     CommandScheduled {
         command_message: GameCommandMessage,
+    },
+    /// Positive semantic result for the v2 at-least-once command protocol.
+    /// This is still CommandScheduled—not a gateway receipt/CommandAccepted.
+    CommandScheduledV2 {
+        command_id: ClientCommandIdentityV2,
+        command_message: GameCommandMessage,
+        /// True when the executor is returning a previously recorded outcome;
+        /// replicas must not schedule the same logical command again.
+        deduplicated_replay: bool,
+    },
+    /// Terminal negative semantic result for a v2 player command.
+    CommandRejected {
+        command_id: ClientCommandIdentityV2,
+        reason: String,
     },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated {
@@ -1528,6 +1553,20 @@ impl GameState {
             GameEvent::CommandScheduled { command_message } => {
                 self.command_queue.push(command_message);
             }
+
+            GameEvent::CommandScheduledV2 {
+                command_message,
+                deduplicated_replay,
+                ..
+            } => {
+                if !deduplicated_replay {
+                    self.command_queue.push(command_message);
+                }
+            }
+
+            // Rejections are terminal protocol outcomes, not game-state
+            // mutations. They are retained in the server recovery envelope.
+            GameEvent::CommandRejected { .. } => {}
 
             GameEvent::StatusUpdated { status } => {
                 self.status = status;

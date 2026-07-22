@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use common::{GameType, QueueMode};
-use loadtest::config::{self, Args, Config, GameMode};
+use loadtest::config::{self, Args, Config, GameMode, Population};
 use loadtest::report::{
     InfrastructureSample, LoadTestRun, RampStageRecord, SessionFailureRecord, SessionOutcome,
     SessionPhase, SessionRecord, aggregate_report, unix_time_ms, write_report,
@@ -27,6 +27,20 @@ const SPAWN_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 const FAILURE_CIRCUIT_BREAKER_MIN_SESSIONS: usize = 4;
 const FAILURE_CIRCUIT_BREAKER_RATE: f64 = 0.20;
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionConcurrencyState {
@@ -239,6 +253,7 @@ async fn run(config: Config) -> Result<()> {
         queue_mode: queue_mode(config.queue_mode),
         selected_mode: config.mode.as_str().to_owned(),
         competitive: matches!(config.queue_mode, config::QueueMode::Competitive),
+        population: config.population,
         connect_timeout: config.connect_timeout,
         lobby_timeout: config.lobby_timeout,
         queue_timeout: config.queue_timeout,
@@ -277,6 +292,8 @@ async fn run(config: Config) -> Result<()> {
     run.metadata
         .insert("mode".to_owned(), config.mode.to_string());
     run.metadata
+        .insert("population".to_owned(), config.population.to_string());
+    run.metadata
         .insert("queue_mode".to_owned(), config.queue_mode.to_string());
     run.metadata.insert(
         "command_profile".to_owned(),
@@ -296,11 +313,17 @@ async fn run(config: Config) -> Result<()> {
     );
     run.metadata.insert(
         "lobby_topology".to_owned(),
-        if config.players_per_game() > 1 {
+        if config.population == Population::Game && config.sessions_per_group() > 1 {
             format!(
                 "one_full_party_lobby_per_game_{}_members",
-                config.players_per_game()
+                config.sessions_per_group()
             )
+        } else if config.population == Population::Idle {
+            "none_idle_authenticated_socket".to_owned()
+        } else if config.population == Population::Matchmaking {
+            "one_player_lobby_held_in_queue".to_owned()
+        } else if config.population == Population::Lobby {
+            "one_player_lobby_held_outside_queue".to_owned()
         } else {
             "one_player_lobby_per_game".to_owned()
         },
@@ -331,7 +354,7 @@ async fn run(config: Config) -> Result<()> {
     let mut next_group_index = 1u64;
     let mut next_wave_index = 0u32;
     let mut interrupted = false;
-    let mut signal = Box::pin(tokio::signal::ctrl_c());
+    let mut signal = Box::pin(shutdown_signal());
     let mut observation_interval = interval(OBSERVATION_INTERVAL);
     observation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spawn_interval = interval_at(Instant::now() + SPAWN_INTERVAL, SPAWN_INTERVAL);
@@ -388,7 +411,7 @@ async fn run(config: Config) -> Result<()> {
         run.games.expected = run
             .games
             .expected
-            .saturating_add(launched / config.players_per_game());
+            .saturating_add(config.expected_games(launched));
         let mut target_reached = concurrency.connected() >= stage.target_concurrency;
         let mut target_reached_at = target_reached.then(unix_time_ms);
 
@@ -438,7 +461,7 @@ async fn run(config: Config) -> Result<()> {
                         && Instant::now() < stage_deadline
                     {
                         let budget = launch_budget(&config, total_sessions_launched);
-                        if budget < config.players_per_game() {
+                        if budget < config.sessions_per_group() {
                             let reason = format!(
                                 "maximum total session limit {} reached before concurrency target {} could be maintained",
                                 config.max_total_sessions,
@@ -469,7 +492,7 @@ async fn run(config: Config) -> Result<()> {
                         run.games.expected = run
                             .games
                             .expected
-                            .saturating_add(launched / config.players_per_game());
+                            .saturating_add(config.expected_games(launched));
                     }
                 }
                 _ = observation_interval.tick() => {
@@ -503,7 +526,7 @@ async fn run(config: Config) -> Result<()> {
     info!(
         connected = concurrency.connected(),
         pending = concurrency.pending(),
-        "ramp complete; draining token-sent sessions"
+        "ramp complete; draining authenticated sessions"
     );
     let drain_deadline = Instant::now() + config.drain_timeout;
     while !tasks.is_empty() && Instant::now() < drain_deadline {
@@ -587,6 +610,10 @@ async fn run(config: Config) -> Result<()> {
         config.require_scale_out.to_string(),
     );
     run.metadata.insert(
+        "require_planned_handoff".to_owned(),
+        config.require_planned_handoff.to_string(),
+    );
+    run.metadata.insert(
         "observed_backend_hints".to_owned(),
         observed_backend_hints.to_string(),
     );
@@ -610,9 +637,10 @@ async fn run(config: Config) -> Result<()> {
         total_sessions_launched.to_string(),
     );
     run.metadata.insert(
-        "coordinator_peak_token_sent_concurrency".to_owned(),
+        "coordinator_peak_authenticated_concurrency".to_owned(),
         concurrency.peak_connected().to_string(),
     );
+    run.peak_authenticated_concurrency = concurrency.peak_connected();
     if !planned_groups.is_empty() {
         // This should be unreachable because every JoinSet result is drained,
         // but keep the report denominator complete if Tokio ever returns an
@@ -637,8 +665,8 @@ async fn run(config: Config) -> Result<()> {
     let coordinator_failures = metadata_counter(&run, "coordinator_task_failures");
     let all_sessions_accounted = aggregate.session_counts.total == total_sessions_launched;
     let all_games_observed = run.games.observed == run.games.expected;
-    let peak_token_sent_target_reached =
-        aggregate.session_counts.peak_token_sent_concurrency >= config.max_concurrency();
+    let peak_authenticated_target_reached =
+        aggregate.session_counts.peak_authenticated_concurrency >= config.max_concurrency();
     let all_stages_completed = !interrupted && run.ramp_stages.len() == config.stages.len();
     let all_targets_reached =
         all_stages_completed && run.ramp_stages.iter().all(|stage| stage.target_reached);
@@ -651,10 +679,10 @@ async fn run(config: Config) -> Result<()> {
             completed_rate * 100.0
         ));
     }
-    if !peak_token_sent_target_reached {
+    if !peak_authenticated_target_reached {
         threshold_failures.push(format!(
-            "peak token-sent logical sessions {} never reached configured maximum {}",
-            aggregate.session_counts.peak_token_sent_concurrency,
+            "peak server-authenticated sessions {} never reached configured maximum {}",
+            aggregate.session_counts.peak_authenticated_concurrency,
             config.max_concurrency()
         ));
     }
@@ -684,13 +712,77 @@ async fn run(config: Config) -> Result<()> {
     if !all_stages_completed {
         threshold_failures.push("the configured stage plan did not complete".to_owned());
     } else if !all_targets_reached {
-        threshold_failures
-            .push("one or more token-sent session concurrency targets were not reached".to_owned());
+        threshold_failures.push(
+            "one or more server-authenticated session concurrency targets were not reached"
+                .to_owned(),
+        );
     }
     if config.require_scale_out && !scale_out_observed {
         threshold_failures.push(format!(
             "active selected-region servers did not rise above baseline {baseline_server_count}"
         ));
+    }
+    if aggregate
+        .metrics
+        .planned_handoffs
+        .pending_commands_at_finish
+        > 0
+    {
+        threshold_failures.push(format!(
+            "{} game commands lacked a terminal outcome at session finish",
+            aggregate
+                .metrics
+                .planned_handoffs
+                .pending_commands_at_finish
+        ));
+    }
+    if config.require_planned_handoff {
+        let handoffs = &aggregate.metrics.planned_handoffs;
+        if handoffs.attempts == 0 {
+            threshold_failures.push("no planned drain handoff was observed".to_owned());
+        }
+        if handoffs.failures > 0 || handoffs.successes != handoffs.attempts {
+            threshold_failures.push(format!(
+                "planned handoffs were not lossless: {} attempts, {} successes, {} failures",
+                handoffs.attempts, handoffs.successes, handoffs.failures
+            ));
+        }
+        if config.population == Population::Game
+            && handoffs
+                .outcome_barriers
+                .saturating_add(handoffs.terminal_completions)
+                != handoffs.successes
+        {
+            threshold_failures.push(format!(
+                "only {} of {} planned handoffs observed an outcome barrier or terminal snapshot",
+                handoffs
+                    .outcome_barriers
+                    .saturating_add(handoffs.terminal_completions),
+                handoffs.successes
+            ));
+        }
+        if handoffs.continuity_proofs != handoffs.successes {
+            threshold_failures.push(format!(
+                "only {} of {} successful planned handoffs had observed old/new continuity",
+                handoffs.continuity_proofs, handoffs.successes
+            ));
+        }
+        if config.population == Population::Game
+            && config.command_profile.sends_unchanged_turns()
+            && handoffs.successes > 0
+            && handoffs.commands_sent == 0
+        {
+            threshold_failures.push(
+                "no every-tick game command was emitted on an old socket while a planned candidate was prepared"
+                    .to_owned(),
+            );
+        }
+        if aggregate.metrics.usable_session_gap_ms.max_ms.unwrap_or(0) > 0 {
+            threshold_failures.push(format!(
+                "usable-session gap reached {} ms during planned-handoff certification",
+                aggregate.metrics.usable_session_gap_ms.max_ms.unwrap_or(0)
+            ));
+        }
     }
     let passed = threshold_failures.is_empty();
     run.metadata.insert(
@@ -702,8 +794,8 @@ async fn run(config: Config) -> Result<()> {
         all_games_observed.to_string(),
     );
     run.metadata.insert(
-        "peak_token_sent_target_reached".to_owned(),
-        peak_token_sent_target_reached.to_string(),
+        "peak_authenticated_target_reached".to_owned(),
+        peak_authenticated_target_reached.to_string(),
     );
     run.metadata.insert(
         "all_stages_completed".to_owned(),
@@ -732,6 +824,8 @@ async fn run(config: Config) -> Result<()> {
         completed = aggregate.session_counts.completed,
         failed = aggregate.session_counts.failed,
         peak_token_sent = aggregate.session_counts.peak_token_sent_concurrency,
+        peak_authenticated = aggregate.session_counts.peak_authenticated_concurrency,
+        peak_active_games = aggregate.session_counts.peak_active_game_concurrency,
         games_completed = aggregate.games.completed,
         games_timeboxed = aggregate.games.timeboxed,
         games_expected = aggregate.games.expected,
@@ -767,7 +861,7 @@ fn spawn_deficit_wave(
     activity_tx: &mpsc::UnboundedSender<SessionActivityEvent>,
     cancellation: CancellationToken,
 ) -> usize {
-    let players_per_game = config.players_per_game();
+    let players_per_game = config.sessions_per_group();
     let group_count = groups_to_launch(
         target,
         concurrency.reserved(),
@@ -1150,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_drain_records_a_transient_token_sent_target_before_terminal() {
+    fn stage_drain_records_a_transient_authenticated_target_before_terminal() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut concurrency = SessionConcurrencyTracker::default();
         concurrency.reserve(&[1]);

@@ -66,7 +66,7 @@ services:
       # SNAKETRON_TEST_MODE: "true"
       # JWT secret (use a secure secret in production)
       SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
-      # Redis configuration for cluster singleton coordination
+      # Redis configuration for membership, assignment, leases, and streams
       SNAKETRON_REDIS_URL: "redis://redis:6379"
     ports:
       - "8080:8080"   # HTTP port (API + WebSocket)

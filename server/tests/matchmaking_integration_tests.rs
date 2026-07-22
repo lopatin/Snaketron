@@ -1,6 +1,8 @@
 use ::common::{GameEvent, GameType};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::future::join_all;
+use redis::AsyncCommands;
+use server::redis_keys::RedisKeys;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, timeout};
 
@@ -452,12 +454,34 @@ async fn test_rejoin_active_game() -> Result<()> {
     let game_id2 = wait_for_match(&mut client2).await?;
     assert_eq!(game_id, game_id2, "Both players should be in same game");
 
+    let committed_mapping: Option<u32> = redis_conn
+        .get(RedisKeys::matchmaking_user_active_game(
+            env.user_ids()[0] as u32,
+        ))
+        .await?;
+    assert_eq!(committed_mapping, Some(game_id));
+
     // Client1 disconnects
     client1.disconnect().await?;
 
     // Client1 reconnects and rejoins
     let mut client1_new = TestClient::connect(&server_addr).await?;
     client1_new.authenticate(env.user_ids()[0]).await?;
+
+    // Matchmaking commit and its per-user mapping are durable even if the
+    // original Pub/Sub notification was missed while this socket was down.
+    // Authentication on any gateway must replay the routing notification.
+    let recovered_game_id = timeout(Duration::from_secs(10), async {
+        loop {
+            if let WSMessage::JoinGame(recovered_game_id) = client1_new.receive_message().await? {
+                return Ok::<u32, anyhow::Error>(recovered_game_id);
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for durable JoinGame recovery")??;
+    assert_eq!(recovered_game_id, game_id);
+
     client1_new
         .send_message(WSMessage::JoinGame(game_id))
         .await?;

@@ -10,15 +10,28 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::db::Database;
-use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager::LobbyManager;
-use crate::matchmaking_manager::{ActiveMatch, MatchStatus, MatchmakingManager, QueuedPlayer};
+use crate::matchmaking_manager::{
+    ActiveMatch, MatchCommitOutcome, MatchStatus, MatchmakingManager, QueuedPlayer,
+};
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 const FFA_MAX_RECURSION_DEPTH: usize = 8;
+#[derive(Debug)]
+enum MatchCreationOutcome {
+    Committed(u32),
+    Conflict { game_id: u32, reason: String },
+}
+
+struct PreparedMatch {
+    game_id: u32,
+    partition_id: u32,
+    game_state: GameState,
+    match_info: ActiveMatch,
+}
 
 /// Explicit player-level team assignment
 #[derive(Debug, Clone)]
@@ -686,7 +699,6 @@ fn find_ffa_combination(
 /// Main matchmaking loop
 pub async fn run_matchmaking_loop(
     mut matchmaking_manager: MatchmakingManager,
-    bus: Arc<GameBus>,
     cancellation_token: CancellationToken,
     lobby_manager: Arc<LobbyManager>,
     db: Arc<dyn Database>,
@@ -695,7 +707,6 @@ pub async fn run_matchmaking_loop(
 
     let mut tick_interval = interval(Duration::from_secs(2));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -721,38 +732,9 @@ pub async fn run_matchmaking_loop(
         let mut total_games_created = 0;
 
         for game_type in &game_types {
-            // Clean up expired entries for both queue modes before attempting to create matches
-            // Expire entries older than 5 minutes (300 seconds)
-            const MAX_QUEUE_AGE_SECONDS: i64 = 300;
-
-            // Clean up quickmatch queue
-            if let Err(e) = matchmaking_manager
-                .cleanup_expired_entries(
-                    game_type,
-                    &common::QueueMode::Quickmatch,
-                    MAX_QUEUE_AGE_SECONDS,
-                )
-                .await
-            {
-                error!(game_type = ?game_type, error = %e, "Failed to cleanup expired quickmatch queue entries");
-            }
-
-            // Clean up competitive queue
-            if let Err(e) = matchmaking_manager
-                .cleanup_expired_entries(
-                    game_type,
-                    &common::QueueMode::Competitive,
-                    MAX_QUEUE_AGE_SECONDS,
-                )
-                .await
-            {
-                error!(game_type = ?game_type, error = %e, "Failed to cleanup expired competitive queue entries");
-            }
-
             // Try lobby-based matchmaking for quickmatch
             match create_lobby_matches(
                 &mut matchmaking_manager,
-                &bus,
                 game_type.clone(),
                 common::QueueMode::Quickmatch,
                 lobby_manager.clone(),
@@ -780,7 +762,6 @@ pub async fn run_matchmaking_loop(
             // Try lobby-based matchmaking for competitive
             match create_lobby_matches(
                 &mut matchmaking_manager,
-                &bus,
                 game_type.clone(),
                 common::QueueMode::Competitive,
                 lobby_manager.clone(),
@@ -882,7 +863,6 @@ fn filter_compatible_lobbies(
 /// Create matches from lobbies in the queue using advanced combination matching
 async fn create_lobby_matches(
     matchmaking_manager: &mut MatchmakingManager,
-    bus: &GameBus,
     game_type: GameType,
     queue_mode: common::QueueMode,
     lobby_manager: Arc<LobbyManager>,
@@ -1021,18 +1001,17 @@ async fn create_lobby_matches(
             break;
         }
 
-        // Create game from this combination
-        match create_game_from_lobbies(
+        let creation = create_game_from_lobbies(
             matchmaking_manager,
-            bus,
             &game_type,
             &queue_mode,
             &combination,
             db.as_ref(),
         )
-        .await
-        {
-            Ok(game_id) => {
+        .await;
+
+        match creation {
+            Ok(MatchCreationOutcome::Committed(game_id)) => {
                 games_created += 1;
                 info!(
                     "Created game {} from {} lobbies with {} total players (avg MMR: {})",
@@ -1042,38 +1021,34 @@ async fn create_lobby_matches(
                     combination.avg_mmr
                 );
 
-                // Remove matched lobbies from available pool and ALL queues they were in
+                // The atomic commit removed every exact queue identity and
+                // moved durable lobby metadata to `matched`. Pub/Sub remains
+                // a best-effort presentation refresh.
                 for lobby in &combination.lobbies {
                     available_lobbies.retain(|l| l.lobby_code != lobby.lobby_code);
 
-                    // Use remove_lobby_from_all_queues to ensure lobby is removed from
-                    // all game type queues it was registered for (prevents double-matching)
-                    if let Err(e) = matchmaking_manager
-                        .remove_lobby_from_all_queues(lobby)
-                        .await
-                    {
-                        error!(
-                            "Failed to remove lobby {} from all queues: {}",
-                            lobby.lobby_code, e
-                        );
-                    } else if let Err(e) = lobby_manager
-                        .update_lobby_state(&lobby.lobby_code, "waiting")
-                        .await
-                    {
+                    if let Err(e) = lobby_manager.publish_lobby_update(&lobby.lobby_code).await {
                         error!(
                             lobby_code = lobby.lobby_code,
                             error = %e,
-                            "Failed to update lobby state after leaving matchmaking queue"
+                            "Failed to publish matched lobby state"
                         );
                     }
                 }
-
-                // Publish match notifications to all lobby members
-                if let Err(e) =
-                    publish_lobby_match_notifications(&combination.lobbies, game_id).await
-                {
-                    error!("Failed to publish match notifications: {}", e);
+            }
+            Ok(MatchCreationOutcome::Conflict { game_id, reason }) => {
+                // The selected identities are stale. Do not repeatedly allocate IDs for
+                // them in this local pass; the next Redis read will observe the winner.
+                for lobby in &combination.lobbies {
+                    available_lobbies.retain(|candidate| {
+                        candidate.lobby_code != lobby.lobby_code
+                            || candidate.queue_token != lobby.queue_token
+                    });
                 }
+                info!(
+                    game_id,
+                    reason, "Atomic matchmaking claim lost; discarded the unused durable game ID"
+                );
             }
             Err(e) => {
                 error!("Failed to create game from lobby combination: {}", e);
@@ -1085,15 +1060,14 @@ async fn create_lobby_matches(
     Ok(games_created)
 }
 
-/// Create a game from a combination of lobbies with proper team assignments
-async fn create_game_from_lobbies(
+/// Allocate an ID and construct all match data without mutating Valkey.
+async fn prepare_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
-    bus: &GameBus,
     game_type: &GameType,
     queue_mode: &common::QueueMode,
     combination: &MatchmakingCombination,
     db: &dyn Database,
-) -> Result<u32> {
+) -> Result<PreparedMatch> {
     let game_id = matchmaking_manager.generate_game_id(db).await?;
     let partition_id = game_id % PARTITION_COUNT;
 
@@ -1212,7 +1186,13 @@ async fn create_game_from_lobbies(
 
     game_state.spawn_initial_food();
 
-    // Store active match information
+    let mut lobby_codes: Vec<String> = combination
+        .lobbies
+        .iter()
+        .map(|lobby| lobby.lobby_code.clone())
+        .collect();
+    lobby_codes.sort();
+    lobby_codes.dedup();
     let match_info = ActiveMatch {
         players: all_players,
         game_type: game_type.clone(),
@@ -1220,140 +1200,67 @@ async fn create_game_from_lobbies(
         partition_id,
         created_at: Utc::now().timestamp_millis(),
         spectators,
+        lobby_codes,
     };
-    matchmaking_manager
-        .store_active_match(game_id, match_info)
-        .await?;
 
-    // Publish game events
-    let event = StreamEvent::GameCreated {
+    Ok(PreparedMatch {
         game_id,
-        game_state: game_state.clone(),
-    };
-
-    // stream_seq 0: the executor owning the game loop assigns the stream.
-    bus.publish_snapshot(partition_id, game_id, &game_state, 0)
-        .await
-        .context("Failed to publish initial game snapshot")?;
-
-    bus.publish_command(partition_id, &event)
-        .await
-        .context("Failed to publish GameCreated event")?;
-
-    Ok(game_id)
+        partition_id,
+        game_state,
+        match_info,
+    })
 }
 
-/// Publish match found notifications to all members of matched lobbies
-async fn publish_lobby_match_notifications(
-    lobbies: &[crate::matchmaking_manager::QueuedLobby],
-    game_id: u32,
-) -> Result<()> {
-    let redis_url = std::env::var("SNAKETRON_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-
-    let client = redis::Client::open(redis_url.as_str()).context("Failed to open Redis client")?;
-    let mut conn = client
-        .get_multiplexed_tokio_connection()
-        .await
-        .context("Failed to get Redis connection")?;
-
-    let partition_id = game_id % PARTITION_COUNT;
-
-    for lobby in lobbies {
-        let channel =
-            crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby.lobby_code);
-        let notification = serde_json::json!({
-            "type": "MatchFound",
-            "game_id": game_id,
-            "partition_id": partition_id
-        });
-
-        let _: Result<i32, _> = redis::cmd("PUBLISH")
-            .arg(&channel)
-            .arg(notification.to_string())
-            .query_async(&mut conn)
-            .await;
-
-        info!(
-            "Published match notification to lobby {} (code: {})",
-            lobby.lobby_code, lobby.lobby_code
-        );
-    }
-
-    Ok(())
-}
-
-/// Create a match from a specific set of players (for custom games)
-pub async fn create_custom_match(
+async fn create_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
-    bus: &GameBus,
+    game_type: &GameType,
+    queue_mode: &common::QueueMode,
+    combination: &MatchmakingCombination,
     db: &dyn Database,
-    players: Vec<QueuedPlayer>,
-    game_type: GameType,
-) -> Result<u32> {
-    let _user_ids: Vec<u32> = players.iter().map(|p| p.user_id).collect();
+) -> Result<MatchCreationOutcome> {
+    let prepared =
+        prepare_game_from_lobbies(matchmaking_manager, game_type, queue_mode, combination, db)
+            .await?;
 
-    let game_id = matchmaking_manager.generate_game_id(db).await?;
-    let partition_id = game_id % PARTITION_COUNT;
-
-    // Create game state
-    let start_ms = Utc::now().timestamp_millis() + GAME_START_DELAY_MS;
-    let (width, height) = match &game_type {
-        GameType::TeamMatch { .. } => (60, 40),
-        _ => (40, 40),
-    };
-
-    let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    // Custom games default to Quickmatch queue mode
-    let mut game_state = GameState::new(
-        width,
-        height,
-        game_type.clone(),
-        common::QueueMode::Quickmatch,
-        rng_seed,
-        start_ms,
-    );
-
-    // Add players
-    for player in &players {
-        game_state.add_player(player.user_id, Some(player.username.clone()))?;
-    }
-
-    game_state.spawn_initial_food();
-
-    // Store active match
-    let match_info = ActiveMatch {
-        players: players.clone(),
-        spectators: Vec::new(),
-        game_type: game_type.clone(),
-        status: MatchStatus::Waiting,
-        partition_id,
-        created_at: Utc::now().timestamp_millis(),
-    };
-    matchmaking_manager
-        .store_active_match(game_id, match_info)
-        .await?;
-
-    // Publish events
     let event = StreamEvent::GameCreated {
-        game_id,
-        game_state: game_state.clone(),
+        game_id: prepared.game_id,
+        game_state: prepared.game_state,
     };
+    let payload = serde_json::to_string(&event).context("Failed to serialize GameCreated")?;
 
-    // stream_seq 0: the executor owning the game loop assigns the stream.
-    bus.publish_snapshot(partition_id, game_id, &game_state, 0)
-        .await?;
-
-    bus.publish_command(partition_id, &event).await?;
-
-    info!(
-        game_id,
-        partition_id,
-        player_count = players.len(),
-        "Custom match created"
-    );
-
-    Ok(game_id)
+    match matchmaking_manager
+        .commit_match(
+            prepared.game_id,
+            prepared.partition_id,
+            game_type,
+            queue_mode,
+            &prepared.match_info,
+            &payload,
+            &combination.lobbies,
+        )
+        .await?
+    {
+        MatchCommitOutcome::Committed { stream_id } => {
+            info!(
+                game_id = prepared.game_id,
+                partition_id = prepared.partition_id,
+                stream_id,
+                "Atomically committed match and GameCreated"
+            );
+            Ok(MatchCreationOutcome::Committed(prepared.game_id))
+        }
+        MatchCommitOutcome::AlreadyCommitted => {
+            warn!(
+                game_id = prepared.game_id,
+                "Atomic match commit was retried after an ambiguous response"
+            );
+            Ok(MatchCreationOutcome::Committed(prepared.game_id))
+        }
+        MatchCommitOutcome::Conflict { reason } => Ok(MatchCreationOutcome::Conflict {
+            game_id: prepared.game_id,
+            reason,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1366,6 +1273,7 @@ mod tests {
     fn ffa_lobby(code: &str, user_ids: &[u32], queued_at: i64) -> QueuedLobby {
         QueuedLobby {
             lobby_code: code.to_string(),
+            queue_token: format!("token-{code}"),
             members: user_ids
                 .iter()
                 .map(|user_id| LobbyMember {
@@ -1392,6 +1300,7 @@ mod tests {
     fn one_player_lobby_forms_a_solo_match() {
         let lobby = QueuedLobby {
             lobby_code: "SOLO1".to_string(),
+            queue_token: "token-solo1".to_string(),
             members: vec![LobbyMember {
                 user_id: 5,
                 username: "solo_player".to_string(),
@@ -1417,6 +1326,7 @@ mod tests {
     fn duo_lobby_splits_into_duel() {
         let lobby = QueuedLobby {
             lobby_code: "ABC123".to_string(),
+            queue_token: "token-abc123".to_string(),
             members: vec![
                 LobbyMember {
                     user_id: 10,
@@ -1462,6 +1372,7 @@ mod tests {
     fn four_player_lobby_splits_into_two_v_two_without_spectators() {
         let lobby = QueuedLobby {
             lobby_code: "TEAM4".to_string(),
+            queue_token: "token-team4".to_string(),
             members: (20..24)
                 .map(|user_id| LobbyMember {
                     user_id,
