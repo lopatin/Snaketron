@@ -1688,7 +1688,9 @@ inject_hard_crash_and_prove_takeover() {
         any(.runtime_partitions[];
           .owner_matches
           and .active_games > 0
-          and .pending_count > 0)
+          and .pending_count > 0
+          and (.lease_token as $token
+            | any(.pending_entry_sample[]; .consumer == $token)))
       ' "$candidate" >/dev/null; then
       mv "$candidate" "$pre"
       break
@@ -1707,14 +1709,21 @@ inject_hard_crash_and_prove_takeover() {
   local killed_task_id
   local killed_task_arn
   local killed_task_boot_id
+  local killed_lease_token
   partition_json="$(jq -ce '
     [.runtime_partitions[]
-      | select(.owner_matches and .active_games > 0 and .pending_count > 0)]
+      | select(
+          .owner_matches
+          and .active_games > 0
+          and .pending_count > 0
+          and (.lease_token as $token
+            | any(.pending_entry_sample[]; .consumer == $token)))]
     | sort_by(-.pending_count, -.active_games, .partition)
     | .[0]
   ' "$pre")"
   killed_partition="$(jq -r '.partition' <<<"$partition_json")"
   killed_boot_id="$(jq -r '.active_owner' <<<"$partition_json")"
+  killed_lease_token="$(jq -r '.lease_token' <<<"$partition_json")"
   member_json="$(jq -ce --arg boot_id "$killed_boot_id" '
     [.live_members[]
       | select(.boot_id == $boot_id and .lifecycle == "ACTIVE")]
@@ -1751,9 +1760,11 @@ inject_hard_crash_and_prove_takeover() {
     ' >"$report_dir/hard-crash-manifest.json"
 
   # One non-retried ECS Exec session discovers exactly one non-PID-1 `server`
-  # child, emits the timestamp used by every deadline, then SIGKILLs it.
+  # child, records the timestamp used by every deadline, SIGKILLs the child,
+  # and only then emits the marker. A marker therefore proves that the kill
+  # syscall succeeded before the PEL observation begins.
   local hard_kill_command
-  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; kill_at_ms=$(date +%s%3N); printf "SNAKETRON_HARD_KILL_AT_MS=%s SERVER_PID=%s\\n" "$kill_at_ms" "$server_pid"; kill -KILL "$server_pid"'\'''
+  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; kill_at_ms=$(date +%s%3N); kill -KILL "$server_pid"; printf "SNAKETRON_HARD_KILL_AT_MS=%s SERVER_PID=%s\\n" "$kill_at_ms" "$server_pid"'\'''
   local exec_output="$report_dir/hard-crash-ecs-exec.log"
   aws ecs execute-command \
     --region "$SNAKETRON_AWS_REGION" \
@@ -1776,6 +1787,55 @@ inject_hard_crash_and_prove_takeover() {
     echo "The single ECS Exec injection did not emit its hard-kill marker" >&2
     return 1
   fi
+
+  # Capture the Redis PEL immediately after the fail-stop marker and before
+  # polling for successor ownership. This ties the takeover proof to exact
+  # command IDs that the killed lease could no longer acknowledge.
+  local pending_after_kill="$report_dir/control-plane-immediate-post-kill.json"
+  local pending_candidate="$pending_after_kill.pending"
+  local pending_deadline=$((SECONDS + 2))
+  while (( SECONDS < pending_deadline )); do
+    if capture_control_status "$pending_candidate" 2>/dev/null \
+      && jq -e \
+        --arg killed_lease_token "$killed_lease_token" \
+        --argjson partition "$killed_partition" \
+        --argjson kill_at_ms "$kill_at_ms" '
+          .captured_at_ms >= $kill_at_ms
+          and ([.runtime_partitions[]
+            | select(.partition == $partition)
+            | .pending_entry_sample[]
+            | select(.consumer == $killed_lease_token)] | length) > 0
+        ' "$pending_candidate" >/dev/null; then
+      mv "$pending_candidate" "$pending_after_kill"
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ ! -f "$pending_after_kill" ]]; then
+    [[ -f "$pending_candidate" ]] && mv "$pending_candidate" "$pending_after_kill"
+    wait "$ecs_exec_pid" 2>/dev/null || true
+    echo "No exact pending command remained under the killed lease immediately after SIGKILL" >&2
+    return 1
+  fi
+
+  local manifest_pending="$report_dir/hard-crash-manifest.pending.json"
+  jq \
+    --arg killed_lease_token "$killed_lease_token" \
+    --argjson partition "$killed_partition" \
+    --slurpfile observed "$pending_after_kill" '
+      . + {
+        pending_after_kill: {
+          captured_at_unix_ms: $observed[0].captured_at_ms,
+          partition: $partition,
+          killed_lease_token: $killed_lease_token,
+          entries: [$observed[0].runtime_partitions[]
+            | select(.partition == $partition)
+            | .pending_entry_sample[]
+            | select(.consumer == $killed_lease_token)]
+        }
+      }
+    ' "$report_dir/hard-crash-manifest.json" >"$manifest_pending"
+  mv "$manifest_pending" "$report_dir/hard-crash-manifest.json"
 
   local owner_ready="$report_dir/control-plane-hard-crash-owner-ready.json"
   local owner_candidate="$owner_ready.pending"
@@ -1821,7 +1881,6 @@ inject_hard_crash_and_prove_takeover() {
     echo "Killed membership and fenced partition ownership did not fail over to a pre-existing survivor within five seconds" >&2
     return 1
   fi
-  local manifest_pending="$report_dir/hard-crash-manifest.pending.json"
   jq \
     --argjson kill_at_unix_ms "$kill_at_ms" \
     --argjson ecs_exec_exit_code "$ecs_exec_exit_code" \
@@ -1920,6 +1979,7 @@ assert_hard_crash_report() {
   jq -n \
     --slurpfile report "$summary" \
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
+    --slurpfile pending_after_kill "$report_dir/control-plane-immediate-post-kill.json" \
     --slurpfile owner_ready "$report_dir/control-plane-hard-crash-owner-ready.json" \
     --slurpfile final "$report_dir/control-plane-hard-crash-final-10.json" '
       def p99:
@@ -1942,6 +2002,11 @@ assert_hard_crash_report() {
       | $manifest[0] as $m
       | $m.kill_at_unix_ms as $kill
       | $m.selected_partition.partition as $partition
+      | ($m.pending_after_kill.entries | map(.id) | unique | sort) as $pending_ids
+      | ([$pending_after_kill[0].runtime_partitions[]
+          | select(.partition == $partition)
+          | .pending_entry_sample[]
+          | select(.consumer == $m.selected_partition.lease_token)]) as $observed_pending
       # Exclude any bucket that began before the observer proved the successor
       # lease. The selected bucket end remains the conservative output bound.
       | ($owner_ready[0].captured_at_ms / 1000 | ceil) as $first_post_second
@@ -1964,6 +2029,8 @@ assert_hard_crash_report() {
             [$affected[].pending_commands_after_outcome_barrier] | add // 0),
           pending_commands_at_finish:
             $r.metrics.planned_handoffs.pending_commands_at_finish,
+          pending_ids_observed_after_kill: $pending_ids,
+          pending_observed_at_unix_ms: $m.pending_after_kill.captured_at_unix_ms,
           kill_to_ready_p99_ms: $kill_to_ready_p99_ms,
           first_authoritative_output_second: $first_output_second,
           first_authoritative_output_upper_bound_ms: (
@@ -1997,6 +2064,14 @@ assert_hard_crash_report() {
                 and (($r.metrics.command_counts_by_unix_second
                       [($second | tostring)] // 0) >= 1280))
             and ($affected | length) > 0
+            and $m.pending_after_kill.partition == $partition
+            and $m.pending_after_kill.killed_lease_token == $m.selected_partition.lease_token
+            and $m.pending_after_kill.captured_at_unix_ms >= $kill
+            and $m.pending_after_kill.captured_at_unix_ms
+              == $pending_after_kill[0].captured_at_ms
+            and ($pending_ids | length) > 0
+            and ($pending_ids | length) == ($m.pending_after_kill.entries | length)
+            and $m.pending_after_kill.entries == $observed_pending
             and $kill_to_ready_p99_ms != null
             and $kill_to_ready_p99_ms <= 10000
             and all($affected[];
@@ -2005,12 +2080,12 @@ assert_hard_crash_report() {
             and $r.metrics.planned_handoffs.pending_commands_at_finish == 0
             and $first_output_second != null
             and ((($first_output_second + 1) * 1000) - $kill) <= 5000
-            and ($final[0].runtime_partitions[]
-              | select(.partition == $partition)
-              | .owner_matches
-                and .pending_count == 0
-                and .pending_completion_count == 0
-                and .quarantined_command_count == 0)
+            and all($final[0].runtime_partitions[];
+              .consumer_group_exists
+              and .owner_matches
+              and .pending_count == 0
+              and .pending_completion_count == 0
+              and .quarantined_command_count == 0)
           )
         }
     ' >"$report_dir/hard-crash-acceptance.json"
@@ -2523,17 +2598,15 @@ run_staging_suite() {
     local final_deadline=$((SECONDS + 60))
     while (( SECONDS < final_deadline )); do
       if capture_control_status "$final_candidate" 2>/dev/null \
-        && jq -e \
-          --slurpfile manifest "$report_dir/hard-crash-manifest.json" '
-            ($manifest[0].selected_partition.partition) as $partition
-            | ([.live_members[] | select(.lifecycle == "ACTIVE")] | length) == 10
+        && jq -e '
+            ([.live_members[] | select(.lifecycle == "ACTIVE")] | length) == 10
             and .assignment != null
-            and all(.runtime_partitions[]; .owner_matches)
-            and (.runtime_partitions[]
-              | select(.partition == $partition)
-              | .pending_count == 0
-                and .pending_completion_count == 0
-                and .quarantined_command_count == 0)
+            and all(.runtime_partitions[];
+              .consumer_group_exists
+              and .owner_matches
+              and .pending_count == 0
+              and .pending_completion_count == 0
+              and .quarantined_command_count == 0)
           ' "$final_candidate" >/dev/null; then
         mv "$final_candidate" "$final_control"
         break
@@ -2541,7 +2614,7 @@ run_staging_suite() {
       sleep 0.2
     done
     if [[ ! -f "$final_control" ]]; then
-      echo "Affected hard-crash partition did not fully drain after load completion" >&2
+      echo "Executor partitions did not fully drain after hard-crash load completion" >&2
       return 1
     fi
 

@@ -5,7 +5,7 @@ use chrono::Utc;
 use common::{GameType, QueueMode};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use redis::streams::StreamPendingReply;
+use redis::streams::{StreamPendingCountReply, StreamPendingId, StreamPendingReply};
 use serde::Serialize;
 use server::cluster_membership::{BootIdentity, ClusterNamespace, TaskMembership};
 use server::game_executor::PARTITION_COUNT;
@@ -14,10 +14,31 @@ use server::redis_keys::RedisKeys;
 use std::env;
 use uuid::Uuid;
 
+const PENDING_ENTRY_SAMPLE_LIMIT: usize = 128;
+
 #[derive(Debug)]
 struct Args {
     region_key: String,
     redis_url: String,
+}
+
+#[derive(Serialize)]
+struct PendingEntry {
+    id: String,
+    consumer: String,
+    idle_ms: u64,
+    delivery_count: u64,
+}
+
+impl From<StreamPendingId> for PendingEntry {
+    fn from(entry: StreamPendingId) -> Self {
+        Self {
+            id: entry.id,
+            consumer: entry.consumer,
+            idle_ms: entry.last_delivered_ms as u64,
+            delivery_count: entry.times_delivered as u64,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -30,6 +51,7 @@ struct RuntimePartition {
     lease_ttl_ms: i64,
     consumer_group_exists: bool,
     pending_count: u64,
+    pending_entry_sample: Vec<PendingEntry>,
     pending_completion_count: u64,
     quarantined_command_count: u64,
     active_games: u64,
@@ -146,6 +168,15 @@ async fn read_partition(
         Err(error) if error.to_string().contains("NOGROUP") => (false, 0),
         Err(error) => return Err(error).context("failed to inspect executor pending entries"),
     };
+    let pending_entry_sample = if consumer_group_exists && pending_count > 0 {
+        let pending: StreamPendingCountReply = redis
+            .xpending_count(&stream, &group, "-", "+", PENDING_ENTRY_SAMPLE_LIMIT)
+            .await
+            .context("failed to inspect exact executor pending entries")?;
+        pending.ids.into_iter().map(PendingEntry::from).collect()
+    } else {
+        Vec::new()
+    };
 
     let pending_completion_count: u64 = redis
         .scard(namespace.pending_completions(partition))
@@ -169,6 +200,7 @@ async fn read_partition(
         lease_ttl_ms,
         consumer_group_exists,
         pending_count,
+        pending_entry_sample,
         pending_completion_count,
         quarantined_command_count,
         active_games,
@@ -229,5 +261,24 @@ mod tests {
         );
         assert_eq!(parse_active_owner("not-a-token"), None);
         assert_eq!(parse_active_owner(&format!("{boot}:bad")), None);
+    }
+
+    #[test]
+    fn preserves_exact_pending_entry_delivery_metadata() {
+        let entry = PendingEntry::from(StreamPendingId {
+            id: "1234-5".to_string(),
+            consumer: "lease-token".to_string(),
+            last_delivered_ms: 42,
+            times_delivered: 3,
+        });
+        assert_eq!(
+            serde_json::to_value(entry).unwrap(),
+            serde_json::json!({
+                "id": "1234-5",
+                "consumer": "lease-token",
+                "idle_ms": 42,
+                "delivery_count": 3,
+            })
+        );
     }
 }
