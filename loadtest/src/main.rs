@@ -228,6 +228,7 @@ async fn run(config: Config) -> Result<()> {
         .preflight(&TargetOptions {
             target: config.target_url.to_string(),
             region: config.region.clone(),
+            require_same_origin: config.require_same_origin,
         })
         .await
         .context("target preflight failed before any sessions were launched")?;
@@ -241,6 +242,14 @@ async fn run(config: Config) -> Result<()> {
         Url::parse(&preflight.api_origin).context("preflight returned an invalid API origin")?;
     let selected_origin = Url::parse(&preflight.selected_origin)
         .context("preflight returned an invalid selected-region origin")?;
+    if config.require_same_origin {
+        ensure_effective_endpoints_same_origin(
+            &config.target_url,
+            &api_origin,
+            &selected_origin,
+            &websocket_url,
+        )?;
+    }
     ensure_effective_endpoints_confirmed(
         config.production_confirmed,
         &[&api_origin, &selected_origin, &websocket_url],
@@ -248,7 +257,7 @@ async fn run(config: Config) -> Result<()> {
     let settings = SessionSettings {
         api_origin,
         websocket_url,
-        origin: preflight.selected_origin.clone(),
+        origin: selected_origin.to_string(),
         game_type: game_type(config.mode),
         queue_mode: queue_mode(config.queue_mode),
         selected_mode: config.mode.as_str().to_owned(),
@@ -288,6 +297,14 @@ async fn run(config: Config) -> Result<()> {
     run.metadata.insert(
         "websocket_url".to_owned(),
         settings.websocket_url.to_string(),
+    );
+    run.metadata
+        .insert("api_origin".to_owned(), settings.api_origin.to_string());
+    run.metadata
+        .insert("selected_origin".to_owned(), settings.origin.clone());
+    run.metadata.insert(
+        "require_same_origin".to_owned(),
+        config.require_same_origin.to_string(),
     );
     run.metadata
         .insert("mode".to_owned(), config.mode.to_string());
@@ -1149,6 +1166,57 @@ fn ensure_effective_endpoints_confirmed(
     Ok(())
 }
 
+fn ensure_effective_endpoints_same_origin(
+    target: &Url,
+    api_origin: &Url,
+    selected_origin: &Url,
+    websocket_url: &Url,
+) -> Result<()> {
+    let mut mismatches = Vec::new();
+    if target.scheme() != api_origin.scheme() || !same_authority(target, api_origin) {
+        mismatches.push("API origin");
+    }
+    if target.scheme() != selected_origin.scheme() || !same_authority(target, selected_origin) {
+        mismatches.push("selected regional origin");
+    }
+    let expected_websocket_scheme = match target.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        scheme => {
+            return Err(anyhow!(
+                "same-origin gate does not support target scheme '{scheme}'"
+            ));
+        }
+    };
+    if websocket_url.scheme() != expected_websocket_scheme || !same_authority(target, websocket_url)
+    {
+        mismatches.push("WebSocket endpoint");
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "--require-same-origin rejected incoherent endpoints before guest creation: {}; target={target}, api_origin={api_origin}, selected_origin={selected_origin}, websocket_url={websocket_url}",
+        mismatches.join(", ")
+    ))
+}
+
+fn same_authority(left: &Url, right: &Url) -> bool {
+    left.host_str()
+        .zip(right.host_str())
+        .is_some_and(|(left_host, right_host)| left_host.eq_ignore_ascii_case(right_host))
+        && effective_port(left) == effective_port(right)
+}
+
+fn effective_port(url: &Url) -> Option<u16> {
+    url.port().or(match url.scheme() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    })
+}
+
 fn report_directory(root: &Path, run_id: &str) -> PathBuf {
     root.join(run_id)
 }
@@ -1376,6 +1444,55 @@ mod tests {
             .is_ok()
         );
         assert!(ensure_effective_endpoints_confirmed(false, &[&custom_api]).is_ok());
+    }
+
+    #[test]
+    fn same_origin_gate_accepts_only_coherent_effective_endpoints() {
+        let target = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let api = Url::parse("https://stg-123-1.snaketron.io:443/").unwrap();
+        let selected = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let websocket = Url::parse("wss://stg-123-1.snaketron.io/socket").unwrap();
+
+        assert!(
+            ensure_effective_endpoints_same_origin(&target, &api, &selected, &websocket).is_ok()
+        );
+    }
+
+    #[test]
+    fn same_origin_gate_reports_every_endpoint_that_escaped_the_target() {
+        let target = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let production_api = Url::parse("https://api.snaketron.io/").unwrap();
+        let production_region = Url::parse("https://use1.snaketron.io/").unwrap();
+        let production_websocket = Url::parse("wss://use1.snaketron.io/ws").unwrap();
+
+        let error = ensure_effective_endpoints_same_origin(
+            &target,
+            &production_api,
+            &production_region,
+            &production_websocket,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("before guest creation"));
+        assert!(error.contains("API origin"));
+        assert!(error.contains("selected regional origin"));
+        assert!(error.contains("WebSocket endpoint"));
+        assert!(error.contains("target=https://stg-123-1.snaketron.io/"));
+    }
+
+    #[test]
+    fn same_origin_gate_rejects_scheme_or_port_changes_on_the_same_host() {
+        let target = Url::parse("http://localhost:8080/").unwrap();
+        let api = Url::parse("http://localhost:8080/").unwrap();
+        let selected = Url::parse("https://localhost:8080/").unwrap();
+        let websocket = Url::parse("ws://localhost:8081/ws").unwrap();
+
+        let error = ensure_effective_endpoints_same_origin(&target, &api, &selected, &websocket)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected regional origin"));
+        assert!(error.contains("WebSocket endpoint"));
+        assert!(!error.contains("API origin"));
     }
 
     #[tokio::test]

@@ -145,6 +145,11 @@ pub struct Args {
     #[arg(long)]
     pub confirm_production: bool,
 
+    /// Fail before creating guests unless the effective API, regional, and
+    /// WebSocket endpoints all remain on the explicit target origin.
+    #[arg(long)]
+    pub require_same_origin: bool,
+
     /// Fail the run unless the selected region's active server count rises
     /// above its preflight baseline.
     #[arg(long)]
@@ -444,6 +449,7 @@ pub struct Config {
     pub run_id: String,
     pub command_profile: CommandProfile,
     pub production_confirmed: bool,
+    pub require_same_origin: bool,
     pub require_scale_out: bool,
     pub require_planned_handoff: bool,
 }
@@ -538,6 +544,7 @@ impl TryFrom<Args> for Config {
             run_id,
             command_profile: args.command_profile,
             production_confirmed: args.confirm_production,
+            require_same_origin: args.require_same_origin,
             require_scale_out: args.require_scale_out,
             require_planned_handoff: args.require_planned_handoff,
         })
@@ -702,7 +709,7 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
 }
 
 fn parse_target_url(value: &str) -> Result<Url, ConfigError> {
-    let url =
+    let mut url =
         Url::parse(value).map_err(|error| ConfigError::InvalidTargetUrl(error.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ConfigError::InvalidTargetUrl(
@@ -719,6 +726,9 @@ fn parse_target_url(value: &str) -> Result<Url, ConfigError> {
             "embedded credentials are not allowed".to_string(),
         ));
     }
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
     Ok(url)
 }
 
@@ -738,6 +748,11 @@ fn parse_websocket_url(value: &str) -> Result<Url, ConfigError> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(ConfigError::InvalidWebSocketUrl(
             "embedded credentials are not allowed".to_string(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ConfigError::InvalidWebSocketUrl(
+            "query strings and fragments are not allowed".to_string(),
         ));
     }
     Ok(url)
@@ -872,6 +887,7 @@ mod tests {
             run_id: Some("test-run".to_string()),
             command_profile: CommandProfile::Realistic,
             confirm_production: false,
+            require_same_origin: false,
             require_scale_out: false,
             require_planned_handoff: false,
         }
@@ -1064,6 +1080,28 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_target_metadata_and_rejects_websocket_query_secrets() {
+        let mut args = test_args();
+        args.target = "https://staging.example.test/private?token=do-not-log#secret".to_string();
+        assert_eq!(
+            args.into_config().unwrap().target_url.as_str(),
+            "https://staging.example.test/"
+        );
+
+        for websocket in [
+            "wss://staging.example.test/ws?token=do-not-log",
+            "wss://staging.example.test/ws#secret",
+        ] {
+            let mut args = test_args();
+            args.ws_url = Some(websocket.to_string());
+            let error = args.into_config().unwrap_err().to_string();
+            assert!(error.contains("query strings and fragments are not allowed"));
+            assert!(!error.contains("do-not-log"));
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
     fn validates_run_id_for_safe_report_paths() {
         let mut args = test_args();
         args.run_id = Some("../unsafe".to_string());
@@ -1110,6 +1148,16 @@ mod tests {
 
         assert_eq!(args.mode, GameMode::TwoVTwo);
         assert_eq!(args.command_profile, CommandProfile::EveryTick);
+    }
+
+    #[test]
+    fn clap_exposes_the_fail_closed_same_origin_gate() {
+        let config = Args::try_parse_from(["snaketron-loadtest", "--require-same-origin"])
+            .unwrap()
+            .into_config()
+            .unwrap();
+
+        assert!(config.require_same_origin);
     }
 
     #[test]

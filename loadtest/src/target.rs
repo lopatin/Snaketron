@@ -26,6 +26,8 @@ pub struct TargetOptions {
     pub target: String,
     /// Optional region ID. Matching is case-insensitive.
     pub region: Option<String>,
+    /// Keep API discovery, health probes, and session endpoints on `target`.
+    pub require_same_origin: bool,
 }
 
 impl TargetOptions {
@@ -33,11 +35,17 @@ impl TargetOptions {
         Self {
             target: target.into(),
             region: None,
+            require_same_origin: false,
         }
     }
 
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    pub fn requiring_same_origin(mut self) -> Self {
+        self.require_same_origin = true;
         self
     }
 }
@@ -338,7 +346,7 @@ impl TargetResolver {
         let client = Client::builder()
             .connect_timeout(request_timeout)
             .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(LOAD_TEST_USER_AGENT)
             .build()
             .map_err(|source| TargetError::ClientBuild { source })?;
@@ -366,12 +374,16 @@ impl TargetResolver {
     /// and capture the initial aggregate user count.
     pub async fn preflight(&self, options: &TargetOptions) -> Result<TargetPreflight, TargetError> {
         let requested_target = normalize_target_url(&options.target)?;
-        let api_origin = derive_api_origin(&requested_target)?;
-        let (regions, regions_endpoint) = self.fetch_regions(&api_origin).await?;
+        let api_origin = resolve_api_origin(&requested_target, options.require_same_origin)?;
+        let (mut regions, regions_endpoint) = self.fetch_regions(&api_origin).await?;
         if regions.is_empty() {
             return Err(TargetError::NoRegions {
                 url: regions_endpoint.url,
             });
+        }
+        normalize_region_endpoints(&mut regions)?;
+        if options.require_same_origin {
+            require_and_rewrite_same_origin_regions(&mut regions, &requested_target)?;
         }
 
         // Probe serially. Each latency is measured around only its own request,
@@ -393,8 +405,8 @@ impl TargetResolver {
         } else {
             RegionSelection::LowestLatencyHealthy
         };
-        let selected_origin = normalized_region_origin(&selected.region)?.to_string();
-        let websocket_url = websocket_url_for_region(&selected.region)?.to_string();
+        let selected_origin = normalized_region_origin(&selected.region)?;
+        let websocket_url = websocket_url_for_region(&selected.region)?;
         let initial_user_counts = self.sample_user_counts(&api_origin).await?;
         let initial_server_counts = self.sample_server_counts(&api_origin).await?;
 
@@ -405,8 +417,8 @@ impl TargetResolver {
             regions_endpoint,
             region_selection,
             selected_region: selected.region.clone(),
-            selected_origin,
-            websocket_url,
+            selected_origin: selected_origin.to_string(),
+            websocket_url: websocket_url.to_string(),
             selected_health: selected,
             region_health,
             initial_user_counts,
@@ -715,51 +727,82 @@ pub fn derive_api_origin(target: &Url) -> Result<Url, TargetError> {
     Ok(api_origin)
 }
 
+fn resolve_api_origin(target: &Url, require_same_origin: bool) -> Result<Url, TargetError> {
+    if require_same_origin {
+        validate_http_origin(target, target.as_str())?;
+        Ok(target.clone())
+    } else {
+        derive_api_origin(target)
+    }
+}
+
+/// Derive the WebSocket endpoint represented by an explicit HTTP(S) target.
+pub fn websocket_url_for_target(target: &Url) -> Result<Url, TargetError> {
+    validate_http_origin(target, target.as_str())?;
+    let mut ws_url = target.clone();
+    let desired_scheme = match target.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => unreachable!("validate_http_origin accepted only HTTP(S)"),
+    };
+    ws_url
+        .set_scheme(desired_scheme)
+        .map_err(|_| TargetError::InvalidTarget {
+            target: target.to_string(),
+            reason: "could not set WebSocket scheme".to_string(),
+        })?;
+    ws_url.set_path("/ws");
+    ws_url.set_query(None);
+    ws_url.set_fragment(None);
+    Ok(ws_url)
+}
+
 /// Return the configured regional WebSocket URL or derive `/ws` from origin.
 pub fn websocket_url_for_region(region: &RegionMetadata) -> Result<Url, TargetError> {
     let origin = normalized_region_origin(region)?;
+    let target_label = format!("region '{}' WebSocket endpoint", region.id);
     let mut ws_url = if region.ws_url.trim().is_empty() {
         origin.clone()
     } else {
         Url::parse(region.ws_url.trim()).map_err(|error| TargetError::InvalidTarget {
-            target: region.ws_url.clone(),
-            reason: format!(
-                "region '{}' has an invalid WebSocket URL: {error}",
-                region.id
-            ),
+            target: target_label.clone(),
+            reason: format!("invalid WebSocket URL: {error}"),
         })?
     };
+    if ws_url.query().is_some() || ws_url.fragment().is_some() {
+        return Err(TargetError::InvalidTarget {
+            target: target_label.clone(),
+            reason: "WebSocket URL cannot contain a query string or fragment".to_string(),
+        });
+    }
 
     let desired_scheme = match ws_url.scheme() {
         "http" => "ws",
         "https" => "wss",
         "ws" => "ws",
         "wss" => "wss",
-        scheme => {
+        _ => {
             return Err(TargetError::InvalidTarget {
-                target: ws_url.to_string(),
-                reason: format!(
-                    "region '{}' WebSocket URL uses unsupported scheme '{scheme}'",
-                    region.id
-                ),
+                target: target_label.clone(),
+                reason: "WebSocket URL uses an unsupported scheme; expected ws or wss".to_string(),
             });
         }
     };
     ws_url
         .set_scheme(desired_scheme)
         .map_err(|_| TargetError::InvalidTarget {
-            target: ws_url.to_string(),
+            target: target_label.clone(),
             reason: "could not set WebSocket scheme".to_string(),
         })?;
     if ws_url.host_str().is_none() || !ws_url.username().is_empty() || ws_url.password().is_some() {
         return Err(TargetError::InvalidTarget {
-            target: ws_url.to_string(),
+            target: target_label.clone(),
             reason: "WebSocket URL must have a host and cannot contain credentials".to_string(),
         });
     }
     if origin.scheme() == "https" && ws_url.scheme() != "wss" {
         return Err(TargetError::InvalidTarget {
-            target: ws_url.to_string(),
+            target: target_label,
             reason: format!(
                 "region '{}' cannot downgrade an HTTPS origin to an insecure WebSocket",
                 region.id
@@ -770,6 +813,57 @@ pub fn websocket_url_for_region(region: &RegionMetadata) -> Result<Url, TargetEr
     ws_url.set_query(None);
     ws_url.set_fragment(None);
     Ok(ws_url)
+}
+
+fn require_and_rewrite_same_origin_regions(
+    regions: &mut [RegionMetadata],
+    requested_target: &Url,
+) -> Result<(), TargetError> {
+    let expected_websocket = websocket_url_for_target(requested_target)?;
+    for region in regions.iter() {
+        let advertised_origin = normalized_region_origin(region)?;
+        if advertised_origin.origin() != requested_target.origin() {
+            return Err(TargetError::InvalidTarget {
+                target: requested_target.to_string(),
+                reason: format!(
+                    "region '{}' advertised a cross-origin HTTP endpoint in same-origin mode",
+                    region.id
+                ),
+            });
+        }
+        let advertised_websocket = websocket_url_for_region(region)?;
+        if advertised_websocket.origin() != expected_websocket.origin() {
+            return Err(TargetError::InvalidTarget {
+                target: requested_target.to_string(),
+                reason: format!(
+                    "region '{}' advertised a cross-origin WebSocket endpoint in same-origin mode",
+                    region.id
+                ),
+            });
+        }
+    }
+    for region in regions {
+        region.origin = requested_target.to_string();
+        region.ws_url = expected_websocket.to_string();
+    }
+    Ok(())
+}
+
+fn normalize_region_endpoints(regions: &mut [RegionMetadata]) -> Result<(), TargetError> {
+    let endpoints = regions
+        .iter()
+        .map(|region| {
+            Ok((
+                normalized_region_origin(region)?,
+                websocket_url_for_region(region)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, TargetError>>()?;
+    for (region, (origin, websocket)) in regions.iter_mut().zip(endpoints) {
+        region.origin = origin.to_string();
+        region.ws_url = websocket.to_string();
+    }
+    Ok(())
 }
 
 /// Select an explicit healthy region, or the lowest-latency healthy region.
@@ -828,11 +922,24 @@ pub fn select_region<'a>(
 }
 
 fn normalized_region_origin(region: &RegionMetadata) -> Result<Url, TargetError> {
-    let origin =
-        normalize_target_url(&region.origin).map_err(|error| TargetError::InvalidTarget {
-            target: region.origin.clone(),
-            reason: format!("region '{}' has an invalid origin: {error}", region.id),
-        })?;
+    let origin = normalize_target_url(&region.origin).map_err(|error| {
+        let reason = match error {
+            TargetError::InvalidTarget { reason, .. } if reason.contains("credentials") => {
+                "HTTP origin cannot contain credentials".to_string()
+            }
+            TargetError::InvalidTarget { reason, .. } if reason.contains("scheme") => {
+                "HTTP origin uses an unsupported scheme; expected http or https".to_string()
+            }
+            TargetError::InvalidTarget { reason, .. } if reason.contains("host") => {
+                "HTTP origin must include a host".to_string()
+            }
+            _ => "invalid HTTP origin".to_string(),
+        };
+        TargetError::InvalidTarget {
+            target: format!("region '{}' HTTP origin", region.id),
+            reason,
+        }
+    })?;
     Ok(origin)
 }
 
@@ -905,6 +1012,49 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    async fn spawn_mock_origin(response: String) -> (Url, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            requests,
+            task,
+        )
+    }
+
+    fn mock_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\n");
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        response
+    }
 
     fn region(id: &str, origin: &str, ws_url: &str) -> RegionMetadata {
         RegionMetadata {
@@ -941,11 +1091,27 @@ mod tests {
     }
 
     #[test]
-    fn maps_public_hosts_to_the_api_origin_but_keeps_local_targets() {
-        let public = normalize_target_url("https://use1.snaketron.io/play").unwrap();
+    fn maps_public_hosts_to_the_api_origin_but_keeps_custom_targets() {
+        for host in [
+            "snaketron.io",
+            "www.snaketron.io",
+            "api.snaketron.io",
+            "use1.snaketron.io",
+            "euw1.snaketron.io",
+            "stg-29938169949-1.snaketron.io",
+        ] {
+            let public = normalize_target_url(&format!("https://{host}/play")).unwrap();
+            assert_eq!(
+                derive_api_origin(&public).unwrap().as_str(),
+                "https://api.snaketron.io/"
+            );
+        }
+
+        let staging =
+            normalize_target_url("https://stg-29938169949-1.snaketron.io/private?token=x").unwrap();
         assert_eq!(
-            derive_api_origin(&public).unwrap().as_str(),
-            "https://api.snaketron.io/"
+            resolve_api_origin(&staging, true).unwrap().as_str(),
+            "https://stg-29938169949-1.snaketron.io/"
         );
 
         let local = normalize_target_url("http://localhost:8080/anything").unwrap();
@@ -956,11 +1122,101 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_mode_validates_then_rewrites_region_endpoints() {
+        let target = normalize_target_url("https://stg-123-1.snaketron.io/").unwrap();
+        let mut regions = vec![region(
+            "use1",
+            "https://stg-123-1.snaketron.io/ignored",
+            "wss://stg-123-1.snaketron.io/ignored",
+        )];
+
+        require_and_rewrite_same_origin_regions(&mut regions, &target).unwrap();
+        assert_eq!(regions[0].origin, "https://stg-123-1.snaketron.io/");
+        assert_eq!(regions[0].ws_url, "wss://stg-123-1.snaketron.io/ws");
+
+        let mut escaped = vec![region(
+            "use1",
+            "https://use1.snaketron.io",
+            "wss://use1.snaketron.io/ws",
+        )];
+        assert!(require_and_rewrite_same_origin_regions(&mut escaped, &target).is_err());
+    }
+
+    #[tokio::test]
+    async fn strict_client_does_not_follow_a_cross_origin_redirect() {
+        let (second_origin, second_requests, second_task) = spawn_mock_origin(mock_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            "[]",
+        ))
+        .await;
+        let location = second_origin.join("api/regions").unwrap().to_string();
+        let (target, target_requests, target_task) =
+            spawn_mock_origin(mock_response("302 Found", &[("Location", &location)], "")).await;
+
+        let resolver = TargetResolver::new(Duration::from_secs(2)).unwrap();
+        let result = resolver
+            .preflight(&TargetOptions::new(target.as_str()).requiring_same_origin())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TargetError::UnexpectedStatus {
+                operation: "region discovery",
+                status: StatusCode::FOUND,
+                ..
+            })
+        ));
+        assert_eq!(target_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(second_requests.load(Ordering::SeqCst), 0);
+        target_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn same_origin_mode_rejects_advertised_cross_origin_before_probing_it() {
+        let (second_origin, second_requests, second_task) = spawn_mock_origin(mock_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            r#"{"status":"ok"}"#,
+        ))
+        .await;
+        let regions = serde_json::to_string(&vec![RegionMetadata {
+            id: "use1".to_string(),
+            name: "USE1".to_string(),
+            origin: second_origin.to_string(),
+            ws_url: websocket_url_for_target(&second_origin)
+                .unwrap()
+                .to_string(),
+        }])
+        .unwrap();
+        let (target, target_requests, target_task) = spawn_mock_origin(mock_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            &regions,
+        ))
+        .await;
+
+        let resolver = TargetResolver::new(Duration::from_secs(2)).unwrap();
+        let error = resolver
+            .preflight(&TargetOptions::new(target.as_str()).requiring_same_origin())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cross-origin HTTP endpoint"));
+        assert_eq!(target_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(second_requests.load(Ordering::SeqCst), 0);
+        target_task.abort();
+        second_task.abort();
+    }
+
+    #[test]
     fn uses_or_derives_a_secure_websocket_url() {
         let configured = region(
             "use1",
             "https://use1.snaketron.io",
-            "wss://games.snaketron.io/ignored?token=none",
+            "wss://games.snaketron.io/ignored",
         );
         assert_eq!(
             websocket_url_for_region(&configured).unwrap().as_str(),
@@ -971,6 +1227,50 @@ mod tests {
         assert_eq!(
             websocket_url_for_region(&derived).unwrap().as_str(),
             "ws://localhost:8080/ws"
+        );
+
+        let target = normalize_target_url("http://localhost:8080/").unwrap();
+        assert_eq!(
+            websocket_url_for_target(&target).unwrap().as_str(),
+            "ws://localhost:8080/ws"
+        );
+    }
+
+    #[test]
+    fn rejects_websocket_query_secrets_without_echoing_them() {
+        let configured = region(
+            "use1",
+            "https://use1.snaketron.io",
+            "wss://use1.snaketron.io/ws?token=do-not-log#also-secret",
+        );
+        let error = websocket_url_for_region(&configured)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("query string or fragment"));
+        assert!(!error.contains("do-not-log"));
+        assert!(!error.contains("also-secret"));
+    }
+
+    #[test]
+    fn region_http_origin_errors_and_normalization_do_not_leak_metadata() {
+        let invalid = region(
+            "use1",
+            "https://user:credential-secret@example.test/?token=query-secret",
+            "",
+        );
+        let error = normalized_region_origin(&invalid).unwrap_err().to_string();
+        assert!(error.contains("region 'use1' HTTP origin"));
+        assert!(!error.contains("credential-secret"));
+        assert!(!error.contains("query-secret"));
+
+        let query_only = region(
+            "use1",
+            "https://example.test/private?token=query-secret#fragment-secret",
+            "",
+        );
+        assert_eq!(
+            normalized_region_origin(&query_only).unwrap().as_str(),
+            "https://example.test/"
         );
     }
 

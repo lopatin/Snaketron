@@ -7,12 +7,256 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-local}"
 staging_redis_control_url=""
 staging_traefik_metrics_control_url=""
+# The staging EXIT trap runs after Bash has unwound run_staging_suite on a
+# set -e failure. Keep the state needed by that trap at script scope; function
+# locals are no longer available by the time an EXIT trap runs.
+report_dir=""
+scaling_resource=""
+original_desired=""
+scaling_state=""
+load_pid=""
+idle_population_pid=""
+lobby_population_pid=""
+matchmaking_population_pid=""
+traefik_monitor_pid=""
+traefik_monitor_dir=""
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Required command not found: $1" >&2
     exit 1
   }
+}
+
+sanitize_task_definition_evidence() {
+  jq '
+    {
+      taskDefinition: {
+        taskDefinitionArn: .taskDefinition.taskDefinitionArn,
+        family: .taskDefinition.family,
+        revision: .taskDefinition.revision,
+        status: .taskDefinition.status,
+        networkMode: .taskDefinition.networkMode,
+        requiresCompatibilities: .taskDefinition.requiresCompatibilities,
+        cpu: .taskDefinition.cpu,
+        memory: .taskDefinition.memory,
+        runtimePlatform: .taskDefinition.runtimePlatform,
+        ephemeralStorage: .taskDefinition.ephemeralStorage,
+        containerDefinitions: [
+          .taskDefinition.containerDefinitions[]
+          | {
+              name,
+              image,
+              essential,
+              linuxParameters: (
+                if .linuxParameters == null
+                then null
+                else {initProcessEnabled: .linuxParameters.initProcessEnabled}
+                end
+              )
+            }
+        ]
+      }
+    }
+  '
+}
+
+assert_task_definition_evidence_sanitized() {
+  jq -e '
+    (.taskDefinition.taskDefinitionArn | type == "string" and length > 0)
+    and (.taskDefinition.containerDefinitions | type == "array" and length > 0)
+    and all(.taskDefinition.containerDefinitions[];
+      (.name | type == "string" and length > 0)
+      and (.image | type == "string" and length > 0)
+      and (.essential | type == "boolean")
+      and ([keys[]
+        | select(
+            . != "name"
+            and . != "image"
+            and . != "essential"
+            and . != "linuxParameters")
+      ] | length == 0)
+      and (
+        .linuxParameters == null
+        or ([.linuxParameters | keys[]
+          | select(. != "initProcessEnabled")]
+          | length == 0)
+      )
+      and (has("environment") | not)
+      and (has("environmentFiles") | not)
+      and (has("secrets") | not)
+      and (has("repositoryCredentials") | not)
+      and (has("logConfiguration") | not)
+      and (has("dockerLabels") | not)
+      and (has("healthCheck") | not)
+      and (has("command") | not)
+      and (has("entryPoint") | not))
+  ' "$@"
+}
+
+select_verified_task_service_name() {
+  local environment="$1"
+  local region="$2"
+  local aws_region="$3"
+  local origin="$4"
+  local redis_url="$5"
+  local router_service_key="$6"
+  jq -er \
+    --arg environment "$environment" \
+    --arg region "$region" \
+    --arg aws_region "$aws_region" \
+    --arg origin "$origin" \
+    --arg redis_url "$redis_url" \
+    --arg router_service_key "$router_service_key" '
+      ([.taskDefinition.containerDefinitions[]
+          | select(.name == "snaketron-server")
+          | .environment[]
+          | {key: .name, value: .value}
+        ] | from_entries) as $server_environment
+      | select(
+          $server_environment.SNAKETRON_ENVIRONMENT == $environment
+          and $server_environment.SNAKETRON_REGION == $region
+          and $server_environment.SNAKETRON_AWS_REGION == $aws_region
+          and $server_environment.SNAKETRON_ORIGIN == $origin
+          and $server_environment.SNAKETRON_REDIS_URL == $redis_url
+          and $server_environment.AWS_REGION == "us-east-1"
+          and $server_environment.DYNAMODB_TABLE_PREFIX == ("snaketron-" + $environment)
+          and $server_environment.DYNAMODB_ENDPOINT == "")
+      | .taskDefinition.containerDefinitions[]
+      | select(.name == "snaketron-server")
+      | .dockerLabels[$router_service_key]
+      | select(type == "string" and length > 0)
+    '
+}
+
+test_task_definition_evidence_sanitizer() {
+  local sensitive="fixture-sensitive-value-do-not-persist"
+  local sanitized
+  sanitized="$(
+    jq -n --arg sensitive "$sensitive" '
+      {
+        taskDefinition: {
+          taskDefinitionArn: "arn:aws:ecs:us-east-1:111111111111:task-definition/fixture:7",
+          family: "fixture",
+          revision: 7,
+          cpu: "512",
+          memory: "1024",
+          containerDefinitions: [
+            {
+              name: "server",
+              image: "111111111111.dkr.ecr.us-east-1.amazonaws.com/fixture:commit",
+              essential: true,
+              linuxParameters: {initProcessEnabled: true},
+              environment: [{name: "SECRET", value: $sensitive}],
+              environmentFiles: [{type: "s3", value: $sensitive}],
+              secrets: [{name: "SECRET", valueFrom: $sensitive}],
+              repositoryCredentials: {credentialsParameter: $sensitive},
+              dockerLabels: {"unrelated.label": $sensitive},
+              healthCheck: {command: ["CMD-SHELL", $sensitive]},
+              logConfiguration: {
+                options: {token: $sensitive},
+                secretOptions: [{name: "token", valueFrom: $sensitive}]
+              },
+              command: [$sensitive],
+              entryPoint: [$sensitive]
+            },
+            {name: "sidecar", image: "fixture-sidecar:latest", essential: false}
+          ]
+        }
+      }
+    ' | sanitize_task_definition_evidence
+  )" || {
+    echo "Task-definition evidence sanitizer could not process its fixture" >&2
+    return 1
+  }
+
+  if [[ "$sanitized" == *"$sensitive"* ]]; then
+    echo "Task-definition evidence retained forbidden fixture data" >&2
+    return 1
+  fi
+
+  if ! printf '%s\n' "$sanitized" \
+    | assert_task_definition_evidence_sanitized >/dev/null; then
+    echo "Task-definition evidence sanitizer produced an unsafe shape" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$sanitized" \
+    | jq -e '
+        .taskDefinition.family == "fixture"
+        and .taskDefinition.revision == 7
+        and .taskDefinition.cpu == "512"
+        and .taskDefinition.memory == "1024"
+        and (.taskDefinition.containerDefinitions | length) == 2
+        and .taskDefinition.containerDefinitions[0].essential == true
+        and .taskDefinition.containerDefinitions[0].linuxParameters.initProcessEnabled == true
+        and .taskDefinition.containerDefinitions[1].essential == false
+      ' >/dev/null; then
+    echo "Task-definition evidence sanitizer removed required structural fields" >&2
+    return 1
+  fi
+}
+
+test_live_task_definition_gate() {
+  local router_service_key="traefik.http.routers.snaketron-dev.service"
+  local fixture
+  fixture="$(jq -n --arg router_service_key "$router_service_key" '
+    {
+      taskDefinition: {
+        containerDefinitions: [{
+          name: "snaketron-server",
+          environment: [
+            {name: "SNAKETRON_ENVIRONMENT", value: "dev"},
+            {name: "SNAKETRON_REGION", value: "use1"},
+            {name: "SNAKETRON_AWS_REGION", value: "us-east-1"},
+            {name: "SNAKETRON_ORIGIN", value: "https://stg-123-1.snaketron.io"},
+            {name: "SNAKETRON_REDIS_URL", value: "redis://fixture.cache.amazonaws.com:6379/"},
+            {name: "AWS_REGION", value: "us-east-1"},
+            {name: "DYNAMODB_TABLE_PREFIX", value: "snaketron-dev"},
+            {name: "DYNAMODB_ENDPOINT", value: ""}
+          ],
+          dockerLabels: {($router_service_key): "snaketron-dev-use1"}
+        }]
+      }
+    }
+  ')"
+
+  local service_name
+  service_name="$(printf '%s\n' "$fixture" \
+    | select_verified_task_service_name \
+      dev use1 us-east-1 \
+      https://stg-123-1.snaketron.io \
+      redis://fixture.cache.amazonaws.com:6379/ \
+      "$router_service_key")" || {
+    echo "Live task-definition gate rejected its safe fixture" >&2
+    return 1
+  }
+  if [[ "$service_name" != "snaketron-dev-use1" ]]; then
+    echo "Live task-definition gate returned the wrong Traefik service" >&2
+    return 1
+  fi
+
+  local mutation
+  for mutation in AWS_REGION DYNAMODB_TABLE_PREFIX DYNAMODB_ENDPOINT; do
+    local unsafe
+    unsafe="$(printf '%s\n' "$fixture" | jq --arg mutation "$mutation" '
+      .taskDefinition.containerDefinitions[0].environment |= map(
+        if .name == $mutation then .value = "unsafe" else . end)
+    ')"
+    if printf '%s\n' "$unsafe" \
+      | select_verified_task_service_name \
+        dev use1 us-east-1 \
+        https://stg-123-1.snaketron.io \
+        redis://fixture.cache.amazonaws.com:6379/ \
+        "$router_service_key" >/dev/null 2>&1; then
+      echo "Live task-definition gate accepted unsafe $mutation" >&2
+      return 1
+    fi
+  done
+}
+
+test_evidence_safety_helpers() {
+  test_task_definition_evidence_sanitizer
+  test_live_task_definition_gate
 }
 
 run_offline_cdk_synth() {
@@ -68,6 +312,8 @@ run_local_suite() {
   require_command cargo
   require_command wasm-pack
   require_command curl
+  require_command jq
+  test_evidence_safety_helpers
   if command -v redis-cli >/dev/null 2>&1; then
     redis-cli -n 1 PING | grep -qx PONG || {
       echo "Redis database 1 is required at 127.0.0.1:6379" >&2
@@ -342,7 +588,13 @@ verify_staging_identity() {
 
   aws ecs describe-task-definition \
     --region "$SNAKETRON_AWS_REGION" \
-    --task-definition "$staging_task_definition_arn" >"$identity_dir/task-definition.json"
+    --task-definition "$staging_task_definition_arn" \
+    | sanitize_task_definition_evidence >"$identity_dir/task-definition.json"
+  assert_task_definition_evidence_sanitized \
+    "$identity_dir/task-definition.json" >/dev/null || {
+      echo "The saved task-definition evidence retained sensitive fields or lost its required shape" >&2
+      return 1
+    }
   staging_image_uri="$(jq -er '
     .taskDefinition.containerDefinitions[]
     | select(.name == "snaketron-server")
@@ -437,38 +689,26 @@ verify_staging_identity() {
   fi
   local target_origin
   target_origin="$(printf '%s' "$SNAKETRON_STAGING_TARGET" | sed 's:/*$::')"
-  jq -e \
-    --arg environment "$SNAKETRON_STAGING_ENVIRONMENT" \
-    --arg region "$SNAKETRON_REGION_CODE" \
-    --arg aws_region "$SNAKETRON_AWS_REGION" \
-    --arg origin "$target_origin" \
-    --arg redis_url "$expected_redis_url" '
-      [.taskDefinition.containerDefinitions[]
-        | select(.name == "snaketron-server")
-        | .environment[]
-        | {key: .name, value: .value}
-      ] | from_entries
-      | .SNAKETRON_ENVIRONMENT == $environment
-        and .SNAKETRON_REGION == $region
-        and .SNAKETRON_AWS_REGION == $aws_region
-        and .SNAKETRON_ORIGIN == $origin
-        and .SNAKETRON_REDIS_URL == $redis_url
-    ' "$identity_dir/task-definition.json" >/dev/null || {
-      echo "The ECS task definition does not point at the confirmed environment, region, origin, and Valkey primary" >&2
-      return 1
-    }
   local router_service_key="traefik.http.routers.snaketron-${SNAKETRON_STAGING_ENVIRONMENT}.service"
   local task_service_name
-  task_service_name="$(jq -er \
-    --arg key "$router_service_key" '
-      .taskDefinition.containerDefinitions[]
-      | select(.name == "snaketron-server")
-      | .dockerLabels[$key]
-      | select(type == "string" and length > 0)
-    ' "$identity_dir/task-definition.json")" || {
-      echo "The verified task definition lacks its expected Traefik router service label" >&2
-      return 1
-    }
+  # Verify the live immutable task-definition revision without writing its raw
+  # environment or arbitrary labels into the evidence tree. The selected
+  # routing label is constrained below and recorded in verified-deployment.json.
+  task_service_name="$(
+    aws ecs describe-task-definition \
+      --region "$SNAKETRON_AWS_REGION" \
+      --task-definition "$staging_task_definition_arn" \
+    | select_verified_task_service_name \
+      "$SNAKETRON_STAGING_ENVIRONMENT" \
+      "$SNAKETRON_REGION_CODE" \
+      "$SNAKETRON_AWS_REGION" \
+      "$target_origin" \
+      "$expected_redis_url" \
+      "$router_service_key"
+  )" || {
+    echo "The ECS task definition does not match the confirmed environment, DynamoDB/Valkey targets, and Traefik route" >&2
+    return 1
+  }
   if [[ ! "$task_service_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "The task definition's Traefik service name is malformed" >&2
     return 1
@@ -543,14 +783,12 @@ verify_staging_identity() {
     --arg runner_submodule_commit "$runner_submodule_commit" \
     --arg expected_submodule_commit "$expected_submodule_commit" \
     --arg valkey_arn "$staging_valkey_arn" \
+    --arg valkey_primary_host "$staging_valkey_host" \
+    --argjson valkey_primary_port "$staging_valkey_port" \
     --arg traefik_instance_id "$SNAKETRON_TRAEFIK_INSTANCE_ID" \
     --arg traefik_private_ip "$staging_traefik_private_ip" \
     --arg traefik_service_label "$staging_traefik_service_label" \
     --arg target_origin "$target_origin" \
-    --arg redis_url "$SNAKETRON_STAGING_REDIS_URL" \
-    --arg redis_control_url "$staging_redis_control_url" \
-    --arg traefik_metrics_url "$SNAKETRON_TRAEFIK_METRICS_URL" \
-    --arg traefik_metrics_control_url "$staging_traefik_metrics_control_url" \
     --arg control_tunnel_instance_id "${SNAKETRON_CONTROL_TUNNEL_INSTANCE_ID:-}" \
     '{
       account: $account,
@@ -570,14 +808,14 @@ verify_staging_identity() {
       runner_submodule_commit: $runner_submodule_commit,
       expected_submodule_commit: $expected_submodule_commit,
       valkey_arn: $valkey_arn,
+      valkey_primary: {
+        host: $valkey_primary_host,
+        port: $valkey_primary_port
+      },
       traefik_instance_id: $traefik_instance_id,
       traefik_private_ip: $traefik_private_ip,
       traefik_service_label: $traefik_service_label,
       target_origin: $target_origin,
-      redis_url: $redis_url,
-      redis_control_url: $redis_control_url,
-      traefik_metrics_url: $traefik_metrics_url,
-      traefik_metrics_control_url: $traefik_metrics_control_url,
       control_tunnel_instance_id: (
         if $control_tunnel_instance_id == "" then null
         else $control_tunnel_instance_id
@@ -744,9 +982,10 @@ start_traefik_monitor() {
 }
 
 stop_traefik_monitor() {
-  if [[ -n "$traefik_monitor_pid" ]] && kill -0 "$traefik_monitor_pid" 2>/dev/null; then
-    kill -TERM "$traefik_monitor_pid" 2>/dev/null || true
-    wait "$traefik_monitor_pid" 2>/dev/null || true
+  local monitor_pid="${traefik_monitor_pid:-}"
+  if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+    kill -TERM "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
   fi
   traefik_monitor_pid=""
 }
@@ -1783,8 +2022,9 @@ run_staging_suite() {
   require_staging_environment
   configure_staging_control_urls
 
-  local run_id="autoscaling-${certification_mode}-$(date -u +%Y%m%dT%H%M%SZ)"
-  local report_dir="$repo_dir/test-results/$run_id"
+  local run_id
+  run_id="autoscaling-${certification_mode}-$(date -u +%Y%m%dT%H%M%SZ)"
+  report_dir="$repo_dir/test-results/$run_id"
   mkdir -p "$report_dir"
 
   # This is the final read-only gate before any load or cloud mutation. It
@@ -1808,7 +2048,7 @@ run_staging_suite() {
   local staging_traefik_service_label=""
   local cluster_name="${SNAKETRON_ECS_CLUSTER##*/}"
   local service_name="${SNAKETRON_ECS_SERVICE##*/}"
-  local scaling_resource="service/$cluster_name/$service_name"
+  scaling_resource="service/$cluster_name/$service_name"
   verify_staging_identity "$report_dir"
   verify_scaling_policies "$report_dir"
   if [[ "$crash_mode" == true ]]; then
@@ -1827,7 +2067,6 @@ run_staging_suite() {
       }
   fi
 
-  local original_desired
   original_desired="$(aws ecs describe-services \
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
@@ -1839,7 +2078,6 @@ run_staging_suite() {
     exit 1
   fi
 
-  local scaling_state
   scaling_state="$(aws application-autoscaling describe-scalable-targets \
     --region "$SNAKETRON_AWS_REGION" \
     --service-namespace ecs \
@@ -1852,12 +2090,12 @@ run_staging_suite() {
     exit 1
   fi
 
-  local load_pid=""
-  local idle_population_pid=""
-  local lobby_population_pid=""
-  local matchmaking_population_pid=""
-  local traefik_monitor_pid=""
-  local traefik_monitor_dir=""
+  load_pid=""
+  idle_population_pid=""
+  lobby_population_pid=""
+  matchmaking_population_pid=""
+  traefik_monitor_pid=""
+  traefik_monitor_dir=""
 
   set_scaling_suspended() {
     local value="$1"
@@ -2014,6 +2252,7 @@ run_staging_suite() {
     "$loadtest_runner"
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
+    --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
     --stages "272@$load_stage_duration" \
@@ -2160,6 +2399,7 @@ run_staging_suite() {
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
+    --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --population idle \
     --mode duel \
@@ -2175,6 +2415,7 @@ run_staging_suite() {
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
+    --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --population lobby \
     --mode duel \
@@ -2190,6 +2431,7 @@ run_staging_suite() {
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
+    --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --population matchmaking \
     --mode 2v2 \
@@ -2677,8 +2919,13 @@ case "$mode" in
   --staging-crash)
     run_staging_suite crash
     ;;
+  --test-evidence-sanitizer)
+    require_command jq
+    test_evidence_safety_helpers
+    echo "Evidence safety helper tests passed"
+    ;;
   *)
-    echo "Usage: $0 [local|--staging|--staging-crash]" >&2
+    echo "Usage: $0 [local|--staging|--staging-crash|--test-evidence-sanitizer]" >&2
     exit 2
     ;;
 esac
