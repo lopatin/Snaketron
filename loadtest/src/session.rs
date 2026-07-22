@@ -3831,30 +3831,38 @@ impl LiveSession {
             self.last_lobby_state = Some(state.clone());
         }
         match message {
-            WSMessage::GameEvent(event) => match &event.event {
-                GameEvent::CommandScheduledV2 { command_id, .. }
-                    if command_id.user_id == self.user_id
-                        && command_id.client_game_session_id == self.client_game_session_id =>
-                {
-                    if self.pending_commands.remove(&command_id.sequence).is_some() {
-                        let received_at_second = unix_time_ms() / 1_000;
-                        let total = self
-                            .record
-                            .metrics
-                            .scheduled_command_counts_by_unix_second
-                            .entry(received_at_second)
-                            .or_default();
-                        *total = total.saturating_add(1);
+            WSMessage::GameEvent(event) => {
+                clear_pending_after_terminal_event(
+                    &mut self.pending_commands,
+                    self.record.game_id,
+                    event.game_id,
+                    &event.event,
+                );
+                match &event.event {
+                    GameEvent::CommandScheduledV2 { command_id, .. }
+                        if command_id.user_id == self.user_id
+                            && command_id.client_game_session_id == self.client_game_session_id =>
+                    {
+                        if self.pending_commands.remove(&command_id.sequence).is_some() {
+                            let received_at_second = unix_time_ms() / 1_000;
+                            let total = self
+                                .record
+                                .metrics
+                                .scheduled_command_counts_by_unix_second
+                                .entry(received_at_second)
+                                .or_default();
+                            *total = total.saturating_add(1);
+                        }
                     }
+                    GameEvent::CommandRejected { command_id, .. }
+                        if command_id.user_id == self.user_id
+                            && command_id.client_game_session_id == self.client_game_session_id =>
+                    {
+                        self.pending_commands.remove(&command_id.sequence);
+                    }
+                    _ => {}
                 }
-                GameEvent::CommandRejected { command_id, .. }
-                    if command_id.user_id == self.user_id
-                        && command_id.client_game_session_id == self.client_game_session_id =>
-                {
-                    self.pending_commands.remove(&command_id.sequence);
-                }
-                _ => {}
-            },
+            }
             WSMessage::CommandOutcomes {
                 game_id: _,
                 client_game_session_id,
@@ -4096,6 +4104,24 @@ impl LiveSession {
             );
         }
         self.record
+    }
+}
+
+fn clear_pending_after_terminal_event<T>(
+    pending_commands: &mut BTreeMap<u64, T>,
+    current_game_id: Option<u32>,
+    event_game_id: u32,
+    event: &GameEvent,
+) {
+    let status = match event {
+        GameEvent::Snapshot { game_state } => &game_state.status,
+        GameEvent::StatusUpdated { status } => status,
+        _ => return,
+    };
+    if current_game_id == Some(event_game_id) && matches!(status, GameStatus::Complete { .. }) {
+        // Terminal authoritative state makes every unresolved command for this
+        // game a definitive no-op, including after reconnect snapshot replay.
+        pending_commands.clear();
     }
 }
 
@@ -4447,6 +4473,42 @@ mod tests {
                 .expect("test player should fit in duel snapshot");
         }
         game_state
+    }
+
+    #[test]
+    fn only_current_game_terminal_events_clear_pending_commands() {
+        let mut pending = BTreeMap::from([(1, ()), (2, ())]);
+        let nonterminal = GameEvent::Snapshot {
+            game_state: duel_snapshot(&[7, 8]),
+        };
+        clear_pending_after_terminal_event(&mut pending, Some(42), 42, &nonterminal);
+        assert_eq!(pending.len(), 2);
+
+        let terminal_status = GameEvent::StatusUpdated {
+            status: GameStatus::Complete {
+                winning_snake_id: None,
+            },
+        };
+        clear_pending_after_terminal_event(&mut pending, Some(42), 99, &terminal_status);
+        assert_eq!(pending.len(), 2);
+
+        clear_pending_after_terminal_event(&mut pending, Some(42), 42, &terminal_status);
+        assert!(pending.is_empty());
+
+        pending.insert(3, ());
+        let mut terminal_snapshot = duel_snapshot(&[7, 8]);
+        terminal_snapshot.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        clear_pending_after_terminal_event(
+            &mut pending,
+            Some(42),
+            42,
+            &GameEvent::Snapshot {
+                game_state: terminal_snapshot,
+            },
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

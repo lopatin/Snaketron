@@ -163,25 +163,27 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 
 ## Required staging evidence
 
-The minimum certification load envelope is 256 concurrent authenticated game
-sessions, 128 concurrent duel games, four new sessions per second, and the
-`every-tick` command profile over ten partitions. The runner targets 272 game
-sessions / 136 duels so ordinary four-session game churn cannot turn a brief
-peak into false five-minute evidence. During planned scale-in it adds 10 idle,
-10 lobby, and three deliberately unmatched 2v2 probes, so the measured service
-load is at least 295 authenticated sockets plus short dual-socket handoff
-overlap. These companion probes and the churn buffer are explicit certification
-traffic, not a relaxation of the 256-session/128-game minimum. The staging
-runner requires that minimum at every sampled second for five minutes and
-during the measured scale-in. It also requires a per-second command-write floor
-consistent with the `every-tick` profile, no
-active-socket hard reconnect,
-zero measured usable-session gap for every observed planned handoff, at least
-one nonterminal game handoff with its command-outcome barrier, and the complete
-`1 -> 10 -> 1` ownership staircase. During the measured `10 -> 1` window it
-also requires uninterrupted four-session launch waves from the load generator's
-one-second monotonic ticker, no failed admission, and initial WebSocket
-authentication within ten seconds.
+The minimum capacity envelope is 256 concurrent authenticated game sessions,
+128 concurrent duel games, four new sessions per second, and the `every-tick`
+command profile over ten partitions. Capacity Run B targets 272 game sessions /
+136 duels so ordinary churn cannot turn a brief peak into false five-minute
+evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
+settled in membership, assignment, and partition leases. It never runs on the
+one-task baseline.
+
+Continuity Run A is a separate fixed 64-session `every-tick` run. It must first
+cause CPU or memory target tracking to add capacity; if it does not, the run
+fails rather than increasing the initial task to the capacity envelope. Policy
+writes are then suspended while Run A proves the direct `1 -> 10 -> 1`
+ownership staircase. At ten tasks the runner adds 10 idle, 10 lobby, and three
+deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
+starts a 208-session idle ramp at four sessions per second. This keeps new-user
+admission continuous through the 45-second drain deadline while leaving only
+64 command-bearing game sockets on the final task. Run A must prove no active
+socket hard reconnect, zero measured usable-session gap, terminal command
+outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
+nine partition moves in each direction. No game completion is awaited before
+either desired-count change.
 
 `--staging` certifies the planned path and deliberately injects no crash.
 `--staging-crash` is a separate invocation with no planned-handoff requirement.
@@ -193,8 +195,11 @@ command/checkpoint/fencing kill boundaries; the one external task kill proves
 their composition with ECS membership, replacement, ingress reconnect, and the
 naturally occurring partition backlog.
 Crash mode verifies ECS Exec on the tagged service and every selected task,
-suspends scaling policy writes, forces ten healthy tasks, and waits for a
-thirty-second stable traffic window. It selects an owned partition only when it
+suspends scaling policy writes, and forces and verifies ten healthy/ready tasks
+before launching the 272-session load. It then requires at least 256 public
+WebSockets and 128 authoritative active games for thirty consecutive seconds;
+the final load report is the authority for authenticated session count. It
+selects an owned partition only when it
 has both active games and pending work, maps that owner to one exact task ARN,
 then performs one non-retried ECS Exec command that finds exactly one non-PID-1
 `server` process and sends it SIGKILL. The 200 ms control-plane observer requires
@@ -305,7 +310,7 @@ order, uploads both evidence directories, and always destroys and verifies the
 absence of the ephemeral stacks afterward. It does not preserve or transition
 state from a previous deployment.
 
-At settled task counts `1`, `10`, and `1`, the runner records membership, the
+At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
 pending completions, and active-game counts. It fails unless leases match
 desired owners, tokens are unique, owners are balanced, assignment versions
@@ -317,18 +322,24 @@ writes `scale-in-window.json`; report schema 9 includes each session's launch
 wave, start time, and bounded initial admission-ready duration so the admission
 assertion is phase-specific.
 
-Scaling evidence has three deliberately distinct parts:
+Scaling evidence has four deliberately distinct parts:
 
-1. With policy writes enabled, load must cause an AWS-observed desired/running
-   count above one and a successful target-tracking scaling activity. This is
-   the automatic scale-out proof.
+1. With policy writes enabled, fixed Run A load must cause an AWS-observed
+   desired/running count above one and a successful target-tracking scaling
+   activity. The runner fails immediately if Run A exits first. This is the
+   automatic scale-out proof.
 2. Policy writes are temporarily suspended only for the deterministic forced
-   1-to-10-to-1 ownership staircase. The settled control-plane snapshots prove
-   that leg's exact ownership behavior.
-3. The runner establishes a fresh ten-task baseline while load is still active,
-   waits for the finite load to end, re-enables target tracking, and requires an
-   AWS-observed automatic scale-in to one plus a successful target-tracking
-   activity. This scale-in observation is separate from the forced staircase.
+   1-to-10-to-1 ownership staircase under Run A and its companion/admission
+   probes. The settled control-plane snapshots prove that leg's exact ownership
+   behavior without placing capacity load on one task.
+3. With policy writes still suspended and all Run A clients gone, the runner
+   establishes ten verified tasks and runs the separate 272-session Run B. The
+   per-second 256-session/128-duel and command gates cover five continuous
+   minutes, and exact task identities prove socket/event distribution.
+4. Only after Run B has ended does the runner re-enable target tracking and
+   require an AWS-observed automatic scale-in from ten to one plus a successful
+   target-tracking activity. This observation is separate from the forced
+   staircase.
 
 Report schema 9 records coordinator-observed, server-confirmed peak
 authentication concurrency, fully joined active-game concurrency, lifecycle
@@ -343,13 +354,13 @@ then resent with the same stable identity. Certification instead requires every
 session to finish with zero pending commands; first-seen terminal outcomes and
 the deterministic deduplication tests enforce one logical result despite a
 physical resend.
-The
-base game gate requires at least 256 authenticated sessions and 128 simultaneous
-duel games throughout the five-minute interval, in addition to phase-specific
-scale-in admission checks. Separate population reports require every idle, lobby, and
-queued probe to reach its intended state before scale-in and remain alive until
-that transition finishes; their exact task identities must collectively cover
-the settled ten-task membership.
+The Run B gate requires at least 256 authenticated sessions and 128 simultaneous
+duel games throughout the five-minute interval. Separate Run A population
+reports require every idle, lobby, and queued probe to reach its intended state
+before scale-in and remain alive until that transition finishes. The 208-session
+idle admission report proves uninterrupted four-session waves and ten-second
+p99 readiness through the scale-in window. Exact task identities must cover the
+settled ten-task membership in both the continuity and capacity phases.
 
 The runner derives the Traefik service label from the verified ECS task
 definition, continuously scrapes its service-server-up gauge, and fails on
@@ -361,5 +372,6 @@ metric series. It also saves and gates a Container Insights Logs Insights result
 with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, unexpected Valkey eviction,
-insufficient Valkey memory headroom, or failure to corroborate the 295-socket
-measured load (272 game sessions plus 23 mixed-population probes).
+insufficient Valkey memory headroom, or failure to corroborate the measured
+phase envelopes (at least 295 simultaneous sockets during transition/admission
+and 272 game sessions during capacity).

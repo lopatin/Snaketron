@@ -422,9 +422,9 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - CPU target: 70%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
-2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions.
+2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses a fixed one-task-safe continuity cohort; it must not force the complete capacity envelope onto one task.
 3. The autoscaler must never select zero desired tasks.
-4. Validate `1 -> 10 -> 1` with active games, lobbies, matchmaking, idle sockets, and continuously submitted commands.
+4. Validate `1 -> 10 -> 1` with active games, lobbies, matchmaking, idle sockets, continuously submitted commands, and four new admissions per second. Separately hold the 256-session/128-duel capacity envelope only after ten tasks are healthy and ready.
 5. No custom game-specific autoscaling metric is added in this phase.
 6. Every task currently replicates every partition, so task-local replica memory may not fall on scale-out. Scaling tests must prove memory behavior is acceptable; otherwise the replication model or memory policy needs a separate decision.
 7. Existing WebSockets do not redistribute on scale-up, so service-average CPU can hide a hot gateway task. Record per-task CPU, memory, connections, and event-forwarding load during validation.
@@ -543,7 +543,7 @@ Timing is an operational objective, never a substitute for fencing or durability
 
 | Measure | Initial release target |
 | --- | --- |
-| Planned partition handoff | Under the supported envelope, continuously submitted commands all reach a terminal outcome, deterministic fingerprints match, and the three-second stale overlay never activates. |
+| Planned partition handoff | Under the transition envelope, continuously submitted commands all reach a terminal outcome, deterministic fingerprints match, and the three-second stale overlay never activates. |
 | Planned WebSocket drain | Zero measured interval without either old or replacement authenticated, game-ready socket for supported clients; completion within the 20-second client handoff window and 45-second application deadline. |
 | Crash takeover with another ready task and healthy Valkey | p99 first fresh authoritative output within five seconds. |
 | Hard gateway crash with survivor and healthy ingress | Automatic authenticated game resume p99 within ten seconds; uninterrupted transport is not promised. |
@@ -554,7 +554,7 @@ Timing is an operational objective, never a substitute for fencing or durability
 | Planned new-user availability | p99 reaches a ready backend within ten seconds and sees no terminal connection error. Transient internal `503` retries are allowed and measured. |
 | Correctness invariants | Zero violations across deterministic, chaos, and load suites. |
 
-The supported staging envelope is 256 authenticated sessions, 128 concurrent duel games, four new sessions per second, and the `every-tick` command profile across ten partitions, held at target for at least five minutes. The five- and ten-second recovery objectives must pass inside that envelope. Timing targets may be changed only by an explicit product decision; correctness properties may not be relaxed.
+The supported staging envelope is 256 authenticated sessions, 128 concurrent duel games, four new sessions per second, and the `every-tick` command profile across ten partitions, held at target for at least five minutes on ten verified tasks. The planned `1 -> 10 -> 1` transition uses a separate one-task-safe continuity cohort, including four new low-CPU admissions per second during scale-in; this phase separation is not a reduction of the capacity envelope. The five- and ten-second recovery objectives must pass inside the full envelope. Timing targets may be changed only by an explicit product decision; correctness properties may not be relaxed.
 
 ## 14. Observability and alerts
 
@@ -593,8 +593,8 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 
 | Test | Pass criteria |
 | --- | --- |
-| Scale `1 -> 10` while games receive commands | Exactly nine partitions move, owner counts become one each, no active WebSocket hard-reconnect occurs, every submitted command reaches a terminal outcome, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
-| Scale `10 -> 1` with games, lobbies, matchmaking, and idle clients distributed across the service | Exactly nine partitions move; every observed drain handoff has zero usable-session gap and one command owner; no active socket hard-reconnects; four newly started sessions per second each reach a ready backend, with p99 initial WebSocket authentication within ten seconds and no terminal error; no game completion is awaited. |
+| Scale `1 -> 10` under the fixed one-task-safe continuity load while games receive commands | Exactly nine partitions move, owner counts become one each, no active WebSocket hard-reconnect occurs, every submitted command reaches a terminal outcome, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
+| Scale `10 -> 1` under the same continuity load with games, lobbies, matchmaking, and idle clients distributed across the service | Exactly nine partitions move; every observed drain handoff has zero usable-session gap and one command owner; no active socket hard-reconnects; four newly started low-CPU sessions per second each reach a ready backend, with p99 initial WebSocket authentication within ten seconds and no terminal error; no game completion is awaited. |
 | Kill after command `XADD`, before group delivery | Successor reads it as new work and applies one logical result. |
 | Kill after delivery into pending, before schedule | `XAUTOCLAIM` recovers it and applies one logical result. |
 | Kill after schedule, before checkpoint | Replay does not lose or double-apply the command. |
@@ -629,7 +629,9 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | CPU or memory target tracking scales out; the planned `1 -> 10 -> 1` ownership staircase passes; no Valkey eviction/write failure, zero-ready interval, ECS health failure, or Traefik health failure occurs. |
+| Run the fixed 64-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. |
+| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; no Valkey eviction/write failure, zero-ready interval, ECS health failure, or Traefik health failure occurs. |
+| Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan
 

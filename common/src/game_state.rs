@@ -8,6 +8,24 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod sorted_hash_set {
+    use serde::{Serialize, Serializer};
+    use std::collections::HashSet;
+
+    pub fn serialize<T, S>(
+        values: &HashSet<T>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        T: Ord + Serialize,
+        S: Serializer,
+    {
+        let mut values: Vec<_> = values.iter().collect();
+        values.sort_unstable();
+        values.serialize(serializer)
+    }
+}
+
 const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -320,7 +338,9 @@ pub enum GameStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandQueue {
     queue: BinaryHeap<Reverse<GameCommandMessage>>,
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     active_ids: HashSet<CommandId>,
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     tombstone_ids: HashSet<CommandId>,
 }
 
@@ -421,6 +441,7 @@ pub struct GameState {
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
     // Spectators by user_id (do not have snakes/players)
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     pub spectators: HashSet<u32>,
     // Score tracking - snake_id -> score
     pub scores: HashMap<u32, u32>,
@@ -2550,5 +2571,39 @@ mod tests {
 
         let third = heap.pop().unwrap().0;
         assert_eq!(third.tick(), 20);
+    }
+
+    #[test]
+    fn game_state_hash_sets_serialize_in_stable_order() {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.spectators.extend([9, 2, 5]);
+
+        for sequence_number in [7, 3] {
+            let mut command = create_command_message(10, 1, sequence_number, false);
+            command.command_id_server = Some(create_command_id(10, 1, sequence_number));
+            state.command_queue.push(command);
+        }
+
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["spectators"], serde_json::json!([2, 5, 9]));
+
+        let tombstone_sequences: Vec<u64> = json["command_queue"]["tombstone_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(tombstone_sequences, vec![3, 7]);
+
+        let round_trip: GameState = serde_json::from_value(json).unwrap();
+        let round_trip_json = serde_json::to_value(round_trip).unwrap();
+        assert_eq!(round_trip_json["spectators"], serde_json::json!([2, 5, 9]));
+        assert_eq!(
+            round_trip_json["command_queue"]["tombstone_ids"],
+            serde_json::json!([
+                {"tick": 10, "user_id": 1, "sequence_number": 3},
+                {"tick": 10, "user_id": 1, "sequence_number": 7}
+            ])
+        );
     }
 }

@@ -14,8 +14,13 @@ use common::{
     ClientCommandIdentityV2, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
     GameStatus,
 };
+use futures_util::FutureExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -24,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 const HANDOFF_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const COMPLETION_MATERIALIZATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -299,7 +305,47 @@ enum V2Incorporation {
 
 struct GameActorSlot {
     sender: mpsc::Sender<GameActorMessage>,
+    terminally_completed: Arc<AtomicBool>,
     _task: JoinHandle<()>,
+}
+
+impl GameActorSlot {
+    fn has_terminal_completion(&self) -> bool {
+        self.terminally_completed.load(Ordering::Acquire)
+    }
+
+    /// Returns `None` only when durable terminal completion makes rejecting
+    /// and ACKing the delivery safe. Every abnormal closure remains an error,
+    /// leaving the Redis pending entry available for crash recovery.
+    async fn deliver(&self, delivery: CommandDelivery) -> Result<Option<DeliveryDisposition>> {
+        if self._task.is_finished() {
+            if self.has_terminal_completion() {
+                return Ok(None);
+            }
+            bail!("game actor stopped before command delivery");
+        }
+
+        let (reply, receive) = oneshot::channel();
+        if self
+            .sender
+            .send(GameActorMessage::Delivery { delivery, reply })
+            .await
+            .is_err()
+        {
+            if self.has_terminal_completion() {
+                return Ok(None);
+            }
+            bail!("game actor stopped before command delivery");
+        }
+
+        match receive.await {
+            Ok(result) => result.map(Some),
+            Err(_) if self.has_terminal_completion() => Ok(None),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("game actor dropped delivery reply"))
+            }
+        }
+    }
 }
 
 struct GameActor {
@@ -344,6 +390,34 @@ fn report_autonomous_actor_failure(
 ) {
     let _ = actor_failures.send(autonomous_actor_failure(partition, game_id, error));
     fatal.cancel();
+}
+
+async fn supervise_actor_run(
+    future: impl std::future::Future<Output = Result<()>>,
+    actor_failures: &mpsc::UnboundedSender<anyhow::Error>,
+    fatal: &CancellationToken,
+    partition: u32,
+    game_id: u32,
+) -> bool {
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            error!(game_id, %error, "v2 game actor failed");
+            report_autonomous_actor_failure(actor_failures, fatal, partition, game_id, error);
+            false
+        }
+        Err(_) => {
+            error!(game_id, "v2 game actor panicked");
+            report_autonomous_actor_failure(
+                actor_failures,
+                fatal,
+                partition,
+                game_id,
+                anyhow::anyhow!("game actor panicked"),
+            );
+            false
+        }
+    }
 }
 
 impl GameActor {
@@ -400,7 +474,7 @@ impl GameActor {
         }
     }
 
-    async fn run(mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut checkpoint = tokio::time::interval(self.config.checkpoint_interval);
@@ -1287,7 +1361,7 @@ fn insert_actor(
 ) {
     let game_id = envelope.game_id;
     let (sender, receiver) = mpsc::channel(256);
-    let actor = GameActor::from_envelope(
+    let mut actor = GameActor::from_envelope(
         server_id,
         envelope,
         bus,
@@ -1299,16 +1373,23 @@ fn insert_actor(
         completion_cancel.clone(),
     );
     let partition = actor.guard.partition();
+    let terminally_completed = Arc::new(AtomicBool::new(false));
+    let task_terminally_completed = terminally_completed.clone();
     let task = tokio::spawn(async move {
-        if let Err(error) = actor.run().await {
-            error!(game_id, %error, "v2 game actor failed");
-            report_autonomous_actor_failure(&actor_failures, &fatal, partition, game_id, error);
+        if supervise_actor_run(actor.run(), &actor_failures, &fatal, partition, game_id).await
+            && actor.completion_committed
+        {
+            // Publish terminal completion before dropping the actor's
+            // receiver. A queued request may be dropped as the actor exits,
+            // and its waiter must distinguish that benign race from failure.
+            task_terminally_completed.store(true, Ordering::Release);
         }
     });
     actors.insert(
         game_id,
         GameActorSlot {
             sender,
+            terminally_completed,
             _task: task,
         },
     );
@@ -1486,7 +1567,10 @@ async fn dispatch_batch(
         }
 
         let slot = actors.get(&game_id).context("game actor disappeared")?;
-        if slot._task.is_finished() {
+        let Some(disposition) = slot.deliver(delivery).await? else {
+            // Only a durably completed actor permits terminal rejection. An
+            // abnormal closure returns above and leaves the command pending so
+            // partition restart can recover it.
             reject_or_quarantine_delivery(
                 bus,
                 guard,
@@ -1496,16 +1580,8 @@ async fn dispatch_batch(
             )
             .await?;
             continue;
-        }
-        let (reply, receive) = oneshot::channel();
-        slot.sender
-            .send(GameActorMessage::Delivery { delivery, reply })
-            .await
-            .context("game actor stopped before command delivery")?;
-        match receive
-            .await
-            .context("game actor dropped delivery reply")??
-        {
+        };
+        match disposition {
             DeliveryDisposition::Incorporated => {
                 cursors.insert(game_id, stream_id);
             }
@@ -1553,23 +1629,91 @@ async fn activate_all(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
     Ok(())
 }
 
+async fn await_actor_replies(
+    replies: Vec<(oneshot::Receiver<Result<()>>, Arc<AtomicBool>)>,
+    dropped_context: &'static str,
+) -> Result<()> {
+    let mut actor_error = None;
+    let mut dropped_error = None;
+    for (reply, terminally_completed) in replies {
+        match reply.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if actor_error.is_none() {
+                    actor_error = Some(error);
+                }
+            }
+            Err(_) if terminally_completed.load(Ordering::Acquire) => {}
+            Err(error) => {
+                if dropped_error.is_none() {
+                    dropped_error = Some(anyhow::Error::new(error).context(dropped_context));
+                }
+            }
+        }
+    }
+    match actor_error.or(dropped_error) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn publish_snapshots(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
+    publish_snapshots_with_timeout(actors, SNAPSHOT_FANOUT_TIMEOUT).await
+}
+
+async fn publish_snapshots_with_timeout(
+    actors: &HashMap<u32, GameActorSlot>,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, publish_snapshots_unbounded(actors))
+        .await
+        .context("partition snapshot fan-out exceeded its deadline")?
+}
+
+async fn publish_snapshots_unbounded(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
     let mut replies = Vec::with_capacity(actors.len());
     for slot in actors.values() {
         if slot._task.is_finished() {
-            continue;
+            if slot.has_terminal_completion() {
+                continue;
+            }
+            bail!("game actor stopped before snapshot request");
         }
         let (reply, receive) = oneshot::channel();
-        slot.sender
+        if slot
+            .sender
             .send(GameActorMessage::Snapshot { reply })
             .await
-            .context("game actor stopped before snapshot request")?;
-        replies.push(receive);
+            .is_err()
+        {
+            if slot.has_terminal_completion() {
+                continue;
+            }
+            bail!("game actor stopped before snapshot request");
+        }
+        replies.push((receive, slot.terminally_completed.clone()));
     }
-    for reply in replies {
-        reply.await.context("game actor dropped snapshot reply")??;
+    await_actor_replies(replies, "game actor dropped snapshot reply").await
+}
+
+async fn barrier_actors(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
+    let mut replies = Vec::with_capacity(actors.len());
+    for slot in actors.values() {
+        let (reply, receive) = oneshot::channel();
+        if slot
+            .sender
+            .send(GameActorMessage::Barrier { reply })
+            .await
+            .is_err()
+        {
+            if slot.has_terminal_completion() {
+                continue;
+            }
+            bail!("game actor stopped before handoff barrier");
+        }
+        replies.push((receive, slot.terminally_completed.clone()));
     }
-    Ok(())
+    await_actor_replies(replies, "game actor dropped handoff barrier").await
 }
 
 async fn cooperative_handoff(
@@ -1603,39 +1747,16 @@ async fn cooperative_handoff(
             }
         }
     });
-    let barrier = async {
-        let mut replies = Vec::with_capacity(actors.len());
-        for slot in actors.values() {
-            let (reply, receive) = oneshot::channel();
-            if slot
-                .sender
-                .send(GameActorMessage::Barrier { reply })
-                .await
-                .is_err()
-            {
-                if slot._task.is_finished() {
-                    continue;
-                }
-                bail!("game actor stopped before handoff barrier");
+    let barrier_result =
+        match tokio::time::timeout(HANDOFF_BARRIER_TIMEOUT, barrier_actors(actors)).await {
+            Ok(result) => result,
+            Err(_) => {
+                fatal.cancel();
+                Err(anyhow::anyhow!(
+                    "partition handoff barrier exceeded its single deadline"
+                ))
             }
-            replies.push(receive);
-        }
-        for reply in replies {
-            reply
-                .await
-                .context("game actor dropped handoff barrier")??;
-        }
-        Result::<()>::Ok(())
-    };
-    let barrier_result = match tokio::time::timeout(HANDOFF_BARRIER_TIMEOUT, barrier).await {
-        Ok(result) => result,
-        Err(_) => {
-            fatal.cancel();
-            Err(anyhow::anyhow!(
-                "partition handoff barrier exceeded its single deadline"
-            ))
-        }
-    };
+        };
     keepalive_stop.cancel();
     let keepalive_result = keepalive
         .await
@@ -1800,6 +1921,303 @@ mod tests {
                     .downcast_ref::<tokio::time::error::Elapsed>()
                     .is_some()
         }));
+    }
+
+    #[tokio::test]
+    async fn actor_panic_is_forwarded_and_cancels_partition() {
+        let (failures, mut receiver) = mpsc::unbounded_channel();
+        let fatal = CancellationToken::new();
+
+        let completed_normally = supervise_actor_run(
+            async {
+                panic!("injected game actor panic");
+                #[allow(unreachable_code)]
+                Result::<()>::Ok(())
+            },
+            &failures,
+            &fatal,
+            9,
+            29,
+        )
+        .await;
+
+        assert!(!completed_normally);
+        assert!(fatal.is_cancelled());
+        let failure = receiver
+            .try_recv()
+            .expect("actor panic should reach the partition executor");
+        assert!(failure.to_string().contains("game 29 actor"));
+        assert!(
+            failure
+                .chain()
+                .any(|cause| cause.to_string() == "game actor panicked")
+        );
+    }
+
+    fn synthetic_delivery(sequence: u64) -> CommandDelivery {
+        CommandDelivery {
+            stream_id: format!("{sequence}-0"),
+            payload: CommandDeliveryPayload::Poison {
+                raw: Vec::new(),
+                reason: "synthetic actor delivery".to_string(),
+            },
+            decision: None,
+        }
+    }
+
+    async fn sender_closed_slot(terminal: bool) -> GameActorSlot {
+        let (sender, receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task_terminally_completed = terminally_completed.clone();
+        let (ready, closed) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if terminal {
+                task_terminally_completed.store(true, Ordering::Release);
+            }
+            drop(receiver);
+            let _ = ready.send(());
+            std::future::pending::<()>().await;
+        });
+        closed.await.expect("test receiver should close");
+        GameActorSlot {
+            sender,
+            terminally_completed,
+            _task: task,
+        }
+    }
+
+    fn reply_dropping_slot(terminal: bool) -> GameActorSlot {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task_terminally_completed = terminally_completed.clone();
+        let task = tokio::spawn(async move {
+            let Some(GameActorMessage::Delivery { reply, .. }) = receiver.recv().await else {
+                panic!("delivery was not sent to test actor");
+            };
+            if terminal {
+                task_terminally_completed.store(true, Ordering::Release);
+            }
+            drop(reply);
+            std::future::pending::<()>().await;
+        });
+        GameActorSlot {
+            sender,
+            terminally_completed,
+            _task: task,
+        }
+    }
+
+    async fn abort_test_slot(slot: GameActorSlot) {
+        slot._task.abort();
+        let _ = slot._task.await;
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_racing_snapshot_reply_is_benign() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task_terminally_completed = terminally_completed.clone();
+        let task = tokio::spawn(async move {
+            let Some(GameActorMessage::Snapshot { reply }) = receiver.recv().await else {
+                panic!("snapshot request was not delivered");
+            };
+            // This is the exact actor-exit ordering: publish durable terminal
+            // completion first, then drop the receiver and its queued reply.
+            task_terminally_completed.store(true, Ordering::Release);
+            drop(reply);
+        });
+        let mut actors = HashMap::from([(
+            17,
+            GameActorSlot {
+                sender,
+                terminally_completed,
+                _task: task,
+            },
+        )]);
+
+        publish_snapshots(&actors).await?;
+
+        actors.remove(&17).expect("test actor exists")._task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abnormal_actor_exit_racing_snapshot_reply_fails_closed() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(async move {
+            let Some(GameActorMessage::Snapshot { reply }) = receiver.recv().await else {
+                panic!("snapshot request was not delivered");
+            };
+            drop(reply);
+        });
+        let mut actors = HashMap::from([(
+            18,
+            GameActorSlot {
+                sender,
+                terminally_completed,
+                _task: task,
+            },
+        )]);
+
+        let error = publish_snapshots(&actors)
+            .await
+            .expect_err("an unclassified actor exit must fail the partition");
+        assert!(error.to_string().contains("dropped snapshot reply"));
+        actors
+            .remove(&18)
+            .expect("test actor exists")
+            ._task
+            .await
+            .expect("test actor should stop normally");
+    }
+
+    #[tokio::test]
+    async fn explicit_actor_error_wins_over_secondary_dropped_reply() {
+        let (dropped_sender, dropped_reply) = oneshot::channel();
+        drop(dropped_sender);
+        let (failed_sender, failed_reply) = oneshot::channel();
+        failed_sender
+            .send(Err(anyhow::anyhow!("primary snapshot failure")))
+            .expect("test receiver remains open");
+        let replies = vec![
+            (dropped_reply, Arc::new(AtomicBool::new(false))),
+            (failed_reply, Arc::new(AtomicBool::new(false))),
+        ];
+
+        let error = await_actor_replies(replies, "secondary dropped reply")
+            .await
+            .expect_err("actor failure must fail the operation");
+
+        assert_eq!(error.to_string(), "primary snapshot failure");
+    }
+
+    #[tokio::test]
+    async fn delivery_send_closure_is_benign_only_after_terminal_commit() -> Result<()> {
+        let terminal = sender_closed_slot(true).await;
+        assert!(terminal.deliver(synthetic_delivery(1)).await?.is_none());
+        abort_test_slot(terminal).await;
+
+        let abnormal = sender_closed_slot(false).await;
+        let error = match abnormal.deliver(synthetic_delivery(2)).await {
+            Err(error) => error,
+            Ok(_) => panic!("abnormal send closure must fail the partition"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stopped before command delivery")
+        );
+        abort_test_slot(abnormal).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_reply_closure_is_benign_only_after_terminal_commit() -> Result<()> {
+        let terminal = reply_dropping_slot(true);
+        assert!(terminal.deliver(synthetic_delivery(3)).await?.is_none());
+        abort_test_slot(terminal).await;
+
+        let abnormal = reply_dropping_slot(false);
+        let error = match abnormal.deliver(synthetic_delivery(4)).await {
+            Err(error) => error,
+            Ok(_) => panic!("abnormal reply closure must fail the partition"),
+        };
+        assert!(error.to_string().contains("dropped delivery reply"));
+        abort_test_slot(abnormal).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_fanout_has_one_typed_deadline() {
+        let (pending_sender, mut pending_receiver) = mpsc::channel(1);
+        let pending_task = tokio::spawn(async move {
+            let Some(GameActorMessage::Snapshot { reply }) = pending_receiver.recv().await else {
+                panic!("snapshot request was not delivered");
+            };
+            let _reply = reply;
+            std::future::pending::<()>().await;
+        });
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let mut actors = HashMap::from([(
+            21,
+            GameActorSlot {
+                sender: pending_sender,
+                terminally_completed,
+                _task: pending_task,
+            },
+        )]);
+
+        let error = publish_snapshots_with_timeout(&actors, Duration::from_millis(25))
+            .await
+            .expect_err("one fan-out deadline must bound reply draining");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        }));
+
+        for (_, slot) in actors.drain() {
+            abort_test_slot(slot).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_racing_handoff_barrier_is_benign() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task_terminally_completed = terminally_completed.clone();
+        let task = tokio::spawn(async move {
+            let Some(GameActorMessage::Barrier { reply }) = receiver.recv().await else {
+                panic!("handoff barrier was not delivered");
+            };
+            task_terminally_completed.store(true, Ordering::Release);
+            drop(reply);
+        });
+        let mut actors = HashMap::from([(
+            19,
+            GameActorSlot {
+                sender,
+                terminally_completed,
+                _task: task,
+            },
+        )]);
+
+        barrier_actors(&actors).await?;
+
+        actors.remove(&19).expect("test actor exists")._task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abnormal_actor_exit_racing_handoff_barrier_fails_closed() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(async move {
+            let Some(GameActorMessage::Barrier { reply }) = receiver.recv().await else {
+                panic!("handoff barrier was not delivered");
+            };
+            drop(reply);
+        });
+        let mut actors = HashMap::from([(
+            20,
+            GameActorSlot {
+                sender,
+                terminally_completed,
+                _task: task,
+            },
+        )]);
+
+        let error = barrier_actors(&actors)
+            .await
+            .expect_err("an unclassified actor exit must fail handoff");
+        assert!(error.to_string().contains("dropped handoff barrier"));
+        actors
+            .remove(&20)
+            .expect("test actor exists")
+            ._task
+            .await
+            .expect("test actor should stop normally");
     }
 
     #[derive(Default)]

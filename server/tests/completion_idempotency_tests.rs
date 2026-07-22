@@ -1,9 +1,11 @@
 use anyhow::Result;
 use chrono::Utc;
-use common::{GameState, GameStatus, GameType, QueueMode};
+use common::{
+    CommandId, GameCommand, GameCommandMessage, GameState, GameStatus, GameType, QueueMode,
+};
 use server::completion::{
     COMPLETION_SCHEMA_VERSION, CompletionEffect, CompletionRecordV1, EffectApplyResult,
-    apply_all_effects, materialize_completion,
+    apply_all_effects, canonical_json_bytes, materialize_completion,
 };
 use server::db::{Database, dynamodb::DynamoDatabase, models::User};
 use uuid::Uuid;
@@ -425,6 +427,23 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         &[&high_user_a, &high_user_b],
         now,
     )?;
+    solo_state.spectators.extend([9_001, 9_002, 9_003, 9_004]);
+    for sequence_number in 1..=4 {
+        let client_id = CommandId {
+            tick: 1,
+            user_id: high_user_a.id as u32,
+            sequence_number,
+        };
+        solo_state.command_queue.push(GameCommandMessage {
+            command_id_client: client_id.clone(),
+            command_id_server: Some(client_id),
+            command: GameCommand::UpdateStatus {
+                status: GameStatus::Complete {
+                    winning_snake_id: None,
+                },
+            },
+        });
+    }
     for player in solo_state.players.values() {
         solo_state.scores.insert(player.snake_id, 777);
     }
@@ -446,7 +465,17 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
             .iter()
             .all(|(_, result)| *result == EffectApplyResult::Applied)
     );
-    let reloaded: CompletionRecordV1 = serde_json::from_slice(&serde_json::to_vec(&high_record)?)?;
+    let canonical = canonical_json_bytes(&high_record)?;
+    let mut reloaded = high_record.clone();
+    for _ in 0..16 {
+        reloaded = serde_json::from_slice(&serde_json::to_vec(&reloaded)?)?;
+        assert_eq!(canonical_json_bytes(&reloaded)?, canonical);
+        assert_eq!(
+            db.apply_completion_effect(&reloaded, &reloaded.effects[0])
+                .await?,
+            EffectApplyResult::AlreadyApplied
+        );
+    }
     assert!(
         apply_all_effects(&db, &reloaded)
             .await?
