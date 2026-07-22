@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.89-trixie as builder
+FROM rust:1.89-trixie AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -20,6 +20,7 @@ COPY server ./server
 COPY client ./client
 COPY terminal ./terminal
 COPY bot ./bot
+COPY loadtest ./loadtest
 
 # Build the runtime. The read-only resilience_admin tool is built by the
 # operations runner and is not part of the serving image.
