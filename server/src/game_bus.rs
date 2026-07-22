@@ -134,6 +134,12 @@ pub struct ReclaimedCommandBatch {
     pub complete: bool,
 }
 
+#[cfg(test)]
+type ExecutorReadReplyGate = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
 /// The game-critical transport. All methods take `&self`; internal
 /// connections are cheaply cloneable handles.
 pub struct GameBus {
@@ -145,6 +151,8 @@ pub struct GameBus {
     cancellation_token: CancellationToken,
     #[cfg(test)]
     checkpoint_failures_remaining: AtomicUsize,
+    #[cfg(test)]
+    executor_read_reply_gate: std::sync::Arc<std::sync::Mutex<Option<ExecutorReadReplyGate>>>,
 }
 
 impl GameBus {
@@ -159,6 +167,8 @@ impl GameBus {
             cancellation_token,
             #[cfg(test)]
             checkpoint_failures_remaining: AtomicUsize::new(0),
+            #[cfg(test)]
+            executor_read_reply_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -175,6 +185,18 @@ impl GameBus {
                 remaining.checked_sub(1)
             })
             .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_nonempty_executor_read_reply(&self) -> ExecutorReadReplyGate {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self
+            .executor_read_reply_gate
+            .lock()
+            .expect("executor read-reply gate mutex was poisoned") =
+            Some((entered.clone(), release.clone()));
+        (entered, release)
     }
 
     async fn xadd(&self, key: &str, maxlen: usize, payload: Vec<u8>) -> Result<()> {
@@ -278,6 +300,8 @@ impl GameBus {
             guard,
             claim_cursor: "0-0".to_string(),
             cancellation: self.cancellation_token.clone(),
+            #[cfg(test)]
+            read_reply_gate: self.executor_read_reply_gate.clone(),
         })
     }
 
@@ -1506,6 +1530,8 @@ pub struct ExecutorCommandConsumer {
     guard: PartitionLeaseGuard,
     claim_cursor: String,
     cancellation: CancellationToken,
+    #[cfg(test)]
+    read_reply_gate: std::sync::Arc<std::sync::Mutex<Option<ExecutorReadReplyGate>>>,
 }
 
 impl ExecutorCommandConsumer {
@@ -1629,6 +1655,18 @@ impl ExecutorCommandConsumer {
         for stream in reply.keys {
             for entry in stream.ids {
                 deliveries.push(decode_command_delivery(entry));
+            }
+        }
+        #[cfg(test)]
+        if !deliveries.is_empty() {
+            let gate = self
+                .read_reply_gate
+                .lock()
+                .expect("executor read-reply gate mutex was poisoned")
+                .take();
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
             }
         }
         Ok(deliveries)

@@ -2,7 +2,7 @@
 
 use crate::completion::{CompletionRecordV1, EffectApplyResult, materialize_completion};
 use crate::db::Database;
-use crate::game_bus::{CommandDelivery, CommandDeliveryPayload, GameBus};
+use crate::game_bus::{CommandDelivery, CommandDeliveryPayload, GameBus, SnapshotRequest};
 use crate::game_executor::{PARTITION_COUNT, StreamEvent, authorize_game_command};
 use crate::partition_lease::{PartitionLeaseGuard, PartitionLeaseStore};
 use crate::recovery::{
@@ -301,6 +301,12 @@ enum V2Incorporation {
     Incorporated,
     PrunedDuplicate,
     Quarantine(String),
+}
+
+enum LiveExecutorWork {
+    CompletionRetry,
+    SnapshotRequest(Option<SnapshotRequest>),
+    Deliveries(Result<Vec<CommandDelivery>>),
 }
 
 struct GameActorSlot {
@@ -1228,110 +1234,129 @@ async fn run_game_executor_v2(
 
     let result: Result<()> = async {
         loop {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    fatal.cancel();
-                    return Ok(());
-                }
-                Some(error) = actor_failure_rx.recv() => {
-                    fatal.cancel();
-                    return Err(error);
-                }
-                _ = fatal.cancelled() => {
-                    return Err(anyhow::anyhow!("partition {partition} executor failed closed"));
-                }
-                Some(ExecutorControl::Handoff { reply }) = control.recv() => {
-                    watchdog_stop.cancel();
-                    let result = cooperative_handoff(
-                        &actors,
-                        &lease_store,
-                        &guard,
-                        &fatal,
-                        &completion_cancel,
-                    ).await;
-                    let ok = result.is_ok();
-                    let _ = reply.send(result);
-                    if ok { return Ok(()); }
-                    fatal.cancel();
-                    return Err(anyhow::anyhow!("partition handoff failed"));
-                }
-                event = watchdog_rx.recv() => {
-                    match event {
-                        Some(LeaseWatchdogEvent::AssignmentMoved) => {
-                            cooperative_handoff(
+            // XREADGROUP mutates Redis before its multiplexed response reaches
+            // this future. Keep the exact read future alive while normal timer
+            // and snapshot branches run; dropping it would strand its assigned
+            // entries in this consumer's PEL until a partition restart.
+            let deliveries = {
+                let read = consumer.read_new_blocking();
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            fatal.cancel();
+                            return Ok(());
+                        }
+                        Some(error) = actor_failure_rx.recv() => {
+                            fatal.cancel();
+                            return Err(error);
+                        }
+                        _ = fatal.cancelled() => {
+                            return Err(anyhow::anyhow!("partition {partition} executor failed closed"));
+                        }
+                        Some(ExecutorControl::Handoff { reply }) = control.recv() => {
+                            watchdog_stop.cancel();
+                            let result = cooperative_handoff(
                                 &actors,
                                 &lease_store,
                                 &guard,
                                 &fatal,
                                 &completion_cancel,
-                            ).await?;
-                            return Ok(());
-                        }
-                        Some(LeaseWatchdogEvent::AuthorityLost) | None => {
+                            ).await;
+                            let ok = result.is_ok();
+                            let _ = reply.send(result);
+                            if ok { return Ok(()); }
                             fatal.cancel();
-                            return Err(anyhow::anyhow!("partition {partition} lease authority was lost"));
+                            return Err(anyhow::anyhow!("partition handoff failed"));
                         }
-                        Some(LeaseWatchdogEvent::Failed(error)) => {
-                            fatal.cancel();
-                            return Err(error.context("partition lease renewal failed closed"));
+                        event = watchdog_rx.recv() => {
+                            match event {
+                                Some(LeaseWatchdogEvent::AssignmentMoved) => {
+                                    cooperative_handoff(
+                                        &actors,
+                                        &lease_store,
+                                        &guard,
+                                        &fatal,
+                                        &completion_cancel,
+                                    ).await?;
+                                    return Ok(());
+                                }
+                                Some(LeaseWatchdogEvent::AuthorityLost) | None => {
+                                    fatal.cancel();
+                                    return Err(anyhow::anyhow!("partition {partition} lease authority was lost"));
+                                }
+                                Some(LeaseWatchdogEvent::Failed(error)) => {
+                                    fatal.cancel();
+                                    return Err(error.context("partition lease renewal failed closed"));
+                                }
+                            }
+                        }
+                        work = async {
+                            tokio::select! {
+                                _ = completion_retry.tick() => LiveExecutorWork::CompletionRetry,
+                                request = snapshot_requests.recv() => {
+                                    LiveExecutorWork::SnapshotRequest(request)
+                                }
+                                deliveries = &mut read => LiveExecutorWork::Deliveries(deliveries),
+                            }
+                        } => match work {
+                            LiveExecutorWork::CompletionRetry => {
+                                if completion_worker.as_ref().is_some_and(|task| task.is_finished()) {
+                                    let task = completion_worker.take().expect("finished worker exists");
+                                    match task.await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => warn!(partition, %error, "pending completion retry failed"),
+                                        Err(error) => warn!(partition, %error, "pending completion retry worker panicked"),
+                                    }
+                                }
+                                if completion_worker.is_none() {
+                                    let retry_bus = bus.clone();
+                                    let retry_guard = guard.clone();
+                                    let retry_db = db.clone();
+                                    let retention = config.retention;
+                                    completion_worker = Some(tokio::spawn(async move {
+                                        drain_pending_completions(
+                                            retry_bus.as_ref(),
+                                            &retry_guard,
+                                            retry_db.as_ref(),
+                                            retention,
+                                        ).await
+                                    }));
+                                }
+                                if let Err(error) = bus.trim_executor_commands_fenced(&guard).await {
+                                    warn!(partition, %error, "executor command trim failed");
+                                }
+                            }
+                            LiveExecutorWork::SnapshotRequest(request) => {
+                                let Some(request) = request else {
+                                    return Err(anyhow::anyhow!("partition {partition} snapshot-request reader exited"));
+                                };
+                                if request.partition_id != partition {
+                                    return Err(anyhow::anyhow!("snapshot request was routed to the wrong partition"));
+                                }
+                                publish_snapshots(&actors).await?;
+                            }
+                            LiveExecutorWork::Deliveries(deliveries) => break deliveries?,
                         }
                     }
                 }
-                _ = completion_retry.tick() => {
-                    if completion_worker.as_ref().is_some_and(|task| task.is_finished()) {
-                        let task = completion_worker.take().expect("finished worker exists");
-                        match task.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => warn!(partition, %error, "pending completion retry failed"),
-                            Err(error) => warn!(partition, %error, "pending completion retry worker panicked"),
-                        }
-                    }
-                    if completion_worker.is_none() {
-                        let retry_bus = bus.clone();
-                        let retry_guard = guard.clone();
-                        let retry_db = db.clone();
-                        let retention = config.retention;
-                        completion_worker = Some(tokio::spawn(async move {
-                            drain_pending_completions(
-                                retry_bus.as_ref(),
-                                &retry_guard,
-                                retry_db.as_ref(),
-                                retention,
-                            ).await
-                        }));
-                    }
-                    if let Err(error) = bus.trim_executor_commands_fenced(&guard).await {
-                        warn!(partition, %error, "executor command trim failed");
-                    }
-                }
-                request = snapshot_requests.recv() => {
-                    let Some(request) = request else {
-                        return Err(anyhow::anyhow!("partition {partition} snapshot-request reader exited"));
-                    };
-                    if request.partition_id != partition {
-                        return Err(anyhow::anyhow!("snapshot request was routed to the wrong partition"));
-                    }
-                    publish_snapshots(&actors).await?;
-                }
-                deliveries = consumer.read_new_blocking() => {
-                    let deliveries = deliveries?;
-                    dispatch_batch(
-                        deliveries,
-                        &mut actors,
-                        &mut cursors,
-                        server_id,
-                        &bus,
-                        &guard,
-                        db.clone(),
-                        config.clone(),
-                        fatal.clone(),
-                        completion_cancel.clone(),
-                        actor_failures.clone(),
-                        true,
-                    ).await?;
-                }
-            }
+            };
+            dispatch_batch(
+                deliveries,
+                &mut actors,
+                &mut cursors,
+                server_id,
+                &bus,
+                &guard,
+                db.clone(),
+                config.clone(),
+                fatal.clone(),
+                completion_cancel.clone(),
+                actor_failures.clone(),
+                true,
+            )
+            .await?;
         }
     }
     .await;
@@ -2657,6 +2682,26 @@ mod tests {
             .collect()
     }
 
+    async fn wait_for_game_snapshot(
+        subscription: &mut crate::game_bus::PartitionSubscription,
+        game_id: u32,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = subscription
+                    .recv_event()
+                    .await
+                    .context("partition event reader stopped before snapshot")?;
+                if event.game_id == game_id && matches!(event.event, GameEvent::Snapshot { .. }) {
+                    return Result::<()>::Ok(());
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for game snapshot")??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn command_crash_boundaries_recover_one_logical_result() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -3892,6 +3937,109 @@ mod tests {
                 failure_events.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
             ));
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_executor_preserves_assigned_read_across_snapshot_work() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("preserve-live-read").await?;
+
+            // Keep the actor alive while the test deliberately pauses command
+            // delivery after Redis has assigned it to the consumer group.
+            let mut baseline = harness.recovery().await?;
+            baseline.game_state.start_ms = chrono::Utc::now().timestamp_millis() + 60_000;
+            baseline.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(&harness.guard, &baseline, &[], Duration::from_secs(60))
+                .await?;
+
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let executor_cancel = CancellationToken::new();
+            let config = RecoveryConfig {
+                checkpoint_interval: Duration::from_millis(50),
+                ..RecoveryConfig::default()
+            };
+            let (_handle, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                config,
+                executor_cancel.clone(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+
+            let (read_assigned, release_read_reply) =
+                harness.bus.gate_next_nonempty_executor_read_reply();
+            let stream_id = harness.append_command().await?;
+            tokio::time::timeout(Duration::from_secs(2), read_assigned.notified())
+                .await
+                .context("executor did not assign the command-group entry")?;
+
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert_eq!(pending.ids.len(), 1);
+            assert_eq!(pending.ids[0].id, stream_id);
+
+            // A snapshot request is ordinary live-loop work. It must not drop
+            // the already-assigned read and leave that entry in the PEL.
+            harness
+                .bus
+                .request_partition_snapshots(harness.partition)
+                .await?;
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_read_reply.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if harness.recovery().await?.command_cursor == stream_id {
+                        return Result::<()>::Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("assigned command was stranded after snapshot work")??;
+
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(pending.ids.is_empty());
+
+            executor_cancel.cancel();
+            let executor_result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .context("executor did not stop after test cancellation")?
+                .context("executor task panicked")?;
+            executor_result?;
+
             let live_guard = harness.guard.clone();
             harness.cleanup(&live_guard).await?;
             Result::<()>::Ok(())
