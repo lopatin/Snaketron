@@ -1,8 +1,8 @@
 //! Unique, assignment-aware executor leases and exact-token fencing.
 
 use crate::cluster_membership::{BootIdentity, ClusterNamespace};
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, bail};
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -72,7 +72,7 @@ impl PartitionLeaseGuard {
 
 #[derive(Clone)]
 pub struct PartitionLeaseStore {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     namespace: ClusterNamespace,
     ttl: Duration,
     operation_timeout: Duration,
@@ -80,7 +80,7 @@ pub struct PartitionLeaseStore {
 
 impl PartitionLeaseStore {
     pub fn new(
-        redis: ConnectionManager,
+        redis: impl Into<RedisConnection>,
         namespace: ClusterNamespace,
         ttl: Duration,
         operation_timeout: Duration,
@@ -92,7 +92,7 @@ impl PartitionLeaseStore {
             bail!("coordination operation timeout must be shorter than lease TTL");
         }
         Ok(Self {
-            redis,
+            redis: redis.into(),
             namespace,
             ttl,
             operation_timeout,
@@ -137,7 +137,7 @@ impl PartitionLeaseStore {
                 "#,
             );
             script
-                .key(self.namespace.assignment())
+                .key(self.namespace.partition_assignment(partition))
                 .key(self.namespace.partition_lease(partition))
                 .arg(partition)
                 .arg(boot_id.as_str())
@@ -181,7 +181,7 @@ impl PartitionLeaseStore {
                 "#,
             );
             script
-                .key(self.namespace.assignment())
+                .key(self.namespace.partition_assignment(guard.partition))
                 .key(guard.lease_key())
                 .arg(guard.partition)
                 .arg(guard.token.boot_id.as_str())
@@ -286,7 +286,7 @@ impl PartitionLeaseStore {
 /// partition lease it has no desired-owner predicate.
 #[derive(Clone)]
 pub struct CoordinatorLeaseStore {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     namespace: ClusterNamespace,
     ttl: Duration,
     operation_timeout: Duration,
@@ -294,7 +294,7 @@ pub struct CoordinatorLeaseStore {
 
 impl CoordinatorLeaseStore {
     pub fn new(
-        redis: ConnectionManager,
+        redis: impl Into<RedisConnection>,
         namespace: ClusterNamespace,
         ttl: Duration,
         operation_timeout: Duration,
@@ -303,7 +303,7 @@ impl CoordinatorLeaseStore {
             bail!("coordinator operation timeout must be shorter than lease TTL");
         }
         Ok(Self {
-            redis,
+            redis: redis.into(),
             namespace,
             ttl,
             operation_timeout,

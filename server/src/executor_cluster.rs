@@ -15,8 +15,8 @@ use crate::partition_lease::{
     LeaseToken, PartitionLeaseStore,
 };
 use crate::recovery::RecoveryConfig;
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result};
-use redis::aio::ConnectionManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -228,7 +228,7 @@ pub fn start_executor_cluster(
     server_id: u64,
     boot_id: BootIdentity,
     namespace: ClusterNamespace,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     bus: Arc<GameBus>,
     db: Arc<dyn Database>,
     local_lifecycle: LocalTaskLifecycle,
@@ -676,7 +676,10 @@ mod tests {
         };
         let mut setup = manager.clone();
         let _: () = setup
-            .set(namespace.assignment(), serde_json::to_vec(&assignment)?)
+            .set(
+                namespace.partition_assignment(0),
+                serde_json::to_vec(&assignment)?,
+            )
             .await?;
         let leases = PartitionLeaseStore::new(
             manager.clone(),
@@ -696,7 +699,10 @@ mod tests {
         assignment.computed_at_ms += 1;
         assignment.owners.insert(0, owner_b);
         let _: () = setup
-            .set(namespace.assignment(), serde_json::to_vec(&assignment)?)
+            .set(
+                namespace.partition_assignment(0),
+                serde_json::to_vec(&assignment)?,
+            )
             .await?;
 
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -712,7 +718,10 @@ mod tests {
         watchdog.await?;
         let _ = leases.release(&guard).await?;
         let _: () = setup
-            .del(&[namespace.assignment(), namespace.partition_lease(0)])
+            .del(&[
+                namespace.partition_assignment(0),
+                namespace.partition_lease(0),
+            ])
             .await?;
         Ok(())
     }

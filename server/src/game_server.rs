@@ -18,18 +18,17 @@ use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
-use crate::redis_utils::create_connection_manager_until_available;
+use crate::redis_utils::{RedisClient, create_connection_manager_until_available};
 use crate::region_cache::RegionCache;
 use crate::resilience_metrics;
 use crate::resilience_metrics::spawn_resilience_metrics;
 use crate::{
     db::{Database, ServerRegistration},
-    matchmaking::run_matchmaking_loop,
+    matchmaking::{run_game_created_outbox_loop, run_matchmaking_loop},
     redis_keys::RedisKeys,
     replication::ReplicationManager,
     ws_server::JwtVerifier,
 };
-use redis::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -265,11 +264,10 @@ impl GameServer {
         info!("Using Redis URL: {}", redis_url);
 
         // Create the Redis client and connection manager
-        let redis_client =
-            Client::open(redis_url.clone()).context("Failed to create Redis client")?;
+        let redis_client = RedisClient::open(&redis_url, Some(pubsub_tx.clone()))
+            .context("Failed to create Redis client")?;
         let redis = create_connection_manager_until_available(
-            redis_client,
-            pubsub_tx.clone(),
+            redis_client.clone(),
             cancellation_token.clone(),
         )
         .await?;
@@ -282,8 +280,7 @@ impl GameServer {
         // Create the game-critical message bus (Redis Streams).
         let game_bus = Arc::new(GameBus::new(
             redis.clone(),
-            Client::open(redis_url.clone())
-                .context("Failed to create Redis client for game bus")?,
+            redis_client,
             cancellation_token.clone(),
         ));
 
@@ -296,10 +293,29 @@ impl GameServer {
         lobby_manager.start_lobby_update_forwarder();
 
         // Create the matchmaking manager
-        let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(
-            MatchmakingManager::new(redis.clone())
-                .context("Failed to create matchmaking manager")?,
-        ));
+        let matchmaking = MatchmakingManager::new(redis.clone())
+            .context("Failed to create matchmaking manager")?;
+        let outbox_matchmaking = matchmaking.clone();
+        let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(matchmaking));
+
+        let outbox_token = cancellation_token.clone();
+        let outbox_exit_token = outbox_token.clone();
+        let outbox_bus = game_bus.clone();
+        let outbox_lifecycle = lifecycle.clone();
+        let outbox_fatal_tx = fatal_tx.clone();
+        handles.push(tokio::spawn(async move {
+            let result =
+                run_game_created_outbox_loop(outbox_matchmaking, outbox_bus, outbox_token).await;
+            if !outbox_exit_token.is_cancelled() {
+                outbox_lifecycle.mark_critical_failure();
+                let reason = match result {
+                    Ok(()) => anyhow::anyhow!("game-created outbox loop exited unexpectedly"),
+                    Err(error) => error.context("game-created outbox loop failed"),
+                };
+                error!("{}", reason);
+                let _ = outbox_fatal_tx.send(reason);
+            }
+        }));
 
         // Create RegionCache for dynamic region discovery
         let dynamodb_client = crate::db::dynamodb::dynamodb_client().await;
@@ -427,8 +443,9 @@ impl GameServer {
 
         // A bounded, independent Valkey probe drives readiness. Liveness is
         // intentionally unaffected so an outage cannot cause an ECS restart
-        // storm. Use a write canary rather than PING: under noeviction memory
-        // pressure reads can remain healthy while checkpoints/XADD fail.
+        // storm. Use a write canary rather than PING: under Serverless capacity
+        // pressure reads can remain healthy while correctness-bearing writes
+        // fail, so readiness must exercise the write path.
         let mut readiness_redis = redis.clone();
         let redis_lifecycle = lifecycle.clone();
         let redis_token = cancellation_token.clone();

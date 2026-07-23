@@ -1,10 +1,12 @@
 //! Deterministic, minimally-moving desired placement for executor partitions.
 
 use crate::cluster_membership::{BootIdentity, ClusterNamespace, TaskMembership};
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, bail};
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ASSIGNMENT_SCHEMA_VERSION: u16 = 2;
 
@@ -176,13 +178,18 @@ pub enum AssignmentWrite {
 
 #[derive(Clone)]
 pub struct AssignmentStore {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     namespace: ClusterNamespace,
+    last_synced_view_version: Arc<AtomicU64>,
 }
 
 impl AssignmentStore {
-    pub fn new(redis: ConnectionManager, namespace: ClusterNamespace) -> Self {
-        Self { redis, namespace }
+    pub fn new(redis: impl Into<RedisConnection>, namespace: ClusterNamespace) -> Self {
+        Self {
+            redis: redis.into(),
+            namespace,
+            last_synced_view_version: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn key(&self) -> String {
@@ -286,6 +293,7 @@ impl AssignmentStore {
             && previous.eligible_members == next.eligible_members
             && previous.owners == next.owners
         {
+            self.sync_partition_views(previous, partition_count).await?;
             return Ok((AssignmentWrite::Written, previous.clone()));
         }
         let outcome = self
@@ -295,7 +303,59 @@ impl AssignmentStore {
                 &next,
             )
             .await?;
+        if outcome == AssignmentWrite::Written {
+            self.sync_partition_views(&next, partition_count).await?;
+        }
         Ok((outcome, next))
+    }
+
+    /// Project the canonical control-plane document into each executor slot.
+    /// The projection is monotonic, so a delayed old coordinator cannot roll
+    /// a partition back. A new coordinator always repairs all views once;
+    /// afterward unchanged reconciliations stay local and write-free.
+    async fn sync_partition_views(
+        &self,
+        assignment: &AssignmentDocument,
+        partition_count: u32,
+    ) -> Result<()> {
+        if self.last_synced_view_version.load(Ordering::Acquire) == assignment.version {
+            return Ok(());
+        }
+        let payload = serde_json::to_vec(assignment)?;
+        let expected_version = assignment.version.to_string();
+        for partition in 0..partition_count {
+            let mut redis = self.redis.clone();
+            let result: i32 = redis::Script::new(
+                r#"
+                local current = redis.call('GET', KEYS[1])
+                if current then
+                    local ok, decoded = pcall(cjson.decode, current)
+                    if ok and tonumber(decoded.version) > tonumber(ARGV[1]) then return 0 end
+                    if ok and tostring(decoded.version) == ARGV[1] then
+                        if current == ARGV[2] then return 0 end
+                        return -1
+                    end
+                end
+                redis.call('SET', KEYS[1], ARGV[2])
+                return 1
+                "#,
+            )
+            .key(self.namespace.partition_assignment(partition))
+            .arg(&expected_version)
+            .arg(&payload)
+            .invoke_async(&mut redis)
+            .await
+            .with_context(|| format!("failed to sync assignment view for partition {partition}"))?;
+            if result < 0 {
+                bail!(
+                    "partition {partition} has a conflicting assignment at version {}",
+                    assignment.version
+                );
+            }
+        }
+        self.last_synced_view_version
+            .store(assignment.version, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -385,7 +445,7 @@ mod tests {
         }
     }
 
-    async fn redis_store(prefix: &str) -> Result<(ConnectionManager, AssignmentStore)> {
+    async fn redis_store(prefix: &str) -> Result<(redis::aio::ConnectionManager, AssignmentStore)> {
         let client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")?;
         let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(8);
         let manager = crate::redis_utils::create_connection_manager(client, pubsub_tx).await?;

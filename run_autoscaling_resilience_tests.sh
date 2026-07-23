@@ -267,7 +267,7 @@ test_live_task_definition_gate() {
             {name: "SNAKETRON_REGION", value: "use1"},
             {name: "SNAKETRON_AWS_REGION", value: "us-east-1"},
             {name: "SNAKETRON_ORIGIN", value: "https://stg-123-1.snaketron.io"},
-            {name: "SNAKETRON_REDIS_URL", value: "redis://fixture.cache.amazonaws.com:6379/"},
+            {name: "SNAKETRON_REDIS_URL", value: "rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true"},
             {name: "AWS_REGION", value: "us-east-1"},
             {name: "DYNAMODB_TABLE_PREFIX", value: "snaketron-dev"},
             {name: "DYNAMODB_ENDPOINT", value: ""}
@@ -283,7 +283,7 @@ test_live_task_definition_gate() {
     | select_verified_task_service_name \
       dev use1 us-east-1 \
       https://stg-123-1.snaketron.io \
-      redis://fixture.cache.amazonaws.com:6379/ \
+      'rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true' \
       "$router_service_key")" || {
     echo "Live task-definition gate rejected its safe fixture" >&2
     return 1
@@ -304,7 +304,7 @@ test_live_task_definition_gate() {
       | select_verified_task_service_name \
         dev use1 us-east-1 \
         https://stg-123-1.snaketron.io \
-        redis://fixture.cache.amazonaws.com:6379/ \
+        'rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true' \
         "$router_service_key" >/dev/null 2>&1; then
       echo "Live task-definition gate accepted unsafe $mutation" >&2
       return 1
@@ -406,10 +406,11 @@ run_offline_cdk_synth() {
     return 1
   fi
   local expires_at_epoch=$(( $(date -u +%s) + 3600 ))
-  local lookup_context='"availability-zones:account=111111111111:region=us-east-1":["us-east-1a","us-east-1b"],"availability-zones:account=111111111111:region=eu-west-1":["eu-west-1a","eu-west-1b"],"hosted-zone:account=111111111111:domainName=snaketron.io:region=us-east-1":{"Id":"/hostedzone/ZDUMMYIO","Name":"snaketron.io."},"hosted-zone:account=111111111111:domainName=snaketron.com:region=us-east-1":{"Id":"/hostedzone/ZDUMMYCOM","Name":"snaketron.com."},"hosted-zone:account=111111111111:domainName=snaketron.io:region=eu-west-1":{"Id":"/hostedzone/ZDUMMYIO","Name":"snaketron.io."},"hosted-zone:account=111111111111:domainName=snaketron.com:region=eu-west-1":{"Id":"/hostedzone/ZDUMMYCOM","Name":"snaketron.com."}'
+  local shared_vpc_id="vpc-0123456789abcdef0"
+  local lookup_context='"availability-zones:account=111111111111:region=us-east-1":["us-east-1a","us-east-1b"],"availability-zones:account=111111111111:region=eu-west-1":["eu-west-1a","eu-west-1b"],"hosted-zone:account=111111111111:domainName=snaketron.io:region=us-east-1":{"Id":"/hostedzone/ZDUMMYIO","Name":"snaketron.io."},"hosted-zone:account=111111111111:domainName=snaketron.com:region=us-east-1":{"Id":"/hostedzone/ZDUMMYCOM","Name":"snaketron.com."},"hosted-zone:account=111111111111:domainName=snaketron.io:region=eu-west-1":{"Id":"/hostedzone/ZDUMMYIO","Name":"snaketron.io."},"hosted-zone:account=111111111111:domainName=snaketron.com:region=eu-west-1":{"Id":"/hostedzone/ZDUMMYCOM","Name":"snaketron.com."},"vpc-provider:account=111111111111:filter.vpc-id=vpc-0123456789abcdef0:region=us-east-1:returnAsymmetricSubnets=true":{"vpcId":"vpc-0123456789abcdef0","vpcCidrBlock":"10.1.0.0/16","ownerAccountId":"111111111111","availabilityZones":[],"subnetGroups":[{"name":"Public","type":"Public","subnets":[{"subnetId":"subnet-public-a","cidr":"10.1.0.0/24","availabilityZone":"us-east-1a","routeTableId":"rtb-public-a"}]},{"name":"Private","type":"Private","subnets":[{"subnetId":"subnet-private-a","cidr":"10.1.2.0/24","availabilityZone":"us-east-1a","routeTableId":"rtb-private-a"},{"subnetId":"subnet-private-b","cidr":"10.1.3.0/24","availabilityZone":"us-east-1b","routeTableId":"rtb-private-b"}]}]}'
   local development_context
   local production_context
-  development_context="{\"environment\":\"development\",\"ephemeral\":\"true\",\"ephemeralRunId\":\"1-1\",\"expiresAtEpoch\":\"$expires_at_epoch\",\"imageTag\":\"0000000000000000000000000000000000000000\",$lookup_context}"
+  development_context="{\"environment\":\"development\",\"ephemeral\":\"true\",\"sharedVpcId\":\"$shared_vpc_id\",\"ephemeralRunId\":\"1-1\",\"expiresAtEpoch\":\"$expires_at_epoch\",\"imageTag\":\"0000000000000000000000000000000000000000\",$lookup_context}"
   production_context="{\"environment\":\"production\",$lookup_context}"
 
   if ! (
@@ -501,7 +502,7 @@ require_staging_environment() {
     SNAKETRON_AWS_REGION
     SNAKETRON_REGION_CODE
     SNAKETRON_STAGING_REDIS_URL
-    SNAKETRON_VALKEY_REPLICATION_GROUP_ID
+    SNAKETRON_VALKEY_SERVERLESS_CACHE_NAME
     SNAKETRON_TRAEFIK_INSTANCE_ID
     SNAKETRON_TRAEFIK_METRICS_URL
   )
@@ -565,11 +566,8 @@ configure_staging_control_urls() {
 
   local tunneled=false
   if [[ "$staging_redis_control_url" != "$SNAKETRON_STAGING_REDIS_URL" ]]; then
-    is_loopback_url "$staging_redis_control_url" || {
-      echo "A differing SNAKETRON_STAGING_REDIS_CONTROL_URL must use a loopback tunnel" >&2
-      return 1
-    }
-    tunneled=true
+    echo "SNAKETRON_STAGING_REDIS_CONTROL_URL must preserve the Serverless cache hostname for TLS and cluster discovery" >&2
+    return 1
   fi
   if [[ "$staging_traefik_metrics_control_url" != "$SNAKETRON_TRAEFIK_METRICS_URL" ]]; then
     is_loopback_url "$staging_traefik_metrics_control_url" || {
@@ -783,44 +781,33 @@ verify_staging_identity() {
     return 1
   fi
 
-  aws elasticache describe-replication-groups \
+  aws elasticache describe-serverless-caches \
     --region "$SNAKETRON_AWS_REGION" \
-    --replication-group-id "$SNAKETRON_VALKEY_REPLICATION_GROUP_ID" \
+    --serverless-cache-name "$SNAKETRON_VALKEY_SERVERLESS_CACHE_NAME" \
     >"$identity_dir/valkey.json"
-  staging_valkey_arn="$(jq -r '.ReplicationGroups[0].ARN' "$identity_dir/valkey.json")"
-  staging_valkey_host="$(jq -r '.ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint.Address' "$identity_dir/valkey.json")"
-  staging_valkey_port="$(jq -r '.ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint.Port' "$identity_dir/valkey.json")"
-  staging_valkey_cluster_id="$(jq -r '.ReplicationGroups[0].MemberClusters[0]' "$identity_dir/valkey.json")"
-  jq -e '
-    (.ReplicationGroups | length) == 1
-    and .ReplicationGroups[0].Status == "available"
-    and (.ReplicationGroups[0].MemberClusters | length) == 1
+  jq -e --arg expected_name "$SNAKETRON_VALKEY_SERVERLESS_CACHE_NAME" '
+    (.ServerlessCaches | length) == 1
+    and .ServerlessCaches[0].ServerlessCacheName == $expected_name
+    and (.ServerlessCaches[0].Status | ascii_downcase) == "available"
+    and (.ServerlessCaches[0].Engine | ascii_downcase) == "valkey"
+    and (.ServerlessCaches[0].Endpoint.Address | type == "string" and length > 0)
+    and .ServerlessCaches[0].Endpoint.Port == 6379
   ' "$identity_dir/valkey.json" >/dev/null || {
-    echo "The named Valkey replication group is not one available single-node group" >&2
+    echo "The named Serverless Valkey cache is not one available TLS endpoint" >&2
     return 1
   }
+  staging_valkey_arn="$(jq -r '.ServerlessCaches[0].ARN' "$identity_dir/valkey.json")"
+  staging_valkey_name="$(jq -r '.ServerlessCaches[0].ServerlessCacheName' "$identity_dir/valkey.json")"
+  staging_valkey_host="$(jq -r '.ServerlessCaches[0].Endpoint.Address' "$identity_dir/valkey.json")"
+  staging_valkey_port="$(jq -r '.ServerlessCaches[0].Endpoint.Port' "$identity_dir/valkey.json")"
   aws elasticache list-tags-for-resource \
     --region "$SNAKETRON_AWS_REGION" \
     --resource-name "$staging_valkey_arn" >"$identity_dir/valkey-tags.json"
-  assert_aws_tags "$identity_dir/valkey-tags.json" TagList "Valkey replication group"
-  aws elasticache describe-cache-clusters \
-    --region "$SNAKETRON_AWS_REGION" \
-    --cache-cluster-id "$staging_valkey_cluster_id" \
-    --show-cache-node-info >"$identity_dir/valkey-cache-cluster.json"
-  staging_valkey_parameter_group="$(jq -r '.CacheClusters[0].CacheParameterGroup.CacheParameterGroupName' "$identity_dir/valkey-cache-cluster.json")"
-  aws elasticache describe-cache-parameters \
-    --region "$SNAKETRON_AWS_REGION" \
-    --cache-parameter-group-name "$staging_valkey_parameter_group" \
-    --source user >"$identity_dir/valkey-parameters.json"
-  jq -e '.Parameters[] | select(.ParameterName == "maxmemory-policy" and .ParameterValue == "noeviction")' \
-    "$identity_dir/valkey-parameters.json" >/dev/null || {
-      echo "Staging Valkey must explicitly use maxmemory-policy=noeviction" >&2
-      return 1
-    }
+  assert_aws_tags "$identity_dir/valkey-tags.json" TagList "Serverless Valkey cache"
 
-  local expected_redis_url="redis://$staging_valkey_host:$staging_valkey_port/"
-  if [[ "$SNAKETRON_STAGING_REDIS_URL" != "$expected_redis_url"* ]]; then
-    echo "SNAKETRON_STAGING_REDIS_URL does not name the tagged Valkey primary" >&2
+  local expected_redis_url="rediss://$staging_valkey_host:$staging_valkey_port/?protocol=resp3&cluster=true"
+  if [[ "$SNAKETRON_STAGING_REDIS_URL" != "$expected_redis_url" ]]; then
+    echo "SNAKETRON_STAGING_REDIS_URL must name the tagged Serverless cache with TLS, RESP3, and cluster mode" >&2
     return 1
   fi
   local target_origin
@@ -919,8 +906,9 @@ verify_staging_identity() {
     --arg runner_submodule_commit "$runner_submodule_commit" \
     --arg expected_submodule_commit "$expected_submodule_commit" \
     --arg valkey_arn "$staging_valkey_arn" \
-    --arg valkey_primary_host "$staging_valkey_host" \
-    --argjson valkey_primary_port "$staging_valkey_port" \
+    --arg valkey_name "$staging_valkey_name" \
+    --arg valkey_endpoint_host "$staging_valkey_host" \
+    --argjson valkey_endpoint_port "$staging_valkey_port" \
     --arg traefik_instance_id "$SNAKETRON_TRAEFIK_INSTANCE_ID" \
     --arg traefik_private_ip "$staging_traefik_private_ip" \
     --arg traefik_service_label "$staging_traefik_service_label" \
@@ -944,9 +932,10 @@ verify_staging_identity() {
       runner_submodule_commit: $runner_submodule_commit,
       expected_submodule_commit: $expected_submodule_commit,
       valkey_arn: $valkey_arn,
-      valkey_primary: {
-        host: $valkey_primary_host,
-        port: $valkey_primary_port
+      valkey_serverless_cache_name: $valkey_name,
+      valkey_endpoint: {
+        host: $valkey_endpoint_host,
+        port: $valkey_endpoint_port
       },
       traefik_instance_id: $traefik_instance_id,
       traefik_private_ip: $traefik_private_ip,
@@ -1656,24 +1645,33 @@ collect_cloudwatch_evidence() {
     Name=ClusterName,Value="$cluster_name" \
     Name=ServiceName,Value="$service_name"
 
-  cloudwatch_metric "$cloudwatch_dir/valkey-cpu.json" \
-    AWS/ElastiCache CPUUtilization Maximum \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
-  cloudwatch_metric "$cloudwatch_dir/valkey-memory.json" \
-    AWS/ElastiCache DatabaseMemoryUsagePercentage Maximum \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
+  cloudwatch_metric "$cloudwatch_dir/valkey-ecpu.json" \
+    AWS/ElastiCache ElastiCacheProcessingUnits Maximum \
+    Name=clusterId,Value="$staging_valkey_name"
+  cloudwatch_metric "$cloudwatch_dir/valkey-data-storage.json" \
+    AWS/ElastiCache BytesUsedForCache Maximum \
+    Name=clusterId,Value="$staging_valkey_name"
   cloudwatch_metric "$cloudwatch_dir/valkey-connections.json" \
     AWS/ElastiCache CurrConnections Maximum \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
+    Name=clusterId,Value="$staging_valkey_name"
   cloudwatch_metric "$cloudwatch_dir/valkey-read-latency.json" \
-    AWS/ElastiCache GetTypeCmdsLatency Average \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
+    AWS/ElastiCache SuccessfulReadRequestLatency Average \
+    Name=clusterId,Value="$staging_valkey_name"
   cloudwatch_metric "$cloudwatch_dir/valkey-write-latency.json" \
-    AWS/ElastiCache SetTypeCmdsLatency Average \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
+    AWS/ElastiCache SuccessfulWriteRequestLatency Average \
+    Name=clusterId,Value="$staging_valkey_name"
   cloudwatch_metric "$cloudwatch_dir/valkey-evictions.json" \
     AWS/ElastiCache Evictions Sum \
-    Name=CacheClusterId,Value="$staging_valkey_cluster_id"
+    Name=clusterId,Value="$staging_valkey_name"
+  cloudwatch_metric "$cloudwatch_dir/valkey-throttled-commands.json" \
+    AWS/ElastiCache ThrottledCmds Sum \
+    Name=clusterId,Value="$staging_valkey_name"
+  cloudwatch_metric "$cloudwatch_dir/valkey-network-in.json" \
+    AWS/ElastiCache NetworkBytesIn Sum \
+    Name=clusterId,Value="$staging_valkey_name"
+  cloudwatch_metric "$cloudwatch_dir/valkey-network-out.json" \
+    AWS/ElastiCache NetworkBytesOut Sum \
+    Name=clusterId,Value="$staging_valkey_name"
 
   cloudwatch_metric "$cloudwatch_dir/traefik-cpu.json" \
     AWS/EC2 CPUUtilization Maximum \
@@ -1717,11 +1715,36 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) < 90' \
-      "$cloudwatch_dir/valkey-memory.json" >/dev/null || {
-      echo "CloudWatch acceptance failed: readiness, recovery, ownership, checkpoint, drain, socket-envelope, eviction, or Valkey headroom evidence is outside bounds" >&2
-      return 1
+    && jq -e '([.Datapoints[].Sum] | add) == 0' \
+      "$cloudwatch_dir/valkey-throttled-commands.json" >/dev/null || {
+      echo "CloudWatch acceptance failed: readiness, recovery, ownership, checkpoint, drain, socket-envelope, Serverless Valkey eviction, or throttling evidence is outside bounds" >&2
+      return 2
   }
+}
+
+collect_cloudwatch_evidence_with_retry() {
+  local report_dir="$1"
+  local attempt
+  local status
+  for attempt in $(seq 1 8); do
+    # Run in an errexit-enabled subshell. Calling a function directly as an
+    # `if` condition disables Bash errexit inside that function and could let a
+    # missing metric fall through to the correctness gate.
+    set +e
+    ( set -e; collect_cloudwatch_evidence "$report_dir" )
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      return 0
+    fi
+    # Complete buckets with a failed correctness gate will not improve with
+    # ingestion time. Only missing/partial evidence receives a bounded retry.
+    if (( status == 2 || attempt == 8 )); then
+      return "$status"
+    fi
+    echo "CloudWatch evidence is not complete yet; retrying in 60 seconds ($attempt/8)" >&2
+    sleep 60
+  done
 }
 
 collect_container_insights_evidence() {
@@ -2305,10 +2328,9 @@ run_staging_suite() {
   local staging_image_digest=""
   local staging_image_commit=""
   local staging_valkey_arn=""
+  local staging_valkey_name=""
   local staging_valkey_host=""
   local staging_valkey_port=""
-  local staging_valkey_cluster_id=""
-  local staging_valkey_parameter_group=""
   local staging_traefik_ip=""
   local staging_traefik_private_ip=""
   # Populated from the verified task definition's router label. Callers cannot
@@ -3621,7 +3643,7 @@ run_staging_suite() {
   # CloudWatch datapoints commonly arrive after their measurement timestamp.
   # Waiting changes no cloud state and prevents a false pass on partial data.
   sleep 120
-  collect_cloudwatch_evidence "$report_dir"
+  collect_cloudwatch_evidence_with_retry "$report_dir"
   collect_container_insights_evidence "$report_dir"
 
   echo "Staging evidence written to $report_dir"

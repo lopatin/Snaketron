@@ -1843,6 +1843,7 @@ async fn drain_pending_completions(
         let record = bus
             .load_pending_completion(guard.namespace(), guard.partition(), game_id)
             .await?;
+        bus.cleanup_matchmaking_for_completion(&record).await?;
         for effect in &record.effects {
             if db.apply_completion_effect(&record, effect).await?
                 == EffectApplyResult::AlreadyApplied
@@ -2476,7 +2477,7 @@ mod tests {
             );
             let _: () = raw
                 .set(
-                    namespace.assignment(),
+                    namespace.partition_assignment(partition),
                     serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
                 )
                 .await?;
@@ -2617,7 +2618,7 @@ mod tests {
             let _: () = self
                 .raw
                 .del(&[
-                    self.namespace.assignment(),
+                    self.namespace.partition_assignment(self.partition),
                     live_guard.lease_key(),
                     self.namespace.recovery(self.game_id),
                     self.namespace.recovery_failure(self.game_id),
@@ -3453,7 +3454,7 @@ mod tests {
             let _: () = harness
                 .raw
                 .set(
-                    harness.namespace.assignment(),
+                    harness.namespace.partition_assignment(harness.partition),
                     serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
                 )
                 .await?;
@@ -4138,7 +4139,7 @@ mod tests {
         );
         let _: () = raw
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -4177,7 +4178,7 @@ mod tests {
         stop.cancel();
         watchdog.await?;
         let _: () = raw
-            .del(&[namespace.assignment(), guard.lease_key()])
+            .del(&[namespace.partition_assignment(partition), guard.lease_key()])
             .await?;
         Ok(())
     }

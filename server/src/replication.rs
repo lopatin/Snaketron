@@ -20,6 +20,10 @@ struct ReplicatedGame {
 
 type ReplicaStore = Arc<RwLock<HashMap<u32, ReplicatedGame>>>;
 
+fn should_warn_unknown_event(event: &GameEventMessage) -> bool {
+    !(event.stream_seq == 0 && matches!(&event.event, GameEvent::CommandRejected { .. }))
+}
+
 async fn replica_snapshot(store: &ReplicaStore, game_id: u32) -> Option<(GameState, u64)> {
     let replicas = store.read().await;
     replicas
@@ -345,7 +349,18 @@ impl PartitionReplica {
                             replica.stream_seq = event_msg.stream_seq;
                         }
                     } else {
-                        warn!("Received event for unknown game {}", game_id);
+                        if should_warn_unknown_event(&event_msg) {
+                            warn!("Received state event for unknown game {}", game_id);
+                        } else {
+                            // A rejection is an out-of-band command outcome and
+                            // does not mutate replica state. Missing stateful
+                            // events still warn, so this expected race can stay
+                            // at debug without masking a cold replica.
+                            debug!(
+                                "Received command rejection for unknown local replica {}",
+                                game_id
+                            );
+                        }
                     }
                 }
             }
@@ -766,11 +781,10 @@ impl ReplicationManager {
         // from the main server's connection. The push channel only satisfies
         // the shared connection-manager config; nothing here subscribes to
         // Pub/Sub pushes.
-        let redis_client = redis::Client::open(redis_url)?;
         let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
+        let redis_client = crate::redis_utils::RedisClient::open(redis_url, Some(pubsub_tx))?;
         let redis = crate::redis_utils::create_connection_manager_until_available(
             redis_client.clone(),
-            pubsub_tx.clone(),
             cancellation_token.clone(),
         )
         .await?;
@@ -862,7 +876,7 @@ impl ReplicationManager {
 mod tests {
     use super::{
         ContinuityAction, FilteredEventReceiver, ReplicaStore, ReplicatedGame, continuity_action,
-        replica_snapshot,
+        replica_snapshot, should_warn_unknown_event,
     };
     use common::{GameEvent, GameEventMessage, GameState, GameType, QueueMode};
     use std::collections::{HashMap, HashSet};
@@ -961,6 +975,13 @@ mod tests {
         tx.send(rejection).unwrap();
         let got = filtered.recv().await.unwrap();
         assert!(matches!(got.event, GameEvent::CommandRejected { .. }));
+        assert!(!should_warn_unknown_event(&got));
+    }
+
+    #[test]
+    fn unknown_state_events_remain_warning_worthy() {
+        assert!(should_warn_unknown_event(&event(1, 1)));
+        assert!(should_warn_unknown_event(&snapshot(1, 1)));
     }
 
     #[tokio::test]

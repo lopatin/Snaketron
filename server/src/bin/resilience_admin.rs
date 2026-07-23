@@ -4,13 +4,13 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use common::{GameType, QueueMode};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use redis::streams::{StreamPendingCountReply, StreamPendingId, StreamPendingReply};
 use serde::Serialize;
 use server::cluster_membership::{BootIdentity, ClusterNamespace, TaskMembership};
 use server::game_executor::PARTITION_COUNT;
 use server::partition_assignment::{AssignmentDocument, AssignmentStore};
 use server::redis_keys::RedisKeys;
+use server::redis_utils::{RedisClient, RedisConnection};
 use std::env;
 use uuid::Uuid;
 
@@ -99,7 +99,7 @@ fn parse_args() -> Result<Args> {
 }
 
 async fn read_live_members(
-    redis: &mut ConnectionManager,
+    redis: &mut RedisConnection,
     namespace: &ClusterNamespace,
     now_ms: i64,
 ) -> Result<Vec<TaskMembership>> {
@@ -137,7 +137,7 @@ fn parse_active_owner(token: &str) -> Option<String> {
 }
 
 async fn read_partition(
-    redis: &mut ConnectionManager,
+    redis: &mut RedisConnection,
     namespace: &ClusterNamespace,
     assignment: Option<&AssignmentDocument>,
     partition: u32,
@@ -211,8 +211,11 @@ async fn read_partition(
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let namespace = ClusterNamespace::new(args.region_key.clone())?;
-    let client = redis::Client::open(args.redis_url.as_str()).context("invalid Redis URL")?;
-    let connection = ConnectionManager::new(client)
+    let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+    let client =
+        RedisClient::open(args.redis_url.as_str(), Some(push_tx)).context("invalid Redis URL")?;
+    let connection = client
+        .get_managed_connection()
         .await
         .context("failed to connect to Valkey")?;
     let assignment = AssignmentStore::new(connection.clone(), namespace.clone())

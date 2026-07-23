@@ -14,6 +14,7 @@ use crate::recovery::{
     validate_client_command_identity,
 };
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 use crate::replication::GameStateReader;
 use crate::user_cache::UserCache;
 use anyhow::{Context, Result, anyhow};
@@ -23,7 +24,6 @@ use common::{
 };
 use futures_util::SinkExt;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -412,7 +412,7 @@ pub async fn handle_websocket(
     db: Arc<dyn Database>,
     user_cache: UserCache,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     pubsub_manager: Arc<PubSubManager>,
     game_bus: Arc<GameBus>,
@@ -462,7 +462,7 @@ async fn handle_websocket_connection(
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
     replication_manager: Arc<crate::replication::ReplicationManager>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
@@ -1053,7 +1053,7 @@ async fn handle_websocket_connection(
 }
 
 async fn publish_lobby_chat_message(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     payload: LobbyChatBroadcast,
 ) -> Result<()> {
     let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
@@ -1079,7 +1079,7 @@ async fn publish_lobby_chat_message(
 }
 
 async fn publish_game_chat_message(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     payload: GameChatBroadcast,
 ) -> Result<()> {
     let channel = RedisKeys::game_chat_channel(payload.game_id);
@@ -1186,7 +1186,7 @@ async fn compute_lobby_avg_mmr(db: &Arc<dyn Database>, members: &[LobbyMember]) 
 }
 
 async fn load_lobby_chat_history(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     lobby_code: &str,
 ) -> Result<Vec<LobbyChatBroadcast>> {
     let key = RedisKeys::lobby_chat_history_key(lobby_code);
@@ -1212,7 +1212,7 @@ async fn load_lobby_chat_history(
 }
 
 async fn load_game_chat_history(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     game_id: u32,
 ) -> Result<Vec<GameChatBroadcast>> {
     let key = RedisKeys::game_chat_history_key(game_id);
@@ -2459,7 +2459,7 @@ fn unsent_lobby_match(mapped_game_id: Option<u32>, last_sent_game_id: Option<u32
 
 async fn reconcile_lobby_match(
     lobby_code: &str,
-    redis: &mut ConnectionManager,
+    redis: &mut RedisConnection,
     ws_tx: &mpsc::Sender<Message>,
     last_sent_game_id: &mut Option<u32>,
 ) -> bool {
@@ -2527,10 +2527,11 @@ async fn reconcile_lobby_match(
 async fn subscribe_to_lobby_match_notifications(
     lobby_code: String,
     pubsub_manager: Arc<PubSubManager>,
-    mut redis: ConnectionManager,
+    redis: impl Into<RedisConnection>,
     ws_tx: mpsc::Sender<Message>,
     cancellation_token: CancellationToken,
 ) {
+    let mut redis = redis.into();
     let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
     let mut manager = (*pubsub_manager).clone();
     let mut last_sent_game_id = None;
@@ -2731,7 +2732,7 @@ async fn process_ws_message(
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
-    redis: &ConnectionManager,
+    redis: &RedisConnection,
     _redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     websocket_id: &str,

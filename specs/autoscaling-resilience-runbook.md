@@ -11,10 +11,12 @@ compatibility gate.
 - `minTasks=1` is intentional. If the sole task dies, the region is unavailable
   until ECS starts a replacement. Games recover only while their Valkey
   checkpoints remain inside `SNAKETRON_RECOVERY_RETENTION_MS`.
-- Regional Valkey is one non-clustered node. A Valkey outage or loss can take
-  the region down. `maxmemory-policy=noeviction` is required so memory pressure
-  rejects writes visibly instead of silently deleting leases, streams,
-  assignments, or checkpoints.
+- Regional Valkey is one logical ElastiCache Serverless cache. A cache outage or
+  data loss can take the region down. Serverless is TLS-only, cluster-mode-only,
+  and fixes `maxmemory-policy=volatile-lru`; CDK deliberately sets no data or
+  ECPU maximum. Any `Evictions` or `ThrottledCmds` sample is a release failure
+  and production alarm because leases, streams, assignments, and checkpoints
+  are correctness-bearing.
 - Traefik/NAT remains a single ingress dependency. Its failure is outside this
   release's availability guarantee.
 - A hard gateway crash necessarily drops its sockets. Clients reconnect
@@ -26,17 +28,24 @@ compatibility gate.
 
 ## First deployment
 
-Take maintenance downtime, stop the superseded service, discard its ephemeral
-runtime state or use an empty dedicated keyspace, and deploy the new server and
-client together. No live migration or transition behavior is implemented or
-tested.
+Take maintenance downtime and deploy the new cache, server, and client as one
+direct cutoff. The current Server stacks in both regions import the old Valkey
+endpoint exports, so an ordinary first `cdk deploy --all` cannot replace those
+exports. Before the first Serverless deployment, delete
+`Snaketron-Monitoring-prod-use1`, then `Snaketron-Server-prod-use1` in
+`us-east-1`; delete `Snaketron-Monitoring-prod-euw1`, then
+`Snaketron-Server-prod-euw1` in `eu-west-1`; wait for all four deletions; and
+only then run the production workflow to replace Valkey and redeploy every
+stack. This is a one-time operator action during the accepted downtime, not
+application migration machinery. No live migration, dual exports,
+mixed-version mode, or transition behavior is implemented or tested.
 
 For steady-state inspection after startup:
 
 ```bash
 cargo run -p server --release --bin resilience_admin -- status \
   --region-key use1 \
-  --redis-url redis://REGIONAL_VALKEY:6379/
+  --redis-url 'rediss://SERVERLESS_VALKEY:6379/?protocol=resp3&cluster=true'
 ```
 
 ## Local verification
@@ -80,10 +89,13 @@ command-owning socket. The Rust suite separately proves that group-aware command
 trimming retains and reclaims a backlog beyond 8,192 pending entries, trims only
 after ACK, and that the one-second checkpoint cadence and fail-closed checkpoint
 age budget are independent of game tick duration. These are deterministic local
-acceptance results, not additional staging fault actions.
+acceptance results, not additional staging fault actions. Local standalone
+Valkey preserves numbered test databases; static key-family tests cover Cluster
+slot compatibility. Only the public ephemeral run against actual ElastiCache
+Serverless proves TLS, cluster routing across every slot family, and provider behavior.
 
 That test is deliberately local-only and mutation-safe: it refuses non-loopback
-hosts, requires dedicated Valkey database 14, serializes itself with a Redis
+hosts, requires dedicated standalone Valkey database 14, serializes itself with a Redis
 lock, and deletes only its exact stream and namespaced keys. To run it alone:
 
 ```bash
@@ -156,8 +168,9 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 
 1. All tasks should become unready while liveness stays healthy. Do not create
    an ECS restart storm.
-2. `Evictions` must remain zero. If writes are rejected, reduce admission/load
-   or increase cache capacity; never switch to an evicting policy.
+2. `Evictions` and `ThrottledCmds` must remain zero. If either is nonzero,
+   preserve diagnostics and stop the release. Do not add a storage/ECPU ceiling
+   or pretend Serverless can be configured to `noeviction`.
 3. After restoration, allow exact-token leases and consumer pending state to
    reconcile. Do not bypass fencing or reset cursors.
 
@@ -243,30 +256,35 @@ results for:
   one logical outcome per command, and restored healthy ECS capacity.
 
 Neither the planned staging run nor the non-production task-SIGKILL result has
-been executed and attached in this repository. The release remains blocked
-until both pass. Local success alone is not evidence of ECS routing and
-autoscaling behavior.
+a passing report attached in this repository. The first public planned-path run
+failed and motivated the Serverless migration; it is diagnostic evidence, not
+release evidence. The release remains blocked until both Serverless-backed runs
+pass. Local success alone is not evidence of ECS routing and autoscaling behavior.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
-The runner reads the private regional Valkey through `resilience_admin` and
+The runner reads the private regional Serverless Valkey through `resilience_admin` and
 scrapes Traefik metrics. The canonical `SNAKETRON_STAGING_REDIS_URL` and
 `SNAKETRON_TRAEFIK_METRICS_URL` are always identity-checked against the tagged
-deployment. Actual control traffic may use the optional
-`SNAKETRON_STAGING_REDIS_CONTROL_URL` and
-`SNAKETRON_TRAEFIK_METRICS_CONTROL_URL`. If either differs, it must be loopback
-and `SNAKETRON_CONTROL_TUNNEL_INSTANCE_ID` must equal the already verified
-Traefik instance. Run from a VPC-connected host, VPN, or such an SSM tunnel;
-public HTTPS access alone is insufficient.
+deployment. `SNAKETRON_STAGING_REDIS_CONTROL_URL` must equal the canonical URL
+so TLS SNI and Cluster topology retain the real cache hostname. Traefik control
+traffic may use a differing loopback
+`SNAKETRON_TRAEFIK_METRICS_CONTROL_URL`; then
+`SNAKETRON_CONTROL_TUNNEL_INSTANCE_ID` must equal the already verified Traefik
+instance. Run from a VPC-connected host, VPN, or such an SSM tunnel;
+public HTTPS access alone is insufficient. The certification workflow preserves
+the real cache hostname in the `rediss://` URL, maps that hostname to loopback,
+and forwards local port 6379 through SSM so rustls still validates the AWS
+certificate and cluster discovery retains the deployment identity.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
-ManagedBy=CDK tags on the ECS service/cluster, Valkey replication group, and
+ManagedBy=CDK tags on the ECS service/cluster, Serverless Valkey cache, and
 Traefik instance. It also verifies the task definition points at that
-environment, logical/AWS region, public origin, and Valkey primary; DNS points
-at that Traefik instance; Valkey is the expected available single node with
-noeviction; and the supplied Prometheus endpoint belongs to that same instance.
+environment, logical/AWS region, public origin, and exact TLS/RESP3/cluster
+Valkey endpoint; DNS points at that Traefik instance; the cache is available;
+and the supplied Prometheus endpoint belongs to that same instance.
 The running image digest must carry exactly one outer-repository commit tag
 matching the runner's outer checkout. Both the outer checkout and Snaketron
 submodule must be clean, and the submodule HEAD must equal the outer commit's
@@ -293,9 +311,9 @@ SNAKETRON_ECS_CLUSTER=STAGING_CLUSTER \
 SNAKETRON_ECS_SERVICE=STAGING_SERVICE \
 SNAKETRON_AWS_REGION=us-east-1 \
 SNAKETRON_REGION_CODE=use1 \
-SNAKETRON_STAGING_REDIS_URL=redis://STAGING_VALKEY:6379/ \
-SNAKETRON_STAGING_REDIS_CONTROL_URL=redis://127.0.0.1:16379/ \
-SNAKETRON_VALKEY_REPLICATION_GROUP_ID=snaketron-valkey-dev-use1 \
+SNAKETRON_STAGING_REDIS_URL='rediss://STAGING_SERVERLESS_VALKEY:6379/?protocol=resp3&cluster=true' \
+SNAKETRON_STAGING_REDIS_CONTROL_URL='rediss://STAGING_SERVERLESS_VALKEY:6379/?protocol=resp3&cluster=true' \
+SNAKETRON_VALKEY_SERVERLESS_CACHE_NAME=snaketron-valkey-serverless-dev-use1 \
 SNAKETRON_TRAEFIK_INSTANCE_ID=i-0123456789abcdef0 \
 SNAKETRON_CONTROL_TUNNEL_INSTANCE_ID=i-0123456789abcdef0 \
 SNAKETRON_TRAEFIK_METRICS_URL=http://TRAEFIK_PRIVATE_IP:9090/metrics \
@@ -308,7 +326,12 @@ The “Ephemeral Development Certification” workflow provisions one short-live
 development environment, opens both SSM tunnels, runs those commands in that
 order, uploads both evidence directories, and always destroys and verifies the
 absence of the ephemeral stacks afterward. It does not preserve or transition
-state from a previous deployment.
+state from a previous deployment. The workflow discovers and validates the
+production Network stack's VPC, then imports it read-only. Development owns only
+its separately tagged security groups, Serverless cache, ECS resources,
+Traefik/EIP, and run-unique DNS record; cleanup must prove the shared VPC still
+exists and must never create, replace, or delete its routes, endpoints, or flow
+logs.
 
 At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
@@ -375,12 +398,13 @@ opaque per-task service IDs, and matches settled tasks by exact private-IP
 `:8080` URL. It fails on any scrape error or zero-healthy-backend sample.
 Settled ECS phase snapshots
 require every running task to be healthy. After CloudWatch ingestion settles,
-the runner requires complete time-bucket coverage for ECS CPU/memory, ElastiCache
-CPU/memory/connections/evictions, Traefik-host CPU/network, and resilience
+the runner requires complete time-bucket coverage for ECS CPU/memory, Serverless
+Valkey bytes/ECPU/read-write latency/connections/network/evictions/throttling,
+Traefik-host CPU/network, and resilience
 metric series. It also saves and gates a Container Insights Logs Insights result
 with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
-ownership/index mismatch, planned drain failure, unexpected Valkey eviction,
-insufficient Valkey memory headroom, or failure to corroborate the measured
+ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
+command, or failure to corroborate the measured
 phase envelopes (at least 295 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

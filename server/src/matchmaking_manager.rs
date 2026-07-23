@@ -1,10 +1,10 @@
 use crate::db::Database;
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use common::GameType;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -52,7 +52,7 @@ pub enum MatchStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchCommitOutcome {
-    Committed { stream_id: String },
+    Committed { outbox_id: String },
     AlreadyCommitted,
     Conflict { reason: String },
 }
@@ -84,13 +84,43 @@ struct MatchCommitUser {
 #[derive(Serialize)]
 struct MatchCommitPlan {
     active_matches_key: String,
-    command_stream_key: String,
+    outbox_key: String,
+    outbox_payload: String,
     game_id: String,
     active_match_json: String,
-    game_created_payload: String,
     lobbies: Vec<MatchCommitLobby>,
     users: Vec<MatchCommitUser>,
     notifications: Vec<MatchCommitNotification>,
+}
+
+const GAME_CREATED_OUTBOX_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameCreatedOutboxRecord {
+    pub schema_version: u16,
+    pub game_id: u32,
+    pub partition_id: u32,
+    pub game_created_payload: String,
+}
+
+impl GameCreatedOutboxRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != GAME_CREATED_OUTBOX_SCHEMA_VERSION {
+            return Err(anyhow!("unsupported game-created outbox schema"));
+        }
+        if self.partition_id != self.game_id % crate::game_executor::PARTITION_COUNT {
+            return Err(anyhow!("game-created outbox partition mismatch"));
+        }
+        match serde_json::from_str::<crate::game_executor::StreamEvent>(&self.game_created_payload)?
+        {
+            crate::game_executor::StreamEvent::GameCreated { game_id, .. }
+                if game_id == self.game_id =>
+            {
+                Ok(())
+            }
+            _ => Err(anyhow!("game-created outbox payload identity mismatch")),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -274,8 +304,9 @@ return {1, 'removed'}
 
 // Redis scripts are isolated but do not roll back commands that precede a
 // runtime script error. Validate every key type and every claim predicate
-// before issuing the first write; with the service's non-evicting Valkey
-// policy, the write phase then consists only of type-safe commands.
+// before issuing the first write. The write phase then uses only validated
+// key types; any Serverless capacity rejection is surfaced to the caller and
+// the match is treated as uncommitted unless the durable record is observed.
 const COMMIT_MATCH_SCRIPT: &str = r#"
 local plan = cjson.decode(ARGV[1])
 
@@ -292,9 +323,9 @@ if active_type ~= 'none' and active_type ~= 'hash' then
     return {0, 'active-matches-wrong-type'}
 end
 
-local stream_type = key_type(plan.command_stream_key)
-if stream_type ~= 'none' and stream_type ~= 'stream' then
-    return {0, 'command-stream-wrong-type'}
+local outbox_type = key_type(plan.outbox_key)
+if outbox_type ~= 'none' and outbox_type ~= 'hash' then
+    return {0, 'game-created-outbox-wrong-type'}
 end
 
 local existing = redis.call('HGET', plan.active_matches_key, plan.game_id)
@@ -303,6 +334,11 @@ if existing then
         return {2, 'already-committed'}
     end
     return {0, 'game-id-already-committed'}
+end
+
+local existing_outbox = redis.call('HGET', plan.outbox_key, plan.game_id)
+if existing_outbox and existing_outbox ~= plan.outbox_payload then
+    return {0, 'game-created-outbox-conflict'}
 end
 
 for _, lobby in ipairs(plan.lobbies) do
@@ -371,28 +407,88 @@ for _, user in ipairs(plan.users) do
     redis.call('DEL', user.queue_identity_key)
 end
 
-local stream_id = redis.call(
-    'XADD', plan.command_stream_key, '*', 'data', plan.game_created_payload
-)
+redis.call('HSET', plan.outbox_key, plan.game_id, plan.outbox_payload)
 for _, notification in ipairs(plan.notifications) do
     redis.call('PUBLISH', notification.channel, notification.payload)
 end
-return {1, stream_id}
+return {1, plan.game_id}
 "#;
+
+impl LobbyAdmissionPlan {
+    fn redis_keys(&self) -> Vec<&str> {
+        let mut keys = vec![
+            self.lobby_active_game_key.as_str(),
+            self.lobby_metadata_key.as_str(),
+            self.queue_identity_key.as_str(),
+        ];
+        keys.extend(self.user_active_game_keys.iter().map(String::as_str));
+        keys.extend(
+            self.user_queue_claims
+                .iter()
+                .map(|claim| claim.key.as_str()),
+        );
+        for pair in &self.queue_pairs {
+            keys.push(&pair.queue_key);
+            keys.push(&pair.mmr_key);
+        }
+        keys
+    }
+}
+
+impl LobbyRemovalPlan {
+    fn redis_keys(&self) -> Vec<&str> {
+        let mut keys = vec![
+            self.lobby_active_game_key.as_str(),
+            self.lobby_metadata_key.as_str(),
+            self.queue_identity_key.as_str(),
+        ];
+        keys.extend(
+            self.user_queue_claims
+                .iter()
+                .map(|claim| claim.key.as_str()),
+        );
+        for pair in &self.queue_pairs {
+            keys.push(&pair.queue_key);
+            keys.push(&pair.mmr_key);
+        }
+        keys
+    }
+}
+
+impl MatchCommitPlan {
+    fn redis_keys(&self) -> Vec<&str> {
+        let mut keys = vec![self.active_matches_key.as_str(), self.outbox_key.as_str()];
+        for lobby in &self.lobbies {
+            keys.push(&lobby.active_game_key);
+            keys.push(&lobby.metadata_key);
+            keys.push(&lobby.queue_identity_key);
+            for pair in &lobby.queue_pairs {
+                keys.push(&pair.queue_key);
+                keys.push(&pair.mmr_key);
+            }
+        }
+        for user in &self.users {
+            keys.push(&user.active_game_key);
+            keys.push(&user.queue_status_key);
+            keys.push(&user.queue_identity_key);
+        }
+        keys
+    }
+}
 
 /// Redis-based matchmaking manager
 #[derive(Clone)]
 pub struct MatchmakingManager {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     max_retries: u32,
     retry_delay: Duration,
 }
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
-    pub fn new(redis: ConnectionManager) -> Result<Self> {
+    pub fn new(redis: impl Into<RedisConnection>) -> Result<Self> {
         Ok(Self {
-            redis,
+            redis: redis.into(),
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
         })
@@ -466,7 +562,11 @@ impl MatchmakingManager {
 
         let (code, detail) = loop {
             attempts += 1;
-            match script
+            let mut invocation = script.prepare_invoke();
+            for key in plan.redis_keys() {
+                invocation.key(key);
+            }
+            match invocation
                 .arg(&plan_json)
                 .invoke_async::<(i64, String)>(&mut self.redis)
                 .await
@@ -703,7 +803,12 @@ impl MatchmakingManager {
 
     async fn execute_lobby_removal(&mut self, plan: LobbyRemovalPlan) -> Result<bool> {
         let plan_json = serde_json::to_string(&plan)?;
-        let (code, detail): (i64, String) = redis::Script::new(REMOVE_LOBBY_SCRIPT)
+        let script = redis::Script::new(REMOVE_LOBBY_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        for key in plan.redis_keys() {
+            invocation.key(key);
+        }
+        let (code, detail): (i64, String) = invocation
             .arg(plan_json)
             .invoke_async(&mut self.redis)
             .await
@@ -816,12 +921,19 @@ impl MatchmakingManager {
                 payload: notification_payload.clone(),
             })
             .collect();
+        let outbox_record = GameCreatedOutboxRecord {
+            schema_version: GAME_CREATED_OUTBOX_SCHEMA_VERSION,
+            game_id,
+            partition_id,
+            game_created_payload: game_created_payload.to_string(),
+        };
+        outbox_record.validate()?;
         let plan = MatchCommitPlan {
             active_matches_key: RedisKeys::matchmaking_active_matches(),
-            command_stream_key: RedisKeys::stream_commands(partition_id),
+            outbox_key: RedisKeys::matchmaking_game_created_outbox(),
+            outbox_payload: serde_json::to_string(&outbox_record)?,
             game_id: game_id.to_string(),
             active_match_json: active_match_json.clone(),
-            game_created_payload: game_created_payload.to_string(),
             lobbies: commit_lobbies,
             users: commit_users,
             notifications,
@@ -832,7 +944,11 @@ impl MatchmakingManager {
         let mut delay = self.retry_delay;
         let (code, detail) = loop {
             attempts += 1;
-            match script
+            let mut invocation = script.prepare_invoke();
+            for key in plan.redis_keys() {
+                invocation.key(key);
+            }
+            match invocation
                 .arg(&plan_json)
                 .invoke_async::<(i64, String)>(&mut self.redis)
                 .await
@@ -867,7 +983,7 @@ impl MatchmakingManager {
         };
 
         match code {
-            1 => Ok(MatchCommitOutcome::Committed { stream_id: detail }),
+            1 => Ok(MatchCommitOutcome::Committed { outbox_id: detail }),
             2 => Ok(MatchCommitOutcome::AlreadyCommitted),
             0 => {
                 crate::resilience_metrics::record_match_claim_conflicts(1);
@@ -890,6 +1006,51 @@ impl MatchmakingManager {
         match match_json {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
+        }
+    }
+
+    pub async fn scan_game_created_outbox(
+        &mut self,
+        cursor: u64,
+    ) -> Result<(u64, Vec<(String, String)>)> {
+        redis::cmd("HSCAN")
+            .arg(RedisKeys::matchmaking_game_created_outbox())
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(100_u32)
+            .query_async(&mut self.redis)
+            .await
+            .context("failed to scan game-created outbox")
+    }
+
+    pub async fn acknowledge_game_created_outbox(
+        &mut self,
+        game_id: u32,
+        expected_payload: &str,
+    ) -> Result<bool> {
+        let result: i32 = redis::Script::new(
+            r#"
+            local current = redis.call('HGET', KEYS[1], ARGV[1])
+            if not current then return 0 end
+            if current ~= ARGV[2] then return -1 end
+            return redis.call('HDEL', KEYS[1], ARGV[1])
+            "#,
+        )
+        .key(RedisKeys::matchmaking_game_created_outbox())
+        .arg(game_id)
+        .arg(expected_payload)
+        .invoke_async(&mut self.redis)
+        .await
+        .context("failed to acknowledge game-created outbox record")?;
+        match result {
+            1 => Ok(true),
+            0 => Ok(false),
+            -1 => Err(anyhow!(
+                "game-created outbox payload changed before acknowledgement"
+            )),
+            other => Err(anyhow!(
+                "game-created outbox acknowledgement returned {other}"
+            )),
         }
     }
 

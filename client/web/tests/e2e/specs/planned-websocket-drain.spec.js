@@ -80,6 +80,15 @@ async function emitServerMessage(page, socketIndex, message) {
   }, { socketIndex, message });
 }
 
+async function emitPongThenQueuedOldMessage(page, socketIndex, pong, queuedMessage) {
+  await page.evaluate(({ socketIndex, pong, queuedMessage }) => {
+    const socket = window.__mockSockets[socketIndex];
+    const alreadyQueuedHandler = socket.onmessage;
+    socket.serverMessage(pong);
+    alreadyQueuedHandler?.({ data: JSON.stringify(queuedMessage) });
+  }, { socketIndex, pong, queuedMessage });
+}
+
 async function sendCommandProbe(page, probe) {
   await page.evaluate((value) => {
     window.__wsContext.sendMessage({ GameCommandV2: { probe: value } });
@@ -92,6 +101,20 @@ async function socketMessages(page, socketIndex, messageType) {
       .map((raw) => JSON.parse(raw))
       .filter((message) => Object.prototype.hasOwnProperty.call(message, messageType))
   ), { socketIndex, messageType });
+}
+
+async function continuityPings(page, socketIndex) {
+  return (await socketMessages(page, socketIndex, 'Ping'))
+    .filter((message) => Number(message.Ping.client_time) < 0);
+}
+
+async function confirmContinuityProbe(page, oldSocketIndex) {
+  await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
+  const [{ Ping: { client_time: clientTime } }] = await continuityPings(page, oldSocketIndex);
+  await emitServerMessage(page, oldSocketIndex, {
+    Pong: { client_time: clientTime, server_time: Date.now() },
+  });
+  return clientTime;
 }
 
 async function expectOldSocketUsableWithoutOverlay(page, oldSocketIndex) {
@@ -159,7 +182,7 @@ async function establishActiveGame(page) {
   return oldSocketIndex;
 }
 
-async function beginDrain(page, oldSocketIndex, { autoOpen = true } = {}) {
+async function beginDrain(page, oldSocketIndex, { autoOpen = true, deadlineMs = 15_000 } = {}) {
   // Candidate opening is explicit so its handlers are certainly attached
   // before the mock backend fires `open`.
   await page.evaluate(() => {
@@ -167,7 +190,7 @@ async function beginDrain(page, oldSocketIndex, { autoOpen = true } = {}) {
   });
   const socketCountBeforeDrain = await page.evaluate(() => window.__mockSockets.length);
   await emitServerMessage(page, oldSocketIndex, {
-    Drain: { task_boot_id: 'old-task', deadline_unix_ms: Date.now() + 15_000 },
+    Drain: { task_boot_id: 'old-task', deadline_unix_ms: Date.now() + deadlineMs },
   });
   await expect.poll(() => page.evaluate(() => window.__mockSockets.length))
     .toBeGreaterThan(socketCountBeforeDrain);
@@ -355,6 +378,29 @@ test('planned drain keeps the old game socket usable until the replacement is fu
   expect(candidateCommandsBeforeBarrier).toEqual([]);
 
   await emitServerMessage(page, candidateSocketIndex, { CommandOutcomesComplete: { game_id: 42 } });
+  await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
+  await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
+  expect(await page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
+    tick: 8,
+    streamSequence: 13,
+  });
+
+  const [{ Ping: { client_time: continuityClientTime } }] = await continuityPings(
+    page,
+    oldSocketIndex,
+  );
+  await emitServerMessage(page, oldSocketIndex, {
+    Pong: { client_time: continuityClientTime - 1, server_time: Date.now() },
+  });
+  await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
+  expect(await continuityPings(page, oldSocketIndex)).toHaveLength(1);
+
+  await emitPongThenQueuedOldMessage(
+    page,
+    oldSocketIndex,
+    { Pong: { client_time: continuityClientTime, server_time: Date.now() } },
+    snapshot(15, 100),
+  );
   await expect.poll(() => page.evaluate(({ oldSocketIndex, candidateSocketIndex }) => ({
     activeSocket: window.__mockSockets.indexOf(window.__wsInstance),
     oldReadyState: window.__mockSockets[oldSocketIndex].readyState,
@@ -373,6 +419,14 @@ test('planned drain keeps the old game socket usable until the replacement is fu
   await expect.poll(() => page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
     tick: 99,
     streamSequence: 14,
+  });
+  // The Pong proves transport overlap, not a stream fence. A frame already
+  // queued on the retired socket is ignored; the candidate's independent
+  // replica subscription delivers the same authoritative sequence.
+  await emitServerMessage(page, candidateSocketIndex, snapshot(15, 100));
+  await expect.poll(() => page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
+    tick: 100,
+    streamSequence: 15,
   });
 
   await sendCommandProbe(page, 'after-promotion');
@@ -453,6 +507,7 @@ test('a warming replacement retries the game on the same authenticated socket', 
   await emitServerMessage(page, candidateSocketIndex, {
     CommandOutcomesComplete: { game_id: 42 },
   });
+  await confirmContinuityProbe(page, oldSocketIndex);
   await expect.poll(() => page.evaluate((index) => (
     window.__mockSockets.indexOf(window.__wsInstance) === index
   ), candidateSocketIndex)).toBe(true);
@@ -595,12 +650,15 @@ for (const failurePhase of [
       await emitServerMessage(page, candidateSocketIndex, snapshot(10, 90));
     }
     if (failurePhase === 'outcomes-before-continuity') {
-      // Advance the active stream after the candidate snapshot. Even with its
-      // outcomes barrier, the candidate must not promote behind this watermark.
+      // Reach the final candidate watermark and outcome barrier, but withhold
+      // the old-path Pong. Readiness alone must not promote or close the old
+      // command owner.
       await emitServerMessage(page, oldSocketIndex, snapshot(11, 6));
       await emitServerMessage(page, candidateSocketIndex, {
         CommandOutcomesComplete: { game_id: 42 },
       });
+      await emitServerMessage(page, candidateSocketIndex, snapshot(11, 91));
+      await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
     }
 
     await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
@@ -633,3 +691,52 @@ for (const failurePhase of [
     await expect(page.getByTestId('game-snapshot-loading')).toHaveCount(0);
   });
 }
+
+test('an old socket crash before continuity proof adopts an already-ready candidate', async ({ page }) => {
+  const oldSocketIndex = await establishActiveGame(page);
+  const candidateSocketIndex = await beginDrain(page, oldSocketIndex);
+  await authenticateCandidate(page, candidateSocketIndex);
+  await emitServerMessage(page, candidateSocketIndex, lobbyUpdate);
+  await emitServerMessage(page, candidateSocketIndex, snapshot(10, 90));
+  await emitServerMessage(page, candidateSocketIndex, {
+    CommandOutcomesComplete: { game_id: 42 },
+  });
+
+  await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
+  await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
+  await page.evaluate((index) => {
+    window.__mockSockets[index].serverClose(1012, 'old gateway crashed before Pong');
+  }, oldSocketIndex);
+
+  await expect.poll(() => page.evaluate((index) => (
+    window.__mockSockets.indexOf(window.__wsInstance) === index
+  ), candidateSocketIndex)).toBe(true);
+  await sendCommandProbe(page, 'after-crash-promotion');
+  expect((await socketMessages(page, candidateSocketIndex, 'GameCommandV2'))
+    .map((message) => message.GameCommandV2.probe)).toEqual(['after-crash-promotion']);
+  await expect(page.getByText('Connecting to game server…')).toHaveCount(0);
+  await expect(page.getByText('CONNECTION LOST — RESYNCING')).toHaveCount(0);
+  await expect(page.getByTestId('game-snapshot-loading')).toHaveCount(0);
+});
+
+test('the drain deadline keeps an already-ready candidate when old close loses the race', async ({ page }) => {
+  const oldSocketIndex = await establishActiveGame(page);
+  const candidateSocketIndex = await beginDrain(page, oldSocketIndex, { deadlineMs: 1_500 });
+  await authenticateCandidate(page, candidateSocketIndex);
+  await emitServerMessage(page, candidateSocketIndex, lobbyUpdate);
+  await emitServerMessage(page, candidateSocketIndex, snapshot(10, 90));
+  await emitServerMessage(page, candidateSocketIndex, {
+    CommandOutcomesComplete: { game_id: 42 },
+  });
+
+  await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
+  await expect.poll(() => page.evaluate((index) => (
+    window.__mockSockets.indexOf(window.__wsInstance) === index
+  ), candidateSocketIndex), { timeout: 4_000 }).toBe(true);
+  await sendCommandProbe(page, 'after-deadline-promotion');
+  expect((await socketMessages(page, candidateSocketIndex, 'GameCommandV2'))
+    .map((message) => message.GameCommandV2.probe)).toEqual(['after-deadline-promotion']);
+  await expect(page.getByText('Connecting to game server…')).toHaveCount(0);
+  await expect(page.getByText('CONNECTION LOST — RESYNCING')).toHaveCount(0);
+  await expect(page.getByTestId('game-snapshot-loading')).toHaveCount(0);
+});

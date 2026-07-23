@@ -5,9 +5,9 @@
 //! budget.  Membership here is ephemeral control-plane state in Valkey.
 
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, bail};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -139,6 +139,10 @@ impl ClusterNamespace {
         RedisKeys::cluster_assignment(&self.region)
     }
 
+    pub fn partition_assignment(&self, partition: u32) -> String {
+        RedisKeys::cluster_partition_assignment(&self.region, partition)
+    }
+
     pub fn assignment_lease(&self) -> String {
         RedisKeys::cluster_assignment_lease(&self.region)
     }
@@ -190,14 +194,14 @@ impl ClusterNamespace {
 
 #[derive(Clone)]
 pub struct MembershipStore {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     namespace: ClusterNamespace,
     ttl: Duration,
 }
 
 impl MembershipStore {
     pub fn new(
-        redis: ConnectionManager,
+        redis: impl Into<RedisConnection>,
         namespace: ClusterNamespace,
         ttl: Duration,
     ) -> Result<Self> {
@@ -205,7 +209,7 @@ impl MembershipStore {
             bail!("membership TTL must be at least 500ms");
         }
         Ok(Self {
-            redis,
+            redis: redis.into(),
             namespace,
             ttl,
         })

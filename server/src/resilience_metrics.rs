@@ -9,9 +9,9 @@ use crate::game_executor::PARTITION_COUNT;
 use crate::lifecycle::TaskLifecycle as LocalTaskLifecycle;
 use crate::partition_assignment::AssignmentStore;
 use crate::recovery::RecoveryEnvelopeV2;
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use redis::streams::StreamPendingReply;
 use serde_json::{Map, Value, json};
 use std::array;
@@ -201,7 +201,7 @@ impl PartitionOutageTracker {
 /// CloudWatch uses `Maximum` for regional gauges and `Sum` for counters.
 /// Dimensions deliberately exclude partitions, users, and games.
 pub fn spawn_resilience_metrics(
-    redis: ConnectionManager,
+    redis: RedisConnection,
     namespace: ClusterNamespace,
     lifecycle: LocalTaskLifecycle,
     server_id: u64,
@@ -351,27 +351,28 @@ pub fn spawn_resilience_metrics(
 }
 
 async fn observe_partition_outages(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     namespace: &ClusterNamespace,
     assignment_store: &AssignmentStore,
     now_ms: i64,
     tracker: &mut PartitionOutageTracker,
 ) -> Result<()> {
     let assignment = assignment_store.load().await?;
-    let lease_keys: Vec<String> = (0..PARTITION_COUNT)
-        .map(|partition| namespace.partition_lease(partition))
-        .collect();
-    let leases: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-        .arg(&lease_keys)
-        .query_async(&mut redis)
-        .await
-        .context("failed to sample partition leases for outage timing")?;
+    let mut leases = Vec::with_capacity(PARTITION_COUNT as usize);
+    for partition in 0..PARTITION_COUNT {
+        leases.push(
+            redis
+                .get(namespace.partition_lease(partition))
+                .await
+                .context("failed to sample partition lease for outage timing")?,
+        );
+    }
     tracker.observe(now_ms, assignment.as_ref(), &leases);
     Ok(())
 }
 
 async fn collect_regional_gauges(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     namespace: &ClusterNamespace,
     membership: &MembershipStore,
     assignment_store: &AssignmentStore,
@@ -423,14 +424,15 @@ async fn collect_regional_gauges(
         }
     }
 
-    let lease_keys: Vec<String> = (0..PARTITION_COUNT)
-        .map(|partition| namespace.partition_lease(partition))
-        .collect();
-    let leases: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-        .arg(&lease_keys)
-        .query_async(&mut redis)
-        .await
-        .context("failed to inspect partition leases for metrics")?;
+    let mut leases = Vec::with_capacity(PARTITION_COUNT as usize);
+    for partition in 0..PARTITION_COUNT {
+        leases.push(
+            redis
+                .get(namespace.partition_lease(partition))
+                .await
+                .context("failed to inspect partition lease for metrics")?,
+        );
+    }
     let (active_leases, lease_deficit, owner_mismatches) =
         summarize_partition_leases(assignment.as_ref(), &leases);
     gauges.active_partition_leases = active_leases;
@@ -462,37 +464,27 @@ async fn collect_regional_gauges(
     }
 
     // These are bounded regional aggregates: one SCARD and one XLEN for each
-    // of the fixed executor partitions, issued in a single pipeline. The
+    // fixed executor partition. Partitions intentionally occupy distinct
+    // cluster slots, so issue independently routed commands. The
     // pending-completion set is the durable retry queue for external effects;
     // the quarantine stream is the durable terminal disposition for poison
     // commands. Neither requires scanning game- or user-labelled keys.
-    let mut durability_pipeline = redis::pipe();
+    let mut pending_completions = 0_u64;
+    let mut quarantined_commands = 0_u64;
     for partition in 0..PARTITION_COUNT {
-        durability_pipeline
-            .cmd("SCARD")
-            .arg(namespace.pending_completions(partition));
+        let pending: u64 = redis
+            .scard(namespace.pending_completions(partition))
+            .await
+            .context("failed to inspect pending completion queue")?;
+        let quarantined: u64 = redis
+            .xlen(namespace.command_quarantine(partition))
+            .await
+            .context("failed to inspect command quarantine")?;
+        pending_completions = pending_completions.saturating_add(pending);
+        quarantined_commands = quarantined_commands.saturating_add(quarantined);
     }
-    for partition in 0..PARTITION_COUNT {
-        durability_pipeline
-            .cmd("XLEN")
-            .arg(namespace.command_quarantine(partition));
-    }
-    let durability_counts: Vec<u64> = durability_pipeline
-        .query_async(&mut redis)
-        .await
-        .context("failed to inspect completion and quarantine durability queues")?;
-    let partition_count = PARTITION_COUNT as usize;
-    if durability_counts.len() != partition_count * 2 {
-        anyhow::bail!("unexpected durability metrics pipeline response length");
-    }
-    gauges.pending_completions = durability_counts[..partition_count]
-        .iter()
-        .copied()
-        .fold(0, u64::saturating_add);
-    gauges.quarantined_commands = durability_counts[partition_count..]
-        .iter()
-        .copied()
-        .fold(0, u64::saturating_add);
+    gauges.pending_completions = pending_completions;
+    gauges.quarantined_commands = quarantined_commands;
 
     let mut indexed_games = Vec::new();
     for partition in 0..PARTITION_COUNT {
@@ -504,15 +496,15 @@ async fn collect_regional_gauges(
     }
     gauges.active_games = indexed_games.len() as u64;
     if !indexed_games.is_empty() {
-        let keys: Vec<String> = indexed_games
-            .iter()
-            .map(|(_, game_id)| namespace.recovery(*game_id))
-            .collect();
-        let envelopes: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-            .arg(&keys)
-            .query_async(&mut redis)
-            .await
-            .context("failed to inspect active recovery checkpoints")?;
+        let mut envelopes: Vec<Option<Vec<u8>>> = Vec::with_capacity(indexed_games.len());
+        for (_, game_id) in &indexed_games {
+            envelopes.push(
+                redis
+                    .get(namespace.recovery(*game_id))
+                    .await
+                    .context("failed to inspect active recovery checkpoint")?,
+            );
+        }
         for ((partition, game_id), payload) in indexed_games.into_iter().zip(envelopes) {
             let Some(payload) = payload else {
                 gauges.active_game_index_mismatches += 1;

@@ -1,5 +1,5 @@
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
-use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -155,7 +155,7 @@ type LobbyBroadcasters = RwLock<HashMap<String, LobbyBroadcaster>>;
 
 /// Manages lobby membership and presence using Redis heartbeats
 pub struct LobbyManager {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     #[allow(dead_code)] // kept alive for future lobby persistence
     db: Arc<dyn Database>,
     lobby_broadcasters: LobbyBroadcasters,
@@ -165,7 +165,7 @@ pub struct LobbyManager {
 
 impl LobbyManager {
     pub fn new(
-        redis: ConnectionManager,
+        redis: RedisConnection,
         db: Arc<dyn Database>,
         pubsub_manager: Arc<PubSubManager>,
     ) -> Self {
@@ -526,11 +526,17 @@ impl LobbyManager {
             RedisKeys::lobby_chat_history_key(lobby_code),
         ];
 
-        self.redis
-            .clone()
-            .del::<_, ()>(keys)
-            .await
-            .context("Failed to delete lobby keys from Redis")?;
+        // Lobby metadata participates in the matchmaking slot while the
+        // transient members/preferences/chat keys do not. Delete them
+        // independently so this remains valid on Redis Cluster/Valkey
+        // Serverless, where a multi-key DEL may not cross hash slots.
+        let mut redis = self.redis.clone();
+        for key in keys {
+            redis
+                .del::<_, ()>(key)
+                .await
+                .context("Failed to delete a lobby key from Redis")?;
+        }
 
         info!("Deleted lobby '{}'", lobby_code);
         Ok(())

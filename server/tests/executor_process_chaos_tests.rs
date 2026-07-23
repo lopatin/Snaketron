@@ -703,9 +703,16 @@ async fn write_assignment(
     assignment.validate(PARTITION_COUNT)?;
     let payload = serde_json::to_vec(&assignment)?;
     redis
-        .set::<_, _, ()>(namespace.assignment(), payload)
+        .set::<_, _, ()>(namespace.assignment(), payload.clone())
         .await
-        .context("failed to write process-chaos assignment")
+        .context("failed to write process-chaos canonical assignment")?;
+    for partition in 0..PARTITION_COUNT {
+        redis
+            .set::<_, _, ()>(namespace.partition_assignment(partition), payload.clone())
+            .await
+            .context("failed to write process-chaos partition assignment")?;
+    }
+    Ok(())
 }
 
 async fn cleanup_scenario(
@@ -713,6 +720,12 @@ async fn cleanup_scenario(
     namespace: &ClusterNamespace,
     game_id: u32,
 ) -> Result<()> {
+    for partition in 0..PARTITION_COUNT {
+        redis
+            .del::<_, ()>(namespace.partition_assignment(partition))
+            .await
+            .context("failed to remove process-chaos partition assignment")?;
+    }
     redis
         .del::<_, ()>(&[
             namespace.assignment(),

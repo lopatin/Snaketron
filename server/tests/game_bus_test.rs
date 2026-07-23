@@ -109,7 +109,10 @@ async fn one_expired_recovery_is_isolated_from_valid_games() -> Result<()> {
         );
         let assignment = serde_json::json!({ "owners": owners });
         let _: () = redis
-            .set(namespace.assignment(), serde_json::to_vec(&assignment)?)
+            .set(
+                namespace.partition_assignment(partition),
+                serde_json::to_vec(&assignment)?,
+            )
             .await?;
         let lease_store = PartitionLeaseStore::new(
             manager,
@@ -185,7 +188,7 @@ async fn one_expired_recovery_is_isolated_from_valid_games() -> Result<()> {
 
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard.lease_key(),
                 namespace.recovery(valid_game_id),
                 namespace.recovery_failure(expired_game_id),
@@ -222,7 +225,7 @@ async fn indexed_recovery_ignores_ten_thousand_unrelated_snapshots() -> Result<(
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -298,7 +301,7 @@ async fn indexed_recovery_ignores_ten_thousand_unrelated_snapshots() -> Result<(
         }
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard.lease_key(),
                 namespace.recovery(game_ids[0]),
                 namespace.recovery(game_ids[1]),
@@ -335,7 +338,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -469,7 +472,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
 
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 new_guard.lease_key(),
                 namespace.recovery(game_id),
                 namespace.active_games(partition),
@@ -507,7 +510,7 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -563,7 +566,7 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": successor_owners }))?,
             )
             .await?;
@@ -594,7 +597,11 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
         assert!(redis.xlen::<_, usize>(&stream).await? <= 1);
 
         let _: () = redis
-            .del(&[namespace.assignment(), successor_guard.lease_key(), stream])
+            .del(&[
+                namespace.partition_assignment(partition),
+                successor_guard.lease_key(),
+                stream,
+            ])
             .await?;
         token.cancel();
         Ok(())
@@ -643,7 +650,7 @@ async fn group_created_after_publish_starts_at_zero_and_delivers_history() -> Re
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -663,7 +670,11 @@ async fn group_created_after_publish_starts_at_zero_and_delivers_history() -> Re
         assert_eq!(deliveries[0].stream_id, historical_id);
 
         let _: () = redis
-            .del(&[namespace.assignment(), guard.lease_key(), stream])
+            .del(&[
+                namespace.partition_assignment(partition),
+                guard.lease_key(),
+                stream,
+            ])
             .await?;
         token.cancel();
         Ok(())
@@ -701,7 +712,7 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -807,7 +818,7 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
 
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard.lease_key(),
                 namespace.recovery(game_id),
                 namespace.active_games(partition),
@@ -849,7 +860,7 @@ async fn stale_group_reader_cannot_capture_a_post_takeover_command() -> Result<(
         };
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&assignment(&owner_a))?,
             )
             .await?;
@@ -883,7 +894,7 @@ async fn stale_group_reader_cannot_capture_a_post_takeover_command() -> Result<(
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&assignment(&owner_b))?,
             )
             .await?;
@@ -985,7 +996,7 @@ async fn stale_group_reader_cannot_capture_a_post_takeover_command() -> Result<(
 
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard_b.lease_key(),
                 namespace.command_quarantine(partition),
                 RedisKeys::stream_events(partition),
@@ -1026,7 +1037,7 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
         );
         let _: () = redis
             .set(
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
             )
             .await?;
@@ -1159,7 +1170,7 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
             .await?;
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard.lease_key(),
                 namespace.command_quarantine(partition),
             ])
@@ -1225,7 +1236,10 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         );
         let assignment = serde_json::json!({ "owners": owners });
         let _: () = redis
-            .set(namespace.assignment(), serde_json::to_vec(&assignment)?)
+            .set(
+                namespace.partition_assignment(partition),
+                serde_json::to_vec(&assignment)?,
+            )
             .await?;
         let lease_store = PartitionLeaseStore::new(
             manager,
@@ -1338,6 +1352,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             )
             .await?
         );
+        bus.cleanup_matchmaking_for_completion(&record).await?;
         for key in [
             &user_player_key,
             &user_spectator_key,
@@ -1423,6 +1438,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             )
             .await?
         );
+        bus.cleanup_matchmaking_for_completion(&record).await?;
         for key in [
             &user_player_key,
             &user_spectator_key,
@@ -1545,7 +1561,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
 
         let _: () = redis
             .del(&[
-                namespace.assignment(),
+                namespace.partition_assignment(partition),
                 guard.lease_key(),
                 namespace.recovery(game_id),
                 namespace.active_games(partition),

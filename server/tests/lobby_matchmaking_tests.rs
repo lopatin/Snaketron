@@ -4,10 +4,12 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, PushInfo};
 use server::{
+    game_bus::GameBus,
     game_executor::StreamEvent,
     lobby_manager::LobbyMember,
     matchmaking_manager::{
-        ActiveMatch, MatchCommitOutcome, MatchStatus, MatchmakingManager, QueuedPlayer,
+        ActiveMatch, GameCreatedOutboxRecord, MatchCommitOutcome, MatchStatus, MatchmakingManager,
+        QueuedPlayer,
     },
     redis_keys::RedisKeys,
     redis_utils::create_connection_manager,
@@ -17,6 +19,7 @@ use tokio::{
     sync::broadcast,
     time::{Duration, timeout},
 };
+use tokio_util::sync::CancellationToken;
 
 mod common;
 use self::common::{TestClient, TestEnvironment};
@@ -729,6 +732,33 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
         ))
         .await?;
     assert_eq!((queue_len, mmr_len), (0, 0));
+
+    let (_cursor, mut outbox) = left.scan_game_created_outbox(0).await?;
+    assert_eq!(outbox.len(), 1);
+    let (outbox_game_id, outbox_payload) = outbox.pop().expect("one committed outbox record");
+    assert_eq!(outbox_game_id, winner_id.to_string());
+    let outbox_record: GameCreatedOutboxRecord = serde_json::from_str(&outbox_payload)?;
+    let redis_client = Client::open(test_redis_url())?;
+    let (pubsub_tx, _rx) = broadcast::channel::<PushInfo>(128);
+    let conn = create_connection_manager(redis_client.clone(), pubsub_tx).await?;
+    let game_bus = GameBus::new(conn, redis_client, CancellationToken::new());
+    let first_delivery = game_bus.publish_game_created_once(&outbox_record).await?;
+    let retry_delivery = game_bus.publish_game_created_once(&outbox_record).await?;
+    assert_eq!(first_delivery, retry_delivery);
+    assert!(
+        left.acknowledge_game_created_outbox(winner_id, "different-payload")
+            .await
+            .expect_err("a changed outbox payload must not expire the delivery fence")
+            .to_string()
+            .contains("payload changed")
+    );
+    assert!(
+        left.acknowledge_game_created_outbox(winner_id, &outbox_payload)
+            .await?
+    );
+    game_bus
+        .expire_game_created_delivery_marker(winner_id)
+        .await?;
 
     let winner_partition = winner_id % server::game_executor::PARTITION_COUNT;
     let loser_partition = loser_id % server::game_executor::PARTITION_COUNT;

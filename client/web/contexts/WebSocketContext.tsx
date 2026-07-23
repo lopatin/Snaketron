@@ -72,6 +72,9 @@ interface SocketSlot {
   authTimeoutId: ReturnType<typeof setTimeout> | null;
   gameWarmRetryTimeoutId: ReturnType<typeof setTimeout> | null;
   contextRestoreStartedAtMs: number | null;
+  continuityProbeClientTime: number | null;
+  continuityProbeActiveGeneration: number | null;
+  continuityProbeConfirmed: boolean;
 }
 
 // Extend window interface for testing
@@ -103,6 +106,12 @@ const clearGameWarmRetryTimeout = (slot: SocketSlot) => {
     clearTimeout(slot.gameWarmRetryTimeoutId);
     slot.gameWarmRetryTimeoutId = null;
   }
+};
+
+const clearContinuityProof = (slot: SocketSlot) => {
+  slot.continuityProbeClientTime = null;
+  slot.continuityProbeActiveGeneration = null;
+  slot.continuityProbeConfirmed = false;
 };
 
 const boundedMetricDuration = (startedAtMs: number, nowMs: number = Date.now()): number =>
@@ -179,6 +188,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const activeSlotRef = useRef<SocketSlot | null>(null);
   const candidateSlotRef = useRef<SocketSlot | null>(null);
   const nextGenerationRef = useRef(0);
+  const nextContinuityProbeClientTimeRef = useRef(0);
   const reconnectAttemptRef = useRef(0);
   const candidateAttemptRef = useRef(0);
   const candidateRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -493,7 +503,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clockSync.start();
   }, []);
 
-  const promoteCandidate = useCallback((candidate: SocketSlot) => {
+  const promoteCandidate = useCallback((
+    candidate: SocketSlot,
+    allowUnprovenTransportOverlap: boolean = false,
+  ) => {
     if (candidateSlotRef.current !== candidate) {
       return;
     }
@@ -516,7 +529,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       candidate.socket.close(1000, 'client context changed during handoff');
       return;
     }
-    if (!replacementReadyForPromotion({
+    const replacementIsReady = replacementReadyForPromotion({
       socketOpen: candidate.socket.readyState === WebSocket.OPEN,
       authenticated: candidate.authenticated,
       inFlightRequestCount,
@@ -528,7 +541,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       gameStreamWatermark: candidate.gameStreamWatermark,
     }, candidate.expectedGameId === null
       ? null
-      : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null)) {
+      : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null);
+    if (!replacementIsReady) {
+      clearContinuityProof(candidate);
       return;
     }
 
@@ -537,6 +552,43 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       previous.role === 'active' &&
       previous.authenticated &&
       previous.socket.readyState === WebSocket.OPEN,
+    );
+    if (previousWasUsable && previous) {
+      if (
+        !allowUnprovenTransportOverlap && (
+          candidate.continuityProbeClientTime === null ||
+          candidate.continuityProbeActiveGeneration !== previous.generation
+        )
+      ) {
+        clearContinuityProof(candidate);
+        const clientTime = --nextContinuityProbeClientTimeRef.current;
+        candidate.continuityProbeClientTime = clientTime;
+        candidate.continuityProbeActiveGeneration = previous.generation;
+        try {
+          previous.socket.send(JSON.stringify({ Ping: { client_time: clientTime } }));
+        } catch (error) {
+          clearContinuityProof(candidate);
+          console.warn('Old WebSocket failed the planned-handoff continuity probe', error);
+          try {
+            previous.socket.close(1011, 'planned handoff continuity probe failed');
+          } catch {
+            // The normal close/recovery path will run if the transport is gone.
+          }
+        }
+        return;
+      }
+      if (!candidate.continuityProbeConfirmed && !allowUnprovenTransportOverlap) {
+        return;
+      }
+    }
+    // This probe proves only that the old transport was still usable after the
+    // replacement became fully ready. It is not a game-stream ordering fence:
+    // the candidate has its own snapshot, outcome barrier, and replica stream.
+    const transportOverlapProved = Boolean(
+      previousWasUsable &&
+      previous &&
+      candidate.continuityProbeConfirmed &&
+      candidate.continuityProbeActiveGeneration === previous.generation,
     );
     const nowMs = Date.now();
     clearGameWarmRetryTimeout(candidate);
@@ -577,7 +629,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
     const plannedStartedAtMs = plannedHandoffStartedAtRef.current;
     if (plannedStartedAtMs !== null) {
-      if (previousWasUsable) {
+      if (transportOverlapProved) {
         recordWsMetric('planned_handoff_success', {
           count: 1,
           duration_ms: boundedMetricDuration(plannedStartedAtMs, nowMs),
@@ -606,6 +658,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     candidate.gameComplete = false;
     candidate.gameStreamWatermark = null;
     candidate.commandOutcomesReady = candidate.expectedGameId === null;
+    clearContinuityProof(candidate);
 
     if (candidate.expectedLobbyCode) {
       const preferences = buildInitialLobbyPreferences();
@@ -662,6 +715,24 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
     if (slot.role === 'retired') {
       return;
+    }
+
+    if (
+      slot.role === 'active' &&
+      activeSlotRef.current === slot &&
+      rawMessage?.Pong
+    ) {
+      const candidate = candidateSlotRef.current;
+      if (
+        candidate &&
+        candidate.continuityProbeActiveGeneration === slot.generation &&
+        Number(rawMessage.Pong.client_time) === candidate.continuityProbeClientTime
+      ) {
+        dispatchRawMessage(slot, rawMessage);
+        candidate.continuityProbeConfirmed = true;
+        promoteCandidate(candidate);
+        return;
+      }
     }
 
     if (rawMessage?.Authenticated) {
@@ -836,6 +907,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     dispatchRawMessage(slot, rawMessage);
+    const candidate = candidateSlotRef.current;
+    if (candidate) {
+      // An old-socket event can move the authoritative watermark ahead of a
+      // candidate after its probe was sent. Revalidate on every active frame
+      // so only a proof from the final overlapping readiness window counts.
+      promoteCandidate(candidate);
+    }
   }, [buildInitialLobbyPreferences, completeActiveRecovery, dispatchRawMessage, promoteCandidate, recoverAfterCandidateFailure, restoreCandidateContext, setAuthHandshakeState]);
 
   const attachSocketHandlers = useCallback((slot: SocketSlot, onConnect?: () => void) => {
@@ -948,6 +1026,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       // A transport loss is not a request to leave. Keep the in-memory and
       // persisted lobby identity so the next authenticated socket can rejoin.
       recordTrace({ Note: { ts_ms: nowMs, note: 'ws disconnected, reconnect scheduled' } });
+      const candidate = candidateSlotRef.current;
+      if (candidate) {
+        // The make-before-break proof failed, but a fully restored candidate
+        // can still become the crash-recovery socket immediately.
+        promoteCandidate(candidate);
+        if (activeSlotRef.current === candidate) {
+          return;
+        }
+      }
       if (!reconnectEnabledRef.current || candidateSlotRef.current) {
         return;
       }
@@ -957,7 +1044,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         openActiveRef.current(slot.url, onConnect);
       }, delay);
     };
-  }, [configureClockSync, getToken, handleParsedMessage, recordPlannedHandoffFailure, recoverAfterCandidateFailure, setAuthHandshakeState]);
+  }, [configureClockSync, getToken, handleParsedMessage, promoteCandidate, recordPlannedHandoffFailure, recoverAfterCandidateFailure, setAuthHandshakeState]);
 
   const createSlot = useCallback((url: string, role: SocketRole): SocketSlot => {
     const socket = new WebSocket(url);
@@ -983,6 +1070,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       authTimeoutId: null,
       gameWarmRetryTimeoutId: null,
       contextRestoreStartedAtMs: null,
+      continuityProbeClientTime: null,
+      continuityProbeActiveGeneration: null,
+      continuityProbeConfirmed: false,
     };
   }, []);
 
@@ -1036,6 +1126,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (candidateSlotRef.current !== slot || slot.role !== 'candidate') {
           return;
         }
+        // The old task and this timer share a deadline. If the replacement is
+        // already ready, keep it when this timer wins the race with the old
+        // socket's close event. This is crash-style promotion (and therefore a
+        // planned-handoff failure), not proof of a zero-gap planned handoff.
+        promoteCandidate(slot, true);
+        if (activeSlotRef.current === slot) {
+          return;
+        }
         slot.role = 'retired';
         candidateSlotRef.current = null;
         clearGameWarmRetryTimeout(slot);
@@ -1054,7 +1152,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         reconnectDelayMs(attempt),
       );
     }
-  }, [attachSocketHandlers, createSlot, currentRegionUrl, recordPlannedHandoffFailure, recoverAfterCandidateFailure]);
+  }, [attachSocketHandlers, createSlot, currentRegionUrl, promoteCandidate, recordPlannedHandoffFailure, recoverAfterCandidateFailure]);
   startCandidateRef.current = startCandidate;
 
   const connect = useCallback((url: string, onConnect?: () => void) => {

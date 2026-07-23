@@ -16,7 +16,7 @@ Snaketron must treat abrupt ECS task loss as the normal game-recovery path. Exec
 
 The minimum correct design is:
 
-- short-lived task membership and a versioned, explicit partition assignment map in regional Valkey;
+- short-lived task membership and a versioned, explicit partition assignment map in regional ElastiCache Serverless for Valkey;
 - one uniquely tokened, fenced lease for the active authority of each partition;
 - executor-only Redis consumer groups for durable command takeover;
 - the existing per-game snapshots, extended into recovery checkpoints with command cursors and deduplication state;
@@ -24,7 +24,7 @@ The minimum correct design is:
 - truthful readiness and automatic Traefik health routing;
 - client command resend plus make-before-break WebSocket handoff for planned task removal.
 
-This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, distributed Valkey, or custom autoscaling signals.
+This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, a self-managed cache cluster, or custom autoscaling signals. ElastiCache Serverless itself is TLS-only and cluster-mode-only; the application must therefore be Redis-Cluster-aware.
 
 ## 2. Product problem
 
@@ -82,7 +82,7 @@ The legacy `specs/HighAvailability.md` describes a superseded Raft architecture.
 | Planned scale-down with another ready task | Supported clients maintain at least one authenticated, game-ready socket throughout make-before-break handoff. Lobby/game context and pending commands survive. New users retain service availability. |
 | Abrupt task crash with another ready task | Automatic WebSocket reconnect and game recovery without user action. A brief reconnect or stale indication is allowed because the transport already failed. Acknowledged state and commands survive. |
 | Abrupt crash at `minTasks=1` | An availability gap is allowed until ECS starts a replacement. State resumes automatically if Valkey and a retained recovery checkpoint remain available. |
-| Regional Valkey outage or data loss | Availability and state recovery during the outage are outside this release's guarantee. Restoration must not intentionally bypass fencing or idempotency. |
+| Regional Serverless Valkey outage or data loss | Availability and state recovery during the outage are outside this release's guarantee. Restoration must not intentionally bypass fencing or idempotency. |
 | Single Traefik/NAT failure | Availability is outside this release's guarantee. |
 
 Literal uninterrupted transport cannot be promised after a hard gateway crash. The zero-gap objective applies to the cooperative, planned path.
@@ -108,7 +108,7 @@ For this PRD:
 
 ## 6. Non-goals
 
-- Multi-AZ, clustered, or distributed Valkey.
+- Self-managed Valkey nodes, replication groups, shards, or failover policy; those are delegated to ElastiCache Serverless.
 - Redundant managed ingress, NAT redesign, or regional disaster recovery.
 - Raising the service floor above `minTasks=1`.
 - Game-count, queue-depth, or other custom autoscaling signals.
@@ -122,7 +122,7 @@ For this PRD:
 - A matchmaking singleton as a correctness dependency.
 - Manual Traefik updates in response to node events.
 - DynamoDB capacity redesign in this phase.
-- Continuous availability when the accepted single Valkey or single ingress dependency is unavailable.
+- Continuous availability when the regional Serverless Valkey dependency or single ingress dependency is unavailable.
 
 ## 7. Core invariants
 
@@ -148,7 +148,7 @@ These are safety properties, not performance targets. No observed violation is a
 flowchart LR
     C["Browser client"] <-->|"WebSocket"| G["Any ready ECS task / gateway"]
     G -->|"XADD player command"| CS["Partition command stream"]
-    A["Assignment coordinator singleton"] -->|"Versioned desired owner map"| V["Regional Valkey"]
+    A["Assignment coordinator singleton"] -->|"Versioned desired owner map"| V["Regional Serverless Valkey"]
     V --> A
     V --> L["Fenced partition lease"]
     CS -->|"Consumer group / pending takeover"| E["Assigned partition executor"]
@@ -159,7 +159,7 @@ flowchart LR
     E -->|"Idempotent completion effects"| D["DynamoDB"]
 ~~~
 
-The assignment coordinator is control plane only. Existing assignments and active leases continue if the coordinator is temporarily absent. Valkey remains the regional coordination and recovery dependency.
+The assignment coordinator is control plane only. Existing assignments and active leases continue if the coordinator is temporarily absent. Serverless Valkey remains the regional coordination and recovery dependency.
 
 ## 9. Functional requirements
 
@@ -196,11 +196,12 @@ The assignment coordinator is control plane only. Existing assignments and activ
 8. A task may acquire a free partition lease only if it is the desired owner in the current assignment.
 9. An incumbent stops renewing when it is no longer the desired owner. Its existing unexpired lease token remains the active authority until it is compare-deleted or expires.
 10. Assignment change alone must not invalidate a final fenced checkpoint. This desired-versus-active distinction is the cooperative handoff; no separate transfer state machine is required.
-11. New cluster coordination and recovery keys must be region-namespaced through `RedisKeys`. Existing command, event, and snapshot-request streams may remain unprefixed because each deployment uses a region-local Valkey instance; they must still be constructed only through `RedisKeys`.
+11. Every Valkey key must be constructed through `RedisKeys`. Cluster hash tags define distinct atomicity categories: regional membership, regional canonical assignment, global matchmaking, active-server metrics, and one separate family for each of the ten executor partitions. All keys in one Lua script, transaction, multi-key command, or pipeline batch must share one tag. Executor families must remain distinct so Serverless can distribute authoritative traffic across slots.
+12. The canonical assignment document lives in the assignment slot. After a successful compare-and-set, the coordinator projects the complete document into each partition slot using a monotonic per-partition view. Lease acquire/renew reads that local view. A crash during projection may delay movement until reconciliation, but must never authorize two generations or roll a view backward.
 
 ### R3 — Fenced partition authority
 
-1. Every successful partition lease acquisition must receive a never-reused acquisition token. Use a process boot UUID plus an acquisition UUID. Do not add a Redis monotonic epoch for this release; the accepted single Valkey primary only needs exact-token equality.
+1. Every successful partition lease acquisition must receive a never-reused acquisition token. Use a process boot UUID plus an acquisition UUID. Do not add a Redis monotonic epoch for this release; exact-token equality against the one logical Serverless cache is sufficient.
 2. The lease value must include the task boot identity and acquisition token.
 3. Acquire must atomically verify current desired ownership and lease availability.
 4. Renew must atomically verify current desired ownership and the exact acquisition token.
@@ -216,8 +217,8 @@ The assignment coordinator is control plane only. Existing assignments and activ
 8. Fencing checks must be centralized in a small set of lease-aware `GameBus` scripts or APIs. Callers must not implement a non-atomic “check, then write.”
 9. Lease renewal and fencing operations must use their dedicated 750 ms deadline, which remains shorter than the three-second lease TTL.
 10. A fenced-write rejection must prevent the mutation. Rejection on an authoritative actor or consumer path immediately cancels that executor; an already-cancelled background retry may only stop and leave its durable work for the successor.
-11. Fencing addresses a paused, partitioned, timed-out, or detached application process that resumes late. It is required even with a single-node Valkey deployment; it is not primarily a defense against multi-primary Redis split brain.
-12. Valkey must use `maxmemory-policy=noeviction`. A visible write failure under memory pressure is safer than silent eviction of coordination or recovery state.
+11. Fencing addresses a paused, partitioned, timed-out, or detached application process that resumes late. It is not primarily a defense against a cache split brain; ElastiCache presents one managed logical cache endpoint.
+12. ElastiCache Serverless fixes `maxmemory-policy=volatile-lru`; the application cannot select `noeviction`. Do not configure a data-storage maximum or ECPU maximum: those ceilings can respectively cause eviction/write failure or throttling during a scale event. `Evictions` and `ThrottledCmds` must remain zero in certification and alarm in production. Correctness still comes from durable protocol state and fail-closed error handling, not from assuming eviction is impossible.
 
 ### R4 — Durable executor command consumption
 
@@ -340,8 +341,9 @@ The assignment coordinator is control plane only. Existing assignments and activ
    4. the client opens a second socket through the same regional URL, not a server-specific URL;
    5. the second socket authenticates and restores lobby/game context;
    6. for a game, the second socket receives a current snapshot, resolved-command outcomes, and `CommandOutcomesComplete`, then buffers subsequent events;
-   7. the client atomically switches command ownership to the new socket generation;
-   8. only then does the client close the old socket.
+   7. after the candidate is ready, the client sends a uniquely tagged application Ping on the old socket and receives its matching Pong; this proves temporal transport overlap only, not game-stream ordering;
+   8. the client atomically switches command ownership to the new socket generation;
+   9. only then does the client close the old socket. If the old transport closes or the shared deadline fires after the candidate is fully ready but before the Pong, retain and promote that candidate as crash recovery while recording a planned-handoff failure.
 10. During overlap, only one socket sends player commands. Event delivery may overlap, but stable event revisions and socket-generation filtering must make duplicates harmless.
 11. Use one drain message containing only the departing gateway task identity and deadline; it must never direct clients to an executor host because executor and gateway placement are independent.
 12. Generic durable outbound WebSocket replay is not required; reauthentication, rejoin, and a fresh snapshot are sufficient.
@@ -356,19 +358,20 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - inserts every queue and MMR-index member and sets the lobby state to `queued` in the same operation.
    A retry of the same physical request is idempotent. A later request while the lobby is already queued preserves the first admitted preferences; changing them requires cancel and requeue.
 3. Cancellation must compare and remove the exact admitted lobby identity, its queue/MMR members, and its per-user claims in one operation. It sets an existing lobby's state back to `waiting` only when no active-game mapping won the race. Repeated cancellation is idempotent.
-4. Commit a selected match through one atomic Valkey Lua operation that:
+4. Commit a selected match through one atomic Valkey Lua operation in the matchmaking hash slot that:
    - verifies every selected lobby/queue entry is still eligible;
    - removes the selected lobbies from every relevant queue and MMR index;
    - records the active match;
    - records user/lobby-to-active-game mappings;
    - changes existing lobby metadata to `matched`;
-   - appends durable `GameCreated` work;
+   - writes one durable `GameCreated` outbox record containing the complete initial event;
    - publishes each connected-lobby `MatchFound` hint only after those durable writes, before the same script returns.
 5. Allocate the durable DynamoDB game ID before the Valkey commit. Unused IDs after a failed claim are acceptable.
 6. Exactly one concurrent claim may succeed. Losing workers must leave the winning match intact and must not partially remove other queue state.
-7. `GameCreated` carries the full initial state. The executor remains the only checkpoint writer: it creates the initial recovery checkpoint and active-game index entry before ACKing `GameCreated`.
-8. `MatchFound` remains a hint. A connected lobby listener must subscribe first, then read the durable lobby-to-game mapping; every hint triggers another authoritative mapping read, and a five-second fallback reconciliation covers a missed hint or subscription reconnect. Deduplicate forwarded `JoinGame` messages by game ID. Disconnected recipients resolve the same durable mapping during authentication.
-9. The atomic admission predicates and atomic eligibility/commit are the matchmaking fences. A separate matchmaking ownership epoch or saga is not required.
+7. Every task may scan the small matchmaking outbox. Delivery into the destination partition slot must atomically compare/create a per-game delivery marker and append `GameCreated`; retries after an ambiguous response return the original delivery rather than append a duplicate. Remove the source outbox field only by compare-and-delete after destination success. No singleton is required.
+8. `GameCreated` carries the full initial state. The executor remains the only checkpoint writer: it creates the initial recovery checkpoint and active-game index entry before ACKing `GameCreated`.
+9. `MatchFound` remains a hint. A connected lobby listener must subscribe first, then read the durable lobby-to-game mapping; every hint triggers another authoritative mapping read, and a five-second fallback reconciliation covers a missed hint or subscription reconnect. Deduplicate forwarded `JoinGame` messages by game ID. Disconnected recipients resolve the same durable mapping during authentication.
+10. The atomic admission predicates and atomic eligibility/commit are the matchmaking fences. A separate matchmaking ownership epoch or general saga framework is not required; the one outbox is the narrow cross-slot bridge imposed by Redis Cluster.
 
 ### R10 — Truthful liveness, readiness, and routing
 
@@ -408,11 +411,11 @@ The assignment coordinator is control plane only. Existing assignments and activ
 7. Retrying after an ambiguous DynamoDB response must converge to the same result.
 8. Recovery may redeliver completion work; repeated delivery must be observable as a prevented duplicate, not a repeated reward.
 9. The completion record must retain recoverable pending-effect status and be retried until every required idempotent DynamoDB effect is confirmed. It may be cleaned up only after confirmation and the configured completion grace period.
-10. The fenced completion commit must atomically clean matchmaking state for that game:
+10. Because completion state is partition-local while matchmaking mappings share the matchmaking slot, the fenced completion commit must retain the pending-completion record until a separate idempotent matchmaking cleanup succeeds. That cleanup must:
     - remove only that game's active-match record;
     - remove player, spectator, and lobby active-game mappings only when their current value still equals the completed game ID;
     - never delete a mapping that has already advanced to a newer game.
-11. The fenced completion commit must durably publish one full terminal snapshot and one terminal status notification. Retrying after a timeout or crash must repair a missing notification without publishing duplicates during the completion grace period.
+11. The partition-local fenced completion commit must durably publish one full terminal snapshot and one terminal status notification. Retrying after a timeout or crash must repair a missing notification without publishing duplicates during the completion grace period.
 12. Durable effects must enforce their dependency order in the storage transaction: no XP, MMR, ranking, or high-score effect may commit before the completed-game record, and a ranking projection may not commit before its matching MMR effect.
 13. A successor executor must be able to finalize a game created or previously executed by another task. Completion identity must be the durable game ID and immutable completion revision; it must not require the finalizing task's server ID to match the original executor.
 
@@ -429,26 +432,24 @@ The assignment coordinator is control plane only. Existing assignments and activ
 6. Every task currently replicates every partition, so task-local replica memory may not fall on scale-out. Scaling tests must prove memory behavior is acceptable; otherwise the replication model or memory policy needs a separate decision.
 7. Existing WebSockets do not redistribute on scale-up, so service-average CPU can hide a hot gateway task. Record per-task CPU, memory, connections, and event-forwarding load during validation.
 8. Do not increase the partition count or add adaptive splitting without load evidence.
-9. Load tests must include Valkey latency and the shared regional NAT/Traefik
-   host's CPU, network, connection success, and admission latency/error evidence.
+9. Load tests must include Serverless Valkey read/write latency, ECPU, bytes, connections, network traffic, `ThrottledCmds`, and `Evictions`, plus the shared regional NAT/Traefik host's CPU, network, connection success, and admission latency/error evidence.
    Connection-tracking occupancy is an optional capacity diagnostic when the
    host exposes it; it is not an autoscaling-correctness or release gate.
    Redesigning those dependencies remains out of scope.
 
 ## 10. Logical Valkey data model
 
-Exact names are implementation details, but all additions must live in `RedisKeys` and include the region where the deployment does not already isolate keyspace.
+Exact suffixes are implementation details, but the brace-delimited hash-tag families are part of the Serverless compatibility contract. Keys outside an atomic multi-key operation may remain independently slotted.
 
 | Logical record | Suggested shape | Purpose |
 | --- | --- | --- |
-| Task membership | `cluster:{region}:members` sorted by expiry plus short-TTL task metadata | Detect active, warming, draining, and crashed tasks. |
-| Coordinator lease | `cluster:{region}:assignment:lease` = acquisition token with TTL | Elect one assignment writer. |
-| Assignment | `cluster:{region}:assignment:v2` = versioned atomic document | Persist explicit desired owner for each partition. |
-| Partition lease | `cluster:{region}:partition:{p}:lease:v2` = task boot ID + acquisition token with TTL | Define active fenced authority. |
-| Command stream | Existing partition command stream + stable executor group | Durable commands and pending takeover. |
-| Active-game index | `cluster:{region}:partition:{p}:active-games` set | Bound recovery to one partition's live games. |
-| Recovery checkpoint | `game:recovery:v2:{game_id}` | Full per-game state plus cursor, counters, and dedupe metadata. |
-| Active game mapping | `user:{user_id}:active-game` or equivalent committed match record | Recover a missed match notification or reconnect. |
+| Task membership | Keys tagged `{snaketron:members:<region>}` | Detect active, warming, draining, and crashed tasks atomically. |
+| Coordinator lease + canonical assignment | Keys tagged `{snaketron:assignment:<region>}` | Elect one writer and persist one explicit versioned owner map. |
+| Per-partition assignment view | Key tagged `{snaketron:exec:<p>}` containing the complete canonical document/version | Let partition lease scripts verify desired ownership without a cross-slot read. |
+| Partition lease, streams, active-game index, recovery and completion records | Keys tagged `{snaketron:exec:<p>}` | Keep every fenced executor transaction single-slot while spreading ten partitions across Serverless slots. |
+| Matchmaking queues, mappings, active matches, and `GameCreated` outbox | Keys tagged `{snaketron:mm}` | Keep admission/cancel/match claims atomic. |
+| `GameCreated` delivery marker | Key tagged `{snaketron:exec:<p>}` beside the destination command stream | Make cross-slot outbox delivery idempotent. |
+| Active-server metrics + expiry index | Hash and sorted set tagged `{snaketron:server-metrics}` | Refresh and prune per-task region/user counts atomically without a cluster-wide key scan. |
 | Effect idempotency | DynamoDB item keyed by game, user, and effect | Prevent duplicate completion rewards. |
 
 Illustrative recovery envelope:
@@ -532,7 +533,7 @@ The stored source token is diagnostic only. On recovery, the successor's newly a
 | Failure after visible confirmation but before `XACK` | If checkpointed, the successor skips the command; otherwise it loads the decision keyed by the pending stream ID and restores that exact result. In both cases no duplicate logical effect or incremental schedule is produced before the recovery snapshot reanchors the client. |
 | Checkpoint write failure | Do not ACK covered entries. Emit positive confirmation only while the original entry remains durably recoverable, retry, and expose unhealthy checkpoint age. Step down only if lease/fencing validity cannot be established or an explicit fail-closed age budget is exceeded. |
 | Matchmaker crash before atomic commit | Entrants remain queued; an allocated game ID may be unused. |
-| Matchmaker crash after atomic commit but before Pub/Sub | Durable mappings and `GameCreated` remain; reconnect discovers the match. |
+| Matchmaker crash after atomic commit but before outbox delivery or Pub/Sub | Durable mappings and the `GameCreated` outbox record remain. Any task idempotently delivers it into the partition stream; reconnect discovers the match without Pub/Sub. |
 | Valkey unavailable to all tasks | Readiness becomes false; liveness remains true; availability is not promised. On restoration, token and pending state reconcile without bypassing the durable consumer-group path. |
 | Sole task crash | Region is unavailable until replacement. State resumes only inside the documented checkpoint-retention window. |
 | Replacement after checkpoint retention | Explicit unrecoverable result; no silent game restart. |
@@ -571,7 +572,7 @@ Required metrics:
 - active WebSockets and planned-drain failures;
 - load-test reconnect, authentication, rejoin, snapshot, per-command terminal-outcome latency, command-outcome barrier, usable-session-gap, and socket-generation evidence, combined with real-browser Playwright stale-overlay evidence;
 - match claim conflicts and prevented duplicate completion effects;
-- ECS CPU/memory and staging evidence for Valkey latency and functional shared
+- ECS CPU/memory and staging evidence for Serverless Valkey latency, ECPU, bytes, connections, network traffic, throttling, evictions, and functional shared
   Traefik/NAT capacity through connection success, admission latency/errors,
   CPU, and network. Connection-tracking occupancy is optional when available.
 
@@ -585,7 +586,7 @@ Critical alerts:
 - active-game index/checkpoint mismatch;
 - fingerprint divergence after recovery;
 - any planned-drain failure;
-- Valkey memory pressure or an eviction policy capable of silently evicting active coordination/recovery data.
+- any Serverless Valkey eviction or throttled command, or sustained service-side latency inconsistent with the command budget.
 
 ## 15. Acceptance and chaos test matrix
 
@@ -619,7 +620,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Repeat and concurrently submit one lobby admission, then submit two lobbies containing the same user | One immutable lobby identity and one per-user claim win; every queue/MMR index has one exact member; conflicting admission is rejected; cancellation or match commit removes every winning claim so no stale lobby can rematch a user. |
 | Lose admission or cancellation responses, retry them, and interrupt the caller between durable queue mutation and presentation refresh | The atomic queue identity and lobby metadata state agree (`queued`, `waiting`, or `matched`); retries converge without a hidden queue member or stranded queued banner. |
 | Concurrent matchmakers select the same lobbies | Exactly one atomic claim wins; no player or lobby belongs to two committed matches. |
-| Kill matchmaker before and after each commit boundary, including loss of the script response | Before commit, entrants remain queued; after commit, match/mappings/`GameCreated` exist, connected lobby subscribers receive the in-script `MatchFound` hint, and the executor creates the checkpoint before ACK. Disconnected recipients recover from mappings. |
+| Kill matchmaker before/after the matchmaking commit, destination outbox delivery, and source acknowledgement, including loss of each response | Before commit, entrants remain queued. After commit, match/mappings/outbox exist. Any task delivers exactly one partition `GameCreated`; retries repair either half, and the executor creates the checkpoint before ACK. Disconnected recipients recover from mappings. |
 | Commit immediately before a connected lobby listener subscribes, then drop or duplicate the Pub/Sub hint | Subscribe-then-read or the five-second reconciliation forwards the durable game ID once; duplicate hint/read overlap does not send a second `JoinGame`, and a later play-again game ID is still delivered. |
 | Kill after the fenced Valkey completion commit and before each DynamoDB effect or its confirmation marker | A successor reloads the same immutable completion revision; completed game, XP, MMR, rankings, and high scores converge to one application per effect key, and pending completion state is retained until all effects are confirmed. |
 | Time out the fenced completion commit after it may have executed, then retry it repeatedly | The exact same completion record is accepted; one terminal snapshot and one terminal status are observable, matchmaking cleanup converges, and no completion effect is duplicated. |
@@ -630,7 +631,8 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
 | Run the fixed 64-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. |
-| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; no Valkey eviction/write failure, zero-ready interval, ECS health failure, or Traefik health failure occurs. |
+| Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
+| Run the complete protocol against actual ElastiCache Serverless | TLS certificate validation, RESP3, cluster discovery, and operations across every hash-slot family succeed; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan
@@ -639,7 +641,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 
 - Add the metrics and deterministic fault hooks required by the acceptance matrix.
 - Add chaos runners alongside the existing resilience test scripts.
-- Configure and verify non-evicting behavior for correctness-bearing Valkey data, with capacity alarms before writes fail.
+- Provision uncapped ElastiCache Serverless for Valkey, add zero-tolerance eviction/throttling alarms, and statically test every atomic hash-slot family.
 - Record the fixed certification envelope and its Valkey, functional
   Traefik/NAT, per-task CPU/memory, and socket evidence.
 
@@ -692,15 +694,17 @@ criteria pass before the production ramp.
 
 | Area | Expected changes |
 | --- | --- |
-| New assignment module + `redis_keys.rs` | Membership, coordinator, versioned desired assignment, allocator, and key namespacing. |
-| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, lease-aware scripts, versioned checkpoint APIs. |
+| Assignment module + `redis_keys.rs` | Membership, coordinator, canonical assignment, monotonic partition views, allocator, and explicit Cluster hash-slot families. |
+| `server/src/redis_utils.rs` | One standalone/cluster-aware connection abstraction; TLS and Redis Cluster selection from the deployment URL. |
+| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, lease-aware single-slot scripts, versioned checkpoint APIs, idempotent outbox delivery, and separately retryable completion cleanup. |
 | `server/src/game_executor_v2.rs` | Recovery envelope, dedupe, active-game index, backlog-first resume, cooperative checkpoint/release, idempotent finalization. |
 | `server/src/game_server.rs` and `main.rs` | SIGTERM, lifecycle state, readiness state, critical-worker failure policy, one bounded drain deadline. |
-| `server/src/matchmaking.rs` and manager | Atomic queue admission/cancellation/commit scripts, durable user-to-game mappings, recoverable `GameCreated`. |
+| `server/src/matchmaking.rs` and manager | Atomic queue admission/cancellation/commit scripts, durable user-to-game mappings, and a bounded `GameCreated` outbox. |
 | `server/src/ws_server.rs` | Explicit auth response, drain protocol, generation-safe cleanup, active-game resolution, retryable warming. |
 | `client/web/contexts/WebSocketContext.tsx` | Immediate/backoff reconnect, socket generations, dual-socket drain, explicit auth, one command owner. |
 | Client game integration | Stable session command IDs, external outbox, resolved watermark/sparse outcomes, terminal rejection. |
-| `cdk/lib/fargate-stack.ts` | Liveness/readiness routing, sticky-cookie removal, health timing, stop timeout. |
+| `cdk/lib/valkey-stack.ts` and `fargate-stack.ts` | Serverless Valkey, TLS cluster URL, Serverless metrics/alarms, liveness/readiness routing, sticky-cookie removal, health timing, and stop timeout. |
+| Ephemeral development infrastructure | Public run-unique stage reuses but never owns or mutates the production VPC; the run owns and destroys its cache, compute, security groups, ingress/EIP, and DNS. |
 | Traefik configuration | Automatic health-based withdrawal/discovery and valid self-health endpoint. |
 | Test runners | Deterministic failure points, scaling/load scenarios, stale-owner and pending-entry tests. |
 
@@ -718,11 +722,11 @@ criteria pass before the production ramp.
 - Checkpoints remain full and per game.
 - Gateway and executor remain in the same binary/service but are logically independent.
 - Planned task removal uses dual sockets; executor movement alone never moves sockets.
-- Matchmaking safety comes from atomic admission/cancellation and one atomic commit, not a singleton.
+- Matchmaking safety comes from atomic admission/cancellation and one matchmaking-slot commit, plus one narrow idempotent outbox bridge into the executor partition slot; it does not require a singleton or generic saga system.
 - Readiness and liveness are separate.
 - CPU/memory autoscaling and `minTasks=1` remain.
-- Single Valkey and single ingress availability risks are accepted for this phase.
-- Correctness-bearing Valkey data is non-evicting; memory pressure fails visibly.
+- Regional Serverless Valkey and single-ingress availability risks are accepted for this phase.
+- Serverless Valkey uses its fixed `volatile-lru` policy. CDK sets no data/ECPU usage maximum; any eviction or throttling fails certification and alarms in production.
 
 ### External release evidence still required
 
@@ -751,8 +755,7 @@ local-readiness-to-route timing run is required. Those either duplicate the two
 evidence paths above, test an accepted unavailable dependency, or add telemetry
 without strengthening the user-visible guarantee.
 
-Neither external result has yet been executed and attached. The release remains
-blocked until both pass.
+Neither external result has a passing report attached. The first public planned-path attempt exposed fixed-node Valkey saturation and handoff defects and therefore does not count. The release remains blocked until both Serverless-backed runs pass.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
@@ -770,6 +773,6 @@ This work is complete only when:
 8. One non-production ECS task SIGKILL during the fixed load proves that hard
    crashes reconnect and recover automatically within the validated service
    targets when a survivor exists.
-9. The documented `minTasks=1`, Valkey, ingress, and retention limitations are visible in operational runbooks.
+9. The documented `minTasks=1`, regional Serverless Valkey, ingress, and retention limitations are visible in operational runbooks.
 10. Readiness, liveness, assignment, fencing, pending commands, checkpoints, recovery, WebSocket drain, and idempotent effects are observable and alerted.
 11. The superseded Raft high-availability document is marked superseded by this PRD.

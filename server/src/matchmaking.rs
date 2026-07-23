@@ -10,16 +10,77 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::db::Database;
+use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::{
-    ActiveMatch, MatchCommitOutcome, MatchStatus, MatchmakingManager, QueuedPlayer,
+    ActiveMatch, GameCreatedOutboxRecord, MatchCommitOutcome, MatchStatus, MatchmakingManager,
+    QueuedPlayer,
 };
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 const FFA_MAX_RECURSION_DEPTH: usize = 8;
+
+/// Retry the two single-slot halves of match creation until both are durable.
+/// Every task may help; duplicate workers are harmless because destination
+/// publication and source acknowledgement are compare-and-set operations.
+pub async fn run_game_created_outbox_loop(
+    mut matchmaking: MatchmakingManager,
+    game_bus: Arc<GameBus>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let mut ticker = interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = 0_u64;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+
+        let (next_cursor, records) = match matchmaking.scan_game_created_outbox(cursor).await {
+            Ok(batch) => batch,
+            Err(error) => {
+                warn!(%error, "game-created outbox scan failed; retrying");
+                cursor = 0;
+                continue;
+            }
+        };
+        cursor = next_cursor;
+        for (field, payload) in records {
+            let record: GameCreatedOutboxRecord = serde_json::from_str(&payload)
+                .context("game-created outbox contains malformed JSON")?;
+            record.validate()?;
+            if field != record.game_id.to_string() {
+                anyhow::bail!("game-created outbox field/payload identity mismatch");
+            }
+            if let Err(error) = game_bus.publish_game_created_once(&record).await {
+                warn!(game_id = record.game_id, %error, "game-created outbox delivery failed; retrying");
+                continue;
+            }
+            match matchmaking
+                .acknowledge_game_created_outbox(record.game_id, &payload)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(error) = game_bus
+                        .expire_game_created_delivery_marker(record.game_id)
+                        .await
+                    {
+                        warn!(game_id = record.game_id, %error, "failed to expire acknowledged game-created marker");
+                    }
+                }
+                Err(error) => {
+                    warn!(game_id = record.game_id, %error, "game-created outbox acknowledgement failed; retrying");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum MatchCreationOutcome {
     Committed(u32),
@@ -1240,12 +1301,12 @@ async fn create_game_from_lobbies(
         )
         .await?
     {
-        MatchCommitOutcome::Committed { stream_id } => {
+        MatchCommitOutcome::Committed { outbox_id } => {
             info!(
                 game_id = prepared.game_id,
                 partition_id = prepared.partition_id,
-                stream_id,
-                "Atomically committed match and GameCreated"
+                outbox_id,
+                "Atomically committed match and durable GameCreated outbox record"
             );
             Ok(MatchCreationOutcome::Committed(prepared.game_id))
         }

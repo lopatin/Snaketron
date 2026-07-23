@@ -27,14 +27,17 @@ use crate::db::Database;
 use crate::game_bus::GameBus;
 use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
+use crate::redis_keys::RedisKeys;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
 use crate::user_cache::UserCache;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 
+use crate::redis_utils::RedisConnection;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const ACTIVE_SERVER_METRIC_TTL_MS: u64 = 10_000;
 
 /// A dependency-free listener that serves liveness immediately and installs
 /// the full application router once Redis-dependent bootstrap has converged.
@@ -131,7 +134,7 @@ pub struct HttpServerState {
     /// JWT verifier for WebSocket authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
     /// Cloneable Redis connection manager
-    pub redis: ConnectionManager,
+    pub redis: RedisConnection,
     /// Redis URL for creating new connections
     pub redis_url: String,
     /// PubSub manager for loss-tolerant fan-out (chat, lobby, counters)
@@ -171,7 +174,7 @@ pub async fn install_http_application(
     db: Arc<dyn Database>,
     jwt_manager: Arc<JwtManager>,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
     game_bus: Arc<GameBus>,
@@ -453,7 +456,7 @@ async fn health_ready(State(state): State<DeferredHttpState>) -> impl IntoRespon
 
 /// Background task to update Redis metrics every 5 seconds
 fn spawn_metrics_updater(
-    redis: ConnectionManager,
+    redis: RedisConnection,
     server_id: u64,
     region: String,
     connection_count: Arc<AtomicUsize>,
@@ -484,31 +487,59 @@ fn spawn_metrics_updater(
 
 /// Update server metrics in Redis
 async fn update_redis_metrics(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     server_id: u64,
     region: &str,
     count: usize,
 ) -> Result<()> {
-    // let mut redis = redis;
-
-    // Set user count with 10-second TTL (auto-cleanup for dead servers)
-    let _: () = redis
-        .set_ex(format!("server:{}:user_count", server_id), count, 10)
-        .await
-        .context("Failed to set user count in Redis")?;
-
-    // Set region (no TTL, persistent)
-    let _: () = redis
-        .set(format!("server:{}:region", server_id), region)
-        .await
-        .context("Failed to set region in Redis")?;
+    let metric = regions::ActiveServerMetric {
+        region: region.to_string(),
+        user_count: u32::try_from(count).unwrap_or(u32::MAX),
+    };
+    let payload = serde_json::to_string(&metric).context("Failed to serialize server metric")?;
+    let result: i32 = redis::Script::new(
+        r#"
+        local function key_type(key)
+            local response = redis.call('TYPE', key)
+            if type(response) == 'table' then return response['ok'] end
+            return response
+        end
+        local metrics_type = key_type(KEYS[1])
+        local expiry_type = key_type(KEYS[2])
+        if metrics_type ~= 'none' and metrics_type ~= 'hash' then
+            return redis.error_reply('active server metrics key has wrong type')
+        end
+        if expiry_type ~= 'none' and expiry_type ~= 'zset' then
+            return redis.error_reply('active server expiry key has wrong type')
+        end
+        local now = redis.call('TIME')
+        local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+        -- Write the expiry first. If a later command fails, an orphaned index
+        -- member is harmless and self-pruning; a hash field without an expiry
+        -- would be counted forever.
+        redis.call('ZADD', KEYS[2], now_ms + tonumber(ARGV[3]), ARGV[1])
+        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+        return 1
+        "#,
+    )
+    .key(RedisKeys::active_server_metrics())
+    .key(RedisKeys::active_server_metrics_expiry())
+    .arg(server_id)
+    .arg(payload)
+    .arg(ACTIVE_SERVER_METRIC_TTL_MS)
+    .invoke_async(&mut redis)
+    .await
+    .context("Failed to refresh active server metric")?;
+    if result != 1 {
+        anyhow::bail!("active server metric refresh returned {result}");
+    }
 
     Ok(())
 }
 
 /// Background task to broadcast user count updates every 5 seconds
 fn spawn_user_count_broadcaster(
-    redis: ConnectionManager,
+    redis: RedisConnection,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -531,51 +562,17 @@ fn spawn_user_count_broadcaster(
 }
 
 /// Aggregate user counts from Redis and broadcast to all WebSocket clients
-async fn broadcast_user_counts(mut redis: ConnectionManager) -> Result<()> {
-    use redis::AsyncCommands;
+async fn broadcast_user_counts(mut redis: RedisConnection) -> Result<()> {
     use std::collections::HashMap;
 
-    // Query all server user count keys
-    let server_keys: Vec<String> = redis::cmd("KEYS")
-        .arg("server:*:user_count")
-        .query_async(&mut redis)
+    let metrics = regions::load_active_server_metrics(&mut redis)
         .await
-        .context("Failed to query server keys")?;
+        .context("Failed to query active server metrics")?;
 
     let mut region_counts: HashMap<String, u32> = HashMap::new();
-
-    for key in server_keys {
-        // Get user count for this server
-        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut redis).await {
-            Ok(count) => count,
-            Err(e) => {
-                tracing::warn!("Failed to get user count for {}: {}", key, e);
-                continue;
-            }
-        };
-
-        // Extract server_id from key "server:{server_id}:user_count"
-        let server_id = match key.split(':').nth(1) {
-            Some(id) => id,
-            None => {
-                tracing::warn!("Invalid key format: {}", key);
-                continue;
-            }
-        };
-
-        // Get region for this server
-        let region_key = format!("server:{}:region", server_id);
-        let region: String = match redis::cmd("GET")
-            .arg(&region_key)
-            .query_async(&mut redis)
-            .await
-        {
-            Ok(region) => region,
-            Err(_) => continue, // Skip if no region set
-        };
-
-        // Aggregate counts by region
-        *region_counts.entry(region).or_insert(0) += count;
+    for metric in metrics {
+        let regional_count = region_counts.entry(metric.region).or_insert(0_u32);
+        *regional_count = regional_count.saturating_add(metric.user_count);
     }
 
     // Serialize and publish to Redis channel
@@ -596,6 +593,56 @@ mod deferred_http_tests {
     use super::*;
     use axum::routing::get;
     use std::time::Duration;
+
+    static ACTIVE_SERVER_METRICS_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn active_server_registry_refreshes_and_prunes_expired_tasks() -> Result<()> {
+        let _guard = ACTIVE_SERVER_METRICS_TEST_LOCK.lock().await;
+        let client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let mut manager = crate::redis_utils::create_connection_manager(client, push_tx).await?;
+        let keys = [
+            RedisKeys::active_server_metrics(),
+            RedisKeys::active_server_metrics_expiry(),
+        ];
+        let _: () = manager.del(&keys).await?;
+
+        update_redis_metrics(manager.clone().into(), 101, "use1", 2).await?;
+        update_redis_metrics(manager.clone().into(), 202, "euw1", 3).await?;
+        let mut connection: RedisConnection = manager.clone().into();
+        let mut metrics = regions::load_active_server_metrics(&mut connection).await?;
+        metrics.sort_by(|left, right| left.region.cmp(&right.region));
+        assert_eq!(
+            metrics,
+            vec![
+                regions::ActiveServerMetric {
+                    region: "euw1".into(),
+                    user_count: 3,
+                },
+                regions::ActiveServerMetric {
+                    region: "use1".into(),
+                    user_count: 2,
+                },
+            ]
+        );
+
+        let _: () = manager
+            .zadd(RedisKeys::active_server_metrics_expiry(), 101, 0_i64)
+            .await?;
+        let metrics = regions::load_active_server_metrics(&mut connection).await?;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].region, "euw1");
+        assert!(
+            !manager
+                .hexists::<_, _, bool>(RedisKeys::active_server_metrics(), 101)
+                .await?
+        );
+
+        let _: () = manager.del(&keys).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cold_boot_is_live_unready_then_installs_application_without_rebind() -> Result<()> {

@@ -35,10 +35,10 @@ use crate::recovery::{
     CommandDecisionV1, RECOVERY_FAILURE_SCHEMA_VERSION, RecoveryEnvelopeV2, RecoveryFailureV1,
 };
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::{RedisClient, RedisConnection};
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use redis::streams::{
     StreamAutoClaimReply, StreamId, StreamMaxlen, StreamReadOptions, StreamReadReply,
 };
@@ -109,6 +109,7 @@ const READER_RECONNECT_BACKOFF_MS: u64 = 100;
 const EXECUTOR_GROUP_BATCH: usize = 512;
 const EXECUTOR_GROUP_IDLE: Duration = Duration::from_millis(50);
 const FENCED_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const GAME_CREATED_DELIVERY_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 // Stream commands are hot-path values; avoid a heap allocation solely to equalize poison size.
@@ -145,9 +146,9 @@ type ExecutorReadReplyGate = (
 pub struct GameBus {
     /// Shared non-blocking connection for XADD/KV. Never used for blocking
     /// reads (rule #1).
-    redis: ConnectionManager,
+    redis: RedisConnection,
     /// Used to open a dedicated connection per reader task.
-    redis_client: redis::Client,
+    redis_client: RedisClient,
     cancellation_token: CancellationToken,
     #[cfg(test)]
     checkpoint_failures_remaining: AtomicUsize,
@@ -157,13 +158,13 @@ pub struct GameBus {
 
 impl GameBus {
     pub fn new(
-        redis: ConnectionManager,
-        redis_client: redis::Client,
+        redis: impl Into<RedisConnection>,
+        redis_client: impl Into<RedisClient>,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
-            redis,
-            redis_client,
+            redis: redis.into(),
+            redis_client: redis_client.into(),
             cancellation_token,
             #[cfg(test)]
             checkpoint_failures_remaining: AtomicUsize::new(0),
@@ -223,6 +224,53 @@ impl GameBus {
         self.xadd_untrimmed(&RedisKeys::stream_commands(partition_id), payload)
             .await
             .map(|_| ())
+    }
+
+    /// Cross-slot destination half of matchmaking's durable outbox. The
+    /// marker and command stream share the partition slot, so a retry after an
+    /// ambiguous response returns the original stream ID without a second
+    /// GameCreated entry.
+    pub async fn publish_game_created_once(
+        &self,
+        record: &crate::matchmaking_manager::GameCreatedOutboxRecord,
+    ) -> Result<String> {
+        record.validate()?;
+        let mut redis = self.redis.clone();
+        redis::Script::new(
+            r#"
+            local existing = redis.call('GET', KEYS[1])
+            if existing then return existing end
+            local stream_id = redis.call('XADD', KEYS[2], '*', 'data', ARGV[1])
+            -- Keep the marker non-expiring until the source outbox has been
+            -- acknowledged. Serverless volatile eviction must not reopen the
+            -- duplicate window between the two slot-local transactions.
+            redis.call('SET', KEYS[1], stream_id)
+            return stream_id
+            "#,
+        )
+        .key(RedisKeys::matchmaking_game_created_delivery(record.game_id))
+        .key(RedisKeys::stream_commands(record.partition_id))
+        .arg(record.game_created_payload.as_bytes())
+        .invoke_async(&mut redis)
+        .await
+        .context("failed to idempotently deliver GameCreated from matchmaking outbox")
+    }
+
+    /// Once the source outbox is gone, retain the marker only long enough to
+    /// cover another worker that scanned the old field before acknowledgement.
+    pub async fn expire_game_created_delivery_marker(&self, game_id: u32) -> Result<()> {
+        let mut redis = self.redis.clone();
+        let updated: bool = redis
+            .pexpire(
+                RedisKeys::matchmaking_game_created_delivery(game_id),
+                GAME_CREATED_DELIVERY_RETENTION_MS as i64,
+            )
+            .await
+            .context("failed to expire acknowledged GameCreated delivery marker")?;
+        if !updated {
+            anyhow::bail!("acknowledged GameCreated delivery marker is missing");
+        }
+        Ok(())
     }
 
     pub async fn request_partition_snapshots(&self, partition_id: u32) -> Result<()> {
@@ -288,7 +336,7 @@ impl GameBus {
     ) -> Result<ExecutorCommandConsumer> {
         let connection = self
             .redis_client
-            .get_multiplexed_async_connection()
+            .get_dedicated_connection()
             .await
             .context("failed to open dedicated executor command connection")?;
         let group = guard.namespace().command_group(guard.partition());
@@ -1212,80 +1260,36 @@ impl GameBus {
             if not require_type(KEYS[5], 'set') or
                not require_type(KEYS[6], 'set') or
                not require_type(KEYS[7], 'stream') or
-               not require_type(KEYS[8], 'hash') or
-               not require_type(KEYS[9], 'string') or
-               not require_type(KEYS[10], 'stream') or
-               not require_type(KEYS[11], 'hash') then
+               not require_type(KEYS[8], 'string') or
+               not require_type(KEYS[9], 'stream') or
+               not require_type(KEYS[10], 'hash') then
                 return -3
             end
 
-            local active_json = redis.call('HGET', KEYS[8], ARGV[6])
-            local active_match = nil
-            if active_json then
-                local active_ok
-                active_ok, active_match = pcall(cjson.decode, active_json)
-                if not active_ok then return -4 end
-            end
-
-            local cleanup_keys = {}
-            local seen = {}
-            local function add_cleanup_key(key)
-                if not seen[key] then
-                    seen[key] = true
-                    cleanup_keys[#cleanup_keys + 1] = key
-                end
-            end
-            local function add_user(user_id)
-                if user_id ~= nil then
-                    add_cleanup_key(ARGV[10] .. tostring(user_id) .. ARGV[12])
-                end
-            end
-            local final_state = decoded_record.final_state or {}
-            for user_id, _ in pairs(final_state.players or {}) do add_user(user_id) end
-            for _, user_id in ipairs(final_state.spectators or {}) do add_user(user_id) end
-            if active_match then
-                for _, player in ipairs(active_match.players or {}) do add_user(player.user_id) end
-                for _, player in ipairs(active_match.spectators or {}) do add_user(player.user_id) end
-                for _, lobby_code in ipairs(active_match.lobby_codes or {}) do
-                    if type(lobby_code) ~= 'string' then return -4 end
-                    add_cleanup_key(ARGV[11] .. lobby_code .. ARGV[12])
-                end
-            end
-
-            local delete_keys = {}
-            for _, key in ipairs(cleanup_keys) do
-                if not require_type(key, 'string') then return -3 end
-                if redis.call('GET', key) == ARGV[6] then
-                    delete_keys[#delete_keys + 1] = key
-                end
-            end
-
-            local notified = redis.call('GET', KEYS[9])
-            if notified and notified ~= ARGV[14] then return -2 end
+            local notified = redis.call('GET', KEYS[8])
+            if notified and notified ~= ARGV[11] then return -2 end
 
             if created == 1 then redis.call('SET', KEYS[2], ARGV[2]) end
             redis.call('SET', KEYS[3], ARGV[3], 'PX', ARGV[4])
             redis.call('SET', KEYS[4], ARGV[5], 'PX', ARGV[4])
             redis.call('SREM', KEYS[5], ARGV[6])
             redis.call('SADD', KEYS[6], ARGV[6])
-            for _, key in ipairs(delete_keys) do redis.call('DEL', key) end
-            if active_json then redis.call('HDEL', KEYS[8], ARGV[6]) end
 
             if not notified then
-                redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[13], '*', 'data', ARGV[9])
+                redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[10], '*', 'data', ARGV[9])
                 redis.call('XADD', KEYS[7], '*', 'data', ARGV[8])
-                redis.call('SET', KEYS[9], ARGV[14])
+                redis.call('SET', KEYS[8], ARGV[11])
             end
             -- Retire covered work only after every authoritative record and
-            -- terminal publication above has succeeded. Valkey rejects a
-            -- noeviction OOM before a script's first write, but scripts still
-            -- do not roll back earlier commands after other runtime errors;
-            -- acknowledging last preserves the recoverable completion trigger.
-            if #ARGV >= 15 then
+            -- terminal publication above has succeeded. Scripts do not roll
+            -- back earlier commands after a runtime error; acknowledging last
+            -- preserves the recoverable completion trigger when Serverless
+            -- rejects an operation or another command fails.
+            if #ARGV >= 12 then
                 local ids = {}
-                for i = 15, #ARGV do ids[#ids + 1] = ARGV[i] end
+                for i = 12, #ARGV do ids[#ids + 1] = ARGV[i] end
                 redis.call('XACK', KEYS[7], ARGV[7], unpack(ids))
-                redis.call('HDEL', KEYS[11], unpack(ids))
+                redis.call('HDEL', KEYS[10], unpack(ids))
             end
             return created
             "#,
@@ -1299,7 +1303,6 @@ impl GameBus {
             .key(guard.namespace().active_games(guard.partition()))
             .key(guard.namespace().pending_completions(guard.partition()))
             .key(RedisKeys::stream_commands(guard.partition()))
-            .key(RedisKeys::matchmaking_active_matches())
             .key(
                 guard
                     .namespace()
@@ -1316,9 +1319,6 @@ impl GameBus {
             .arg(guard.namespace().command_group(guard.partition()))
             .arg(terminal_status_payload)
             .arg(terminal_snapshot_payload)
-            .arg(RedisKeys::MATCHMAKING_USER_ACTIVE_GAME_PREFIX)
-            .arg(RedisKeys::MATCHMAKING_LOBBY_ACTIVE_GAME_PREFIX)
-            .arg(RedisKeys::MATCHMAKING_ACTIVE_GAME_SUFFIX)
             .arg(EVENTS_MAXLEN)
             .arg(record.revision.to_string());
         for id in covered_stream_ids {
@@ -1467,6 +1467,83 @@ impl GameBus {
         Ok(record)
     }
 
+    /// Retryable matchmaking-slot half of terminal cleanup. It deliberately
+    /// runs outside the fenced partition transaction: Redis Cluster cannot
+    /// atomically mutate this global control slot and a partition slot. The
+    /// caller keeps the partition's pending-completion record until this
+    /// idempotent compare-delete succeeds.
+    pub async fn cleanup_matchmaking_for_completion(
+        &self,
+        record: &crate::completion::CompletionRecordV1,
+    ) -> Result<()> {
+        record.validate()?;
+        let active_matches_key = RedisKeys::matchmaking_active_matches();
+        let mut redis = self.redis.clone();
+        let active_json: Option<String> = redis
+            .hget(&active_matches_key, record.game_id.to_string())
+            .await
+            .context("failed to load active match for terminal cleanup")?;
+        let active_match = active_json
+            .map(|value| {
+                serde_json::from_str::<crate::matchmaking_manager::ActiveMatch>(&value)
+                    .context("active match is malformed during terminal cleanup")
+            })
+            .transpose()?;
+
+        let mut user_ids = std::collections::BTreeSet::new();
+        user_ids.extend(record.final_state.players.keys().copied());
+        user_ids.extend(record.final_state.spectators.iter().copied());
+        let mut lobby_codes = std::collections::BTreeSet::new();
+        if let Some(active_match) = active_match {
+            user_ids.extend(active_match.players.iter().map(|player| player.user_id));
+            user_ids.extend(active_match.spectators.iter().map(|player| player.user_id));
+            lobby_codes.extend(active_match.lobby_codes);
+        }
+
+        let mut mapping_keys: Vec<String> = user_ids
+            .into_iter()
+            .map(RedisKeys::matchmaking_user_active_game)
+            .collect();
+        mapping_keys.extend(
+            lobby_codes
+                .into_iter()
+                .map(|code| RedisKeys::matchmaking_lobby_active_game(&code)),
+        );
+        let script = redis::Script::new(
+            r#"
+            local active_type = redis.call('TYPE', KEYS[1])
+            if type(active_type) == 'table' then active_type = active_type.ok end
+            if active_type ~= 'none' and active_type ~= 'hash' then return -1 end
+            for i = 2, #KEYS do
+                local value_type = redis.call('TYPE', KEYS[i])
+                if type(value_type) == 'table' then value_type = value_type.ok end
+                if value_type ~= 'none' and value_type ~= 'string' then return -1 end
+            end
+            for i = 2, #KEYS do
+                if redis.call('GET', KEYS[i]) == ARGV[1] then
+                    redis.call('DEL', KEYS[i])
+                end
+            end
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            return 1
+            "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation.key(active_matches_key);
+        for key in &mapping_keys {
+            invocation.key(key);
+        }
+        let result: i32 = invocation
+            .arg(record.game_id)
+            .invoke_async(&mut redis)
+            .await
+            .context("failed to clean terminal matchmaking mappings")?;
+        if result != 1 {
+            anyhow::bail!("terminal matchmaking cleanup found a key with the wrong type");
+        }
+        Ok(())
+    }
+
     pub async fn subscribe_to_partition(&self, partition_id: u32) -> Result<PartitionSubscription> {
         let (event_tx, event_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
@@ -1517,7 +1594,7 @@ impl GameBus {
 }
 
 pub struct ExecutorCommandConsumer {
-    connection: redis::aio::MultiplexedConnection,
+    connection: RedisConnection,
     stream_key: String,
     group: String,
     consumer: String,
@@ -1696,7 +1773,7 @@ fn decode_command_delivery(entry: StreamId) -> CommandDelivery {
 }
 
 async fn snapshot_request_reader(
-    client: redis::Client,
+    client: RedisClient,
     key: String,
     mut last_id: String,
     sender: mpsc::Sender<SnapshotRequest>,
@@ -1706,7 +1783,7 @@ async fn snapshot_request_reader(
         if cancellation.is_cancelled() || sender.is_closed() {
             return;
         }
-        let mut connection = match client.get_multiplexed_async_connection().await {
+        let mut connection = match client.get_dedicated_connection().await {
             Ok(connection) => connection,
             Err(error) => {
                 warn!(%error, %key, "snapshot-request reader failed to connect");
@@ -1774,7 +1851,7 @@ async fn snapshot_request_reader(
 /// propagates instead of defaulting: defaulting to 0-0 on a live stream
 /// would replay the entire retained backlog as fresh messages (re-running
 /// stale commands and resurrecting completed games).
-async fn resolve_stream_anchor(redis: &mut ConnectionManager, key: &str) -> Result<String> {
+async fn resolve_stream_anchor(redis: &mut RedisConnection, key: &str) -> Result<String> {
     match redis
         .xinfo_stream::<_, redis::streams::StreamInfoStreamReply>(key)
         .await
@@ -1801,7 +1878,7 @@ fn stream_does_not_exist(e: &redis::RedisError) -> bool {
 /// "$" re-evaluates to "now" on every call, so an entry written to stream B
 /// while we were processing stream A's reply would be skipped forever.
 async fn partition_reader(
-    client: redis::Client,
+    client: RedisClient,
     partition_id: u32,
     mut last_ids: [String; 3],
     event_tx: mpsc::Sender<GameEventMessage>,
@@ -1821,7 +1898,7 @@ async fn partition_reader(
 
         // Dedicated connection: blocking XREADs park it, and nothing else
         // shares it (rule #1 — this is what made the old implementation slow).
-        let mut conn = match client.get_multiplexed_async_connection().await {
+        let mut conn = match client.get_dedicated_connection().await {
             Ok(conn) => conn,
             Err(e) => {
                 warn!(

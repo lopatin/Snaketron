@@ -2934,6 +2934,7 @@ async fn prepare_planned_candidate(
     let mut candidate_ready_at = None;
     let mut continuity_probe_client_time = None;
     let mut continuity_confirmed_at = None;
+    let mut game_join_retry_at = None;
 
     loop {
         let candidate_is_ready = authenticated
@@ -3069,6 +3070,23 @@ async fn prepare_planned_candidate(
                     }
                 }
             }
+            _ = tokio::time::sleep_until(game_join_retry_at.unwrap_or(deadline)), if game_join_retry_at.is_some() => {
+                game_join_retry_at = None;
+                tokio::time::timeout_at(
+                    deadline,
+                    send_candidate_message(
+                        session,
+                        &mut socket,
+                        WSMessage::JoinGame(game_id),
+                        cancellation,
+                    ),
+                )
+                .await
+                .map_err(|_| PlannedHandoffAttemptError::Candidate(anyhow!(
+                    "planned handoff deadline reached during GameWarming retry",
+                )))?
+                .map_err(PlannedHandoffAttemptError::Candidate)?;
+            }
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PlannedHandoffAttemptError::Candidate)?;
                 session.observe_received(&message);
@@ -3137,6 +3155,7 @@ async fn prepare_planned_candidate(
                             .game_events_received
                             .saturating_add(1);
                         if let GameEvent::Snapshot { game_state } = &event.event {
+                            game_join_retry_at = None;
                             snapshot_terminal = matches!(game_state.status, GameStatus::Complete { .. });
                             snapshot = Some(game_state.clone());
                             candidate_watermark = Some(event.stream_seq);
@@ -3170,9 +3189,17 @@ async fn prepare_planned_candidate(
                         outcomes_ready = true;
                         outcome_barrier_observed = true;
                     }
-                    WSMessage::GameWarming { .. }
-                    | WSMessage::Drain { .. }
-                    | WSMessage::GameLoadFailed { .. } => {
+                    WSMessage::GameWarming {
+                        game_id: warming,
+                        retry_after_ms,
+                    } if warming == game_id => {
+                        game_join_retry_at = planned_game_join_retry_at(
+                            tokio::time::Instant::now(),
+                            deadline,
+                            retry_after_ms,
+                        );
+                    }
+                    WSMessage::Drain { .. } | WSMessage::GameLoadFailed { .. } => {
                         return Err(PlannedHandoffAttemptError::Candidate(anyhow!(
                             "candidate could not restore the game before promotion"
                         )));
@@ -3192,6 +3219,15 @@ async fn prepare_planned_candidate(
             }
         }
     }
+}
+
+fn planned_game_join_retry_at(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    retry_after_ms: u64,
+) -> Option<tokio::time::Instant> {
+    let retry_at = now + Duration::from_millis(retry_after_ms.clamp(100, 2_000));
+    (retry_at < deadline).then_some(retry_at)
 }
 
 fn record_planned_handoff_failure(
@@ -4721,6 +4757,23 @@ mod tests {
     }
 
     #[test]
+    fn game_warming_retry_never_competes_with_the_handoff_deadline() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            planned_game_join_retry_at(now, now + Duration::from_millis(101), 100),
+            Some(now + Duration::from_millis(100)),
+        );
+        assert_eq!(
+            planned_game_join_retry_at(now, now + Duration::from_millis(100), 100),
+            None,
+        );
+        assert_eq!(
+            planned_game_join_retry_at(now, now + Duration::from_millis(50), 2_000),
+            None,
+        );
+    }
+
+    #[test]
     fn extracts_only_the_sticky_cookie() {
         assert_eq!(
             sticky_cookie_value("snaketron_sticky=backend-token; Path=/; Secure"),
@@ -5300,6 +5353,32 @@ mod tests {
             ));
             candidate_socket
                 .send(Message::Text(
+                    serde_json::to_string(&WSMessage::GameWarming {
+                        game_id: 42,
+                        retry_after_ms: 100,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), candidate_socket.next())
+                    .await
+                    .is_err(),
+                "GameWarming retry ignored the server delay"
+            );
+            let retried_join_game =
+                tokio::time::timeout(Duration::from_millis(500), candidate_socket.next())
+                    .await
+                    .expect("GameWarming scheduled a same-socket JoinGame retry")
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(retried_join_game.to_text().unwrap()).unwrap(),
+                WSMessage::JoinGame(42)
+            ));
+            candidate_socket
+                .send(Message::Text(
                     serde_json::to_string(&WSMessage::JoinedLobby {
                         lobby_code: "TEST-LOBBY".to_owned(),
                     })
@@ -5546,6 +5625,13 @@ mod tests {
         assert_eq!(session.record.metrics.planned_handoff_attempts, 1);
         assert_eq!(session.record.metrics.planned_handoff_successes, 1);
         assert_eq!(session.record.metrics.planned_handoff_failures, 0);
+        assert_eq!(
+            session
+                .record
+                .diagnostics
+                .get("planned_handoff_candidate_failures"),
+            None
+        );
         assert_eq!(session.record.metrics.planned_handoff_outcome_barriers, 1);
         assert_eq!(
             session.record.metrics.planned_handoff_terminal_completions,
