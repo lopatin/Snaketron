@@ -201,20 +201,21 @@ evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
 settled in membership, assignment, and partition leases. It never runs on the
 one-task baseline.
 
-Continuity Run A is a separate fixed 128-session / 64-duel `every-tick` run on the
-one-vCPU minimum task. Two exact-source measurements bound this calibration:
-run `30030317623` held the historical 96-session cohort at only 53--59% CPU,
-below the unchanged 70% target, while run `30039460661` held 144 sessions at
-95.7--98.3% CPU for multiple complete minutes and violated the one-second
-command budget before scale-out. Removing one ninth of that measured work
-projects roughly 85--87% one-task CPU, leaving material SLO headroom while
-remaining unambiguously above the target. The 128-session cohort is now frozen.
-It must first
+Continuity Run A is a separate fixed 224-session / 112-duel `every-tick` run on
+the one-vCPU minimum task. This is the one same-version recalibration after the
+checkpoint-write dispatcher split. Exact-source run `30046381977` held 128
+sessions at 45.18--48.83% average CPU over complete steady minutes, with a
+measured 3.5% idle baseline. Scaling only the non-idle component to 224 sessions
+projects 76.4--82.8% CPU, wholly above the unchanged 70% target without aiming
+near saturation. The fixed cohort retains one stage, the existing eight-minute
+target-tracking budget, and the existing 20-minute run clock. It does not use
+synthetic CPU, lower a target, force the transition, or adapt load from live
+metrics. The 224-session cohort is now frozen. It must first
 cause CPU or memory target tracking to add capacity; if it does not, the run
 writes are not accepted as a substitute. The pre-movement one-task baseline
 must itself keep every command outcome within one second; this explicitly
 prevents autoscaling from hiding an already-overloaded starting task. The
-fixed 128-session calibration fails rather than being adjusted again, forced,
+fixed 224-session calibration fails rather than being adjusted again, forced,
 or accepted if either the policy trigger or that latency budget is missed.
 Policy writes are then
 suspended while Run A proves the
@@ -223,7 +224,7 @@ direct `1 -> 10 -> 1` ownership staircase. At ten tasks the runner adds 10 idle,
 deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
 starts a 208-session idle ramp at four sessions per second. This keeps new-user
 admission continuous through the 45-second drain deadline while leaving only
-128 command-bearing game sockets on the final task. Run A must prove no active
+224 command-bearing game sockets on the final task. Run A must prove no active
 socket hard reconnect, zero measured usable-session gap, terminal command
 outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
 nine partition moves in each direction. No game completion is awaited before
@@ -383,16 +384,36 @@ deadlines together. The checkpoint retained unacknowledged work, retried, and
 the affected game completed durably; there was no fence rejection or data
 loss. The correction adds exactly one fresh checkpoint-write dispatcher per
 task while leaving takeover/reconnect reads and best-effort regional metrics on
-the existing recovery-read dispatcher. It also fixes Run A at 128 sessions / 64
-duels: the observed 144-session baseline was already saturated, while the
-measured work projects 128 at roughly 85--87% CPU, still safely above the
-unchanged 70% target. Do not adjust the cohort again if the next run fails.
+the existing recovery-read dispatcher. The first follow-up used 128 sessions /
+64 duels based on a cross-topology projection from the saturated 144-session
+run.
+
+Exact-source Serverless run
+[`30046381977`](https://github.com/lopatin/snaketron-io/actions/runs/30046381977)
+showed why that projection was invalid after the dispatcher split. The
+configured 128-session / 64-duel stage remained active for the full eight-minute
+scale-out observation window and completed 768 of 768 sessions, 384 of 384
+games, and all 687,455 commands. Worst sent-second outcome latency was 488
+milliseconds, no second
+exceeded 500 milliseconds or the one-second gate, disconnects/reconnects were
+zero, and checkpoint failures were zero. Complete-minute CPU averages remained
+45.18--48.83%, so target tracking correctly stayed at one task and the runner
+failed closed before forced handoff, capacity, or SIGKILL. The smaller cohort
+and connection topology changed together, so do not claim the split alone
+halved CPU. Command rate fell only about 10% while CPU, pending age, and latency
+collapsed, which is consistent with removal of nonlinear queue amplification.
+
+Run A is fixed once from this same-version evidence at 224 sessions / 112
+duels. After subtracting the measured 3.5% idle CPU, the observed range projects
+to 76.4--82.8% at 224. Keep the existing CPU 70% / memory 80% targets,
+one-second gate, one-stage 20-minute runner, and eight-minute target-tracking
+budget. Do not adjust the cohort again if the next run fails.
 One hundred two best-effort active-game mapping lookups also timed out during
 the 144-session ownership bursts without causing a failed admission or usable
 gap; retain this as a diagnostic risk and investigate the matchmaking-manager
-critical section only if it recurs at the bounded 128-session run. Cleanup
-succeeded and its full absence verification passed. The capacity and SIGKILL
-phases did not run.
+critical section only if it recurs at the bounded 224-session run. Cleanup
+succeeded and its full absence verification passed for both follow-ups. The
+capacity and SIGKILL phases did not run in either one.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
@@ -559,5 +580,5 @@ with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
 command, or failure to corroborate the measured
-phase envelopes (at least 359 simultaneous sockets during transition/admission
+phase envelopes (at least 455 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

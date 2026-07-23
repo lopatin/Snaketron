@@ -667,7 +667,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 128-session / 64-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition, adjust the fixed cohort again, or weaken the budget. |
+| Run the fixed 224-session / 112-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition, adjust the fixed cohort again, or weaken the budget. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub, bulk recovery reads, and full-state checkpoint writes each use independently bootstrapped connections isolated from authoritative hot/control commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
@@ -912,12 +912,34 @@ completed durably, and no fence rejection or data loss occurred. The minimum
 correction opens one fresh checkpoint-write dispatcher per task, leaving bulk
 reads and regional metrics on the existing recovery-read dispatcher; it does
 not add per-partition pools, new persistence, a timeout increase, or a reader
-endpoint. Run A is fixed at 128 sessions / 64 duels: this projects roughly
-85--87% one-task CPU from the measured 144-session saturation, preserving
-headroom during the multi-minute target-tracking delay while remaining safely
-above the unchanged 70% target. This cohort must not be adjusted again to make
-a later run pass. Cleanup and its full absence verification succeeded. Capacity
-Run B and SIGKILL did not run, so release certification remains blocked.
+endpoint. The first follow-up calibration used 128 sessions / 64 duels based
+on the saturated pre-split run; that was a declared hypothesis, not a product
+invariant. Cleanup and its full absence verification succeeded. Capacity Run B
+and SIGKILL did not run, so release certification remained blocked.
+
+Exact-source Serverless run
+([GitHub Actions 30046381977](https://github.com/lopatin/snaketron-io/actions/runs/30046381977))
+then kept the configured 128-session / 64-duel stage active through the full
+eight-minute scale-out observation window. It completed 768 of 768 sessions
+and 384 of 384 games, resolving all 687,455 commands with a 488-millisecond
+maximum
+sent-second latency, no sent-second above 500 milliseconds, zero disconnects,
+zero reconnects, and zero checkpoint failures. CPU minute averages were only
+45.18--48.83%, so the unchanged 70% target correctly did not scale; the run
+failed closed and did not enter the forced, capacity, or SIGKILL phases. The
+new topology and the smaller cohort changed together, so this result must not
+be presented as a causal A/B claim. The command rate fell only about 10% from the
+144-session run while CPU, pending age, and latency collapsed, which is
+consistent with removing a nonlinear shared-dispatcher queueing knee. Cleanup
+and independent absence verification succeeded.
+
+Run A is now fixed once from same-version evidence at 224 sessions / 112
+duels. Subtracting the measured 3.5% idle CPU, scaling the observed 128-session
+work, and restoring idle overhead projects 76.4--82.8% CPU: wholly above the
+70% target without aiming near saturation. This revision replaces a falsified
+cross-topology projection; it does not lower a gate, force desired count, or
+add adaptive load. The 224-session cohort must not be adjusted again to make a
+later run pass. Complete planned and SIGKILL AWS runs are still required.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
