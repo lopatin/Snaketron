@@ -262,6 +262,7 @@ async fn game_bus(redis_url: &str) -> Result<Arc<GameBus>> {
     let redis = redis::aio::ConnectionManager::new(client.clone()).await?;
     Ok(Arc::new(GameBus::new(
         redis.clone(),
+        redis.clone(),
         redis,
         client,
         CancellationToken::new(),

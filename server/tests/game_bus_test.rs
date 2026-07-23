@@ -80,7 +80,7 @@ async fn streams_bus(token: CancellationToken) -> Result<StreamsTestBus> {
     let redis =
         server::redis_utils::create_connection_manager(client.clone(), pubsub_tx.clone()).await?;
     Ok(StreamsTestBus {
-        bus: GameBus::new(redis.clone(), redis.clone(), client, token),
+        bus: GameBus::new(redis.clone(), redis.clone(), redis.clone(), client, token),
         publisher: redis,
     })
 }

@@ -273,10 +273,10 @@ impl GameServer {
         .await?;
         info!("Redis connection manager created successfully");
 
-        // Large recovery envelopes must not share redis-rs' bounded cluster
+        // Large recovery reads must not share redis-rs' bounded cluster
         // dispatcher with latency-sensitive commands, events, or leases.
         // Cloning `redis` would share that dispatcher, so establish one
-        // independent connection for checkpoint, takeover, and reconnect
+        // independent connection for takeover, reconnect, and telemetry
         // payloads.
         let recovery_redis = create_connection_manager_until_available(
             redis_client.clone(),
@@ -284,6 +284,17 @@ impl GameServer {
         )
         .await?;
         info!("Redis recovery connection created successfully");
+
+        // Checkpoint and terminal-completion writes carry the full recovery
+        // envelope. Give them one independent dispatcher so a scale-out burst
+        // of recovery reads cannot delay authoritative actors. This is one
+        // connection per task, not a per-partition pool.
+        let checkpoint_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        info!("Redis checkpoint connection created successfully");
 
         // Pub/Sub must never share the cluster dispatcher's underlying
         // connections with ordinary commands. RESP3 subscription
@@ -301,6 +312,7 @@ impl GameServer {
         let game_bus = Arc::new(GameBus::new(
             redis.clone(),
             recovery_redis.clone(),
+            checkpoint_redis,
             redis_client.clone(),
             cancellation_token.clone(),
         ));

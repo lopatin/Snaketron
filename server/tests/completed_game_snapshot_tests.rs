@@ -28,7 +28,13 @@ async fn test_game_bus() -> Result<(GameBus, redis::aio::ConnectionManager)> {
         .await
         .context("Redis is required for this integration test; start it with ./test-deps.sh")?;
     let inspection_connection = redis.clone();
-    let bus = GameBus::new(redis.clone(), redis, client, CancellationToken::new());
+    let bus = GameBus::new(
+        redis.clone(),
+        redis.clone(),
+        redis,
+        client,
+        CancellationToken::new(),
+    );
 
     Ok((bus, inspection_connection))
 }

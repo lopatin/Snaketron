@@ -4115,6 +4115,7 @@ mod tests {
             let bus = Arc::new(GameBus::new(
                 manager.clone(),
                 manager.clone(),
+                manager.clone(),
                 client,
                 token.clone(),
             ));

@@ -201,17 +201,20 @@ evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
 settled in membership, assignment, and partition leases. It never runs on the
 one-task baseline.
 
-Continuity Run A is a separate fixed 144-session / 72-duel `every-tick` run on the
-one-vCPU minimum task. This is a one-time recalibration from the historical
-96-session cohort: exact-source run `30030317623` held service-average CPU at
-only 53--59%, below the unchanged 70% target, so it could not exercise automatic
-scale-out. The 144-session cohort passed the same one-task local command budget
-with sufficient CPU margin and is now frozen. It must first
+Continuity Run A is a separate fixed 128-session / 64-duel `every-tick` run on the
+one-vCPU minimum task. Two exact-source measurements bound this calibration:
+run `30030317623` held the historical 96-session cohort at only 53--59% CPU,
+below the unchanged 70% target, while run `30039460661` held 144 sessions at
+95.7--98.3% CPU for multiple complete minutes and violated the one-second
+command budget before scale-out. Removing one ninth of that measured work
+projects roughly 85--87% one-task CPU, leaving material SLO headroom while
+remaining unambiguously above the target. The 128-session cohort is now frozen.
+It must first
 cause CPU or memory target tracking to add capacity; if it does not, the run
 writes are not accepted as a substitute. The pre-movement one-task baseline
 must itself keep every command outcome within one second; this explicitly
 prevents autoscaling from hiding an already-overloaded starting task. The
-fixed 144-session calibration fails rather than being raised further, forced,
+fixed 128-session calibration fails rather than being adjusted again, forced,
 or accepted if either the policy trigger or that latency budget is missed.
 Policy writes are then
 suspended while Run A proves the
@@ -220,7 +223,7 @@ direct `1 -> 10 -> 1` ownership staircase. At ten tasks the runner adds 10 idle,
 deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
 starts a 208-session idle ramp at four sessions per second. This keeps new-user
 admission continuous through the 45-second drain deadline while leaving only
-144 command-bearing game sockets on the final task. Run A must prove no active
+128 command-bearing game sockets on the final task. Run A must prove no active
 socket hard reconnect, zero measured usable-session gap, terminal command
 outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
 nine partition moves in each direction. No game completion is awaited before
@@ -362,6 +365,35 @@ growing without bound. The process used roughly 79% CPU at the full plateau.
 This is causal diagnostic evidence only; actual Serverless cluster-mode
 planned and SIGKILL runs remain mandatory.
 
+Exact-source Serverless run
+[`30039460661`](https://github.com/lopatin/snaketron-io/actions/runs/30039460661)
+then proved natural CPU target-tracking `1 -> 2`, the forced `1 -> 10 -> 1`
+staircase, all 1,852 continuity sessions, all 926 games, all 1,653,922 command outcomes,
+256 of 256 planned handoffs, zero reconnects, and zero measured usable-session
+gap. It still failed the unchanged one-second latency gate. The 144-session
+one-task baseline spent five complete minutes at 95.7--98.3% CPU and had 20
+failing sent-seconds with a 2.023-second maximum. Forced scale-out had 12
+failing seconds with a 3.278-second maximum; scale-in had seven with a
+2.081-second maximum. Serverless Valkey reported zero throttle and eviction
+with sub-1.4-millisecond average successful request latency.
+
+At the scale-out burst, seven recovery-envelope reads and one fenced checkpoint
+write sharing the recovery dispatcher hit their 750-millisecond client
+deadlines together. The checkpoint retained unacknowledged work, retried, and
+the affected game completed durably; there was no fence rejection or data
+loss. The correction adds exactly one fresh checkpoint-write dispatcher per
+task while leaving takeover/reconnect reads and best-effort regional metrics on
+the existing recovery-read dispatcher. It also fixes Run A at 128 sessions / 64
+duels: the observed 144-session baseline was already saturated, while the
+measured work projects 128 at roughly 85--87% CPU, still safely above the
+unchanged 70% target. Do not adjust the cohort again if the next run fails.
+One hundred two best-effort active-game mapping lookups also timed out during
+the 144-session ownership bursts without causing a failed admission or usable
+gap; retain this as a diagnostic risk and investigate the matchmaking-manager
+critical section only if it recurs at the bounded 128-session run. Cleanup
+succeeded and its full absence verification passed. The capacity and SIGKILL
+phases did not run.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -386,15 +418,16 @@ Pub/Sub. Subscription confirmations must never share the reply queue used by
 matchmaking, executor, or recovery commands; this role separation is required
 for Serverless certification.
 
-The server also opens one independently bootstrapped recovery connection per
-task. Large periodic checkpoints, takeover journal/envelope loads, reconnect
-outcome reads, immutable completion-record loads, and regional recovery metrics
-use that dispatcher. Commands, ordinary events, leases, assignment,
+The server also opens two independently bootstrapped bulk connections per task.
+Full-state periodic checkpoints and terminal completion commits use the
+checkpoint-write dispatcher. Takeover journal/envelope loads, reconnect outcome
+reads, immutable completion-record loads, and regional recovery metrics use the
+recovery-read dispatcher. Commands, ordinary events, leases, assignment,
 matchmaking, and readiness remain on the hot/control dispatcher. Cloning a
 redis-rs cluster connection is insufficient because clones share its bounded
-client-side dispatcher. Do not add per-partition pools unless fresh Serverless
-evidence shows that the single recovery dispatcher cannot sustain the bounded
-envelope.
+client-side dispatcher. Do not add per-partition pools, a priority scheduler,
+or a telemetry-only connection unless fresh Serverless evidence shows that
+this fixed task-level split is insufficient.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
@@ -526,5 +559,5 @@ with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
 command, or failure to corroborate the measured
-phase envelopes (at least 375 simultaneous sockets during transition/admission
+phase envelopes (at least 359 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

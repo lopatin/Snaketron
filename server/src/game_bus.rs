@@ -149,10 +149,14 @@ pub struct GameBus {
     /// Shared non-blocking connection for XADD/KV. Never used for blocking
     /// reads (rule #1).
     redis: RedisConnection,
-    /// Independent dispatcher for large recovery/checkpoint payloads. A
-    /// cloned cluster connection shares the same bounded dispatcher, so this
-    /// must be created separately by the production bootstrap.
+    /// Independent dispatcher for large recovery reads and regional metrics.
+    /// A cloned cluster connection shares the same bounded dispatcher, so
+    /// this must be created separately by the production bootstrap.
     recovery_redis: RedisConnection,
+    /// Independent dispatcher for full-state checkpoint and completion
+    /// writes. Keeping these writes off the recovery-read dispatcher prevents
+    /// a scale-out snapshot burst from stalling authoritative actors.
+    checkpoint_redis: RedisConnection,
     /// Used to open a dedicated connection per reader task.
     redis_client: RedisClient,
     cancellation_token: CancellationToken,
@@ -168,12 +172,14 @@ impl GameBus {
     pub fn new(
         redis: impl Into<RedisConnection>,
         recovery_redis: impl Into<RedisConnection>,
+        checkpoint_redis: impl Into<RedisConnection>,
         redis_client: impl Into<RedisClient>,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
             redis: redis.into(),
             recovery_redis: recovery_redis.into(),
+            checkpoint_redis: checkpoint_redis.into(),
             redis_client: redis_client.into(),
             cancellation_token,
             #[cfg(test)]
@@ -665,7 +671,7 @@ impl GameBus {
         for id in covered_stream_ids {
             invocation.arg(id);
         }
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.checkpoint_redis.clone();
         let acked: i64 = tokio::time::timeout(
             FENCED_OPERATION_TIMEOUT,
             invocation.invoke_async(&mut redis),
@@ -1360,7 +1366,7 @@ impl GameBus {
             crate::recovery::validate_stream_id(id)?;
             invocation.arg(id);
         }
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.checkpoint_redis.clone();
         let result: i32 = tokio::time::timeout(
             FENCED_OPERATION_TIMEOUT,
             invocation.invoke_async(&mut redis),
@@ -2176,13 +2182,18 @@ mod tests {
     async fn recovery_payloads_and_hot_streams_use_their_configured_connections() -> Result<()> {
         let hot_client = redis::Client::open("redis://127.0.0.1:6379/12?protocol=resp3")?;
         let recovery_client = redis::Client::open("redis://127.0.0.1:6379/13?protocol=resp3")?;
+        let checkpoint_client = redis::Client::open("redis://127.0.0.1:6379/14?protocol=resp3")?;
         let (hot_push, _hot_push_rx) = tokio::sync::broadcast::channel(8);
         let (recovery_push, _recovery_push_rx) = tokio::sync::broadcast::channel(8);
+        let (checkpoint_push, _checkpoint_push_rx) = tokio::sync::broadcast::channel(8);
         let hot = create_connection_manager(hot_client.clone(), hot_push).await?;
         let recovery = create_connection_manager(recovery_client.clone(), recovery_push).await?;
+        let checkpoint =
+            create_connection_manager(checkpoint_client.clone(), checkpoint_push).await?;
         let bus = GameBus::new(
             hot.clone(),
             recovery.clone(),
+            checkpoint.clone(),
             hot_client.clone(),
             CancellationToken::new(),
         );
@@ -2190,13 +2201,20 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let namespace = ClusterNamespace::new(format!("connection-routing-{salt}"))?;
-        let game_id = (salt % u32::MAX as u128) as u32;
+        let game_id = (salt % (u32::MAX - crate::game_executor::PARTITION_COUNT) as u128) as u32;
         let partition = game_id % crate::game_executor::PARTITION_COUNT;
+        let checkpoint_game_id = game_id + crate::game_executor::PARTITION_COUNT;
         let recovery_key = namespace.recovery(game_id);
         let completion_key = namespace.completion(game_id);
+        let checkpoint_recovery_key = namespace.recovery(checkpoint_game_id);
+        let checkpoint_snapshot_key = RedisKeys::game_snapshot(checkpoint_game_id);
+        let active_games_key = namespace.active_games(partition);
+        let assignment_key = namespace.partition_assignment(partition);
+        let lease_key = namespace.partition_lease(partition);
         let command_stream = RedisKeys::stream_commands(partition);
         let mut hot_raw = hot_client.get_multiplexed_async_connection().await?;
         let mut recovery_raw = recovery_client.get_multiplexed_async_connection().await?;
+        let mut checkpoint_raw = checkpoint_client.get_multiplexed_async_connection().await?;
         let _: () = redis::cmd("DEL")
             .arg(&recovery_key)
             .arg(&completion_key)
@@ -2208,6 +2226,14 @@ mod tests {
             .arg(&completion_key)
             .arg(&command_stream)
             .query_async(&mut recovery_raw)
+            .await?;
+        let _: () = redis::cmd("DEL")
+            .arg(&checkpoint_recovery_key)
+            .arg(&checkpoint_snapshot_key)
+            .arg(&active_games_key)
+            .arg(&assignment_key)
+            .arg(&lease_key)
+            .query_async(&mut checkpoint_raw)
             .await?;
 
         let _: () = recovery_raw
@@ -2244,6 +2270,53 @@ mod tests {
         assert_eq!(hot_stream_len, 1);
         assert_eq!(recovery_stream_len, 0);
 
+        let owner = BootIdentity::new();
+        let mut owners = serde_json::Map::new();
+        owners.insert(
+            partition.to_string(),
+            serde_json::Value::String(owner.to_string()),
+        );
+        let _: () = checkpoint_raw
+            .set(
+                &assignment_key,
+                serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+            )
+            .await?;
+        let leases = PartitionLeaseStore::new(
+            checkpoint.clone(),
+            namespace.clone(),
+            Duration::from_secs(30),
+            Duration::from_millis(750),
+        )?;
+        let guard = leases
+            .try_acquire(partition, &owner)
+            .await?
+            .context("checkpoint routing test did not acquire its lease")?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let envelope = RecoveryEnvelopeV2::new(
+            checkpoint_game_id,
+            partition,
+            GameState::new(
+                40,
+                40,
+                common::GameType::FreeForAll { max_players: 4 },
+                common::QueueMode::Quickmatch,
+                Some(7),
+                now,
+            ),
+            "0-0".into(),
+            crate::recovery::ResolvedCommandState::default(),
+            0,
+            0,
+            now,
+            guard.encoded_token(),
+        );
+        bus.checkpoint_and_ack_fenced(&guard, &envelope, &[], Duration::from_secs(60))
+            .await?;
+        assert!(checkpoint_raw.exists(&checkpoint_recovery_key).await?);
+        assert!(!hot_raw.exists(&checkpoint_recovery_key).await?);
+        assert!(!recovery_raw.exists(&checkpoint_recovery_key).await?);
+
         let _: () = redis::cmd("DEL")
             .arg(&recovery_key)
             .arg(&completion_key)
@@ -2255,6 +2328,14 @@ mod tests {
             .arg(&completion_key)
             .arg(&command_stream)
             .query_async(&mut recovery_raw)
+            .await?;
+        let _: () = redis::cmd("DEL")
+            .arg(&checkpoint_recovery_key)
+            .arg(&checkpoint_snapshot_key)
+            .arg(&active_games_key)
+            .arg(&assignment_key)
+            .arg(&lease_key)
+            .query_async(&mut checkpoint_raw)
             .await?;
         Ok(())
     }
@@ -2269,6 +2350,7 @@ mod tests {
         // the warm shared connection remains fully functional.
         let unreachable = RedisClient::open("redis://127.0.0.1:1/1?protocol=resp3", None)?;
         let bus = GameBus::new(
+            manager.clone(),
             manager.clone(),
             manager.clone(),
             unreachable,

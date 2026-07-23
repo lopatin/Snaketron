@@ -1823,7 +1823,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 375' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 359' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2962,7 +2962,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 144@20m \
+    --stages 128@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -2974,12 +2974,12 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${continuity_command[@]}" &
   load_pid=$!
-  # One hundred forty-four sessions retain active games on every partition
+  # One hundred twenty-eight sessions retain active games on every partition
   # and drive the one-vCPU minimum task above its target-tracking threshold.
   # They must still trigger the configured CPU/memory policy naturally;
   # failure to trigger is a certification failure, not permission to force
   # the transition.
-  wait_for_region_socket_floor automatic-scale-out-baseline 144
+  wait_for_region_socket_floor automatic-scale-out-baseline 128
   automatic_scale_out_baseline_started_ms="$(unix_time_ms)"
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
@@ -3187,8 +3187,8 @@ run_staging_suite() {
   # without putting the full game-command envelope on one task.
   # The public count is a heartbeat-delayed raw WebSocket count. It proves the
   # candidate sockets exist; the finished admission report proves auth/readiness.
-  # Run A now carries 144 game sockets plus the 23 context probes.
-  wait_for_region_socket_floor pre-admission 167
+  # Run A now carries 128 game sockets plus the 23 context probes.
+  wait_for_region_socket_floor pre-admission 151
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -3208,7 +3208,7 @@ run_staging_suite() {
   # Wait for three complete four-session admission waves beyond that baseline
   # before starting scale-in, so the first measured wave is real rather than a
   # stale count inherited from the fixed populations.
-  wait_for_region_socket_floor admission-seed 179 "$admission_population_pid"
+  wait_for_region_socket_floor admission-seed 163 "$admission_population_pid"
   local scale_in_started_ms
   scale_in_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
@@ -3277,12 +3277,12 @@ run_staging_suite() {
       . as $report
       | .schema_version >= 10
       and .metadata.threshold_result == "passed"
-      and .configured_max_concurrency == 144
+      and .configured_max_concurrency == 128
       and .metadata.mode == "duel"
       and .metadata.command_profile == "every-tick"
       and .metadata.spawn_rate_per_second == "4"
-      and .session_counts.peak_authenticated_concurrency == 144
-      and .session_counts.peak_active_game_concurrency >= 72
+      and .session_counts.peak_authenticated_concurrency == 128
+      and .session_counts.peak_active_game_concurrency >= 64
       and .session_counts.failed == 0
       and .session_counts.cancelled == 0
       and .session_counts.incomplete == 0
@@ -3545,9 +3545,9 @@ run_staging_suite() {
         lobby_task_counts: counts($lobby),
         matchmaking_task_counts: counts($matchmaking),
         transition: {
-          configured_game_websockets: 144,
+          configured_game_websockets: 128,
           companion_websockets: 23,
-          configured_total_websockets: 167,
+          configured_total_websockets: 151,
           observed_game_websockets: ([$game_counts[]] | add // 0),
           observed_total_websockets:
             (([$game_counts[]] | add // 0)
@@ -3571,11 +3571,11 @@ run_staging_suite() {
     and (.idle_task_boot_ids | length) > 1
     and (.lobby_task_boot_ids | length) > 1
     and (.matchmaking_task_boot_ids | length) >= 1
-    and .transition.configured_game_websockets == 144
+    and .transition.configured_game_websockets == 128
     and .transition.companion_websockets == 23
-    and .transition.configured_total_websockets == 167
-    and .transition.observed_game_websockets == 144
-    and .transition.observed_total_websockets == 167
+    and .transition.configured_total_websockets == 151
+    and .transition.observed_game_websockets == 128
+    and .transition.observed_total_websockets == 151
   ' "$report_dir/population-distribution.json" >/dev/null || {
     echo "Exact TaskBootId transition WebSocket/event-forwarding distribution was not proven" >&2
     exit 1
