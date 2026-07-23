@@ -5,7 +5,7 @@
 | Status | Direct-only implementation acceptance draft |
 | Product | Snaketron regional game service |
 | Owners | Engineering / Product |
-| Last updated | 2026-07-22 |
+| Last updated | 2026-07-23 |
 | Scope | Executor ownership, task lifecycle, WebSocket continuity, matchmaking safety, readiness, and autoscaling |
 
 ## 1. Executive summary
@@ -25,6 +25,12 @@ The minimum correct design is:
 - client command resend plus make-before-break WebSocket handoff for planned task removal.
 
 This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, a self-managed cache cluster, or custom autoscaling signals. ElastiCache Serverless itself is TLS-only and cluster-mode-only; the application must therefore be Redis-Cluster-aware. CDK pins Serverless Valkey major 8 for its faster managed burst expansion, without adding a paid ECPU minimum or a correctness-affecting maximum.
+
+The initial production conversion from the unused node-based cache is a
+deliberate destructive cutoff with downtime. It has no dual-running cache,
+legacy endpoint adapter, data migration, or rollback acceptance requirement.
+After that one-time conversion, all runtime and autoscaling requirements in
+this PRD apply to Serverless Valkey only.
 
 ## 2. Product problem
 
@@ -122,6 +128,8 @@ For this PRD:
 - A matchmaking singleton as a correctness dependency.
 - Manual Traefik updates in response to node events.
 - DynamoDB capacity redesign in this phase.
+- A graceful or data-preserving migration from the unused node-based Valkey
+  deployment.
 - Continuous availability when the regional Serverless Valkey dependency or single ingress dependency is unavailable.
 
 ## 7. Core invariants
@@ -290,9 +298,10 @@ The assignment coordinator is control plane only. Existing assignments and activ
 5. Maintain a `partition -> active game IDs` index. Recovery must query this index and fetch checkpoints in a pipeline/batch rather than scan all `game:snapshot:*` keys.
 6. The authoritative recovery source is the versioned checkpoint. A local replica may accelerate recovery only if it carries the same cursor and dedupe metadata; an ordinary state-only replica must not override the checkpoint.
 7. A successor must batch-load the partition decision journal under its new
-   fence, attach entries to reclaimed commands by exact stream ID, and process
-   pending/new commands in stream order. It skips commands already covered by
-   the checkpoint; for an uncovered journaled command it restores the exact
+   fence, attach entries to reclaimed commands by exact stream ID, and preserve
+   each game's complete source-stream projection while allowing independent
+   games to be interleaved. It skips commands already covered by the
+   checkpoint; for an uncovered journaled command it restores the exact
    recorded schedule, server-command counter, resolved outcome, and strictly
    advancing event watermark without reauthorizing or republishing the
    incremental outcome. It then catches the deterministic engine up to wall
@@ -310,12 +319,15 @@ The assignment coordinator is control plane only. Existing assignments and activ
     next existing periodic checkpoint. Concurrent gateway warm-up requests
     therefore coalesce without weakening subscribe-before-request ordering.
     Successor activation still publishes its immediate recovery re-anchor.
-13. The partition reader may enqueue ordinary commands for independent games
-    concurrently, but it must keep at most one unresolved delivery per game and
-    use a bounded fan-out. It must settle replies in source-stream order and
-    flush all accepted deliveries before any serial control action or handoff.
-    This removes cross-game head-of-line blocking without introducing a second
-    scheduler or relaxing per-game ordering and recovery semantics.
+13. The partition reader must round-robin the complete projection for each
+    addressable game, keep at most one unresolved delivery per game, and use a
+    bounded fan-out. A later command, status, creation, cursor, decision,
+    checkpoint, ACK, or actor-membership action for one game must first settle
+    that game's earlier accepted delivery; it must not wait for unrelated
+    games. Global drains are limited to Poison boundaries, ownership handoff,
+    the bounded fan-out window, failure, and batch completion. This removes
+    cross-game head-of-line blocking without introducing a second scheduler or
+    relaxing per-game ordering and recovery semantics.
 
 ### R7 — Planned partition handoff and task shutdown
 
@@ -819,6 +831,40 @@ commands received terminal outcomes, maximum outcome latency was 170
 milliseconds, all 192 session attempts passed, and the pending backlog remained
 below one second. This local result is causal diagnostic evidence only; a fresh
 AWS run remains required.
+
+The next selective-settlement AWS attempt
+([GitHub Actions 30014346604](https://github.com/lopatin/snaketron-io/actions/runs/30014346604))
+showed that command-only interleaving was incomplete: lifecycle markers still
+split adjacent per-game runs and the exact-source dispatcher still globally
+settled pending actors on status, creation, terminal, and inactive paths. One
+task again processed roughly 430 outcomes per second against roughly 950
+submitted commands per second, pending age reached about 70 seconds, and the
+maximum outcome latency reached 53.6 seconds before any scale event.
+
+The following exact-source Serverless run
+([GitHub Actions 30021797806](https://github.com/lopatin/snaketron-io/actions/runs/30021797806))
+proved substantially more of the system. Automatic `1 -> 2 -> 1` and forced
+`1 -> 10 -> 1` assignment movement completed, all 64 planned handoffs retained
+zero usable-session gap, and 1,248 of 1,248 sessions plus 967,475 of 967,475
+command outcomes completed with no ordinary disconnect. Valkey 8 remained at
+zero throttling and eviction. The run still failed: reset-to-one had two
+1.1--1.2-second sent windows, forced scale-in had one 1.040-second window, and a
+later synchronized game rollover grew maximum outcome latency to 44.765 seconds
+and game-join p99 to 51.701 seconds. Capacity Run B and SIGKILL therefore did
+not run. DynamoDB separately throttled completion-effect and admission writes,
+but its largest throttle intervals occurred while command outcomes were
+healthy, and throttling ended while the rollover backlog kept growing; command
+submission, scheduling outcomes, checkpoints, and ACKs are Valkey-only.
+
+The subsequent patch round-robins the complete per-game stream projection,
+makes lifecycle settlement game-local, and preserves global drains only for
+Poison, handoff, the bounded fanout window, failure, and batch completion. Its
+focused causal regressions and all 163 server library tests pass. A local
+96-session / 48-duel rollover run through a simulated six-millisecond cache RTT
+completed 288 of 288 sessions, 144 of 144 games, and 251,700 of 251,700 command
+outcomes with zero failures, zero disconnects, no sent-second over one second,
+and a 291-millisecond maximum outcome. This remains diagnostic evidence; the
+release is still blocked on fresh complete planned and SIGKILL AWS runs.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

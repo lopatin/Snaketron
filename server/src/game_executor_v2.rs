@@ -1766,20 +1766,29 @@ fn is_parallel_actor_delivery(payload: &CommandDeliveryPayload) -> bool {
     )
 }
 
-fn append_round_robin_game_command_run(
+fn delivery_game_id(payload: &CommandDeliveryPayload) -> Option<u32> {
+    match payload {
+        CommandDeliveryPayload::Poison { .. } => None,
+        CommandDeliveryPayload::Command(StreamEvent::GameCreated { game_id, .. })
+        | CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
+            game_id, ..
+        })
+        | CommandDeliveryPayload::Command(StreamEvent::StatusUpdated { game_id, .. }) => {
+            Some(*game_id)
+        }
+    }
+}
+
+fn append_round_robin_game_delivery_run(
     run: &mut Vec<CommandDelivery>,
     reordered: &mut Vec<CommandDelivery>,
 ) {
     let mut game_positions = HashMap::new();
     let mut game_queues: Vec<VecDeque<CommandDelivery>> = Vec::new();
     for delivery in run.drain(..) {
-        let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
-            game_id, ..
-        }) = &delivery.payload
-        else {
-            unreachable!("round-robin run contains only game commands");
-        };
-        let position = *game_positions.entry(*game_id).or_insert_with(|| {
+        let game_id = delivery_game_id(&delivery.payload)
+            .expect("round-robin run contains only addressable game deliveries");
+        let position = *game_positions.entry(game_id).or_insert_with(|| {
             game_queues.push(VecDeque::new());
             game_queues.len() - 1
         });
@@ -1800,18 +1809,18 @@ fn append_round_robin_game_command_run(
     }
 }
 
-fn round_robin_game_command_runs(deliveries: Vec<CommandDelivery>) -> Vec<CommandDelivery> {
+fn round_robin_game_delivery_runs(deliveries: Vec<CommandDelivery>) -> Vec<CommandDelivery> {
     let mut reordered = Vec::with_capacity(deliveries.len());
     let mut run = Vec::new();
     for delivery in deliveries {
-        if is_parallel_actor_delivery(&delivery.payload) {
+        if delivery_game_id(&delivery.payload).is_some() {
             run.push(delivery);
             continue;
         }
-        append_round_robin_game_command_run(&mut run, &mut reordered);
+        append_round_robin_game_delivery_run(&mut run, &mut reordered);
         reordered.push(delivery);
     }
-    append_round_robin_game_command_run(&mut run, &mut reordered);
+    append_round_robin_game_delivery_run(&mut run, &mut reordered);
     reordered
 }
 
@@ -1888,6 +1897,23 @@ async fn drain_pending_dispatch_replies_after_failure(
         .context("pending dispatch failure had no source error")?)
 }
 
+async fn preserve_dispatch_error<T>(
+    result: Result<T>,
+    pending: &mut VecDeque<PendingDispatchDelivery>,
+    fatal: &CancellationToken,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            fatal.cancel();
+            match drain_pending_dispatch_replies_after_failure(pending, Some(error), None).await {
+                Ok(()) => unreachable!("failure drain always returns its primary error"),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
 async fn flush_pending_dispatch_deliveries(
     pending: &mut VecDeque<PendingDispatchDelivery>,
     bus: &GameBus,
@@ -1961,10 +1987,10 @@ async fn settle_pending_dispatch_delivery_for_game(
     cursors: &mut HashMap<u32, String>,
     fatal: &CancellationToken,
 ) -> Result<()> {
-    let Some(index) = pending_delivery_position_for_game(pending, game_id) else {
-        return Ok(());
-    };
-    settle_pending_dispatch_delivery_at(pending, index, bus, guard, cursors, fatal).await
+    while let Some(index) = pending_delivery_position_for_game(pending, game_id) {
+        settle_pending_dispatch_delivery_at(pending, index, bus, guard, cursors, fatal).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1983,12 +2009,12 @@ async fn dispatch_batch(
     activate_new_actors: bool,
 ) -> Result<()> {
     let mut pending = VecDeque::with_capacity(DISPATCH_FANOUT_WINDOW);
-    // Redis preserves global append order, so two clients in one game commonly
-    // produce adjacent entries. Offer one command per game before the next
-    // per-game round; otherwise the second adjacent entry waits for its first
-    // reply before any later game is even offered to an actor. Per-game order
-    // remains unchanged, and control entries retain their barrier positions.
-    for delivery in round_robin_game_command_runs(deliveries) {
+    // Redis preserves global append order, so commands and lifecycle markers
+    // for one game commonly arrive in dense runs. Offer one delivery per game
+    // before the next per-game round. This preserves each game's complete
+    // stream projection while keeping unrelated games out of its barriers.
+    // Unaddressable poison entries retain their exact batch-wide boundaries.
+    for delivery in round_robin_game_delivery_runs(deliveries) {
         // XREADGROUP may already have returned a large batch when assignment
         // changes. Leave untouched entries in the old consumer's PEL so the
         // successor can claim them at zero idle time instead of extending the
@@ -2002,8 +2028,10 @@ async fn dispatch_batch(
             CommandDeliveryPayload::Poison { raw, reason } => {
                 flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
                     .await?;
-                bus.quarantine_and_ack_fenced(guard, &stream_id, raw, reason)
-                    .await?;
+                let quarantine = bus
+                    .quarantine_and_ack_fenced(guard, &stream_id, raw, reason)
+                    .await;
+                preserve_dispatch_error(quarantine, &mut pending, &fatal).await?;
                 continue;
             }
             CommandDeliveryPayload::Command(StreamEvent::GameCreated { game_id, .. })
@@ -2015,15 +2043,31 @@ async fn dispatch_batch(
                 *game_id
             }
         };
+
+        // Every later action for this game observes all of its earlier actor
+        // work. Cursors, decisions, checkpoints, ACKs, and actor membership
+        // are game-scoped, so unrelated actor replies need not be a lifecycle
+        // barrier.
+        settle_pending_dispatch_delivery_for_game(
+            &mut pending,
+            game_id,
+            bus,
+            guard,
+            cursors,
+            &fatal,
+        )
+        .await?;
+
         if game_id % PARTITION_COUNT != guard.partition() {
-            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
-            bus.quarantine_and_ack_fenced(
-                guard,
-                &stream_id,
-                &[],
-                "command game belongs to a different partition",
-            )
-            .await?;
+            let quarantine = bus
+                .quarantine_and_ack_fenced(
+                    guard,
+                    &stream_id,
+                    &[],
+                    "command game belongs to a different partition",
+                )
+                .await;
+            preserve_dispatch_error(quarantine, &mut pending, &fatal).await?;
             continue;
         }
         if let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
@@ -2042,11 +2086,11 @@ async fn dispatch_batch(
                     .map(|error| error.to_string())
             };
             if let Some(reason) = identity_error {
-                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
-                    .await?;
                 crate::resilience_metrics::record_command_rejections(1);
-                bus.quarantine_and_ack_fenced(guard, &stream_id, &[], &reason)
-                    .await?;
+                let quarantine = bus
+                    .quarantine_and_ack_fenced(guard, &stream_id, &[], &reason)
+                    .await;
+                preserve_dispatch_error(quarantine, &mut pending, &fatal).await?;
                 continue;
             }
         }
@@ -2057,11 +2101,16 @@ async fn dispatch_batch(
             }) => Some(command_id.clone()),
             _ => None,
         };
-        if let Some(cursor) = cursors.get(&game_id)
-            && stream_id_leq(&stream_id, cursor)?
-        {
-            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
-            bus.xack_fenced(guard, &[stream_id]).await?;
+        let duplicate = match cursors.get(&game_id) {
+            Some(cursor) => {
+                preserve_dispatch_error(stream_id_leq(&stream_id, cursor), &mut pending, &fatal)
+                    .await?
+            }
+            None => false,
+        };
+        if duplicate {
+            let ack = bus.xack_fenced(guard, &[stream_id]).await.map(|_| ());
+            preserve_dispatch_error(ack, &mut pending, &fatal).await?;
             continue;
         }
 
@@ -2070,9 +2119,9 @@ async fn dispatch_batch(
             ..
         }) = &delivery.payload
         {
-            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
             actors.remove(&game_id);
-            bus.xack_fenced(guard, &[stream_id]).await?;
+            let ack = bus.xack_fenced(guard, &[stream_id]).await.map(|_| ());
+            preserve_dispatch_error(ack, &mut pending, &fatal).await?;
             continue;
         }
 
@@ -2091,21 +2140,19 @@ async fn dispatch_batch(
             // a game. Waiting only for this game keeps every unrelated actor
             // in flight instead of collapsing the fanout window whenever two
             // players in one game submit adjacent commands.
-            settle_pending_dispatch_delivery_for_game(
-                &mut pending,
-                game_id,
-                bus,
-                guard,
-                cursors,
-                &fatal,
-            )
-            .await?;
-            let slot = actors.get(&game_id).context("game actor disappeared")?;
+            let Some(slot) = actors.get(&game_id) else {
+                return preserve_dispatch_error(
+                    Err(anyhow::anyhow!("game actor disappeared")),
+                    &mut pending,
+                    &fatal,
+                )
+                .await;
+            };
             // A full actor mailbox must not delay assignment movement. Dropping
             // this enqueue future leaves the untouched Redis PEL entry for the
             // successor; already accepted work is drained below.
-            let actor_reply =
-                enqueue_delivery_until_handoff(slot, delivery, &handoff_cancel).await?;
+            let enqueue = enqueue_delivery_until_handoff(slot, delivery, &handoff_cancel).await;
+            let actor_reply = preserve_dispatch_error(enqueue, &mut pending, &fatal).await?;
             let actor_reply = match actor_reply {
                 ActorDeliveryEnqueue::Accepted(actor_reply) => actor_reply,
                 ActorDeliveryEnqueue::HandoffRequested => {
@@ -2114,9 +2161,7 @@ async fn dispatch_batch(
                     return Ok(());
                 }
                 ActorDeliveryEnqueue::TerminallyCompleted => {
-                    flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
-                        .await?;
-                    apply_delivery_disposition(
+                    let disposition = apply_delivery_disposition(
                         game_id,
                         stream_id,
                         replyable_command_id.as_ref(),
@@ -2125,7 +2170,8 @@ async fn dispatch_batch(
                         guard,
                         cursors,
                     )
-                    .await?;
+                    .await;
+                    preserve_dispatch_error(disposition, &mut pending, &fatal).await?;
                     continue;
                 }
             };
@@ -2142,25 +2188,20 @@ async fn dispatch_batch(
             continue;
         }
 
-        // Creation, activation, terminal/control markers, and rejection paths
-        // are explicit barriers. They may mutate the actor map or externally
-        // settle a stream entry, so every earlier actor delivery must finish
-        // first.
-        flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
-
         let mut created_actor = false;
         if !actors.contains_key(&game_id) {
             let CommandDeliveryPayload::Command(StreamEvent::GameCreated { game_state, .. }) =
                 &delivery.payload
             else {
-                reject_or_quarantine_delivery(
+                let rejection = reject_or_quarantine_delivery(
                     bus,
                     guard,
                     &stream_id,
                     replyable_command_id.as_ref(),
                     "command targets an inactive game without GameCreated",
                 )
-                .await?;
+                .await;
+                preserve_dispatch_error(rejection, &mut pending, &fatal).await?;
                 continue;
             };
             let envelope = RecoveryEnvelopeV2::new(
@@ -2190,9 +2231,17 @@ async fn dispatch_batch(
             created_actor = true;
         }
 
-        let slot = actors.get(&game_id).context("game actor disappeared")?;
-        let disposition = slot.deliver(delivery).await?;
-        apply_delivery_disposition(
+        let Some(slot) = actors.get(&game_id) else {
+            return preserve_dispatch_error(
+                Err(anyhow::anyhow!("game actor disappeared")),
+                &mut pending,
+                &fatal,
+            )
+            .await;
+        };
+        let delivery_result = slot.deliver(delivery).await;
+        let disposition = preserve_dispatch_error(delivery_result, &mut pending, &fatal).await?;
+        let apply = apply_delivery_disposition(
             game_id,
             stream_id,
             replyable_command_id.as_ref(),
@@ -2201,23 +2250,30 @@ async fn dispatch_batch(
             guard,
             cursors,
         )
-        .await?;
+        .await;
+        preserve_dispatch_error(apply, &mut pending, &fatal).await?;
         if created_actor && activate_new_actors {
             // The incorporated GameCreated remains pending and replayable. Do
             // not start a retrying activation checkpoint after ownership has
             // already moved; the successor performs activation instead.
             if handoff_cancel.is_cancelled() {
+                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                    .await?;
                 return Ok(());
             }
-            let slot = actors.get(&game_id).context("new game actor disappeared")?;
-            let (reply, receive) = oneshot::channel();
-            slot.sender
-                .send(GameActorMessage::Activate { reply })
-                .await
-                .context("new game actor stopped before activation")?;
-            receive
-                .await
-                .context("new game actor dropped activation reply")??;
+            let activation = async {
+                let slot = actors.get(&game_id).context("new game actor disappeared")?;
+                let (reply, receive) = oneshot::channel();
+                slot.sender
+                    .send(GameActorMessage::Activate { reply })
+                    .await
+                    .context("new game actor stopped before activation")?;
+                receive
+                    .await
+                    .context("new game actor dropped activation reply")?
+            }
+            .await;
+            preserve_dispatch_error(activation, &mut pending, &fatal).await?;
         }
     }
     flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
@@ -2654,7 +2710,7 @@ mod tests {
     }
 
     #[test]
-    fn game_command_rounds_preserve_per_game_order_and_control_barriers() {
+    fn full_game_delivery_rounds_preserve_per_game_projection_and_poison_boundary() {
         let first_game = 11;
         let second_game = 21;
         let third_game = 31;
@@ -2699,48 +2755,116 @@ mod tests {
 
         let input_per_game = deliveries.iter().fold(
             HashMap::<u32, Vec<String>>::new(),
-            |mut commands, delivery| {
-                if let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
-                    game_id,
-                    ..
-                }) = &delivery.payload
-                {
-                    commands
-                        .entry(*game_id)
+            |mut game_deliveries, delivery| {
+                if let Some(game_id) = delivery_game_id(&delivery.payload) {
+                    game_deliveries
+                        .entry(game_id)
                         .or_default()
                         .push(delivery.stream_id.clone());
                 }
-                commands
+                game_deliveries
             },
         );
-        let reordered = round_robin_game_command_runs(deliveries);
+        let reordered = round_robin_game_delivery_runs(deliveries);
         assert_eq!(
             reordered
                 .iter()
                 .map(|delivery| delivery.stream_id.as_str())
                 .collect::<Vec<_>>(),
             [
-                "1-0", "3-0", "5-0", "2-0", "4-0", "6-0", "7-0", "8-0", "11-0", "9-0", "10-0",
-                "12-0", "13-0", "14-0", "15-0",
+                "1-0", "3-0", "5-0", "2-0", "4-0", "6-0", "7-0", "11-0", "8-0", "12-0", "9-0",
+                "10-0", "13-0", "14-0", "15-0",
             ]
         );
         let output_per_game = reordered.iter().fold(
             HashMap::<u32, Vec<String>>::new(),
-            |mut commands, delivery| {
-                if let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
-                    game_id,
-                    ..
-                }) = &delivery.payload
-                {
-                    commands
-                        .entry(*game_id)
+            |mut game_deliveries, delivery| {
+                if let Some(game_id) = delivery_game_id(&delivery.payload) {
+                    game_deliveries
+                        .entry(game_id)
                         .or_default()
                         .push(delivery.stream_id.clone());
                 }
-                commands
+                game_deliveries
             },
         );
         assert_eq!(output_per_game, input_per_game);
+        let poison_position = reordered
+            .iter()
+            .position(|delivery| delivery_game_id(&delivery.payload).is_none())
+            .expect("poison delivery remains present");
+        assert_eq!(reordered[poison_position].stream_id, "13-0");
+        assert!(
+            reordered[..poison_position]
+                .iter()
+                .all(|delivery| delivery.stream_id != "14-0" && delivery.stream_id != "15-0"),
+            "deliveries after poison must never cross its batch-wide boundary"
+        );
+    }
+
+    #[test]
+    fn rollover_rounds_interleave_commands_statuses_and_new_game_creation() {
+        let first_game = 11;
+        let second_game = 21;
+        let third_game = 31;
+        let fourth_game = 41;
+        let state = || {
+            GameState::new(
+                20,
+                20,
+                GameType::FreeForAll { max_players: 2 },
+                QueueMode::Quickmatch,
+                Some(1),
+                0,
+            )
+        };
+        let deliveries = vec![
+            parallel_test_delivery(1, first_game, 1, 1),
+            parallel_test_delivery(2, first_game, 2, 1),
+            control_test_delivery(
+                3,
+                StreamEvent::StatusUpdated {
+                    game_id: first_game,
+                    status: GameStatus::Complete {
+                        winning_snake_id: None,
+                    },
+                },
+            ),
+            parallel_test_delivery(4, second_game, 3, 1),
+            parallel_test_delivery(5, second_game, 4, 1),
+            control_test_delivery(
+                6,
+                StreamEvent::StatusUpdated {
+                    game_id: second_game,
+                    status: GameStatus::Complete {
+                        winning_snake_id: None,
+                    },
+                },
+            ),
+            control_test_delivery(
+                7,
+                StreamEvent::GameCreated {
+                    game_id: third_game,
+                    game_state: state(),
+                },
+            ),
+            control_test_delivery(
+                8,
+                StreamEvent::GameCreated {
+                    game_id: fourth_game,
+                    game_state: state(),
+                },
+            ),
+        ];
+
+        let reordered = round_robin_game_delivery_runs(deliveries);
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|delivery| delivery.stream_id.as_str())
+                .collect::<Vec<_>>(),
+            ["1-0", "4-0", "7-0", "8-0", "2-0", "5-0", "3-0", "6-0"]
+        );
     }
 
     #[tokio::test]
@@ -3080,6 +3204,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_waits_for_its_game_without_waiting_for_unrelated_actor() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let harness = CrashBoundaryHarness::new("game-local-lifecycle-barrier").await?;
+            let first_game = harness.game_id;
+            let lifecycle_game = first_game + PARTITION_COUNT;
+            let deliveries = vec![
+                parallel_test_delivery(1, first_game, 11, 1),
+                parallel_test_delivery(2, lifecycle_game, 21, 1),
+                control_test_delivery(
+                    3,
+                    StreamEvent::StatusUpdated {
+                        game_id: lifecycle_game,
+                        status: GameStatus::Complete {
+                            winning_snake_id: None,
+                        },
+                    },
+                ),
+            ];
+
+            let first_entered = Arc::new(tokio::sync::Notify::new());
+            let release_first = Arc::new(tokio::sync::Notify::new());
+            let first_entered_task = first_entered.clone();
+            let release_first_task = release_first.clone();
+            let (first_sender, mut first_receiver) = mpsc::channel(1);
+            let first_task = tokio::spawn(async move {
+                let Some(GameActorMessage::Delivery { reply, .. }) = first_receiver.recv().await
+                else {
+                    panic!("unrelated game never received its command");
+                };
+                first_entered_task.notify_one();
+                release_first_task.notified().await;
+                assert!(reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok());
+            });
+
+            let lifecycle_entered = Arc::new(tokio::sync::Notify::new());
+            let release_lifecycle = Arc::new(tokio::sync::Notify::new());
+            let lifecycle_removed = Arc::new(tokio::sync::Notify::new());
+            let lifecycle_entered_task = lifecycle_entered.clone();
+            let release_lifecycle_task = release_lifecycle.clone();
+            let lifecycle_removed_task = lifecycle_removed.clone();
+            let (lifecycle_sender, mut lifecycle_receiver) = mpsc::channel(1);
+            let lifecycle_task = tokio::spawn(async move {
+                let Some(GameActorMessage::Delivery { reply, .. }) =
+                    lifecycle_receiver.recv().await
+                else {
+                    panic!("lifecycle game never received its command");
+                };
+                lifecycle_entered_task.notify_one();
+                release_lifecycle_task.notified().await;
+                assert!(reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok());
+                assert!(
+                    lifecycle_receiver.recv().await.is_none(),
+                    "status removal closes only this actor mailbox"
+                );
+                lifecycle_removed_task.notify_one();
+            });
+
+            let mut actors = HashMap::from([
+                (
+                    first_game,
+                    GameActorSlot {
+                        sender: first_sender,
+                        terminally_completed: Arc::new(AtomicBool::new(false)),
+                        _task: first_task,
+                    },
+                ),
+                (
+                    lifecycle_game,
+                    GameActorSlot {
+                        sender: lifecycle_sender,
+                        terminally_completed: Arc::new(AtomicBool::new(false)),
+                        _task: lifecycle_task,
+                    },
+                ),
+            ]);
+            let mut cursors = HashMap::from([
+                (first_game, "0-0".to_string()),
+                (lifecycle_game, "0-0".to_string()),
+            ]);
+            let fatal = CancellationToken::new();
+            let handoff = fatal.child_token();
+            let (actor_failures, _failure_events) = mpsc::unbounded_channel();
+            let bus = harness.bus.clone();
+            let guard = harness.guard.clone();
+            {
+                let dispatch = dispatch_batch(
+                    deliveries,
+                    &mut actors,
+                    &mut cursors,
+                    2,
+                    &bus,
+                    &guard,
+                    Arc::new(UnusedDatabase::default()),
+                    RecoveryConfig::default(),
+                    fatal,
+                    handoff,
+                    actor_failures,
+                    false,
+                );
+                tokio::pin!(dispatch);
+                let actors_entered = async {
+                    tokio::time::timeout(Duration::from_secs(1), first_entered.notified())
+                        .await
+                        .context("unrelated command was not offered to its actor")?;
+                    tokio::time::timeout(Duration::from_secs(1), lifecycle_entered.notified())
+                        .await
+                        .context("lifecycle command was held behind the unrelated actor")?;
+                    Result::<()>::Ok(())
+                };
+                tokio::select! {
+                    result = &mut dispatch => {
+                        panic!("dispatch completed before either blocked actor was released: {result:?}");
+                    }
+                    observed = actors_entered => observed?,
+                }
+
+                tokio::select! {
+                    result = &mut dispatch => {
+                        panic!("dispatch completed before either blocked actor was released: {result:?}");
+                    }
+                    removed = tokio::time::timeout(
+                        Duration::from_millis(25),
+                        lifecycle_removed.notified(),
+                    ) => {
+                        assert!(removed.is_err(), "status must wait for its own earlier command");
+                    }
+                }
+
+                release_lifecycle.notify_one();
+                tokio::select! {
+                    result = &mut dispatch => {
+                        panic!("dispatch completed before the unrelated actor was released: {result:?}");
+                    }
+                    removed = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        lifecycle_removed.notified(),
+                    ) => {
+                        removed.context(
+                            "lifecycle marker was held behind the unrelated actor"
+                        )?;
+                    }
+                }
+
+                release_first.notify_one();
+                tokio::time::timeout(Duration::from_secs(1), &mut dispatch).await??;
+            }
+
+            assert_eq!(
+                cursors.get(&lifecycle_game).map(String::as_str),
+                Some("2-0")
+            );
+            let first_slot = actors
+                .remove(&first_game)
+                .context("unrelated actor remains present")?;
+            tokio::time::timeout(Duration::from_secs(1), first_slot._task).await??;
+            assert!(
+                !actors.contains_key(&lifecycle_game),
+                "completed lifecycle removes only its own actor"
+            );
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dispatch_fanout_later_actor_error_wins_over_earlier_dropped_reply() -> Result<()> {
         let fatal = CancellationToken::new();
         let first_fatal = fatal.clone();
@@ -3125,6 +3417,44 @@ mod tests {
             "the later typed actor error must replace the secondary dropped-reply error"
         );
         assert!(pending.is_empty(), "every accepted reply must be drained");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn synchronous_dispatch_error_cancels_and_drains_unrelated_reply() -> Result<()> {
+        let fatal = CancellationToken::new();
+        let actor_fatal = fatal.clone();
+        let (sender, reply) = oneshot::channel::<Result<DeliveryDisposition>>();
+        let actor = tokio::spawn(async move {
+            actor_fatal.cancelled().await;
+            drop(sender);
+        });
+        let mut pending = VecDeque::from([PendingDispatchDelivery {
+            game_id: 27,
+            stream_id: "2-0".to_string(),
+            replyable_command_id: None,
+            actor_reply: PendingActorReply {
+                reply,
+                terminally_completed: Arc::new(AtomicBool::new(false)),
+            },
+        }]);
+        let source =
+            redis::RedisError::from((redis::ErrorKind::IoError, "synchronous Redis failure"));
+
+        let error =
+            preserve_dispatch_error::<()>(Err(anyhow::Error::new(source)), &mut pending, &fatal)
+                .await
+                .expect_err("the synchronous failure must remain authoritative");
+
+        actor.await?;
+        assert!(fatal.is_cancelled());
+        assert!(pending.is_empty(), "every accepted reply must be drained");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<redis::RedisError>().is_some()),
+            "the typed primary error must survive the secondary reply closure"
+        );
         Ok(())
     }
 

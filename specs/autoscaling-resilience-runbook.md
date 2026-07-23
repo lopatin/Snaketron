@@ -23,6 +23,33 @@ the autoscaling design in [autoscaling-resilience-prd.md](autoscaling-resilience
 - Recovery after checkpoint retention expires is explicitly unrecoverable; the
   server must not fabricate a replacement game.
 
+## One-time production Serverless Valkey cutover
+
+The first production deployment of this design is intentionally destructive.
+There are no users or cache state to migrate, so the production workflow does
+not dual-run the old node cache, preserve its plaintext endpoint, or attempt a
+zero-downtime compatibility transition.
+
+For each production region, the workflow detects the old
+`AWS::ElastiCache::ReplicationGroup`, deletes and waits for the Monitoring and
+Server stacks that consume its generated endpoint exports, and removes the
+Server stack's retained `/ecs/snaketron/prod` log group. It leaves the Valkey
+stack itself in place so the ordinary dependency-ordered CDK deployment can
+replace its resource with Valkey 8 Serverless before recreating Server and
+Monitoring. The step is idempotent. While the legacy resource exists it performs
+the destructive cutoff; after Valkey is already Serverless, a rerun also removes
+failed, non-updatable Server or Monitoring stacks, cleans the retained Server
+log group when recreation is needed, and lets the ordinary deployment recreate
+missing consumers.
+
+Expect service downtime and loss of the old cache contents during this one-time
+cutover. Old task definitions are not a valid rollback because they contain the
+deleted plaintext endpoint; a failed cutover is recovered by rerunning or
+fixing the deployment forward. After deployment, the workflow requires one
+available Valkey 8 Serverless cache per region, no old Snaketron replication
+group, and an exact task URL of
+`rediss://HOST:6379/?protocol=resp3&cluster=true`.
+
 For steady-state inspection after startup:
 
 ```bash
@@ -283,6 +310,28 @@ game, the same 96-socket / 48-duel profile completed 172,093 commands locally
 with a 170-millisecond maximum outcome latency, zero failed session attempts,
 and a sub-second pending backlog. That local result identifies the bottleneck
 but does not replace the required fresh AWS certification.
+
+The selective-settlement AWS follow-up, GitHub Actions `30014346604`, showed
+that command-only interleaving still left lifecycle markers as cross-game
+barriers. It failed before scale-out with about 70 seconds of pending age and a
+53.6-second maximum command outcome. GitHub Actions `30021797806` then
+successfully exercised automatic `1 -> 2 -> 1`, forced `1 -> 10 -> 1`, balanced
+lease movement, and 64 of 64 zero-gap planned handoffs on actual Serverless
+Valkey. It still failed the command budget during reset-to-one and later game
+rollover; maximum outcome latency reached 44.765 seconds and the capacity and
+SIGKILL phases did not run. Valkey recorded zero throttling and eviction.
+DynamoDB completion/admission writes throttled independently, but their timing
+and the Valkey-only command scheduling path do not explain the sustained
+command-outcome backlog by themselves. Cleanup again removed every development
+runtime resource.
+
+After full-event per-game interleaving and game-local lifecycle settlement, the
+local six-millisecond-cache-RTT rollover profile passed 288 of 288 sessions,
+144 of 144 games, and 251,700 command outcomes with no disconnect, no failed
+session, no sent-second above one second, and a 291-millisecond maximum. Treat
+this as diagnostic only. Do not mark the release complete until a fresh AWS
+planned run reaches the full capacity phase and a separate authorized SIGKILL
+run passes.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
