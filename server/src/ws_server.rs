@@ -4440,7 +4440,10 @@ mod lifecycle_protocol_tests {
         let redis = create_connection_manager(client.clone(), pubsub_tx.clone())
             .await
             .unwrap();
-        let pubsub_manager = Arc::new(PubSubManager::new(redis.clone(), pubsub_tx));
+        let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
         let mut control = client.get_multiplexed_async_connection().await.unwrap();
         let lobby_code = format!("LISTENER-{}", uuid::Uuid::new_v4());
         let mapping_key = RedisKeys::matchmaking_lobby_active_game(&lobby_code);

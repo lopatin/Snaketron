@@ -398,6 +398,21 @@ fn report_autonomous_actor_failure(
     fatal.cancel();
 }
 
+/// An actor reports its source error before dropping any in-flight reply
+/// channel. Preserve that source when dispatch observes the secondary channel
+/// closure first, so Redis/timeout failures retain their partition-local
+/// recovery classification instead of being promoted to a task-fatal
+/// invariant error.
+fn prefer_actor_failure<T>(
+    dispatch_result: Result<T>,
+    actor_failures: &mut mpsc::UnboundedReceiver<anyhow::Error>,
+) -> Result<T> {
+    match dispatch_result {
+        Ok(value) => Ok(value),
+        Err(dispatch_error) => Err(actor_failures.try_recv().unwrap_or(dispatch_error)),
+    }
+}
+
 async fn supervise_actor_run(
     future: impl std::future::Future<Output = Result<()>>,
     actor_failures: &mpsc::UnboundedSender<anyhow::Error>,
@@ -1342,7 +1357,7 @@ async fn run_game_executor_v2(
                     }
                 }
             };
-            dispatch_batch(
+            let dispatch_result = dispatch_batch(
                 deliveries,
                 &mut actors,
                 &mut cursors,
@@ -1356,7 +1371,8 @@ async fn run_game_executor_v2(
                 actor_failures.clone(),
                 true,
             )
-            .await?;
+            .await;
+            prefer_actor_failure(dispatch_result, &mut actor_failure_rx)?;
         }
     }
     .await;
@@ -2116,6 +2132,29 @@ mod tests {
             .expect_err("actor failure must fail the operation");
 
         assert_eq!(error.to_string(), "primary snapshot failure");
+    }
+
+    #[test]
+    fn queued_actor_failure_wins_over_dropped_delivery_reply() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let source =
+            redis::RedisError::from((redis::ErrorKind::IoError, "primary actor Redis failure"));
+        sender
+            .send(autonomous_actor_failure(4, 14, anyhow::Error::new(source)))
+            .expect("test receiver remains open");
+
+        let error = prefer_actor_failure::<()>(
+            Err(anyhow::anyhow!("game actor dropped delivery reply")),
+            &mut receiver,
+        )
+        .expect_err("actor failure must fail the dispatch");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<redis::RedisError>().is_some()),
+            "the primary typed Redis source must survive the reply-closure race"
+        );
     }
 
     #[tokio::test]

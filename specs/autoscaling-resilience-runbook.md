@@ -275,8 +275,15 @@ traffic may use a differing loopback
 instance. Run from a VPC-connected host, VPN, or such an SSM tunnel;
 public HTTPS access alone is insufficient. The certification workflow preserves
 the real cache hostname in the `rediss://` URL, maps that hostname to loopback,
-and forwards local port 6379 through SSM so rustls still validates the AWS
-certificate and cluster discovery retains the deployment identity.
+and forwards both Serverless ports 6379 (primary) and 6380 (read endpoint)
+through separate SSM sessions so rustls still validates the AWS certificate
+and redis-rs can complete cluster discovery. The application URL remains
+anchored to port 6379.
+
+The server opens a separate reconnecting Redis connection pool for RESP3
+Pub/Sub. Subscription confirmations must never share the reply queue used by
+matchmaking, executor, or recovery commands; this role separation is required
+for Serverless certification.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
@@ -323,15 +330,15 @@ SNAKETRON_TRAEFIK_METRICS_CONTROL_URL=http://127.0.0.1:19090/metrics \
 ```
 
 The “Ephemeral Development Certification” workflow provisions one short-lived
-development environment, opens both SSM tunnels, runs those commands in that
-order, uploads both evidence directories, and always destroys and verifies the
-absence of the ephemeral stacks afterward. It does not preserve or transition
-state from a previous deployment. The workflow discovers and validates the
-production Network stack's VPC, then imports it read-only. Development owns only
-its separately tagged security groups, Serverless cache, ECS resources,
-Traefik/EIP, and run-unique DNS record; cleanup must prove the shared VPC still
-exists and must never create, replace, or delete its routes, endpoints, or flow
-logs.
+development environment, opens three SSM sessions (Valkey 6379, Valkey 6380,
+and Traefik metrics), runs those commands in that order, uploads both evidence
+directories, and always destroys and verifies the absence of the ephemeral
+stacks afterward. It does not preserve or transition state from a previous
+deployment. The workflow discovers and validates the production Network
+stack's VPC, then imports it read-only. Development owns only its separately
+tagged security groups, Serverless cache, ECS resources, Traefik/EIP, and
+run-unique DNS record; cleanup must prove the shared VPC still exists and must
+never create, replace, or delete its routes, endpoints, or flow logs.
 
 At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,

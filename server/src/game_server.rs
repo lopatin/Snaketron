@@ -32,7 +32,7 @@ use crate::{
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct EcsTaskMetadata {
@@ -50,9 +50,9 @@ fn ecs_task_id_from_arn(task_arn: &str) -> Option<String> {
 }
 
 /// Resolve ECS identity for membership diagnostics without making the
-/// metadata service a startup dependency. CDK supplies the task-definition
-/// ARN directly; the task ID comes from metadata v4 when available and falls
-/// back to the process boot UUID for local/test and degraded startup.
+/// metadata service a startup dependency. Explicit environment overrides are
+/// honored; otherwise the task ID comes from metadata v4 and falls back to the
+/// process boot UUID for local/test and degraded startup.
 async fn resolve_executor_task_metadata(
     boot_identity: &BootIdentity,
 ) -> (Option<String>, Option<String>) {
@@ -273,9 +273,17 @@ impl GameServer {
         .await?;
         info!("Redis connection manager created successfully");
 
-        // Create the PubsubManager for loss-tolerant fan-out
-        // (chat/lobby/counters).
-        let pubsub_manager = Arc::new(PubSubManager::new(redis.clone(), pubsub_tx.clone()));
+        // Pub/Sub must never share the cluster dispatcher's underlying
+        // connections with ordinary commands. RESP3 subscription
+        // confirmations are push frames that also consume a command reply;
+        // isolating them prevents a reconnect/resubscribe burst from shifting
+        // the response FIFO used by authoritative executor writes.
+        let pubsub_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx.clone()));
 
         // Create the game-critical message bus (Redis Streams).
         let game_bus = Arc::new(GameBus::new(

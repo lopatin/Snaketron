@@ -7,7 +7,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-const BOOTSTRAP_CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const REDIS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+// Cluster bootstrap opens every address advertised by CLUSTER SLOTS. Keep the
+// outer deadline longer than one connection attempt so redis-rs can discard a
+// transiently unreachable replica without hiding a broken topology for 30s.
+const BOOTSTRAP_CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Parsed application endpoint. `cluster=true` belongs to Snaketron rather
@@ -82,8 +87,8 @@ impl RedisClient {
                 .min_retry_wait(100)
                 .max_retry_wait(60_000)
                 .retry_wait_formula(100, 2)
-                .connection_timeout(Duration::from_secs(30))
-                .response_timeout(Duration::from_secs(30));
+                .connection_timeout(REDIS_CONNECTION_TIMEOUT)
+                .response_timeout(REDIS_RESPONSE_TIMEOUT);
             if let Some(push_sender) = push_sender {
                 builder = builder.push_sender(push_sender);
             }
@@ -228,8 +233,8 @@ fn standalone_manager_config(
     push_sender: Option<tokio::sync::broadcast::Sender<PushInfo>>,
 ) -> ConnectionManagerConfig {
     let mut config = ConnectionManagerConfig::new()
-        .set_connection_timeout(Duration::from_secs(30))
-        .set_response_timeout(Duration::from_secs(30))
+        .set_connection_timeout(REDIS_CONNECTION_TIMEOUT)
+        .set_response_timeout(REDIS_RESPONSE_TIMEOUT)
         .set_number_of_retries(10)
         .set_exponent_base(2)
         .set_factor(1000)

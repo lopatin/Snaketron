@@ -472,6 +472,11 @@ impl MatchCommitPlan {
             keys.push(&user.queue_status_key);
             keys.push(&user.queue_identity_key);
         }
+        keys.extend(
+            self.notifications
+                .iter()
+                .map(|notification| notification.channel.as_str()),
+        );
         keys
     }
 }

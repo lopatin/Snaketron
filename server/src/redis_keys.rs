@@ -151,7 +151,14 @@ impl RedisKeys {
 
     /// Lobby notification channel for all members of a lobby
     pub fn matchmaking_lobby_notification_channel(lobby_code: &str) -> String {
-        format!("matchmaking:lobby:notification:{}", lobby_code)
+        // PUBLISH is part of the atomic matchmaking Lua commit. ElastiCache
+        // Serverless therefore requires the channel to share the script's
+        // matchmaking hash slot just like every data key it touches.
+        format!(
+            "matchmaking:{{{}}}:lobby:notification:{}",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
     }
 
     // === User Cache ===
@@ -412,6 +419,7 @@ mod tests {
             RedisKeys::matchmaking_user_queue_identity(1),
             RedisKeys::matchmaking_lobby_active_game("ABC"),
             RedisKeys::matchmaking_lobby_queue_identity("ABC"),
+            RedisKeys::matchmaking_lobby_notification_channel("ABC"),
             RedisKeys::lobby_metadata("ABC"),
         ]);
 
