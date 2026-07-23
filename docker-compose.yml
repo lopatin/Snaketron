@@ -26,7 +26,7 @@ services:
       - snaketron-network
 
   redis:
-    image: valkey/valkey:latest
+    image: valkey/valkey:8-alpine
     container_name: snaketron-valkey
     ports:
       - "6379:6379"

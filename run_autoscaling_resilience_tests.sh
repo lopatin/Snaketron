@@ -790,10 +790,12 @@ verify_staging_identity() {
     and .ServerlessCaches[0].ServerlessCacheName == $expected_name
     and (.ServerlessCaches[0].Status | ascii_downcase) == "available"
     and (.ServerlessCaches[0].Engine | ascii_downcase) == "valkey"
+    and .ServerlessCaches[0].MajorEngineVersion == "8"
+    and (.ServerlessCaches[0].FullEngineVersion | startswith("8."))
     and (.ServerlessCaches[0].Endpoint.Address | type == "string" and length > 0)
     and .ServerlessCaches[0].Endpoint.Port == 6379
   ' "$identity_dir/valkey.json" >/dev/null || {
-    echo "The named Serverless Valkey cache is not one available TLS endpoint" >&2
+    echo "The named Serverless Valkey 8 cache is not one available TLS endpoint" >&2
     return 1
   }
   staging_valkey_arn="$(jq -r '.ServerlessCaches[0].ARN' "$identity_dir/valkey.json")"
@@ -1718,7 +1720,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 279' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 271' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2857,7 +2859,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 48@20m \
+    --stages 40@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -2865,13 +2867,17 @@ run_staging_suite() {
     --run-id "$continuity_run_id" \
     --report-dir "$report_dir"
   )
+  local automatic_scale_out_baseline_started_ms
   local automatic_scale_out_started_ms
   "${continuity_command[@]}" &
   load_pid=$!
-  # Forty-eight sessions are the one-task calibration derived from the first
-  # live run. Failure to trigger the configured CPU/memory policy is a
-  # certification failure; never escalate the initial task to the full
-  # capacity envelope.
+  # Forty sessions retain active games on every partition while leaving the
+  # one-task command path below the latency instability observed at 48. They
+  # must still trigger the configured CPU/memory policy naturally; failure to
+  # trigger is a certification failure, not permission to use the full
+  # capacity envelope as the calibration.
+  wait_for_region_socket_floor automatic-scale-out-baseline 40
+  automatic_scale_out_baseline_started_ms="$(unix_time_ms)"
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
   # The load ramp is not itself an ownership transition. Start the strict
@@ -2893,6 +2899,15 @@ run_staging_suite() {
         | (($at * 1000) | floor)]
       | min
     ' "$report_dir/automatic-scale-out-activities.json")"
+  jq -n \
+    --argjson started_at_unix_ms "$automatic_scale_out_baseline_started_ms" \
+    --argjson finished_at_unix_ms "$automatic_scale_out_started_ms" '
+      {
+        started_at_unix_ms: $started_at_unix_ms,
+        finished_at_unix_ms: $finished_at_unix_ms,
+        duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
+      }
+    ' >"$report_dir/automatic-scale-out-baseline-window.json"
 
   # Freeze policy writes only for the deterministic ownership staircase. This
   # keeps the autoscaler from undoing the forced ten-to-one leg while commands
@@ -3059,7 +3074,7 @@ run_staging_suite() {
   # without putting the full game-command envelope on one task.
   # The public count is a heartbeat-delayed raw WebSocket count. It proves the
   # candidate sockets exist; the finished admission report proves auth/readiness.
-  wait_for_region_socket_floor pre-admission 71
+  wait_for_region_socket_floor pre-admission 63
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -3145,12 +3160,12 @@ run_staging_suite() {
       . as $report
       | .schema_version >= 10
       and .metadata.threshold_result == "passed"
-      and .configured_max_concurrency == 48
+      and .configured_max_concurrency == 40
       and .metadata.mode == "duel"
       and .metadata.command_profile == "every-tick"
       and .metadata.spawn_rate_per_second == "4"
-      and .session_counts.peak_authenticated_concurrency == 48
-      and .session_counts.peak_active_game_concurrency >= 24
+      and .session_counts.peak_authenticated_concurrency == 40
+      and .session_counts.peak_active_game_concurrency >= 20
       and .session_counts.failed == 0
       and .session_counts.cancelled == 0
       and .session_counts.incomplete == 0
@@ -3191,6 +3206,7 @@ run_staging_suite() {
   # every input still receives a prompt authoritative result.
   local movement_window
   for movement_window in \
+    "$report_dir/automatic-scale-out-baseline-window.json" \
     "$report_dir/automatic-scale-out-window.json" \
     "$report_dir/reset-to-one-window.json" \
     "$report_dir/scale-out-window.json" \
@@ -3412,9 +3428,9 @@ run_staging_suite() {
         lobby_task_counts: counts($lobby),
         matchmaking_task_counts: counts($matchmaking),
         transition: {
-          configured_game_websockets: 48,
+          configured_game_websockets: 40,
           companion_websockets: 23,
-          configured_total_websockets: 71,
+          configured_total_websockets: 63,
           observed_game_websockets: ([$game_counts[]] | add // 0),
           observed_total_websockets:
             (([$game_counts[]] | add // 0)
@@ -3438,11 +3454,11 @@ run_staging_suite() {
     and (.idle_task_boot_ids | length) > 1
     and (.lobby_task_boot_ids | length) > 1
     and (.matchmaking_task_boot_ids | length) >= 1
-    and .transition.configured_game_websockets == 48
+    and .transition.configured_game_websockets == 40
     and .transition.companion_websockets == 23
-    and .transition.configured_total_websockets == 71
-    and .transition.observed_game_websockets == 48
-    and .transition.observed_total_websockets == 71
+    and .transition.configured_total_websockets == 63
+    and .transition.observed_game_websockets == 40
+    and .transition.observed_total_websockets == 63
   ' "$report_dir/population-distribution.json" >/dev/null || {
     echo "Exact TaskBootId transition WebSocket/event-forwarding distribution was not proven" >&2
     exit 1

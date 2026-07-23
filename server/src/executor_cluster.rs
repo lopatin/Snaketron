@@ -29,7 +29,10 @@ use tracing::{info, warn};
 const STATE_WARMING: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
 const STATE_DRAINING: u8 = 2;
-const CONTROL_TICK: Duration = Duration::from_millis(500);
+// Bound the healthy release-to-acquire polling gap well below the one-second
+// command continuity budget. This remains coarse relative to game ticks and
+// adds only five small coordination passes per task per second.
+const CONTROL_TICK: Duration = Duration::from_millis(200);
 
 async fn run_membership_heartbeat(
     store: MembershipStore,
@@ -360,8 +363,8 @@ async fn run_executor_cluster(
                     // Consumer groups are required runtime state. Establish
                     // all of them before readiness, retrying the complete set
                     // after a partial bootstrap failure. Once established,
-                    // do not spend every 500 ms control tick reissuing ten
-                    // XGROUP commands from every task.
+                    // do not spend every control tick reissuing ten XGROUP
+                    // commands from every task.
                     if !command_groups_ready {
                         for partition in 0..PARTITION_COUNT {
                             bus.ensure_executor_command_group(&namespace, partition).await?;
@@ -692,8 +695,13 @@ mod tests {
             .await?
             .context("initial owner did not acquire its assigned lease")?;
         let stop = CancellationToken::new();
-        let (watchdog, mut events) =
-            spawn_lease_watchdog(leases.clone(), guard.clone(), stop.clone());
+        let handoff_requested = CancellationToken::new();
+        let (watchdog, mut events) = spawn_lease_watchdog(
+            leases.clone(),
+            guard.clone(),
+            stop.clone(),
+            handoff_requested.clone(),
+        );
 
         assignment.version += 1;
         assignment.computed_at_ms += 1;
@@ -709,6 +717,7 @@ mod tests {
             .await
             .context("owner change did not wake the lease watchdog")?;
         assert!(matches!(event, Some(LeaseWatchdogEvent::AssignmentMoved)));
+        assert!(handoff_requested.is_cancelled());
         assert!(
             leases.validate(&guard).await?,
             "owner change must request cooperative handoff while the exact incumbent lease remains fenced"

@@ -88,26 +88,24 @@ where
 
 pub struct PartitionExecutorV2Handle {
     control: mpsc::Sender<ExecutorControl>,
-    completion_cancel: CancellationToken,
+    handoff_cancel: CancellationToken,
 }
 
 impl Clone for PartitionExecutorV2Handle {
     fn clone(&self) -> Self {
         Self {
             control: self.control.clone(),
-            completion_cancel: self.completion_cancel.clone(),
+            handoff_cancel: self.handoff_cancel.clone(),
         }
     }
 }
 
 impl PartitionExecutorV2Handle {
-    /// Stops intake, barriers every game actor, checkpoints/ACKs, then
-    /// compare-deletes the exact lease. The caller owns the global ECS deadline.
+    /// Stops intake, barriers every game actor, then compare-deletes the exact
+    /// lease. Uncheckpointed commands remain in the durable PEL/decision
+    /// journal for the successor's crash-authoritative recovery path. The
+    /// caller owns the global ECS deadline.
     pub async fn handoff(&self) -> Result<()> {
-        // Bootstrap can be awaiting a recovered terminal game's DynamoDB MMR
-        // read before the control loop starts. Cancel that partition-local work
-        // before queueing the handoff request so direct ECS drain is authoritative.
-        self.completion_cancel.cancel();
         let (reply, receive) = oneshot::channel();
         if self
             .control
@@ -121,6 +119,13 @@ impl PartitionExecutorV2Handle {
             // left for this caller to drain.
             return Ok(());
         }
+        // Publish the typed request before setting the sticky cancellation
+        // flag. If a caller is aborted while a full channel is being awaited,
+        // this prevents a flag-only executor that stops dispatching but keeps
+        // renewing indefinitely. After enqueue succeeds, cancellation promptly
+        // interrupts any partition-local bootstrap or completion work that is
+        // delaying the control loop.
+        self.handoff_cancel.cancel();
         match receive.await {
             Ok(result) => result,
             Err(_) => Ok(()),
@@ -190,6 +195,7 @@ pub(crate) fn spawn_lease_watchdog(
     lease_store: PartitionLeaseStore,
     guard: PartitionLeaseGuard,
     stop: CancellationToken,
+    handoff_cancel: CancellationToken,
 ) -> (JoinHandle<()>, mpsc::Receiver<LeaseWatchdogEvent>) {
     let (events, receiver) = mpsc::channel(1);
     let task = tokio::spawn(async move {
@@ -227,6 +233,12 @@ pub(crate) fn spawn_lease_watchdog(
                             last_transient_error = None;
                         }
                         Ok(Ok(Some(event))) => {
+                            if let LeaseWatchdogEvent::AssignmentMoved = &event {
+                                // Wake live command dispatch immediately. The
+                                // event channel remains the typed authority
+                                // result used by bootstrap and the main loop.
+                                handoff_cancel.cancel();
+                            }
                             let _ = events.send(event).await;
                             return;
                         }
@@ -560,16 +572,14 @@ impl GameActor {
                         }
                         GameActorMessage::Barrier { reply } => {
                             self.live = false;
-                            let result = if self.terminal_pending() {
-                                // Completion still has no durable terminal state.
-                                // Its last non-terminal checkpoint and unacked
-                                // command entries are the takeover source.
-                                Ok(())
-                            } else {
-                                self.checkpoint().await
-                            };
-                            if result.is_err() { self.fatal.cancel(); }
-                            let _ = reply.send(result);
+                            // FIFO mailbox ordering proves every delivery this
+                            // actor accepted has finished. Do not add a second
+                            // full-state checkpoint here: the periodic
+                            // checkpoint plus unacked PEL entries and durable
+                            // decision journal are already the authoritative
+                            // crash-recovery source. The successor checkpoints
+                            // recovered state before activation.
+                            let _ = reply.send(Ok(()));
                             return Ok(());
                         }
                     }
@@ -1088,10 +1098,13 @@ pub fn spawn_game_executor_v2(
 ) -> (PartitionExecutorV2Handle, JoinHandle<Result<()>>) {
     let (control, receiver) = mpsc::channel(4);
     let fatal = cancellation.child_token();
-    let completion_cancel = fatal.child_token();
+    // One shared signal stops both further batch dispatch and any game-local
+    // completion read. Direct drain and assignment movement therefore enter
+    // exactly the same cooperative handoff path.
+    let handoff_cancel = fatal.child_token();
     let handle = PartitionExecutorV2Handle {
         control,
-        completion_cancel: completion_cancel.clone(),
+        handoff_cancel: handoff_cancel.clone(),
     };
     let task = tokio::spawn(run_game_executor_v2(
         server_id,
@@ -1102,7 +1115,7 @@ pub fn spawn_game_executor_v2(
         config,
         cancellation,
         fatal,
-        completion_cancel,
+        handoff_cancel,
         receiver,
     ));
     (handle, task)
@@ -1118,7 +1131,7 @@ async fn run_game_executor_v2(
     config: RecoveryConfig,
     cancellation: CancellationToken,
     fatal: CancellationToken,
-    completion_cancel: CancellationToken,
+    handoff_cancel: CancellationToken,
     mut control: mpsc::Receiver<ExecutorControl>,
 ) -> Result<()> {
     let partition = guard.partition();
@@ -1127,8 +1140,12 @@ async fn run_game_executor_v2(
     // may include a large active-game set or PEL, and must never outlive the
     // three-second lease it was acquired under.
     let watchdog_stop = CancellationToken::new();
-    let (watchdog, mut watchdog_rx) =
-        spawn_lease_watchdog(lease_store.clone(), guard.clone(), watchdog_stop.clone());
+    let (watchdog, mut watchdog_rx) = spawn_lease_watchdog(
+        lease_store.clone(),
+        guard.clone(),
+        watchdog_stop.clone(),
+        handoff_cancel.clone(),
+    );
 
     let bootstrap = async {
         // Anchor fan-out requests immediately on acquisition so a cold
@@ -1158,7 +1175,7 @@ async fn run_game_executor_v2(
                 db.clone(),
                 config.clone(),
                 fatal.clone(),
-                completion_cancel.clone(),
+                handoff_cancel.clone(),
                 actor_failures.clone(),
             );
         }
@@ -1190,7 +1207,7 @@ async fn run_game_executor_v2(
                 db.clone(),
                 config.clone(),
                 fatal.clone(),
-                completion_cancel.clone(),
+                handoff_cancel.clone(),
                 actor_failures.clone(),
                 false,
             )
@@ -1215,7 +1232,7 @@ async fn run_game_executor_v2(
                 db.clone(),
                 config.clone(),
                 fatal.clone(),
-                completion_cancel.clone(),
+                handoff_cancel.clone(),
                 actor_failures.clone(),
                 false,
             )
@@ -1335,7 +1352,7 @@ async fn run_game_executor_v2(
                                 &lease_store,
                                 &guard,
                                 &fatal,
-                                &completion_cancel,
+                                &handoff_cancel,
                             ).await;
                             let ok = result.is_ok();
                             let _ = reply.send(result);
@@ -1351,7 +1368,7 @@ async fn run_game_executor_v2(
                                         &lease_store,
                                         &guard,
                                         &fatal,
-                                        &completion_cancel,
+                                        &handoff_cancel,
                                     ).await?;
                                     return Ok(());
                                 }
@@ -1425,7 +1442,7 @@ async fn run_game_executor_v2(
                 db.clone(),
                 config.clone(),
                 fatal.clone(),
-                completion_cancel.clone(),
+                handoff_cancel.clone(),
                 actor_failures.clone(),
                 true,
             )
@@ -1546,11 +1563,18 @@ async fn dispatch_batch(
     db: Arc<dyn Database>,
     config: RecoveryConfig,
     fatal: CancellationToken,
-    completion_cancel: CancellationToken,
+    handoff_cancel: CancellationToken,
     actor_failures: mpsc::UnboundedSender<anyhow::Error>,
     activate_new_actors: bool,
 ) -> Result<()> {
     for delivery in deliveries {
+        // XREADGROUP may already have returned a large batch when assignment
+        // changes. Leave untouched entries in the old consumer's PEL so the
+        // successor can claim them at zero idle time instead of extending the
+        // ownership pause by draining the entire batch first.
+        if handoff_cancel.is_cancelled() {
+            return Ok(());
+        }
         let stream_id = delivery.stream_id.clone();
         let game_id = match &delivery.payload {
             CommandDeliveryPayload::Poison { raw, reason } => {
@@ -1659,7 +1683,7 @@ async fn dispatch_batch(
                 db.clone(),
                 config.clone(),
                 fatal.clone(),
-                completion_cancel.clone(),
+                handoff_cancel.clone(),
                 actor_failures.clone(),
             );
             created_actor = true;
@@ -1820,12 +1844,12 @@ async fn cooperative_handoff(
     lease_store: &PartitionLeaseStore,
     guard: &PartitionLeaseGuard,
     fatal: &CancellationToken,
-    completion_cancel: &CancellationToken,
+    handoff_cancel: &CancellationToken,
 ) -> Result<()> {
     // Preempt game-local completion materialization before enqueueing barriers.
-    // This leaves the durable pre-terminal checkpoint and PEL entry for the
-    // successor instead of letting a slow DynamoDB read hold partition transfer.
-    completion_cancel.cancel();
+    // This leaves the durable checkpoint and PEL entry for the successor
+    // instead of letting a slow DynamoDB read hold partition transfer.
+    handoff_cancel.cancel();
 
     let keepalive_stop = CancellationToken::new();
     let keepalive_task_stop = keepalive_stop.clone();
@@ -2006,6 +2030,38 @@ mod tests {
                 .is_some()),
             "context must retain the timeout source used by local-restart classification"
         );
+    }
+
+    #[tokio::test]
+    async fn aborted_blocked_handoff_does_not_set_a_flag_without_a_request() -> Result<()> {
+        let (control, _control_receiver) = mpsc::channel(1);
+        let (occupied_reply, _occupied_receive) = oneshot::channel();
+        control
+            .send(ExecutorControl::Handoff {
+                reply: occupied_reply,
+            })
+            .await?;
+        let handoff_cancel = CancellationToken::new();
+        let handle = PartitionExecutorV2Handle {
+            control,
+            handoff_cancel: handoff_cancel.clone(),
+        };
+
+        let blocked = tokio::spawn(async move { handle.handoff().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !handoff_cancel.is_cancelled(),
+            "cancellation must not become sticky until the typed request is queued"
+        );
+        blocked.abort();
+        assert!(
+            blocked
+                .await
+                .expect_err("blocked handoff should abort")
+                .is_cancelled()
+        );
+        assert!(!handoff_cancel.is_cancelled());
+        Ok(())
     }
 
     #[test]
@@ -3471,7 +3527,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_handoff_preempts_blocked_completion_and_successor_finishes() -> Result<()> {
+    async fn handoff_barrier_leaves_live_work_for_exact_successor_replay() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("live-handoff-replay").await?;
+            let baseline = harness.recovery().await?;
+            let (sender, receiver) = mpsc::channel(8);
+            let fatal = harness.token.child_token();
+            let recovery_config = RecoveryConfig {
+                // Keep the test focused on the handoff barrier. A slow CI
+                // runner must not let the ordinary periodic checkpoint race
+                // the assertion that Barrier itself performs no checkpoint.
+                checkpoint_interval: Duration::from_secs(60),
+                ..RecoveryConfig::default()
+            };
+            let mut original = GameActor::from_envelope(
+                2,
+                baseline,
+                harness.bus.clone(),
+                harness.guard.clone(),
+                Arc::new(UnusedDatabase::default()),
+                recovery_config,
+                receiver,
+                fatal.clone(),
+                fatal.child_token(),
+            );
+            let original_task = tokio::spawn(async move { original.run().await });
+
+            let (activate_reply, activate_result) = oneshot::channel();
+            sender
+                .send(GameActorMessage::Activate {
+                    reply: activate_reply,
+                })
+                .await?;
+            activate_result.await??;
+
+            let pending_id = harness.append_command().await?;
+            let mut consumer = harness
+                .bus
+                .subscribe_executor_commands(harness.guard.clone())
+                .await?;
+            let mut deliveries = consumer.read_new_now().await?;
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].stream_id, pending_id);
+            let (delivery_reply, delivery_result) = oneshot::channel();
+            sender
+                .send(GameActorMessage::Delivery {
+                    delivery: deliveries.remove(0),
+                    reply: delivery_reply,
+                })
+                .await?;
+            assert!(matches!(
+                delivery_result.await??,
+                DeliveryDisposition::Incorporated
+            ));
+
+            let (barrier_reply, barrier_result) = oneshot::channel();
+            sender
+                .send(GameActorMessage::Barrier {
+                    reply: barrier_reply,
+                })
+                .await?;
+            barrier_result.await??;
+            original_task.await??;
+
+            assert_eq!(
+                harness.recovery().await?.command_cursor,
+                "0-0",
+                "handoff must leave post-checkpoint work pending for authoritative recovery"
+            );
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert_eq!(pending.ids.len(), 1);
+            assert_eq!(pending.ids[0].id, pending_id);
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                1
+            );
+
+            let successor_guard = harness.takeover().await?;
+            let mut recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&successor_guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            let mut successor_consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let mut reclaimed = successor_consumer.reclaim_next().await?;
+            assert_eq!(reclaimed.deliveries.len(), 1);
+            assert_eq!(reclaimed.deliveries[0].stream_id, pending_id);
+            let mut decisions = harness
+                .bus
+                .load_command_decisions_fenced(&successor_guard)
+                .await?;
+            attach_command_decisions(&mut reclaimed.deliveries, &mut decisions);
+            assert!(decisions.is_empty());
+
+            let mut successor = harness.actor(recovered.remove(0), successor_guard.clone());
+            assert!(matches!(
+                successor
+                    .incorporate(reclaimed.deliveries.remove(0))
+                    .await?,
+                DeliveryDisposition::Incorporated
+            ));
+            assert_one_scheduled_result(&successor, &harness.command_id);
+            successor.activate().await?;
+
+            assert_eq!(harness.recovery().await?.command_cursor, pending_id);
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(pending.ids.is_empty());
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                0
+            );
+            let scheduled = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| {
+                    matches!(
+                        &message.event,
+                        GameEvent::CommandScheduledV2 { command_id, .. }
+                            if command_id == &harness.command_id
+                    )
+                })
+                .count();
+            assert_eq!(
+                scheduled, 1,
+                "successor replay duplicated a visible outcome"
+            );
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assignment_move_preempts_blocked_completion_and_successor_finishes() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut harness = CrashBoundaryHarness::new("blocked-completion-handoff").await?;
             let now = chrono::Utc::now().timestamp_millis();
@@ -3519,7 +3736,7 @@ mod tests {
             let mmr_read_entered = Arc::new(tokio::sync::Notify::new());
             let never_release_mmr_read = Arc::new(tokio::sync::Notify::new());
             let partition_cancellation = CancellationToken::new();
-            let (executor, executor_task) = spawn_game_executor_v2(
+            let (_executor, executor_task) = spawn_game_executor_v2(
                 2,
                 harness.guard.clone(),
                 harness.leases.clone(),
@@ -3535,13 +3752,6 @@ mod tests {
                 .await
                 .context("completion never entered the blocked MMR read")?;
 
-            tokio::time::timeout(Duration::from_secs(3), executor.handoff())
-                .await
-                .context("blocked completion exceeded the three-second handoff budget")??;
-            tokio::time::timeout(Duration::from_secs(1), executor_task)
-                .await
-                .context("old partition executor did not stop after handoff")???;
-
             let successor_owner = BootIdentity::new();
             let mut owners = serde_json::Map::new();
             owners.insert(
@@ -3555,6 +3765,10 @@ mod tests {
                     serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
                 )
                 .await?;
+
+            tokio::time::timeout(Duration::from_secs(3), executor_task)
+                .await
+                .context("assignment-driven handoff did not preempt blocked completion")???;
 
             let persisted = harness.recovery().await?;
             assert!(
@@ -4123,7 +4337,7 @@ mod tests {
             assert_eq!(deliveries[0].stream_id, stream_id);
 
             let fatal = CancellationToken::new();
-            let completion_cancel = fatal.child_token();
+            let handoff_cancel = fatal.child_token();
             let (actor_failures, mut failure_events) = mpsc::unbounded_channel();
             let mut actors = HashMap::new();
             let mut cursors = HashMap::new();
@@ -4137,7 +4351,7 @@ mod tests {
                 Arc::new(UnusedDatabase::default()),
                 RecoveryConfig::default(),
                 fatal.clone(),
-                completion_cancel,
+                handoff_cancel,
                 actor_failures,
                 true,
             )
@@ -4386,8 +4600,12 @@ mod tests {
             .await?
             .context("test lease was not acquired")?;
         let stop = CancellationToken::new();
-        let (watchdog, mut events) =
-            spawn_lease_watchdog(leases.clone(), guard.clone(), stop.clone());
+        let (watchdog, mut events) = spawn_lease_watchdog(
+            leases.clone(),
+            guard.clone(),
+            stop.clone(),
+            CancellationToken::new(),
+        );
 
         // Keep a recovery-like task continuously runnable for more than twice
         // the lease TTL. The watchdog has to make progress independently; an

@@ -24,7 +24,7 @@ The minimum correct design is:
 - truthful readiness and automatic Traefik health routing;
 - client command resend plus make-before-break WebSocket handoff for planned task removal.
 
-This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, a self-managed cache cluster, or custom autoscaling signals. ElastiCache Serverless itself is TLS-only and cluster-mode-only; the application must therefore be Redis-Cluster-aware.
+This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, a self-managed cache cluster, or custom autoscaling signals. ElastiCache Serverless itself is TLS-only and cluster-mode-only; the application must therefore be Redis-Cluster-aware. CDK pins Serverless Valkey major 8 for its faster managed burst expansion, without adding a paid ECPU minimum or a correctness-affecting maximum.
 
 ## 2. Product problem
 
@@ -285,7 +285,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - authoritative event stream sequence or revision;
    - checkpoint timestamp and source lease token for diagnostics.
 3. Active games must initiate checkpoints on a one-second wall-clock cadence, independent of custom game tick duration. Persisted checkpoint age must remain below `SNAKETRON_MAX_CHECKPOINT_AGE_MS` (default ten seconds) or the actor fails closed.
-4. Checkpoints must also be written at game creation, cooperative handoff, and completion.
+4. Checkpoints must also be written at game creation, successor activation after recovery, and completion. A planned handoff must not add a redundant incumbent checkpoint; it uses the same last-checkpoint plus PEL/decision-journal recovery source as an abrupt crash.
 5. Maintain a `partition -> active game IDs` index. Recovery must query this index and fetch checkpoints in a pipeline/batch rather than scan all `game:snapshot:*` keys.
 6. The authoritative recovery source is the versioned checkpoint. A local replica may accelerate recovery only if it carries the same cursor and dedupe metadata; an ordinary state-only replica must not override the checkpoint.
 7. A successor must batch-load the partition decision journal under its new
@@ -306,12 +306,9 @@ The assignment coordinator is control plane only. Existing assignments and activ
 ### R7 — Planned partition handoff and task shutdown
 
 1. Planned scale-up and scale-down must use the same crash-safe primitives as abrupt recovery.
-2. When desired ownership changes, the incumbent must stop fetching new group work and stop renewing the lease.
+2. When desired ownership changes, the incumbent must stop fetching new group work and ordinary assignment-conditioned renewal. An exact-token keepalive may preserve its authority only until the game barriers complete and that same token is compare-deleted.
 3. While its current token is still valid, the incumbent must place a barrier into every active game loop. Each loop must process already queued commands, stop tick advancement, acknowledge quiescence, and perform no later authoritative mutation under that token.
-4. After every game loop reaches the barrier, the incumbent must:
-   1. write handoff checkpoints for active games;
-   2. ACK entries covered by those checkpoints;
-   3. compare-delete its partition lease.
+4. After every game loop reaches the barrier, the incumbent must compare-delete its exact partition lease without writing another full-state checkpoint. Commands newer than the last periodic checkpoint remain in the PEL with any published outcome in the decision journal; the successor replays them and checkpoints/ACKs the recovered state before activation.
 5. If every loop does not reach the barrier before the handoff deadline, stop the old executor and fall back to normal lease-expiry recovery; do not extend shutdown or publish an unfenced partial handoff.
 6. The successor may acquire only after the old lease is deleted or expires.
 7. A crash at any handoff step must require no cleanup: the successor claims pending entries and resumes from the last successful checkpoint.
@@ -630,9 +627,9 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 48-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, command backlog beyond the ten-second recovery budget, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. The earlier 64-session calibration was removed after live evidence showed it was not one-task-safe. |
+| Run the fixed 40-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger is a failed certification, not permission to increase the calibration into an unsafe one-task envelope. The earlier 64- and 48-session calibrations were removed after live evidence showed they were not one-task-safe. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
-| Run the complete protocol against actual ElastiCache Serverless | TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub uses a connection pool isolated from authoritative commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub uses a connection pool isolated from authoritative commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan
