@@ -675,6 +675,11 @@ impl GameActor {
                     // handoff cannot expose only a canceled prefix. The sticky
                     // signal prevents any later tick from starting.
                     self.advance_live().await?;
+                    // Start the next polling interval after this work rather
+                    // than from the old wall-clock grid. A slow fenced event
+                    // publication must not leave the timer immediately ready
+                    // to beat an already-queued command again.
+                    tick.reset();
                     if self.completion_committed {
                         return Ok(());
                     }
@@ -4107,7 +4112,12 @@ mod tests {
             let manager =
                 crate::redis_utils::create_connection_manager(client.clone(), pubsub_tx).await?;
             let token = CancellationToken::new();
-            let bus = Arc::new(GameBus::new(manager.clone(), client, token.clone()));
+            let bus = Arc::new(GameBus::new(
+                manager.clone(),
+                manager.clone(),
+                client,
+                token.clone(),
+            ));
             let mut owners = serde_json::Map::new();
             owners.insert(
                 partition.to_string(),

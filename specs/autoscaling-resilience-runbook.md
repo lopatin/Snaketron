@@ -201,21 +201,26 @@ evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
 settled in membership, assignment, and partition leases. It never runs on the
 one-task baseline.
 
-Continuity Run A is a separate fixed 96-session / 48-duel `every-tick` run on the
-one-vCPU minimum task. It must first
+Continuity Run A is a separate fixed 144-session / 72-duel `every-tick` run on the
+one-vCPU minimum task. This is a one-time recalibration from the historical
+96-session cohort: exact-source run `30030317623` held service-average CPU at
+only 53--59%, below the unchanged 70% target, so it could not exercise automatic
+scale-out. The 144-session cohort passed the same one-task local command budget
+with sufficient CPU margin and is now frozen. It must first
 cause CPU or memory target tracking to add capacity; if it does not, the run
 writes are not accepted as a substitute. The pre-movement one-task baseline
 must itself keep every command outcome within one second; this explicitly
 prevents autoscaling from hiding an already-overloaded starting task. The
-calibration fails rather than being raised, forced, or accepted if either the
-policy trigger or that latency budget is missed. Policy writes are then
+fixed 144-session calibration fails rather than being raised further, forced,
+or accepted if either the policy trigger or that latency budget is missed.
+Policy writes are then
 suspended while Run A proves the
 direct `1 -> 10 -> 1` ownership staircase. At ten tasks the runner adds 10 idle,
 10 lobby, and three
 deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
 starts a 208-session idle ramp at four sessions per second. This keeps new-user
 admission continuous through the 45-second drain deadline while leaving only
-96 command-bearing game sockets on the final task. Run A must prove no active
+144 command-bearing game sockets on the final task. Run A must prove no active
 socket hard reconnect, zero measured usable-session gap, terminal command
 outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
 nine partition moves in each direction. No game completion is awaited before
@@ -333,6 +338,30 @@ this as diagnostic only. Do not mark the release complete until a fresh AWS
 planned run reaches the full capacity phase and a separate authorized SIGKILL
 run passes.
 
+The next exact-source Serverless run, GitHub Actions `30030317623`, completed
+538 of 538 sessions and returned terminal outcomes for all 399,655 submitted
+commands with no disconnect, while Valkey remained free of throttling and
+eviction with roughly one-millisecond service-side latency. It still failed
+before scale-out: the 96-session cohort held service-average CPU below the 70%
+target, maximum command-outcome latency reached 32.1 seconds, game-join p99
+reached 32.7 seconds, and pending age reached roughly 33 seconds. Recovery
+payload inspection found that every authoritative server command created a
+tombstone intended only to cancel a speculative client command; those unused
+tombstones grew forever and were serialized into every recovery checkpoint and
+snapshot. Cleanup succeeded and an independent inventory found no development
+runtime resource remaining.
+
+After bounding that queue bookkeeping, resetting a slow tick interval so it
+cannot repeatedly beat queued actor mail, and isolating large recovery traffic
+on one independent Redis dispatcher, the recalibrated 144-session / 72-duel
+local profile passed 288 of 288 sessions, 144 of 144 games, and 258,446 of
+258,446 command outcomes. Maximum outcome latency was 148 milliseconds, no
+sent-second exceeded one second, no client disconnected, pending age remained
+below one second, and the recovery envelope plateaued near 244 KB instead of
+growing without bound. The process used roughly 79% CPU at the full plateau.
+This is causal diagnostic evidence only; actual Serverless cluster-mode
+planned and SIGKILL runs remain mandatory.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -356,6 +385,16 @@ The server opens a separate reconnecting Redis connection pool for RESP3
 Pub/Sub. Subscription confirmations must never share the reply queue used by
 matchmaking, executor, or recovery commands; this role separation is required
 for Serverless certification.
+
+The server also opens one independently bootstrapped recovery connection per
+task. Large periodic checkpoints, takeover journal/envelope loads, reconnect
+outcome reads, immutable completion-record loads, and regional recovery metrics
+use that dispatcher. Commands, ordinary events, leases, assignment,
+matchmaking, and readiness remain on the hot/control dispatcher. Cloning a
+redis-rs cluster connection is insufficient because clones share its bounded
+client-side dispatcher. Do not add per-partition pools unless fresh Serverless
+evidence shows that the single recovery dispatcher cannot sustain the bounded
+envelope.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
@@ -487,5 +526,5 @@ with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
 command, or failure to corroborate the measured
-phase envelopes (at least 327 simultaneous sockets during transition/admission
+phase envelopes (at least 375 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

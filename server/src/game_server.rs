@@ -273,6 +273,18 @@ impl GameServer {
         .await?;
         info!("Redis connection manager created successfully");
 
+        // Large recovery envelopes must not share redis-rs' bounded cluster
+        // dispatcher with latency-sensitive commands, events, or leases.
+        // Cloning `redis` would share that dispatcher, so establish one
+        // independent connection for checkpoint, takeover, and reconnect
+        // payloads.
+        let recovery_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        info!("Redis recovery connection created successfully");
+
         // Pub/Sub must never share the cluster dispatcher's underlying
         // connections with ordinary commands. RESP3 subscription
         // confirmations are push frames that also consume a command reply;
@@ -288,7 +300,8 @@ impl GameServer {
         // Create the game-critical message bus (Redis Streams).
         let game_bus = Arc::new(GameBus::new(
             redis.clone(),
-            redis_client,
+            recovery_redis.clone(),
+            redis_client.clone(),
             cancellation_token.clone(),
         ));
 
@@ -442,7 +455,7 @@ impl GameServer {
         // counters through CloudWatch Embedded Metric Format. Telemetry is
         // intentionally best effort and never participates in authority.
         handles.push(spawn_resilience_metrics(
-            redis.clone(),
+            recovery_redis,
             cluster_namespace.clone(),
             lifecycle.clone(),
             server_id,

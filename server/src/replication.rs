@@ -793,6 +793,7 @@ impl ReplicationManager {
         .await?;
 
         let bus = Arc::new(GameBus::new(
+            redis.clone(),
             redis,
             redis_client,
             cancellation_token.clone(),

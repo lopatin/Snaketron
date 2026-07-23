@@ -742,7 +742,7 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
     let redis_client = Client::open(test_redis_url())?;
     let (pubsub_tx, _rx) = broadcast::channel::<PushInfo>(128);
     let conn = create_connection_manager(redis_client.clone(), pubsub_tx).await?;
-    let game_bus = GameBus::new(conn, redis_client, CancellationToken::new());
+    let game_bus = GameBus::new(conn.clone(), conn, redis_client, CancellationToken::new());
     let first_delivery = game_bus.publish_game_created_once(&outbox_record).await?;
     let retry_delivery = game_bus.publish_game_created_once(&outbox_record).await?;
     assert_eq!(first_delivery, retry_delivery);

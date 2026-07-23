@@ -372,8 +372,13 @@ impl CommandQueue {
         // eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
         self.queue.push(Reverse(command_message.clone()));
 
-        // Delete the non-server-sent command from the queue.
-        if command_message.command_id_server.is_some() {
+        if command_message.command_id_server.is_none() {
+            self.active_ids
+                .insert(command_message.command_id_client.clone());
+        } else if self.active_ids.contains(&command_message.command_id_client) {
+            // Delete the matching speculative command from the queue. An
+            // authoritative-only queue has no active client copy and therefore
+            // must not retain one tombstone per server command forever.
             // debug!("CommandQueue::push: Tombstoning client command {:?}", command_message.command_id_client);
             // eprintln!("COMMON DEBUG: Tombstoning client command {:?}", command_message.command_id_client);
             self.tombstone_ids.insert(command_message.command_id_client);
@@ -396,20 +401,21 @@ impl CommandQueue {
         if let Some(Reverse(command_message)) = self.queue.pop() {
             // debug!("CommandQueue::pop: Popped command: {:?}", command_message);
             // eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
-            if command_message.command_id_server.is_none()
-                && self
+            if command_message.command_id_server.is_none() {
+                self.active_ids.remove(&command_message.command_id_client);
+                if self
                     .tombstone_ids
                     .remove(&command_message.command_id_client)
-            {
-                // eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
-                // Ignore the command if it's a tombstone.
-                // Continue popping the next command.
-                self.pop(max_tick)
-            } else {
-                // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
-                // eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
-                Some(command_message)
+                {
+                    // eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
+                    // Ignore the command if it's a tombstone.
+                    // Continue popping the next command.
+                    return self.pop(max_tick);
+                }
             }
+            // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
+            // eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
+            Some(command_message)
         } else {
             // debug!("CommandQueue::pop: Queue is empty");
             // eprintln!("COMMON DEBUG: CommandQueue::pop: Queue is empty");
@@ -2142,11 +2148,14 @@ mod tests {
         // Push client command
         let client_cmd = create_command_message(10, 1, 1, false);
         queue.push(client_cmd.clone());
+        assert!(queue.active_ids.contains(&client_cmd.command_id_client));
+        assert!(queue.tombstone_ids.is_empty());
 
         // Push server command with same client_id - should tombstone the client command
         let mut server_cmd = client_cmd.clone();
         server_cmd.command_id_server = Some(create_command_id(10, 1, 1));
         queue.push(server_cmd.clone());
+        assert!(queue.tombstone_ids.contains(&server_cmd.command_id_client));
 
         // Pop should return the server command (not the tombstoned client command)
         let popped = queue.pop(10).unwrap();
@@ -2154,6 +2163,30 @@ mod tests {
 
         // Queue should now be empty (client command was tombstoned)
         assert!(queue.pop(10).is_none());
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
+    }
+
+    #[test]
+    fn test_command_queue_authoritative_commands_do_not_create_tombstones() {
+        let mut queue = CommandQueue::new();
+
+        for sequence_number in 1..=2048 {
+            let mut command = create_command_message(10, 1, sequence_number, false);
+            command.command_id_server = Some(create_command_id(10, 1, sequence_number));
+            queue.push(command);
+        }
+
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
+
+        let mut popped = 0;
+        while queue.pop(10).is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 2048);
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
     }
 
     #[test]
@@ -2579,13 +2612,23 @@ mod tests {
         state.spectators.extend([9, 2, 5]);
 
         for sequence_number in [7, 3] {
-            let mut command = create_command_message(10, 1, sequence_number, false);
-            command.command_id_server = Some(create_command_id(10, 1, sequence_number));
-            state.command_queue.push(command);
+            let client_command = create_command_message(10, 1, sequence_number, false);
+            state.command_queue.push(client_command.clone());
+            let mut server_command = client_command;
+            server_command.command_id_server = Some(create_command_id(10, 1, sequence_number));
+            state.command_queue.push(server_command);
         }
 
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["spectators"], serde_json::json!([2, 5, 9]));
+
+        let active_sequences: Vec<u64> = json["command_queue"]["active_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(active_sequences, vec![3, 7]);
 
         let tombstone_sequences: Vec<u64> = json["command_queue"]["tombstone_ids"]
             .as_array()
@@ -2598,6 +2641,13 @@ mod tests {
         let round_trip: GameState = serde_json::from_value(json).unwrap();
         let round_trip_json = serde_json::to_value(round_trip).unwrap();
         assert_eq!(round_trip_json["spectators"], serde_json::json!([2, 5, 9]));
+        assert_eq!(
+            round_trip_json["command_queue"]["active_ids"],
+            serde_json::json!([
+                {"tick": 10, "user_id": 1, "sequence_number": 3},
+                {"tick": 10, "user_id": 1, "sequence_number": 7}
+            ])
+        );
         assert_eq!(
             round_trip_json["command_queue"]["tombstone_ids"],
             serde_json::json!([

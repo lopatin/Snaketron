@@ -667,9 +667,9 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 96-session / 48-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition or weaken the budget. |
+| Run the fixed 144-session / 72-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition or weaken the budget. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
-| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub uses a connection pool isolated from authoritative commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub and bulk recovery each use independently bootstrapped connections isolated from authoritative hot/control commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan
@@ -865,6 +865,33 @@ completed 288 of 288 sessions, 144 of 144 games, and 251,700 of 251,700 command
 outcomes with zero failures, zero disconnects, no sent-second over one second,
 and a 291-millisecond maximum outcome. This remains diagnostic evidence; the
 release is still blocked on fresh complete planned and SIGKILL AWS runs.
+
+The next exact-source Serverless attempt
+([GitHub Actions 30030317623](https://github.com/lopatin/snaketron-io/actions/runs/30030317623))
+completed 538 of 538 sessions and returned terminal outcomes for all 399,655
+submitted commands without a disconnect. Valkey again recorded zero throttling
+and eviction with roughly one-millisecond service-side latency. The run still
+failed before scale-out: the 96-session cohort held service-average CPU at only
+53--59%, below the unchanged 70% target, maximum command-outcome latency reached
+32.1 seconds, game-join p99 reached 32.7 seconds, and pending age reached about
+33 seconds. Recovery inspection proved that every authoritative command added
+a speculative-command tombstone that could never be consumed on the server;
+the set therefore grew forever and was duplicated into every checkpoint and
+snapshot. Cleanup succeeded and an independent inventory found no development
+runtime resource remaining.
+
+The corrective patch bounds that existing queue bookkeeping, resets the actor
+tick interval after slow publication so queued mail gets a bounded opportunity,
+and routes large checkpoint, takeover, reconnect-outcome, completion-record,
+and metrics traffic through one independently bootstrapped recovery dispatcher.
+It does not add per-partition pools or a new persistence format. A local
+144-session / 72-duel run then passed 288 of 288 sessions, 144 of 144 games, and
+258,446 of 258,446 command outcomes with zero disconnect, a 148-millisecond
+maximum outcome, sub-second pending age, and a recovery-envelope plateau near
+244 KB. CPU was roughly 79% at the full one-task plateau, supporting the
+one-time fixed Run A recalibration without changing the CPU 70% / memory 80%
+policy. This remains diagnostic evidence; fresh complete planned and SIGKILL
+AWS runs are still required.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
