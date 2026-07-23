@@ -803,6 +803,23 @@ resource remained. This run is also diagnostic evidence, not release evidence;
 the crash suite did not run. The release remains
 blocked until fresh planned and crash runs both pass end to end.
 
+A third exact-source Serverless-backed attempt
+([GitHub Actions 30007863987](https://github.com/lopatin/snaketron-io/actions/runs/30007863987))
+kept Valkey healthy under 197,000--234,000 commands per minute, with zero
+throttling or eviction and service-side read/write latency averaging under 1.5
+milliseconds. It nevertheless failed before scale-out: paired commands for one
+game forced the dispatcher to settle every unrelated game, so one task
+self-throttled at 30% average CPU while command outcome latency reached 51.605
+seconds and 24 of 574 sessions timed out waiting for an initial snapshot. The
+run therefore did not manufacture a scale event by lowering the CPU target or
+forcing desired count. Cleanup succeeded and an independent inventory again
+found no development resource remaining. A selective per-game settlement fix
+then sustained 96 local sockets / 48 duels for three minutes: all 172,093
+commands received terminal outcomes, maximum outcome latency was 170
+milliseconds, all 192 session attempts passed, and the pending backlog remained
+below one second. This local result is causal diagnostic evidence only; a fresh
+AWS run remains required.
+
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
 ## 19. Definition of done

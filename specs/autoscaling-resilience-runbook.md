@@ -270,6 +270,20 @@ diagnostic evidence, not release evidence. The release remains blocked
 until fresh planned and crash runs pass. Local success alone is not evidence of
 ECS routing and autoscaling behavior.
 
+The next exact-source run, GitHub Actions `30007863987`, also kept Serverless
+Valkey healthy: zero throttling and eviction, average service-side read/write
+latency below 1.5 milliseconds, and 197,000--234,000 commands per minute. It
+failed before scale-out because adjacent same-game commands caused a global
+dispatcher settlement barrier. The task averaged only 30% CPU while pending
+command age reached 65.739 seconds, maximum command outcome latency reached
+51.605 seconds, and 24 of 574 sessions timed out waiting for an initial
+snapshot. Cleanup succeeded and an independent inventory found no development
+resource remaining. After changing the barrier to settle only the repeated
+game, the same 96-socket / 48-duel profile completed 172,093 commands locally
+with a 170-millisecond maximum outcome latency, zero failed session attempts,
+and a sub-second pending backlog. That local result identifies the bottleneck
+but does not replace the required fresh AWS certification.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
