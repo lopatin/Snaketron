@@ -481,7 +481,7 @@ impl LobbyManager {
             return Ok(None);
         }
 
-        info!("Fetching metadata for lobby '{}'", lobby_code);
+        debug!("Fetching metadata for lobby '{}'", lobby_code);
 
         // Fetch all metadata fields
         let data: HashMap<String, String> = redis

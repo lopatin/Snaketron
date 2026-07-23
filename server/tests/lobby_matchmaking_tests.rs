@@ -6,7 +6,7 @@ use redis::{AsyncCommands, Client, PushInfo};
 use server::{
     game_bus::GameBus,
     game_executor::StreamEvent,
-    lobby_manager::LobbyMember,
+    lobby_manager::{Lobby, LobbyMember, LobbyPreferences},
     matchmaking_manager::{
         ActiveMatch, GameCreatedOutboxRecord, MatchCommitOutcome, MatchStatus, MatchmakingManager,
         QueuedPlayer,
@@ -15,6 +15,7 @@ use server::{
     redis_utils::create_connection_manager,
     ws_server::WSMessage,
 };
+use std::collections::BTreeMap;
 use tokio::{
     sync::broadcast,
     time::{Duration, timeout},
@@ -1009,6 +1010,378 @@ async fn retired_socket_cleanup_preserves_replacement_lobby_and_active_mapping()
     .await??;
 
     replacement.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+async fn await_lobby_roster_without_forbidden_member(
+    client: &mut TestClient,
+    lobby_code: &str,
+    expected_user_ids: &[u32],
+    forbidden_user_id: u32,
+) -> Result<()> {
+    loop {
+        let WSMessage::LobbyUpdate {
+            lobby_code: update_lobby_code,
+            members,
+            ..
+        } = client.receive_message().await?
+        else {
+            continue;
+        };
+        if update_lobby_code != lobby_code {
+            continue;
+        }
+
+        let mut user_ids: Vec<_> = members.into_iter().map(|member| member.user_id).collect();
+        user_ids.sort_unstable();
+        if user_ids.contains(&forbidden_user_id) {
+            anyhow::bail!(
+                "stale Pub/Sub member {forbidden_user_id} was forwarded to lobby {lobby_code}"
+            );
+        }
+        if user_ids == expected_user_ids {
+            return Ok(());
+        }
+    }
+}
+
+async fn fail_on_lobby_update(client: &mut TestClient, lobby_code: &str) -> Result<()> {
+    loop {
+        if let WSMessage::LobbyUpdate {
+            lobby_code: update_lobby_code,
+            ..
+        } = client.receive_message().await?
+            && update_lobby_code == lobby_code
+        {
+            anyhow::bail!("unexpected lobby update for {lobby_code}");
+        }
+    }
+}
+
+async fn assert_no_lobby_updates(
+    first: &mut TestClient,
+    second: &mut TestClient,
+    lobby_code: &str,
+    duration: Duration,
+) -> Result<()> {
+    match timeout(duration, async {
+        tokio::try_join!(
+            fail_on_lobby_update(first, lobby_code),
+            fail_on_lobby_update(second, lobby_code),
+        )
+    })
+    .await
+    {
+        Err(_) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(_)) => unreachable!("lobby update sentinels never return successfully"),
+    }
+}
+
+async fn await_lobby_switch_denial(client: &mut TestClient, lobby_code: &str) -> Result<()> {
+    loop {
+        match client.receive_message().await? {
+            WSMessage::AccessDenied { reason } if reason.contains("Leave") => return Ok(()),
+            WSMessage::LobbyCreated { .. } | WSMessage::JoinedLobby { .. } => {
+                anyhow::bail!("direct lobby switch unexpectedly succeeded");
+            }
+            WSMessage::LobbyUpdate {
+                lobby_code: update_lobby_code,
+                ..
+            }
+            | WSMessage::LobbyChatHistory {
+                lobby_code: update_lobby_code,
+                ..
+            } if update_lobby_code == lobby_code => {
+                anyhow::bail!("lobby scope {lobby_code} restarted before switch denial");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn fail_on_lobby_scope_replay(client: &mut TestClient, lobby_code: &str) -> Result<()> {
+    loop {
+        match client.receive_message().await? {
+            WSMessage::LobbyUpdate {
+                lobby_code: update_lobby_code,
+                ..
+            }
+            | WSMessage::LobbyChatHistory {
+                lobby_code: update_lobby_code,
+                ..
+            } if update_lobby_code == lobby_code => {
+                anyhow::bail!("lobby scope {lobby_code} was restarted after a denied switch");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("lobby_roster_read_repair").await?;
+    env.add_server().await?;
+    let host_user_id = env.create_user().await?;
+    let follower_user_id = env.create_user().await?;
+    let durable_only_user_id = env.create_user().await?;
+    let stale_only_user_id = env.create_user().await?;
+    let server_addr = env.ws_addr(0).expect("server should exist");
+
+    let mut host = TestClient::connect(&server_addr).await?;
+    host.authenticate(host_user_id).await?;
+    host.send_message(WSMessage::CreateLobby).await?;
+    let lobby_code = timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LobbyCreated { lobby_code } = host.receive_message().await? {
+                return Ok::<String, anyhow::Error>(lobby_code);
+            }
+        }
+    })
+    .await??;
+
+    let mut follower = TestClient::connect(&server_addr).await?;
+    follower.authenticate(follower_user_id).await?;
+    follower
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: lobby_code.clone(),
+            preferences: None,
+        })
+        .await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::JoinedLobby {
+                lobby_code: joined_code,
+            } = follower.receive_message().await?
+                && joined_code == lobby_code
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    let mut baseline = [host_user_id as u32, follower_user_id as u32];
+    baseline.sort_unstable();
+    timeout(Duration::from_secs(3), async {
+        tokio::try_join!(
+            await_lobby_roster_without_forbidden_member(
+                &mut host,
+                &lobby_code,
+                &baseline,
+                stale_only_user_id as u32,
+            ),
+            await_lobby_roster_without_forbidden_member(
+                &mut follower,
+                &lobby_code,
+                &baseline,
+                stale_only_user_id as u32,
+            ),
+        )
+    })
+    .await??;
+
+    // Phase 1: mutate the authoritative roster without publishing anything.
+    // Both sockets must converge from the periodic durable read alone.
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let expires_at = Utc::now().timestamp_millis() + 60_000;
+    redis
+        .zadd::<_, _, _, ()>(
+            RedisKeys::lobby_members_set(&lobby_code),
+            format!("{durable_only_user_id}:synthetic-transport"),
+            expires_at,
+        )
+        .await?;
+
+    let mut expected = [
+        host_user_id as u32,
+        follower_user_id as u32,
+        durable_only_user_id as u32,
+    ];
+    expected.sort_unstable();
+    timeout(Duration::from_secs(3), async {
+        tokio::try_join!(
+            await_lobby_roster_without_forbidden_member(
+                &mut host,
+                &lobby_code,
+                &expected,
+                stale_only_user_id as u32,
+            ),
+            await_lobby_roster_without_forbidden_member(
+                &mut follower,
+                &lobby_code,
+                &expected,
+                stale_only_user_id as u32,
+            ),
+        )
+    })
+    .await??;
+
+    // Phase 2: inject a stale roster through the real Redis Pub/Sub path. Its
+    // removed sentinel member must never reach either socket; the durable read
+    // resolves to the already-sent logical roster and emits nothing.
+    let stale_lobby = Lobby {
+        lobby_code: lobby_code.clone(),
+        members: BTreeMap::from([
+            (
+                host_user_id as u32,
+                make_lobby_member(host_user_id as u32, "stale-host"),
+            ),
+            (
+                follower_user_id as u32,
+                make_lobby_member(follower_user_id as u32, "stale-follower"),
+            ),
+            (
+                stale_only_user_id as u32,
+                make_lobby_member(stale_only_user_id as u32, "removed-member"),
+            ),
+        ]),
+        host_user_id,
+        state: "waiting".to_owned(),
+        preferences: LobbyPreferences::default(),
+    };
+    let stale_hint = serde_json::json!({
+        "LobbyUpdate": {
+            "lobby": stale_lobby,
+        }
+    })
+    .to_string();
+    let subscribers: i64 = redis
+        .publish(RedisKeys::lobby_updates_channel(), &stale_hint)
+        .await?;
+    assert!(
+        subscribers > 0,
+        "stale hint must traverse the server's real Pub/Sub subscription"
+    );
+    assert_no_lobby_updates(
+        &mut host,
+        &mut follower,
+        &lobby_code,
+        Duration::from_secs(2),
+    )
+    .await?;
+
+    // Phase 3: wait longer than the ten-second presence-heartbeat cadence.
+    // Scores change, but the client-visible roster does not, so no update is
+    // resent by either periodic reconciliation loop.
+    assert_no_lobby_updates(
+        &mut host,
+        &mut follower,
+        &lobby_code,
+        Duration::from_secs(11),
+    )
+    .await?;
+
+    follower.disconnect().await?;
+    host.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_lobby_switch_is_denied_without_restarting_current_scope() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("lobby_switch_denial").await?;
+    env.add_server().await?;
+    let user_id = env.create_user().await?;
+    let server_addr = env.ws_addr(0).expect("server should exist");
+
+    let mut client = TestClient::connect(&server_addr).await?;
+    client.authenticate(user_id).await?;
+    client.send_message(WSMessage::CreateLobby).await?;
+    let lobby_code = timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LobbyCreated { lobby_code } = client.receive_message().await? {
+                return Ok::<String, anyhow::Error>(lobby_code);
+            }
+        }
+    })
+    .await??;
+    timeout(
+        Duration::from_secs(3),
+        await_lobby_roster_without_forbidden_member(
+            &mut client,
+            &lobby_code,
+            &[user_id as u32],
+            u32::MAX,
+        ),
+    )
+    .await??;
+
+    // Seed chat history and consume its live delivery. If denial accidentally
+    // rebuilds the lobby scope, history loading would replay this message.
+    client
+        .send_message(WSMessage::Chat("before-denial".to_owned()))
+        .await?;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let WSMessage::LobbyChatMessage {
+                lobby_code: message_lobby_code,
+                message,
+                ..
+            } = client.receive_message().await?
+                && message_lobby_code == lobby_code
+                && message == "before-denial"
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    client.send_message(WSMessage::CreateLobby).await?;
+    timeout(
+        Duration::from_secs(3),
+        await_lobby_switch_denial(&mut client, &lobby_code),
+    )
+    .await??;
+    client
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: "USE1-DENIED".to_owned(),
+            preferences: None,
+        })
+        .await?;
+    timeout(
+        Duration::from_secs(3),
+        await_lobby_switch_denial(&mut client, &lobby_code),
+    )
+    .await??;
+
+    match timeout(
+        Duration::from_millis(1500),
+        fail_on_lobby_scope_replay(&mut client, &lobby_code),
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(_)) => unreachable!("lobby scope replay sentinel never returns successfully"),
+    }
+
+    client
+        .send_message(WSMessage::Chat("after-denial".to_owned()))
+        .await?;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let WSMessage::LobbyChatMessage {
+                lobby_code: message_lobby_code,
+                message,
+                ..
+            } = client.receive_message().await?
+                && message_lobby_code == lobby_code
+                && message == "after-denial"
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    client.disconnect().await?;
     env.shutdown().await?;
     Ok(())
 }

@@ -20,7 +20,7 @@ struct ReplicatedGame {
 
 type ReplicaStore = Arc<RwLock<HashMap<u32, ReplicatedGame>>>;
 
-fn should_warn_unknown_event(event: &GameEventMessage) -> bool {
+fn is_stateful_unknown_event(event: &GameEventMessage) -> bool {
     !(event.stream_seq == 0 && matches!(&event.event, GameEvent::CommandRejected { .. }))
 }
 
@@ -287,7 +287,7 @@ impl PartitionReplica {
             let mut replicas = self.replica_store.write().await;
             match &event_msg.event {
                 GameEvent::Snapshot { game_state } => {
-                    info!(
+                    debug!(
                         "Received snapshot for game {} at tick {} (stream_seq {})",
                         game_id, event_msg.tick, event_msg.stream_seq
                     );
@@ -349,8 +349,12 @@ impl PartitionReplica {
                             replica.stream_seq = event_msg.stream_seq;
                         }
                     } else {
-                        if should_warn_unknown_event(&event_msg) {
-                            warn!("Received state event for unknown game {}", game_id);
+                        if is_stateful_unknown_event(&event_msg) {
+                            // A newly started replica subscribes before its
+                            // requested snapshots arrive, so state deltas for
+                            // not-yet-anchored games are expected during warmup.
+                            // The explicit gap path above remains WARN-level.
+                            debug!("Received state event for unknown game {}", game_id);
                         } else {
                             // A rejection is an out-of-band command outcome and
                             // does not mutate replica state. Missing stateful
@@ -392,11 +396,10 @@ impl PartitionReplica {
                         }
                     }
                     Err(_) => {
-                        // This shouldn't happen with broadcast channels, but log if it does
-                        warn!(
-                            "Failed to broadcast event for game {} - channel may be closed",
-                            game_id
-                        );
+                        // Tokio broadcast returns SendError whenever the last
+                        // socket receiver has gone away. That is normal as
+                        // clients finish or switch generations.
+                        debug!("No receivers for game {} broadcast", game_id);
                     }
                 }
             }
@@ -876,7 +879,7 @@ impl ReplicationManager {
 mod tests {
     use super::{
         ContinuityAction, FilteredEventReceiver, ReplicaStore, ReplicatedGame, continuity_action,
-        replica_snapshot, should_warn_unknown_event,
+        is_stateful_unknown_event, replica_snapshot,
     };
     use common::{GameEvent, GameEventMessage, GameState, GameType, QueueMode};
     use std::collections::{HashMap, HashSet};
@@ -975,13 +978,13 @@ mod tests {
         tx.send(rejection).unwrap();
         let got = filtered.recv().await.unwrap();
         assert!(matches!(got.event, GameEvent::CommandRejected { .. }));
-        assert!(!should_warn_unknown_event(&got));
+        assert!(!is_stateful_unknown_event(&got));
     }
 
     #[test]
-    fn unknown_state_events_remain_warning_worthy() {
-        assert!(should_warn_unknown_event(&event(1, 1)));
-        assert!(should_warn_unknown_event(&snapshot(1, 1)));
+    fn unknown_state_events_are_distinguished_from_out_of_band_rejections() {
+        assert!(is_stateful_unknown_event(&event(1, 1)));
+        assert!(is_stateful_unknown_event(&snapshot(1, 1)));
     }
 
     #[tokio::test]

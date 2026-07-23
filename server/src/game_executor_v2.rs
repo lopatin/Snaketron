@@ -15,7 +15,7 @@ use common::{
     GameStatus,
 };
 use futures_util::FutureExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc,
@@ -37,6 +37,10 @@ const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const COMPLETION_MATERIALIZATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// Keep cross-game work concurrent without turning one large XREADGROUP reply
+// into an unbounded handoff obligation. Accepted deliveries are still ordered
+// by each game's FIFO mailbox and settled in original stream order.
+const DISPATCH_FANOUT_WINDOW: usize = 64;
 
 fn is_retryable_checkpoint_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -402,15 +406,41 @@ struct GameActorSlot {
     _task: JoinHandle<()>,
 }
 
+struct PendingActorReply {
+    reply: oneshot::Receiver<Result<DeliveryDisposition>>,
+    terminally_completed: Arc<AtomicBool>,
+}
+
+impl PendingActorReply {
+    async fn wait(self) -> Result<Option<DeliveryDisposition>> {
+        match self.reply.await {
+            Ok(result) => result.map(Some),
+            Err(_) if self.terminally_completed.load(Ordering::Acquire) => Ok(None),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("game actor dropped delivery reply"))
+            }
+        }
+    }
+}
+
+enum ActorDeliveryEnqueue {
+    Accepted(PendingActorReply),
+    TerminallyCompleted,
+    HandoffRequested,
+}
+
 impl GameActorSlot {
     fn has_terminal_completion(&self) -> bool {
         self.terminally_completed.load(Ordering::Acquire)
     }
 
-    /// Returns `None` only when durable terminal completion makes rejecting
-    /// and ACKing the delivery safe. Every abnormal closure remains an error,
-    /// leaving the Redis pending entry available for crash recovery.
-    async fn deliver(&self, delivery: CommandDelivery) -> Result<Option<DeliveryDisposition>> {
+    /// Enqueues one delivery without waiting for its result. Per-game FIFO is
+    /// provided by the actor mailbox; callers may enqueue unrelated games
+    /// before settling replies to avoid partition-wide head-of-line blocking.
+    async fn enqueue_delivery(
+        &self,
+        delivery: CommandDelivery,
+    ) -> Result<Option<PendingActorReply>> {
         if self._task.is_finished() {
             if self.has_terminal_completion() {
                 return Ok(None);
@@ -431,13 +461,37 @@ impl GameActorSlot {
             bail!("game actor stopped before command delivery");
         }
 
-        match receive.await {
-            Ok(result) => result.map(Some),
-            Err(_) if self.has_terminal_completion() => Ok(None),
-            Err(error) => {
-                Err(anyhow::Error::new(error).context("game actor dropped delivery reply"))
-            }
-        }
+        Ok(Some(PendingActorReply {
+            reply: receive,
+            terminally_completed: self.terminally_completed.clone(),
+        }))
+    }
+
+    /// Returns `None` only when durable terminal completion makes rejecting
+    /// and ACKing the delivery safe. Every abnormal closure remains an error,
+    /// leaving the Redis pending entry available for crash recovery.
+    async fn deliver(&self, delivery: CommandDelivery) -> Result<Option<DeliveryDisposition>> {
+        let Some(pending) = self.enqueue_delivery(delivery).await? else {
+            return Ok(None);
+        };
+        pending.wait().await
+    }
+}
+
+async fn enqueue_delivery_until_handoff(
+    slot: &GameActorSlot,
+    delivery: CommandDelivery,
+    handoff_cancel: &CancellationToken,
+) -> Result<ActorDeliveryEnqueue> {
+    let enqueue = slot.enqueue_delivery(delivery);
+    tokio::pin!(enqueue);
+    tokio::select! {
+        biased;
+        _ = handoff_cancel.cancelled() => Ok(ActorDeliveryEnqueue::HandoffRequested),
+        result = &mut enqueue => Ok(match result? {
+            Some(reply) => ActorDeliveryEnqueue::Accepted(reply),
+            None => ActorDeliveryEnqueue::TerminallyCompleted,
+        }),
     }
 }
 
@@ -1689,6 +1743,156 @@ fn attach_command_decisions(
     }
 }
 
+struct PendingDispatchDelivery {
+    game_id: u32,
+    stream_id: String,
+    replyable_command_id: Option<ClientCommandIdentityV2>,
+    actor_reply: PendingActorReply,
+}
+
+fn has_pending_delivery_for_game(
+    pending: &VecDeque<PendingDispatchDelivery>,
+    game_id: u32,
+) -> bool {
+    pending
+        .iter()
+        .any(|pending_delivery| pending_delivery.game_id == game_id)
+}
+
+fn is_parallel_actor_delivery(payload: &CommandDeliveryPayload) -> bool {
+    matches!(
+        payload,
+        CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 { .. })
+    )
+}
+
+fn advance_cursor_monotonically(
+    cursors: &mut HashMap<u32, String>,
+    game_id: u32,
+    stream_id: String,
+) -> Result<()> {
+    if let Some(cursor) = cursors.get(&game_id)
+        && stream_id_leq(&stream_id, cursor)?
+    {
+        return Ok(());
+    }
+    // Validate even the first cursor stored for a game. Normal Redis batches
+    // arrive in order, but recovery tests and future dispatch sources must not
+    // be able to regress or inject an invalid in-memory cursor.
+    crate::recovery::validate_stream_id(&stream_id)?;
+    cursors.insert(game_id, stream_id);
+    Ok(())
+}
+
+async fn apply_delivery_disposition(
+    game_id: u32,
+    stream_id: String,
+    replyable_command_id: Option<&ClientCommandIdentityV2>,
+    disposition: Option<DeliveryDisposition>,
+    bus: &GameBus,
+    guard: &PartitionLeaseGuard,
+    cursors: &mut HashMap<u32, String>,
+) -> Result<()> {
+    let Some(disposition) = disposition else {
+        // Only a durably completed actor permits terminal rejection. An
+        // abnormal closure fails before reaching this helper and leaves the
+        // command pending so partition restart can recover it.
+        return reject_or_quarantine_delivery(
+            bus,
+            guard,
+            &stream_id,
+            replyable_command_id,
+            "command targets a game whose authoritative actor has completed",
+        )
+        .await;
+    };
+    match disposition {
+        DeliveryDisposition::Incorporated => {
+            advance_cursor_monotonically(cursors, game_id, stream_id)
+        }
+        DeliveryDisposition::Quarantine { reason } => {
+            reject_or_quarantine_delivery(bus, guard, &stream_id, replyable_command_id, &reason)
+                .await
+        }
+    }
+}
+
+async fn drain_pending_dispatch_replies_after_failure(
+    pending: &mut VecDeque<PendingDispatchDelivery>,
+    mut primary_error: Option<anyhow::Error>,
+    dropped_error: Option<anyhow::Error>,
+) -> Result<()> {
+    // A later actor may have produced the source error that canceled the
+    // shared fatal token and caused an earlier actor to drop its reply. Drain
+    // every accepted receiver so an explicit typed error wins over that
+    // secondary closure. Successful dispositions remain pending for recovery
+    // once any earlier settlement has failed.
+    while let Some(pending_delivery) = pending.pop_front() {
+        if let Ok(Err(error)) = pending_delivery.actor_reply.reply.await
+            && primary_error.is_none()
+        {
+            primary_error = Some(error);
+        }
+    }
+    Err(primary_error
+        .or(dropped_error)
+        .context("pending dispatch failure had no source error")?)
+}
+
+async fn flush_pending_dispatch_deliveries(
+    pending: &mut VecDeque<PendingDispatchDelivery>,
+    bus: &GameBus,
+    guard: &PartitionLeaseGuard,
+    cursors: &mut HashMap<u32, String>,
+    fatal: &CancellationToken,
+) -> Result<()> {
+    // Waiting in source-stream order preserves the executor's prior cursor
+    // and error-settlement semantics. Actor work itself is already concurrent
+    // because every delivery in this bounded window was enqueued first.
+    while let Some(pending_delivery) = pending.pop_front() {
+        let disposition = match pending_delivery.actor_reply.reply.await {
+            Ok(Ok(disposition)) => Some(disposition),
+            Ok(Err(error)) => {
+                fatal.cancel();
+                return drain_pending_dispatch_replies_after_failure(pending, Some(error), None)
+                    .await;
+            }
+            Err(_)
+                if pending_delivery
+                    .actor_reply
+                    .terminally_completed
+                    .load(Ordering::Acquire) =>
+            {
+                None
+            }
+            Err(error) => {
+                fatal.cancel();
+                return drain_pending_dispatch_replies_after_failure(
+                    pending,
+                    None,
+                    Some(anyhow::Error::new(error).context("game actor dropped delivery reply")),
+                )
+                .await;
+            }
+        };
+        if let Err(error) = apply_delivery_disposition(
+            pending_delivery.game_id,
+            pending_delivery.stream_id,
+            pending_delivery.replyable_command_id.as_ref(),
+            disposition,
+            bus,
+            guard,
+            cursors,
+        )
+        .await
+        {
+            fatal.cancel();
+            return drain_pending_dispatch_replies_after_failure(pending, Some(error), None).await;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_batch(
     deliveries: Vec<CommandDelivery>,
@@ -1704,17 +1908,21 @@ async fn dispatch_batch(
     actor_failures: mpsc::UnboundedSender<anyhow::Error>,
     activate_new_actors: bool,
 ) -> Result<()> {
+    let mut pending = VecDeque::with_capacity(DISPATCH_FANOUT_WINDOW);
     for delivery in deliveries {
         // XREADGROUP may already have returned a large batch when assignment
         // changes. Leave untouched entries in the old consumer's PEL so the
         // successor can claim them at zero idle time instead of extending the
         // ownership pause by draining the entire batch first.
         if handoff_cancel.is_cancelled() {
+            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
             return Ok(());
         }
         let stream_id = delivery.stream_id.clone();
         let game_id = match &delivery.payload {
             CommandDeliveryPayload::Poison { raw, reason } => {
+                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                    .await?;
                 bus.quarantine_and_ack_fenced(guard, &stream_id, raw, reason)
                     .await?;
                 continue;
@@ -1729,6 +1937,7 @@ async fn dispatch_batch(
             }
         };
         if game_id % PARTITION_COUNT != guard.partition() {
+            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
             bus.quarantine_and_ack_fenced(
                 guard,
                 &stream_id,
@@ -1754,6 +1963,8 @@ async fn dispatch_batch(
                     .map(|error| error.to_string())
             };
             if let Some(reason) = identity_error {
+                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                    .await?;
                 crate::resilience_metrics::record_command_rejections(1);
                 bus.quarantine_and_ack_fenced(guard, &stream_id, &[], &reason)
                     .await?;
@@ -1770,6 +1981,7 @@ async fn dispatch_batch(
         if let Some(cursor) = cursors.get(&game_id)
             && stream_id_leq(&stream_id, cursor)?
         {
+            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
             bus.xack_fenced(guard, &[stream_id]).await?;
             continue;
         }
@@ -1779,10 +1991,72 @@ async fn dispatch_batch(
             ..
         }) = &delivery.payload
         {
+            flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
             actors.remove(&game_id);
             bus.xack_fenced(guard, &[stream_id]).await?;
             continue;
         }
+
+        let is_existing_game_command =
+            actors.contains_key(&game_id) && is_parallel_actor_delivery(&delivery.payload);
+        if is_existing_game_command {
+            // Never have two unresolved deliveries for the same game. The
+            // actor would execute them FIFO, but a later scheduled outcome
+            // could otherwise reach the event stream before the dispatcher
+            // publishes an earlier quarantine/rejection disposition. One
+            // outstanding command per game preserves outcome order while the
+            // window still runs unrelated games concurrently.
+            if has_pending_delivery_for_game(&pending, game_id) {
+                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                    .await?;
+            }
+            let slot = actors.get(&game_id).context("game actor disappeared")?;
+            // A full actor mailbox must not delay assignment movement. Dropping
+            // this enqueue future leaves the untouched Redis PEL entry for the
+            // successor; already accepted work is drained below.
+            let actor_reply =
+                enqueue_delivery_until_handoff(slot, delivery, &handoff_cancel).await?;
+            let actor_reply = match actor_reply {
+                ActorDeliveryEnqueue::Accepted(actor_reply) => actor_reply,
+                ActorDeliveryEnqueue::HandoffRequested => {
+                    flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                        .await?;
+                    return Ok(());
+                }
+                ActorDeliveryEnqueue::TerminallyCompleted => {
+                    flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                        .await?;
+                    apply_delivery_disposition(
+                        game_id,
+                        stream_id,
+                        replyable_command_id.as_ref(),
+                        None,
+                        bus,
+                        guard,
+                        cursors,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            pending.push_back(PendingDispatchDelivery {
+                game_id,
+                stream_id,
+                replyable_command_id,
+                actor_reply,
+            });
+            if pending.len() >= DISPATCH_FANOUT_WINDOW {
+                flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal)
+                    .await?;
+            }
+            continue;
+        }
+
+        // Creation, activation, terminal/control markers, and rejection paths
+        // are explicit barriers. They may mutate the actor map or externally
+        // settle a stream entry, so every earlier actor delivery must finish
+        // first.
+        flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
 
         let mut created_actor = false;
         if !actors.contains_key(&game_id) {
@@ -1827,35 +2101,17 @@ async fn dispatch_batch(
         }
 
         let slot = actors.get(&game_id).context("game actor disappeared")?;
-        let Some(disposition) = slot.deliver(delivery).await? else {
-            // Only a durably completed actor permits terminal rejection. An
-            // abnormal closure returns above and leaves the command pending so
-            // partition restart can recover it.
-            reject_or_quarantine_delivery(
-                bus,
-                guard,
-                &stream_id,
-                replyable_command_id.as_ref(),
-                "command targets a game whose authoritative actor has completed",
-            )
-            .await?;
-            continue;
-        };
-        match disposition {
-            DeliveryDisposition::Incorporated => {
-                cursors.insert(game_id, stream_id);
-            }
-            DeliveryDisposition::Quarantine { reason } => {
-                reject_or_quarantine_delivery(
-                    bus,
-                    guard,
-                    &stream_id,
-                    replyable_command_id.as_ref(),
-                    &reason,
-                )
-                .await?;
-            }
-        }
+        let disposition = slot.deliver(delivery).await?;
+        apply_delivery_disposition(
+            game_id,
+            stream_id,
+            replyable_command_id.as_ref(),
+            disposition,
+            bus,
+            guard,
+            cursors,
+        )
+        .await?;
         if created_actor && activate_new_actors {
             // The incorporated GameCreated remains pending and replayable. Do
             // not start a retrying activation checkpoint after ownership has
@@ -1874,6 +2130,7 @@ async fn dispatch_batch(
                 .context("new game actor dropped activation reply")??;
         }
     }
+    flush_pending_dispatch_deliveries(&mut pending, bus, guard, cursors, &fatal).await?;
     Ok(())
 }
 
@@ -2262,6 +2519,318 @@ mod tests {
             },
             decision: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_fanout_preserves_same_game_fifo() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let terminally_completed = Arc::new(AtomicBool::new(false));
+        let (observed_sender, observed_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            for _ in 0..3 {
+                let Some(GameActorMessage::Delivery { delivery, reply }) = receiver.recv().await
+                else {
+                    panic!("test actor stopped before every delivery arrived");
+                };
+                observed.push(delivery.stream_id);
+                assert!(
+                    reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok(),
+                    "delivery waiter remains open"
+                );
+            }
+            observed_sender
+                .send(observed)
+                .expect("test observer remains open");
+        });
+        let slot = GameActorSlot {
+            sender,
+            terminally_completed,
+            _task: task,
+        };
+
+        let mut replies = Vec::new();
+        for sequence in 1..=3 {
+            replies.push(
+                slot.enqueue_delivery(synthetic_delivery(sequence))
+                    .await?
+                    .context("test actor completed unexpectedly")?,
+            );
+        }
+        for reply in replies {
+            assert!(matches!(
+                reply.wait().await?,
+                Some(DeliveryDisposition::Incorporated)
+            ));
+        }
+        assert_eq!(
+            observed_receiver.await?,
+            ["1-0".to_string(), "2-0".to_string(), "3-0".to_string()]
+        );
+        slot._task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_fanout_runs_unrelated_game_while_first_is_blocked() -> Result<()> {
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let first_entered_task = first_entered.clone();
+        let release_first_task = release_first.clone();
+        let first_task = tokio::spawn(async move {
+            let Some(GameActorMessage::Delivery { reply, .. }) = first_receiver.recv().await else {
+                panic!("first delivery was not enqueued");
+            };
+            first_entered_task.notify_one();
+            release_first_task.notified().await;
+            assert!(
+                reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok(),
+                "first delivery waiter remains open"
+            );
+        });
+        let first_slot = GameActorSlot {
+            sender: first_sender,
+            terminally_completed: Arc::new(AtomicBool::new(false)),
+            _task: first_task,
+        };
+
+        let (second_sender, mut second_receiver) = mpsc::channel(1);
+        let second_task = tokio::spawn(async move {
+            let Some(GameActorMessage::Delivery { reply, .. }) = second_receiver.recv().await
+            else {
+                panic!("second delivery was not enqueued");
+            };
+            assert!(
+                reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok(),
+                "second delivery waiter remains open"
+            );
+        });
+        let second_slot = GameActorSlot {
+            sender: second_sender,
+            terminally_completed: Arc::new(AtomicBool::new(false)),
+            _task: second_task,
+        };
+
+        let first_reply = first_slot
+            .enqueue_delivery(synthetic_delivery(1))
+            .await?
+            .context("first actor completed unexpectedly")?;
+        first_entered.notified().await;
+        let second_reply = second_slot
+            .enqueue_delivery(synthetic_delivery(2))
+            .await?
+            .context("second actor completed unexpectedly")?;
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), second_reply.wait()).await??,
+            Some(DeliveryDisposition::Incorporated)
+        ));
+        release_first.notify_one();
+        assert!(matches!(
+            first_reply.wait().await?,
+            Some(DeliveryDisposition::Incorporated)
+        ));
+        first_slot._task.await?;
+        second_slot._task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_fanout_later_actor_error_wins_over_earlier_dropped_reply() -> Result<()> {
+        let fatal = CancellationToken::new();
+        let first_fatal = fatal.clone();
+        let (first_sender, first_reply) = oneshot::channel::<Result<DeliveryDisposition>>();
+        let first_task = tokio::spawn(async move {
+            first_fatal.cancelled().await;
+            drop(first_sender);
+        });
+
+        let (failed_sender, failed_reply) = oneshot::channel();
+        let source =
+            redis::RedisError::from((redis::ErrorKind::IoError, "later actor Redis failure"));
+        fatal.cancel();
+        assert!(
+            failed_sender.send(Err(anyhow::Error::new(source))).is_ok(),
+            "failed actor reply receiver remains open"
+        );
+
+        let first_error = match first_reply.await {
+            Ok(_) => panic!("fatal cancellation must drop the earlier actor reply"),
+            Err(error) => anyhow::Error::new(error).context("game actor dropped delivery reply"),
+        };
+        first_task.await?;
+
+        let mut pending = VecDeque::from([PendingDispatchDelivery {
+            game_id: 27,
+            stream_id: "2-0".to_string(),
+            replyable_command_id: None,
+            actor_reply: PendingActorReply {
+                reply: failed_reply,
+                terminally_completed: Arc::new(AtomicBool::new(false)),
+            },
+        }]);
+        let error =
+            drain_pending_dispatch_replies_after_failure(&mut pending, None, Some(first_error))
+                .await
+                .expect_err("later explicit actor error must fail the dispatch");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<redis::RedisError>().is_some()),
+            "the later typed actor error must replace the secondary dropped-reply error"
+        );
+        assert!(pending.is_empty(), "every accepted reply must be drained");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_fanout_handoff_cancels_blocked_enqueue() -> Result<()> {
+        let release_receiver = Arc::new(tokio::sync::Notify::new());
+        let release_receiver_task = release_receiver.clone();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (received_sender, received_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            release_receiver_task.notified().await;
+            let Some(GameActorMessage::Delivery { delivery, reply }) = receiver.recv().await else {
+                panic!("accepted delivery disappeared");
+            };
+            assert!(
+                reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok(),
+                "accepted delivery waiter remains open"
+            );
+            tokio::task::yield_now().await;
+            received_sender
+                .send((delivery.stream_id, receiver.try_recv().is_ok()))
+                .expect("test observer remains open");
+        });
+        let slot = GameActorSlot {
+            sender,
+            terminally_completed: Arc::new(AtomicBool::new(false)),
+            _task: task,
+        };
+
+        let accepted = slot
+            .enqueue_delivery(synthetic_delivery(1))
+            .await?
+            .context("test actor completed unexpectedly")?;
+        assert_eq!(slot.sender.capacity(), 0, "test mailbox must be full");
+
+        {
+            let handoff = CancellationToken::new();
+            let blocked = enqueue_delivery_until_handoff(&slot, synthetic_delivery(2), &handoff);
+            tokio::pin!(blocked);
+            tokio::select! {
+                result = &mut blocked => {
+                    panic!("full-mailbox enqueue completed before handoff: {:?}", result.err());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            handoff.cancel();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(100), &mut blocked).await??,
+                ActorDeliveryEnqueue::HandoffRequested
+            ));
+        }
+
+        release_receiver.notify_one();
+        assert!(matches!(
+            accepted.wait().await?,
+            Some(DeliveryDisposition::Incorporated)
+        ));
+        assert_eq!(
+            received_receiver.await?,
+            ("1-0".to_string(), false),
+            "the canceled second delivery must remain outside the actor mailbox"
+        );
+        slot._task.await?;
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_fanout_cursor_never_regresses() -> Result<()> {
+        let mut cursors = HashMap::from([(17, "10-2".to_string())]);
+
+        advance_cursor_monotonically(&mut cursors, 17, "9-99".to_string())?;
+        assert_eq!(cursors.get(&17).map(String::as_str), Some("10-2"));
+
+        advance_cursor_monotonically(&mut cursors, 17, "10-2".to_string())?;
+        assert_eq!(cursors.get(&17).map(String::as_str), Some("10-2"));
+
+        advance_cursor_monotonically(&mut cursors, 17, "10-3".to_string())?;
+        assert_eq!(cursors.get(&17).map(String::as_str), Some("10-3"));
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_fanout_same_game_requires_flush() {
+        let (_reply_sender, reply) = oneshot::channel();
+        let pending = VecDeque::from([PendingDispatchDelivery {
+            game_id: 17,
+            stream_id: "1-0".to_string(),
+            replyable_command_id: None,
+            actor_reply: PendingActorReply {
+                reply,
+                terminally_completed: Arc::new(AtomicBool::new(false)),
+            },
+        }]);
+
+        assert!(has_pending_delivery_for_game(&pending, 17));
+        assert!(!has_pending_delivery_for_game(&pending, 27));
+    }
+
+    #[test]
+    fn dispatch_fanout_only_accepts_game_commands() {
+        assert!(!is_parallel_actor_delivery(&synthetic_delivery(1).payload));
+
+        let command_id = ClientCommandIdentityV2 {
+            game_id: 11,
+            user_id: 22,
+            client_game_session_id: "parallel-candidate".to_string(),
+            sequence: 1,
+        };
+        let command = CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
+            game_id: command_id.game_id,
+            user_id: command_id.user_id,
+            command_id,
+            command: GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 1,
+                    user_id: 22,
+                    sequence_number: 1,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: 1,
+                    direction: Direction::Up,
+                },
+            },
+        });
+        assert!(is_parallel_actor_delivery(&command));
+
+        let state = GameState::new(
+            20,
+            20,
+            GameType::FreeForAll { max_players: 2 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        assert!(!is_parallel_actor_delivery(
+            &CommandDeliveryPayload::Command(StreamEvent::GameCreated {
+                game_id: 11,
+                game_state: state,
+            })
+        ));
+        assert!(!is_parallel_actor_delivery(
+            &CommandDeliveryPayload::Command(StreamEvent::StatusUpdated {
+                game_id: 11,
+                status: GameStatus::Complete {
+                    winning_snake_id: None,
+                },
+            })
+        ));
     }
 
     async fn sender_closed_slot(terminal: bool) -> GameActorSlot {

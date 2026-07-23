@@ -214,6 +214,7 @@ pub struct PlayerMetadata {
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
 const CHAT_HISTORY_LIMIT: usize = 200;
+const LOBBY_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
 const LOBBY_MATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -414,6 +415,63 @@ fn take_lobby_update_receiver(
 ) -> broadcast::Receiver<lobby_manager::Lobby> {
     let replacement = receiver.resubscribe();
     std::mem::replace(receiver, replacement)
+}
+
+#[derive(PartialEq, Eq)]
+struct LobbyUpdateFingerprint {
+    lobby_code: String,
+    members: Vec<(u32, String)>,
+    host_user_id: i32,
+    state: String,
+    preferences: lobby_manager::LobbyPreferences,
+}
+
+/// Publish the durable lobby snapshot, rather than trusting the at-most-once
+/// Pub/Sub payload as authoritative state. A missing lobby is represented by
+/// the same terminal update used by the lobby manager's deletion forwarder.
+async fn send_authoritative_lobby_update(
+    lobby_manager: &Arc<lobby_manager::LobbyManager>,
+    lobby_code: &str,
+    ws_tx: &mpsc::Sender<Message>,
+    last_sent_update: &mut Option<LobbyUpdateFingerprint>,
+) -> Result<bool> {
+    let lobby = lobby_manager
+        .get_lobby_opt(lobby_code)
+        .await?
+        .unwrap_or_else(|| lobby_manager::Lobby {
+            lobby_code: lobby_code.to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 0,
+            state: "deleted".to_owned(),
+            preferences: lobby_manager::LobbyPreferences::default(),
+        });
+    let fingerprint = LobbyUpdateFingerprint {
+        lobby_code: lobby.lobby_code.clone(),
+        members: lobby
+            .members
+            .values()
+            .map(|member| (member.user_id, member.username.clone()))
+            .collect(),
+        host_user_id: lobby.host_user_id,
+        state: lobby.state.clone(),
+        preferences: lobby.preferences.clone(),
+    };
+    if last_sent_update.as_ref() == Some(&fingerprint) {
+        return Ok(true);
+    }
+    let ws_message = WSMessage::LobbyUpdate {
+        lobby_code: lobby.lobby_code,
+        members: lobby.members.into_values().collect(),
+        host_user_id: lobby.host_user_id,
+        state: lobby.state,
+        preferences: lobby.preferences,
+    };
+    let json_msg = serde_json::to_string(&ws_message)?;
+    if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+        return Ok(false);
+    }
+    *last_sent_update = Some(fingerprint);
+    Ok(true)
 }
 
 /// Handle WebSocket connection from Axum
@@ -703,6 +761,26 @@ async fn handle_websocket_connection(
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                     let was_in_lobby = matches!(&state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
+                                    if was_in_lobby
+                                        && matches!(
+                                            &ws_message,
+                                            WSMessage::CreateLobby | WSMessage::JoinLobby { .. }
+                                        )
+                                    {
+                                        let denial = WSMessage::AccessDenied {
+                                            reason: "Leave your current lobby before creating or joining another lobby".to_owned(),
+                                        };
+                                        if ws_tx
+                                            .send(Message::Text(
+                                                serde_json::to_string(&denial)?.into(),
+                                            ))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     // Keep the requested id so a denied switch does not look like a
                                     // successful re-entry into the connection's previously authorized
                                     // game. Successful JoinGame retries still restart subscriptions.
@@ -833,49 +911,53 @@ async fn handle_websocket_connection(
                                             // Handle lobby state transitions
                                             if entering_lobby
                                                 && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &mut new_state {
-                                                    if let Some(handle) = lobby_update_handle.take() {
-                                                        handle.abort();
-                                                    }
-                                                    if let Some(handle) = lobby_chat_handle.take() {
-                                                        handle.abort();
-                                                    }
+                                                if let Some(handle) = lobby_update_handle.take() {
+                                                    handle.abort();
+                                                }
+                                                if let Some(handle) = lobby_chat_handle.take() {
+                                                    handle.abort();
+                                                }
 
                                                     let mut lobby_rx = take_lobby_update_receiver(&mut lobby_handle.rx);
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let cancellation_token_clone = cancellation_token.clone();
+                                                    let lobby_manager_clone = lobby_manager.clone();
 
                                                     lobby_update_handle = Some(tokio::spawn(async move {
+                                                        let mut last_sent_update = None;
+                                                        let mut reconciliation = tokio::time::interval(
+                                                            LOBBY_STATE_RECONCILIATION_INTERVAL,
+                                                        );
+                                                        reconciliation.set_missed_tick_behavior(
+                                                            tokio::time::MissedTickBehavior::Skip,
+                                                        );
                                                         loop {
                                                             tokio::select! {
+                                                                biased;
                                                                 _ = cancellation_token_clone.cancelled() => {
                                                                     debug!("Lobby update task cancelled for lobby {}", lobby_code_for_updates);
                                                                     break;
                                                                 }
                                                                 update = lobby_rx.recv() => {
                                                                     match update {
-                                                                        Ok(lobby) => {
-                                                                            debug!("Received lobby update for lobby {}", lobby.lobby_code);
-                                                                            let ws_message = WSMessage::LobbyUpdate {
-                                                                                lobby_code: lobby.lobby_code,
-                                                                                members: lobby.members.into_values().collect(),
-                                                                                host_user_id: lobby.host_user_id,
-                                                                                state: lobby.state,
-                                                                                preferences: lobby.preferences,
-                                                                            };
-
-                                                                            let json_msg = match serde_json::to_string(&ws_message) {
-                                                                                Ok(json) => json,
-                                                                                Err(e) => {
-                                                                                    error!("Failed to serialize lobby update: {}", e);
-                                                                                    continue;
+                                                                        Ok(_) => {
+                                                                            debug!("Received lobby update hint for lobby {}", lobby_code_for_updates);
+                                                                            match send_authoritative_lobby_update(
+                                                                                &lobby_manager_clone,
+                                                                                &lobby_code_for_updates,
+                                                                                &ws_tx_clone,
+                                                                                &mut last_sent_update,
+                                                                            ).await {
+                                                                                Ok(true) => {}
+                                                                                Ok(false) => {
+                                                                                    debug!("WebSocket channel closed while sending lobby update for {}", lobby_code_for_updates);
+                                                                                    break;
                                                                                 }
-                                                                            };
-
-                                                                            if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_err() {
-                                                                                debug!("WebSocket channel closed while sending lobby update for {}", lobby_code_for_updates);
-                                                                                break;
+                                                                                Err(error) => {
+                                                                                    warn!("Failed to reconcile lobby {} after update hint: {}", lobby_code_for_updates, error);
+                                                                                }
                                                                             }
                                                                         }
                                                                         Err(broadcast::error::RecvError::Closed) => {
@@ -884,6 +966,23 @@ async fn handle_websocket_connection(
                                                                         }
                                                                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                                                             warn!("Missed {} lobby updates for lobby {}", skipped, lobby_code_for_updates);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                _ = reconciliation.tick() => {
+                                                                    match send_authoritative_lobby_update(
+                                                                        &lobby_manager_clone,
+                                                                        &lobby_code_for_updates,
+                                                                        &ws_tx_clone,
+                                                                        &mut last_sent_update,
+                                                                    ).await {
+                                                                        Ok(true) => {}
+                                                                        Ok(false) => {
+                                                                            debug!("WebSocket channel closed while reconciling lobby {}", lobby_code_for_updates);
+                                                                            break;
+                                                                        }
+                                                                        Err(error) => {
+                                                                            debug!("Periodic lobby reconciliation failed for {}: {}", lobby_code_for_updates, error);
                                                                         }
                                                                     }
                                                                 }
@@ -964,7 +1063,7 @@ async fn handle_websocket_connection(
                                                             );
                                                         }
                                                     }
-                                                }
+                                            }
 
                                             // Abort lobby subscription when leaving lobby
                                             // BUT keep lobby_match_handle active if entering Authenticated with a lobby_code (for Play Again notifications)

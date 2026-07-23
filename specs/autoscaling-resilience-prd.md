@@ -310,6 +310,12 @@ The assignment coordinator is control plane only. Existing assignments and activ
     next existing periodic checkpoint. Concurrent gateway warm-up requests
     therefore coalesce without weakening subscribe-before-request ordering.
     Successor activation still publishes its immediate recovery re-anchor.
+13. The partition reader may enqueue ordinary commands for independent games
+    concurrently, but it must keep at most one unresolved delivery per game and
+    use a bounded fan-out. It must settle replies in source-stream order and
+    flush all accepted deliveries before any serial control action or handoff.
+    This removes cross-game head-of-line blocking without introducing a second
+    scheduler or relaxing per-game ordering and recovery semantics.
 
 ### R7 — Planned partition handoff and task shutdown
 
@@ -352,6 +358,17 @@ The assignment coordinator is control plane only. Existing assignments and activ
 10. During overlap, only one socket sends player commands. Event delivery may overlap, but stable event revisions and socket-generation filtering must make duplicates harmless.
 11. Use one drain message containing only the departing gateway task identity and deadline; it must never direct clients to an executor host because executor and gateway placement are independent.
 12. Generic durable outbound WebSocket replay is not required; reauthentication, rejoin, and a fresh snapshot are sufficient.
+13. Treat lobby-roster Pub/Sub as an invalidation hint, not authoritative
+    delivery. A socket entering a lobby must immediately read the durable
+    roster, every hint must trigger another durable read, and the next
+    successful read on the one-second periodic cadence repairs a missed hint
+    without reconnecting or changing the client protocol. A socket must not
+    resend an unchanged client-visible snapshot merely because member
+    heartbeat timestamps changed.
+14. A socket already in a lobby must receive `AccessDenied` for `CreateLobby`
+    or `JoinLobby`. It must send `LeaveLobby` successfully before entering a
+    different lobby; denial leaves the current lobby presence and every
+    lobby-scoped subscription unchanged.
 
 ### R9 — Crash-safe, concurrency-safe matchmaking
 
@@ -618,8 +635,11 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Recover with 10,000 unrelated snapshot keys in Valkey | Recovery reads only the indexed games for the acquired partition; unrelated key count does not change the fetched envelope count. |
 | Leave a command pending beyond 8,192 later appends | Safe trimming retains and reclaims the pending command. |
 | Fail checkpoint writes for nine seconds, then for eleven seconds, with the ten-second age budget | In the nine-second case commands remain pending and checkpointing recovers; in the eleven-second case the actor fails closed at the budget without falsely retiring work. |
+| Block one game actor while a later command targets another game in the same partition batch | The unrelated game receives its command before the blocked actor is released; each game retains one unresolved delivery at most, cursors never regress, and a handoff drains only the accepted prefix while leaving the untouched suffix recoverable in the PEL. |
 | Inject failure at each WebSocket drain phase | Old socket remains usable until replacement auth, rejoin, snapshot, and switch complete; only one sends commands. |
 | Close an old socket after a new socket restores the same lobby/game | Old cleanup does not remove new presence or active context. |
+| Persist a lobby member without delivering its Pub/Sub hint, then enqueue a stale hint | Every connected member converges to the durable roster by the next successful periodic read; the stale payload is never presented as authoritative state, and unchanged later reads enqueue no duplicate update. |
+| Attempt `CreateLobby` and `JoinLobby` while already in a lobby | Both requests receive `AccessDenied` and require `LeaveLobby`; the current presence, roster subscription, match subscription, and chat subscription continue without duplicate roster or history delivery. |
 | Crash gateway during an ambiguous command send | Resend uses the same identity; outcome is one acceptance or one terminal rejection. |
 | Admit new sessions continuously while a backend performs the configured eight-second route-withdrawal wait | Existing sockets migrate; late new upgrade attempts may receive retryable `503`, but every new session reaches a ready backend within ten seconds and surfaces no terminal user error. Provider/health settings and exact healthy-backend coverage corroborate capacity; no internal readiness-transition timestamp is required. |
 | Repeat and concurrently submit one lobby admission, then submit two lobbies containing the same user | One immutable lobby identity and one per-user claim win; every queue/MMR index has one exact member; conflicting admission is rejected; cancellation or match commit removes every winning claim so no stale lobby can rematch a user. |
@@ -769,7 +789,18 @@ zero eviction, and cleanup, but failed the one-second command budget after
 exposing both one-task saturation and concurrent task warm-up amplification of
 full-game snapshot/checkpoint work. It also exposed an invalid sequential
 Traefik timing calculation. Both
-attempts are diagnostic evidence, not release evidence. The release remains
+attempts are diagnostic evidence, not release evidence. A second exact-source
+Serverless-backed attempt ([GitHub Actions 29996912370](https://github.com/lopatin/snaketron-io/actions/runs/29996912370))
+again provisioned Valkey 8.1 over TLS/RESP3, moved the expected partitions,
+completed 61 of 61 planned active-game handoffs with zero socket reconnects and
+zero usable-session gap, admitted 208 of 208 concurrent new sessions, and
+recorded zero cache throttling or eviction. It nevertheless failed: all 394
+full baseline seconds exceeded the one-second command-outcome budget, with a
+12.114-second maximum, and six sessions in three newly created lobbies missed
+their exact roster because the WebSocket path treated at-most-once Pub/Sub as
+authoritative state. Cleanup independently verified that no development
+resource remained. This run is also diagnostic evidence, not release evidence;
+the crash suite did not run. The release remains
 blocked until fresh planned and crash runs both pass end to end.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.

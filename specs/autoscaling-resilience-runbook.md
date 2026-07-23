@@ -257,7 +257,16 @@ planned run, GitHub Actions `29990657012`, provisioned and exercised Valkey 8.1
 without cache throttling or eviction and cleaned up successfully, but exposed
 one-task saturation plus concurrent snapshot/checkpoint amplification and
 exceeded the one-second command budget.
-It is diagnostic evidence, not release evidence. The release remains blocked
+The follow-up exact-source run, GitHub Actions `29996912370`, again provisioned
+Valkey 8.1 over TLS/RESP3, recorded zero cache throttling and eviction, admitted
+208 of 208 new sessions, and completed 61 of 61 planned active-game handoffs
+with no socket reconnect or usable-session gap. It still failed: every full
+one-task baseline second exceeded the one-second command-outcome budget (12.114
+seconds maximum), and six sessions across three newly created lobbies missed
+their authoritative roster because at-most-once Pub/Sub had no read-repair
+path. The crash phase therefore did not run. Its cleanup completed and an
+independent inventory found no development resource remaining. Both runs are
+diagnostic evidence, not release evidence. The release remains blocked
 until fresh planned and crash runs pass. Local success alone is not evidence of
 ECS routing and autoscaling behavior.
 
