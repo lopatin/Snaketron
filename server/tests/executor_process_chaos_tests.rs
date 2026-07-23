@@ -449,6 +449,10 @@ async fn read_incumbent_command(
                 if let Some(delivery) = deliveries?.into_iter().next() {
                     return Ok(delivery);
                 }
+                // Production's blocking-style executor reader performs this
+                // wait locally. Mirror it here instead of flooding one shared
+                // dispatcher with an unbounded empty-read loop.
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             _ = renew.tick() => {
                 ensure!(store.renew(guard).await?, "incumbent lost its lease before fault injection");

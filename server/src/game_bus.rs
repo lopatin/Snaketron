@@ -140,6 +140,8 @@ type ExecutorReadReplyGate = (
     std::sync::Arc<tokio::sync::Notify>,
     std::sync::Arc<tokio::sync::Notify>,
 );
+#[cfg(test)]
+type CheckpointGate = ExecutorReadReplyGate;
 
 /// The game-critical transport. All methods take `&self`; internal
 /// connections are cheaply cloneable handles.
@@ -152,6 +154,8 @@ pub struct GameBus {
     cancellation_token: CancellationToken,
     #[cfg(test)]
     checkpoint_failures_remaining: AtomicUsize,
+    #[cfg(test)]
+    checkpoint_gate: std::sync::Arc<std::sync::Mutex<Option<CheckpointGate>>>,
     #[cfg(test)]
     executor_read_reply_gate: std::sync::Arc<std::sync::Mutex<Option<ExecutorReadReplyGate>>>,
 }
@@ -168,6 +172,8 @@ impl GameBus {
             cancellation_token,
             #[cfg(test)]
             checkpoint_failures_remaining: AtomicUsize::new(0),
+            #[cfg(test)]
+            checkpoint_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             executor_read_reply_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -186,6 +192,18 @@ impl GameBus {
                 remaining.checked_sub(1)
             })
             .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_checkpoint(&self) -> CheckpointGate {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self
+            .checkpoint_gate
+            .lock()
+            .expect("checkpoint gate mutex was poisoned") =
+            Some((entered.clone(), release.clone()));
+        (entered, release)
     }
 
     #[cfg(test)]
@@ -329,16 +347,15 @@ impl GameBus {
         }
     }
 
-    /// Opens the executor-only group reader on its own connection.
+    /// Opens the executor-only group reader on the warm shared dispatcher.
+    /// Unlike the fan-out readers below, this consumer never sends a blocking
+    /// Redis command: its empty-read wait is a local Tokio sleep. Reusing the
+    /// dispatcher avoids a TLS/Cluster bootstrap for every partition handoff.
     pub async fn subscribe_executor_commands(
         &self,
         guard: PartitionLeaseGuard,
     ) -> Result<ExecutorCommandConsumer> {
-        let connection = self
-            .redis_client
-            .get_dedicated_connection()
-            .await
-            .context("failed to open dedicated executor command connection")?;
+        let connection = self.redis.clone();
         let group = guard.namespace().command_group(guard.partition());
         Ok(ExecutorCommandConsumer {
             connection,
@@ -583,6 +600,18 @@ impl GameBus {
         }
         for id in covered_stream_ids {
             crate::recovery::validate_stream_id(id)?;
+        }
+
+        #[cfg(test)]
+        let checkpoint_gate = self
+            .checkpoint_gate
+            .lock()
+            .expect("checkpoint gate mutex was poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some((entered, release)) = checkpoint_gate {
+            entered.notify_one();
+            release.notified().await;
         }
 
         #[cfg(test)]
@@ -2119,7 +2148,12 @@ fn stream_id_less_than(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::stream_id_less_than;
+    use super::*;
+    use crate::cluster_membership::{BootIdentity, ClusterNamespace};
+    use crate::partition_lease::PartitionLeaseStore;
+    use crate::redis_utils::{RedisClient, create_connection_manager};
+    use anyhow::Context;
+    use redis::AsyncCommands;
 
     #[test]
     fn stream_id_ordering() {
@@ -2130,5 +2164,70 @@ mod tests {
         assert!(stream_id_less_than("9-0", "10-0"));
         assert!(!stream_id_less_than("10-0", "9-0"));
         assert!(!stream_id_less_than("5-2", "5-2"));
+    }
+
+    #[tokio::test]
+    async fn executor_reader_reuses_the_warm_connection() -> Result<()> {
+        let live_client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let manager = create_connection_manager(live_client.clone(), push_tx).await?;
+        // This client is deliberately unusable. A regression to opening a new
+        // per-partition connection makes subscription fail immediately, while
+        // the warm shared connection remains fully functional.
+        let unreachable = RedisClient::open("redis://127.0.0.1:1/1?protocol=resp3", None)?;
+        let bus = GameBus::new(manager.clone(), unreachable, CancellationToken::new());
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("warm-reader-{salt}"))?;
+        let owner = BootIdentity::new();
+        let partition = (salt % crate::game_executor::PARTITION_COUNT as u128) as u32;
+        let mut raw = live_client.get_multiplexed_async_connection().await?;
+        let mut owners = serde_json::Map::new();
+        owners.insert(
+            partition.to_string(),
+            serde_json::Value::String(owner.to_string()),
+        );
+        let _: () = raw
+            .set(
+                namespace.partition_assignment(partition),
+                serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+            )
+            .await?;
+        let leases = PartitionLeaseStore::new(
+            manager,
+            namespace.clone(),
+            Duration::from_secs(30),
+            Duration::from_millis(750),
+        )?;
+        let guard = leases
+            .try_acquire(partition, &owner)
+            .await?
+            .context("test partition lease was not acquired")?;
+        bus.ensure_executor_command_group(&namespace, partition)
+            .await?;
+
+        let mut consumer = tokio::time::timeout(
+            Duration::from_millis(100),
+            bus.subscribe_executor_commands(guard.clone()),
+        )
+        .await
+        .context("executor subscription attempted a cold connection")??;
+        assert!(consumer.reclaim_next().await?.complete);
+
+        let _ = leases.release(&guard).await?;
+        let _: i32 = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(RedisKeys::stream_commands(partition))
+            .arg(namespace.command_group(partition))
+            .query_async(&mut raw)
+            .await?;
+        let _: () = raw
+            .del(&[
+                namespace.partition_assignment(partition),
+                namespace.partition_lease(partition),
+            ])
+            .await?;
+        Ok(())
     }
 }

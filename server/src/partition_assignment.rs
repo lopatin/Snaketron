@@ -357,6 +357,19 @@ impl AssignmentStore {
             .store(assignment.version, Ordering::Release);
         Ok(())
     }
+
+    /// Repairs the partition-local lease views without changing canonical
+    /// placement. The coordinator uses this while a safe membership change is
+    /// being stabilized, so a prior crash during projection cannot leave lease
+    /// acquisition blocked for the duration of that window.
+    pub(crate) async fn repair_partition_views(
+        &self,
+        assignment: &AssignmentDocument,
+        partition_count: u32,
+    ) -> Result<()> {
+        assignment.validate(partition_count)?;
+        self.sync_partition_views(assignment, partition_count).await
+    }
 }
 
 #[cfg(test)]

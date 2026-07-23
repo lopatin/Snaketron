@@ -1,15 +1,15 @@
 //! Runtime wiring for membership, assignment, and fenced partition executors.
 
 use crate::cluster_membership::{
-    BootIdentity, ClusterNamespace, MembershipStore, TaskLifecycle as ClusterTaskLifecycle,
-    TaskMembership,
+    BootIdentity, ClusterNamespace, EXECUTOR_PROTOCOL_VERSION, MEMBERSHIP_SCHEMA_VERSION,
+    MembershipStore, TaskLifecycle as ClusterTaskLifecycle, TaskMembership,
 };
 use crate::db::Database;
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor_v2::{PartitionExecutorV2Handle, spawn_game_executor_v2};
 use crate::lifecycle::TaskLifecycle as LocalTaskLifecycle;
-use crate::partition_assignment::AssignmentStore;
+use crate::partition_assignment::{AssignmentDocument, AssignmentStore};
 use crate::partition_lease::{
     CoordinatorLeaseStore, DEFAULT_COORDINATION_OPERATION_TIMEOUT, DEFAULT_PARTITION_LEASE_TTL,
     LeaseToken, PartitionLeaseStore,
@@ -33,6 +33,98 @@ const STATE_DRAINING: u8 = 2;
 // command continuity budget. This remains coarse relative to game ticks and
 // adds only five small coordination passes per task per second.
 const CONTROL_TICK: Duration = Duration::from_millis(200);
+// ECS makes a desired-count change visible one task at a time. Coalesce only
+// membership changes whose incumbent owners can safely continue serving; a
+// crashed, expired, warming, or incompatible owner always bypasses this wait.
+const ASSIGNMENT_STABILIZATION_WINDOW: Duration = Duration::from_secs(4);
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// `DRAINING` is terminal for a process boot. Every heartbeat/control-loop
+/// promotion or demotion goes through this CAS so a stale observation can
+/// never resurrect assignment eligibility after shutdown has started.
+fn transition_unless_draining(state: &AtomicU8, next: u8) -> bool {
+    debug_assert!(matches!(next, STATE_WARMING | STATE_ACTIVE));
+    let mut current = state.load(Ordering::Acquire);
+    loop {
+        if current == STATE_DRAINING {
+            return false;
+        }
+        match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AssignmentStabilizer {
+    candidate_eligible: Option<Vec<BootIdentity>>,
+    changed_at: Option<tokio::time::Instant>,
+}
+
+impl AssignmentStabilizer {
+    fn reset(&mut self) {
+        self.candidate_eligible = None;
+        self.changed_at = None;
+    }
+
+    /// Returns true when canonical assignment may be reconciled now. A live
+    /// ACTIVE or DRAINING incumbent keeps serving while ordinary joins/drains
+    /// settle; any incumbent that cannot safely serve triggers immediate
+    /// crash/readiness recovery.
+    fn should_reconcile(
+        &mut self,
+        current: Option<&AssignmentDocument>,
+        members: &[TaskMembership],
+        now_ms: i64,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let mut eligible: Vec<_> = members
+            .iter()
+            .filter(|member| member.is_assignment_eligible(now_ms))
+            .map(|member| member.boot_id.clone())
+            .collect();
+        eligible.sort();
+        eligible.dedup();
+
+        let Some(current) = current else {
+            self.reset();
+            return true;
+        };
+        if current.eligible_members == eligible {
+            self.reset();
+            return true;
+        }
+
+        let urgent_owner_loss = current.owners.values().any(|owner| {
+            !members.iter().any(|member| {
+                &member.boot_id == owner
+                    && member.schema_version == MEMBERSHIP_SCHEMA_VERSION
+                    && member.executor_protocol_version == EXECUTOR_PROTOCOL_VERSION
+                    && member.expires_at_ms > now_ms
+                    && matches!(
+                        member.lifecycle,
+                        ClusterTaskLifecycle::Active | ClusterTaskLifecycle::Draining
+                    )
+            })
+        });
+        if urgent_owner_loss {
+            self.reset();
+            return true;
+        }
+
+        match (&self.candidate_eligible, self.changed_at) {
+            (Some(candidate), Some(changed_at)) if candidate == &eligible => {
+                now.saturating_duration_since(changed_at) >= ASSIGNMENT_STABILIZATION_WINDOW
+            }
+            _ => {
+                self.candidate_eligible = Some(eligible);
+                self.changed_at = Some(now);
+                false
+            }
+        }
+    }
+}
 
 async fn run_membership_heartbeat(
     store: MembershipStore,
@@ -51,8 +143,7 @@ async fn run_membership_heartbeat(
             _ = cancellation.cancelled() => return Ok(()),
             _ = interval.tick() => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let current_state = state.load(Ordering::Acquire);
-                let member_lifecycle = if current_state == STATE_DRAINING {
+                let member_lifecycle = if state.load(Ordering::Acquire) == STATE_DRAINING {
                     ClusterTaskLifecycle::Draining
                 } else if lifecycle.is_assignment_eligible() {
                     ClusterTaskLifecycle::Active
@@ -61,8 +152,11 @@ async fn run_membership_heartbeat(
                     // the demotion. A healthy Redis makes the membership
                     // document follow on this same heartbeat; an unavailable
                     // Redis cannot grant this task a fenced lease anyway.
-                    state.store(STATE_WARMING, Ordering::Release);
-                    ClusterTaskLifecycle::Warming
+                    if transition_unless_draining(&state, STATE_WARMING) {
+                        ClusterTaskLifecycle::Warming
+                    } else {
+                        ClusterTaskLifecycle::Draining
+                    }
                 };
                 let member = TaskMembership::new(
                     boot_id.clone(),
@@ -89,9 +183,7 @@ async fn run_membership_heartbeat(
                         // The same in-flight operation is allowed to reconnect
                         // and completes after Valkey returns.
                         lifecycle.mark_membership_ready(false);
-                        if state.load(Ordering::Acquire) != STATE_DRAINING {
-                            state.store(STATE_WARMING, Ordering::Release);
-                        }
+                        transition_unless_draining(&state, STATE_WARMING);
                         warn!("Membership heartbeat timed out; awaiting local reconnect");
                         tokio::select! {
                             biased;
@@ -102,26 +194,22 @@ async fn run_membership_heartbeat(
                 };
                 match result {
                     Ok(()) => {
-                        if state.load(Ordering::Acquire) != STATE_DRAINING {
-                            state.store(
-                                if member_lifecycle == ClusterTaskLifecycle::Active {
-                                    STATE_ACTIVE
-                                } else {
-                                    STATE_WARMING
-                                },
-                                Ordering::Release,
-                            );
-                        }
+                        let transitioned = transition_unless_draining(
+                            &state,
+                            if member_lifecycle == ClusterTaskLifecycle::Active {
+                                STATE_ACTIVE
+                            } else {
+                                STATE_WARMING
+                            },
+                        );
                         lifecycle.mark_membership_ready(
                             member_lifecycle == ClusterTaskLifecycle::Active
-                                && state.load(Ordering::Acquire) != STATE_DRAINING,
+                                && transitioned,
                         );
                     }
                     Err(error) => {
                         lifecycle.mark_membership_ready(false);
-                        if state.load(Ordering::Acquire) != STATE_DRAINING {
-                            state.store(STATE_WARMING, Ordering::Release);
-                        }
+                        transition_unless_draining(&state, STATE_WARMING);
                         warn!(%error, "Membership heartbeat failed; retrying locally");
                     }
                 }
@@ -157,10 +245,17 @@ impl ExecutorClusterHandle {
         Ok(())
     }
 
-    /// Announces DRAINING immediately, then handoffs all currently owned
-    /// partitions in parallel under one caller-supplied deadline.
-    pub async fn drain(&self, deadline: tokio::time::Instant) -> Result<()> {
+    /// Synchronously prevents a readiness-demotion heartbeat from publishing
+    /// WARMING before the explicit DRAINING announcement is persisted.
+    pub fn begin_draining(&self) {
         self.state.store(STATE_DRAINING, Ordering::Release);
+    }
+
+    /// Announces DRAINING, releases coordinator authority, and keeps serving
+    /// current partitions until the stabilized partition views move them. The
+    /// deadline remains a crash-authoritative fallback; games never wait to end.
+    pub async fn drain(&self, deadline: tokio::time::Instant) -> Result<()> {
+        self.begin_draining();
         if let Err(error) = self.publish_membership().await {
             warn!(%error, "Could not publish draining membership; TTL expiry remains authoritative");
         }
@@ -173,20 +268,22 @@ impl ExecutorClusterHandle {
         {
             warn!(%error, "Could not release coordinator lease; TTL expiry remains authoritative");
         }
-        let handles: Vec<_> = self.executors.lock().await.values().cloned().collect();
-        let handoff = async {
-            let mut tasks = Vec::with_capacity(handles.len());
-            for handle in handles {
-                tasks.push(tokio::spawn(async move { handle.handoff().await }));
+
+        // Assignment movement is the one planned-handoff trigger. Waiting on
+        // the handle map also waits for every monotonic partition-local view,
+        // actor barrier, and exact-token release; observing only the canonical
+        // document would release too early while its ten views are projected.
+        let assignment_handoff = async {
+            loop {
+                if self.executors.lock().await.is_empty() {
+                    return Result::<()>::Ok(());
+                }
+                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
             }
-            for task in tasks {
-                task.await.context("partition handoff task panicked")??;
-            }
-            Result::<()>::Ok(())
         };
-        let handoff_result = tokio::time::timeout_at(deadline, handoff)
+        let handoff_result = tokio::time::timeout_at(deadline, assignment_handoff)
             .await
-            .context("executor cluster drain exceeded global deadline")
+            .context("executor assignment handoff exceeded global deadline")
             .and_then(|result| result);
         // Cleanup is unconditional. A concurrent assignment watcher may have
         // completed the same cooperative handoff first, or one partition may
@@ -337,6 +434,7 @@ async fn run_executor_cluster(
     let mut tick = tokio::time::interval(CONTROL_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut command_groups_ready = false;
+    let mut assignment_stabilizer = AssignmentStabilizer::default();
 
     loop {
         tokio::select! {
@@ -355,10 +453,8 @@ async fn run_executor_cluster(
             }
             _ = tick.tick() => {
                 let control_result: Result<()> = async {
-                    if state.load(Ordering::Acquire) == STATE_ACTIVE
-                        && !local_lifecycle.is_assignment_eligible()
-                    {
-                        state.store(STATE_WARMING, Ordering::Release);
+                    if !local_lifecycle.is_assignment_eligible() {
+                        transition_unless_draining(&state, STATE_WARMING);
                     }
                     // Consumer groups are required runtime state. Establish
                     // all of them before readiness, retrying the complete set
@@ -390,6 +486,8 @@ async fn run_executor_cluster(
                                 &assignment,
                                 &coordinator,
                                 &mut coordinator_token,
+                                document.as_ref(),
+                                &mut assignment_stabilizer,
                             )
                             .await?;
                             // Reconciliation may have replaced the document.
@@ -410,7 +508,7 @@ async fn run_executor_cluster(
                             if state.load(Ordering::Acquire) != STATE_ACTIVE
                                 || !local_lifecycle.is_assignment_eligible()
                             {
-                                state.store(STATE_WARMING, Ordering::Release);
+                                transition_unless_draining(&state, STATE_WARMING);
                                 drop(executor_handles);
                                 let _ = leases.release(&guard).await;
                                 continue;
@@ -487,14 +585,23 @@ async fn reconcile_assignment(
     assignment: &AssignmentStore,
     coordinator: &CoordinatorLeaseStore,
     token: &mut Option<LeaseToken>,
+    current_assignment: Option<&AssignmentDocument>,
+    stabilizer: &mut AssignmentStabilizer,
 ) -> Result<()> {
     if let Some(current) = token
         && !coordinator.renew(current).await?
     {
         *token = None;
+        stabilizer.reset();
     }
     if token.is_none() {
-        *token = coordinator.try_acquire(boot_id).await?;
+        let acquired = coordinator.try_acquire(boot_id).await?;
+        if acquired.is_some() {
+            // A candidate observed by an old coordinator must not inherit its
+            // elapsed quiet window into a new fenced coordinator term.
+            stabilizer.reset();
+        }
+        *token = acquired;
     }
     let Some(token) = token else {
         return Ok(());
@@ -502,9 +609,20 @@ async fn reconcile_assignment(
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     let members = membership.list_live(now_ms).await?;
-    assignment
-        .reconcile(&token.encode(), PARTITION_COUNT, &members, now_ms)
-        .await?;
+    if stabilizer.should_reconcile(
+        current_assignment,
+        &members,
+        now_ms,
+        tokio::time::Instant::now(),
+    ) {
+        assignment
+            .reconcile(&token.encode(), PARTITION_COUNT, &members, now_ms)
+            .await?;
+    } else if let Some(current_assignment) = current_assignment {
+        assignment
+            .repair_partition_views(current_assignment, PARTITION_COUNT)
+            .await?;
+    }
     Ok(())
 }
 
@@ -536,6 +654,180 @@ mod tests {
     use tokio::io;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
+
+    fn test_id(value: u128) -> BootIdentity {
+        BootIdentity::parse(format!("{value:032x}")).expect("valid test UUID")
+    }
+
+    fn test_member(
+        boot_id: BootIdentity,
+        lifecycle: ClusterTaskLifecycle,
+        now_ms: i64,
+    ) -> TaskMembership {
+        TaskMembership::new(
+            boot_id,
+            1,
+            None,
+            Some("test:2".into()),
+            lifecycle,
+            now_ms,
+            Duration::from_secs(30),
+        )
+    }
+
+    fn single_owner_assignment(owner: BootIdentity) -> AssignmentDocument {
+        AssignmentDocument {
+            schema_version: ASSIGNMENT_SCHEMA_VERSION,
+            version: 1,
+            region: "test".into(),
+            computed_at_ms: 0,
+            eligible_members: vec![owner.clone()],
+            owners: (0..PARTITION_COUNT)
+                .map(|partition| (partition, owner.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn cold_start_assignment_is_not_stabilized() {
+        let mut stabilizer = AssignmentStabilizer::default();
+        let now = tokio::time::Instant::now();
+        assert!(stabilizer.should_reconcile(None, &[], 0, now));
+    }
+
+    #[test]
+    fn draining_is_absorbing_after_a_stale_active_observation() {
+        let state = AtomicU8::new(STATE_ACTIVE);
+        let stale_observation = state.load(Ordering::Acquire);
+        assert_eq!(stale_observation, STATE_ACTIVE);
+
+        state.store(STATE_DRAINING, Ordering::Release);
+
+        assert!(!transition_unless_draining(&state, STATE_WARMING));
+        assert!(!transition_unless_draining(&state, STATE_ACTIVE));
+        assert_eq!(state.load(Ordering::Acquire), STATE_DRAINING);
+    }
+
+    #[test]
+    fn staggered_safe_changes_require_one_complete_quiet_window() {
+        let owner = test_id(1);
+        let joining_b = test_id(2);
+        let joining_c = test_id(3);
+        let current = single_owner_assignment(owner.clone());
+        let now_ms = 1_000;
+        let started = tokio::time::Instant::now();
+        let mut stabilizer = AssignmentStabilizer::default();
+
+        let two = vec![
+            test_member(owner.clone(), ClusterTaskLifecycle::Active, now_ms),
+            test_member(joining_b.clone(), ClusterTaskLifecycle::Active, now_ms),
+        ];
+        assert!(!stabilizer.should_reconcile(Some(&current), &two, now_ms, started));
+        assert!(!stabilizer.should_reconcile(
+            Some(&current),
+            &two,
+            now_ms,
+            started + ASSIGNMENT_STABILIZATION_WINDOW - Duration::from_millis(1),
+        ));
+
+        let three = vec![
+            test_member(owner, ClusterTaskLifecycle::Active, now_ms),
+            test_member(joining_b, ClusterTaskLifecycle::Active, now_ms),
+            test_member(joining_c, ClusterTaskLifecycle::Active, now_ms),
+        ];
+        let changed_again = started + Duration::from_secs(2);
+        assert!(!stabilizer.should_reconcile(Some(&current), &three, now_ms, changed_again,));
+        assert!(!stabilizer.should_reconcile(
+            Some(&current),
+            &three,
+            now_ms,
+            changed_again + ASSIGNMENT_STABILIZATION_WINDOW - Duration::from_millis(1),
+        ));
+        assert!(stabilizer.should_reconcile(
+            Some(&current),
+            &three,
+            now_ms,
+            changed_again + ASSIGNMENT_STABILIZATION_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn live_draining_owner_is_safe_but_missing_or_warming_owner_is_urgent() {
+        let owner = test_id(10);
+        let survivor = test_id(11);
+        let current = single_owner_assignment(owner.clone());
+        let now_ms = 1_000;
+        let now = tokio::time::Instant::now();
+
+        let mut draining = AssignmentStabilizer::default();
+        assert!(!draining.should_reconcile(
+            Some(&current),
+            &[
+                test_member(owner.clone(), ClusterTaskLifecycle::Draining, now_ms),
+                test_member(survivor.clone(), ClusterTaskLifecycle::Active, now_ms),
+            ],
+            now_ms,
+            now,
+        ));
+
+        let mut missing = AssignmentStabilizer::default();
+        assert!(missing.should_reconcile(
+            Some(&current),
+            &[test_member(
+                survivor.clone(),
+                ClusterTaskLifecycle::Active,
+                now_ms,
+            )],
+            now_ms,
+            now,
+        ));
+
+        let mut warming = AssignmentStabilizer::default();
+        assert!(warming.should_reconcile(
+            Some(&current),
+            &[
+                test_member(owner, ClusterTaskLifecycle::Warming, now_ms),
+                test_member(survivor, ClusterTaskLifecycle::Active, now_ms),
+            ],
+            now_ms,
+            now,
+        ));
+
+        let mut incompatible_owner = test_member(test_id(10), ClusterTaskLifecycle::Active, now_ms);
+        incompatible_owner.executor_protocol_version = EXECUTOR_PROTOCOL_VERSION + 1;
+        let mut incompatible = AssignmentStabilizer::default();
+        assert!(incompatible.should_reconcile(
+            Some(&current),
+            &[
+                incompatible_owner,
+                test_member(test_id(11), ClusterTaskLifecycle::Active, now_ms),
+            ],
+            now_ms,
+            now,
+        ));
+    }
+
+    #[test]
+    fn coordinator_term_reset_discards_elapsed_candidate() {
+        let owner = test_id(20);
+        let joiner = test_id(21);
+        let current = single_owner_assignment(owner.clone());
+        let now_ms = 1_000;
+        let started = tokio::time::Instant::now();
+        let members = [
+            test_member(owner, ClusterTaskLifecycle::Active, now_ms),
+            test_member(joiner, ClusterTaskLifecycle::Active, now_ms),
+        ];
+        let mut stabilizer = AssignmentStabilizer::default();
+        assert!(!stabilizer.should_reconcile(Some(&current), &members, now_ms, started));
+        stabilizer.reset();
+        assert!(!stabilizer.should_reconcile(
+            Some(&current),
+            &members,
+            now_ms,
+            started + ASSIGNMENT_STABILIZATION_WINDOW,
+        ));
+    }
 
     #[test]
     fn cooperative_handoff_lease_loss_is_a_normal_authority_exit() {
@@ -718,9 +1010,22 @@ mod tests {
             .context("owner change did not wake the lease watchdog")?;
         assert!(matches!(event, Some(LeaseWatchdogEvent::AssignmentMoved)));
         assert!(handoff_requested.is_cancelled());
+        let remaining_ttl_ms: i64 = redis::cmd("PTTL")
+            .arg(namespace.partition_lease(0))
+            .query_async(&mut setup)
+            .await?;
+        assert!(
+            remaining_ttl_ms >= 2_000,
+            "assignment movement must give the cooperative barrier a fresh lease TTL, got {remaining_ttl_ms}ms"
+        );
         assert!(
             leases.validate(&guard).await?,
             "owner change must request cooperative handoff while the exact incumbent lease remains fenced"
+        );
+        tokio::time::sleep(DEFAULT_PARTITION_LEASE_TTL + Duration::from_millis(250)).await;
+        assert!(
+            leases.validate(&guard).await?,
+            "watchdog must bridge assignment handoff beyond one lease TTL until the partition loop takes over"
         );
 
         stop.cancel();

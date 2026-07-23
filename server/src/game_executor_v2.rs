@@ -26,9 +26,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const HANDOFF_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+// Bridge the interval between assignment detection and the partition loop
+// entering its own cooperative barrier. The bound prevents a wedged incumbent
+// from extending old authority indefinitely; expiry remains the fallback.
+const HANDOFF_WATCHDOG_BRIDGE_TIMEOUT: Duration = HANDOFF_BARRIER_TIMEOUT;
 const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -182,12 +186,55 @@ async fn probe_partition_lease(
 ) -> Result<Option<LeaseWatchdogEvent>> {
     match lease_store.renew(guard).await {
         Ok(true) => Ok(None),
-        Ok(false) => match lease_store.validate(guard).await {
+        // A desired-owner change intentionally makes ordinary renewal fail.
+        // Refresh the still-exact incumbent token once before announcing the
+        // handoff so the partition loop receives a full TTL for its barrier.
+        // If the token itself is gone, authority was actually lost.
+        Ok(false) => match lease_store.renew_for_handoff(guard).await {
             Ok(true) => Ok(Some(LeaseWatchdogEvent::AssignmentMoved)),
             Ok(false) => Ok(Some(LeaseWatchdogEvent::AuthorityLost)),
-            Err(error) => Err(error.context("partition lease validation failed transiently")),
+            Err(error) => Err(error.context("partition handoff lease refresh failed transiently")),
         },
         Err(error) => Err(error.context("partition lease renewal failed transiently")),
+    }
+}
+
+async fn bridge_assignment_handoff(
+    lease_store: &PartitionLeaseStore,
+    guard: &PartitionLeaseGuard,
+    stop: &CancellationToken,
+) {
+    let deadline = Instant::now() + HANDOFF_WATCHDOG_BRIDGE_TIMEOUT;
+    let mut renew = tokio::time::interval(LEASE_RENEW_INTERVAL);
+    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                warn!(
+                    partition = guard.partition(),
+                    "assignment handoff did not reach the partition barrier before its bounded lease bridge ended"
+                );
+                return;
+            }
+            _ = renew.tick() => {
+                let renewal = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => return,
+                    result = lease_store.renew_for_handoff(guard) => result,
+                };
+                match renewal {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => warn!(
+                        partition = guard.partition(),
+                        %error,
+                        "assignment handoff lease bridge failed transiently"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -238,6 +285,11 @@ pub(crate) fn spawn_lease_watchdog(
                                 // event channel remains the typed authority
                                 // result used by bootstrap and the main loop.
                                 handoff_cancel.cancel();
+                                if events.send(event).await.is_err() {
+                                    return;
+                                }
+                                bridge_assignment_handoff(&lease_store, &guard, &stop).await;
+                                return;
                             }
                             let _ = events.send(event).await;
                             return;
@@ -535,6 +587,7 @@ impl GameActor {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut checkpoint = tokio::time::interval(self.config.checkpoint_interval);
         checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut handoff_requested = false;
         // Consume the immediate first interval tick; creation/activation writes
         // the required initial checkpoint explicitly.
         checkpoint.tick().await;
@@ -543,10 +596,28 @@ impl GameActor {
             tokio::select! {
                 biased;
                 _ = self.fatal.cancelled() => return Ok(()),
-                _ = checkpoint.tick(), if self.live => {
-                    self.checkpoint().await?;
+                _ = self.completion_cancel.cancelled(), if self.live && !handoff_requested => {
+                    // Assignment movement/direct drain uses this shared signal.
+                    // Finish the operation already in flight, but do not start
+                    // another periodic tick or checkpoint ahead of the FIFO
+                    // delivery/barrier messages that complete handoff. Keep
+                    // live command semantics until Barrier so an already-
+                    // accepted delivery still writes its durable decision.
+                    handoff_requested = true;
                 }
-                _ = tick.tick(), if self.live => {
+                _ = checkpoint.tick(), if self.live && !handoff_requested => {
+                    let handoff = self.completion_cancel.clone();
+                    tokio::select! {
+                        biased;
+                        _ = handoff.cancelled() => handoff_requested = true,
+                        result = self.checkpoint() => result?,
+                    }
+                }
+                _ = tick.tick(), if self.live && !handoff_requested => {
+                    // `run_until` mutates the engine before publishing its
+                    // event batch. Finish this one already-started tick so a
+                    // handoff cannot expose only a canceled prefix. The sticky
+                    // signal prevents any later tick from starting.
                     self.advance_live().await?;
                     if self.completion_committed {
                         return Ok(());
@@ -561,12 +632,28 @@ impl GameActor {
                             let _ = reply.send(result);
                         }
                         GameActorMessage::Activate { reply } => {
-                            let result = self.activate().await;
+                            let handoff = self.completion_cancel.clone();
+                            let result = tokio::select! {
+                                biased;
+                                _ = handoff.cancelled() => {
+                                    handoff_requested = true;
+                                    Ok(())
+                                }
+                                result = self.activate() => result,
+                            };
                             if result.is_err() { self.fatal.cancel(); }
                             let _ = reply.send(result);
                         }
                         GameActorMessage::Snapshot { reply } => {
-                            let result = self.publish_fresh_snapshot().await;
+                            let handoff = self.completion_cancel.clone();
+                            let result = tokio::select! {
+                                biased;
+                                _ = handoff.cancelled() => {
+                                    handoff_requested = true;
+                                    Ok(())
+                                }
+                                result = self.publish_fresh_snapshot() => result,
+                            };
                             if result.is_err() { self.fatal.cancel(); }
                             let _ = reply.send(result);
                         }
@@ -692,7 +779,12 @@ impl GameActor {
             // contiguous watermark still proves terminal resolution. Never
             // run the command again: checkpoint/ACK the duplicate and publish
             // a fresh snapshot so gateways resend that watermark.
-            self.publish_fresh_snapshot().await?;
+            let handoff = self.completion_cancel.clone();
+            tokio::select! {
+                biased;
+                _ = handoff.cancelled() => {}
+                result = self.publish_fresh_snapshot() => result?,
+            }
         }
         Ok(DeliveryDisposition::Incorporated)
     }
@@ -1147,6 +1239,7 @@ async fn run_game_executor_v2(
         handoff_cancel.clone(),
     );
 
+    let bootstrap_started = Instant::now();
     let bootstrap = async {
         // Anchor fan-out requests immediately on acquisition so a cold
         // replica's one-shot request cannot fall into bootstrap.
@@ -1157,6 +1250,7 @@ async fn run_game_executor_v2(
         let envelopes = bus
             .load_partition_recovery_fenced(&guard, config.retention)
             .await?;
+        let recovered_game_count = envelopes.len();
         if !envelopes.is_empty() {
             crate::resilience_metrics::record_recovered_games(envelopes.len() as u64);
         }
@@ -1182,6 +1276,7 @@ async fn run_game_executor_v2(
 
         let mut consumer = bus.subscribe_executor_commands(guard.clone()).await?;
         let mut command_decisions = bus.load_command_decisions_fenced(&guard).await?;
+        let mut replayed_command_count = 0usize;
 
         // Recover all PEL entries first, then every currently undelivered entry.
         loop {
@@ -1194,6 +1289,7 @@ async fn run_game_executor_v2(
             }
             if !batch.deliveries.is_empty() {
                 crate::resilience_metrics::record_recovery_replays(batch.deliveries.len() as u64);
+                replayed_command_count += batch.deliveries.len();
             }
             let mut deliveries = batch.deliveries;
             attach_command_decisions(&mut deliveries, &mut command_decisions);
@@ -1246,6 +1342,13 @@ async fn run_game_executor_v2(
             );
         }
         activate_all(&actors).await?;
+        info!(
+            partition,
+            recovered_games = recovered_game_count,
+            replayed_commands = replayed_command_count,
+            bootstrap_elapsed_ms = bootstrap_started.elapsed().as_millis() as u64,
+            "completed v2 partition bootstrap"
+        );
         Result::<_>::Ok((snapshot_requests, consumer, actors, cursors))
     };
     tokio::pin!(bootstrap);
@@ -1363,6 +1466,11 @@ async fn run_game_executor_v2(
                         event = watchdog_rx.recv() => {
                             match event {
                                 Some(LeaseWatchdogEvent::AssignmentMoved) => {
+                                    // The watchdog kept this exact token alive
+                                    // while the event waited behind in-flight
+                                    // actor work. Hand renewal to the bounded
+                                    // cooperative barrier before release.
+                                    watchdog_stop.cancel();
                                     cooperative_handoff(
                                         &actors,
                                         &lease_store,
@@ -1425,7 +1533,11 @@ async fn run_game_executor_v2(
                                 if request.partition_id != partition {
                                     return Err(anyhow::anyhow!("snapshot request was routed to the wrong partition"));
                                 }
-                                publish_snapshots(&actors).await?;
+                                tokio::select! {
+                                    biased;
+                                    _ = handoff_cancel.cancelled() => {}
+                                    result = publish_snapshots(&actors) => result?,
+                                }
                             }
                             LiveExecutorWork::Deliveries(deliveries) => break deliveries?,
                         }
@@ -1720,6 +1832,12 @@ async fn dispatch_batch(
             }
         }
         if created_actor && activate_new_actors {
+            // The incorporated GameCreated remains pending and replayable. Do
+            // not start a retrying activation checkpoint after ownership has
+            // already moved; the successor performs activation instead.
+            if handoff_cancel.is_cancelled() {
+                return Ok(());
+            }
             let slot = actors.get(&game_id).context("new game actor disappeared")?;
             let (reply, receive) = oneshot::channel();
             slot.sender
@@ -2724,6 +2842,48 @@ mod tests {
                 .await?)
         }
 
+        async fn move_partition_to(&mut self, successor: &BootIdentity) -> Result<()> {
+            let mut owners = serde_json::Map::new();
+            owners.insert(
+                self.partition.to_string(),
+                serde_json::Value::String(successor.to_string()),
+            );
+            let _: () = self
+                .raw
+                .set(
+                    self.namespace.partition_assignment(self.partition),
+                    serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+                )
+                .await?;
+            Ok(())
+        }
+
+        async fn defer_game_start(&mut self) -> Result<()> {
+            let mut baseline = self.recovery().await?;
+            baseline.game_state.start_ms = chrono::Utc::now().timestamp_millis() + 60_000;
+            baseline.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            self.bus
+                .checkpoint_and_ack_fenced(&self.guard, &baseline, &[], Duration::from_secs(60))
+                .await?;
+            Ok(())
+        }
+
+        async fn await_handoff_and_acquire(
+            &self,
+            task: JoinHandle<Result<()>>,
+            successor: &BootIdentity,
+            context: &'static str,
+        ) -> Result<PartitionLeaseGuard> {
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .with_context(|| context)?
+                .context("executor task panicked during assignment handoff")??;
+            self.leases
+                .try_acquire(self.partition, successor)
+                .await?
+                .context("successor could not immediately acquire the cooperatively released lease")
+        }
+
         async fn takeover(&self) -> Result<PartitionLeaseGuard> {
             if !self.leases.release(&self.guard).await? {
                 bail!("test owner could not release its original token");
@@ -3540,6 +3700,7 @@ mod tests {
                 checkpoint_interval: Duration::from_secs(60),
                 ..RecoveryConfig::default()
             };
+            let handoff_cancel = fatal.child_token();
             let mut original = GameActor::from_envelope(
                 2,
                 baseline,
@@ -3549,7 +3710,7 @@ mod tests {
                 recovery_config,
                 receiver,
                 fatal.clone(),
-                fatal.child_token(),
+                handoff_cancel.clone(),
             );
             let original_task = tokio::spawn(async move { original.run().await });
 
@@ -3576,17 +3737,19 @@ mod tests {
                     reply: delivery_reply,
                 })
                 .await?;
-            assert!(matches!(
-                delivery_result.await??,
-                DeliveryDisposition::Incorporated
-            ));
-
+            // The delivery is already accepted by the FIFO mailbox. Handoff
+            // must suppress new periodic work without dropping that delivery.
+            handoff_cancel.cancel();
             let (barrier_reply, barrier_result) = oneshot::channel();
             sender
                 .send(GameActorMessage::Barrier {
                     reply: barrier_reply,
                 })
                 .await?;
+            assert!(matches!(
+                delivery_result.await??,
+                DeliveryDisposition::Incorporated
+            ));
             barrier_result.await??;
             original_task.await??;
 
@@ -3680,6 +3843,203 @@ mod tests {
                 "successor replay duplicated a visible outcome"
             );
 
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assignment_move_preempts_inflight_periodic_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("periodic-checkpoint-handoff").await?;
+            harness.defer_game_start().await?;
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let (_executor, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_millis(100),
+                    ..RecoveryConfig::default()
+                },
+                CancellationToken::new(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+
+            let (checkpoint_entered, _never_release_checkpoint) =
+                harness.bus.gate_next_checkpoint();
+            tokio::time::timeout(Duration::from_secs(2), checkpoint_entered.notified())
+                .await
+                .context("periodic checkpoint did not enter the deterministic gate")?;
+
+            let successor = BootIdentity::new();
+            harness.move_partition_to(&successor).await?;
+            let successor_guard = harness
+                .await_handoff_and_acquire(
+                    task,
+                    &successor,
+                    "assignment handoff waited on an in-flight periodic checkpoint",
+                )
+                .await?;
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assignment_move_preempts_inflight_snapshot_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("snapshot-checkpoint-handoff").await?;
+            harness.defer_game_start().await?;
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let (_executor, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_secs(60),
+                    ..RecoveryConfig::default()
+                },
+                CancellationToken::new(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+
+            let (checkpoint_entered, _never_release_checkpoint) =
+                harness.bus.gate_next_checkpoint();
+            harness
+                .bus
+                .request_partition_snapshots(harness.partition)
+                .await?;
+            tokio::time::timeout(Duration::from_secs(2), checkpoint_entered.notified())
+                .await
+                .context("snapshot checkpoint did not enter the deterministic gate")?;
+
+            let successor = BootIdentity::new();
+            harness.move_partition_to(&successor).await?;
+            let successor_guard = harness
+                .await_handoff_and_acquire(
+                    task,
+                    &successor,
+                    "assignment handoff waited on in-flight snapshot fan-out",
+                )
+                .await?;
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assignment_move_preempts_inflight_new_actor_activation() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("new-actor-activation-handoff").await?;
+            harness.defer_game_start().await?;
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let (_executor, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_secs(60),
+                    ..RecoveryConfig::default()
+                },
+                CancellationToken::new(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+
+            let new_game_id = harness.game_id + PARTITION_COUNT;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut new_game_state = GameState::new(
+                40,
+                40,
+                GameType::FreeForAll { max_players: 4 },
+                QueueMode::Quickmatch,
+                Some(9),
+                now_ms + 60_000,
+            );
+            new_game_state.status = GameStatus::Started { server_id: 1 };
+            new_game_state.add_player(88, Some("player-88".into()))?;
+            let created = StreamEvent::GameCreated {
+                game_id: new_game_id,
+                game_state: new_game_state,
+            };
+            let (checkpoint_entered, _never_release_checkpoint) =
+                harness.bus.gate_next_checkpoint();
+            let created_stream_id: String = harness
+                .raw
+                .xadd(
+                    RedisKeys::stream_commands(harness.partition),
+                    "*",
+                    &[("data", serde_json::to_vec(&created)?)],
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(2), checkpoint_entered.notified())
+                .await
+                .context("new-actor activation did not enter the deterministic checkpoint gate")?;
+
+            let successor = BootIdentity::new();
+            harness.move_partition_to(&successor).await?;
+            let successor_guard = harness
+                .await_handoff_and_acquire(
+                    task,
+                    &successor,
+                    "assignment handoff waited on new-actor activation",
+                )
+                .await?;
+
+            assert!(
+                !harness
+                    .raw
+                    .exists::<_, bool>(harness.namespace.recovery(new_game_id))
+                    .await?,
+                "canceled activation must leave GameCreated for successor replay"
+            );
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(
+                pending
+                    .ids
+                    .iter()
+                    .any(|entry| entry.id == created_stream_id)
+            );
+
+            let _: () = harness
+                .raw
+                .del(&[
+                    harness.namespace.recovery(new_game_id),
+                    RedisKeys::game_snapshot(new_game_id),
+                ])
+                .await?;
             harness.cleanup(&successor_guard).await?;
             Result::<()>::Ok(())
         })

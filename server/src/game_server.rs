@@ -613,8 +613,13 @@ impl GameServer {
         // Flip readiness immediately. The client-facing socket deadline is
         // published later, once route withdrawal has consumed its actual
         // share of the one global shutdown budget.
-        self.lifecycle.begin_draining(shutdown_deadline_unix_ms);
         let executor_cluster = self.executor_cluster.clone();
+        // Mark executor membership DRAINING before the local readiness flag
+        // drops. Otherwise the heartbeat can briefly publish WARMING, which is
+        // correctly treated as an urgent owner failure and defeats safe
+        // coalescing of a planned ECS scale-in wave.
+        executor_cluster.begin_draining();
+        self.lifecycle.begin_draining(shutdown_deadline_unix_ms);
         let executor_handoff_deadline =
             (tokio::time::Instant::now() + Duration::from_secs(20)).min(shutdown_deadline);
         let executor_drain =

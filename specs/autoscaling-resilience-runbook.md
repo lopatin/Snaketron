@@ -1,10 +1,7 @@
 # Autoscaling resilience operations runbook
 
-This runbook covers direct deployment and steady-state operation of the
-autoscaling design in [autoscaling-resilience-prd.md](autoscaling-resilience-prd.md).
-The superseded server has no users, so the first deployment intentionally uses
-maintenance downtime. There is no live state migration, mixed-version mode, or
-compatibility gate.
+This runbook covers deployment, certification, and steady-state operation of
+the autoscaling design in [autoscaling-resilience-prd.md](autoscaling-resilience-prd.md).
 
 ## Accepted availability boundary
 
@@ -25,20 +22,6 @@ compatibility gate.
   available.
 - Recovery after checkpoint retention expires is explicitly unrecoverable; the
   server must not fabricate a replacement game.
-
-## First deployment
-
-Take maintenance downtime and deploy the new cache, server, and client as one
-direct cutoff. The current Server stacks in both regions import the old Valkey
-endpoint exports, so an ordinary first `cdk deploy --all` cannot replace those
-exports. Before the first Serverless deployment, delete
-`Snaketron-Monitoring-prod-use1`, then `Snaketron-Server-prod-use1` in
-`us-east-1`; delete `Snaketron-Monitoring-prod-euw1`, then
-`Snaketron-Server-prod-euw1` in `eu-west-1`; wait for all four deletions; and
-only then run the production workflow to replace Valkey and redeploy every
-stack. This is a one-time operator action during the accepted downtime, not
-application migration machinery. No live migration, dual exports,
-mixed-version mode, or transition behavior is implemented or tested.
 
 For steady-state inspection after startup:
 
@@ -127,10 +110,15 @@ remain unchanged.
 
 Routine ECS deployments use the same steady-state mechanisms as autoscaling:
 
-- a new ready task joins membership and receives a balanced desired assignment;
+- staggered ready-task joins and planned drains coalesce behind a four-second
+  quiet window while every incumbent can continue serving;
+- a missing, expired, warming, or incompatible owner bypasses that window and
+  is reassigned immediately after failure detection;
+- the final ready-task set receives one balanced desired assignment;
 - executor partitions move under fenced ownership without moving WebSockets;
-- a departing task becomes unready, performs bounded partition handoff, and
-  requests make-before-break socket handoff;
+- a departing task publishes `DRAINING`, keeps serving until its monotonic
+  partition views move, performs bounded partition handoff, and requests
+  make-before-break socket handoff;
 - if SIGTERM, handoff, or any release step fails, lease expiry and pending-entry
   reclaim remain the authoritative recovery path.
 
@@ -337,8 +325,7 @@ The “Ephemeral Development Certification” workflow provisions one short-live
 development environment, opens three SSM sessions (Valkey 6379, Valkey 6380,
 and Traefik metrics), runs those commands in that order, uploads both evidence
 directories, and always destroys and verifies the absence of the ephemeral
-stacks afterward. It does not preserve or transition state from a previous
-deployment. The workflow discovers and validates the production Network
+stacks afterward. The workflow discovers and validates the production Network
 stack's VPC, then imports it read-only. Development owns only its separately
 tagged security groups, Serverless cache, ECS resources, Traefik/EIP, and
 run-unique DNS record; cleanup must prove the shared VPC still exists and must
@@ -347,9 +334,12 @@ never create, replace, or delete its routes, endpoints, or flow logs.
 At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
 pending completions, and active-game counts. It fails unless leases match
-desired owners, tokens are unique, owners are balanced, assignment versions
-advance, the assignment's eligible-member set exactly equals active membership,
-and each staircase leg moves the minimum nine partitions. A fresh ten-task
+desired owners, tokens are unique, owners are balanced, the assignment's
+eligible-member set exactly equals active membership, and each forced staircase
+leg advances assignment monotonically while moving the minimum nine partitions
+between its settled endpoints. Closely spaced membership waves should coalesce,
+but task-readiness waves separated by more than the quiet window may correctly
+produce more than one intermediate version. A fresh ten-task
 membership/ECS-health pair is captured immediately before scale-in. These
 snapshots complement continuous unowned-duration and fencing metrics. It also
 records the automatic, reset, forced scale-out, and forced scale-in windows;
