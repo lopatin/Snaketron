@@ -1766,6 +1766,55 @@ fn is_parallel_actor_delivery(payload: &CommandDeliveryPayload) -> bool {
     )
 }
 
+fn append_round_robin_game_command_run(
+    run: &mut Vec<CommandDelivery>,
+    reordered: &mut Vec<CommandDelivery>,
+) {
+    let mut game_positions = HashMap::new();
+    let mut game_queues: Vec<VecDeque<CommandDelivery>> = Vec::new();
+    for delivery in run.drain(..) {
+        let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
+            game_id, ..
+        }) = &delivery.payload
+        else {
+            unreachable!("round-robin run contains only game commands");
+        };
+        let position = *game_positions.entry(*game_id).or_insert_with(|| {
+            game_queues.push(VecDeque::new());
+            game_queues.len() - 1
+        });
+        game_queues[position].push_back(delivery);
+    }
+
+    loop {
+        let mut appended = false;
+        for queue in &mut game_queues {
+            if let Some(delivery) = queue.pop_front() {
+                reordered.push(delivery);
+                appended = true;
+            }
+        }
+        if !appended {
+            break;
+        }
+    }
+}
+
+fn round_robin_game_command_runs(deliveries: Vec<CommandDelivery>) -> Vec<CommandDelivery> {
+    let mut reordered = Vec::with_capacity(deliveries.len());
+    let mut run = Vec::new();
+    for delivery in deliveries {
+        if is_parallel_actor_delivery(&delivery.payload) {
+            run.push(delivery);
+            continue;
+        }
+        append_round_robin_game_command_run(&mut run, &mut reordered);
+        reordered.push(delivery);
+    }
+    append_round_robin_game_command_run(&mut run, &mut reordered);
+    reordered
+}
+
 fn advance_cursor_monotonically(
     cursors: &mut HashMap<u32, String>,
     game_id: u32,
@@ -1934,7 +1983,12 @@ async fn dispatch_batch(
     activate_new_actors: bool,
 ) -> Result<()> {
     let mut pending = VecDeque::with_capacity(DISPATCH_FANOUT_WINDOW);
-    for delivery in deliveries {
+    // Redis preserves global append order, so two clients in one game commonly
+    // produce adjacent entries. Offer one command per game before the next
+    // per-game round; otherwise the second adjacent entry waits for its first
+    // reply before any later game is even offered to an actor. Per-game order
+    // remains unchanged, and control entries retain their barrier positions.
+    for delivery in round_robin_game_command_runs(deliveries) {
         // XREADGROUP may already have returned a large batch when assignment
         // changes. Leave untouched entries in the old consumer's PEL so the
         // successor can claim them at zero idle time instead of extending the
@@ -2591,6 +2645,104 @@ mod tests {
         }
     }
 
+    fn control_test_delivery(stream_sequence: u64, event: StreamEvent) -> CommandDelivery {
+        CommandDelivery {
+            stream_id: format!("{stream_sequence}-0"),
+            payload: CommandDeliveryPayload::Command(event),
+            decision: None,
+        }
+    }
+
+    #[test]
+    fn game_command_rounds_preserve_per_game_order_and_control_barriers() {
+        let first_game = 11;
+        let second_game = 21;
+        let third_game = 31;
+        let deliveries = vec![
+            parallel_test_delivery(1, first_game, 1, 1),
+            parallel_test_delivery(2, first_game, 2, 1),
+            parallel_test_delivery(3, second_game, 3, 1),
+            parallel_test_delivery(4, second_game, 4, 1),
+            parallel_test_delivery(5, third_game, 5, 1),
+            parallel_test_delivery(6, third_game, 6, 1),
+            control_test_delivery(
+                7,
+                StreamEvent::StatusUpdated {
+                    game_id: first_game,
+                    status: GameStatus::Complete {
+                        winning_snake_id: None,
+                    },
+                },
+            ),
+            parallel_test_delivery(8, first_game, 1, 2),
+            parallel_test_delivery(9, first_game, 2, 2),
+            parallel_test_delivery(10, first_game, 1, 3),
+            parallel_test_delivery(11, second_game, 3, 2),
+            control_test_delivery(
+                12,
+                StreamEvent::GameCreated {
+                    game_id: second_game,
+                    game_state: GameState::new(
+                        20,
+                        20,
+                        GameType::FreeForAll { max_players: 2 },
+                        QueueMode::Quickmatch,
+                        Some(1),
+                        0,
+                    ),
+                },
+            ),
+            synthetic_delivery(13),
+            parallel_test_delivery(14, third_game, 5, 2),
+            parallel_test_delivery(15, third_game, 6, 2),
+        ];
+
+        let input_per_game = deliveries.iter().fold(
+            HashMap::<u32, Vec<String>>::new(),
+            |mut commands, delivery| {
+                if let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
+                    game_id,
+                    ..
+                }) = &delivery.payload
+                {
+                    commands
+                        .entry(*game_id)
+                        .or_default()
+                        .push(delivery.stream_id.clone());
+                }
+                commands
+            },
+        );
+        let reordered = round_robin_game_command_runs(deliveries);
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|delivery| delivery.stream_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "1-0", "3-0", "5-0", "2-0", "4-0", "6-0", "7-0", "8-0", "11-0", "9-0", "10-0",
+                "12-0", "13-0", "14-0", "15-0",
+            ]
+        );
+        let output_per_game = reordered.iter().fold(
+            HashMap::<u32, Vec<String>>::new(),
+            |mut commands, delivery| {
+                if let CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
+                    game_id,
+                    ..
+                }) = &delivery.payload
+                {
+                    commands
+                        .entry(*game_id)
+                        .or_default()
+                        .push(delivery.stream_id.clone());
+                }
+                commands
+            },
+        );
+        assert_eq!(output_per_game, input_per_game);
+    }
+
     #[tokio::test]
     async fn dispatch_fanout_preserves_same_game_fifo() -> Result<()> {
         let (sender, mut receiver) = mpsc::channel(8);
@@ -2804,9 +2956,14 @@ mod tests {
             let first_task = tokio::spawn(async move {
                 let Some(GameActorMessage::Delivery { reply, .. }) = first_receiver.recv().await
                 else {
-                    panic!("first game never received its command");
+                    panic!("first game never received its first command");
                 };
                 first_release.notified().await;
+                assert!(reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok());
+                let Some(GameActorMessage::Delivery { reply, .. }) = first_receiver.recv().await
+                else {
+                    panic!("first game never received its second command");
+                };
                 assert!(reply.send(Ok(DeliveryDisposition::Incorporated)).is_ok());
             });
 
@@ -2868,9 +3025,10 @@ mod tests {
             ]);
             let deliveries = vec![
                 parallel_test_delivery(1, first_game, 11, 1),
-                parallel_test_delivery(2, repeated_game, 21, 1),
-                parallel_test_delivery(3, repeated_game, 22, 1),
-                parallel_test_delivery(4, later_game, 31, 1),
+                parallel_test_delivery(2, first_game, 12, 1),
+                parallel_test_delivery(3, repeated_game, 21, 1),
+                parallel_test_delivery(4, repeated_game, 22, 1),
+                parallel_test_delivery(5, later_game, 31, 1),
             ];
             let fatal = CancellationToken::new();
             let handoff = fatal.child_token();
@@ -2907,9 +3065,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(1), &mut dispatch).await??;
             }
 
-            assert_eq!(cursors.get(&first_game).map(String::as_str), Some("1-0"));
-            assert_eq!(cursors.get(&repeated_game).map(String::as_str), Some("3-0"));
-            assert_eq!(cursors.get(&later_game).map(String::as_str), Some("4-0"));
+            assert_eq!(cursors.get(&first_game).map(String::as_str), Some("2-0"));
+            assert_eq!(cursors.get(&repeated_game).map(String::as_str), Some("4-0"));
+            assert_eq!(cursors.get(&later_game).map(String::as_str), Some("5-0"));
             for (_, slot) in actors {
                 slot._task.await?;
             }
