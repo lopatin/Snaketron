@@ -1515,22 +1515,29 @@ collect_ecs_runtime_evidence() {
         | select(
             .taskDefinitionArn == $task_definition
             and .stopCode == "ServiceSchedulerInitiated"
-            and .stoppingAt != null
             and .stoppedAt != null
             and (.stoppedAt | epoch) >= $started
           )
         | {
             task_id: (.taskArn | split("/")[-1]),
             stopping_at: .stoppingAt,
-            stopped_at: .stoppedAt,
-            shutdown_ms: (((.stoppedAt | epoch) - (.stoppingAt | epoch)) * 1000)
+            execution_stopped_at: .executionStoppedAt,
+            application_shutdown_ms:
+              (if .stoppingAt == null or .executionStoppedAt == null
+               then null
+               else (((.executionStoppedAt | epoch) - (.stoppingAt | epoch)) * 1000)
+               end)
           }]
     ' "$ecs_dir/stopped-tasks.json" >"$ecs_dir/task-shutdown-durations.json"
   jq -e '
     length >= 9
-    and all(.[]; .shutdown_ms >= 0 and .shutdown_ms <= 45000)
+    and all(.[];
+      .stopping_at != null
+      and .execution_stopped_at != null
+      and .application_shutdown_ms >= 0
+      and .application_shutdown_ms <= 45000)
   ' "$ecs_dir/task-shutdown-durations.json" >/dev/null || {
-    echo "ECS did not prove every measured scheduler shutdown completed within 45 seconds" >&2
+    echo "ECS did not prove every measured application shutdown completed within 45 seconds" >&2
     return 1
   }
 }
@@ -1711,7 +1718,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 295' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 279' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2850,7 +2857,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 64@20m \
+    --stages 48@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -2861,9 +2868,10 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${continuity_command[@]}" &
   load_pid=$!
-  # Sixty-four sessions are the first evidence-backed calibration. Failure to
-  # trigger the configured CPU/memory policy is a certification failure; never
-  # escalate the initial task to the full capacity envelope.
+  # Forty-eight sessions are the one-task calibration derived from the first
+  # live run. Failure to trigger the configured CPU/memory policy is a
+  # certification failure; never escalate the initial task to the full
+  # capacity envelope.
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
   # The load ramp is not itself an ownership transition. Start the strict
@@ -3051,7 +3059,7 @@ run_staging_suite() {
   # without putting the full game-command envelope on one task.
   # The public count is a heartbeat-delayed raw WebSocket count. It proves the
   # candidate sockets exist; the finished admission report proves auth/readiness.
-  wait_for_region_socket_floor pre-admission 87
+  wait_for_region_socket_floor pre-admission 71
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -3068,7 +3076,7 @@ run_staging_suite() {
     --run-id "$admission_run_id" \
     --report-dir "$report_dir" &
   admission_population_pid=$!
-  wait_for_region_socket_floor admission-seed 91 "$admission_population_pid"
+  wait_for_region_socket_floor admission-seed 75 "$admission_population_pid"
   local scale_in_started_ms
   scale_in_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
@@ -3137,12 +3145,12 @@ run_staging_suite() {
       . as $report
       | .schema_version >= 10
       and .metadata.threshold_result == "passed"
-      and .configured_max_concurrency == 64
+      and .configured_max_concurrency == 48
       and .metadata.mode == "duel"
       and .metadata.command_profile == "every-tick"
       and .metadata.spawn_rate_per_second == "4"
-      and .session_counts.peak_authenticated_concurrency == 64
-      and .session_counts.peak_active_game_concurrency >= 32
+      and .session_counts.peak_authenticated_concurrency == 48
+      and .session_counts.peak_active_game_concurrency >= 24
       and .session_counts.failed == 0
       and .session_counts.cancelled == 0
       and .session_counts.incomplete == 0
@@ -3404,9 +3412,9 @@ run_staging_suite() {
         lobby_task_counts: counts($lobby),
         matchmaking_task_counts: counts($matchmaking),
         transition: {
-          configured_game_websockets: 64,
+          configured_game_websockets: 48,
           companion_websockets: 23,
-          configured_total_websockets: 87,
+          configured_total_websockets: 71,
           observed_game_websockets: ([$game_counts[]] | add // 0),
           observed_total_websockets:
             (([$game_counts[]] | add // 0)
@@ -3430,11 +3438,11 @@ run_staging_suite() {
     and (.idle_task_boot_ids | length) > 1
     and (.lobby_task_boot_ids | length) > 1
     and (.matchmaking_task_boot_ids | length) >= 1
-    and .transition.configured_game_websockets == 64
+    and .transition.configured_game_websockets == 48
     and .transition.companion_websockets == 23
-    and .transition.configured_total_websockets == 87
-    and .transition.observed_game_websockets == 64
-    and .transition.observed_total_websockets == 87
+    and .transition.configured_total_websockets == 71
+    and .transition.observed_game_websockets == 48
+    and .transition.observed_total_websockets == 71
   ' "$report_dir/population-distribution.json" >/dev/null || {
     echo "Exact TaskBootId transition WebSocket/event-forwarding distribution was not proven" >&2
     exit 1

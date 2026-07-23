@@ -274,6 +274,29 @@ fn watchdog_event_error(partition: u32, event: Option<LeaseWatchdogEvent>) -> an
     }
 }
 
+async fn release_bootstrap_authority(
+    lease_store: &PartitionLeaseStore,
+    guard: &PartitionLeaseGuard,
+    fatal: &CancellationToken,
+    watchdog_stop: &CancellationToken,
+) -> Result<()> {
+    // Bootstrap may own detached actors or an in-flight fenced stream read.
+    // Cancel those futures before compare-deleting the exact token. Redis
+    // serializes the release with every same-slot fenced mutation: an old
+    // operation either commits before the release while the successor is
+    // still excluded, or observes the missing token and is rejected after it.
+    fatal.cancel();
+    watchdog_stop.cancel();
+    // `false` means the exact token is already absent. That is also a
+    // successful authority exit, and compare-delete can never remove a
+    // successor's different token.
+    let _ = lease_store
+        .release(guard)
+        .await
+        .context("failed to release bootstrap partition authority")?;
+    Ok(())
+}
+
 // Deliveries are hot-path values; avoid boxing every command for small control variants.
 #[allow(clippy::large_enum_variant)]
 enum GameActorMessage {
@@ -1219,9 +1242,44 @@ async fn run_game_executor_v2(
             fatal.cancel();
             Err(error)
         }
+        Some(ExecutorControl::Handoff { reply }) = control.recv() => {
+            let result = release_bootstrap_authority(
+                &lease_store,
+                &guard,
+                &fatal,
+                &watchdog_stop,
+            ).await;
+            match result {
+                Ok(()) => {
+                    let _ = reply.send(Ok(()));
+                    Ok(None)
+                }
+                Err(error) => {
+                    // Preserve the typed Redis/timeout source for the
+                    // partition supervisor. The drain caller still receives a
+                    // useful error, while the old token safely falls back to
+                    // expiry instead of escalating an expected handoff race
+                    // into a task-fatal invariant failure.
+                    let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
+                    Err(error)
+                }
+            }
+        }
         event = watchdog_rx.recv() => {
-            fatal.cancel();
-            Err(watchdog_event_error(partition, event))
+            match event {
+                Some(LeaseWatchdogEvent::AssignmentMoved) => {
+                    release_bootstrap_authority(
+                        &lease_store,
+                        &guard,
+                        &fatal,
+                        &watchdog_stop,
+                    ).await.map(|()| None)
+                }
+                event => {
+                    fatal.cancel();
+                    Err(watchdog_event_error(partition, event))
+                }
+            }
         }
         result = &mut bootstrap => result.map(Some),
     };
@@ -3614,6 +3672,141 @@ mod tests {
                 })
                 .count();
             assert_eq!(terminal_event_count, 1);
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assignment_move_during_blocked_bootstrap_releases_for_successor() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("bootstrap-assignment-move").await?;
+            let (read_assigned, _never_release_read_reply) =
+                harness.bus.gate_next_nonempty_executor_read_reply();
+            let pending_id = harness.append_command().await?;
+            let executor_cancel = CancellationToken::new();
+            let (_executor, executor_task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig::default(),
+                executor_cancel,
+            );
+            tokio::time::timeout(Duration::from_secs(2), read_assigned.notified())
+                .await
+                .context("executor did not block inside bootstrap command recovery")?;
+
+            let successor_owner = BootIdentity::new();
+            let mut owners = serde_json::Map::new();
+            owners.insert(
+                harness.partition.to_string(),
+                serde_json::Value::String(successor_owner.to_string()),
+            );
+            let _: () = harness
+                .raw
+                .set(
+                    harness.namespace.partition_assignment(harness.partition),
+                    serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+                )
+                .await?;
+
+            // The harness lease lasts 30 seconds. Completion here proves that
+            // assignment movement compare-deletes the exact bootstrap token
+            // instead of waiting for expiry.
+            let executor_result = tokio::time::timeout(Duration::from_secs(3), executor_task)
+                .await
+                .context("assignment move waited for the bootstrap lease TTL")?
+                .context("bootstrap executor task panicked")?;
+            executor_result?;
+            let successor_guard = harness
+                .leases
+                .try_acquire(harness.partition, &successor_owner)
+                .await?
+                .context("successor could not acquire the released bootstrap lease")?;
+
+            let mut successor_consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let reclaimed = successor_consumer.reclaim_next().await?;
+            assert_eq!(reclaimed.deliveries.len(), 1);
+            assert_eq!(reclaimed.deliveries[0].stream_id, pending_id);
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_handoff_during_blocked_bootstrap_releases_for_successor() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("bootstrap-direct-handoff").await?;
+            let (read_assigned, _never_release_read_reply) =
+                harness.bus.gate_next_nonempty_executor_read_reply();
+            let pending_id = harness.append_command().await?;
+            let executor_cancel = CancellationToken::new();
+            let (executor, executor_task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig::default(),
+                executor_cancel,
+            );
+            tokio::time::timeout(Duration::from_secs(2), read_assigned.notified())
+                .await
+                .context("executor did not block inside bootstrap command recovery")?;
+
+            tokio::time::timeout(Duration::from_secs(2), executor.handoff())
+                .await
+                .context("direct handoff was not observed during blocked bootstrap")??;
+            let executor_result = tokio::time::timeout(Duration::from_secs(1), executor_task)
+                .await
+                .context("bootstrap executor did not stop after direct handoff")?
+                .context("bootstrap executor task panicked")?;
+            executor_result?;
+            assert!(
+                !harness
+                    .raw
+                    .exists::<_, bool>(harness.guard.lease_key())
+                    .await?,
+                "direct bootstrap handoff left the exact lease until TTL expiry"
+            );
+
+            let successor_owner = BootIdentity::new();
+            let mut owners = serde_json::Map::new();
+            owners.insert(
+                harness.partition.to_string(),
+                serde_json::Value::String(successor_owner.to_string()),
+            );
+            let _: () = harness
+                .raw
+                .set(
+                    harness.namespace.partition_assignment(harness.partition),
+                    serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+                )
+                .await?;
+            let successor_guard = harness
+                .leases
+                .try_acquire(harness.partition, &successor_owner)
+                .await?
+                .context("successor could not acquire after direct bootstrap handoff")?;
+
+            let mut successor_consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let reclaimed = successor_consumer.reclaim_next().await?;
+            assert_eq!(reclaimed.deliveries.len(), 1);
+            assert_eq!(reclaimed.deliveries[0].stream_id, pending_id);
 
             harness.cleanup(&successor_guard).await?;
             Result::<()>::Ok(())

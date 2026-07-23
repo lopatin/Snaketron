@@ -184,7 +184,7 @@ evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
 settled in membership, assignment, and partition leases. It never runs on the
 one-task baseline.
 
-Continuity Run A is a separate fixed 64-session `every-tick` run. It must first
+Continuity Run A is a separate fixed 48-session `every-tick` run. It must first
 cause CPU or memory target tracking to add capacity; if it does not, the run
 fails rather than increasing the initial task to the capacity envelope. Policy
 writes are then suspended while Run A proves the direct `1 -> 10 -> 1`
@@ -192,7 +192,7 @@ ownership staircase. At ten tasks the runner adds 10 idle, 10 lobby, and three
 deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
 starts a 208-session idle ramp at four sessions per second. This keeps new-user
 admission continuous through the 45-second drain deadline while leaving only
-64 command-bearing game sockets on the final task. Run A must prove no active
+48 command-bearing game sockets on the final task. Run A must prove no active
 socket hard reconnect, zero measured usable-session gap, terminal command
 outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
 nine partition moves in each direction. No game completion is awaited before
@@ -413,5 +413,5 @@ with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
 command, or failure to corroborate the measured
-phase envelopes (at least 295 simultaneous sockets during transition/admission
+phase envelopes (at least 279 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

@@ -405,6 +405,17 @@ async fn next_outbound_message(
     }
 }
 
+/// Move the receiver created before `join_lobby` publishes its initial
+/// snapshot into the WebSocket forwarder. `Receiver::resubscribe()` starts at
+/// the current tail, so using only that new receiver would discard an initial
+/// update that reached this task while the join response was being assembled.
+fn take_lobby_update_receiver(
+    receiver: &mut broadcast::Receiver<lobby_manager::Lobby>,
+) -> broadcast::Receiver<lobby_manager::Lobby> {
+    let replacement = receiver.resubscribe();
+    std::mem::replace(receiver, replacement)
+}
+
 /// Handle WebSocket connection from Axum
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_websocket(
@@ -719,7 +730,7 @@ async fn handle_websocket_connection(
                                         socket_generation,
                                         &cluster_namespace,
                                     ).await {
-                                        Ok(new_state) => {
+                                        Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
                                             let entered_game_id = match &new_state {
                                                 ConnectionState::Authenticated { game_id, .. } => *game_id,
@@ -821,7 +832,7 @@ async fn handle_websocket_connection(
 
                                             // Handle lobby state transitions
                                             if entering_lobby
-                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
+                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &mut new_state {
                                                     if let Some(handle) = lobby_update_handle.take() {
                                                         handle.abort();
                                                     }
@@ -829,7 +840,7 @@ async fn handle_websocket_connection(
                                                         handle.abort();
                                                     }
 
-                                                    let mut lobby_rx = lobby_handle.rx.resubscribe();
+                                                    let mut lobby_rx = take_lobby_update_receiver(&mut lobby_handle.rx);
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let ws_tx_clone = ws_tx.clone();
@@ -4223,9 +4234,10 @@ mod lifecycle_protocol_tests {
         recovery_bridge_snapshot, send_command_outcomes_from_resolved,
         send_completed_game_snapshot, send_recovery_bridge_snapshot,
         snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        unsent_lobby_match,
+        take_lobby_update_receiver, unsent_lobby_match,
     };
     use crate::lifecycle::DrainNotice;
+    use crate::lobby_manager::{Lobby, LobbyPreferences};
     use crate::pubsub_manager::PubSubManager;
     use crate::recovery::{RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes};
     use crate::redis_keys::RedisKeys;
@@ -4255,6 +4267,54 @@ mod lifecycle_protocol_tests {
         assert_eq!(identity.user_id, 5);
         assert_eq!(identity.client_game_session_id, "session-a");
         assert_eq!(identity.sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn lobby_forwarder_keeps_the_initial_update_published_during_join() {
+        let (updates, mut join_receiver) = broadcast::channel(4);
+        let initial = Lobby {
+            lobby_code: "USE1-INITIAL".to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 7,
+            state: "open".to_owned(),
+            preferences: LobbyPreferences::default(),
+        };
+        updates
+            .send(initial)
+            .expect("join receiver should retain the initial update");
+
+        let mut forwarder_receiver = take_lobby_update_receiver(&mut join_receiver);
+        assert_eq!(
+            forwarder_receiver
+                .recv()
+                .await
+                .expect("forwarder lost the queued initial update")
+                .lobby_code,
+            "USE1-INITIAL"
+        );
+        assert!(matches!(
+            join_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let next = Lobby {
+            lobby_code: "USE1-NEXT".to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 7,
+            state: "open".to_owned(),
+            preferences: LobbyPreferences::default(),
+        };
+        updates
+            .send(next)
+            .expect("both receivers should remain subscribed");
+        assert_eq!(
+            forwarder_receiver
+                .recv()
+                .await
+                .expect("forwarder lost a later update")
+                .lobby_code,
+            "USE1-NEXT"
+        );
     }
 
     #[test]

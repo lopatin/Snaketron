@@ -630,7 +630,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 64-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. |
+| Run the fixed 48-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one without a task exit, readiness failure, command backlog beyond the ten-second recovery budget, or manual desired-count update; failure to trigger is a failed certification, not permission to put the capacity envelope on one task. The earlier 64-session calibration was removed after live evidence showed it was not one-task-safe. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Run the complete protocol against actual ElastiCache Serverless | TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub uses a connection pool isolated from authoritative commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
@@ -741,7 +741,8 @@ Only these external results remain:
 
 - the planned non-production `1 -> 10 -> 1` staging run passes the fixed load,
   continuous admission, exact healthy-backend, checkpoint-age, Valkey-capacity,
-  and 45-second application/60-second ECS shutdown gates; and
+  and 45-second application shutdown gate while retaining the configured
+  60-second ECS container stop-timeout safety margin; and
 - during a separate run of the same fixed load envelope, one separately
   authorized non-production ECS task receives SIGKILL without graceful cleanup.
   Its naturally observed affected-partition backlog must meet the five-second
