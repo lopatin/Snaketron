@@ -690,7 +690,10 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let salt = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let partition = (salt % server::game_executor::PARTITION_COUNT as u128) as u32;
+        // These correctness paths require a real executor partition (0..10).
+        // Give each such test a fixed, distinct partition so parallel tests
+        // cannot delete one another's shared partition stream.
+        let partition = 7;
         let base_game_id = 1_400_000_000u32;
         let game_id = base_game_id
             + (partition + server::game_executor::PARTITION_COUNT
@@ -1017,7 +1020,7 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let salt = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let partition = (salt % server::game_executor::PARTITION_COUNT as u128) as u32;
+        let partition = 8;
         let base_game_id = 1_500_000_000u32;
         let game_id = base_game_id
             + (partition + server::game_executor::PARTITION_COUNT
@@ -1030,6 +1033,9 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
         let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(8);
         let manager =
             server::redis_utils::create_connection_manager(client.clone(), pubsub_tx).await?;
+        let command_stream = RedisKeys::stream_commands(partition);
+        let event_stream = RedisKeys::stream_events(partition);
+        let _: () = redis.del(&[&command_stream, &event_stream]).await?;
         let mut owners = serde_json::Map::new();
         owners.insert(
             partition.to_string(),
@@ -1154,17 +1160,12 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
         );
 
         let _: usize = redis
-            .xdel(
-                RedisKeys::stream_commands(partition),
-                &[&stream_id, &poison_id],
-            )
+            .xdel(&command_stream, &[&stream_id, &poison_id])
             .await?;
-        let _: usize = redis
-            .xdel(RedisKeys::stream_events(partition), &[&rejection_stream_id])
-            .await?;
+        let _: usize = redis.xdel(&event_stream, &[&rejection_stream_id]).await?;
         let _: i32 = redis::cmd("XGROUP")
             .arg("DESTROY")
-            .arg(RedisKeys::stream_commands(partition))
+            .arg(&command_stream)
             .arg(namespace.command_group(partition))
             .query_async(&mut redis)
             .await?;

@@ -61,6 +61,25 @@ traefik_sample_has_healthy_task() {
   ' "$sample"
 }
 
+traefik_sample_has_healthy_fleet() {
+  local sample="$1"
+  local healthy_observation="$2"
+  local expected_count
+  expected_count="$(jq -er '.tasks | length | select(. > 0)' "$healthy_observation")" \
+    || return 1
+  local observed_count=0
+  while IFS= read -r private_ipv4; do
+    [[ -n "$private_ipv4" ]] || return 1
+    traefik_sample_has_healthy_task "$sample" "$private_ipv4" || return 1
+    observed_count=$((observed_count + 1))
+  done < <(jq -er '
+    .tasks[]
+    | .private_ipv4
+    | select(type == "string" and length > 0)
+  ' "$healthy_observation")
+  (( observed_count == expected_count ))
+}
+
 command_outcomes_meet_window_budget() {
   local summary="$1"
   local window="$2"
@@ -106,6 +125,8 @@ sanitize_task_definition_evidence() {
               name,
               image,
               essential,
+              cpu,
+              memory,
               linuxParameters: (
                 if .linuxParameters == null
                 then null
@@ -132,8 +153,12 @@ assert_task_definition_evidence_sanitized() {
             . != "name"
             and . != "image"
             and . != "essential"
+            and . != "cpu"
+            and . != "memory"
             and . != "linuxParameters")
       ] | length == 0)
+      and (.cpu == null or (.cpu | type == "number"))
+      and (.memory == null or (.memory | type == "number"))
       and (
         .linuxParameters == null
         or ([.linuxParameters | keys[]
@@ -204,6 +229,8 @@ test_task_definition_evidence_sanitizer() {
               name: "server",
               image: "111111111111.dkr.ecr.us-east-1.amazonaws.com/fixture:commit",
               essential: true,
+              cpu: 512,
+              memory: 1024,
               linuxParameters: {initProcessEnabled: true},
               environment: [{name: "SECRET", value: $sensitive}],
               environmentFiles: [{type: "s3", value: $sensitive}],
@@ -246,6 +273,8 @@ test_task_definition_evidence_sanitizer() {
         and .taskDefinition.memory == "1024"
         and (.taskDefinition.containerDefinitions | length) == 2
         and .taskDefinition.containerDefinitions[0].essential == true
+        and .taskDefinition.containerDefinitions[0].cpu == 512
+        and .taskDefinition.containerDefinitions[0].memory == 1024
         and .taskDefinition.containerDefinitions[0].linuxParameters.initProcessEnabled == true
         and .taskDefinition.containerDefinitions[1].essential == false
       ' >/dev/null; then
@@ -313,13 +342,33 @@ test_live_task_definition_gate() {
 }
 
 test_traefik_server_up_parser() {
-  local fixture
-  fixture="$(mktemp)"
+  local fixture_dir
+  fixture_dir="$(mktemp -d)"
+  local fixture="$fixture_dir/partial-a.prom"
+  local partial_b="$fixture_dir/partial-b.prom"
+  local complete="$fixture_dir/complete.prom"
+  local healthy="$fixture_dir/healthy.json"
   printf '%s\n' \
     '# TYPE traefik_service_server_up gauge' \
     'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 1' \
     'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 0' \
     >"$fixture"
+  printf '%s\n' \
+    '# TYPE traefik_service_server_up gauge' \
+    'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 0' \
+    'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 1' \
+    >"$partial_b"
+  printf '%s\n' \
+    '# TYPE traefik_service_server_up gauge' \
+    'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 1' \
+    'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 1' \
+    >"$complete"
+  jq -n '{
+    tasks: [
+      {task_id: "task-a", private_ipv4: "10.0.1.10"},
+      {task_id: "task-b", private_ipv4: "10.0.2.20"}
+    ]
+  }' >"$healthy"
 
   local result=0
   traefik_sample_has_healthy_backend "$fixture" || result=1
@@ -330,10 +379,17 @@ test_traefik_server_up_parser() {
   if traefik_sample_has_healthy_task "$fixture" 10.0.3.30; then
     result=1
   fi
-  rm -f "$fixture"
+  if traefik_sample_has_healthy_fleet "$fixture" "$healthy"; then
+    result=1
+  fi
+  if traefik_sample_has_healthy_fleet "$partial_b" "$healthy"; then
+    result=1
+  fi
+  traefik_sample_has_healthy_fleet "$complete" "$healthy" || result=1
+  rm -rf "$fixture_dir"
 
   if (( result != 0 )); then
-    echo "Traefik server-up parser accepted an unhealthy task or rejected a healthy opaque service" >&2
+    echo "Traefik server-up parser accepted partial fleet coverage or rejected a healthy opaque service" >&2
     return 1
   fi
 }
@@ -729,6 +785,19 @@ verify_staging_identity() {
       echo "The saved task-definition evidence retained sensitive fields or lost its required shape" >&2
       return 1
     }
+  jq -e '
+    .taskDefinition.cpu == "1024"
+    and .taskDefinition.memory == "2048"
+    and ([.taskDefinition.containerDefinitions[]
+      | select(
+          .name == "snaketron-server"
+          and .cpu == 1024
+          and .memory == 2048)]
+      | length) == 1
+  ' "$identity_dir/task-definition.json" >/dev/null || {
+    echo "Staging must use the certified one-vCPU, two-GiB task and server-container size" >&2
+    return 1
+  }
   staging_image_uri="$(jq -er '
     .taskDefinition.containerDefinitions[]
     | select(.name == "snaketron-server")
@@ -1271,7 +1340,8 @@ capture_ecs_health() {
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --tasks $task_arns >"$phase_dir/tasks.json"
-  local health_observed_at_ms=$(( $(date -u +%s) * 1000 ))
+  local health_observed_at_ms
+  health_observed_at_ms="$(unix_time_ms)"
   local first_health_observations="$phase_dir/healthy-first-observations.jsonl"
   [[ -f "$first_health_observations" ]] || : >"$first_health_observations"
   while IFS=$'\t' read -r task_id private_ipv4; do
@@ -1389,71 +1459,104 @@ wait_for_traefik_task_readiness() {
   mkdir -p "$readiness_dir"
   local observations="$readiness_dir/observations.jsonl"
   : >"$observations"
-  local deadline_ms
-  deadline_ms="$(jq -r '[.tasks[].healthy_observed_at_unix_ms] | max + 10000' \
-    "$healthy_observation")"
+  local expected_count
+  expected_count="$(jq -er '.tasks | length | select(. > 0)' "$healthy_observation")"
+  local fully_healthy_observed_at_ms
+  fully_healthy_observed_at_ms="$(jq -er \
+    '[.tasks[].healthy_observed_at_unix_ms] | max' "$healthy_observation")"
+  local polling_started_at_ms
+  polling_started_at_ms="$(unix_time_ms)"
+  # This is an operational bound for the staging probe, not a per-task
+  # readiness-transition SLA. User-visible readiness timing is certified by
+  # the admission load; this probe only decides when fleet capacity may count.
+  local deadline=$((SECONDS + 10))
   local sequence=0
 
   while true; do
     sequence=$((sequence + 1))
     local observed_at_ms
     local sample
+    local sample_name
+    local scrape_succeeded=false
+    local all_tasks_server_up=false
     printf -v sample '%s/%03d.prom' "$readiness_dir" "$sequence"
+    sample_name="$(basename "$sample")"
     if curl -fsS --max-time 2 "$staging_traefik_metrics_control_url" >"$sample"; then
-      observed_at_ms=$(( $(date -u +%s) * 1000 ))
-      while IFS=$'\t' read -r task_id private_ipv4 healthy_observed_at_ms; do
-        if grep -Fq "\"task_id\":\"$task_id\"" "$observations"; then
-          continue
-        fi
-        if traefik_sample_has_healthy_task "$sample" "$private_ipv4"; then
-          jq -cn \
-            --arg task_id "$task_id" \
-            --arg private_ipv4 "$private_ipv4" \
-            --argjson healthy_observed_at_unix_ms "$healthy_observed_at_ms" \
-            --argjson server_up_observed_at_unix_ms "$observed_at_ms" '
-              {
-                task_id: $task_id,
-                private_ipv4: $private_ipv4,
-                healthy_observed_at_unix_ms: $healthy_observed_at_unix_ms,
-                server_up_observed_at_unix_ms: $server_up_observed_at_unix_ms,
-                propagation_upper_bound_ms:
-                  ($server_up_observed_at_unix_ms - $healthy_observed_at_unix_ms)
-              }
-            ' >>"$observations"
-        fi
-      done < <(jq -r '
-        .tasks[]
-        | [.task_id, .private_ipv4, .healthy_observed_at_unix_ms]
-        | @tsv
-      ' "$healthy_observation")
+      observed_at_ms="$(unix_time_ms)"
+      scrape_succeeded=true
+      if traefik_sample_has_healthy_fleet "$sample" "$healthy_observation"; then
+        all_tasks_server_up=true
+      fi
     else
-      observed_at_ms=$(( $(date -u +%s) * 1000 ))
+      observed_at_ms="$(unix_time_ms)"
       mv "$sample" "$sample.error"
+      sample_name="${sample_name}.error"
     fi
+    jq -cn \
+      --arg sample_file "$sample_name" \
+      --argjson sequence "$sequence" \
+      --argjson observed_at_unix_ms "$observed_at_ms" \
+      --argjson scrape_succeeded "$scrape_succeeded" \
+      --argjson expected_task_count "$expected_count" \
+      --argjson all_tasks_server_up "$all_tasks_server_up" '
+        {
+          sequence: $sequence,
+          observed_at_unix_ms: $observed_at_unix_ms,
+          sample_file: $sample_file,
+          scrape_succeeded: $scrape_succeeded,
+          expected_task_count: $expected_task_count,
+          all_tasks_server_up: $all_tasks_server_up
+        }
+      ' >>"$observations"
 
-    local observed_count
-    observed_count="$(wc -l <"$observations" | tr -d ' ')"
-    local expected_count
-    expected_count="$(jq -r '.tasks | length' "$healthy_observation")"
-    if [[ "$observed_count" == "$expected_count" ]]; then
+    # Capacity counts only when one fresh scrape sees the complete fleet at
+    # once. Accumulating per-task observations across scrapes could certify a
+    # fleet that was never simultaneously routable.
+    if [[ "$all_tasks_server_up" == true ]]; then
       break
     fi
-    if (( observed_at_ms >= deadline_ms )); then
+    if (( SECONDS >= deadline )); then
       break
     fi
     sleep 2
   done
 
-  jq -s '{tasks: .}' "$observations" >"$readiness_dir/summary.json"
-  jq -e \
+  local polling_finished_at_ms
+  polling_finished_at_ms="$(unix_time_ms)"
+  jq -s \
+    --argjson fully_healthy_observed_at_unix_ms "$fully_healthy_observed_at_ms" \
+    --argjson polling_started_at_unix_ms "$polling_started_at_ms" \
+    --argjson polling_finished_at_unix_ms "$polling_finished_at_ms" \
     --slurpfile healthy "$healthy_observation" '
-      ([.tasks[].task_id] | unique | sort)
-        == ([$healthy[0].tasks[].task_id] | unique | sort)
-      and all(.tasks[];
-        .propagation_upper_bound_ms >= 0
-        and .propagation_upper_bound_ms <= 10000)
+      . as $observations
+      | ([$observations[] | select(.all_tasks_server_up)] | first // null)
+        as $ready_sample
+      | {
+          schema_version: 1,
+          fully_healthy_observed_at_unix_ms:
+            $fully_healthy_observed_at_unix_ms,
+          polling_started_at_unix_ms: $polling_started_at_unix_ms,
+          polling_finished_at_unix_ms: $polling_finished_at_unix_ms,
+          all_tasks_server_up_observed_at_unix_ms:
+            ($ready_sample.observed_at_unix_ms // null),
+          ready_sample_file: ($ready_sample.sample_file // null),
+          expected_tasks: $healthy[0].tasks,
+          ready_sample: $ready_sample,
+          observations: $observations
+        }
+    ' "$observations" >"$readiness_dir/summary.json"
+  jq -e \
+    --argjson expected_count "$expected_count" '
+      .ready_sample != null
+      and .ready_sample.scrape_succeeded
+      and .ready_sample.all_tasks_server_up
+      and .ready_sample.expected_task_count == $expected_count
+      and (.expected_tasks | length) == $expected_count
+      and .ready_sample_file == .ready_sample.sample_file
+      and .all_tasks_server_up_observed_at_unix_ms
+        == .ready_sample.observed_at_unix_ms
     ' "$readiness_dir/summary.json" >/dev/null || {
-      echo "Traefik did not expose every healthy $label task as server_up within ten seconds" >&2
+      echo "Traefik did not expose every healthy $label task simultaneously as server_up during bounded readiness polling" >&2
       return 1
     }
 }
@@ -1720,7 +1823,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 271' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 327' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2574,7 +2677,7 @@ run_staging_suite() {
   start_ecs_runtime_monitor "$report_dir"
   # Keep the one-task continuity/staircase load separate from the supported
   # 272-session capacity load. Target-tracking latency must never leave the
-  # complete capacity envelope on the initial 0.5-vCPU task.
+  # complete capacity envelope on the initial one-vCPU task.
   require_runner_running() {
     local label="$1"
     local pid="$2"
@@ -2859,7 +2962,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 40@20m \
+    --stages 96@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -2871,12 +2974,11 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${continuity_command[@]}" &
   load_pid=$!
-  # Forty sessions retain active games on every partition while leaving the
-  # one-task command path below the latency instability observed at 48. They
-  # must still trigger the configured CPU/memory policy naturally; failure to
-  # trigger is a certification failure, not permission to use the full
-  # capacity envelope as the calibration.
-  wait_for_region_socket_floor automatic-scale-out-baseline 40
+  # Ninety-six sessions retain active games on every partition and drive the
+  # one-vCPU minimum task above its target-tracking threshold. They must still
+  # trigger the configured CPU/memory policy naturally; failure to trigger is
+  # a certification failure, not permission to force the transition.
+  wait_for_region_socket_floor automatic-scale-out-baseline 96
   automatic_scale_out_baseline_started_ms="$(unix_time_ms)"
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
@@ -2970,6 +3072,15 @@ run_staging_suite() {
   require_load_running
   local scale_out_started_ms
   scale_out_started_ms="$(unix_time_ms)"
+  jq -n \
+    --argjson started_at_unix_ms "$scale_out_started_ms" '
+      {
+        status: "in_progress",
+        started_at_unix_ms: $started_at_unix_ms,
+        finished_at_unix_ms: null,
+        duration_ms: null
+      }
+    ' >"$report_dir/scale-out-window.json"
   retry_command 5 aws ecs update-service \
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
@@ -2985,6 +3096,7 @@ run_staging_suite() {
     --argjson started_at_unix_ms "$scale_out_started_ms" \
     --argjson finished_at_unix_ms "$scale_out_finished_ms" \
     '{
+      status: "completed",
       started_at_unix_ms: $started_at_unix_ms,
       finished_at_unix_ms: $finished_at_unix_ms,
       duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
@@ -3074,7 +3186,8 @@ run_staging_suite() {
   # without putting the full game-command envelope on one task.
   # The public count is a heartbeat-delayed raw WebSocket count. It proves the
   # candidate sockets exist; the finished admission report proves auth/readiness.
-  wait_for_region_socket_floor pre-admission 63
+  # Run A now carries 96 game sockets plus the 23 context probes.
+  wait_for_region_socket_floor pre-admission 119
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -3091,7 +3204,10 @@ run_staging_suite() {
     --run-id "$admission_run_id" \
     --report-dir "$report_dir" &
   admission_population_pid=$!
-  wait_for_region_socket_floor admission-seed 75 "$admission_population_pid"
+  # Wait for three complete four-session admission waves beyond that baseline
+  # before starting scale-in, so the first measured wave is real rather than a
+  # stale count inherited from the fixed populations.
+  wait_for_region_socket_floor admission-seed 131 "$admission_population_pid"
   local scale_in_started_ms
   scale_in_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
@@ -3160,12 +3276,12 @@ run_staging_suite() {
       . as $report
       | .schema_version >= 10
       and .metadata.threshold_result == "passed"
-      and .configured_max_concurrency == 40
+      and .configured_max_concurrency == 96
       and .metadata.mode == "duel"
       and .metadata.command_profile == "every-tick"
       and .metadata.spawn_rate_per_second == "4"
-      and .session_counts.peak_authenticated_concurrency == 40
-      and .session_counts.peak_active_game_concurrency >= 20
+      and .session_counts.peak_authenticated_concurrency == 96
+      and .session_counts.peak_active_game_concurrency >= 48
       and .session_counts.failed == 0
       and .session_counts.cancelled == 0
       and .session_counts.incomplete == 0
@@ -3428,9 +3544,9 @@ run_staging_suite() {
         lobby_task_counts: counts($lobby),
         matchmaking_task_counts: counts($matchmaking),
         transition: {
-          configured_game_websockets: 40,
+          configured_game_websockets: 96,
           companion_websockets: 23,
-          configured_total_websockets: 63,
+          configured_total_websockets: 119,
           observed_game_websockets: ([$game_counts[]] | add // 0),
           observed_total_websockets:
             (([$game_counts[]] | add // 0)
@@ -3454,11 +3570,11 @@ run_staging_suite() {
     and (.idle_task_boot_ids | length) > 1
     and (.lobby_task_boot_ids | length) > 1
     and (.matchmaking_task_boot_ids | length) >= 1
-    and .transition.configured_game_websockets == 40
+    and .transition.configured_game_websockets == 96
     and .transition.companion_websockets == 23
-    and .transition.configured_total_websockets == 63
-    and .transition.observed_game_websockets == 40
-    and .transition.observed_total_websockets == 63
+    and .transition.configured_total_websockets == 119
+    and .transition.observed_game_websockets == 96
+    and .transition.observed_total_websockets == 119
   ' "$report_dir/population-distribution.json" >/dev/null || {
     echo "Exact TaskBootId transition WebSocket/event-forwarding distribution was not proven" >&2
     exit 1

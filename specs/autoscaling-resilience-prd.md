@@ -303,6 +303,13 @@ The assignment coordinator is control plane only. Existing assignments and activ
 9. Completed games must have explicit cleanup after their durable completion grace period.
 10. If replacement occurs after the documented recovery retention, the game must produce an explicit unrecoverable outcome. It must not silently fabricate or restart state.
 11. Checkpoint size and write volume must be measured under `1 -> 10 -> 1` load. Delta encoding is considered only if those measurements show a real capacity problem.
+12. A replica snapshot request must not perform an extra checkpoint inline or block
+    the partition command reader behind a full-game fan-out. Each game actor
+    records an idempotent pending-snapshot flag, acknowledges the request
+    locally, and publishes at most one requested snapshot immediately after its
+    next existing periodic checkpoint. Concurrent gateway warm-up requests
+    therefore coalesce without weakening subscribe-before-request ordering.
+    Successor activation still publishes its immediate recovery re-anchor.
 
 ### R7 — Planned partition handoff and task shutdown
 
@@ -423,7 +430,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - CPU target: 70%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
-2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses a fixed one-task-safe continuity cohort; it must not force the complete capacity envelope onto one task.
+2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses a fixed one-task-safe continuity cohort; it must not force the complete capacity envelope onto one task. The minimum application task is one vCPU and two GiB, the smallest valid Fargate memory pairing for one vCPU; target tracking cannot protect a half-vCPU one-task floor from a sub-minute admission or takeover burst.
 3. The autoscaler must never select zero desired tasks.
 4. Validate `1 -> 10 -> 1` with active games, lobbies, matchmaking, idle sockets, continuously submitted commands, and four new admissions per second. Separately hold the 256-session/128-duel capacity envelope only after ten tasks are healthy and ready.
 5. No custom game-specific autoscaling metric is added in this phase.
@@ -628,7 +635,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 40-session `every-tick` continuity calibration from one task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger is a failed certification, not permission to increase the calibration into an unsafe one-task envelope. The earlier 64- and 48-session calibrations were removed after live evidence showed they were not one-task-safe. |
+| Run the fixed 96-session / 48-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition or weaken the budget. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub uses a connection pool isolated from authoritative commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
@@ -754,7 +761,16 @@ local-readiness-to-route timing run is required. Those either duplicate the two
 evidence paths above, test an accepted unavailable dependency, or add telemetry
 without strengthening the user-visible guarantee.
 
-Neither external result has a passing report attached. The first public planned-path attempt exposed fixed-node Valkey saturation and handoff defects and therefore does not count. The release remains blocked until both Serverless-backed runs pass.
+Neither external result has a passing report attached. The fixed-node attempt
+exposed cache saturation and handoff defects. The first Serverless-backed
+planned attempt ([GitHub Actions 29990657012](https://github.com/lopatin/snaketron-io/actions/runs/29990657012))
+proved Valkey 8.1 provisioning, TLS/Cluster connectivity, zero cache throttling,
+zero eviction, and cleanup, but failed the one-second command budget after
+exposing both one-task saturation and concurrent task warm-up amplification of
+full-game snapshot/checkpoint work. It also exposed an invalid sequential
+Traefik timing calculation. Both
+attempts are diagnostic evidence, not release evidence. The release remains
+blocked until fresh planned and crash runs both pass end to end.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

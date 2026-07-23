@@ -103,8 +103,10 @@ DynamicScalingInSuspended=false,DynamicScalingOutSuspended=false,ScheduledScalin
 
 Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
-Both retain a minimum of one. CPU 70%, memory 80%, and both 60-second cooldowns
-remain unchanged.
+Both retain a minimum of one. The application task uses one vCPU and two GiB so
+the one-task floor has takeover and burst headroom while target tracking is
+still observing load. CPU 70%, memory 80%, and both 60-second cooldowns remain
+unchanged.
 
 ## Routine deployments
 
@@ -172,19 +174,21 @@ evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
 settled in membership, assignment, and partition leases. It never runs on the
 one-task baseline.
 
-Continuity Run A is a separate fixed 40-session `every-tick` run. It must first
+Continuity Run A is a separate fixed 96-session / 48-duel `every-tick` run on the
+one-vCPU minimum task. It must first
 cause CPU or memory target tracking to add capacity; if it does not, the run
 writes are not accepted as a substitute. The pre-movement one-task baseline
 must itself keep every command outcome within one second; this explicitly
 prevents autoscaling from hiding an already-overloaded starting task. The
-earlier 48-session calibration was removed after live evidence showed that it
-violated this baseline. Policy writes are then suspended while Run A proves the
+calibration fails rather than being raised, forced, or accepted if either the
+policy trigger or that latency budget is missed. Policy writes are then
+suspended while Run A proves the
 direct `1 -> 10 -> 1` ownership staircase. At ten tasks the runner adds 10 idle,
 10 lobby, and three
 deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
 starts a 208-session idle ramp at four sessions per second. This keeps new-user
 admission continuous through the 45-second drain deadline while leaving only
-40 command-bearing game sockets on the final task. Run A must prove no active
+96 command-bearing game sockets on the final task. Run A must prove no active
 socket hard reconnect, zero measured usable-session gap, terminal command
 outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
 nine partition moves in each direction. No game completion is awaited before
@@ -248,10 +252,14 @@ results for:
   one logical outcome per command, and restored healthy ECS capacity.
 
 Neither the planned staging run nor the non-production task-SIGKILL result has
-a passing report attached in this repository. The first public planned-path run
-failed and motivated the Serverless migration; it is diagnostic evidence, not
-release evidence. The release remains blocked until both Serverless-backed runs
-pass. Local success alone is not evidence of ECS routing and autoscaling behavior.
+a passing report attached in this repository. The first Serverless-backed
+planned run, GitHub Actions `29990657012`, provisioned and exercised Valkey 8.1
+without cache throttling or eviction and cleaned up successfully, but exposed
+one-task saturation plus concurrent snapshot/checkpoint amplification and
+exceeded the one-second command budget.
+It is diagnostic evidence, not release evidence. The release remains blocked
+until fresh planned and crash runs pass. Local success alone is not evidence of
+ECS routing and autoscaling behavior.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
@@ -407,5 +415,5 @@ with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
 command, or failure to corroborate the measured
-phase envelopes (at least 271 simultaneous sockets during transition/admission
+phase envelopes (at least 327 simultaneous sockets during transition/admission
 and 272 game sessions during capacity).

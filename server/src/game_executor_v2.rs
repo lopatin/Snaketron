@@ -449,6 +449,7 @@ struct GameActor {
     command_cursor: String,
     next_event_stream_sequence: u64,
     pending_stream_ids: Vec<String>,
+    snapshot_requested: bool,
     live: bool,
     start_event_pending: bool,
     completion_committed: bool,
@@ -566,6 +567,7 @@ impl GameActor {
             command_cursor: envelope.command_cursor,
             next_event_stream_sequence: envelope.next_event_stream_sequence,
             pending_stream_ids: Vec::new(),
+            snapshot_requested: false,
             live: false,
             start_event_pending,
             completion_committed: false,
@@ -610,7 +612,7 @@ impl GameActor {
                     tokio::select! {
                         biased;
                         _ = handoff.cancelled() => handoff_requested = true,
-                        result = self.checkpoint() => result?,
+                        result = self.checkpoint_and_publish_requested_snapshot() => result?,
                     }
                 }
                 _ = tick.tick(), if self.live && !handoff_requested => {
@@ -645,17 +647,17 @@ impl GameActor {
                             let _ = reply.send(result);
                         }
                         GameActorMessage::Snapshot { reply } => {
-                            let handoff = self.completion_cancel.clone();
-                            let result = tokio::select! {
-                                biased;
-                                _ = handoff.cancelled() => {
-                                    handoff_requested = true;
-                                    Ok(())
-                                }
-                                result = self.publish_fresh_snapshot() => result,
-                            };
-                            if result.is_err() { self.fatal.cancel(); }
-                            let _ = reply.send(result);
+                            // Snapshot requests are hints for the next ordinary
+                            // checkpoint, not synchronous checkpoint work. A
+                            // single bit coalesces any number of replica joins
+                            // while the immediate reply lets the partition
+                            // executor resume command delivery.
+                            if self.completion_cancel.is_cancelled() {
+                                handoff_requested = true;
+                            } else {
+                                self.request_snapshot();
+                            }
+                            let _ = reply.send(Ok(()));
                         }
                         GameActorMessage::Barrier { reply } => {
                             self.live = false;
@@ -1043,6 +1045,29 @@ impl GameActor {
                 }
             }
         }
+    }
+
+    fn request_snapshot(&mut self) {
+        self.snapshot_requested = true;
+    }
+
+    async fn checkpoint_and_publish_requested_snapshot(&mut self) -> Result<()> {
+        self.checkpoint().await?;
+        if !self.snapshot_requested {
+            return Ok(());
+        }
+
+        // The completion transaction is the sole terminal publication path.
+        // A terminal actor will either commit that snapshot or stop; there is
+        // no ordinary snapshot for this request to publish.
+        if !self.engine.get_committed_state().is_complete() {
+            self.publish_event(GameEvent::Snapshot {
+                game_state: self.engine.get_committed_state().clone(),
+            })
+            .await?;
+        }
+        self.snapshot_requested = false;
+        Ok(())
     }
 
     async fn activate(&mut self) -> Result<()> {
@@ -3017,6 +3042,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn periodic_checkpoint_coalesces_snapshot_requests() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("coalesced-snapshot-request").await?;
+            let mut actor = harness.actor(harness.recovery().await?, harness.guard.clone());
+            actor.live = true;
+
+            actor.request_snapshot();
+            actor.request_snapshot();
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+
+            let snapshot_count = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| matches!(message.event, GameEvent::Snapshot { .. }))
+                .count();
+            assert_eq!(
+                snapshot_count, 1,
+                "multiple pending requests must publish one snapshot"
+            );
+            assert!(!actor.snapshot_requested);
+
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+            let snapshot_count = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| matches!(message.event, GameEvent::Snapshot { .. }))
+                .count();
+            assert_eq!(
+                snapshot_count, 1,
+                "a later checkpoint without a request must not publish again"
+            );
+
+            harness.cleanup(&actor.guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_requested_after_checkpoint_publishes_on_following_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("post-checkpoint-snapshot-request").await?;
+            let mut actor = harness.actor(harness.recovery().await?, harness.guard.clone());
+            actor.live = true;
+
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+            assert!(
+                read_game_events(&mut harness.raw, harness.partition)
+                    .await?
+                    .is_empty(),
+                "a checkpoint without a request must not publish a snapshot"
+            );
+
+            actor.request_snapshot();
+            assert!(
+                read_game_events(&mut harness.raw, harness.partition)
+                    .await?
+                    .is_empty(),
+                "recording a request must not publish outside a checkpoint"
+            );
+
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+            let snapshots: Vec<_> = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| matches!(message.event, GameEvent::Snapshot { .. }))
+                .collect();
+            assert_eq!(
+                snapshots.len(),
+                1,
+                "the checkpoint following the request must publish one snapshot"
+            );
+            assert!(!actor.snapshot_requested);
+
+            harness.cleanup(&actor.guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn command_crash_boundaries_recover_one_logical_result() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(30), async {
             // Kill after XADD but before group delivery: the successor reads
@@ -3897,49 +4005,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assignment_move_preempts_inflight_snapshot_checkpoint() -> Result<()> {
+    async fn snapshot_requests_acknowledge_without_entering_checkpoint() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
-            let mut harness = CrashBoundaryHarness::new("snapshot-checkpoint-handoff").await?;
+            let mut harness = CrashBoundaryHarness::new("snapshot-request-ack").await?;
             harness.defer_game_start().await?;
-            let mut events = harness
-                .bus
-                .subscribe_to_partition(harness.partition)
-                .await?;
-            let (_executor, task) = spawn_game_executor_v2(
+            let baseline = harness.recovery().await?;
+            let (sender, receiver) = mpsc::channel(4);
+            let fatal = harness.token.child_token();
+            let completion_cancel = fatal.child_token();
+            let mut actor = GameActor::from_envelope(
                 2,
-                harness.guard.clone(),
-                harness.leases.clone(),
+                baseline,
                 harness.bus.clone(),
+                harness.guard.clone(),
                 Arc::new(UnusedDatabase::default()),
                 RecoveryConfig {
                     checkpoint_interval: Duration::from_secs(60),
                     ..RecoveryConfig::default()
                 },
-                CancellationToken::new(),
+                receiver,
+                fatal.clone(),
+                completion_cancel,
             );
-            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+            actor.live = true;
 
             let (checkpoint_entered, _never_release_checkpoint) =
                 harness.bus.gate_next_checkpoint();
-            harness
-                .bus
-                .request_partition_snapshots(harness.partition)
-                .await?;
-            tokio::time::timeout(Duration::from_secs(2), checkpoint_entered.notified())
+            let task = tokio::spawn(async move { actor.run().await });
+
+            for _ in 0..2 {
+                let (reply, result) = oneshot::channel();
+                sender
+                    .send(GameActorMessage::Snapshot { reply })
+                    .await
+                    .context("test actor stopped before snapshot request")?;
+                tokio::time::timeout(Duration::from_secs(1), result)
+                    .await
+                    .context("snapshot request was not acknowledged immediately")???;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), checkpoint_entered.notified())
+                    .await
+                    .is_err(),
+                "snapshot request entered the checkpoint path"
+            );
+
+            fatal.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
                 .await
-                .context("snapshot checkpoint did not enter the deterministic gate")?;
+                .context("test actor did not stop after cancellation")?
+                .context("test actor task panicked")??;
 
-            let successor = BootIdentity::new();
-            harness.move_partition_to(&successor).await?;
-            let successor_guard = harness
-                .await_handoff_and_acquire(
-                    task,
-                    &successor,
-                    "assignment handoff waited on in-flight snapshot fan-out",
-                )
-                .await?;
-
-            harness.cleanup(&successor_guard).await?;
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
             Result::<()>::Ok(())
         })
         .await??;
