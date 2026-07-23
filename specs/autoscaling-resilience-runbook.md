@@ -503,6 +503,11 @@ stack's VPC, then imports it read-only. Development owns only its separately
 tagged security groups, Serverless cache, ECS resources, Traefik/EIP, and
 run-unique DNS record; cleanup must prove the shared VPC still exists and must
 never create, replace, or delete its routes, endpoints, or flow logs.
+Each run-unique public host can consume one new certificate, so the workflow
+fails closed after 30 attempts in a rolling seven-day window. This preserves
+20 issuance opportunities against Let's Encrypt's current 50-certificate
+registered-domain allowance; it is a conservative workflow budget, not proof
+of the domain's live CA quota.
 
 At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
