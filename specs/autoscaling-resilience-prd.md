@@ -1195,6 +1195,43 @@ targets; the imported production VPC remained untouched. This run is diagnostic
 evidence only. A fresh complete planned run and a separate authorized SIGKILL
 run are both still pending and required for release certification.
 
+Exact-source Serverless run
+([GitHub Actions 30078864960](https://github.com/lopatin/snaketron-io/actions/runs/30078864960),
+outer commit `949bda23dc6d40de4117649c95a247b3361005f0`, Snaketron commit
+`26d96f553977c9538b8e85c90d710855f2c0cad7`) reached the fixed
+224-session / 112-duel Gate A and naturally scaled `1 -> 2`. The successor
+recovered 54 active games and replayed 499 commands while taking five
+partitions. All 2,882 sessions, 1,441 games, and 2,550,557 commands completed
+with terminal outcomes, all ten partitions remained productive, and no client
+disconnected, reconnected, or measured a usable-session gap. Serverless Valkey
+reported zero throttling and eviction.
+
+The unchanged one-second latency gate nevertheless failed: 11 of 323 complete
+baseline seconds exceeded one second with a 1,501-millisecond maximum, and five
+of 45 movement seconds exceeded it with a 1,951-millisecond maximum. The
+best-effort regional metrics reporter fetched and deserialized roughly 25--27
+MB of full recovery envelopes every 15 seconds on the one-vCPU task. Individual
+scans lasted up to about 1.9 seconds and aligned with the latency bursts. The
+evidence implicates telemetry interference; it does not show lost command
+state, ownership instability, or Serverless capacity exhaustion. The fresh
+unchanged-load rerun must confirm the causal correction.
+
+The minimum correction changes no authority or storage protocol. The reporter
+uses same-key `STRLEN` plus bounded header and tail `GETRANGE` reads to retain
+exact checkpoint size, index identity, schema/protocol, and checkpoint-age
+signals while cutting the worst observed sample payload by more than 400
+times. `ActiveGameIndexMismatches` therefore measures bounded checkpoint
+framing and index parity, not arbitrary corruption in the JSON middle;
+authoritative takeover continues to deserialize and validate the complete
+envelope. Do not add another metadata key, checksum, cache, pool, or timeout
+solely to preserve full-body validation in best-effort telemetry.
+
+The run's cleanup and an independent absence audit passed. No active
+development resource remained, production stack timestamps and resource
+identity were unchanged, and production stayed healthy. The run remains
+diagnostic evidence only. Fresh complete planned and SIGKILL runs are still
+required, with the fixed cohort and all acceptance thresholds unchanged.
+
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
 ## 19. Definition of done

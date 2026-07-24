@@ -80,29 +80,156 @@ traefik_sample_has_healthy_fleet() {
   (( observed_count == expected_count ))
 }
 
-command_outcomes_meet_window_budget() {
+command_outcome_window_diagnostics() {
   local summary="$1"
   local window="$2"
   local max_latency_ms="${3:-1000}"
-  jq -e \
+  local required_partition_count="${4:-0}"
+  jq \
     --argjson max_latency_ms "$max_latency_ms" \
+    --argjson required_partition_count "$required_partition_count" \
     --slurpfile window "$window" '
       . as $report
       | (($window[0].started_at_unix_ms / 1000) | ceil) as $first_second
       | (($window[0].finished_at_unix_ms / 1000) | floor) as $after_last_second
-      | ($after_last_second - $first_second) >= 1
-        and all(range($first_second; $after_last_second);
-          . as $second
-          | ($report.metrics.command_counts_by_unix_second
-              [($second | tostring)] // 0) as $sent
-          | $sent > 0
-            and ($report.metrics.command_outcome_counts_by_sent_unix_second
-              [($second | tostring)] // 0) == $sent
-            and ($report.metrics.command_outcome_max_latency_ms_by_sent_unix_second
-              [($second | tostring)] // ($max_latency_ms + 1)) <= $max_latency_ms
-            and ($report.metrics.scheduled_command_counts_by_sent_unix_second
-              [($second | tostring)] // 0) > 0)
-    ' "$summary" >/dev/null
+      | [range($first_second; $after_last_second) as $second
+          | ($second | tostring) as $second_key
+          | ($report.metrics.command_counts_by_unix_second[$second_key] // 0)
+            as $sent
+          | ($report.metrics.command_outcome_counts_by_sent_unix_second
+              [$second_key] // 0) as $outcomes
+          | ($report.metrics.command_outcome_max_latency_ms_by_sent_unix_second
+              [$second_key] // ($max_latency_ms + 1)) as $outcome_max_latency_ms
+          | ($report.metrics.scheduled_command_counts_by_sent_unix_second
+              [$second_key] // 0) as $scheduled
+          | [range(0; $required_partition_count) as $partition
+              | select(
+                  ($report.metrics
+                    .scheduled_command_counts_by_partition_and_unix_second
+                    [($partition | tostring)][$second_key] // 0) <= 0)
+              | $partition] as $missing_partitions
+          | {
+              unix_second: $second,
+              sent: $sent,
+              outcomes: $outcomes,
+              outcome_max_latency_ms: $outcome_max_latency_ms,
+              scheduled: $scheduled,
+              missing_partitions: $missing_partitions
+            }
+          | select(
+              .sent <= 0
+              or .outcomes != .sent
+              or .outcome_max_latency_ms > $max_latency_ms
+              or .scheduled <= 0
+              or (.missing_partitions | length) > 0)
+        ] as $failed_seconds
+      | {
+          max_latency_ms: $max_latency_ms,
+          required_partition_count: $required_partition_count,
+          first_full_second: $first_second,
+          after_last_full_second: $after_last_second,
+          full_second_count: ($after_last_second - $first_second),
+          failed_seconds: $failed_seconds,
+          passed:
+            (($after_last_second - $first_second) >= 1
+              and ($failed_seconds | length) == 0)
+        }
+    ' "$summary"
+}
+
+command_outcomes_meet_window_budget() {
+  command_outcome_window_diagnostics "$@" | jq -e '.passed' >/dev/null
+}
+
+write_gate_a_acceptance_report() {
+  local summary="$1"
+  local baseline_diagnostics="$2"
+  local movement_diagnostics="$3"
+  local zero_load_summary="$4"
+  local runner_exit_status="$5"
+  local output="$6"
+  jq -n \
+    --argjson runner_exit_status "$runner_exit_status" \
+    --slurpfile summary "$summary" \
+    --slurpfile baseline "$baseline_diagnostics" \
+    --slurpfile movement "$movement_diagnostics" \
+    --slurpfile zero_load "$zero_load_summary" '
+      ($summary[0] // {}) as $report
+      | {
+          configuration:
+            (($report.schema_version // 0) >= 10
+              and ($report.metadata.threshold_result // null) == "passed"
+              and ($report.configured_max_concurrency // 0) == 224
+              and ($report.metadata.mode // null) == "duel"
+              and ($report.metadata.command_profile // null) == "every-tick"
+              and ($report.metadata.spawn_rate_per_second // null) == "4"),
+          population_completion:
+            (($report.session_counts.peak_authenticated_concurrency // 0) == 224
+              and ($report.session_counts.peak_active_game_concurrency // 0) >= 112
+              and ($report.session_counts.failed // -1) == 0
+              and ($report.session_counts.cancelled // -1) == 0
+              and ($report.session_counts.incomplete // -1) == 0
+              and ($report.session_counts.completed // -1)
+                == ($report.session_counts.total // -2)
+              and all(($report.sessions // [])[];
+                .outcome == "completed" and .failure_phase == null)
+              and ($report.games.pairing_violations // -1) == 0
+              and (($report.ramp_stages // []) | length) == 1
+              and ($report.ramp_stages[0].target_reached // false)),
+          websocket_continuity:
+            (($report.metrics.traffic.disconnects // -1) == 0
+              and ($report.metrics.traffic.reconnects // -1) == 0
+              and ($report.metrics.usable_session_gap_ms.max_ms // 0) == 0),
+          command_accounting_and_partitions:
+            (([($report.metrics.command_counts_by_unix_second // {})[]] | add)
+              == ($report.metrics.traffic.commands_sent // -1)
+              and ([($report.metrics
+                  .command_outcome_counts_by_sent_unix_second // {})[]] | add)
+                == ($report.metrics.traffic.commands_sent // -1)
+              and (($report.metrics
+                .scheduled_command_counts_by_partition_and_unix_second // {})
+                | length) == 10)
+        } as $outcomes
+      | (($report.missing // false) | not) as $summary_available
+      | {
+          schema_version: 1,
+          gate: "natural-scale-out",
+          runner: {
+            exit_status: $runner_exit_status,
+            passed: ($runner_exit_status == 0)
+          },
+          envelope: {
+            summary_available: $summary_available,
+            passed: ($summary_available and ([$outcomes[]] | all)),
+            outcomes: $outcomes,
+            observed: {
+              configured_max_concurrency:
+                ($report.configured_max_concurrency // null),
+              peak_authenticated_concurrency:
+                ($report.session_counts.peak_authenticated_concurrency // null),
+              peak_active_game_concurrency:
+                ($report.session_counts.peak_active_game_concurrency // null),
+              sessions_total: ($report.session_counts.total // null),
+              sessions_completed: ($report.session_counts.completed // null),
+              commands_sent: ($report.metrics.traffic.commands_sent // null)
+            }
+          },
+          zero_load: {
+            passed: ($zero_load[0].passed // false),
+            sample_count: (($zero_load[0].samples // []) | length),
+            final_sample: (($zero_load[0].samples // []) | last // null)
+          },
+          baseline: ($baseline[0] // {passed: false}),
+          movement: ($movement[0] // {passed: false})
+        }
+      | .passed = (
+          .runner.passed
+          and .envelope.passed
+          and .zero_load.passed
+          and .baseline.passed
+          and .movement.passed
+        )
+    ' >"$output"
 }
 
 sanitize_task_definition_evidence() {
@@ -401,9 +528,34 @@ test_command_outcome_window_gate() {
   local window="$fixture_dir/window.json"
   local invalid="$fixture_dir/invalid.json"
   jq -n '{
+    schema_version: 10,
+    configured_max_concurrency: 224,
+    metadata: {
+      threshold_result: "passed",
+      mode: "duel",
+      command_profile: "every-tick",
+      spawn_rate_per_second: "4"
+    },
+    session_counts: {
+      total: 1,
+      completed: 1,
+      failed: 0,
+      cancelled: 0,
+      incomplete: 0,
+      peak_authenticated_concurrency: 224,
+      peak_active_game_concurrency: 112
+    },
+    sessions: [{outcome: "completed", failure_phase: null}],
+    games: {pairing_violations: 0},
+    ramp_stages: [{target_reached: true}],
     metrics: {
+      traffic: {disconnects: 0, reconnects: 0, commands_sent: 11},
+      usable_session_gap_ms: {max_ms: 0},
       command_counts_by_unix_second: {"10": 5, "11": 6},
       scheduled_command_counts_by_sent_unix_second: {"10": 4, "11": 5},
+      scheduled_command_counts_by_partition_and_unix_second:
+        (reduce range(0; 10) as $partition
+          ({}; .[($partition | tostring)] = {"10": 1, "11": 1})),
       command_outcome_counts_by_sent_unix_second: {"10": 5, "11": 6},
       command_outcome_max_latency_ms_by_sent_unix_second: {"10": 999, "11": 1000}
     }
@@ -432,14 +584,91 @@ test_command_outcome_window_gate() {
   if command_outcomes_meet_window_budget "$invalid" "$window"; then
     result=1
   fi
+  jq 'del(
+    .metrics.scheduled_command_counts_by_partition_and_unix_second["1"]["11"]
+  )' "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window" 1000 2; then
+    result=1
+  fi
+  if ! command_outcome_window_diagnostics \
+    "$invalid" "$window" 1000 2 \
+    | jq -e '
+        .passed == false
+        and .full_second_count == 2
+        and (.failed_seconds | length) == 1
+        and .failed_seconds[0].unix_second == 11
+        and .failed_seconds[0].missing_partitions == [1]
+      ' >/dev/null; then
+    result=1
+  fi
   jq -n '{started_at_unix_ms: 8500, finished_at_unix_ms: 12000}' >"$invalid"
   if command_outcomes_meet_window_budget "$summary" "$invalid"; then
     result=1
   fi
+
+  # The baseline ends before the scaling activity's containing second. Keep
+  # that whole second in the movement gate so immediate disruption cannot hide
+  # inside a fractional control-plane timestamp.
+  jq -n '{started_at_unix_ms: 8500, finished_at_unix_ms: 10000}' >"$window"
+  command_outcome_window_diagnostics "$summary" "$window" 1000 0 \
+    | jq -e '
+        .first_full_second == 9
+        and .after_last_full_second == 10
+      ' >/dev/null || result=1
+  jq -n '{started_at_unix_ms: 10000, finished_at_unix_ms: 12000}' >"$window"
+  command_outcome_window_diagnostics "$summary" "$window" 1000 0 \
+    | jq -e '
+        .first_full_second == 10
+        and .after_last_full_second == 12
+      ' >/dev/null || result=1
+
+  local baseline="$fixture_dir/baseline.json"
+  local movement="$fixture_dir/movement.json"
+  local zero_load="$fixture_dir/zero-load.json"
+  local output="$fixture_dir/gate-a-acceptance.json"
+  jq -n '{passed: true, failed_seconds: []}' >"$baseline"
+  jq -n '{passed: true, failed_seconds: []}' >"$movement"
+  jq -n '{
+    passed: true,
+    samples: [
+      {observed_at_unix_ms: 1, raw_websockets: 0, active_games: 0}
+    ]
+  }' >"$zero_load"
+
+  write_gate_a_acceptance_report \
+    "$summary" "$baseline" "$movement" "$zero_load" 0 "$output"
+  jq -e '
+    .passed
+    and .runner.passed
+    and .envelope.passed
+    and .zero_load.passed
+    and .baseline.passed
+    and .movement.passed
+  ' "$output" >/dev/null || result=1
+
+  jq '
+    .metrics.traffic.commands_sent = 0
+    | .metrics.command_counts_by_unix_second = {}
+    | .metrics.command_outcome_counts_by_sent_unix_second = {}
+  ' "$summary" >"$invalid"
+  write_gate_a_acceptance_report \
+    "$invalid" "$baseline" "$movement" "$zero_load" 0 "$output"
+  jq -e '
+    .passed == false
+    and .envelope.outcomes.command_accounting_and_partitions == false
+  ' "$output" >/dev/null || result=1
+
+  jq -n '{missing: true}' >"$invalid"
+  write_gate_a_acceptance_report \
+    "$invalid" "$baseline" "$movement" "$zero_load" 1 "$output"
+  jq -e '
+    .passed == false
+    and .envelope.summary_available == false
+  ' "$output" >/dev/null || result=1
   rm -rf "$fixture_dir"
 
   if (( result != 0 )); then
-    echo "Command-outcome window gate accepted a stall or rejected valid continuity" >&2
+    echo "Command-window or Gate A evidence contract failed" >&2
     return 1
   fi
 }
@@ -3011,8 +3240,9 @@ run_staging_suite() {
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
   # The load ramp is not itself an ownership transition. Start the strict
-  # continuity window at the first successful target-tracking action so every
-  # full second of the actual scale-out is required to carry command traffic.
+  # movement window at the whole second containing the first successful
+  # target-tracking action. Including that bucket is conservative: immediate
+  # disruption cannot hide in fractional control-plane timestamp precision.
   automatic_scale_out_started_ms="$(jq -er \
     --argjson started "$evidence_started_epoch" '
       def epoch:
@@ -3077,51 +3307,54 @@ run_staging_suite() {
   # they are not a capacity-valid destination load for the forced ten-to-one
   # handoff. Let the runner finish and prove that all of its sockets and games
   # are gone before resetting the service.
-  wait "$load_pid"
+  local natural_scale_out_exit_status=0
+  wait "$load_pid" || natural_scale_out_exit_status=$?
   load_pid=""
   local natural_scale_out_summary="$report_dir/$natural_scale_out_run_id/summary.json"
-  jq -e '
-    .schema_version >= 10
-    and .metadata.threshold_result == "passed"
-    and .configured_max_concurrency == 224
-    and .metadata.mode == "duel"
-    and .metadata.command_profile == "every-tick"
-    and .metadata.spawn_rate_per_second == "4"
-    and .session_counts.peak_authenticated_concurrency == 224
-    and .session_counts.peak_active_game_concurrency >= 112
-    and .session_counts.failed == 0
-    and .session_counts.cancelled == 0
-    and .session_counts.incomplete == 0
-    and .session_counts.completed == .session_counts.total
-    and all(.sessions[]; .outcome == "completed" and .failure_phase == null)
-    and .games.pairing_violations == 0
-    and (.ramp_stages | length) == 1
-    and .ramp_stages[0].target_reached
-    and .metrics.traffic.disconnects == 0
-    and .metrics.traffic.reconnects == 0
-    and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
-    and ([.metrics.command_counts_by_unix_second[]] | add)
-      == .metrics.traffic.commands_sent
-    and ([.metrics.command_outcome_counts_by_sent_unix_second[]] | add)
-      == .metrics.traffic.commands_sent
-    and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
-  ' "$natural_scale_out_summary" >/dev/null || {
-    echo "Natural scale-out load did not satisfy its fixed continuity envelope" >&2
+  # Cleanup evidence is independent of acceptance. Collect it before any
+  # fail-fast report assertion, including when the load runner itself failed
+  # after writing its report.
+  local natural_scale_out_zero_status
+  set +e
+  ( set -e; wait_for_zero_certification_load after-natural-scale-out )
+  natural_scale_out_zero_status=$?
+  set -e
+  local gate_a_baseline_diagnostics="$report_dir/gate-a-baseline-diagnostics.json"
+  local gate_a_movement_diagnostics="$report_dir/gate-a-movement-diagnostics.json"
+  local gate_a_summary="$natural_scale_out_summary"
+  if [[ -s "$natural_scale_out_summary" ]]; then
+    command_outcome_window_diagnostics \
+      "$gate_a_summary" \
+      "$report_dir/automatic-scale-out-baseline-window.json" \
+      1000 10 >"$gate_a_baseline_diagnostics"
+    command_outcome_window_diagnostics \
+      "$gate_a_summary" \
+      "$report_dir/automatic-scale-out-window.json" \
+      1000 10 >"$gate_a_movement_diagnostics"
+  else
+    gate_a_summary="$report_dir/gate-a-missing-load-summary.json"
+    jq -n '{missing: true}' >"$gate_a_summary"
+    jq -n '{
+      passed: false,
+      error: "load_summary_missing",
+      failed_seconds: []
+    }' >"$gate_a_baseline_diagnostics"
+    cp "$gate_a_baseline_diagnostics" "$gate_a_movement_diagnostics"
+  fi
+  write_gate_a_acceptance_report \
+    "$gate_a_summary" \
+    "$gate_a_baseline_diagnostics" \
+    "$gate_a_movement_diagnostics" \
+    "$report_dir/zero-load-after-natural-scale-out.json" \
+    "$natural_scale_out_exit_status" \
+    "$report_dir/gate-a-acceptance.json"
+  jq -e '.passed' "$report_dir/gate-a-acceptance.json" >/dev/null || {
+    echo "Natural scale-out Gate A acceptance failed; see gate-a-acceptance.json" >&2
+    if (( natural_scale_out_zero_status != 0 )); then
+      echo "Gate A cleanup also failed to reach zero sockets and games" >&2
+    fi
     exit 1
   }
-  command_outcomes_meet_window_budget \
-    "$natural_scale_out_summary" \
-    "$report_dir/automatic-scale-out-baseline-window.json" 1000 || {
-      echo "Command outcomes exceeded the natural scale-out baseline budget" >&2
-      exit 1
-    }
-  command_outcomes_meet_window_budget \
-    "$natural_scale_out_summary" \
-    "$report_dir/automatic-scale-out-window.json" 1000 || {
-      echo "Command outcomes exceeded the natural scale-out movement budget" >&2
-      exit 1
-    }
-  wait_for_zero_certification_load after-natural-scale-out
 
   # Automatic scale-out may have stopped at any count from two through ten.
   # Return without load to one healthy task, then start the independent

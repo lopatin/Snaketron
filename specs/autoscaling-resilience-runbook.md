@@ -580,6 +580,45 @@ imported production VPC remained untouched. Treat this run as diagnostic
 evidence only. Fresh complete planned and separately authorized SIGKILL runs
 are both required.
 
+Exact-source Serverless run
+[`30078864960`](https://github.com/lopatin/snaketron-io/actions/runs/30078864960)
+used outer commit `949bda23dc6d40de4117649c95a247b3361005f0` and Snaketron
+commit `26d96f553977c9538b8e85c90d710855f2c0cad7`. Gate A reached its
+frozen 224-session / 112-duel envelope on one task, natural CPU target tracking
+moved `1 -> 2`, and the successor recovered 54 games and replayed 499 commands
+while taking partitions 5--9. All 2,882 sessions, 1,441 games, and 2,550,557
+commands completed with terminal outcomes; all ten partitions remained
+productive, with zero disconnects, reconnects, or measured usable-session gap.
+Serverless Valkey reported zero throttling and eviction.
+
+The run still failed the unchanged one-second command-outcome gate. Eleven of
+323 complete baseline seconds exceeded the limit, with a 1,501-millisecond
+maximum; five of 45 movement seconds exceeded it, with a 1,951-millisecond
+maximum. The regional metrics reporter was downloading and deserializing about
+25--27 MB of full recovery envelopes every 15 seconds on the one-vCPU task.
+Observed scans took up to about 1.9 seconds and aligned with the command
+latency bursts. The evidence implicates application telemetry competing with
+authoritative execution; it does not show command loss, failover failure, or
+Serverless throttling. The fresh unchanged-load rerun must confirm the causal
+correction.
+
+The bounded correction keeps the existing recovery format and persistence
+path. Metrics obtain exact checkpoint size with `STRLEN` and bounded header and
+tail slices with same-key `GETRANGE` commands, retaining index identity,
+schema/protocol, and exact checkpoint-age checks while reducing the worst
+observed sample payload by more than 400 times. The metric deliberately checks
+checkpoint framing and index parity rather than validating the full JSON body;
+authoritative recovery still deserializes and validates the complete envelope.
+Do not add another cache, metadata record, connection pool, or timeout for this
+diagnostic concern, and do not weaken the frozen load or latency gate.
+
+Cleanup for run `30078864960` succeeded. Independent inventory found no active
+development resource in CloudFormation, ECS, EC2, networking, Serverless
+Valkey, DynamoDB, ECR, Route 53, ACM, CloudWatch, Application Auto Scaling, or
+IAM. Production stack timestamps and resources remained unchanged and the
+production health endpoint stayed healthy. This run is diagnostic evidence;
+fresh complete planned and SIGKILL certification remain required.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 

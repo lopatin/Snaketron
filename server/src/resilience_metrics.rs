@@ -4,11 +4,13 @@
 //! best-effort loop and never changes liveness or lease state when CloudWatch,
 //! Valkey, or stdout is unavailable.
 
-use crate::cluster_membership::{ClusterNamespace, MembershipStore, TaskLifecycle};
+use crate::cluster_membership::{
+    ClusterNamespace, EXECUTOR_PROTOCOL_VERSION, MembershipStore, TaskLifecycle,
+};
 use crate::game_executor::PARTITION_COUNT;
 use crate::lifecycle::TaskLifecycle as LocalTaskLifecycle;
 use crate::partition_assignment::AssignmentStore;
-use crate::recovery::RecoveryEnvelopeV2;
+use crate::recovery::RECOVERY_SCHEMA_VERSION;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
@@ -24,6 +26,9 @@ use tracing::warn;
 const EMF_NAMESPACE: &str = "Snaketron/Resilience";
 const DEFAULT_EMIT_INTERVAL_SECS: u64 = 15;
 const OWNERSHIP_SAMPLE_INTERVAL_MS: i64 = 500;
+const RECOVERY_TAIL_SAMPLE_BYTES: i64 = 512;
+const CHECKPOINTED_AT_MARKER: &[u8] = b"\"checkpointed_at_ms\":";
+const SOURCE_LEASE_TOKEN_MARKER: &[u8] = b"\"source_lease_token\":\"";
 
 #[derive(Default)]
 struct Counters {
@@ -142,8 +147,35 @@ struct RegionalGauges {
     active_game_index_mismatches: u64,
 }
 
-/// Tracks lease-absence windows at control-loop resolution while the expensive
-/// regional metrics scan remains on its normal 15-second cadence. Without this
+fn expected_recovery_prefix(partition: u32, game_id: u32) -> String {
+    format!(
+        "{{\"schema_version\":{RECOVERY_SCHEMA_VERSION},\"executor_protocol_version\":{EXECUTOR_PROTOCOL_VERSION},\"game_id\":{game_id},\"partition_id\":{partition},"
+    )
+}
+
+fn checkpointed_at_ms_from_tail(tail: &[u8]) -> Option<i64> {
+    let marker_start = tail
+        .windows(CHECKPOINTED_AT_MARKER.len())
+        .rposition(|window| window == CHECKPOINTED_AT_MARKER)?;
+    let value = &tail[marker_start + CHECKPOINTED_AT_MARKER.len()..];
+    let value_end = value
+        .iter()
+        .position(|byte| !byte.is_ascii_digit() && *byte != b'-')?;
+    if value.get(value_end) != Some(&b',') {
+        return None;
+    }
+    let trailing_fields = &value[value_end + 1..];
+    let source_token = trailing_fields
+        .strip_prefix(SOURCE_LEASE_TOKEN_MARKER)?
+        .strip_suffix(b"\"}")?;
+    if source_token.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&value[..value_end]).ok()?.parse().ok()
+}
+
+/// Tracks lease-absence windows at control-loop resolution while the regional
+/// metrics scan remains on its normal 15-second cadence. Without this
 /// rolling maximum, an outage that starts and ends between EMF samples is
 /// invisible. The first observation is conservatively backdated by one sample
 /// interval so a near-five-second outage cannot be reported as safely shorter.
@@ -397,9 +429,9 @@ async fn collect_regional_gauges(
         .unwrap_or(0);
 
     // All tasks must emit their local counters and socket gauge, but only one
-    // live task needs to download every recovery envelope for identical
-    // regional gauges. Selecting the smallest membership identity is
-    // deterministic and automatically hands collection to a survivor.
+    // live task needs to inspect the regional recovery index. Selecting the
+    // smallest membership identity is deterministic and automatically hands
+    // collection to a survivor.
     let is_regional_reporter = members
         .iter()
         .min_by_key(|member| (member.server_id, member.boot_id.as_str()))
@@ -496,31 +528,45 @@ async fn collect_regional_gauges(
     }
     gauges.active_games = indexed_games.len() as u64;
     if !indexed_games.is_empty() {
-        let mut envelopes: Vec<Option<Vec<u8>>> = Vec::with_capacity(indexed_games.len());
-        for (_, game_id) in &indexed_games {
-            envelopes.push(
-                redis
-                    .get(namespace.recovery(*game_id))
-                    .await
-                    .context("failed to inspect active recovery checkpoint")?,
-            );
-        }
-        for ((partition, game_id), payload) in indexed_games.into_iter().zip(envelopes) {
-            let Some(payload) = payload else {
+        for (partition, game_id) in indexed_games {
+            let key = namespace.recovery(game_id);
+            let expected_prefix = expected_recovery_prefix(partition, game_id);
+            let prefix_end = i64::try_from(expected_prefix.len().saturating_sub(1))
+                .context("recovery checkpoint prefix exceeds Redis range")?;
+            // Loading and deserializing every full recovery envelope made
+            // best-effort telemetry compete with authoritative execution. A
+            // checkpoint can be hundreds of KiB, while its identity lives at
+            // the start and its timestamp is deliberately one of the final
+            // fields. Fetch only those bounded slices plus STRLEN. Keeping all
+            // three commands in one same-key pipeline is cluster-slot safe.
+            // This gauge checks index/framing parity; authoritative takeover
+            // still deserializes and validates the complete envelope.
+            let (checkpoint_bytes, prefix, tail): (u64, Vec<u8>, Vec<u8>) = redis::pipe()
+                .cmd("STRLEN")
+                .arg(&key)
+                .cmd("GETRANGE")
+                .arg(&key)
+                .arg(0)
+                .arg(prefix_end)
+                .cmd("GETRANGE")
+                .arg(&key)
+                .arg(-RECOVERY_TAIL_SAMPLE_BYTES)
+                .arg(-1)
+                .query_async(&mut redis)
+                .await
+                .context("failed to inspect active recovery checkpoint metadata")?;
+            gauges.checkpoint_bytes = gauges.checkpoint_bytes.max(checkpoint_bytes);
+            let Some(checkpointed_at_ms) = checkpointed_at_ms_from_tail(&tail) else {
                 gauges.active_game_index_mismatches += 1;
                 continue;
             };
-            gauges.checkpoint_bytes = gauges.checkpoint_bytes.max(payload.len() as u64);
-            match serde_json::from_slice::<RecoveryEnvelopeV2>(&payload) {
-                Ok(envelope)
-                    if envelope.partition_id == partition && envelope.game_id == game_id =>
-                {
-                    gauges.checkpoint_age_ms = gauges
-                        .checkpoint_age_ms
-                        .max(now_ms.saturating_sub(envelope.checkpointed_at_ms).max(0) as u64);
-                }
-                _ => gauges.active_game_index_mismatches += 1,
+            if checkpoint_bytes == 0 || prefix != expected_prefix.as_bytes() {
+                gauges.active_game_index_mismatches += 1;
+                continue;
             }
+            gauges.checkpoint_age_ms = gauges
+                .checkpoint_age_ms
+                .max(now_ms.saturating_sub(checkpointed_at_ms).max(0) as u64);
         }
     }
     Ok(gauges)
@@ -696,6 +742,8 @@ mod tests {
     use super::*;
     use crate::cluster_membership::BootIdentity;
     use crate::partition_assignment::{ASSIGNMENT_SCHEMA_VERSION, AssignmentDocument};
+    use crate::recovery::{RecoveryEnvelopeV2, ResolvedCommandState};
+    use common::{GameState, GameType, QueueMode};
     use std::collections::BTreeMap;
 
     #[test]
@@ -776,5 +824,59 @@ mod tests {
         assert_eq!(tracker.take_window_max(15_000), 5_000);
         assert_eq!(tracker.take_window_max(15_000), 0);
         Ok(())
+    }
+
+    #[test]
+    fn bounded_checkpoint_metadata_preserves_serialized_identity_and_age() {
+        let prefix = expected_recovery_prefix(7, 127);
+        assert_eq!(
+            prefix,
+            "{\"schema_version\":2,\"executor_protocol_version\":2,\"game_id\":127,\"partition_id\":7,"
+        );
+
+        let envelope = RecoveryEnvelopeV2::new(
+            127,
+            7,
+            GameState::new(
+                40,
+                40,
+                GameType::FreeForAll { max_players: 4 },
+                QueueMode::Quickmatch,
+                Some(7),
+                123_456_789,
+            ),
+            "123-4".into(),
+            ResolvedCommandState::default(),
+            17,
+            91,
+            123_456_789,
+            "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        );
+        let payload = serde_json::to_vec(&envelope).unwrap();
+        assert!(payload.starts_with(prefix.as_bytes()));
+        let tail_start = payload
+            .len()
+            .saturating_sub(RECOVERY_TAIL_SAMPLE_BYTES as usize);
+        assert_eq!(
+            checkpointed_at_ms_from_tail(&payload[tail_start..]),
+            Some(123_456_789),
+        );
+
+        assert_eq!(checkpointed_at_ms_from_tail(b"{}"), None);
+        assert_eq!(
+            checkpointed_at_ms_from_tail(br#""checkpointed_at_ms":123}"#),
+            None,
+            "the timestamp must retain its expected following field",
+        );
+        assert_eq!(
+            checkpointed_at_ms_from_tail(br#""checkpointed_at_ms":123,"#),
+            None,
+            "a truncated trailing field must not look like a checkpoint",
+        );
+        assert_eq!(
+            checkpointed_at_ms_from_tail(br#""checkpointed_at_ms":123,"source_lease_token":"}"#,),
+            None,
+            "an unterminated source token must not look like a checkpoint",
+        );
     }
 }
