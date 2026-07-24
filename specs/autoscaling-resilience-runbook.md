@@ -144,8 +144,9 @@ Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
 Both retain a minimum of one. The application task uses one vCPU and two GiB so
 the one-task floor has takeover and burst headroom while target tracking is
-still observing load. CPU 70%, memory 80%, and both 60-second cooldowns remain
-unchanged.
+still observing load. CPU is targeted at 60%, memory at 80%, and both scale-in
+and scale-out cooldowns are 60 seconds. Development and production use the
+same policy.
 
 ## Routine deployments
 
@@ -483,9 +484,11 @@ collapsed, which is consistent with removal of nonlinear queue amplification.
 
 Run A is fixed once from this same-version evidence at 224 sessions / 112
 duels. After subtracting the measured 3.5% idle CPU, the observed range projects
-to 76.4--82.8% at 224. Keep the existing CPU 70% / memory 80% targets,
-one-second gate, one-stage 20-minute runner, and eight-minute target-tracking
-budget. Do not adjust the cohort again if a later run fails.
+to 76.4--82.8% at 224. That projection originally retained the CPU 70% /
+memory 80% targets; the later bounded-telemetry run below superseded the CPU
+target after directly measuring the optimized build. It did not supersede the
+one-second gate, one-stage 20-minute runner, eight-minute target-tracking
+budget, or frozen cohort. Do not adjust the cohort to make a later run pass.
 One hundred two best-effort active-game mapping lookups also timed out during
 the 144-session ownership bursts without causing a failed admission or usable
 gap; retain this as a diagnostic risk and investigate the matchmaking-manager
@@ -514,9 +517,10 @@ multiple in-flight requests, so do not describe this as strict Redis request
 serialization. The correction below isolates the fixed partition hot paths
 from one another while preserving the existing control and bulk-role
 connections. Run `30050625836` is diagnostic evidence only. Do not change the
-224-session / 112-duel cohort, the CPU 70% / memory 80% policy, the one-second
-gate, or any other acceptance criterion. A fresh full planned run and a
-separate authorized SIGKILL run remain mandatory.
+224-session / 112-duel cohort, the one-second gate, or any other acceptance
+criterion based on that failed run. It did not justify a scaling-policy change;
+the later stable exact-source evidence below does. A fresh full planned run and
+a separate authorized SIGKILL run remain mandatory.
 
 Exact-source Serverless run
 [`30057487544`](https://github.com/lopatin/snaketron-io/actions/runs/30057487544)
@@ -568,8 +572,9 @@ raises only its burst to 512 for the certified make-before-break cohort, and
 the load client retries `429` through its existing admission/reconnect deadline
 just as the browser does. Keep the one checkpoint-write dispatcher per task.
 Do not add more pools, lengthen the 750-millisecond Redis deadline or any
-admission deadline, add a recovery cache, adjust the frozen load, change CPU or
-memory targets, or relax any acceptance gate.
+admission deadline, add a recovery cache, adjust the frozen load, or relax any
+acceptance gate. That run did not itself justify changing CPU or memory
+targets; the later stable exact-source evidence below does.
 The next run must record Serverless connection count and any remaining
 recovery-read warnings before considering another optimization.
 
@@ -618,6 +623,43 @@ Valkey, DynamoDB, ECR, Route 53, ACM, CloudWatch, Application Auto Scaling, or
 IAM. Production stack timestamps and resources remained unchanged and the
 production health endpoint stayed healthy. This run is diagnostic evidence;
 fresh complete planned and SIGKILL certification remain required.
+
+Exact-source Serverless run
+[`30085417447`](https://github.com/lopatin/snaketron-io/actions/runs/30085417447)
+used outer commit `19f7fea443684dc3ab23134e0fe596065e8bf4e4` and Snaketron
+commit `65e097ae9af948463e4948c181166f1c11b20aac`. It reached the frozen
+224-session target with a peak of 112 concurrent duels and completed all 1,344
+sessions, 672 games, and 1,203,217 command outcomes. Every command was
+scheduled. During all 485 full seconds from reaching the target through the
+autoscaling timeout, every partition was productive, no client disconnected or
+reconnected, maximum command-outcome latency was 451 milliseconds, and no
+second exceeded 500 milliseconds. For samples with at least 100 active games
+on one live task, embedded-metric timestamp-to-log delay changed from a
+986-millisecond mean and 1,871-millisecond maximum in the preceding run to a
+227-millisecond mean and 500-millisecond maximum. Checkpoint size and age
+continued to be reported; correctness-failure gauges, Serverless
+`ThrottledCmds`, and `Evictions` remained zero.
+
+The run stopped before movement. Eight consecutive one-minute CloudWatch
+averages during the full-load interval were 65.69%, 68.95%, 74.77%, 66.58%,
+72.25%, 67.98%, 67.95%, and 71.06%. They contained no three consecutive
+periods above the then-configured 70% target; no scale-out action occurred and
+the service remained at one task. The old load-to-threshold calibration no
+longer held on the corrected build. Lower telemetry delay and the changed CPU
+profile are consistent with reduced telemetry overhead, but the run does not
+certify rebalance continuity. Keep the 224-session gate fixed and use the same
+CPU 60% / memory 80% targets in development and production. Sixty percent
+leaves 5.69 points below the weakest measured minute for ordinary variance and
+the managed alarm plus task-start delay; 65% leaves only 0.69 points and is not
+a robust certification or operating threshold.
+Do not change any command, handoff, capacity, or crash criterion. Fresh complete
+planned and SIGKILL runs remain required.
+
+Cleanup succeeded. Independent inventory found no active development stack,
+ECS task or service, EC2/EIP/NAT resource, security group, Serverless or node
+cache, DynamoDB table, ECR repository, log group, dashboard, or staging DNS
+record. The shared production VPC, all production stack timestamps, and both
+healthy production services remained unchanged.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.

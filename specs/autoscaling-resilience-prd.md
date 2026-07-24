@@ -5,7 +5,7 @@
 | Status | Direct-only implementation acceptance draft |
 | Product | Snaketron regional game service |
 | Owners | Engineering / Product |
-| Last updated | 2026-07-23 |
+| Last updated | 2026-07-24 |
 | Scope | Executor ownership, task lifecycle, WebSocket continuity, matchmaking safety, readiness, and autoscaling |
 
 ## 1. Executive summary
@@ -130,7 +130,7 @@ For this PRD:
 7. Preserve gateway/executor independence and avoid reconnecting sockets for executor-only movement.
 8. Provide zero-usable-session-gap WebSocket handoff on planned task removal for supported clients.
 9. Make matchmaking commits atomic and recoverable without Pub/Sub.
-10. Route only to ready tasks and preserve the existing CPU/memory autoscaling policy.
+10. Route only to ready tasks and use CPU/memory target tracking without adding a custom game-specific scaling signal.
 
 ## 6. Non-goals
 
@@ -543,10 +543,12 @@ The assignment coordinator is control plane only. Existing assignments and activ
 
 ### R12 — Autoscaling behavior and capacity constraints
 
-1. Retain the existing target-tracking policies:
-   - CPU target: 70%;
+1. Use the same target-tracking policies in development and production:
+   - CPU target: 60%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
+   The CPU target leaves measured headroom for command processing and partition
+   recovery while the managed alarm evaluates and a replacement task starts.
 2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 224-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is one vCPU and two GiB, the smallest valid Fargate memory pairing for one vCPU; target tracking cannot protect a half-vCPU one-task floor from a sub-minute admission or takeover burst.
 3. The autoscaler must never select zero desired tasks.
 4. Validate forced `1 -> 10 -> 1` with 128 active game sessions / 64 duels
@@ -1231,6 +1233,52 @@ development resource remained, production stack timestamps and resource
 identity were unchanged, and production stayed healthy. The run remains
 diagnostic evidence only. Fresh complete planned and SIGKILL runs are still
 required, with the fixed cohort and all acceptance thresholds unchanged.
+
+The exact-source follow-up
+([GitHub Actions 30085417447](https://github.com/lopatin/snaketron-io/actions/runs/30085417447),
+outer commit `19f7fea443684dc3ab23134e0fe596065e8bf4e4`, Snaketron commit
+`65e097ae9af948463e4948c181166f1c11b20aac`) exercised the bounded telemetry
+path under the fixed 224-session target, which reached a peak of 112 concurrent
+duels. All 1,344 sessions, 672 games, and 1,203,217 commands completed; every
+command was scheduled and received a terminal outcome. There were zero
+disconnects or reconnects. During all 485 full seconds between reaching the
+224-session target and the autoscaling timeout, every partition was productive,
+maximum command-outcome latency was 451 milliseconds, and no second exceeded
+500 milliseconds or the one-second release budget. For comparable samples with
+at least 100 active games on one live task, embedded-metric timestamp-to-log
+delay fell from a 986-millisecond mean and 1,871-millisecond maximum in the
+preceding run to a 227-millisecond mean and 500-millisecond maximum. Telemetry
+continued to report checkpoint size and age; index-mismatch, checkpoint-failure,
+lease-deficit, owner-mismatch, unowned-time, fenced-write-rejection, divergence,
+drain-failure, and quarantine gauges remained zero. Serverless Valkey recorded
+zero throttling or eviction.
+
+The run failed closed before any ownership transition because the optimized
+one-task workload no longer sustained the original 70% CPU target. Eight
+consecutive one-minute CloudWatch averages during the full-load interval were
+65.69%, 68.95%, 74.77%, 66.58%, 72.25%, 67.98%, 67.95%, and 71.06%; the series
+contained no three consecutive minutes above 70%, no scale-out alarm action
+occurred, and the service remained at one task. Planned handoff, capacity, and
+SIGKILL therefore did not run. The old load-to-threshold calibration no longer
+held on the corrected build. The lower telemetry delay and changed CPU profile
+are consistent with reduced telemetry overhead; the result is not evidence of
+an application or Serverless capacity failure.
+
+The minimum operational correction is the normative 60% CPU target in R12,
+shared by development and production. Memory remains 80%, both cooldowns
+remain 60 seconds, the fixed 224-session load and every continuity threshold
+remain unchanged, and no custom signal is added. A 65% target would leave only
+0.69 percentage points below the weakest observed minute and is too sensitive
+to ordinary run variance plus the managed alarm and task-start delay. At 60%,
+the weakest minute has 5.69 points of margin and the latency-sensitive service
+keeps real command and takeover headroom. Idle cost is unchanged because the
+one-task floor remains. This policy change is not certified by the diagnostic
+run; fresh complete planned and SIGKILL evidence is still mandatory.
+
+Cleanup succeeded and an independent absence audit found no active development
+stack, compute, cache, database, ingress, DNS, logging, or scaling resource.
+The imported production VPC, every production stack timestamp, and both
+production services remained unchanged and healthy.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

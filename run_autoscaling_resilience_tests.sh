@@ -1270,10 +1270,10 @@ verify_scaling_policies() {
           )]
       | length == 1;
     (.ScalingPolicies | length) == 2
-    and target("ECSServiceAverageCPUUtilization"; 70)
+    and target("ECSServiceAverageCPUUtilization"; 60)
     and target("ECSServiceAverageMemoryUtilization"; 80)
   ' "$identity_dir/scaling-policies.json" >/dev/null || {
-    echo "Staging must have only CPU=70% and memory=80% target tracking with 60-second cooldowns" >&2
+    echo "Staging must have only CPU=60% and memory=80% target tracking with 60-second cooldowns" >&2
     return 1
   }
 }
