@@ -227,7 +227,34 @@ pub struct ExecutorClusterHandle {
     coordinator_token: Arc<Mutex<Option<LeaseToken>>>,
     metadata: Arc<TaskMetadata>,
     executors: Arc<Mutex<HashMap<u32, PartitionExecutorV2Handle>>>,
+    executor_drain_failure: Arc<Mutex<Option<String>>>,
     cancellation: CancellationToken,
+}
+
+async fn record_executor_drain_failure(failure: &Mutex<Option<String>>, reason: impl Into<String>) {
+    let mut failure = failure.lock().await;
+    if failure.is_none() {
+        *failure = Some(reason.into());
+    }
+}
+
+async fn await_confirmed_partition_handoffs<T>(
+    executors: &Mutex<HashMap<u32, T>>,
+    failure: &Mutex<Option<String>>,
+) -> Result<()> {
+    loop {
+        let executors_empty = executors.lock().await.is_empty();
+        // Worker exit paths record failure before removing their handle. Reading
+        // the latch after the map therefore makes an observed empty map a
+        // truthful proof that every removed executor completed cooperatively.
+        if let Some(reason) = failure.lock().await.clone() {
+            anyhow::bail!("executor planned handoff was not cooperative: {reason}");
+        }
+        if executors_empty {
+            return Ok(());
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
 }
 
 impl ExecutorClusterHandle {
@@ -273,14 +300,8 @@ impl ExecutorClusterHandle {
         // the handle map also waits for every monotonic partition-local view,
         // actor barrier, and exact-token release; observing only the canonical
         // document would release too early while its ten views are projected.
-        let assignment_handoff = async {
-            loop {
-                if self.executors.lock().await.is_empty() {
-                    return Result::<()>::Ok(());
-                }
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-            }
-        };
+        let assignment_handoff =
+            await_confirmed_partition_handoffs(&self.executors, &self.executor_drain_failure);
         let handoff_result = tokio::time::timeout_at(deadline, assignment_handoff)
             .await
             .context("executor assignment handoff exceeded global deadline")
@@ -356,6 +377,7 @@ pub fn start_executor_cluster(
     )?;
     let state = Arc::new(AtomicU8::new(STATE_WARMING));
     let executors = Arc::new(Mutex::new(HashMap::new()));
+    let executor_drain_failure = Arc::new(Mutex::new(None));
     let coordinator_token = Arc::new(Mutex::new(None));
     let metadata = Arc::new(TaskMetadata {
         server_id,
@@ -370,6 +392,7 @@ pub fn start_executor_cluster(
         coordinator_token: coordinator_token.clone(),
         metadata: metadata.clone(),
         executors: executors.clone(),
+        executor_drain_failure: executor_drain_failure.clone(),
         cancellation: cancellation.clone(),
     };
     let task = tokio::spawn(async move {
@@ -387,6 +410,7 @@ pub fn start_executor_cluster(
             metadata,
             state,
             executors,
+            executor_drain_failure,
             coordinator_token,
             cancellation,
         )
@@ -410,6 +434,7 @@ async fn run_executor_cluster(
     metadata: Arc<TaskMetadata>,
     state: Arc<AtomicU8>,
     executors: Arc<Mutex<HashMap<u32, PartitionExecutorV2Handle>>>,
+    executor_drain_failure: Arc<Mutex<Option<String>>>,
     coordinator_token: Arc<Mutex<Option<LeaseToken>>>,
     cancellation: CancellationToken,
 ) -> Result<()> {
@@ -445,11 +470,17 @@ async fn run_executor_cluster(
                     break;
                 }
                 local_lifecycle.mark_membership_ready(false);
-                return Err(match result {
+                let error = match result {
                     Ok(Ok(())) => anyhow::anyhow!("membership heartbeat worker exited unexpectedly"),
                     Ok(Err(error)) => error.context("membership heartbeat worker failed"),
                     Err(error) => anyhow::Error::new(error).context("membership heartbeat worker panicked"),
-                });
+                };
+                record_executor_drain_failure(
+                    &executor_drain_failure,
+                    format!("{error:#}"),
+                )
+                .await;
+                return Err(error);
             }
             _ = tick.tick() => {
                 let control_result: Result<()> = async {
@@ -536,16 +567,59 @@ async fn run_executor_cluster(
                         .collect();
                     for partition in finished {
                         let task = partition_tasks.remove(&partition).expect("task exists");
-                        executors.lock().await.remove(&partition);
-                        match task.await.context("v2 partition executor panicked")? {
-                            Ok(()) => {}
-                            Err(error) if is_coordination_unavailable(&error)
+                        match task.await {
+                            Ok(Ok(())) if !cancellation.is_cancelled() => {
+                                // The partition worker has only two clean exit
+                                // paths: parent cancellation (handled below) or
+                                // a completed exact-token cooperative release.
+                                executors.lock().await.remove(&partition);
+                            }
+                            Ok(Ok(())) => {
+                                let reason = format!(
+                                    "partition {partition} exited during cluster cancellation"
+                                );
+                                record_executor_drain_failure(
+                                    &executor_drain_failure,
+                                    reason.clone(),
+                                )
+                                .await;
+                                executors.lock().await.remove(&partition);
+                                warn!(partition, %reason, "Partition executor did not complete a cooperative handoff");
+                            }
+                            Ok(Err(error)) if is_coordination_unavailable(&error)
                                 || is_normal_authority_exit(&error) => {
+                                record_executor_drain_failure(
+                                    &executor_drain_failure,
+                                    format!("partition {partition} failed closed: {error:#}"),
+                                )
+                                .await;
+                                executors.lock().await.remove(&partition);
                                 warn!(partition, %error, "Partition executor stopped fail-closed; retrying locally");
                             }
-                            Err(error) => return Err(error.context(format!(
-                                "partition {partition} executor invariant failure"
-                            ))),
+                            Ok(Err(error)) => {
+                                let error = error.context(format!(
+                                    "partition {partition} executor invariant failure"
+                                ));
+                                record_executor_drain_failure(
+                                    &executor_drain_failure,
+                                    format!("{error:#}"),
+                                )
+                                .await;
+                                executors.lock().await.remove(&partition);
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                let error = anyhow::Error::new(error).context(format!(
+                                    "partition {partition} executor panicked"
+                                ));
+                                record_executor_drain_failure(
+                                    &executor_drain_failure,
+                                    format!("{error:#}"),
+                                )
+                                .await;
+                                executors.lock().await.remove(&partition);
+                                return Err(error);
+                            }
                         }
                     }
                     Ok(())
@@ -557,18 +631,34 @@ async fn run_executor_cluster(
                         local_lifecycle.mark_assignment_ready(false);
                         warn!(%error, "Executor coordination unavailable; retrying locally");
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        record_executor_drain_failure(
+                            &executor_drain_failure,
+                            format!("executor cluster worker failed: {error:#}"),
+                        )
+                        .await;
+                        return Err(error);
+                    }
                 }
             }
         }
     }
 
-    let remaining: Vec<_> = executors
-        .lock()
-        .await
-        .drain()
-        .map(|(_, handle)| handle)
-        .collect();
+    // This cleanup path is not a confirmed assignment-triggered handoff. Latch
+    // failure before making the registry empty so a concurrent drain waiter
+    // cannot mistake cleanup for cooperative completion.
+    let mut remaining_registry = executors.lock().await;
+    if !remaining_registry.is_empty() {
+        record_executor_drain_failure(
+            &executor_drain_failure,
+            "executor cluster cleanup removed locally owned partitions",
+        )
+        .await;
+    }
+    let remaining: Vec<_> = remaining_registry.drain().collect();
+    drop(remaining_registry);
+    let remaining: Vec<PartitionExecutorV2Handle> =
+        remaining.into_iter().map(|(_, handle)| handle).collect();
     for handle in remaining {
         let _ = handle.handoff().await;
     }
@@ -1081,6 +1171,7 @@ mod tests {
                 task_definition: Some("test:2".into()),
             }),
             executors: Arc::new(Mutex::new(HashMap::new())),
+            executor_drain_failure: Arc::new(Mutex::new(None)),
             cancellation,
         };
 
@@ -1112,6 +1203,53 @@ mod tests {
             ])
             .await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_executor_map_is_not_success_after_fail_closed_exit() {
+        let executors = Mutex::new(HashMap::<u32, ()>::new());
+        let failure = Mutex::new(Some(
+            "partition 3 failed closed before cooperative release".to_owned(),
+        ));
+
+        let error = await_confirmed_partition_handoffs(&executors, &failure)
+            .await
+            .expect_err("an empty map must not hide a fail-closed executor exit");
+        assert!(
+            error
+                .to_string()
+                .contains("partition 3 failed closed before cooperative release")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_is_latched_before_last_executor_removal() {
+        let executors = Arc::new(Mutex::new(HashMap::from([(3_u32, ())])));
+        let failure = Arc::new(Mutex::new(None));
+        let worker_executors = executors.clone();
+        let worker_failure = failure.clone();
+        let worker = tokio::spawn(async move {
+            record_executor_drain_failure(
+                &worker_failure,
+                "partition 3 lost authority during handoff",
+            )
+            .await;
+            worker_executors.lock().await.remove(&3);
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_confirmed_partition_handoffs(&executors, &failure),
+        )
+        .await
+        .expect("handoff waiter did not observe worker exit")
+        .expect_err("fail-closed removal must not be reported as cooperative");
+        worker.await.unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("partition 3 lost authority during handoff")
+        );
     }
 
     #[tokio::test]

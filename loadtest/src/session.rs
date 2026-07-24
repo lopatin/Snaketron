@@ -12,7 +12,7 @@ use common::{
     ClientCommandIdentityV2, Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent,
     GameEventMessage, GameState, GameStatus, GameType, QueueMode, calculate_ai_move,
 };
-use futures_util::{FutureExt, SinkExt, StreamExt, future::join_all};
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use server::lobby_manager::LobbyPreferences;
@@ -206,6 +206,7 @@ struct GameRuntime {
     last_decision_tick: Option<u32>,
     pending_direction: Option<Direction>,
     outstanding_ping: Option<(i64, Instant)>,
+    promotion_suppression_floor: Option<u64>,
 }
 
 #[derive(Default)]
@@ -281,7 +282,27 @@ impl GameRuntime {
             last_decision_tick: None,
             pending_direction: None,
             outstanding_ping: None,
+            promotion_suppression_floor: None,
         })
+    }
+
+    fn suppress_covered_promotion_event(&mut self, event: &GameEventMessage) -> bool {
+        let Some(floor) = self.promotion_suppression_floor else {
+            return false;
+        };
+        if matches!(
+            &event.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
+        ) {
+            self.promotion_suppression_floor = None;
+            return false;
+        }
+        if event.stream_seq > floor {
+            self.promotion_suppression_floor = None;
+            return false;
+        }
+        true
     }
 
     /// Replace all client-predicted state with one authoritative snapshot.
@@ -293,6 +314,7 @@ impl GameRuntime {
         game_state: GameState,
         clock_offset_ms: i64,
     ) -> Result<bool> {
+        self.promotion_suppression_floor = None;
         let (snapshot_user_ids, snake_id) = snapshot_identity(game_id, user_id, &game_state)?;
         self.snapshot_user_ids = snapshot_user_ids;
         if matches!(&game_state.status, GameStatus::Complete { .. }) {
@@ -2353,6 +2375,9 @@ async fn play_session_inner(
                     }
                     WSMessage::GameEvent(event) if event.game_id == game_id => {
                         session.record.metrics.game_events_received = session.record.metrics.game_events_received.saturating_add(1);
+                        if runtime.suppress_covered_promotion_event(&event) {
+                            continue;
+                        }
                         match &event.event {
                             GameEvent::Snapshot { game_state } => {
                                 let snapshot_complete = runtime.apply_snapshot(
@@ -2834,7 +2859,7 @@ struct ReadyPlannedCandidate {
     capabilities: BTreeSet<String>,
     task_boot_id: String,
     socket_generation: u64,
-    snapshot: GameState,
+    snapshot: GameEventMessage,
     buffered_events: Vec<GameEventMessage>,
     auth_ms: u64,
     lobby_rejoin_ms: Option<u64>,
@@ -2898,7 +2923,14 @@ fn process_active_handoff_message(
             return Ok(ActiveHandoffObservation::Pong(client_time));
         }
         WSMessage::GameEvent(event) if event.game_id == game_id => {
-            *active_watermark = (*active_watermark).max(event.stream_seq);
+            if matches!(&event.event, GameEvent::Snapshot { .. }) && event.stream_seq > 0 {
+                // A crash-recovery snapshot starts a new transport stream. The
+                // planned-handoff marker keeps cooperative transfers monotonic,
+                // but the load client must still accept a later crash re-anchor.
+                *active_watermark = event.stream_seq;
+            } else {
+                *active_watermark = (*active_watermark).max(event.stream_seq);
+            }
             session.record.metrics.game_events_received = session
                 .record
                 .metrics
@@ -2906,12 +2938,17 @@ fn process_active_handoff_message(
                 .saturating_add(1);
             match &event.event {
                 GameEvent::Snapshot { game_state } => {
-                    if runtime.apply_snapshot(
+                    let complete = runtime.apply_snapshot(
                         game_id,
                         session.user_id,
                         game_state.clone(),
                         session.clock_offset_ms,
-                    )? {
+                    )?;
+                    // `apply_snapshot` rebuilds the engine. Feed the envelope
+                    // through once so its transport watermark is retained for
+                    // duplicate suppression across atomic promotion.
+                    runtime.engine.process_server_event(&event)?;
+                    if complete {
                         return Ok(ActiveHandoffObservation::GameComplete);
                     }
                 }
@@ -3046,7 +3083,7 @@ async fn prepare_planned_candidate(
     let mut lobby_ready = lobby_code.is_none();
     let mut lobby_rejoin_ms = None;
     let mut snapshot_rejoin_ms = None;
-    let mut snapshot: Option<GameState> = None;
+    let mut snapshot: Option<GameEventMessage> = None;
     let mut snapshot_terminal = false;
     let mut candidate_watermark: Option<u64> = None;
     let mut buffered_events = Vec::new();
@@ -3055,29 +3092,24 @@ async fn prepare_planned_candidate(
     let mut candidate_ready_at = None;
     let mut continuity_probe_client_time = None;
     let mut continuity_confirmed_at = None;
+    let mut promotion_frontier = None;
     let mut game_join_retry_at = None;
 
     loop {
+        let required_watermark = promotion_frontier.unwrap_or(*active_watermark);
         let candidate_is_ready = authenticated
             && lobby_ready
             && (snapshot_terminal || outcomes_ready)
-            && (snapshot_terminal || candidate_watermark.unwrap_or(0) >= *active_watermark)
+            && (snapshot_terminal || candidate_watermark.unwrap_or(0) >= required_watermark)
             && snapshot.is_some();
-        if !candidate_is_ready {
-            // A newly observed old-socket event can move the active watermark
-            // ahead of the candidate. Any previous overlap probe then belongs
-            // to an older readiness window and must not certify promotion.
-            candidate_ready_at = None;
-            continuity_probe_client_time = None;
-            continuity_confirmed_at = None;
-        } else {
+        if candidate_is_ready {
             let ready_at = *candidate_ready_at.get_or_insert_with(Instant::now);
             if continuity_probe_client_time.is_none() {
                 // Do not infer continuity merely because neither socket has
                 // returned an error. Once the candidate is game-ready, prove
                 // the old gateway is still processing ordered application
-                // traffic. The candidate remains subscribed while this ping
-                // round-trip completes, giving an observed overlap interval.
+                // traffic. Every old-socket frame ordered before the matching
+                // pong becomes part of the fixed promotion frontier.
                 let client_time = runtime.outstanding_ping.as_ref().map_or_else(
                     || Utc::now().timestamp_millis(),
                     |(previous, _)| {
@@ -3095,30 +3127,6 @@ async fn prepare_planned_candidate(
             }
 
             if let Some(old_usable_through) = continuity_confirmed_at {
-                // Revalidate against every old-socket frame that is already
-                // readable at the promotion boundary. An authoritative event
-                // can advance the active watermark and invalidate this
-                // readiness window, in which case the candidate catches up and
-                // a fresh overlap probe is required.
-                if let Some(active) = session.next_message().now_or_never() {
-                    let message = active.map_err(PlannedHandoffAttemptError::Active)?;
-                    match process_active_handoff_message(
-                        session,
-                        runtime,
-                        game_id,
-                        active_watermark,
-                        message,
-                    )
-                    .map_err(PlannedHandoffAttemptError::Active)?
-                    {
-                        ActiveHandoffObservation::GameComplete => {
-                            return Err(PlannedHandoffAttemptError::GameComplete);
-                        }
-                        ActiveHandoffObservation::Continue | ActiveHandoffObservation::Pong(_) => {}
-                    }
-                    continue;
-                }
-
                 let ready_snapshot = snapshot
                     .take()
                     .expect("candidate readiness requires an authoritative snapshot");
@@ -3135,7 +3143,10 @@ async fn prepare_planned_candidate(
                     lobby_rejoin_ms,
                     snapshot_rejoin_ms: snapshot_rejoin_ms.unwrap_or_default(),
                     outcome_barrier_observed,
-                    usable_gap_ms: duration_between_ms(ready_at, old_usable_through),
+                    // The old application stream remains visible and writable
+                    // through the atomic promotion, including while the
+                    // candidate catches the fixed post-pong frontier.
+                    usable_gap_ms: 0,
                     active_overlap_ms: duration_between_ms(old_usable_through, ready_at),
                 });
             }
@@ -3168,6 +3179,11 @@ async fn prepare_planned_candidate(
                         if continuity_probe_client_time == Some(client_time) =>
                     {
                         continuity_confirmed_at = Some(Instant::now());
+                        // WebSocket ordering makes this the exact old-stream
+                        // watermark observed through the continuity pong. Later
+                        // old-stream frames remain authoritative and visible,
+                        // but do not turn candidate catch-up into a moving target.
+                        promotion_frontier = Some(*active_watermark);
                     }
                     ActiveHandoffObservation::Continue
                     | ActiveHandoffObservation::Pong(_) => {}
@@ -3278,10 +3294,16 @@ async fn prepare_planned_candidate(
                         if let GameEvent::Snapshot { game_state } = &event.event {
                             game_join_retry_at = None;
                             snapshot_terminal = matches!(game_state.status, GameStatus::Complete { .. });
-                            snapshot = Some(game_state.clone());
+                            snapshot = Some(event.clone());
                             candidate_watermark = Some(event.stream_seq);
                             buffered_events.clear();
                             snapshot_rejoin_ms = snapshot_started.map(elapsed_ms);
+                            if !snapshot_terminal {
+                                // The server follows every live snapshot with
+                                // outcomes from the same recovery envelope. A
+                                // takeover snapshot invalidates an older barrier.
+                                outcomes_ready = false;
+                            }
                         } else if let Some(watermark) = candidate_watermark {
                             if event.stream_seq == 0 || event.stream_seq == watermark.saturating_add(1) {
                                 if event.stream_seq > 0 {
@@ -3459,15 +3481,33 @@ async fn perform_planned_handoff(
         .await
         {
             Ok(mut candidate) => {
-                let snapshot_complete = runtime.apply_snapshot(
-                    game_id,
-                    session.user_id,
-                    candidate.snapshot,
-                    session.clock_offset_ms,
-                )?;
+                let snapshot_event = candidate.snapshot;
+                let GameEvent::Snapshot { game_state } = &snapshot_event.event else {
+                    unreachable!("planned candidate stores only authoritative snapshots");
+                };
+                runtime.promotion_suppression_floor = Some(active_watermark);
+                let snapshot_complete =
+                    if !runtime.suppress_covered_promotion_event(&snapshot_event) {
+                        let complete = runtime.apply_snapshot(
+                            game_id,
+                            session.user_id,
+                            game_state.clone(),
+                            session.clock_offset_ms,
+                        )?;
+                        runtime.engine.process_server_event(&snapshot_event)?;
+                        complete
+                    } else {
+                        // The old application stream stayed authoritative after
+                        // Pong and may be ahead of this buffered candidate
+                        // snapshot. Preserve it and discard the covered prefix,
+                        // including an unsequenced nonterminal recovery bridge.
+                        false
+                    };
                 if !snapshot_complete {
                     for event in candidate.buffered_events {
-                        runtime.engine.process_server_event(&event)?;
+                        if !runtime.suppress_covered_promotion_event(&event) {
+                            runtime.engine.process_server_event(&event)?;
+                        }
                     }
                 }
                 let handoff_complete = snapshot_complete
@@ -5444,7 +5484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_handoff_keeps_old_socket_until_snapshot_outcomes_and_barrier_are_ready() {
+    async fn planned_handoff_freezes_post_pong_frontier_while_old_stream_keeps_advancing() {
         use common::CommandId;
         use tokio::net::TcpListener;
         use tokio_tungstenite::accept_async;
@@ -5647,6 +5687,27 @@ mod tests {
                     }
                 }
             }
+            // These frames are ordered before the pong and therefore must all
+            // be covered by the candidate before promotion.
+            for stream_seq in 2..=5 {
+                old_socket
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
+                            game_id: 42,
+                            tick: server_snapshot.tick,
+                            sequence: server_snapshot.event_sequence,
+                            stream_seq,
+                            user_id: Some(7),
+                            event: GameEvent::TickHash {
+                                hash: server_snapshot.sync_hash(),
+                                server_ts_ms: Utc::now().timestamp_millis(),
+                            },
+                        }))
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
             old_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Pong {
@@ -5657,10 +5718,145 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert!(matches!(
-                old_socket.next().await.unwrap().unwrap(),
-                Message::Close(_)
-            ));
+
+            // The old application stream keeps advancing after Pong while the
+            // candidate catches only the fixed frontier at 5.
+            for stream_seq in 6..=10 {
+                old_socket
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
+                            game_id: 42,
+                            tick: server_snapshot.tick,
+                            sequence: server_snapshot.event_sequence,
+                            stream_seq,
+                            user_id: Some(7),
+                            event: GameEvent::TickHash {
+                                hash: server_snapshot.sync_hash(),
+                                server_ts_ms: Utc::now().timestamp_millis(),
+                            },
+                        }))
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            // A candidate snapshot reaches the frozen frontier but invalidates
+            // the earlier outcome barrier. The old socket must remain the
+            // command owner until the paired barrier is delivered.
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
+                        game_id: 42,
+                        tick: server_snapshot.tick,
+                        sequence: server_snapshot.event_sequence,
+                        stream_seq: 5,
+                        user_id: Some(7),
+                        event: GameEvent::Snapshot {
+                            game_state: server_snapshot.clone(),
+                        },
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let barrier_delay = tokio::time::Instant::now() + Duration::from_millis(50);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(barrier_delay) => break,
+                    frame = old_socket.next() => {
+                        let frame = frame
+                            .expect("old socket stayed open while takeover outcomes loaded")
+                            .unwrap();
+                        match frame {
+                            Message::Text(payload) => {
+                                if let WSMessage::GameCommandV2 { command_id, command } =
+                                    serde_json::from_str::<WSMessage>(&payload).unwrap()
+                                {
+                                    commands_during_handoff.push((command_id, command));
+                                }
+                            }
+                            Message::Close(_) => {
+                                panic!("takeover snapshot promoted before its outcome barrier")
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::CommandOutcomesComplete { game_id: 42 })
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            loop {
+                let frame = old_socket
+                    .next()
+                    .await
+                    .expect("old socket stayed open through candidate promotion")
+                    .unwrap();
+                match frame {
+                    Message::Text(payload) => {
+                        if let WSMessage::GameCommandV2 {
+                            command_id,
+                            command,
+                        } = serde_json::from_str::<WSMessage>(&payload).unwrap()
+                        {
+                            commands_during_handoff.push((command_id, command));
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            // This covered snapshot is deliberately sent only after the old
+            // socket closes. Filtering the candidate's preparation buffer is
+            // therefore insufficient; the promoted stream must retain the old
+            // applied watermark as a suppression floor.
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
+                        game_id: 42,
+                        tick: server_snapshot.tick,
+                        sequence: server_snapshot.event_sequence,
+                        stream_seq: 5,
+                        user_id: Some(7),
+                        event: GameEvent::Snapshot {
+                            game_state: server_snapshot.clone(),
+                        },
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            // The replacement gateway can still deliver its buffered copy of
+            // the post-Pong suffix. The promoted runtime must deduplicate it
+            // against state already applied from the old socket.
+            for stream_seq in 6..=10 {
+                candidate_socket
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
+                            game_id: 42,
+                            tick: server_snapshot.tick,
+                            sequence: server_snapshot.event_sequence,
+                            stream_seq,
+                            user_id: Some(7),
+                            event: GameEvent::TickHash {
+                                hash: server_snapshot.sync_hash(),
+                                server_ts_ms: Utc::now().timestamp_millis(),
+                            },
+                        }))
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
 
             for (index, (expected_id, expected_command)) in
                 commands_during_handoff.into_iter().enumerate()
@@ -5676,8 +5872,8 @@ mod tests {
                         serde_json::to_string(&WSMessage::GameEvent(GameEventMessage {
                             game_id: 42,
                             tick: server_snapshot.tick,
-                            sequence: index as u64 + 2,
-                            stream_seq: index as u64 + 2,
+                            sequence: server_snapshot.event_sequence,
+                            stream_seq: index as u64 + 11,
                             user_id: Some(7),
                             event: GameEvent::CommandScheduledV2 {
                                 command_id: expected_id,
@@ -5775,13 +5971,36 @@ mod tests {
         .unwrap();
 
         assert!(!complete);
+        assert_eq!(
+            runtime.engine.sync_status().last_stream_seq,
+            10,
+            "promotion must preserve old events applied after the frozen Pong frontier"
+        );
+        let mut covered_post_promotion_events = 0_u64;
         while !session.pending_commands.is_empty() {
-            tokio::time::timeout(Duration::from_secs(1), session.next_message())
+            let message = tokio::time::timeout(Duration::from_secs(1), session.next_message())
                 .await
                 .expect("candidate returned terminal command outcomes")
                 .unwrap();
+            if let WSMessage::GameEvent(event) = message {
+                if runtime.suppress_covered_promotion_event(&event) {
+                    covered_post_promotion_events += 1;
+                    continue;
+                }
+                if let GameEvent::Snapshot { game_state } = &event.event {
+                    runtime
+                        .apply_snapshot(42, 7, game_state.clone(), 0)
+                        .unwrap();
+                }
+                runtime.engine.process_server_event(&event).unwrap();
+            }
         }
         assert!(session.pending_commands.is_empty());
+        assert!(
+            covered_post_promotion_events >= 6,
+            "the delayed snapshot and replacement suffix through the old watermark must be suppressed"
+        );
+        assert!(runtime.engine.sync_status().last_stream_seq >= 11);
         assert_eq!(session.record.metrics.planned_handoff_attempts, 1);
         assert_eq!(session.record.metrics.planned_handoff_successes, 1);
         assert_eq!(session.record.metrics.planned_handoff_failures, 0);

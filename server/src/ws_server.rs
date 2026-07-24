@@ -1408,7 +1408,10 @@ async fn load_durable_active_game(
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
 ) -> Result<Option<u32>> {
     tokio::time::timeout(ACTIVE_GAME_MAPPING_TIMEOUT, async {
-        let mut manager = matchmaking_manager.lock().await;
+        let mut manager = {
+            let manager = matchmaking_manager.lock().await;
+            manager.clone()
+        };
         manager.get_user_active_game(user_id).await
     })
     .await
@@ -1806,7 +1809,10 @@ async fn notify_durable_active_game_after_auth(
     db: &Arc<dyn Database>,
 ) -> Result<()> {
     let mapped_game_id = match tokio::time::timeout(ACTIVE_GAME_MAPPING_TIMEOUT, async {
-        let mut manager = matchmaking_manager.lock().await;
+        let mut manager = {
+            let manager = matchmaking_manager.lock().await;
+            manager.clone()
+        };
         manager.get_user_active_game(user_id).await
     })
     .await

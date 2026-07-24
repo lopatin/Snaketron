@@ -173,12 +173,23 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 
 1. Verify the task became unready before it sent `Drain` and Traefik uses
    `/health/ready` for backend health.
-2. Measure ECS discovery polling plus Traefik active-health removal. The server
+2. Verify every incumbent game barrier wrote its fenced
+   `planned-handoff-watermark:v1`, the successor recovery snapshot advanced
+   beyond it, and the successor checkpoint removed it. An executor handoff
+   failure must suppress `Drain` entirely so clients take the crash-reconnect
+   path instead of using a planned stream frontier. Do not treat an empty local
+   executor registry as success; inspect the process-boot failure latch for an
+   authority-loss, worker, cancellation, or cleanup exit.
+3. Measure ECS discovery polling plus Traefik active-health removal. The server
    must reject new upgrades with retryable `503` throughout this window.
-3. Check client socket generations: the old authenticated/game-ready socket
+4. Check client socket generations: the old authenticated/game-ready socket
    must remain usable until the replacement authenticates, rejoins, receives a
-   snapshot and resolved-command barrier, and becomes the sole command owner.
-4. At the application deadline, allow crash-style recovery. Do not wait for a
+   snapshot and its paired resolved-command barrier, catches the fixed
+   post-Pong stream frontier, and becomes the sole command owner. Events from
+   the old socket must remain visible while the candidate catches up. After
+   promotion, covered candidate snapshots or deltas that arrive late must stay
+   suppressed until that stream advances beyond the old applied watermark.
+5. At the application deadline, allow crash-style recovery. Do not wait for a
    game to finish.
 
 ### Replica warming or WebSocket burst rejection

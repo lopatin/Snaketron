@@ -159,6 +159,10 @@ impl ClusterNamespace {
         RedisKeys::cluster_recovery(&self.region, game_id)
     }
 
+    pub fn planned_handoff_watermark(&self, game_id: u32) -> String {
+        RedisKeys::cluster_planned_handoff_watermark(&self.region, game_id)
+    }
+
     pub fn recovery_failure(&self, game_id: u32) -> String {
         RedisKeys::cluster_recovery_failure(&self.region, game_id)
     }

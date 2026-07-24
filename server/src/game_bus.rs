@@ -660,9 +660,63 @@ impl GameBus {
         Ok(stream_id)
     }
 
+    /// Records the exact last event watermark reached by one game actor after
+    /// its FIFO handoff barrier. This is intentionally much smaller than a
+    /// checkpoint: the existing checkpoint, PEL, and decision journal remain
+    /// the state-recovery source, while this marker preserves only publication
+    /// ordering for the successor's recovery snapshot.
+    pub async fn persist_planned_handoff_watermark_fenced(
+        &self,
+        guard: &PartitionLeaseGuard,
+        game_id: u32,
+        next_event_stream_sequence: u64,
+        retention: std::time::Duration,
+    ) -> Result<()> {
+        if game_id % crate::game_executor::PARTITION_COUNT != guard.partition() {
+            anyhow::bail!("planned-handoff watermark does not belong to fenced partition");
+        }
+        let retention_ms = u64::try_from(retention.as_millis())
+            .context("planned-handoff watermark retention exceeds Redis range")?;
+        if retention_ms == 0 {
+            anyhow::bail!("planned-handoff watermark retention must be non-zero");
+        }
+
+        let mut redis = self.partition_connection(guard.partition())?;
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+            -- This key is wholly executor-owned. SET deliberately replaces a
+            -- corrupt value of any Redis type instead of turning recoverable
+            -- auxiliary metadata into a failed cooperative handoff.
+            redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+            return 1
+            "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(guard.lease_key())
+            .key(guard.namespace().planned_handoff_watermark(game_id))
+            .arg(guard.encoded_token())
+            .arg(next_event_stream_sequence)
+            .arg(retention_ms);
+        let operation = invocation.invoke_async(&mut redis);
+        let result: i32 = tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+            .await
+            .context("fenced planned-handoff watermark write timed out")??;
+        match result {
+            1 => Ok(()),
+            -1 => {
+                crate::resilience_metrics::record_fenced_write_rejection(1);
+                anyhow::bail!("stale partition lease rejected planned-handoff watermark")
+            }
+            other => anyhow::bail!("unknown planned-handoff watermark result {other}"),
+        }
+    }
+
     /// Atomically persists the recovery envelope, refreshes the reload
     /// snapshot, indexes the game, and ACKs exactly the command entries covered
-    /// by that envelope.
+    /// by that envelope. A successful checkpoint also subsumes and removes any
+    /// earlier planned-handoff watermark for this game.
     pub async fn checkpoint_and_ack_fenced(
         &self,
         guard: &PartitionLeaseGuard,
@@ -671,6 +725,14 @@ impl GameBus {
         retention: std::time::Duration,
     ) -> Result<usize> {
         envelope.validate()?;
+        if envelope
+            .planned_handoff_event_stream_watermark
+            .is_some_and(|watermark| watermark > envelope.next_event_stream_sequence)
+        {
+            anyhow::bail!(
+                "recovery checkpoint cannot retire an unmerged planned-handoff watermark"
+            );
+        }
         if envelope.partition_id != guard.partition()
             || envelope.game_id % crate::game_executor::PARTITION_COUNT != guard.partition()
         {
@@ -715,6 +777,7 @@ impl GameBus {
             redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
             redis.call('SET', KEYS[3], ARGV[4], 'PX', ARGV[3])
             redis.call('SADD', KEYS[4], ARGV[5])
+            redis.call('DEL', KEYS[7])
             if #ARGV == 6 then return 0 end
             local ids = {}
             for i = 7, #ARGV do ids[#ids + 1] = ARGV[i] end
@@ -731,6 +794,11 @@ impl GameBus {
             .key(guard.namespace().active_games(guard.partition()))
             .key(RedisKeys::stream_commands(guard.partition()))
             .key(guard.namespace().command_decisions(guard.partition()))
+            .key(
+                guard
+                    .namespace()
+                    .planned_handoff_watermark(envelope.game_id),
+            )
             .arg(guard.encoded_token())
             .arg(recovery_payload)
             .arg(retention.as_millis() as u64)
@@ -1081,15 +1149,98 @@ impl GameBus {
             .query_async(&mut redis)
             .await
             .context("failed to batch-load partition recovery envelopes")?;
+        if payloads.len() != game_ids.len() {
+            anyhow::bail!("partition recovery batch returned an unexpected result count");
+        }
+
+        // Marker corruption must degrade to ordinary crash recovery, not make
+        // an otherwise valid game (or the whole partition) unavailable. Read,
+        // validate, and delete corrupt auxiliary values atomically under the
+        // successor's lease. Decimal validation stays string-based so Lua never
+        // rounds a u64 watermark through its double-precision number type.
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {-1, {}, 0} end
+            local values = {}
+            local discarded = 0
+            local max_u64 = '18446744073709551615'
+            for i = 2, #KEYS do
+                local marker_type = redis.call('TYPE', KEYS[i])
+                if type(marker_type) == 'table' then marker_type = marker_type.ok end
+                local value = nil
+                if marker_type == 'string' then
+                    value = redis.call('GET', KEYS[i])
+                    local valid = #value <= 20
+                        and string.match(value, '^%d+$') ~= nil
+                        and (#value < 20 or (#value == 20 and value <= max_u64))
+                    if not valid then
+                        redis.call('DEL', KEYS[i])
+                        value = nil
+                        discarded = discarded + 1
+                    end
+                elseif marker_type ~= 'none' then
+                    redis.call('DEL', KEYS[i])
+                    discarded = discarded + 1
+                end
+                values[#values + 1] = value or ''
+            end
+            return {1, values, discarded}
+            "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation.key(guard.lease_key());
+        for game_id in &game_ids {
+            invocation.key(namespace.planned_handoff_watermark(*game_id));
+        }
+        invocation.arg(guard.encoded_token());
+        let operation = invocation.invoke_async(&mut redis);
+        let (authority, marker_payloads, discarded): (i32, Vec<Vec<u8>>, u64) =
+            tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+                .await
+                .context("fenced planned-handoff watermark load timed out")??;
+        if authority != 1 {
+            crate::resilience_metrics::record_fenced_write_rejection(1);
+            anyhow::bail!("partition lease authority was lost before handoff watermark load");
+        }
+        if marker_payloads.len() != game_ids.len() {
+            anyhow::bail!("planned-handoff watermark batch returned an unexpected result count");
+        }
+        if discarded > 0 {
+            warn!(
+                partition,
+                discarded,
+                "Discarded corrupt planned-handoff watermarks; using ordinary crash recovery"
+            );
+        }
+        let planned_handoff_event_stream_watermarks: Vec<Option<u64>> = marker_payloads
+            .into_iter()
+            .map(|payload| {
+                if payload.is_empty() {
+                    None
+                } else {
+                    // The fenced Lua validator has already proved canonical
+                    // decimal u64 bounds. Still degrade to crash recovery if a
+                    // future server changes that validator incompatibly.
+                    std::str::from_utf8(&payload)
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                }
+            })
+            .collect();
+
         let mut envelopes = Vec::with_capacity(game_ids.len());
-        for (game_id, payload) in game_ids.into_iter().zip(payloads) {
+        for ((game_id, payload), planned_handoff_event_stream_watermark) in game_ids
+            .into_iter()
+            .zip(payloads)
+            .zip(planned_handoff_event_stream_watermarks)
+        {
             let parsed = (|| -> Result<RecoveryEnvelopeV2> {
-                let payload = payload.ok_or_else(|| {
+                let payload = payload.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "active game {game_id} in partition {partition} has no recovery envelope"
                     )
                 })?;
-                let envelope: RecoveryEnvelopeV2 = serde_json::from_slice(&payload)
+                let envelope: RecoveryEnvelopeV2 = serde_json::from_slice(payload)
                     .with_context(|| format!("malformed recovery envelope for game {game_id}"))?;
                 envelope.validate()?;
                 if envelope.game_id != game_id || envelope.partition_id != partition {
@@ -1098,7 +1249,11 @@ impl GameBus {
                 Ok(envelope)
             })();
             match parsed {
-                Ok(envelope) => envelopes.push(envelope),
+                Ok(mut envelope) => {
+                    envelope.planned_handoff_event_stream_watermark =
+                        planned_handoff_event_stream_watermark;
+                    envelopes.push(envelope);
+                }
                 Err(error) => {
                     self.mark_recovery_unrecoverable_fenced(
                         guard,
@@ -1308,6 +1463,14 @@ impl GameBus {
         retention: std::time::Duration,
     ) -> Result<bool> {
         envelope.validate()?;
+        if envelope
+            .planned_handoff_event_stream_watermark
+            .is_some_and(|watermark| watermark > envelope.next_event_stream_sequence)
+        {
+            anyhow::bail!(
+                "completion checkpoint cannot retire an unmerged planned-handoff watermark"
+            );
+        }
         record.validate()?;
         if record.game_id != envelope.game_id
             || record.partition_id != guard.partition()
@@ -1384,6 +1547,7 @@ impl GameBus {
             redis.call('SET', KEYS[4], ARGV[5], 'PX', ARGV[4])
             redis.call('SREM', KEYS[5], ARGV[6])
             redis.call('SADD', KEYS[6], ARGV[6])
+            redis.call('DEL', KEYS[11])
 
             if not notified then
                 redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[10], '*', 'data', ARGV[9])
@@ -1420,6 +1584,7 @@ impl GameBus {
             )
             .key(RedisKeys::stream_events(guard.partition()))
             .key(guard.namespace().command_decisions(guard.partition()))
+            .key(guard.namespace().planned_handoff_watermark(record.game_id))
             .arg(guard.encoded_token())
             .arg(record_payload)
             .arg(recovery_payload)

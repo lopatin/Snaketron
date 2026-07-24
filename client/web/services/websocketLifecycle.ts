@@ -198,6 +198,14 @@ export function candidateCoversActiveWatermark(
   );
 }
 
+export function promotionOrderingFrontier(
+  activeWatermark: number | null,
+  continuityConfirmed: boolean,
+  frozenFrontier: number | null,
+): number | null {
+  return continuityConfirmed ? frozenFrontier : activeWatermark;
+}
+
 export function replacementReadyForPromotion(
   readiness: ReplacementReadiness,
   activeWatermark: number | null,

@@ -49,6 +49,19 @@ fn ecs_task_id_from_arn(task_arn: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn announce_client_drain_after_executor_handoff(
+    lifecycle: &TaskLifecycle,
+    executor_handoff_succeeded: bool,
+    deadline_unix_ms: i64,
+) -> bool {
+    if !executor_handoff_succeeded {
+        return false;
+    }
+    let notice = lifecycle.begin_draining(deadline_unix_ms);
+    lifecycle.announce_drain(notice);
+    true
+}
+
 /// Resolve ECS identity for membership diagnostics without making the
 /// metadata service a startup dependency. Explicit environment overrides are
 /// honored; otherwise the task ID comes from metadata v4 and falls back to the
@@ -677,7 +690,7 @@ impl GameServer {
         self.lifecycle.begin_draining(shutdown_deadline_unix_ms);
         let executor_handoff_deadline =
             (tokio::time::Instant::now() + Duration::from_secs(20)).min(shutdown_deadline);
-        let executor_drain =
+        let mut executor_drain =
             tokio::spawn(async move { executor_cluster.drain(executor_handoff_deadline).await });
         info!("Updating server status to 'draining'");
         match tokio::time::timeout(
@@ -701,8 +714,44 @@ impl GameServer {
             .await;
         }
 
-        // Step 2: ask supported clients to establish a replacement through the
-        // same regional URL. Do not wait for a game to finish.
+        // A client may use a fixed transport frontier only after every executor
+        // actor has durably published its planned-handoff watermark. Fail
+        // closed: if that barrier fails, advertise no planned client handoff and
+        // let the eventual socket close enter ordinary crash recovery instead.
+        let executor_handoff_succeeded = match tokio::time::timeout_at(
+            executor_handoff_deadline,
+            &mut executor_drain,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => true,
+            Ok(Ok(Err(error))) => {
+                resilience_metrics::record_planned_drain_failure(1);
+                warn!(
+                    "Executor handoff failed; suppressing planned client drain so lease expiry and crash reconnect recover: {}",
+                    error
+                );
+                false
+            }
+            Ok(Err(error)) => {
+                resilience_metrics::record_planned_drain_failure(1);
+                warn!(
+                    "Executor handoff task panicked; suppressing planned client drain: {}",
+                    error
+                );
+                false
+            }
+            Err(_) => {
+                executor_drain.abort();
+                resilience_metrics::record_planned_drain_failure(1);
+                warn!("Executor handoff reached its deadline; suppressing planned client drain");
+                false
+            }
+        };
+
+        // Step 2: once the marker-backed executor handoff is complete, ask
+        // supported clients to establish a replacement through the same
+        // regional URL. Do not wait for a game to finish.
         let client_handoff_limit = tokio::time::Instant::now() + Duration::from_secs(20);
         let handoff_deadline = client_handoff_limit.min(shutdown_deadline);
         let handoff_remaining_ms = handoff_deadline
@@ -712,43 +761,28 @@ impl GameServer {
         let handoff_deadline_unix_ms = chrono::Utc::now()
             .timestamp_millis()
             .saturating_add(handoff_remaining_ms);
-        let drain_notice = self.lifecycle.begin_draining(handoff_deadline_unix_ms);
-        self.lifecycle.announce_drain(drain_notice);
-        while self.lifecycle.active_websockets() > 0
-            && tokio::time::Instant::now() < handoff_deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if self.lifecycle.active_websockets() > 0 {
-            resilience_metrics::record_planned_drain_failure(1);
-            warn!(
-                remaining_websockets = self.lifecycle.active_websockets(),
-                "Planned WebSocket handoff window ended with sockets still attached"
-            );
-        }
-
-        match tokio::time::timeout_at(executor_handoff_deadline, executor_drain).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
+        if announce_client_drain_after_executor_handoff(
+            &self.lifecycle,
+            executor_handoff_succeeded,
+            handoff_deadline_unix_ms,
+        ) {
+            while self.lifecycle.active_websockets() > 0
+                && tokio::time::Instant::now() < handoff_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if self.lifecycle.active_websockets() > 0 {
                 resilience_metrics::record_planned_drain_failure(1);
                 warn!(
-                    "Executor handoff failed; lease expiry will recover: {}",
-                    error
+                    remaining_websockets = self.lifecycle.active_websockets(),
+                    "Planned WebSocket handoff window ended with sockets still attached"
                 );
-            }
-            Ok(Err(error)) => {
-                resilience_metrics::record_planned_drain_failure(1);
-                warn!("Executor handoff task panicked: {}", error);
-            }
-            Err(_) => {
-                resilience_metrics::record_planned_drain_failure(1);
-                warn!("Executor handoff reached the global shutdown deadline");
             }
         }
 
         // Step 3: one final cancellation stops HTTP and every remaining worker.
         // Every join below shares the one ECS-bounded deadline.
-        info!("Stopping all services after planned handoff window");
+        info!("Stopping all services after shutdown handoff decision");
         self.lifecycle.begin_stopping();
         self.cancellation_token.cancel();
 
@@ -923,8 +957,9 @@ pub async fn run_heartbeat_loop(
 }
 
 #[cfg(test)]
-mod ecs_metadata_tests {
-    use super::ecs_task_id_from_arn;
+mod tests {
+    use super::{announce_client_drain_after_executor_handoff, ecs_task_id_from_arn};
+    use crate::lifecycle::TaskLifecycle;
 
     #[test]
     fn extracts_task_id_from_long_and_short_ecs_arns() {
@@ -938,5 +973,25 @@ mod ecs_metadata_tests {
             Some("def456")
         );
         assert_eq!(ecs_task_id_from_arn("not-an-arn"), None);
+    }
+
+    #[test]
+    fn client_drain_is_never_announced_after_failed_executor_handoff() {
+        let lifecycle = TaskLifecycle::new("boot-a");
+        let mut drain_rx = lifecycle.subscribe_to_drain();
+
+        assert!(!announce_client_drain_after_executor_handoff(
+            &lifecycle, false, 1234
+        ));
+        assert_eq!(lifecycle.current_drain_notice(), None);
+        assert!(matches!(
+            drain_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(announce_client_drain_after_executor_handoff(
+            &lifecycle, true, 5678
+        ));
+        assert_eq!(drain_rx.try_recv().unwrap().deadline_unix_ms, 5678);
     }
 }

@@ -502,6 +502,7 @@ struct GameActor {
     resolved: ResolvedCommandState,
     command_cursor: String,
     next_event_stream_sequence: u64,
+    planned_handoff_event_stream_watermark: Option<u64>,
     pending_stream_ids: Vec<String>,
     snapshot_requested: bool,
     live: bool,
@@ -620,6 +621,7 @@ impl GameActor {
             resolved: envelope.resolved_client_commands,
             command_cursor: envelope.command_cursor,
             next_event_stream_sequence: envelope.next_event_stream_sequence,
+            planned_handoff_event_stream_watermark: envelope.planned_handoff_event_stream_watermark,
             pending_stream_ids: Vec::new(),
             snapshot_requested: false,
             live: false,
@@ -725,8 +727,24 @@ impl GameActor {
                             // full-state checkpoint here: the periodic
                             // checkpoint plus unacked PEL entries and durable
                             // decision journal are already the authoritative
-                            // crash-recovery source. The successor checkpoints
-                            // recovered state before activation.
+                            // crash-recovery source. Persist only the event
+                            // watermark needed to keep the successor's recovery
+                            // snapshot strictly beyond every event this actor
+                            // published.
+                            if let Err(error) = self
+                                .bus
+                                .persist_planned_handoff_watermark_fenced(
+                                    &self.guard,
+                                    self.game_id,
+                                    self.next_event_stream_sequence,
+                                    self.config.retention,
+                                )
+                                .await
+                            {
+                                self.fatal.cancel();
+                                let _ = reply.send(Err(anyhow::anyhow!("{error:#}")));
+                                return Err(error);
+                            }
                             let _ = reply.send(Ok(()));
                             return Ok(());
                         }
@@ -1135,6 +1153,14 @@ impl GameActor {
         // consumers after the recovery checkpoint is durable.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let _ = self.engine.run_until(now_ms)?;
+        // Durable decisions have now replayed in stream order. Merge the
+        // incumbent's planned-handoff publication watermark only after that
+        // replay, so decisions at or below the marker still restore state and
+        // command outcomes normally. The checkpoint below persists the max and
+        // atomically retires the transient marker.
+        if let Some(watermark) = self.planned_handoff_event_stream_watermark.take() {
+            self.next_event_stream_sequence = self.next_event_stream_sequence.max(watermark);
+        }
         if self.terminal_pending() {
             // Do not checkpoint or publish the terminal state through the
             // ordinary recovery-snapshot path. A failed materialization stays
@@ -4317,6 +4343,7 @@ mod tests {
                     self.namespace.partition_assignment(self.partition),
                     live_guard.lease_key(),
                     self.namespace.recovery(self.game_id),
+                    self.namespace.planned_handoff_watermark(self.game_id),
                     self.namespace.recovery_failure(self.game_id),
                     self.namespace.active_games(self.partition),
                     self.namespace.command_decisions(self.partition),
@@ -4917,6 +4944,15 @@ mod tests {
                 harness.guard.encoded_token(),
             );
             let mut actor = harness.actor(envelope, harness.guard.clone());
+            harness
+                .bus
+                .persist_planned_handoff_watermark_fenced(
+                    &harness.guard,
+                    harness.game_id,
+                    actor.next_event_stream_sequence,
+                    Duration::from_secs(60),
+                )
+                .await?;
 
             // A wrong-type pending index deterministically rejects the fenced
             // completion/checkpoint transaction before it writes anything.
@@ -4934,6 +4970,16 @@ mod tests {
             assert!(error.to_string().contains("wrong type"));
             assert!(actor.engine.get_committed_state().is_complete());
             assert!(!actor.completion_committed);
+            assert_eq!(
+                harness
+                    .raw
+                    .get::<_, Option<u64>>(
+                        harness.namespace.planned_handoff_watermark(harness.game_id)
+                    )
+                    .await?,
+                Some(actor.next_event_stream_sequence),
+                "failed terminal transaction must not partially retire the handoff marker"
+            );
 
             let before_commit = read_game_events(&mut harness.raw, harness.partition).await?;
             assert!(
@@ -4954,6 +5000,13 @@ mod tests {
             assert_eq!(removed, 1);
             actor.advance_live().await?;
             assert!(actor.completion_committed);
+            assert!(
+                !harness
+                    .raw
+                    .exists::<_, bool>(harness.namespace.planned_handoff_watermark(harness.game_id))
+                    .await?,
+                "successful terminal transaction must retire the handoff marker"
+            );
 
             let after_commit = read_game_events(&mut harness.raw, harness.partition).await?;
             let terminal_events: Vec<_> = after_commit
@@ -5307,6 +5360,288 @@ mod tests {
             assert_eq!(
                 scheduled, 1,
                 "successor replay duplicated a visible outcome"
+            );
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_watermark_advances_successor_snapshot_without_a_barrier_checkpoint()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("handoff-event-watermark").await?;
+            let baseline = harness.recovery().await?;
+            let (sender, receiver) = mpsc::channel(4);
+            let fatal = harness.token.child_token();
+            let handoff_cancel = fatal.child_token();
+            let mut original = GameActor::from_envelope(
+                2,
+                baseline,
+                harness.bus.clone(),
+                harness.guard.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_secs(60),
+                    ..RecoveryConfig::default()
+                },
+                receiver,
+                fatal,
+                handoff_cancel.clone(),
+            );
+
+            original.activate().await?;
+            original
+                .publish_event(GameEvent::TickHash {
+                    hash: 0,
+                    server_ts_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await?;
+            let old_visible_watermark = original.next_event_stream_sequence;
+            assert!(old_visible_watermark > harness.recovery().await?.next_event_stream_sequence);
+
+            handoff_cancel.cancel();
+            let original_task = tokio::spawn(async move { original.run().await });
+            let (barrier_reply, barrier_result) = oneshot::channel();
+            sender
+                .send(GameActorMessage::Barrier {
+                    reply: barrier_reply,
+                })
+                .await?;
+            barrier_result.await??;
+            original_task.await??;
+
+            assert_eq!(
+                harness.recovery().await?.next_event_stream_sequence,
+                0,
+                "Barrier must not write a redundant full-state checkpoint"
+            );
+            assert_eq!(
+                harness
+                    .raw
+                    .get::<_, u64>(harness.namespace.planned_handoff_watermark(harness.game_id))
+                    .await?,
+                old_visible_watermark
+            );
+
+            let successor_guard = harness.takeover().await?;
+            let mut recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&successor_guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].planned_handoff_event_stream_watermark,
+                Some(old_visible_watermark)
+            );
+            let mut successor = harness.actor(recovered.remove(0), successor_guard.clone());
+            successor.activate().await?;
+
+            let successor_snapshot = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|event| matches!(event.event, GameEvent::Snapshot { .. }))
+                .max_by_key(|event| event.stream_seq)
+                .context("successor recovery snapshot was not published")?;
+            assert!(
+                successor_snapshot.stream_seq > old_visible_watermark,
+                "successor snapshot {} did not advance old visible watermark {}",
+                successor_snapshot.stream_seq,
+                old_visible_watermark
+            );
+            assert!(
+                !harness
+                    .raw
+                    .exists::<_, bool>(harness.namespace.planned_handoff_watermark(harness.game_id))
+                    .await?,
+                "successor activation checkpoint must atomically retire the marker"
+            );
+            assert_eq!(
+                harness.recovery().await?.next_event_stream_sequence,
+                old_visible_watermark,
+                "activation checkpoint must persist the merged watermark"
+            );
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_handoff_watermark_is_fenced_and_checkpoint_cleanup_is_atomic() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("handoff-watermark-fence").await?;
+            let marker_key = harness.namespace.planned_handoff_watermark(harness.game_id);
+            harness
+                .bus
+                .persist_planned_handoff_watermark_fenced(
+                    &harness.guard,
+                    harness.game_id,
+                    41,
+                    Duration::from_secs(60),
+                )
+                .await?;
+            assert_eq!(harness.raw.get::<_, u64>(&marker_key).await?, 41);
+
+            let successor_guard = harness.takeover().await?;
+            let error = harness
+                .bus
+                .persist_planned_handoff_watermark_fenced(
+                    &harness.guard,
+                    harness.game_id,
+                    42,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect_err("stale incumbent must not replace the marker");
+            assert!(error.to_string().contains("stale partition lease"));
+            assert_eq!(
+                harness.raw.get::<_, u64>(&marker_key).await?,
+                41,
+                "rejected stale write changed the marker"
+            );
+
+            let mut envelope = harness.recovery().await?;
+            envelope.source_lease_token = successor_guard.encoded_token();
+            envelope.next_event_stream_sequence = 41;
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(
+                    &successor_guard,
+                    &envelope,
+                    &[],
+                    Duration::from_secs(60),
+                )
+                .await?;
+            assert!(
+                !harness.raw.exists::<_, bool>(&marker_key).await?,
+                "successful fenced checkpoint must retire the marker"
+            );
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cooperative_handoff_overwrites_wrong_type_marker_and_allows_takeover() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("handoff-marker-overwrite").await?;
+            harness.defer_game_start().await?;
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let (executor, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_secs(60),
+                    ..RecoveryConfig::default()
+                },
+                CancellationToken::new(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+
+            let marker_key = harness.namespace.planned_handoff_watermark(harness.game_id);
+            let _: usize = harness.raw.hset(&marker_key, "wrong", "type").await?;
+            executor.handoff().await?;
+            task.await
+                .context("executor task panicked during cooperative handoff")??;
+
+            let handoff_watermark: u64 = harness.raw.get(&marker_key).await?;
+            let successor_guard = harness
+                .leases
+                .try_acquire(harness.partition, &harness.owner)
+                .await?
+                .context("successor could not acquire the cooperatively released lease")?;
+            let mut recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&successor_guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].planned_handoff_event_stream_watermark,
+                Some(handoff_watermark),
+                "fenced marker write did not replace the corrupt Redis type"
+            );
+            let mut successor = harness.actor(recovered.remove(0), successor_guard.clone());
+            successor.activate().await?;
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn takeover_discards_corrupt_handoff_markers_and_recovers_the_game() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("handoff-marker-corruption").await?;
+            harness.defer_game_start().await?;
+            let marker_key = harness.namespace.planned_handoff_watermark(harness.game_id);
+
+            // A wrong Redis type previously made the batched GET fail and
+            // aborted recovery for every game in the partition.
+            let _: usize = harness.raw.hset(&marker_key, "wrong", "type").await?;
+            let successor_guard = harness.takeover().await?;
+            let stale_error = harness
+                .bus
+                .load_partition_recovery_fenced(&harness.guard, Duration::from_secs(60))
+                .await
+                .expect_err("stale incumbent must not delete recovery metadata");
+            assert!(stale_error.to_string().contains("authority was lost"));
+            assert!(
+                harness.raw.exists::<_, bool>(&marker_key).await?,
+                "stale takeover read deleted the corrupt marker without authority"
+            );
+            let recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&successor_guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].planned_handoff_event_stream_watermark, None);
+            assert!(
+                !harness.raw.exists::<_, bool>(&marker_key).await?,
+                "takeover did not fence-delete the wrong-type marker"
+            );
+
+            // A string with an invalid u64 payload must take the same automatic
+            // crash-recovery path rather than strand the otherwise valid game.
+            let _: () = harness.raw.set(&marker_key, "18446744073709551616").await?;
+            let mut recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&successor_guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].planned_handoff_event_stream_watermark, None);
+            assert!(
+                !harness.raw.exists::<_, bool>(&marker_key).await?,
+                "takeover did not fence-delete the malformed marker"
+            );
+
+            let mut successor = harness.actor(recovered.remove(0), successor_guard.clone());
+            successor.activate().await?;
+            assert!(
+                harness
+                    .raw
+                    .sismember::<_, _, bool>(
+                        harness.namespace.active_games(harness.partition),
+                        harness.game_id
+                    )
+                    .await?,
+                "corrupt auxiliary marker stranded the recoverable game"
             );
 
             harness.cleanup(&successor_guard).await?;

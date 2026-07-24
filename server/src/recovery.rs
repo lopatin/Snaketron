@@ -297,6 +297,12 @@ pub struct RecoveryEnvelopeV2 {
     pub resolved_client_commands: ResolvedCommandState,
     pub next_server_command_sequence: u32,
     pub next_event_stream_sequence: u64,
+    /// Ephemeral takeover floor loaded from the cooperative-handoff marker.
+    /// It is deliberately outside the durable recovery schema: the successor
+    /// merges it after decision replay, then its first checkpoint persists the
+    /// result and atomically clears the marker.
+    #[serde(skip)]
+    pub planned_handoff_event_stream_watermark: Option<u64>,
     pub checkpointed_at_ms: i64,
     /// Diagnostic only. New writes are controlled by the live lease key.
     pub source_lease_token: String,
@@ -325,6 +331,7 @@ impl RecoveryEnvelopeV2 {
             resolved_client_commands,
             next_server_command_sequence,
             next_event_stream_sequence,
+            planned_handoff_event_stream_watermark: None,
             checkpointed_at_ms,
             source_lease_token,
         }

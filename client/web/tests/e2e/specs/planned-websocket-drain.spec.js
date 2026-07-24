@@ -358,7 +358,11 @@ test('planned drain keeps the old game socket usable until the replacement is fu
     { tick: 8, streamSequence: 13 },
   ]);
 
-  await emitServerMessage(page, candidateSocketIndex, snapshot(14, 99));
+  // A recovery-envelope bridge can precede the live replica snapshot and uses
+  // stream_seq 0. It must not be replayed over newer old-socket state when the
+  // candidate is eventually promoted.
+  await emitServerMessage(page, candidateSocketIndex, snapshot(0, 4));
+  await emitServerMessage(page, candidateSocketIndex, snapshot(14, 9));
   await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
   await sendCommandProbe(page, 'candidate-snapshot-ready');
   expect(await page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
@@ -395,12 +399,44 @@ test('planned drain keeps the old game socket usable until the replacement is fu
   await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
   expect(await continuityPings(page, oldSocketIndex)).toHaveLength(1);
 
+  // The candidate was ready through 14 when the probe was sent. The ordered
+  // old stream advances through 15 before the matching pong, so 15 becomes
+  // the fixed promotion frontier.
+  await emitServerMessage(page, oldSocketIndex, snapshot(14, 9));
+  await emitServerMessage(page, oldSocketIndex, snapshot(15, 10));
+  expect(await continuityPings(page, oldSocketIndex)).toHaveLength(1);
   await emitPongThenQueuedOldMessage(
     page,
     oldSocketIndex,
     { Pong: { client_time: continuityClientTime, server_time: Date.now() } },
-    snapshot(15, 100),
+    snapshot(16, 11),
   );
+  await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
+  await sendCommandProbe(page, 'post-pong-catch-up');
+  await expect.poll(() => page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
+    tick: 11,
+    streamSequence: 16,
+  });
+
+  // The candidate snapshot catches the frozen frontier, but it invalidates the
+  // outcome barrier observed for the earlier recovery envelope. The old socket
+  // and its state remain authoritative until the paired barrier arrives.
+  await emitServerMessage(page, candidateSocketIndex, snapshot(15, 10));
+  await expectOldSocketUsableWithoutOverlay(page, oldSocketIndex);
+  await sendCommandProbe(page, 'takeover-snapshot-awaiting-barrier');
+  expect(await page.evaluate(() => window.__drainGameEvents)).toEqual([
+    { tick: 5, streamSequence: 10 },
+    { tick: 6, streamSequence: 11 },
+    { tick: 7, streamSequence: 12 },
+    { tick: 8, streamSequence: 13 },
+    { tick: 9, streamSequence: 14 },
+    { tick: 10, streamSequence: 15 },
+    { tick: 11, streamSequence: 16 },
+  ]);
+
+  await emitServerMessage(page, candidateSocketIndex, {
+    CommandOutcomesComplete: { game_id: 42 },
+  });
   await expect.poll(() => page.evaluate(({ oldSocketIndex, candidateSocketIndex }) => ({
     activeSocket: window.__mockSockets.indexOf(window.__wsInstance),
     oldReadyState: window.__mockSockets[oldSocketIndex].readyState,
@@ -416,23 +452,51 @@ test('planned drain keeps the old game socket usable until the replacement is fu
     connected: true,
     authenticated: true,
   });
-  await expect.poll(() => page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
-    tick: 99,
-    streamSequence: 14,
+  // Promotion discards the bridge and both buffered live candidate snapshots
+  // because the old application stream already made 16 visible. No rollback
+  // to stream 0, 14, or 15 is replayed.
+  expect(await page.evaluate(() => window.__drainGameEvents)).toEqual([
+    { tick: 5, streamSequence: 10 },
+    { tick: 6, streamSequence: 11 },
+    { tick: 7, streamSequence: 12 },
+    { tick: 8, streamSequence: 13 },
+    { tick: 9, streamSequence: 14 },
+    { tick: 10, streamSequence: 15 },
+    { tick: 11, streamSequence: 16 },
+  ]);
+
+  // Frames already covered by the old transport can arrive after the atomic
+  // socket swap, not just in the candidate's initial buffer. Neither a delayed
+  // live snapshot nor a stream-zero recovery bridge may roll visible state
+  // backward while the promoted stream catches the old watermark.
+  await emitServerMessage(page, candidateSocketIndex, snapshot(15, 10));
+  await emitServerMessage(page, candidateSocketIndex, snapshot(0, 4));
+  await page.waitForTimeout(50);
+  expect(await page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
+    tick: 11,
+    streamSequence: 16,
   });
-  // The Pong proves transport overlap, not a stream fence. A frame already
-  // queued on the retired socket is ignored; the candidate's independent
-  // replica subscription delivers the same authoritative sequence.
-  await emitServerMessage(page, candidateSocketIndex, snapshot(15, 100));
+
+  // Once the promoted transport advances beyond that floor, a later live
+  // snapshot remains eligible to re-anchor ordinary crash recovery.
+  await emitServerMessage(page, candidateSocketIndex, snapshot(17, 12));
   await expect.poll(() => page.evaluate(() => window.__drainGameEvents.at(-1))).toEqual({
-    tick: 100,
-    streamSequence: 15,
+    tick: 12,
+    streamSequence: 17,
   });
 
   await sendCommandProbe(page, 'after-promotion');
   const oldCommandsAfterPromotion = await socketMessages(page, oldSocketIndex, 'GameCommandV2');
   const candidateCommandsAfterPromotion = await socketMessages(page, candidateSocketIndex, 'GameCommandV2');
-  expect(oldCommandsAfterPromotion).toHaveLength(5);
+  expect(oldCommandsAfterPromotion.map((message) => message.GameCommandV2.probe)).toEqual([
+    'before-drain',
+    'candidate-open',
+    'candidate-authenticated',
+    'candidate-lobby-ready',
+    'candidate-snapshot-ready',
+    'post-pong-catch-up',
+    'takeover-snapshot-awaiting-barrier',
+  ]);
   expect(candidateCommandsAfterPromotion.map((message) => message.GameCommandV2.probe)).toEqual([
     'after-promotion',
   ]);
@@ -654,10 +718,10 @@ for (const failurePhase of [
       // the old-path Pong. Readiness alone must not promote or close the old
       // command owner.
       await emitServerMessage(page, oldSocketIndex, snapshot(11, 6));
+      await emitServerMessage(page, candidateSocketIndex, snapshot(11, 91));
       await emitServerMessage(page, candidateSocketIndex, {
         CommandOutcomesComplete: { game_id: 42 },
       });
-      await emitServerMessage(page, candidateSocketIndex, snapshot(11, 91));
       await expect.poll(() => continuityPings(page, oldSocketIndex)).toHaveLength(1);
     }
 

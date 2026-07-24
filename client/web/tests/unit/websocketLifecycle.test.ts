@@ -14,6 +14,7 @@ import {
   isTerminalSnapshotForGame,
   missingRequiredServerCapabilities,
   plannedDrainRemainingMs,
+  promotionOrderingFrontier,
   reconnectDelayMs,
   replacementFailureAction,
   replacementReadyForPromotion,
@@ -135,6 +136,42 @@ test('planned handoff waits when the old socket advances after the candidate sna
     },
   };
   assert.equal(advanceCandidateGameWatermark(candidateWatermark, gapAt13, 42), 11);
+});
+
+test('matching pong freezes the promotion frontier while the old stream keeps advancing', () => {
+  const readiness = {
+    socketOpen: true,
+    authenticated: true,
+    inFlightRequestCount: 0,
+    lobbyReady: true,
+    gameReady: true,
+    gameComplete: false,
+    commandOutcomesReady: true,
+    expectsGame: true,
+    gameStreamWatermark: 11,
+  };
+
+  // The old socket advanced through 12 before its matching pong, so 12 is
+  // required. Frames after that pong cannot turn catch-up into a moving target.
+  const frozenAtPong = promotionOrderingFrontier(12, true, 12);
+  assert.equal(replacementReadyForPromotion(readiness, frozenAtPong), false);
+
+  readiness.gameStreamWatermark = 12;
+  const oldStreamNowAt = 100;
+  assert.equal(
+    replacementReadyForPromotion(
+      readiness,
+      promotionOrderingFrontier(oldStreamNowAt, true, frozenAtPong),
+    ),
+    true,
+  );
+  assert.equal(
+    replacementReadyForPromotion(
+      readiness,
+      promotionOrderingFrontier(oldStreamNowAt, false, null),
+    ),
+    false,
+  );
 });
 
 test('a takeover snapshot replaces the retired owners higher transport watermark', () => {

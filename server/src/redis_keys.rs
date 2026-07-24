@@ -297,6 +297,17 @@ impl RedisKeys {
         )
     }
 
+    /// Highest event watermark published by an incumbent immediately before a
+    /// cooperative handoff. The successor uses it only until its first
+    /// checkpoint makes the merged watermark authoritative.
+    pub fn cluster_planned_handoff_watermark(region: &str, game_id: u32) -> String {
+        let partition = Self::game_partition(game_id);
+        format!(
+            "snaketron:{}:cluster:{region}:game:{game_id}:planned-handoff-watermark:v1",
+            Self::executor_tag(partition)
+        )
+    }
+
     pub fn cluster_recovery_failure(region: &str, game_id: u32) -> String {
         let partition = Self::game_partition(game_id);
         format!(
@@ -385,6 +396,10 @@ mod tests {
         );
         assert_eq!(hash_tag(&RedisKeys::stream_events(0)), "snaketron:exec:0");
         assert_eq!(hash_tag(&RedisKeys::game_snapshot(123)), "snaketron:exec:3");
+        assert_eq!(
+            hash_tag(&RedisKeys::cluster_planned_handoff_watermark("use1", 123)),
+            "snaketron:exec:3"
+        );
 
         // Test game type hashing
         let game_type = common::GameType::FreeForAll { max_players: 2 };
@@ -431,6 +446,7 @@ mod tests {
                 RedisKeys::cluster_partition_lease("use1", partition),
                 RedisKeys::cluster_active_games("use1", partition),
                 RedisKeys::cluster_recovery("use1", game_id),
+                RedisKeys::cluster_planned_handoff_watermark("use1", game_id),
                 RedisKeys::cluster_recovery_failure("use1", game_id),
                 RedisKeys::cluster_command_quarantine("use1", partition),
                 RedisKeys::cluster_command_decisions("use1", partition),

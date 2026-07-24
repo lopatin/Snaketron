@@ -35,6 +35,7 @@ import {
   isTerminalSnapshotForGame,
   missingRequiredServerCapabilities,
   plannedDrainRemainingMs,
+  promotionOrderingFrontier,
   reconnectDelayMs,
   replacementFailureAction,
   replacementReadyForPromotion,
@@ -75,6 +76,8 @@ interface SocketSlot {
   continuityProbeClientTime: number | null;
   continuityProbeActiveGeneration: number | null;
   continuityProbeConfirmed: boolean;
+  promotionStreamFrontier: number | null;
+  promotionSuppressionFloor: number | null;
 }
 
 // Extend window interface for testing
@@ -112,6 +115,39 @@ const clearContinuityProof = (slot: SocketSlot) => {
   slot.continuityProbeClientTime = null;
   slot.continuityProbeActiveGeneration = null;
   slot.continuityProbeConfirmed = false;
+  slot.promotionStreamFrontier = null;
+  slot.promotionSuppressionFloor = null;
+};
+
+const suppressCoveredPromotionEvent = (slot: SocketSlot, rawMessage: any): boolean => {
+  const floor = slot.promotionSuppressionFloor;
+  const gameId = slot.expectedGameId;
+  if (
+    floor === null ||
+    gameId === null ||
+    Number(rawMessage?.GameEvent?.game_id) !== gameId
+  ) {
+    return false;
+  }
+
+  if (isTerminalSnapshotForGame(rawMessage, gameId)) {
+    slot.promotionSuppressionFloor = null;
+    return false;
+  }
+
+  const streamSequence = Number(rawMessage?.GameEvent?.stream_seq);
+  if (!Number.isSafeInteger(streamSequence)) {
+    return false;
+  }
+  if (streamSequence > floor) {
+    slot.promotionSuppressionFloor = null;
+    return false;
+  }
+
+  // The old socket already made this prefix visible. Keep the floor until the
+  // promoted transport proves it has moved beyond that prefix; this also
+  // suppresses a delayed stream-zero nonterminal recovery bridge.
+  return true;
 };
 
 const boundedMetricDuration = (startedAtMs: number, nowMs: number = Date.now()): number =>
@@ -529,6 +565,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       candidate.socket.close(1000, 'client context changed during handoff');
       return;
     }
+    const activeWatermark = candidate.expectedGameId === null
+      ? null
+      : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null;
     const replacementIsReady = replacementReadyForPromotion({
       socketOpen: candidate.socket.readyState === WebSocket.OPEN,
       authenticated: candidate.authenticated,
@@ -539,11 +578,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       commandOutcomesReady: candidate.commandOutcomesReady,
       expectsGame: candidate.expectedGameId !== null,
       gameStreamWatermark: candidate.gameStreamWatermark,
-    }, candidate.expectedGameId === null
-      ? null
-      : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null);
+    }, promotionOrderingFrontier(
+      activeWatermark,
+      candidate.continuityProbeConfirmed,
+      candidate.promotionStreamFrontier,
+    ));
     if (!replacementIsReady) {
-      clearContinuityProof(candidate);
       return;
     }
 
@@ -581,9 +621,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return;
       }
     }
-    // This probe proves only that the old transport was still usable after the
-    // replacement became fully ready. It is not a game-stream ordering fence:
-    // the candidate has its own snapshot, outcome barrier, and replica stream.
+    // The pong proves that the old transport was usable and freezes only the
+    // candidate's minimum catch-up frontier. The old socket remains the visible
+    // application stream and command owner until the atomic promotion below.
     const transportOverlapProved = Boolean(
       previousWasUsable &&
       previous &&
@@ -615,8 +655,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       window.__wsInstance = candidate.socket;
     }
 
+    candidate.promotionSuppressionFloor = transportOverlapProved ? activeWatermark : null;
     const buffered = candidate.bufferedMessages.splice(0);
-    buffered.forEach((message) => dispatchRawMessage(candidate, message));
+    buffered.forEach((message) => {
+      if (suppressCoveredPromotionEvent(candidate, message)) {
+        return;
+      }
+      dispatchRawMessage(candidate, message);
+    });
 
     if (previous && previous !== candidate) {
       previous.role = 'retired';
@@ -729,6 +775,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         Number(rawMessage.Pong.client_time) === candidate.continuityProbeClientTime
       ) {
         dispatchRawMessage(slot, rawMessage);
+        candidate.promotionStreamFrontier = candidate.expectedGameId === null
+          ? null
+          : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null;
         candidate.continuityProbeConfirmed = true;
         promoteCandidate(candidate);
         return;
@@ -895,6 +944,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
         slot.gameReady = true;
         slot.gameComplete = isTerminalSnapshotForGame(rawMessage, slot.expectedGameId);
+        if (!slot.gameComplete) {
+          // Every live snapshot is followed by a recovery-outcome barrier.
+          // A takeover snapshot supersedes any barrier observed for an older
+          // recovery envelope, so promotion must wait for the paired barrier.
+          slot.commandOutcomesReady = false;
+        }
       }
       if (
         slot.expectedGameId !== null &&
@@ -906,12 +961,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
+    if (suppressCoveredPromotionEvent(slot, rawMessage)) {
+      return;
+    }
     dispatchRawMessage(slot, rawMessage);
     const candidate = candidateSlotRef.current;
     if (candidate) {
-      // An old-socket event can move the authoritative watermark ahead of a
-      // candidate after its probe was sent. Revalidate on every active frame
-      // so only a proof from the final overlapping readiness window counts.
+      // Keep applying the old authoritative stream after the continuity pong.
+      // Its frozen frontier does not move, but each frame is another chance for
+      // an already-caught-up candidate to complete atomic promotion.
       promoteCandidate(candidate);
     }
   }, [buildInitialLobbyPreferences, completeActiveRecovery, dispatchRawMessage, promoteCandidate, recoverAfterCandidateFailure, restoreCandidateContext, setAuthHandshakeState]);
@@ -1073,6 +1131,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       continuityProbeClientTime: null,
       continuityProbeActiveGeneration: null,
       continuityProbeConfirmed: false,
+      promotionStreamFrontier: null,
+      promotionSuppressionFloor: null,
     };
   }, []);
 
