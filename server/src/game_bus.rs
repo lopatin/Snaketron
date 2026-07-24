@@ -23,7 +23,9 @@
 //!    parked read or another partition's dispatcher.
 //! 2. `XREAD BLOCK` is a push-like wait (Redis wakes the reader on write) —
 //!    the BLOCK value is a liveness checkpoint, not a poll interval.
-//! 3. One `XREAD` watches all three partition streams at once.
+//! 3. Readers that consume all three partition streams use one `XREAD`;
+//!    gateway replicas use an event-only reader so unrelated command traffic
+//!    can never backpressure user-visible state replication.
 //! 4. Fan-out event/request streams remain bounded. Executor commands are
 //!    untrimmed at publish time and retire only through the executor consumer
 //!    group.
@@ -65,6 +67,14 @@ pub struct PartitionSubscription {
     pub event_receiver: mpsc::Receiver<GameEventMessage>,
     pub command_receiver: mpsc::Receiver<CommandDelivery>,
     pub snapshot_request_receiver: mpsc::Receiver<SnapshotRequest>,
+}
+
+/// A gateway replica only needs authoritative game events. Keeping this
+/// reader separate from executor commands and snapshot requests prevents an
+/// unconsumed stream from applying backpressure to live game replication.
+pub struct PartitionEventSubscription {
+    pub partition_id: u32,
+    pub event_receiver: mpsc::Receiver<GameEventMessage>,
 }
 
 pub struct SnapshotRequestSubscription {
@@ -154,10 +164,11 @@ pub struct GameBus {
     /// dispatcher, so production bootstrap must prewarm exactly one distinct
     /// connection for every partition.
     partition_redis: Vec<RedisConnection>,
-    /// Independent dispatcher for large recovery reads and regional metrics.
-    /// A cloned cluster connection shares the same bounded dispatcher, so
-    /// this must be created separately by the production bootstrap.
-    recovery_redis: RedisConnection,
+    /// One independently-created recovery-read dispatcher per partition.
+    /// Takeover and reconnect fan-out can move many full recovery envelopes;
+    /// isolating partitions prevents one large partition from exhausting the
+    /// bounded redis-rs queue used by every other partition.
+    recovery_redis: Vec<RedisConnection>,
     /// Independent dispatcher for full-state checkpoint and completion
     /// writes. Keeping these writes off the recovery-read dispatcher prevents
     /// a scale-out snapshot burst from stalling authoritative actors.
@@ -177,7 +188,7 @@ impl GameBus {
     pub fn new(
         redis: impl Into<RedisConnection>,
         partition_redis: Vec<RedisConnection>,
-        recovery_redis: impl Into<RedisConnection>,
+        recovery_redis: Vec<RedisConnection>,
         checkpoint_redis: impl Into<RedisConnection>,
         redis_client: impl Into<RedisClient>,
         cancellation_token: CancellationToken,
@@ -188,10 +199,16 @@ impl GameBus {
                 partition_redis.len()
             );
         }
+        if recovery_redis.len() != PARTITION_COUNT as usize {
+            anyhow::bail!(
+                "GameBus requires exactly {PARTITION_COUNT} partition-recovery connections, got {}",
+                recovery_redis.len()
+            );
+        }
         Ok(Self {
             redis: redis.into(),
             partition_redis,
-            recovery_redis: recovery_redis.into(),
+            recovery_redis,
             checkpoint_redis: checkpoint_redis.into(),
             redis_client: redis_client.into(),
             cancellation_token,
@@ -211,6 +228,17 @@ impl GameBus {
             .with_context(|| {
                 format!(
                     "partition {partition_id} is outside the fixed executor range 0..{PARTITION_COUNT}"
+                )
+            })
+    }
+
+    fn recovery_connection(&self, partition_id: u32) -> Result<RedisConnection> {
+        self.recovery_redis
+            .get(partition_id as usize)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "partition {partition_id} is outside the fixed recovery range 0..{PARTITION_COUNT}"
                 )
             })
     }
@@ -359,7 +387,7 @@ impl GameBus {
     }
 
     pub async fn get_stored_snapshot(&self, game_id: u32) -> Result<Option<GameState>> {
-        let mut redis = self.partition_connection(game_id % PARTITION_COUNT)?;
+        let mut redis = self.recovery_connection(game_id % PARTITION_COUNT)?;
         let data: Option<Vec<u8>> = redis
             .get(RedisKeys::game_snapshot(game_id))
             .await
@@ -556,7 +584,7 @@ impl GameBus {
         &self,
         guard: &PartitionLeaseGuard,
     ) -> Result<HashMap<String, CommandDecisionV1>> {
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.recovery_connection(guard.partition())?;
         let script = redis::Script::new(
             r#"
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {0, {}} end
@@ -1037,7 +1065,7 @@ impl GameBus {
         }
         let namespace = guard.namespace();
         let partition = guard.partition();
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.recovery_connection(partition)?;
         let game_ids: Vec<u32> = redis
             .smembers(namespace.active_games(partition))
             .await
@@ -1145,7 +1173,7 @@ impl GameBus {
         namespace: &ClusterNamespace,
         game_id: u32,
     ) -> Result<Option<RecoveryFailureV1>> {
-        let mut redis = self.partition_connection(game_id % PARTITION_COUNT)?;
+        let mut redis = self.recovery_connection(game_id % PARTITION_COUNT)?;
         let payload: Option<Vec<u8>> = redis
             .get(namespace.recovery_failure(game_id))
             .await
@@ -1168,7 +1196,7 @@ impl GameBus {
         namespace: &ClusterNamespace,
         game_id: u32,
     ) -> Result<Option<RecoveryEnvelopeV2>> {
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.recovery_connection(game_id % PARTITION_COUNT)?;
         let payload: Option<Vec<u8>> = redis
             .get(namespace.recovery(game_id))
             .await
@@ -1532,7 +1560,7 @@ impl GameBus {
         partition: u32,
         game_id: u32,
     ) -> Result<crate::completion::CompletionRecordV1> {
-        let mut redis = self.recovery_redis.clone();
+        let mut redis = self.recovery_connection(partition)?;
         let payload: Option<Vec<u8>> = redis
             .get(namespace.completion(game_id))
             .await
@@ -1624,6 +1652,31 @@ impl GameBus {
             anyhow::bail!("terminal matchmaking cleanup found a key with the wrong type");
         }
         Ok(())
+    }
+
+    /// Subscribe a gateway replica to authoritative events only.
+    ///
+    /// The anchor is resolved before returning, preserving the
+    /// subscribe-before-snapshot-request ordering without making the gateway
+    /// parse or buffer executor commands and snapshot requests.
+    pub async fn subscribe_to_partition_events(
+        &self,
+        partition_id: u32,
+    ) -> Result<PartitionEventSubscription> {
+        let (event_tx, event_rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let events_key = RedisKeys::stream_events(partition_id);
+        let mut redis = self.partition_connection(partition_id)?;
+        let event_anchor = resolve_stream_anchor(&mut redis, &events_key).await?;
+        let client = self.redis_client.clone();
+        let token = self.cancellation_token.clone();
+        tokio::spawn(async move {
+            partition_event_reader(client, partition_id, event_anchor, event_tx, token).await;
+        });
+
+        Ok(PartitionEventSubscription {
+            partition_id,
+            event_receiver: event_rx,
+        })
     }
 
     pub async fn subscribe_to_partition(&self, partition_id: u32) -> Result<PartitionSubscription> {
@@ -1919,6 +1972,128 @@ async fn snapshot_request_reader(
                         }
                     }
                     last_id = id;
+                }
+            }
+        }
+    }
+}
+
+/// Gateway event reader. It deliberately does not read executor commands or
+/// snapshot requests: those streams can be much hotter than the event stream,
+/// and a full unused channel must never stall live game replication.
+async fn partition_event_reader(
+    client: RedisClient,
+    partition_id: u32,
+    mut last_id: String,
+    sender: mpsc::Sender<GameEventMessage>,
+    cancellation: CancellationToken,
+) {
+    let key = RedisKeys::stream_events(partition_id);
+    let mut first_connect = true;
+
+    'reconnect: loop {
+        if cancellation.is_cancelled() || sender.is_closed() {
+            return;
+        }
+        let mut connection = match client.get_dedicated_connection().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(
+                    %error,
+                    partition = partition_id,
+                    "Gateway event reader failed to connect"
+                );
+                tokio::time::sleep(Duration::from_millis(READER_RECONNECT_BACKOFF_MS)).await;
+                continue;
+            }
+        };
+
+        if !first_connect {
+            match connection
+                .xrange_count::<_, _, _, _, redis::streams::StreamRangeReply>(&key, "-", "+", 1)
+                .await
+            {
+                Ok(reply) => {
+                    if let Some(oldest) = reply
+                        .ids
+                        .first()
+                        .filter(|oldest| stream_id_less_than(&last_id, &oldest.id))
+                    {
+                        error!(
+                            partition = partition_id,
+                            stream = %key,
+                            resume = %last_id,
+                            oldest = %oldest.id,
+                            "Gateway event reader fell behind the trim horizon; downstream sequence-gap recovery will request snapshots"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    %error,
+                    partition = partition_id,
+                    stream = %key,
+                    "Gateway event reader could not check the trim horizon"
+                ),
+            }
+        }
+        first_connect = false;
+
+        loop {
+            let options = StreamReadOptions::default()
+                .count(XREAD_COUNT)
+                .block(XREAD_BLOCK_MS);
+            let keys = [&key];
+            let ids = [&last_id];
+            let reply = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return,
+                result = connection.xread_options::<_, _, StreamReadReply>(&keys, &ids, &options) => {
+                    match result {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                partition = partition_id,
+                                "Gateway event reader reconnecting after XREAD failure"
+                            );
+                            tokio::time::sleep(Duration::from_millis(READER_RECONNECT_BACKOFF_MS)).await;
+                            continue 'reconnect;
+                        }
+                    }
+                }
+            };
+
+            for stream in reply.keys {
+                for entry in stream.ids {
+                    let entry_id = entry.id.clone();
+                    let message = entry
+                        .map
+                        .get("data")
+                        .ok_or_else(|| anyhow::anyhow!("stream entry has no data field"))
+                        .and_then(|payload| {
+                            redis::from_redis_value::<Vec<u8>>(payload).map_err(anyhow::Error::from)
+                        })
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<GameEventMessage>(&bytes)
+                                .map_err(anyhow::Error::from)
+                        });
+                    match message {
+                        Ok(message) => {
+                            if !matches!(
+                                forward(&sender, message, &cancellation).await,
+                                Forward::Delivered
+                            ) {
+                                return;
+                            }
+                        }
+                        Err(error) => warn!(
+                            %error,
+                            id = %entry_id,
+                            stream = %key,
+                            "Malformed gateway event; skipping"
+                        ),
+                    }
+                    last_id = entry_id;
                 }
             }
         }
@@ -2236,7 +2411,9 @@ mod tests {
         let bus = std::sync::Arc::new(GameBus::new(
             global.clone(),
             partition_connections,
-            global.clone(),
+            (0..PARTITION_COUNT)
+                .map(|_| global.clone().into())
+                .collect(),
             global,
             client.clone(),
             CancellationToken::new(),
@@ -2335,6 +2512,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_recovery_lane_does_not_delay_another_partition() -> Result<()> {
+        let client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (global_push, _global_push_rx) = tokio::sync::broadcast::channel(8);
+        let (recovery_zero_push, _recovery_zero_push_rx) = tokio::sync::broadcast::channel(8);
+        let (recovery_one_push, _recovery_one_push_rx) = tokio::sync::broadcast::channel(8);
+        let global = create_connection_manager(client.clone(), global_push).await?;
+        let recovery_zero = create_connection_manager(client.clone(), recovery_zero_push).await?;
+        let recovery_one = create_connection_manager(client.clone(), recovery_one_push).await?;
+        let partition_connections = (0..PARTITION_COUNT)
+            .map(|_| global.clone().into())
+            .collect();
+        let mut recovery_connections: Vec<RedisConnection> = (0..PARTITION_COUNT)
+            .map(|_| global.clone().into())
+            .collect();
+        recovery_connections[0] = recovery_zero.clone().into();
+        recovery_connections[1] = recovery_one.into();
+        let bus = std::sync::Arc::new(GameBus::new(
+            global.clone(),
+            partition_connections,
+            recovery_connections,
+            global,
+            client.clone(),
+            CancellationToken::new(),
+        )?);
+
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("recovery-lane-stall-{salt}"))?;
+        let stall_key = format!("snaketron:test:recovery-lane-stall:{salt}");
+        let lane_name = format!("snaketron-recovery-stall-{salt}");
+        let mut inspector = client.get_multiplexed_async_connection().await?;
+        let _: () = inspector.del(&stall_key).await?;
+
+        let mut stalled_connection = recovery_zero.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg(&lane_name)
+            .query_async(&mut stalled_connection)
+            .await?;
+        let blocked_key = stall_key.clone();
+        let blocked_read = tokio::spawn(async move {
+            redis::cmd("BLPOP")
+                .arg(blocked_key)
+                .arg(0)
+                .query_async::<Option<(String, String)>>(&mut stalled_connection)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let clients: String = redis::cmd("CLIENT")
+                    .arg("LIST")
+                    .query_async(&mut inspector)
+                    .await?;
+                if clients.lines().any(|line| {
+                    line.contains(&format!("name={lane_name}")) && line.contains("cmd=blpop")
+                }) {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("partition-zero recovery lane never entered its blocking operation")??;
+
+        let blocked_bus = bus.clone();
+        let blocked_namespace = namespace.clone();
+        let blocked_recovery =
+            tokio::spawn(async move { blocked_bus.get_recovery(&blocked_namespace, 10_000).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !blocked_recovery.is_finished(),
+            "partition-zero recovery unexpectedly bypassed its stalled lane"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), bus.get_recovery(&namespace, 10_001),)
+                .await
+                .context("partition-one recovery queued behind partition zero")??
+                .is_none()
+        );
+
+        let _: usize = inspector.rpush(&stall_key, "release").await?;
+        tokio::time::timeout(Duration::from_secs(1), blocked_read)
+            .await
+            .context("partition-zero recovery blocking operation did not release")???;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), blocked_recovery)
+                .await
+                .context("partition-zero recovery did not resume after its lane released")???
+                .is_none()
+        );
+        let _: () = inspector.del(&stall_key).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn partition_hot_recovery_and_checkpoint_paths_use_configured_connections() -> Result<()>
     {
         let hot_client = redis::Client::open("redis://127.0.0.1:6379/12?protocol=resp3")?;
@@ -2355,11 +2630,14 @@ mod tests {
         let mut partition_connections: Vec<RedisConnection> =
             (0..PARTITION_COUNT).map(|_| hot.clone().into()).collect();
         partition_connections[partition as usize] = partition_hot.clone().into();
+        let recovery_connections: Vec<RedisConnection> = (0..PARTITION_COUNT)
+            .map(|_| recovery.clone().into())
+            .collect();
         assert!(
             GameBus::new(
                 hot.clone(),
                 partition_connections[..PARTITION_COUNT as usize - 1].to_vec(),
-                recovery.clone(),
+                recovery_connections.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2373,7 +2651,7 @@ mod tests {
             GameBus::new(
                 hot.clone(),
                 extra_partition_connections,
-                recovery.clone(),
+                recovery_connections.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2381,10 +2659,36 @@ mod tests {
             .is_err(),
             "an extra partition-hot connection must fail construction"
         );
+        assert!(
+            GameBus::new(
+                hot.clone(),
+                partition_connections.clone(),
+                recovery_connections[..PARTITION_COUNT as usize - 1].to_vec(),
+                checkpoint.clone(),
+                hot_client.clone(),
+                CancellationToken::new(),
+            )
+            .is_err(),
+            "a missing partition-recovery connection must fail construction"
+        );
+        let mut extra_recovery_connections = recovery_connections.clone();
+        extra_recovery_connections.push(recovery.clone().into());
+        assert!(
+            GameBus::new(
+                hot.clone(),
+                partition_connections.clone(),
+                extra_recovery_connections,
+                checkpoint.clone(),
+                hot_client.clone(),
+                CancellationToken::new(),
+            )
+            .is_err(),
+            "an extra partition-recovery connection must fail construction"
+        );
         let bus = GameBus::new(
             hot.clone(),
             partition_connections,
-            recovery.clone(),
+            recovery_connections,
             checkpoint.clone(),
             hot_client.clone(),
             CancellationToken::new(),
@@ -2563,7 +2867,9 @@ mod tests {
         let bus = GameBus::new(
             manager.clone(),
             partition_connections,
-            manager.clone(),
+            (0..PARTITION_COUNT)
+                .map(|_| manager.clone().into())
+                .collect(),
             manager.clone(),
             unreachable,
             CancellationToken::new(),

@@ -4,7 +4,8 @@ use redis::AsyncCommands;
 use server::cluster_membership::ClusterNamespace;
 use server::game_executor::PARTITION_COUNT;
 use server::recovery::{
-    PUBLIC_UNRECOVERABLE_GAME_REASON, RECOVERY_FAILURE_SCHEMA_VERSION, RecoveryFailureV1,
+    PUBLIC_UNRECOVERABLE_GAME_REASON, RECOVERY_FAILURE_SCHEMA_VERSION, RecoveryEnvelopeV2,
+    RecoveryFailureV1, ResolvedCommandState,
 };
 use server::redis_keys::RedisKeys;
 use server::ws_server::WSMessage;
@@ -14,6 +15,24 @@ mod common;
 use self::common::{TestClient, TestEnvironment};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn publish_game_event_for_test(
+    redis: &mut redis::aio::MultiplexedConnection,
+    partition_id: u32,
+    event: &GameEventMessage,
+) -> Result<()> {
+    let _: String = redis::cmd("XADD")
+        .arg(RedisKeys::stream_events(partition_id))
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(8192)
+        .arg("*")
+        .arg("data")
+        .arg(serde_json::to_vec(event)?)
+        .query_async(&mut *redis)
+        .await?;
+    Ok(())
+}
 
 async fn publish_snapshot_for_test(
     redis: &mut redis::aio::MultiplexedConnection,
@@ -31,16 +50,7 @@ async fn publish_snapshot_for_test(
             game_state: snapshot.clone(),
         },
     };
-    let _: String = redis::cmd("XADD")
-        .arg(RedisKeys::stream_events(partition_id))
-        .arg("MAXLEN")
-        .arg("~")
-        .arg(8192)
-        .arg("*")
-        .arg("data")
-        .arg(serde_json::to_vec(&event)?)
-        .query_async(&mut *redis)
-        .await?;
+    publish_game_event_for_test(redis, partition_id, &event).await?;
     let _: () = redis
         .set_ex(
             RedisKeys::game_snapshot(game_id),
@@ -559,9 +569,132 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
 
     assert_eq!(retry_after_ms, 500);
     assert!(
+        elapsed >= Duration::from_secs(4),
+        "replica was not withheld for the four-second bounded warm-up: {elapsed:?}"
+    );
+    assert!(
         elapsed < Duration::from_secs(6),
         "retryable warm-up exceeded the six-second authorization deadline: {elapsed:?}"
     );
+
+    // The socket remains valid after a bounded warm-up. Honor the server's
+    // retry hint while making the delayed live snapshot available, then retry
+    // JoinGame on that same connection.
+    let retry_at = Instant::now() + Duration::from_millis(retry_after_ms);
+    let namespace = ClusterNamespace::new("test-region")?;
+    let recovery = RecoveryEnvelopeV2::new(
+        game_id,
+        partition_id,
+        live_state.clone(),
+        "0-0".to_string(),
+        ResolvedCommandState::default(),
+        0,
+        0,
+        chrono::Utc::now().timestamp_millis(),
+        "same-socket-warming-test".to_string(),
+    );
+    let _: () = redis
+        .set_ex(
+            namespace.recovery(game_id),
+            serde_json::to_vec(&recovery)?,
+            300,
+        )
+        .await?;
+    publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
+    tokio::time::sleep_until(retry_at).await;
+    client.join_game(game_id).await?;
+
+    let retried_state = receive_snapshot_without_join_failure(&mut client, game_id).await?;
+    assert_eq!(retried_state.start_ms, live_state.start_ms);
+    assert!(
+        matches!(retried_state.status, GameStatus::Started { .. }),
+        "retry returned a non-live snapshot: {:?}",
+        retried_state.status
+    );
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::CommandOutcomesComplete {
+                    game_id: barrier_game_id,
+                } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "same-socket retry failed before its outcome barrier: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("same-socket retry did not receive its command-outcome barrier")??;
+
+    // Receiving the retry snapshot and outcome barrier is not enough: the
+    // retried JoinGame must have installed a live subscription on the same
+    // socket. A subsequent state delta proves that the connection did not
+    // remain in a one-shot recovery path.
+    let delta_stream_seq = env
+        .server(cold_gateway_index)
+        .expect("cold gateway should be running")
+        .replication_manager()
+        .get_stream_seq(game_id)
+        .await
+        .saturating_add(1);
+    let delta_score = 424_242;
+    let delta = GameEventMessage {
+        game_id,
+        tick: retried_state.tick,
+        sequence: retried_state.event_sequence.saturating_add(1),
+        stream_seq: delta_stream_seq,
+        user_id: None,
+        event: GameEvent::ScoreUpdated {
+            snake_id: 0,
+            score: delta_score,
+        },
+    };
+    publish_game_event_for_test(&mut redis, partition_id, &delta).await?;
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) if event.game_id == game_id => {
+                    if matches!(
+                        event.event,
+                        GameEvent::ScoreUpdated {
+                            snake_id: 0,
+                            score
+                        } if score == delta_score
+                    ) {
+                        assert_eq!(event.stream_seq, delta_stream_seq);
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                WSMessage::GameWarming {
+                    game_id: warming_game_id,
+                    ..
+                } if warming_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "same-socket retry returned to warming after its live snapshot"
+                    ));
+                }
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "same-socket retry failed after its live snapshot: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("same-socket retry did not receive a subsequent live delta")??;
 
     client.disconnect().await?;
     env.shutdown().await?;

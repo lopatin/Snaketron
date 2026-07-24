@@ -288,17 +288,30 @@ impl GameServer {
             "Redis partition-hot connections created successfully"
         );
 
-        // Large recovery reads must not share redis-rs' bounded cluster
-        // dispatcher with latency-sensitive commands, events, or leases.
-        // Cloning `redis` would share that dispatcher, so establish one
-        // independent connection for takeover, reconnect, and telemetry
-        // payloads.
-        let recovery_redis = create_connection_manager_until_available(
+        // Recovery and reconnect fan-out can move many full envelopes during
+        // ownership changes. Give each fixed partition an independently
+        // created dispatcher so one partition cannot fill every recovery
+        // reader's bounded client queue.
+        let recovery_redis = futures_util::future::try_join_all((0..PARTITION_COUNT).map(|_| {
+            create_connection_manager_until_available(
+                redis_client.clone(),
+                cancellation_token.clone(),
+            )
+        }))
+        .await?;
+        info!(
+            connections = recovery_redis.len(),
+            "Redis partition-recovery connections created successfully"
+        );
+
+        // Best-effort regional metrics scan partition indexes and recovery
+        // metadata. Keep telemetry off the correctness-bearing recovery lanes.
+        let metrics_redis = create_connection_manager_until_available(
             redis_client.clone(),
             cancellation_token.clone(),
         )
         .await?;
-        info!("Redis recovery connection created successfully");
+        info!("Redis resilience-metrics connection created successfully");
 
         // Checkpoint and terminal-completion writes carry the full recovery
         // envelope. Give them one independent dispatcher so a scale-out burst
@@ -328,7 +341,7 @@ impl GameServer {
         let game_bus = Arc::new(GameBus::new(
             redis.clone(),
             partition_redis,
-            recovery_redis.clone(),
+            recovery_redis,
             checkpoint_redis,
             redis_client.clone(),
             cancellation_token.clone(),
@@ -484,7 +497,7 @@ impl GameServer {
         // counters through CloudWatch Embedded Metric Format. Telemetry is
         // intentionally best effort and never participates in authority.
         handles.push(spawn_resilience_metrics(
-            recovery_redis,
+            metrics_redis,
             cluster_namespace.clone(),
             lifecycle.clone(),
             server_id,

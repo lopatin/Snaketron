@@ -105,7 +105,7 @@ async fn streams_bus(token: CancellationToken) -> Result<StreamsTestBus> {
         bus: GameBus::new(
             redis.clone(),
             (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
-            redis.clone(),
+            (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
             redis.clone(),
             client,
             token,
@@ -1328,7 +1328,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         let envelope = RecoveryEnvelopeV2::new(
             game_id,
             partition,
-            final_state,
+            final_state.clone(),
             "0-0".into(),
             ResolvedCommandState::default(),
             0,
@@ -1388,6 +1388,59 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             )
             .await?
         );
+
+        // Observing the terminal event is sufficient proof that every durable
+        // completion artifact already exists: the fenced Lua transaction
+        // writes these values before its terminal XADD.
+        let terminal_entries: redis::streams::StreamRangeReply = redis
+            .xrange_all(RedisKeys::stream_events(partition))
+            .await?;
+        assert_eq!(terminal_entries.ids.len(), 1);
+        let terminal_payload: Vec<u8> = redis::from_redis_value(
+            terminal_entries.ids[0]
+                .map
+                .get("data")
+                .expect("terminal event has data"),
+        )?;
+        let terminal_event: GameEventMessage = serde_json::from_slice(&terminal_payload)?;
+        assert!(matches!(
+            terminal_event.event,
+            GameEvent::Snapshot {
+                game_state: GameState {
+                    status: GameStatus::Complete { .. },
+                    ..
+                }
+            }
+        ));
+        let stored_completion: Vec<u8> = redis.get(namespace.completion(game_id)).await?;
+        assert_eq!(
+            stored_completion,
+            server::completion::canonical_json_bytes(&record)?
+        );
+        let stored_recovery = bus
+            .get_recovery(&namespace, game_id)
+            .await?
+            .expect("terminal event implies a recovery envelope");
+        assert_eq!(stored_recovery.game_id, game_id);
+        assert_eq!(stored_recovery.game_state.status, final_state.status);
+        assert_eq!(
+            bus.get_stored_snapshot(game_id)
+                .await?
+                .expect("terminal event implies a stored snapshot")
+                .status,
+            final_state.status
+        );
+        assert!(
+            redis
+                .sismember::<_, _, bool>(namespace.pending_completions(partition), game_id)
+                .await?
+        );
+        assert!(
+            !redis
+                .sismember::<_, _, bool>(namespace.active_games(partition), game_id)
+                .await?
+        );
+
         bus.cleanup_matchmaking_for_completion(&record).await?;
         for key in [
             &user_player_key,
@@ -1655,6 +1708,44 @@ async fn paused_consumer_loses_nothing() -> Result<()> {
                 expected, msg.stream_seq
             );
         }
+
+        token.cancel();
+        cleanup(partition).await;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn gateway_event_subscription_is_independent_of_command_backpressure() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
+    timeout(Duration::from_secs(10), async {
+        let token = CancellationToken::new();
+        let bus = streams_bus(token.clone()).await?;
+        let partition = test_partition(11);
+        let mut events = bus.subscribe_to_partition_events(partition).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // More than the legacy combined reader's 2,000-entry command channel.
+        // A gateway never consumes this stream, so it must be structurally
+        // impossible for the backlog to delay a later authoritative event.
+        for _ in 0..2_100 {
+            bus.publish_command(
+                partition,
+                &StreamEvent::StatusUpdated {
+                    game_id: partition,
+                    status: GameStatus::Stopped,
+                },
+            )
+            .await?;
+        }
+        bus.publish_event(partition, &event(partition, 1)).await?;
+
+        let received = timeout(Duration::from_secs(1), events.event_receiver.recv())
+            .await?
+            .expect("gateway event reader stopped unexpectedly");
+        assert_eq!(received.game_id, partition);
+        assert_eq!(received.stream_seq, 1);
 
         token.cancel();
         cleanup(partition).await;

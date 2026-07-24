@@ -1,5 +1,5 @@
-use crate::game_bus::{CommandDeliveryPayload, GameBus, PartitionSubscription};
-use crate::game_executor::{PARTITION_COUNT, StreamEvent};
+use crate::game_bus::{GameBus, PartitionEventSubscription};
+use crate::game_executor::PARTITION_COUNT;
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState, GameStatus};
 use std::collections::{HashMap, HashSet};
@@ -408,6 +408,24 @@ impl PartitionReplica {
         Ok(())
     }
 
+    async fn process_received_event(&self, event: GameEventMessage) -> Result<()> {
+        let game_id = event.game_id;
+        let is_terminal_snapshot = matches!(
+            &event.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
+        );
+        self.process_event(event).await?;
+        if is_terminal_snapshot {
+            // The fenced completion transaction writes the immutable
+            // completion record, recovery envelope, stored snapshot, and
+            // pending-effect index before appending this event.
+            // `process_event` broadcasts before returning.
+            self.evict_game(game_id).await;
+        }
+        Ok(())
+    }
+
     /// Ask the executor to republish snapshots for this partition, at most
     /// once per second, so sustained loss doesn't turn into a request storm.
     async fn request_snapshots_rate_limited(&self) {
@@ -451,7 +469,7 @@ impl PartitionReplica {
             let result = tokio::select! {
                 biased;
                 _ = self.cancellation_token.cancelled() => return Ok(()),
-                result = self.bus.subscribe_to_partition(self.partition_id) => result,
+                result = self.bus.subscribe_to_partition_events(self.partition_id) => result,
             };
             match result {
                 Ok(subscription) => break subscription,
@@ -492,25 +510,14 @@ impl PartitionReplica {
             }
         }
 
-        // Destructure subscription so each receiver can be borrowed independently in select!
-        let PartitionSubscription {
+        let PartitionEventSubscription {
             partition_id: _,
-            command_anchor: _,
             mut event_receiver,
-            mut command_receiver,
-            mut snapshot_request_receiver,
         } = subscription;
 
         // Mark as ready immediately (initial state arrives via the snapshot
         // request above; there is no historical catch-up phase)
         self.status.write().await.is_ready = true;
-
-        // Events and commands use separate Redis streams, so the durable completion marker can
-        // arrive before the final snapshot even though the executor publishes the snapshot first.
-        // Track both sides and evict only after this replica has processed (and broadcast) that
-        // terminal snapshot.
-        let mut terminal_snapshots_seen = HashSet::new();
-        let mut durable_completion_markers = HashSet::new();
 
         // Main event processing loop
         loop {
@@ -526,20 +533,8 @@ impl PartitionReplica {
                 event = event_receiver.recv() => {
                     match event {
                         Some(event) => {
-                            let game_id = event.game_id;
-                            let is_terminal_snapshot = matches!(
-                                &event.event,
-                                GameEvent::Snapshot { game_state }
-                                    if matches!(game_state.status, GameStatus::Complete { .. })
-                            );
-                            if let Err(e) = self.process_event(event).await {
+                            if let Err(e) = self.process_received_event(event).await {
                                 error!("Failed to process event in partition {}: {}", self.partition_id, e);
-                            } else if is_terminal_snapshot {
-                                terminal_snapshots_seen.insert(game_id);
-                                if durable_completion_markers.remove(&game_id) {
-                                    terminal_snapshots_seen.remove(&game_id);
-                                    self.evict_game(game_id).await;
-                                }
                             }
                         }
                         None => {
@@ -550,35 +545,6 @@ impl PartitionReplica {
                     }
                 }
 
-                // Completion commands are published only after the final state is durable.
-                // Until then, keep the completed in-memory state available for refreshes.
-                Some(delivery) = command_receiver.recv() => {
-                    let CommandDeliveryPayload::Command(command) = delivery.payload else {
-                        warn!(
-                            partition = self.partition_id,
-                            stream_id = %delivery.stream_id,
-                            "Ignoring poison command in replica tail reader"
-                        );
-                        continue;
-                    };
-                    if let StreamEvent::StatusUpdated {
-                        game_id,
-                        status: GameStatus::Complete { .. },
-                    } = command
-                    {
-                        if terminal_snapshots_seen.remove(&game_id) {
-                            self.evict_game(game_id).await;
-                        } else {
-                            durable_completion_markers.insert(game_id);
-                        }
-                    }
-                }
-
-                // Drain snapshot requests (processed by game executor, not used here)
-                Some(_) = snapshot_request_receiver.recv() => {
-                    // Snapshot requests are handled by the game executor, we just drain them
-                    // to prevent the channel from filling up and stalling the stream reader
-                }
             }
         }
 
@@ -860,13 +826,17 @@ impl ReplicationManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContinuityAction, FilteredEventReceiver, ReplicaStore, ReplicatedGame, continuity_action,
-        is_stateful_unknown_event, replica_snapshot,
+        ContinuityAction, FilteredEventReceiver, GameEventBroadcasters, PartitionReplica,
+        ReplicaStore, ReplicatedGame, continuity_action, is_stateful_unknown_event,
+        replica_snapshot,
     };
-    use common::{GameEvent, GameEventMessage, GameState, GameType, QueueMode};
+    use crate::game_bus::GameBus;
+    use crate::game_executor::PARTITION_COUNT;
+    use common::{GameEvent, GameEventMessage, GameState, GameStatus, GameType, QueueMode};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::{Barrier, RwLock, broadcast};
+    use tokio_util::sync::CancellationToken;
 
     fn event(sequence: u64, stream_seq: u64) -> GameEventMessage {
         GameEventMessage {
@@ -1025,6 +995,78 @@ mod tests {
         let (observed_state, observed_stream_seq) = reader.await.expect("reader task");
         assert_eq!(observed_state.start_ms, 11);
         assert_eq!(observed_stream_seq, 11);
+    }
+
+    #[tokio::test]
+    async fn terminal_snapshot_is_broadcast_before_replica_eviction() {
+        let client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")
+            .expect("valid local Redis URL");
+        let (push_tx, _push_rx) = broadcast::channel(8);
+        let manager = crate::redis_utils::create_connection_manager(client.clone(), push_tx)
+            .await
+            .expect("local Redis is required for replication tests");
+        let bus = Arc::new(
+            GameBus::new(
+                manager.clone(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                manager,
+                client,
+                CancellationToken::new(),
+            )
+            .expect("test GameBus"),
+        );
+
+        let replica_store: ReplicaStore = Arc::new(RwLock::new(HashMap::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let broadcasters: GameEventBroadcasters =
+            Arc::new(RwLock::new(HashMap::from([(1, event_tx)])));
+        let replica = PartitionReplica::new(
+            1,
+            bus,
+            replica_store.clone(),
+            broadcasters.clone(),
+            CancellationToken::new(),
+        );
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let terminal = GameEventMessage {
+            game_id: 1,
+            tick: state.tick,
+            sequence: state.event_sequence,
+            stream_seq: 1,
+            user_id: None,
+            event: GameEvent::Snapshot { game_state: state },
+        };
+
+        replica
+            .process_received_event(terminal.clone())
+            .await
+            .expect("terminal event processes");
+
+        let received = event_rx
+            .recv()
+            .await
+            .expect("existing receiver gets terminal snapshot");
+        assert_eq!(received.game_id, terminal.game_id);
+        assert_eq!(received.stream_seq, terminal.stream_seq);
+        assert!(matches!(
+            received.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(replica_store.read().await.is_empty());
+        assert!(broadcasters.read().await.is_empty());
     }
 
     #[test]

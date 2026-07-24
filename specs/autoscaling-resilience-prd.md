@@ -263,11 +263,24 @@ The assignment coordinator is control plane only. Existing assignments and activ
 15. Keep `PartitionLeaseStore` acquire/renew/release, membership, assignment,
     matchmaking, and readiness on the low-volume global control connection.
     Partition-hot fenced scripts still validate the lease key atomically from
-    their partition lane. Recovery reads, checkpoint writes, RESP3 Pub/Sub, and
-    stream fan-out readers retain their separately bootstrapped connections.
-    This is a fixed ten-lane topology matching the existing partition count,
-    not a dynamic pool, per-game connection, priority scheduler, or retry
-    system.
+    their partition lane.
+16. Before a task becomes ready, independently bootstrap exactly one
+    recovery-read `redis-rs` cluster connection for each of the ten fixed
+    partitions. Takeover journal/envelope loads, stored-snapshot and
+    recovery-failure loads, reconnect outcome reads, and completion-record
+    loads use the deterministic recovery lane for their partition. Regional
+    resilience metrics use one additional independently bootstrapped,
+    best-effort dispatcher so telemetry cannot queue ahead of recovery.
+    Full-state periodic checkpoints and terminal completion commits retain
+    exactly one independently bootstrapped checkpoint-write dispatcher per
+    task. RESP3 Pub/Sub and stream fan-out readers retain their own dedicated
+    connections.
+17. The fixed topology is ten partition-hot lanes, ten partition-scoped
+    recovery-read lanes, one global control dispatcher, one checkpoint-write
+    dispatcher, one metrics dispatcher, and the already separate Pub/Sub and
+    stream-reader connections. Do not add a dynamic or per-game pool, a
+    priority scheduler, longer client deadlines, a recovery cache, another
+    persistence format, or retries that conceal queueing.
 
 ### R5 — Command acknowledgement, idempotency, and resend
 
@@ -334,15 +347,30 @@ The assignment coordinator is control plane only. Existing assignments and activ
     next existing periodic checkpoint. Concurrent gateway warm-up requests
     therefore coalesce without weakening subscribe-before-request ordering.
     Successor activation still publishes its immediate recovery re-anchor.
-13. The partition reader must round-robin the complete projection for each
-    addressable game, keep at most one unresolved delivery per game, and use a
-    bounded fan-out. A later command, status, creation, cursor, decision,
-    checkpoint, ACK, or actor-membership action for one game must first settle
-    that game's earlier accepted delivery; it must not wait for unrelated
-    games. Global drains are limited to Poison boundaries, ownership handoff,
-    the bounded fan-out window, failure, and batch completion. This removes
-    cross-game head-of-line blocking without introducing a second scheduler or
-    relaxing per-game ordering and recovery semantics.
+13. The authoritative executor partition reader must round-robin the complete
+    projection for each addressable game, keep at most one unresolved delivery
+    per game, and use a bounded fan-out. A later command, status, creation,
+    cursor, decision, checkpoint, ACK, or actor-membership action for one game
+    must first settle that game's earlier accepted delivery; it must not wait
+    for unrelated games. Global drains are limited to Poison boundaries,
+    ownership handoff, the bounded fan-out window, failure, and batch
+    completion. This removes cross-game head-of-line blocking without
+    introducing a second scheduler or relaxing per-game ordering and recovery
+    semantics.
+14. Gateway replicas must use a resumable event-only partition reader. They
+    must not read or drain the executor command stream or snapshot-request
+    stream: pressure on either unrelated stream must not block authoritative
+    game events from reaching connected sockets. The reader anchors before
+    subscription returns, reconnects from its last event-stream ID, and logs a
+    trim-horizon gap for diagnosis. Existing per-game sequence-gap and join-side
+    snapshot repair remain responsible for re-anchoring a stale replica.
+15. After broadcasting a full terminal snapshot, a gateway replica may evict
+    that game immediately. The fenced completion script stores the immutable
+    completion record, final recovery envelope, stored snapshot, pending-effect
+    index, and terminal publications in one atomic partition-slot operation
+    before the terminal snapshot can be observed. The existing command-stream
+    terminal status remains available for executor cleanup, but gateways
+    neither consume it nor wait for it as an eviction/liveness dependency.
 
 ### R7 — Planned partition handoff and task shutdown
 
@@ -458,6 +486,13 @@ The assignment coordinator is control plane only. Existing assignments and activ
 14. ECS container liveness checks run every five seconds with a startup grace period.
 15. New tasks become routable automatically after ECS discovery and readiness pass.
 16. Traefik's `ping` endpoint must remain enabled because its container health command is `traefik healthcheck --ping`.
+17. Retain the per-source-IP WebSocket rate average of 50 upgrades per second
+    and the separate persistent-socket cap, but set the upgrade burst to 512 so
+    the certified same-IP make-before-break cohort is not rejected during
+    scale-in. A client or certification session that receives upgrade `429`
+    retries through the ordinary reconnect path inside its existing admission
+    deadline. This is burst capacity, not a higher sustained rate or a relaxed
+    readiness deadline.
 
 ### R11 — Idempotent finalization and external effects
 
@@ -474,7 +509,15 @@ The assignment coordinator is control plane only. Existing assignments and activ
     - remove only that game's active-match record;
     - remove player, spectator, and lobby active-game mappings only when their current value still equals the completed game ID;
     - never delete a mapping that has already advanced to a newer game.
-11. The partition-local fenced completion commit must durably publish one full terminal snapshot and one terminal status notification. Retrying after a timeout or crash must repair a missing notification without publishing duplicates during the completion grace period.
+11. The partition-local fenced completion commit must durably publish one full
+    terminal snapshot and one terminal status notification in the same atomic
+    script that stores the immutable completion record, final recovery
+    envelope, stored snapshot, and pending-effect index. Retrying after a
+    timeout or crash must repair a missing notification without publishing
+    duplicates during the completion grace period. Because readers cannot
+    observe the terminal snapshot before those durable writes commit, a gateway
+    replica broadcasts that snapshot and then evicts its local game without
+    waiting for a command-stream marker.
 12. Durable effects must enforce their dependency order in the storage transaction: no XP, MMR, ranking, or high-score effect may commit before the completed-game record, and a ranking projection may not commit before its matching MMR effect.
 13. A successor executor must be able to finalize a game created or previously executed by another task. Completion identity must be the durable game ID and immutable completion revision; it must not require the finalizing task's server ID to match the original executor.
 
@@ -673,12 +716,13 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Leave a command pending beyond 8,192 later appends | Safe trimming retains and reclaims the pending command. |
 | Fail checkpoint writes for nine seconds, then for eleven seconds, with the ten-second age budget | In the nine-second case commands remain pending and checkpointing recovers; in the eleven-second case the actor fails closed at the budget without falsely retiring work. |
 | Block one game actor while a later command targets another game in the same partition batch | The unrelated game receives its command before the blocked actor is released; each game retains one unresolved delivery at most, cursors never regress, and a handoff drains only the accepted prefix while leaving the untouched suffix recoverable in the PEL. |
+| Flood the executor command stream beyond the legacy gateway channel capacity while publishing a later authoritative event | The event-only gateway reader continues delivering the event promptly because it reads neither commands nor snapshot requests. |
 | Inject failure at each WebSocket drain phase | Old socket remains usable until replacement auth, rejoin, snapshot, and switch complete; only one sends commands. |
 | Close an old socket after a new socket restores the same lobby/game | Old cleanup does not remove new presence or active context. |
 | Persist a lobby member without delivering its Pub/Sub hint, then enqueue a stale hint | Every connected member converges to the durable roster by the next successful periodic read; the stale payload is never presented as authoritative state, and unchanged later reads enqueue no duplicate update. |
 | Attempt `CreateLobby` and `JoinLobby` while already in a lobby | Both requests receive `AccessDenied` and require `LeaveLobby`; the current presence, roster subscription, match subscription, and chat subscription continue without duplicate roster or history delivery. |
 | Crash gateway during an ambiguous command send | Resend uses the same identity; outcome is one acceptance or one terminal rejection. |
-| Admit new sessions continuously while a backend performs the configured eight-second route-withdrawal wait | Existing sockets migrate; late new upgrade attempts may receive retryable `503`, but every new session reaches a ready backend within ten seconds and surfaces no terminal user error. Provider/health settings and exact healthy-backend coverage corroborate capacity; no internal readiness-transition timestamp is required. |
+| Admit new sessions continuously while a backend performs the configured eight-second route-withdrawal wait | Existing sockets migrate; late new upgrade attempts may receive retryable `503`, and a same-IP certification burst may receive retryable `429`, but every new session retries through the ordinary reconnect path, reaches a ready backend within the unchanged ten-second deadline, and surfaces no terminal user error. The per-IP sustained average remains 50 upgrades per second, the burst is 512, and provider/health settings plus exact healthy-backend coverage corroborate capacity; no internal readiness-transition timestamp is required. |
 | Repeat and concurrently submit one lobby admission, then submit two lobbies containing the same user | One immutable lobby identity and one per-user claim win; every queue/MMR index has one exact member; conflicting admission is rejected; cancellation or match commit removes every winning claim so no stale lobby can rematch a user. |
 | Lose admission or cancellation responses, retry them, and interrupt the caller between durable queue mutation and presentation refresh | The atomic queue identity and lobby metadata state agree (`queued`, `waiting`, or `matched`); retries converge without a hidden queue member or stranded queued banner. |
 | Concurrent matchmakers select the same lobbies | Exactly one atomic claim wins; no player or lobby belongs to two committed matches. |
@@ -686,15 +730,17 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Commit immediately before a connected lobby listener subscribes, then drop or duplicate the Pub/Sub hint | Subscribe-then-read or the five-second reconciliation forwards the durable game ID once; duplicate hint/read overlap does not send a second `JoinGame`, and a later play-again game ID is still delivered. |
 | Kill after the fenced Valkey completion commit and before each DynamoDB effect or its confirmation marker | A successor reloads the same immutable completion revision; completed game, XP, MMR, rankings, and high scores converge to one application per effect key, and pending completion state is retained until all effects are confirmed. |
 | Time out the fenced completion commit after it may have executed, then retry it repeatedly | The exact same completion record is accepted; one terminal snapshot and one terminal status are observable, matchmaking cleanup converges, and no completion effect is duplicated. |
+| Deliver the full terminal snapshot to a gateway replica | The snapshot is broadcast before local eviction; the immutable completion record, final recovery envelope, stored snapshot, and pending-effect index are already durable from the same fenced transaction, so no command-stream completion marker is consumed or awaited. |
 | Delay completion cleanup until a player or lobby is mapped to a newer game | The old active-match record is removed, but every newer user/lobby mapping remains unchanged. |
 | Complete a game on a takeover executor with a different task/server identity | Final state and every durable effect commit once under the original game ID and one completion revision; original executor identity is not required. |
-| Join an active game through a newly ready cold task | Snapshot warming succeeds inside the six-second authorization deadline or returns `GameWarming` with a 500 ms retry hint, never a false missing-game result. |
+| Join an active game through a newly ready cold task | Snapshot warming succeeds inside the six-second authorization deadline or returns `GameWarming` with a 500 ms retry hint, never a false missing-game result. A playing-phase certification client pauses command emission, retries `JoinGame` on the same authenticated socket within its existing game deadline, and resumes only after a fresh snapshot and `CommandOutcomesComplete`; it must not manufacture a reconnect or continue sending against a cold replica. |
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
 | Run the fixed 224-session / 112-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition, adjust the fixed cohort again, or weaken the budget. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
-| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes and the independently bootstrapped control, recovery-read, checkpoint-write, loss-tolerant Pub/Sub, and stream-fan-out connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Stall one partition's recovery-read lane while reading another partition's recovery envelope | The other partition completes its recovery read within one second, and the metrics dispatcher is independently bootstrapped from every correctness-bearing recovery lane. |
 | Stall one partition's `GameCreated` destination lane while another partition has a valid durable outbox record | The unstalled partition publishes and compare-deletes its record within one second while the stalled record remains authoritative in the outbox; after release, the stalled partition publishes exactly once and is acknowledged. |
 | Make one `GameCreated` delivery fail for a record-specific wrong-type marker, followed by a valid record in the same partition batch | The failed record remains in the durable outbox, while the later record still publishes, is compare-deleted, and receives marker expiry within one second. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
@@ -760,9 +806,10 @@ criteria pass before the production ramp.
 | --- | --- |
 | Assignment module + `redis_keys.rs` | Membership, coordinator, canonical assignment, monotonic partition views, allocator, and explicit Cluster hash-slot families. |
 | `server/src/redis_utils.rs` | One standalone/cluster-aware connection abstraction; TLS and Redis Cluster selection from the deployment URL. |
-| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, deterministic routing through ten prewarmed partition-hot lanes, lease-aware single-slot scripts, versioned checkpoint APIs, idempotent outbox delivery, and separately retryable completion cleanup. |
+| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, deterministic routing through ten prewarmed partition-hot lanes and ten independently prewarmed partition-scoped recovery-read lanes, event-only gateway subscriptions, lease-aware single-slot scripts, versioned checkpoint APIs, idempotent outbox delivery, and separately retryable completion cleanup. |
 | `server/src/game_executor_v2.rs` | Recovery envelope, dedupe, active-game index, backlog-first resume, cooperative checkpoint/release, idempotent finalization. |
 | `server/src/game_server.rs` and `main.rs` | SIGTERM, lifecycle state, readiness state, critical-worker failure policy, one bounded drain deadline. |
+| `server/src/replication.rs` | Event-only resumable partition readers and broadcast-before-eviction handling for atomically durable terminal snapshots. |
 | `server/src/matchmaking.rs` and manager | Atomic queue admission/cancellation/commit scripts, durable user-to-game mappings, and a bounded `GameCreated` outbox routed through one nonblocking delivery worker per fixed partition. |
 | `server/src/ws_server.rs` | Explicit auth response, drain protocol, generation-safe cleanup, active-game resolution, retryable warming. |
 | `client/web/contexts/WebSocketContext.tsx` | Immediate/backoff reconnect, socket generations, dual-socket drain, explicit auth, one command owner. |
@@ -782,8 +829,14 @@ criteria pass before the production ramp.
 - Active authority is an exact, unique lease token.
 - Consumer groups are executor-only.
 - The fenced consumer-group executor is the only executor implementation.
+- Gateway replicas tail only authoritative partition events; they do not consume
+  executor commands or snapshot requests.
 - `CommandScheduledV2` is the positive semantic acknowledgement; `XACK` is still required internally.
 - Checkpoints remain full and per game.
+- Recovery reads use ten fixed partition lanes, resilience metrics use a
+  separate dispatcher, and full-state checkpoint/completion writes retain one
+  dispatcher per task. No additional pools, deadline increases, or cache layer
+  are part of this release.
 - Gateway and executor remain in the same binary/service but are logically independent.
 - Planned task removal uses dual sockets; executor movement alone never moves sockets.
 - Matchmaking safety comes from atomic admission/cancellation and one matchmaking-slot commit, plus one narrow idempotent outbox bridge into the executor partition slot; it does not require a singleton or generic saga system.
@@ -907,11 +960,11 @@ the set therefore grew forever and was duplicated into every checkpoint and
 snapshot. Cleanup succeeded and an independent inventory found no development
 runtime resource remaining.
 
-The corrective patch bounds that existing queue bookkeeping, resets the actor
-tick interval after slow publication so queued mail gets a bounded opportunity,
-and routes large checkpoint, takeover, reconnect-outcome, completion-record,
-and metrics traffic through one independently bootstrapped recovery dispatcher.
-It does not add per-partition pools or a new persistence format. A local
+The corrective patch bounded that existing queue bookkeeping, reset the actor
+tick interval after slow publication so queued mail got a bounded opportunity,
+and routed large checkpoint, takeover, reconnect-outcome, completion-record,
+and metrics traffic through the then-single independently bootstrapped recovery
+dispatcher. It did not add per-partition pools or a new persistence format. A local
 144-session / 72-duel run then passed 288 of 288 sessions, 144 of 144 games, and
 258,446 of 258,446 command outcomes with zero disconnect, a 148-millisecond
 maximum outcome, sub-second pending age, and a recovery-envelope plateau near
@@ -936,8 +989,8 @@ The transition evidence also caught seven recovery reads and one retry-safe
 fenced checkpoint write timing out together on the shared recovery dispatcher.
 Unacknowledged work was retained, the next checkpoint succeeded, the game
 completed durably, and no fence rejection or data loss occurred. The minimum
-correction opens one fresh checkpoint-write dispatcher per task, leaving bulk
-reads and regional metrics on the existing recovery-read dispatcher; it does
+correction opened one fresh checkpoint-write dispatcher per task, leaving bulk
+reads and regional metrics on the then-existing recovery-read dispatcher; it did
 not add per-partition pools, new persistence, a timeout increase, or a reader
 endpoint. The first follow-up calibration used 128 sessions / 64 duels based
 on the saturated pre-split run; that was a declared hypothesis, not a product
@@ -990,17 +1043,82 @@ in-flight requests, so this is not a claim that Redis strictly serializes
 requests; the run instead implicates shared client-dispatcher/socket coupling,
 not Serverless capacity. The minimum correction is the fixed topology in R4:
 ten deterministic prewarmed partition-hot lanes, with the low-volume global
-control connection and the existing recovery-read, checkpoint-write, Pub/Sub,
-and fan-out connections kept separate. The durable `GameCreated` scanner also
-routes to one bounded sequential worker per fixed partition so a caller does
-not recreate cross-partition queueing above those lanes. `PartitionLeaseStore`
-remains on control. This adds no dynamic pool, per-game connection, new
-persistence format, or retry policy.
+control connection and the then-existing recovery-read, checkpoint-write,
+Pub/Sub, and fan-out connections kept separate. The durable `GameCreated`
+scanner also routes to one bounded sequential worker per fixed partition so a
+caller does not recreate cross-partition queueing above those lanes.
+`PartitionLeaseStore` remains on control. This added no dynamic pool, per-game
+connection, new persistence format, or retry policy.
 
 Run `30050625836` is diagnostic evidence only. The 224-session / 112-duel
 cohort, CPU 70% / memory 80% targets, one-second outcome gate, and all planned
 and crash acceptance criteria remain unchanged. Fresh complete planned and
 SIGKILL AWS runs are still required after the ten-lane correction.
+
+The next exact-source Serverless run
+([GitHub Actions 30057487544](https://github.com/lopatin/snaketron-io/actions/runs/30057487544),
+outer commit `e23c6b5f3a62bdacdb51742aa12b03b5d8836a0c`, Snaketron commit
+`36f7ac51912072fa6de3d6f2f43f9410d801c6de`) proved the actual Serverless
+deployment and substantially more control-plane behavior. Natural CPU target
+tracking moved `1 -> 2`; the deterministic staircase then moved `1 -> 10 -> 1`
+with healthy assignments and leases. Valkey 8 reported zero `Evictions` and
+zero `ThrottledCmds`. The run attempted 2,770 sessions, completed 2,747, and
+submitted 2,167,559 commands.
+
+It nevertheless failed the unchanged planned-path acceptance gates. Twenty-three
+sessions failed: 19 timed out waiting for their games, while the remaining four
+were two WebSocket-upgrade `429` failures and their paired lobby-session
+failures. Forty-six planned handoffs hard-reconnected or were marked failed,
+with a 3,497-millisecond maximum usable-session gap. Three hundred commands
+remained unresolved, maximum command-outcome latency was 10,381 milliseconds,
+and 534 original-send seconds exceeded the one-second outcome budget.
+
+The failure evidence identifies one causal application-side gateway queue, one
+independent recovery-dispatcher contention risk, and one bounded ingress-burst
+mismatch rather than Serverless capacity. All 1,215 exact
+`Timed out loading command outcomes for snapshot; retrying` warnings originated
+in gateway recovery reads and were transient rather than hard warm-up-deadline
+failures. Those reads nevertheless shared one bounded `redis-rs` dispatcher
+with all ten partition takeover bootstraps and resilience metrics; 1,172
+warnings occurred on the CPU-saturated scale-in survivor, and the warnings
+covered every partition. This justifies isolating fixed partition lanes and
+best-effort metrics, but does not claim that connection topology alone removes
+survivor CPU pressure or within-partition duplicate reads. Separately, each gateway
+replica read partition events, executor commands, and snapshot requests through
+one sequential reader and three bounded channels. Continuous event traffic
+starved command-channel draining; once that channel filled, the reader stopped
+fetching later events. The 19 game-wait timeouts corresponded to 19
+`Replica did not become subscribable after recovery snapshot` warnings, while
+the same authoritative games later completed durably. Finally, the two `429`
+responses occurred when the one certification source IP produced the valid
+scale-in reconnect/admission burst against Traefik's 100-upgrade burst, rather
+than because a backend was unhealthy.
+
+The narrow correction is the topology and reader contract now specified in R4
+and R6: ten independently bootstrapped partition-scoped recovery-read lanes, a
+separate best-effort metrics dispatcher, event-only gateway readers, and
+immediate local replica eviction only after broadcasting the atomically durable
+terminal snapshot. The certification client also treats playing-phase
+`GameWarming` as retryable on the same authenticated socket and pauses command
+emission until a fresh snapshot and `CommandOutcomesComplete`; it then resends
+any still-unresolved commands with their stable identities. The one checkpoint-write dispatcher per task
+remains unchanged. Traefik keeps its 50-upgrade-per-second average and raises
+only its burst to 512; the load client retries `429` through the existing bounded
+admission/reconnect path, matching browser behavior. This does not add another
+pool, increase the 750-millisecond Redis client deadline or any admission
+deadline, add a recovery cache or persistence layer, alter the frozen
+224-session / 112-duel cohort, change CPU 70% / memory 80% target tracking, or
+relax the one-second, planned-handoff, or crash criteria.
+The fresh run must validate the added Serverless connection count and determine
+whether any recovery-read warnings remain; do not add a cache, more lanes, or
+longer deadlines preemptively.
+
+Cleanup for run `30057487544` completed successfully. Independent AWS inventory
+found no development stacks, Serverless cache, ECS/EC2/EIP resources, ECR
+repository, DynamoDB tables, alarms, log groups, DNS records, or scaling
+targets; the imported production VPC remained untouched. This run is diagnostic
+evidence only. A fresh complete planned run and a separate authorized SIGKILL
+run are both still pending and required for release certification.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

@@ -1556,7 +1556,7 @@ mod tests {
         let bus = Arc::new(GameBus::new(
             global.clone(),
             partition_connections,
-            global.clone(),
+            (0..PARTITION_COUNT).map(|_| global.clone()).collect(),
             global,
             app_client,
             CancellationToken::new(),
@@ -1732,7 +1732,7 @@ mod tests {
         let bus = Arc::new(GameBus::new(
             global.clone(),
             partition_connections,
-            global.clone(),
+            (0..PARTITION_COUNT).map(|_| global.clone()).collect(),
             global,
             app_client,
             CancellationToken::new(),

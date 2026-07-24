@@ -265,7 +265,9 @@ async fn game_bus(redis_url: &str) -> Result<Arc<GameBus>> {
         (0..server::game_executor::PARTITION_COUNT)
             .map(|_| redis.clone().into())
             .collect(),
-        redis.clone(),
+        (0..server::game_executor::PARTITION_COUNT)
+            .map(|_| redis.clone().into())
+            .collect(),
         redis,
         client,
         CancellationToken::new(),

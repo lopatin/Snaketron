@@ -208,6 +208,60 @@ struct GameRuntime {
     outstanding_ping: Option<(i64, Instant)>,
 }
 
+#[derive(Default)]
+struct PlayingWarmupState {
+    waiting_for_snapshot: bool,
+    waiting_for_outcome_barrier: bool,
+    join_retry_at: Option<tokio::time::Instant>,
+}
+
+impl PlayingWarmupState {
+    fn observe_warming(
+        &mut self,
+        now: tokio::time::Instant,
+        deadline: tokio::time::Instant,
+        retry_after_ms: u64,
+    ) {
+        self.waiting_for_snapshot = true;
+        self.waiting_for_outcome_barrier = true;
+        self.join_retry_at = bounded_game_join_retry_at(now, deadline, retry_after_ms);
+    }
+
+    fn observe_snapshot(&mut self) -> bool {
+        let was_paused = self.commands_paused();
+        self.waiting_for_snapshot = false;
+        self.finish_if_ready(was_paused)
+    }
+
+    fn observe_outcome_barrier(&mut self) -> bool {
+        let was_paused = self.commands_paused();
+        self.waiting_for_outcome_barrier = false;
+        self.finish_if_ready(was_paused)
+    }
+
+    fn finish_if_ready(&mut self, was_paused: bool) -> bool {
+        let ready = was_paused && !self.commands_paused();
+        if ready {
+            self.join_retry_at = None;
+        }
+        ready
+    }
+
+    fn finish_recovery(&mut self) {
+        self.waiting_for_snapshot = false;
+        self.waiting_for_outcome_barrier = false;
+        self.join_retry_at = None;
+    }
+
+    fn mark_retry_sent(&mut self) {
+        self.join_retry_at = None;
+    }
+
+    fn commands_paused(&self) -> bool {
+        self.waiting_for_snapshot || self.waiting_for_outcome_barrier
+    }
+}
+
 impl GameRuntime {
     fn from_snapshot(
         game_id: u32,
@@ -1348,8 +1402,10 @@ async fn prepare_session(
     ));
     // One admission budget starts at the first connection attempt and ends only
     // after an ordered application pong. A draining task can race Traefik route
-    // withdrawal and return HTTP 503; retry only that explicit response while
-    // retaining this session's guest token and logical identity.
+    // withdrawal and return HTTP 503, while the bounded ingress limiter can
+    // return HTTP 429 during a valid make-before-break burst. Retry only those
+    // transient responses while retaining this session's guest token and
+    // logical identity.
     let admission_started = Instant::now();
     let admission_deadline = tokio::time::Instant::now() + settings.connect_timeout;
     let mut admission_attempts = 0u32;
@@ -1382,10 +1438,12 @@ async fn prepare_session(
         };
         match connect_result {
             Ok(value) => break value,
-            Err(error) if is_retryable_websocket_unavailable(&error) => {
+            Err(error) if is_retryable_websocket_admission(&error) => {
                 record.record_lifecycle(
                     SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
-                        .with_message("HTTP 503 admission response; retrying the same guest token"),
+                        .with_message(
+                            "transient HTTP 429/503 admission response; retrying the same guest token",
+                        ),
                 );
                 let remaining =
                     admission_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1394,7 +1452,7 @@ async fn prepare_session(
                         &mut record,
                         SessionPhase::WebSocketConnect,
                         format!(
-                            "HTTP 503 admission retries exhausted the bounded budget: {error:#}"
+                            "transient HTTP admission retries exhausted the bounded budget: {error:#}"
                         ),
                     );
                     return Err(record);
@@ -2130,6 +2188,7 @@ async fn play_session_inner(
     let game_started = Instant::now();
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut warmup = PlayingWarmupState::default();
 
     loop {
         tokio::select! {
@@ -2188,12 +2247,13 @@ async fn play_session_inner(
                             session.record.complete(unix_time_ms());
                             return Ok(runtime.snapshot_user_ids.clone());
                         }
+                        warmup.finish_recovery();
                         ping_interval = interval(PING_INTERVAL);
                         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     }
                 }
             }
-            _ = runtime.ai_interval.tick() => {
+            _ = runtime.ai_interval.tick(), if !warmup.commands_paused() => {
                 match drive_ai(
                     session,
                     &mut runtime.engine,
@@ -2220,9 +2280,38 @@ async fn play_session_inner(
                             session.record.complete(unix_time_ms());
                             return Ok(runtime.snapshot_user_ids.clone());
                         }
+                        warmup.finish_recovery();
                         ping_interval = interval(PING_INTERVAL);
                         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     }
+                }
+            }
+            _ = tokio::time::sleep_until(warmup.join_retry_at.unwrap_or(game_deadline)),
+                if warmup.join_retry_at.is_some() =>
+            {
+                warmup.mark_retry_sent();
+                if let Err(error) = session
+                    .send_cancellable(WSMessage::JoinGame(game_id), cancellation)
+                    .await
+                {
+                    let snapshot_complete = synchronize_game_runtime(
+                        session,
+                        &mut runtime,
+                        settings,
+                        game_id,
+                        cancellation,
+                        error.context("sending same-socket JoinGame after GameWarming"),
+                        "GameWarming retry transport recovery snapshot synchronized",
+                    )
+                    .await?;
+                    if snapshot_complete {
+                        session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
+                        session.record.complete(unix_time_ms());
+                        return Ok(runtime.snapshot_user_ids.clone());
+                    }
+                    warmup.finish_recovery();
+                    ping_interval = interval(PING_INTERVAL);
+                    ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 }
             }
             incoming = session.next_message() => {
@@ -2244,6 +2333,7 @@ async fn play_session_inner(
                             session.record.complete(unix_time_ms());
                             return Ok(runtime.snapshot_user_ids.clone());
                         }
+                        warmup.finish_recovery();
                         ping_interval = interval(PING_INTERVAL);
                         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                         continue;
@@ -2276,6 +2366,14 @@ async fn play_session_inner(
                                     session.record.complete(unix_time_ms());
                                     return Ok(runtime.snapshot_user_ids.clone());
                                 }
+                                if warmup.observe_snapshot() {
+                                    session
+                                        .resend_pending_commands(game_id)
+                                        .await
+                                        .context(
+                                            "resending unresolved commands after same-socket warm-up barrier",
+                                        )?;
+                                }
                             }
                             GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
                                 runtime.engine.process_server_event(&event)?;
@@ -2286,8 +2384,30 @@ async fn play_session_inner(
                             _ => runtime.engine.process_server_event(&event)?,
                         }
                     }
+                    WSMessage::CommandOutcomesComplete { game_id: completed }
+                        if completed == game_id =>
+                    {
+                        if warmup.observe_outcome_barrier() {
+                            session
+                                .resend_pending_commands(game_id)
+                                .await
+                                .context(
+                                    "resending unresolved commands after same-socket warm-up barrier",
+                                )?;
+                        }
+                    }
                     WSMessage::GameLoadFailed { game_id: failed, reason } if failed == game_id => {
                         return Err(anyhow!("server could not load matched game {failed}: {reason}"));
+                    }
+                    WSMessage::GameWarming {
+                        game_id: warming,
+                        retry_after_ms,
+                    } if warming == game_id => {
+                        warmup.observe_warming(
+                            tokio::time::Instant::now(),
+                            game_deadline,
+                            retry_after_ms,
+                        );
                     }
                     WSMessage::AccessDenied { reason } => {
                         return Err(anyhow!("server denied game session: {reason}"));
@@ -2322,6 +2442,7 @@ async fn play_session_inner(
                             session.record.complete(unix_time_ms());
                             return Ok(runtime.snapshot_user_ids.clone());
                         }
+                        warmup.finish_recovery();
                         ping_interval = interval(PING_INTERVAL);
                         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     }
@@ -3193,7 +3314,7 @@ async fn prepare_planned_candidate(
                         game_id: warming,
                         retry_after_ms,
                     } if warming == game_id => {
-                        game_join_retry_at = planned_game_join_retry_at(
+                        game_join_retry_at = bounded_game_join_retry_at(
                             tokio::time::Instant::now(),
                             deadline,
                             retry_after_ms,
@@ -3221,7 +3342,7 @@ async fn prepare_planned_candidate(
     }
 }
 
-fn planned_game_join_retry_at(
+fn bounded_game_join_retry_at(
     now: tokio::time::Instant,
     deadline: tokio::time::Instant,
     retry_after_ms: u64,
@@ -4316,11 +4437,14 @@ async fn connect_socket(
     Ok((socket, backend, sticky_cookie))
 }
 
-fn is_retryable_websocket_unavailable(error: &anyhow::Error) -> bool {
+fn is_retryable_websocket_admission(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<WebSocketError>().is_some_and(|error| {
             matches!(error, WebSocketError::Http(response)
-                    if response.status() == StatusCode::SERVICE_UNAVAILABLE)
+            if matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ))
         })
     })
 }
@@ -4561,21 +4685,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_websocket_http_503_is_retryable_admission() {
+    fn only_transient_websocket_http_statuses_are_retryable_admission() {
         let unavailable = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(None)
             .unwrap();
         let unavailable = anyhow::Error::new(WebSocketError::Http(unavailable));
-        assert!(is_retryable_websocket_unavailable(&unavailable));
+        assert!(is_retryable_websocket_admission(&unavailable));
+
+        let rate_limited = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(None)
+            .unwrap();
+        let rate_limited = anyhow::Error::new(WebSocketError::Http(rate_limited));
+        assert!(is_retryable_websocket_admission(&rate_limited));
 
         let forbidden = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(None)
             .unwrap();
         let forbidden = anyhow::Error::new(WebSocketError::Http(forbidden));
-        assert!(!is_retryable_websocket_unavailable(&forbidden));
-        assert!(!is_retryable_websocket_unavailable(&anyhow!(
+        assert!(!is_retryable_websocket_admission(&forbidden));
+        assert!(!is_retryable_websocket_admission(&anyhow!(
             "transport failed"
         )));
     }
@@ -4757,18 +4888,47 @@ mod tests {
     }
 
     #[test]
-    fn game_warming_retry_never_competes_with_the_handoff_deadline() {
+    fn game_warming_pauses_commands_until_snapshot_and_outcome_barrier() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        let mut warmup = PlayingWarmupState::default();
+        assert!(!warmup.commands_paused());
+
+        warmup.observe_warming(now, deadline, 1);
+        assert!(warmup.commands_paused());
+        assert_eq!(warmup.join_retry_at, Some(now + Duration::from_millis(100)),);
+
+        warmup.mark_retry_sent();
+        assert!(warmup.commands_paused());
+        assert_eq!(warmup.join_retry_at, None);
+
+        assert!(!warmup.observe_snapshot());
+        assert!(warmup.commands_paused());
+        assert!(warmup.observe_outcome_barrier());
+        assert!(!warmup.commands_paused());
+
+        // The wire loop must also handle the barrier arriving before the
+        // snapshot without resuming or resending early.
+        warmup.observe_warming(now, deadline, 1);
+        assert!(!warmup.observe_outcome_barrier());
+        assert!(warmup.commands_paused());
+        assert!(warmup.observe_snapshot());
+        assert!(!warmup.commands_paused());
+    }
+
+    #[test]
+    fn game_warming_retry_never_competes_with_its_deadline() {
         let now = tokio::time::Instant::now();
         assert_eq!(
-            planned_game_join_retry_at(now, now + Duration::from_millis(101), 100),
+            bounded_game_join_retry_at(now, now + Duration::from_millis(101), 100),
             Some(now + Duration::from_millis(100)),
         );
         assert_eq!(
-            planned_game_join_retry_at(now, now + Duration::from_millis(100), 100),
+            bounded_game_join_retry_at(now, now + Duration::from_millis(100), 100),
             None,
         );
         assert_eq!(
-            planned_game_join_retry_at(now, now + Duration::from_millis(50), 2_000),
+            bounded_game_join_retry_at(now, now + Duration::from_millis(50), 2_000),
             None,
         );
     }

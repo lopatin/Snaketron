@@ -747,7 +747,9 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
         (0..server::game_executor::PARTITION_COUNT)
             .map(|_| conn.clone().into())
             .collect(),
-        conn.clone(),
+        (0..server::game_executor::PARTITION_COUNT)
+            .map(|_| conn.clone().into())
+            .collect(),
         conn,
         redis_client,
         CancellationToken::new(),

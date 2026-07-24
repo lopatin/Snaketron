@@ -181,6 +181,22 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 4. At the application deadline, allow crash-style recovery. Do not wait for a
    game to finish.
 
+### Replica warming or WebSocket burst rejection
+
+1. A playing session that receives `GameWarming` keeps its authenticated socket,
+   pauses command emission, and retries `JoinGame` after the server hint within
+   the existing game deadline. It resumes only after a fresh snapshot and
+   `CommandOutcomesComplete`, then resends any still-unresolved commands with
+   their stable identities. Do not force a reconnect or extend the deadline.
+2. Gateway replicas read only partition events. If event delivery stalls, check
+   that the event-only reader is alive and inspect its last stream ID and any
+   trim-horizon warning. Executor command or snapshot-request channel depth is
+   not a gateway replica dependency.
+3. Traefik keeps a sustained WebSocket-upgrade average of 50 per source IP and a
+   burst of 512. A `429` is retryable inside the client's existing admission
+   deadline. If the 512 burst is exceeded, inspect the source and cohort; do
+   not raise the sustained average or admission deadline to make a test pass.
+
 ### Valkey pressure or outage
 
 1. All tasks should become unready while liveness stays healthy. Do not create
@@ -382,9 +398,9 @@ At the scale-out burst, seven recovery-envelope reads and one fenced checkpoint
 write sharing the recovery dispatcher hit their 750-millisecond client
 deadlines together. The checkpoint retained unacknowledged work, retried, and
 the affected game completed durably; there was no fence rejection or data
-loss. The correction adds exactly one fresh checkpoint-write dispatcher per
+loss. That correction added exactly one fresh checkpoint-write dispatcher per
 task while leaving takeover/reconnect reads and best-effort regional metrics on
-the existing recovery-read dispatcher. The first follow-up used 128 sessions /
+the then-existing recovery-read dispatcher. The first follow-up used 128 sessions /
 64 duels based on a cross-topology projection from the saturated 144-session
 run.
 
@@ -440,6 +456,68 @@ connections. Run `30050625836` is diagnostic evidence only. Do not change the
 gate, or any other acceptance criterion. A fresh full planned run and a
 separate authorized SIGKILL run remain mandatory.
 
+Exact-source Serverless run
+[`30057487544`](https://github.com/lopatin/snaketron-io/actions/runs/30057487544)
+used outer commit `e23c6b5f3a62bdacdb51742aa12b03b5d8836a0c` and Snaketron
+commit `36f7ac51912072fa6de3d6f2f43f9410d801c6de`. Natural CPU target
+tracking moved `1 -> 2`; the deterministic staircase then moved
+`1 -> 10 -> 1` with healthy assignment and lease movement. Actual Valkey 8
+Serverless recorded zero `Evictions` and zero `ThrottledCmds`. The run attempted
+2,770 sessions, completed 2,747, and submitted 2,167,559 commands.
+
+The run failed the unchanged planned-path gates. Twenty-three sessions failed:
+19 timed out waiting for their games, and the other four were two WebSocket
+upgrade `429` responses plus the paired lobby-session cancellations. Forty-six
+planned handoffs hard-reconnected or were marked failed, maximum usable-session
+gap was 3,497 milliseconds, 300 commands remained unresolved, maximum
+command-outcome latency was 10,381 milliseconds, and 534 original-send seconds
+exceeded one second. The separate SIGKILL certification therefore remains
+pending.
+
+Application logs contain 1,215 exact
+`Timed out loading command outcomes for snapshot; retrying` warnings. This log
+site is gateway-only and none exhausted the hard warm-up deadline, but the reads
+shared one bounded recovery dispatcher with all ten partition takeover
+bootstraps and regional metrics. The CPU-saturated scale-in survivor emitted
+1,172 warnings across all ten partitions, while each metrics pass spent roughly
+2--5.6 seconds scanning about 100 recovery envelopes. Partition-scoped lanes and
+a separate metrics dispatcher remove that cross-partition/cross-role risk; they
+are not a claim that topology alone removes CPU saturation or duplicate reads
+within one partition. Separately, gateway replicas used one sequential
+reader for partition events, executor commands, and snapshot requests.
+Continuous event traffic starved command-channel draining; a full channel then
+stopped the reader from fetching later events. The 19 game-wait failures map to
+19 `Replica did not become subscribable after recovery snapshot` warnings even
+though those authoritative games later completed durably. The two `429`
+responses came from the valid same-IP scale-in reconnect/admission burst
+exceeding Traefik's configured 100-upgrade burst, not from an unhealthy
+backend.
+
+The minimum correction is deliberately bounded. Each task opens ten independent
+partition-scoped recovery-read lanes plus one separate best-effort metrics
+dispatcher; gateway replicas read only the partition event stream; and a
+terminal snapshot is broadcast and then immediately evicted locally because
+the same fenced completion script made its completion record, final recovery
+envelope, stored snapshot, and pending-effect index durable before the event
+became observable.
+The load client pauses commands and retries playing-phase `GameWarming` on the
+same authenticated socket. Traefik retains the 50-upgrade-per-second average,
+raises only its burst to 512 for the certified make-before-break cohort, and
+the load client retries `429` through its existing admission/reconnect deadline
+just as the browser does. Keep the one checkpoint-write dispatcher per task.
+Do not add more pools, lengthen the 750-millisecond Redis deadline or any
+admission deadline, add a recovery cache, adjust the frozen load, change CPU or
+memory targets, or relax any acceptance gate.
+The next run must record Serverless connection count and any remaining
+recovery-read warnings before considering another optimization.
+
+Cleanup for run `30057487544` succeeded. Independent inventory found no
+development stacks, Serverless cache, ECS/EC2/EIP resources, ECR repository,
+DynamoDB tables, alarms, log groups, DNS records, or scaling targets; the
+imported production VPC remained untouched. Treat this run as diagnostic
+evidence only. Fresh complete planned and separately authorized SIGKILL runs
+are both required.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -475,6 +553,16 @@ one-lane-per-partition map is intentional; do not replace it with a tunable
 generic pool, per-game connections, a priority scheduler, or retries that hide
 queueing.
 
+Gateway replicas anchor and resume one event-only reader per partition. They do
+not read or drain executor commands or snapshot requests, so backpressure in
+those streams cannot halt user-visible event delivery. On a terminal full
+snapshot, the replica broadcasts first and then evicts the local game. This is
+safe because the single fenced completion script committed the immutable
+completion record, final recovery envelope, stored snapshot, pending-effect
+index, and terminal publications before any reader could observe the snapshot;
+do not reintroduce a command-stream completion marker as an eviction
+dependency.
+
 The durable `GameCreated` scanner groups each validated scan page by partition
 and uses nonblocking sends to ten delivery workers, one per fixed partition.
 Each lane holds one active and at most one queued batch. Its worker preserves
@@ -489,12 +577,17 @@ acquire/renew/release, membership, assignment, matchmaking, and readiness.
 Fenced partition-hot scripts execute through their partition lane and validate
 the live lease key atomically there; moving lease liveness traffic onto a busy
 data lane would weaken takeover timing. Full-state periodic checkpoints and
-terminal completion commits keep the independently bootstrapped
-checkpoint-write dispatcher. Takeover journal/envelope loads, reconnect outcome
-reads, immutable completion-record loads, and regional recovery metrics keep
-the recovery-read dispatcher. RESP3 Pub/Sub and stream fan-out readers also
-keep their separate connections. This is the minimum role topology required by
-the observed Serverless latency variance.
+terminal completion commits keep one independently bootstrapped checkpoint-write
+dispatcher per task. Independently bootstrap exactly ten partition-scoped
+recovery-read connections and route takeover journal/envelope loads,
+stored-snapshot and recovery-failure loads, reconnect outcome reads, and
+immutable completion-record loads by partition. Regional resilience metrics
+use one additional best-effort dispatcher so telemetry cannot queue ahead of
+recovery.
+RESP3 Pub/Sub and stream readers also keep their separate connections. This is
+the minimum role topology required by the observed Serverless latency
+variance. Do not add a dynamic or per-game pool, longer deadlines, a recovery
+cache, or another persistence layer.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
@@ -610,6 +703,13 @@ then resent with the same stable identity. Certification instead requires every
 session to finish with zero pending commands; first-seen terminal outcomes and
 the deterministic deduplication tests enforce one logical result despite a
 physical resend.
+While a session is already playing, `GameWarming` pauses its command generator
+and schedules same-socket `JoinGame` retries from the server hint. Only a fresh
+snapshot plus `CommandOutcomesComplete` resumes commands and triggers stable-ID
+resends for any still-unresolved commands. WebSocket-upgrade `429` also uses the ordinary
+bounded reconnect loop. Both remain charged to the original game/admission
+deadline and are reported; neither creates an exclusion from the one-second
+command gate, ten-second admission gate, or zero-gap planned-handoff gate.
 The Run B gate requires at least 256 authenticated sessions and 128 simultaneous
 duel games throughout the five-minute interval. Separate Run A population
 reports require every idle, lobby, and queued probe to reach its intended state

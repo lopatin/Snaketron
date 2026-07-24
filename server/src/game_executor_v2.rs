@@ -4117,7 +4117,9 @@ mod tests {
                 (0..PARTITION_COUNT)
                     .map(|_| manager.clone().into())
                     .collect(),
-                manager.clone(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
                 manager.clone(),
                 client,
                 token.clone(),
