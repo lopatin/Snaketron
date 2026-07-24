@@ -1795,6 +1795,10 @@ collect_cloudwatch_evidence() {
     AWS/EC2 NetworkOut Sum \
     Name=InstanceId,Value="$SNAKETRON_TRAEFIK_INSTANCE_ID"
 
+  # ActiveWebSockets is emitted by each task into one environment-level
+  # metric stream, so Maximum is a per-task peak rather than a fleet sum.
+  # Gate A proves the one-task 224-socket envelope; exact reports below prove
+  # the separate Gate B and Gate C fleet envelopes.
   jq -e 'all(.Datapoints[]; .Minimum > 0)' \
     "$cloudwatch_dir/ready-tasks.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
@@ -1823,7 +1827,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 455' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 224' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2706,6 +2710,25 @@ run_staging_suite() {
     fi
   }
 
+  wait_for_admission_wave_seed() {
+    local log_file="$1"
+    local pid="$2"
+    local required_waves="$3"
+    local deadline=$((SECONDS + 60))
+    while (( SECONDS < deadline )); do
+      require_population_running admission "$pid"
+      local observed_waves
+      observed_waves="$(grep -cF 'launched coordinated wave' "$log_file" || true)"
+      if [[ "$observed_waves" =~ ^[0-9]+$ ]] \
+        && (( observed_waves >= required_waves )); then
+        return 0
+      fi
+      sleep 0.1
+    done
+    echo "Admission runner did not emit $required_waves launch waves within 60 seconds" >&2
+    return 1
+  }
+
   regional_socket_count() {
     curl -fsS --max-time 3 \
       "${SNAKETRON_STAGING_TARGET%/}/api/regions/user-counts" \
@@ -2953,13 +2976,14 @@ run_staging_suite() {
     return 0
   fi
 
+  local natural_scale_out_run_id="${run_id}-natural-scale-out"
   local continuity_run_id="${run_id}-continuity"
   local capacity_run_id="${run_id}-capacity"
   local idle_run_id="${run_id}-idle"
   local lobby_run_id="${run_id}-lobby"
   local matchmaking_run_id="${run_id}-matchmaking"
   local admission_run_id="${run_id}-admission"
-  local continuity_command=(
+  local natural_scale_out_command=(
     "$loadtest_runner"
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -2970,13 +2994,12 @@ run_staging_suite() {
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
-    --require-planned-handoff \
-    --run-id "$continuity_run_id" \
+    --run-id "$natural_scale_out_run_id" \
     --report-dir "$report_dir"
   )
   local automatic_scale_out_baseline_started_ms
   local automatic_scale_out_started_ms
-  "${continuity_command[@]}" &
+  "${natural_scale_out_command[@]}" &
   load_pid=$!
   # Two hundred twenty-four sessions retain active games on every partition
   # and drive the one-vCPU minimum task above its target-tracking threshold.
@@ -3050,9 +3073,59 @@ run_staging_suite() {
       }
     ' >"$report_dir/automatic-scale-out-window.json"
   require_load_running
+  # Gate A ends here. Its high-load clients may prove natural scale-out, but
+  # they are not a capacity-valid destination load for the forced ten-to-one
+  # handoff. Let the runner finish and prove that all of its sockets and games
+  # are gone before resetting the service.
+  wait "$load_pid"
+  load_pid=""
+  local natural_scale_out_summary="$report_dir/$natural_scale_out_run_id/summary.json"
+  jq -e '
+    .schema_version >= 10
+    and .metadata.threshold_result == "passed"
+    and .configured_max_concurrency == 224
+    and .metadata.mode == "duel"
+    and .metadata.command_profile == "every-tick"
+    and .metadata.spawn_rate_per_second == "4"
+    and .session_counts.peak_authenticated_concurrency == 224
+    and .session_counts.peak_active_game_concurrency >= 112
+    and .session_counts.failed == 0
+    and .session_counts.cancelled == 0
+    and .session_counts.incomplete == 0
+    and .session_counts.completed == .session_counts.total
+    and all(.sessions[]; .outcome == "completed" and .failure_phase == null)
+    and .games.pairing_violations == 0
+    and (.ramp_stages | length) == 1
+    and .ramp_stages[0].target_reached
+    and .metrics.traffic.disconnects == 0
+    and .metrics.traffic.reconnects == 0
+    and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
+    and ([.metrics.command_counts_by_unix_second[]] | add)
+      == .metrics.traffic.commands_sent
+    and ([.metrics.command_outcome_counts_by_sent_unix_second[]] | add)
+      == .metrics.traffic.commands_sent
+    and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
+  ' "$natural_scale_out_summary" >/dev/null || {
+    echo "Natural scale-out load did not satisfy its fixed continuity envelope" >&2
+    exit 1
+  }
+  command_outcomes_meet_window_budget \
+    "$natural_scale_out_summary" \
+    "$report_dir/automatic-scale-out-baseline-window.json" 1000 || {
+      echo "Command outcomes exceeded the natural scale-out baseline budget" >&2
+      exit 1
+    }
+  command_outcomes_meet_window_budget \
+    "$natural_scale_out_summary" \
+    "$report_dir/automatic-scale-out-window.json" 1000 || {
+      echo "Command outcomes exceeded the natural scale-out movement budget" >&2
+      exit 1
+    }
+  wait_for_zero_certification_load after-natural-scale-out
+
   # Automatic scale-out may have stopped at any count from two through ten.
-  # Return to a measured one-task baseline before calling the next phase a
-  # deterministic 1 -> 10 -> 1 staircase.
+  # Return without load to one healthy task, then start the independent
+  # capacity-valid planned-transition cohort.
   local reset_to_one_started_ms
   reset_to_one_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
@@ -3074,7 +3147,40 @@ run_staging_suite() {
         duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
       }
     ' >"$report_dir/reset-to-one-window.json"
+  local continuity_command=(
+    "$loadtest_runner"
+    --target "$SNAKETRON_STAGING_TARGET" \
+    --confirm-production \
+    --require-same-origin \
+    --region "$SNAKETRON_REGION_CODE" \
+    --mode duel \
+    --stages 128@15m \
+    --spawn-rate 4 \
+    --max-total-sessions 4096 \
+    --command-profile every-tick \
+    --require-planned-handoff \
+    --run-id "$continuity_run_id" \
+    --report-dir "$report_dir"
+  )
+  "${continuity_command[@]}" &
+  load_pid=$!
+  wait_for_region_socket_floor planned-transition-baseline 128 "$load_pid"
   require_load_running
+  wait_for_control_plane planned-transition-loaded-1 1
+  wait_for_ecs_health "$report_dir" planned-transition-loaded-1 1
+  local planned_transition_baseline_started_ms
+  planned_transition_baseline_started_ms="$(unix_time_ms)"
+  sleep 10
+  require_load_running
+  jq -n \
+    --argjson started_at_unix_ms "$planned_transition_baseline_started_ms" \
+    --argjson finished_at_unix_ms "$(unix_time_ms)" '
+      {
+        started_at_unix_ms: $started_at_unix_ms,
+        finished_at_unix_ms: $finished_at_unix_ms,
+        duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
+      }
+    ' >"$report_dir/planned-transition-baseline-window.json"
   local scale_out_started_ms
   scale_out_started_ms="$(unix_time_ms)"
   jq -n \
@@ -3185,14 +3291,17 @@ run_staging_suite() {
       echo "Fresh executor membership does not match the ten healthy ECS task IDs" >&2
       exit 1
     }
-  # Generate four new idle admissions per second through the direct ten-to-one
-  # action. Two hundred eight low-CPU sockets cover the 45-second application
-  # drain deadline, including the heartbeat used to observe the seed wave,
-  # without putting the full game-command envelope on one task.
-  # The public count is a heartbeat-delayed raw WebSocket count. It proves the
-  # candidate sockets exist; the finished admission report proves auth/readiness.
-  # Run A now carries 224 game sockets plus the 23 context probes.
-  wait_for_region_socket_floor pre-admission 247
+  # Generate four fresh idle admissions per second through the direct
+  # ten-to-one action without accumulating another steady-state population on
+  # the one-task destination. The open-loop probe holds a successful ready
+  # session for one second; its stage target is only a 64-session in-flight
+  # safety ceiling. The ten-second admission deadline therefore remains fully
+  # exercised while successful clients turn over promptly.
+  # The public count is heartbeat-delayed. It proves the fixed 128 game sockets
+  # plus 23 context probes before the rolling admission wave begins.
+  wait_for_region_socket_floor pre-admission 151
+  local admission_runner_log="$report_dir/admission-runner.log"
+  : >"$admission_runner_log"
   "$loadtest_runner" \
     --target "$SNAKETRON_STAGING_TARGET" \
     --confirm-production \
@@ -3200,19 +3309,22 @@ run_staging_suite() {
     --region "$SNAKETRON_REGION_CODE" \
     --population idle \
     --mode duel \
-    --stages 208@2m \
+    --stages 64@2m \
     --spawn-rate 4 \
-    --max-total-sessions 208 \
-    --untimed-play-duration 2m \
+    --open-loop-admission \
+    --max-total-sessions 512 \
+    --untimed-play-duration 1s \
     --drain-timeout 1m \
-    --require-planned-handoff \
     --run-id "$admission_run_id" \
-    --report-dir "$report_dir" &
+    --report-dir "$report_dir" \
+    > >(tee -a "$admission_runner_log") 2>&1 &
   admission_population_pid=$!
-  # Wait for three complete four-session admission waves beyond that baseline
-  # before starting scale-in, so the first measured wave is real rather than a
-  # stale count inherited from the fixed populations.
-  wait_for_region_socket_floor admission-seed 259 "$admission_population_pid"
+  # Wait on the runner's first three explicit launch records rather than a
+  # fixed sleep: serial target preflight happens before the first wave and can
+  # legitimately take longer than three seconds. The finished report below
+  # remains authoritative for exact wave size, cadence, and readiness.
+  wait_for_admission_wave_seed \
+    "$admission_runner_log" "$admission_population_pid" 3
   local scale_in_started_ms
   scale_in_started_ms="$(unix_time_ms)"
   retry_command 5 aws ecs update-service \
@@ -3277,16 +3389,21 @@ run_staging_suite() {
   local matchmaking_summary="$report_dir/$matchmaking_run_id/summary.json"
   local admission_summary="$report_dir/$admission_run_id/summary.json"
   jq -e \
+    --slurpfile scale_out "$report_dir/scale-out-window.json" \
     --slurpfile scale_in "$report_dir/scale-in-window.json" '
       . as $report
+      | (($scale_in[0].started_at_unix_ms / 1000) | ceil)
+        as $scale_in_first_second
+      | (($scale_in[0].finished_at_unix_ms / 1000) | floor)
+        as $scale_in_after_last_second
       | .schema_version >= 10
       and .metadata.threshold_result == "passed"
-      and .configured_max_concurrency == 224
+      and .configured_max_concurrency == 128
       and .metadata.mode == "duel"
       and .metadata.command_profile == "every-tick"
       and .metadata.spawn_rate_per_second == "4"
-      and .session_counts.peak_authenticated_concurrency == 224
-      and .session_counts.peak_active_game_concurrency >= 112
+      and .session_counts.peak_authenticated_concurrency == 128
+      and .session_counts.peak_active_game_concurrency >= 64
       and .session_counts.failed == 0
       and .session_counts.cancelled == 0
       and .session_counts.incomplete == 0
@@ -3315,21 +3432,44 @@ run_staging_suite() {
       and ($scale_in[0].duration_ms >= 1000 and $scale_in[0].duration_ms <= 45000)
       and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
       and ([.metrics.scheduled_command_counts_by_partition_and_unix_second[] | .[]] | add) > 0
+      and all(range(0; 10);
+        . as $partition
+        | any(
+          ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
+            [($partition | tostring)] // {})
+          | to_entries[];
+          (.key | tonumber) < (($scale_out[0].started_at_unix_ms / 1000) | ceil)
+          and .value > 0))
+      and all(range(0; 10);
+        . as $partition
+        | any(
+          ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
+            [($partition | tostring)] // {})
+          | to_entries[];
+          ((.key | tonumber) >= ($scale_in_first_second - 10))
+          and ((.key | tonumber) < $scale_in_first_second)
+          and .value > 0))
+      and $scale_in_after_last_second > $scale_in_first_second
+      and all(range($scale_in_first_second; $scale_in_after_last_second);
+        . as $second
+        | all(range(0; 10);
+            . as $partition
+            | (($report.metrics.scheduled_command_counts_by_partition_and_unix_second
+              [($partition | tostring)][($second | tostring)] // 0) > 0)))
     ' "$continuity_summary" >/dev/null || {
       echo "Continuity load did not satisfy the active-game transition invariants" >&2
       exit 1
     }
 
-  # Cover automatic scale-out as well as both directions of the forced
-  # staircase. Receipt-time bucket counts alone can hide a one-second
+  # Cover both directions of the forced staircase. Natural scale-out was
+  # already checked against its separate 224-session report. Receipt-time
+  # bucket counts alone can hide a one-second
   # executor stall followed by a catch-up burst. One second is a deliberately
   # strict user-continuity budget: the predictive client remains smooth while
   # every input still receives a prompt authoritative result.
   local movement_window
   for movement_window in \
-    "$report_dir/automatic-scale-out-baseline-window.json" \
-    "$report_dir/automatic-scale-out-window.json" \
-    "$report_dir/reset-to-one-window.json" \
+    "$report_dir/planned-transition-baseline-window.json" \
     "$report_dir/scale-out-window.json" \
     "$report_dir/scale-in-window.json"; do
     command_outcomes_meet_window_budget \
@@ -3350,7 +3490,7 @@ run_staging_suite() {
           .started_at_unix_ms >= $scale_in[0].started_at_unix_ms
           and .started_at_unix_ms <= $scale_in[0].finished_at_unix_ms)]
       as $scale_in_sessions
-    | ($scale_in_sessions
+    | (.sessions
         | group_by(.wave_index)
         | map({
             wave_index: .[0].wave_index,
@@ -3358,12 +3498,23 @@ run_staging_suite() {
             sessions: .
           })
         | sort_by(.started_at_unix_ms)) as $admission_waves
+    | ([$admission_waves[]
+        | select(
+            .started_at_unix_ms
+              >= ($scale_in[0].started_at_unix_ms - 1100)
+            and .started_at_unix_ms
+              <= ($scale_in[0].finished_at_unix_ms + 1100))]
+      ) as $coverage_waves
     | .schema_version >= 10
     and .metadata.threshold_result == "passed"
     and .metadata.population == "idle"
-    and .configured_max_concurrency == 208
+    and .metadata.open_loop_admission == "true"
+    and .configured_max_concurrency == 64
     and .metadata.spawn_rate_per_second == "4"
-    and .session_counts.peak_authenticated_concurrency == 208
+    and .metadata.untimed_play_duration_ms == "1000"
+    and .session_counts.peak_token_sent_concurrency <= 64
+    and .session_counts.peak_authenticated_concurrency <= 64
+    and .session_counts.peak_authenticated_concurrency > 0
     and .session_counts.failed == 0
     and .session_counts.cancelled == 0
     and .session_counts.incomplete == 0
@@ -3372,7 +3523,7 @@ run_staging_suite() {
     and .games.observed == 0
     and all(.sessions[]; .outcome == "completed" and .failure_phase == null)
     and (.ramp_stages | length) == 1
-    and .ramp_stages[0].target_reached
+    and .metadata.all_stages_completed == "true"
     and .metrics.traffic.disconnects == 0
     and .metrics.traffic.reconnects == 0
     and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
@@ -3380,22 +3531,26 @@ run_staging_suite() {
     and .metrics.planned_handoffs.successes == .metrics.planned_handoffs.attempts
     and .metrics.planned_handoff_duration_ms.max_ms <= 20000
     and ($scale_in[0].duration_ms >= 1000 and $scale_in[0].duration_ms <= 45000)
-    and ($admission_waves | length) >= 2
-    and $admission_waves[0].started_at_unix_ms
-      <= ($scale_in[0].started_at_unix_ms + 1100)
-    and $admission_waves[-1].started_at_unix_ms
-      >= ($scale_in[0].finished_at_unix_ms - 1100)
-    and all($admission_waves[];
+    and ($coverage_waves | length) >= 3
+    and $coverage_waves[0].started_at_unix_ms
+      >= ($scale_in[0].started_at_unix_ms - 1100)
+    and $coverage_waves[0].started_at_unix_ms
+      <= $scale_in[0].started_at_unix_ms
+    and $coverage_waves[-1].started_at_unix_ms
+      >= $scale_in[0].finished_at_unix_ms
+    and $coverage_waves[-1].started_at_unix_ms
+      <= ($scale_in[0].finished_at_unix_ms + 1100)
+    and all($coverage_waves[];
       (.sessions | length) == 4
       and all(.sessions[];
         .outcome == "completed"
         and .failure_phase == null
         and .initial_admission_ready_ms != null
         and .initial_admission_ready_ms <= 10000))
-    and all(range(1; ($admission_waves | length));
+    and all(range(1; ($coverage_waves | length));
       . as $index
-      | ($admission_waves[$index].started_at_unix_ms
-        - $admission_waves[$index - 1].started_at_unix_ms) <= 1100)
+      | ($coverage_waves[$index].started_at_unix_ms
+        - $coverage_waves[$index - 1].started_at_unix_ms) <= 1100)
     and all($scale_in_sessions[];
       .outcome == "completed"
       and .failure_phase == null
@@ -3403,7 +3558,7 @@ run_staging_suite() {
     and ([$scale_in_sessions[].initial_admission_ready_ms] | p99) <= 10000
     and (.metrics.initial_admission_ready_ms.p99_ms // 10001) <= 10000
   ' "$admission_summary" >/dev/null || {
-    echo "Planned scale-in did not preserve four-per-second admission, ten-second readiness, and zero-gap handoff" >&2
+    echo "Planned scale-in did not preserve four-per-second admission, ten-second readiness, and the 64-session safety ceiling" >&2
     exit 1
   }
 
@@ -3549,9 +3704,9 @@ run_staging_suite() {
         lobby_task_counts: counts($lobby),
         matchmaking_task_counts: counts($matchmaking),
         transition: {
-          configured_game_websockets: 224,
+          configured_game_websockets: 128,
           companion_websockets: 23,
-          configured_total_websockets: 247,
+          configured_total_websockets: 151,
           observed_game_websockets: ([$game_counts[]] | add // 0),
           observed_total_websockets:
             (([$game_counts[]] | add // 0)
@@ -3575,11 +3730,11 @@ run_staging_suite() {
     and (.idle_task_boot_ids | length) > 1
     and (.lobby_task_boot_ids | length) > 1
     and (.matchmaking_task_boot_ids | length) >= 1
-    and .transition.configured_game_websockets == 224
+    and .transition.configured_game_websockets == 128
     and .transition.companion_websockets == 23
-    and .transition.configured_total_websockets == 247
-    and .transition.observed_game_websockets == 224
-    and .transition.observed_total_websockets == 247
+    and .transition.configured_total_websockets == 151
+    and .transition.observed_game_websockets == 128
+    and .transition.observed_total_websockets == 151
   ' "$report_dir/population-distribution.json" >/dev/null || {
     echo "Exact TaskBootId transition WebSocket/event-forwarding distribution was not proven" >&2
     exit 1
@@ -3763,9 +3918,17 @@ run_staging_suite() {
         automatic_scale_out: {
           desired: $automatic_out[0].services[0].desiredCount,
           running: $automatic_out[0].services[0].runningCount,
-          evidence: "target-tracking activity"
+          evidence: "target-tracking activity",
+          configured_game_sessions: 224,
+          configured_duels: 112
         },
-        deterministic_forced_staircase: $forced[0],
+        deterministic_forced_staircase: ($forced[0] + {
+          configured_game_sessions: 128,
+          configured_duels: 64,
+          fixed_context_sessions: 23,
+          admission_starts_per_second: 4,
+          admission_in_flight_ceiling: 64
+        }),
         fixed_capacity_envelope: {
           configured_sessions: 272,
           required_sessions: 256,

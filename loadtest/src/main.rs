@@ -321,6 +321,10 @@ async fn run(config: Config) -> Result<()> {
         config.spawn_rate.to_string(),
     );
     run.metadata.insert(
+        "open_loop_admission".to_owned(),
+        config.open_loop_admission.to_string(),
+    );
+    run.metadata.insert(
         "max_total_sessions".to_owned(),
         config.max_total_sessions.to_string(),
     );
@@ -696,7 +700,7 @@ async fn run(config: Config) -> Result<()> {
             completed_rate * 100.0
         ));
     }
-    if !peak_authenticated_target_reached {
+    if !config.open_loop_admission && !peak_authenticated_target_reached {
         threshold_failures.push(format!(
             "peak server-authenticated sessions {} never reached configured maximum {}",
             aggregate.session_counts.peak_authenticated_concurrency,
@@ -728,7 +732,7 @@ async fn run(config: Config) -> Result<()> {
     }
     if !all_stages_completed {
         threshold_failures.push("the configured stage plan did not complete".to_owned());
-    } else if !all_targets_reached {
+    } else if !config.open_loop_admission && !all_targets_reached {
         threshold_failures.push(
             "one or more server-authenticated session concurrency targets were not reached"
                 .to_owned(),

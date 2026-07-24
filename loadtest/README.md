@@ -38,6 +38,11 @@ context, and fail if a planned handoff has a usable gap or falls back to a hard
 reconnect. A matchmaking probe should select a mode for which the cohort is
 too small to form a match; the autoscaling runner uses three one-player `2v2`
 lobbies. `--untimed-play-duration` is the hold time for these non-game probes.
+For bounded new-user admission evidence, `--open-loop-admission` is available
+only with `--population idle`. It keeps starting sessions through the normal
+spawn limiter without requiring the configured stage ceiling to be reached;
+the stage value remains a hard in-flight safety ceiling and
+`--max-total-sessions` remains the run-wide launch limit.
 
 Duel and 2v2 use the authoritative server game limit. Solo and FFA have no server time limit, so they play with the AI for two minutes by default, send `LeaveGame`, and confirm that the server processed it with an ordered ping. Natural completion before that window remains authoritative. Override the window with `--untimed-play-duration 5m`; when increasing it, also leave enough `--drain-timeout` for authentication, lobby setup, matchmaking, and the complete play window.
 
@@ -81,7 +86,7 @@ Artifacts are written to `loadtest-reports/<run-id>/` by default:
 - `summary.json` — the machine-readable aggregate plus compact status and completion kind for every session. Schema 8 records initial admission readiness, aggregates successful game-command writes by Unix second, and aggregates first-seen authoritative `CommandScheduledV2` outcomes by partition and second without logging command payloads.
 - `failures/*.json` — complete lifecycle, metrics, failure context, and recent protocol events for every failed, cancelled, or incomplete session; the HTML report links to these files.
 
-The command exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never acknowledged by the server as authenticated, a session is lost from coordinator accounting, a stage misses its target, a launched game is never observed, or deterministic pairing validation fails. Reports measure initial admission from the first WebSocket attempt through the authenticated ordered pong and retain first-seen `CommandScheduledV2` counts by game partition. With `--require-planned-handoff`, every observed drain must promote a ready candidate with an old/new continuity proof and zero measured usable gap. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
+The command exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never acknowledged by the server as authenticated, a session is lost from coordinator accounting, a stage misses its target, a launched game is never observed, or deterministic pairing validation fails. The peak/target checks are intentionally omitted only for an explicit open-loop idle-admission run, where the target is a safety ceiling rather than a desired steady population. Reports measure initial admission from the first WebSocket attempt through the authenticated ordered pong and retain first-seen `CommandScheduledV2` counts by game partition. With `--require-planned-handoff`, every observed drain must promote a ready candidate with an old/new continuity proof and zero measured usable gap. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
 
 Autoscaling evidence is reported separately. The harness samples regional user counts and active regional server counts throughout the run. Backend-cookie aliases, when present, remain a secondary in-band routing hint.
 

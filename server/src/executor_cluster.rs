@@ -726,11 +726,13 @@ fn is_coordination_unavailable(error: &anyhow::Error) -> bool {
 }
 
 fn is_normal_authority_exit(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("lease authority was lost")
-        || message.contains("partition lease was lost")
-        || message.contains("stale partition lease rejected")
-        || message.contains("partition handoff")
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("lease authority was lost")
+            || message.contains("partition lease was lost")
+            || message.contains("stale partition lease rejected")
+            || message.contains("partition handoff")
+    })
 }
 
 #[cfg(test)]
@@ -948,6 +950,22 @@ mod tests {
         let failure =
             crate::game_executor_v2::autonomous_actor_failure(6, 16, anyhow::Error::new(source));
         assert!(is_coordination_unavailable(&failure));
+    }
+
+    #[test]
+    fn autonomous_actor_authority_loss_restarts_only_its_partition() {
+        for source in [
+            "stale partition lease rejected event publication",
+            "partition 8 lease authority was lost",
+            "partition lease was lost before cooperative release",
+        ] {
+            let failure = crate::game_executor_v2::autonomous_actor_failure(
+                8,
+                1978,
+                anyhow::anyhow!("{source}"),
+            );
+            assert!(is_normal_authority_exit(&failure));
+        }
     }
 
     #[test]

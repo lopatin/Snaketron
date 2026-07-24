@@ -70,6 +70,15 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_SPAWN_RATE, value_name = "SESSIONS")]
     pub spawn_rate: usize,
 
+    /// Emit idle admission probes at the configured spawn rate without
+    /// requiring the stage's concurrency ceiling to be reached.
+    ///
+    /// This is intentionally limited to the `idle` population. The stage
+    /// target remains a hard in-flight ceiling, and `max-total-sessions`
+    /// remains the run-wide launch limit.
+    #[arg(long)]
+    pub open_loop_admission: bool,
+
     /// Hard safety cap on virtual-user sessions created during the entire run.
     #[arg(
         long,
@@ -439,6 +448,7 @@ pub struct Config {
     pub population: Population,
     pub stages: StagePlan,
     pub spawn_rate: usize,
+    pub open_loop_admission: bool,
     pub max_total_sessions: usize,
     pub connect_timeout: Duration,
     pub lobby_timeout: Duration,
@@ -493,6 +503,9 @@ impl TryFrom<Args> for Config {
         let region = args.region.map(validate_region).transpose()?;
 
         let sessions_per_group = args.population.sessions_per_group(args.mode);
+        if args.open_loop_admission && args.population != Population::Idle {
+            return Err(ConfigError::OpenLoopAdmissionRequiresIdle);
+        }
         validate_stages(&args.stages, sessions_per_group)?;
         if args.spawn_rate < sessions_per_group {
             return Err(ConfigError::SpawnRateBelowMatchSize {
@@ -534,6 +547,7 @@ impl TryFrom<Args> for Config {
             population: args.population,
             stages: args.stages,
             spawn_rate: args.spawn_rate,
+            open_loop_admission: args.open_loop_admission,
             max_total_sessions: args.max_total_sessions,
             connect_timeout: args.connect_timeout,
             lobby_timeout: args.lobby_timeout,
@@ -576,6 +590,7 @@ pub enum ConfigError {
         spawn_rate: usize,
         players_per_game: usize,
     },
+    OpenLoopAdmissionRequiresIdle,
     SessionLimitBelowConcurrency {
         max_total_sessions: usize,
         max_concurrency: usize,
@@ -630,6 +645,9 @@ impl fmt::Display for ConfigError {
                 formatter,
                 "spawn rate {spawn_rate} must be at least one complete {players_per_game}-player match group per second"
             ),
+            Self::OpenLoopAdmissionRequiresIdle => {
+                formatter.write_str("open-loop admission requires the idle population")
+            }
             Self::SessionLimitBelowConcurrency {
                 max_total_sessions,
                 max_concurrency,
@@ -877,6 +895,7 @@ mod tests {
             population: Population::Game,
             stages: DEFAULT_STAGES.parse().unwrap(),
             spawn_rate: DEFAULT_SPAWN_RATE,
+            open_loop_admission: false,
             max_total_sessions: DEFAULT_MAX_TOTAL_SESSIONS,
             connect_timeout: Duration::from_secs(10),
             lobby_timeout: Duration::from_secs(10),
@@ -993,6 +1012,31 @@ mod tests {
         let config = args.into_config().unwrap();
         assert_eq!(config.sessions_per_group(), 1);
         assert_eq!(config.expected_games(3), 0);
+    }
+
+    #[test]
+    fn open_loop_admission_is_limited_to_idle_probes() {
+        let mut args = test_args();
+        args.open_loop_admission = true;
+        assert_eq!(
+            args.into_config().unwrap_err(),
+            ConfigError::OpenLoopAdmissionRequiresIdle
+        );
+
+        let mut args = test_args();
+        args.population = Population::Idle;
+        args.open_loop_admission = true;
+        let config = args.into_config().unwrap();
+        assert!(config.open_loop_admission);
+    }
+
+    #[test]
+    fn clap_exposes_open_loop_idle_admission() {
+        let args =
+            Args::try_parse_from(["loadtest", "--population", "idle", "--open-loop-admission"])
+                .unwrap();
+        assert_eq!(args.population, Population::Idle);
+        assert!(args.open_loop_admission);
     }
 
     #[test]

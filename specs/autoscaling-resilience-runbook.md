@@ -30,6 +30,14 @@ There are no users or cache state to migrate, so the production workflow does
 not dual-run the old node cache, preserve its plaintext endpoint, or attempt a
 zero-downtime compatibility transition.
 
+Production deployment is manual-only and restricted to the current `main`
+commit. Every dispatch, including a dry run with credentialed CDK planning,
+must provide the GitHub Actions run ID of a successful main-branch Ephemeral
+Development Certification for that exact outer-repository commit. That run
+must complete the planned suite, hard-crash suite, and verified cleanup; a run
+for another commit, branch, repository, or workflow is rejected before AWS
+credentials are used.
+
 For each production region, the workflow detects the old
 `AWS::ElastiCache::ReplicationGroup`, deletes and waits for the Monitoring and
 Server stacks that consume its generated endpoint exports, and removes the
@@ -49,6 +57,10 @@ fixing the deployment forward. After deployment, the workflow requires one
 available Valkey 8 Serverless cache per region, no old Snaketron replication
 group, and an exact task URL of
 `rediss://HOST:6379/?protocol=resp3&cluster=true`.
+The production cache has CloudFormation deletion and replacement policies of
+`Retain`; ephemeral development does not, so its mandatory cleanup remains
+unchanged. Deleting a retained production cache is a separate deliberate
+operator action, not a consequence of deleting its stack.
 
 For steady-state inspection after startup:
 
@@ -220,49 +232,83 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 
 ## Required staging evidence
 
-The minimum capacity envelope is 256 concurrent authenticated game sessions,
-128 concurrent duel games, four new sessions per second, and the `every-tick`
-command profile over ten partitions. Capacity Run B targets 272 game sessions /
-136 duels so ordinary churn cannot turn a brief peak into false five-minute
-evidence. Run B starts only after ten tasks are healthy in ECS and Traefik and
-settled in membership, assignment, and partition leases. It never runs on the
-one-task baseline.
+Certification has three independent load gates.
 
-Continuity Run A is a separate fixed 224-session / 112-duel `every-tick` run on
-the one-vCPU minimum task. This is the one same-version recalibration after the
-checkpoint-write dispatcher split. Exact-source run `30046381977` held 128
-sessions at 45.18--48.83% average CPU over complete steady minutes, with a
-measured 3.5% idle baseline. Scaling only the non-idle component to 224 sessions
-projects 76.4--82.8% CPU, wholly above the unchanged 70% target without aiming
-near saturation. The fixed cohort retains one stage, the existing eight-minute
-target-tracking budget, and the existing 20-minute run clock. It does not use
-synthetic CPU, lower a target, force the transition, or adapt load from live
-metrics. The 224-session cohort is now frozen. It must first
-cause CPU or memory target tracking to add capacity; if it does not, the run
-writes are not accepted as a substitute. The pre-movement one-task baseline
-must itself keep every command outcome within one second; this explicitly
-prevents autoscaling from hiding an already-overloaded starting task. The
-fixed 224-session calibration fails rather than being adjusted again, forced,
-or accepted if either the policy trigger or that latency budget is missed.
-Policy writes are then
-suspended while Run A proves the
-direct `1 -> 10 -> 1` ownership staircase. At ten tasks the runner adds 10 idle,
-10 lobby, and three
-deliberately unmatched 2v2 probes. Immediately before planned scale-in it also
-starts a 208-session idle ramp at four sessions per second. This keeps new-user
-admission continuous through the 45-second drain deadline while leaving only
-224 command-bearing game sockets on the final task. Run A must prove no active
-socket hard reconnect, zero measured usable-session gap, terminal command
-outcomes, nonterminal game handoffs with command-outcome barriers, and exactly
-nine partition moves in each direction. No game completion is awaited before
-either desired-count change.
+**Gate A — natural scale-out.** Run a fixed 224-session / 112-duel
+`every-tick` cohort from the one-vCPU minimum task. It retains one stage, the
+20-minute runner, eight-minute target-tracking observation budget, and the
+existing one-second command-outcome budget. It does not use synthetic CPU,
+lower a target, force the transition, or adapt load from live metrics. CPU or
+memory target tracking must add capacity naturally; failure to trigger or to
+preserve command continuity fails this gate. Once the automatic scale-out
+evidence is complete, let this runner finish and require its WebSockets and
+authoritative games to reach zero. Gate A traffic must not be carried into the
+reset or forced staircase.
+
+**Gate B — planned ownership and socket transition.** With Gate A traffic
+gone, suspend policy writes, return to one healthy task, and launch a separate
+fixed 128-session / 64-duel `every-tick` cohort. Exact-source run
+`30046381977` held this envelope at 45.18--48.83% average one-task CPU over
+complete steady minutes, resolved every command inside 500 milliseconds, and
+recorded zero checkpoint failures. Before movement, require active games and
+scheduled command traffic on every executor partition and prove the one-task
+baseline remains inside the one-second command budget without lease,
+heartbeat, checkpoint, or event-publication timeouts.
+
+Force the direct `1 -> 10 -> 1` staircase under that same 128-session cohort.
+At ten tasks add 10 idle, 10 lobby, and three deliberately unmatched 2v2
+matchmaking probes. During planned scale-in, use the bounded open-loop
+admission mode: start four additional idle sessions every
+second regardless of the current ready count, hold each successful session for
+one second after it becomes ready, and enforce a 64-session in-flight safety
+ceiling. The unchanged ten-second admission deadline plus the one-second hold
+would account for at most 44 normally progressing sessions at four starts per
+second; the ceiling leaves scheduling margin while still failing a stuck
+probe. Allocate enough total session budget to sustain launches for the
+complete 45-second scale-in window. Assert every four-session wave, its bounded
+admission-ready time, the 64-session in-flight ceiling, and continuous wave
+coverage from before scale-in starts until after it finishes.
+
+This complete Gate B destination is bounded at 215 sockets (128 game, 23
+context, and 64 admission) and only 128 are command-bearing. Gate A has already
+placed 224 command-bearing sockets on the one-task origin while ramping at the
+same four starts per second, so it is the conservative one-task capacity
+precondition rather than a duplicated rehearsal. Gate B must still prove the
+final survivor remains ready and resolves every command inside budget.
+
+Gate B must prove no active-socket hard reconnect, zero measured usable-session
+gap, terminal command outcomes, nonterminal game handoffs with
+command-outcome barriers, and exactly nine partition moves in each direction.
+No game completion is awaited before either desired-count change. Its steady
+population is 128 command-bearing game sockets plus 23 context probes. The
+open-loop admission sessions are bounded transient traffic rather than another
+steady target, and make-before-break candidates are additional transient
+sockets.
+
+**Gate C — ten-task capacity.** Only after Gate B traffic is gone, establish
+ten healthy tasks in ECS and Traefik, settled membership, assignment, and
+partition leases. Configure 272 game sessions / 136 duels so ordinary churn
+cannot turn one brief peak into false evidence. Require at least 256 concurrent
+authenticated game sessions / 128 duels and `every-tick` traffic on every
+partition for five continuous minutes after ramping at four new sessions per
+second. This capacity envelope never runs on the one-task baseline.
+
+A forced scale-in is valid only when its complete destination load is sized
+from demonstrated one-task capacity. Gate B proves the command-bearing cohort
+on one task before movement and must prove the complete destination remains
+healthy after movement. If the survivor reaches CPU starvation and lease
+probes, membership heartbeats, checkpoints, or event writes time out together,
+the run has violated that capacity precondition; it has not isolated a
+handoff-ordering defect. Do not weaken fencing to make such a run pass. A write
+without current lease proof remains rejected, the executor and planned drain
+fail closed, and ordinary lease-expiry recovery remains authoritative.
 
 `--staging` certifies the planned path and deliberately injects no crash.
 `--staging-crash` is a separate invocation with no planned-handoff requirement.
 The only distinct abrupt external action is one separately authorized
-non-production ECS task SIGKILL during a separate run of the same fixed load
-envelope while another task is ready. It must not deliver SIGTERM or otherwise
-permit graceful cleanup. The local real-process tests prove the
+non-production ECS task SIGKILL during a separate run of the ten-task
+272-session crash envelope while another task is ready. It must not deliver
+SIGTERM or otherwise permit graceful cleanup. The local real-process tests prove the
 command/checkpoint/fencing kill boundaries; the one external task kill proves
 their composition with ECS membership, replacement, ingress reconnect, and the
 naturally occurring partition backlog.
@@ -293,7 +339,7 @@ server, Traefik, socket-continuity, and command-outcome path. Together they
 satisfy the UI criterion; a second staging-browser rendering test is not
 required.
 
-The fixed-envelope traffic itself is the ingress capacity test. It fails on a
+Gate C traffic is the ingress capacity test. It fails on a
 Traefik scrape error, zero healthy backends, socket loss, failed admission, or
 admission latency beyond ten seconds, and it records host CPU and network.
 Connection-tracking occupancy may be collected as an optional diagnostic when
@@ -309,10 +355,15 @@ results for:
   exact healthy-backend coverage, games/lobbies/matchmaking/idle sockets,
   continuous input, per-task CPU/memory/socket load, Valkey latency/capacity,
   and Traefik/NAT CPU/network; and
-- one non-production task SIGKILL during a separate run of the same load
-  envelope, followed by five-second authoritative recovery for the affected
-  partition's observed backlog, ten-second automatic gateway-session recovery,
-  one logical outcome per command, and restored healthy ECS capacity.
+- one non-production task SIGKILL during a separate run of the ten-task
+  272-session crash envelope, followed by five-second authoritative recovery
+  for the affected partition's observed backlog, ten-second automatic
+  gateway-session recovery, one logical outcome per command, and restored
+  healthy ECS capacity.
+
+The records below retain the earlier combined-harness `Run A` / `Run B`
+terminology and its then-current load decisions. They are historical diagnostic
+evidence, not the current three-gate definition above.
 
 Neither the planned staging run nor the non-production task-SIGKILL result has
 a passing report attached in this repository. The first Serverless-backed
@@ -659,7 +710,7 @@ fails closed after 30 attempts in a rolling seven-day window. This preserves
 registered-domain allowance; it is a conservative workflow budget, not proof
 of the domain's live CA quota.
 
-At settled continuity task counts `1`, `10`, and `1`, the runner records membership, the
+At settled Gate B task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
 pending completions, and active-game counts. It fails unless leases match
 desired owners, tokens are unique, owners are balanced, the assignment's
@@ -675,23 +726,28 @@ report schema 10 includes each session's launch
 wave, start time, and bounded initial admission-ready duration so the admission
 assertion is phase-specific.
 
-Scaling evidence has four deliberately distinct parts:
+Scaling evidence has five deliberately distinct parts:
 
-1. With policy writes enabled, fixed Run A load must cause an AWS-observed
+1. With policy writes enabled, fixed Gate A load must cause an AWS-observed
    desired/running count above one and a successful target-tracking scaling
-   activity. The runner fails immediately if Run A exits first. This is the
+   activity. The runner fails immediately if Gate A exits first. This is the
    automatic scale-out proof. Its strict continuity window begins at the first
    successful scaling activity, excluding only the preceding client ramp when
    no ownership transition exists.
-2. Policy writes are temporarily suspended only for the deterministic forced
-   1-to-10-to-1 ownership staircase under Run A and its companion/admission
-   probes. The settled control-plane snapshots prove that leg's exact ownership
-   behavior without placing capacity load on one task.
-3. With policy writes still suspended and all Run A clients gone, the runner
-   establishes ten verified tasks and runs the separate 272-session Run B. The
+2. Gate A then finishes. The runner requires zero remaining Gate A WebSockets
+   and authoritative games before returning the service to one task. It starts
+   the separate 128-session Gate B cohort only after that one-task baseline is
+   healthy and inside the command and control-operation budgets.
+3. Policy writes remain suspended for Gate B's deterministic
+   `1 -> 10 -> 1` ownership staircase, 23 durable context probes, and bounded
+   open-loop admissions. The settled control-plane snapshots prove exact
+   ownership behavior without placing either high-load Gate A or capacity Gate
+   C on one task.
+4. With policy writes still suspended and all Gate B clients gone, the runner
+   establishes ten verified tasks and runs the separate 272-session Gate C. The
    per-second 256-session/128-duel and command gates cover five continuous
    minutes, and exact task identities prove socket/event distribution.
-4. Only after Run B has ended does the runner re-enable target tracking and
+5. Only after Gate C has ended does the runner re-enable target tracking and
    require an AWS-observed automatic scale-in from ten to one plus a successful
    target-tracking activity. This observation is separate from the forced
    staircase.
@@ -721,13 +777,14 @@ resends for any still-unresolved commands. WebSocket-upgrade `429` also uses the
 bounded reconnect loop. Both remain charged to the original game/admission
 deadline and are reported; neither creates an exclusion from the one-second
 command gate, ten-second admission gate, or zero-gap planned-handoff gate.
-The Run B gate requires at least 256 authenticated sessions and 128 simultaneous
-duel games throughout the five-minute interval. Separate Run A population
+The Gate C run requires at least 256 authenticated sessions and 128 simultaneous
+duel games throughout the five-minute interval. Separate Gate B population
 reports require every idle, lobby, and queued probe to reach its intended state
-before scale-in and remain alive until that transition finishes. The 208-session
-idle admission report proves uninterrupted four-session waves and ten-second
-p99 readiness through the scale-in window. Exact task identities must cover the
-settled ten-task membership in both the continuity and capacity phases.
+before scale-in and remain alive until that transition finishes. The open-loop
+admission report proves one four-session start wave per second, a one-second
+post-ready hold, no more than 64 sessions in flight, and ten-second p99
+readiness throughout the scale-in window. Exact task identities must cover the
+settled ten-task membership in both the transition and capacity phases.
 
 The runner continuously scrapes Traefik's service-server-up gauge, accepts its
 opaque per-task service IDs, and matches settled tasks by exact private-IP
@@ -741,6 +798,8 @@ metric series. It also saves and gates a Container Insights Logs Insights result
 with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
-command, or failure to corroborate the measured
-phase envelopes (at least 455 simultaneous sockets during transition/admission
-and 272 game sessions during capacity).
+command, or failure to corroborate the measured phase envelopes: 224 game
+sessions during natural scale-out; 128 game sessions, 23 durable context
+sessions, bounded open-loop admission, and transient make-before-break
+candidates during the planned transition; and 272 game sessions during
+capacity.
