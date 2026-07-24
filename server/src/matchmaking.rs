@@ -5,6 +5,8 @@ use common::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
@@ -22,6 +24,83 @@ use crate::matchmaking_manager::{
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
 const FFA_MAX_RECURSION_DEPTH: usize = 8;
+const GAME_CREATED_OUTBOX_LANE_CAPACITY: usize = 1;
+
+struct GameCreatedOutboxDelivery {
+    record: GameCreatedOutboxRecord,
+    expected_payload: String,
+}
+
+async fn run_game_created_outbox_worker(
+    partition_id: u32,
+    mut matchmaking: MatchmakingManager,
+    game_bus: Arc<GameBus>,
+    mut batches: mpsc::Receiver<Vec<GameCreatedOutboxDelivery>>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    loop {
+        let batch = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            batch = batches.recv() => batch.context(
+                "game-created outbox worker channel closed unexpectedly"
+            )?,
+        };
+        for delivery in batch {
+            if delivery.record.partition_id != partition_id {
+                anyhow::bail!(
+                    "game-created outbox record for partition {} reached worker {partition_id}",
+                    delivery.record.partition_id
+                );
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = deliver_game_created_outbox_record(
+                    &mut matchmaking,
+                    game_bus.as_ref(),
+                    delivery,
+                ) => {}
+            }
+        }
+    }
+}
+
+async fn deliver_game_created_outbox_record(
+    matchmaking: &mut MatchmakingManager,
+    game_bus: &GameBus,
+    delivery: GameCreatedOutboxDelivery,
+) {
+    let game_id = delivery.record.game_id;
+    if let Err(error) = game_bus.publish_game_created_once(&delivery.record).await {
+        warn!(game_id, %error, "game-created outbox delivery failed; retrying");
+        return;
+    }
+    match matchmaking
+        .acknowledge_game_created_outbox(game_id, &delivery.expected_payload)
+        .await
+    {
+        Ok(_) => {
+            if let Err(error) = game_bus.expire_game_created_delivery_marker(game_id).await {
+                warn!(game_id, %error, "failed to expire acknowledged game-created marker");
+            }
+        }
+        Err(error) => {
+            warn!(game_id, %error, "game-created outbox acknowledgement failed; retrying");
+        }
+    }
+}
+
+fn unexpected_game_created_outbox_worker_exit(
+    joined: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
+) -> anyhow::Error {
+    match joined {
+        Some(Ok(Ok(()))) => anyhow::anyhow!("game-created outbox worker exited unexpectedly"),
+        Some(Ok(Err(error))) => error,
+        Some(Err(error)) => anyhow::anyhow!("game-created outbox worker task failed: {error}"),
+        None => anyhow::anyhow!("all game-created outbox workers exited unexpectedly"),
+    }
+}
 
 /// Retry the two single-slot halves of match creation until both are durable.
 /// Every task may help; duplicate workers are harmless because destination
@@ -31,54 +110,120 @@ pub async fn run_game_created_outbox_loop(
     game_bus: Arc<GameBus>,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    let worker_cancellation = cancellation.child_token();
+    let mut workers = JoinSet::new();
+    let mut lanes = Vec::with_capacity(PARTITION_COUNT as usize);
+    for partition_id in 0..PARTITION_COUNT {
+        let (sender, receiver) = mpsc::channel(GAME_CREATED_OUTBOX_LANE_CAPACITY);
+        lanes.push(sender);
+        let worker_matchmaking = matchmaking.clone();
+        let worker_bus = game_bus.clone();
+        let worker_token = worker_cancellation.clone();
+        workers.spawn(async move {
+            run_game_created_outbox_worker(
+                partition_id,
+                worker_matchmaking,
+                worker_bus,
+                receiver,
+                worker_token,
+            )
+            .await
+            .with_context(|| {
+                format!("game-created outbox worker for partition {partition_id} failed")
+            })
+        });
+    }
+
     let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cursor = 0_u64;
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Ok(()),
-            _ = ticker.tick() => {}
-        }
-
-        let (next_cursor, records) = match matchmaking.scan_game_created_outbox(cursor).await {
-            Ok(batch) => batch,
-            Err(error) => {
-                warn!(%error, "game-created outbox scan failed; retrying");
-                cursor = 0;
-                continue;
-            }
-        };
-        cursor = next_cursor;
-        for (field, payload) in records {
-            let record: GameCreatedOutboxRecord = serde_json::from_str(&payload)
-                .context("game-created outbox contains malformed JSON")?;
-            record.validate()?;
-            if field != record.game_id.to_string() {
-                anyhow::bail!("game-created outbox field/payload identity mismatch");
-            }
-            if let Err(error) = game_bus.publish_game_created_once(&record).await {
-                warn!(game_id = record.game_id, %error, "game-created outbox delivery failed; retrying");
-                continue;
-            }
-            match matchmaking
-                .acknowledge_game_created_outbox(record.game_id, &payload)
-                .await
-            {
-                Ok(_) => {
-                    if let Err(error) = game_bus
-                        .expire_game_created_delivery_marker(record.game_id)
-                        .await
-                    {
-                        warn!(game_id = record.game_id, %error, "failed to expire acknowledged game-created marker");
-                    }
+    let loop_result = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                joined = workers.join_next() => {
+                    return Err(unexpected_game_created_outbox_worker_exit(joined));
                 }
+                _ = ticker.tick() => {}
+            }
+
+            let scan_result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                joined = workers.join_next() => {
+                    return Err(unexpected_game_created_outbox_worker_exit(joined));
+                }
+                result = matchmaking.scan_game_created_outbox(cursor) => result,
+            };
+            let (next_cursor, records) = match scan_result {
+                Ok(batch) => batch,
                 Err(error) => {
-                    warn!(game_id = record.game_id, %error, "game-created outbox acknowledgement failed; retrying");
+                    warn!(%error, "game-created outbox scan failed; retrying");
+                    cursor = 0;
+                    continue;
+                }
+            };
+            cursor = next_cursor;
+            let mut partition_batches: Vec<Vec<GameCreatedOutboxDelivery>> =
+                (0..PARTITION_COUNT).map(|_| Vec::new()).collect();
+            for (field, payload) in records {
+                let record: GameCreatedOutboxRecord = serde_json::from_str(&payload)
+                    .context("game-created outbox contains malformed JSON")?;
+                record.validate()?;
+                if field != record.game_id.to_string() {
+                    anyhow::bail!("game-created outbox field/payload identity mismatch");
+                }
+                let partition_id = record.partition_id;
+                partition_batches[partition_id as usize].push(GameCreatedOutboxDelivery {
+                    record,
+                    expected_payload: payload,
+                });
+            }
+            for (partition_id, batch) in partition_batches.into_iter().enumerate() {
+                if batch.is_empty() {
+                    continue;
+                }
+                match lanes[partition_id].try_send(batch) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(batch)) => {
+                        trace!(
+                            record_count = batch.len(),
+                            partition_id,
+                            "game-created outbox lane is full; leaving records in Redis for retry"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(batch)) => {
+                        anyhow::bail!(
+                            "game-created outbox worker channel for partition {} closed while routing {} records",
+                            partition_id,
+                            batch.len()
+                        );
+                    }
                 }
             }
         }
     }
+    .await;
+
+    worker_cancellation.cancel();
+    drop(lanes);
+    let mut shutdown_error = None;
+    while let Some(joined) = workers.join_next().await {
+        let error = match joined {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => {
+                Some(error.context("game-created outbox worker failed during shutdown"))
+            }
+            Err(error) => Some(anyhow::anyhow!(
+                "game-created outbox worker task failed during shutdown: {error}"
+            )),
+        };
+        if shutdown_error.is_none() {
+            shutdown_error = error;
+        }
+    }
+    loop_result.and(shutdown_error.map_or(Ok(()), Err))
 }
 
 #[derive(Debug)]
@@ -1329,7 +1474,12 @@ mod tests {
     use super::*;
     use crate::lobby_manager::LobbyMember;
     use crate::matchmaking_manager::QueuedLobby;
+    use crate::redis_keys::RedisKeys;
+    use crate::redis_utils::{RedisClient, RedisConnection};
     use common::{QueueMode, TeamId};
+    use redis::AsyncCommands;
+
+    static OUTBOX_DB10_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn ffa_lobby(code: &str, user_ids: &[u32], queued_at: i64) -> QueuedLobby {
         QueuedLobby {
@@ -1351,10 +1501,326 @@ mod tests {
         }
     }
 
+    fn random_game_id_base() -> u32 {
+        let candidate = rand::random::<u32>() % (u32::MAX - 2 * PARTITION_COUNT);
+        candidate - candidate % PARTITION_COUNT
+    }
+
+    fn game_created_outbox_delivery(game_id: u32) -> Result<GameCreatedOutboxDelivery> {
+        let game_created_payload = serde_json::to_string(&StreamEvent::GameCreated {
+            game_id,
+            game_state: GameState::new(
+                10,
+                10,
+                GameType::Solo,
+                QueueMode::Quickmatch,
+                Some(u64::from(game_id)),
+                Utc::now().timestamp_millis(),
+            ),
+        })?;
+        let record = GameCreatedOutboxRecord {
+            schema_version: 1,
+            game_id,
+            partition_id: game_id % PARTITION_COUNT,
+            game_created_payload,
+        };
+        record.validate()?;
+        Ok(GameCreatedOutboxDelivery {
+            expected_payload: serde_json::to_string(&record)?,
+            record,
+        })
+    }
+
     #[tokio::test]
     async fn test_match_creation_logic() {
         // Test the match creation logic
         // This would require mocking Redis and PubSub
+    }
+
+    #[tokio::test]
+    async fn stalled_game_created_lane_does_not_block_another_partition() -> Result<()> {
+        let _test_lock = OUTBOX_DB10_TEST_LOCK.lock().await;
+        // Dedicated logical DB for this test. Nothing is flushed: every key
+        // touched below is explicitly removed before and after the exercise.
+        let url = "redis://127.0.0.1:6379/10?protocol=resp3";
+        let client = redis::Client::open(url)?;
+        let app_client = RedisClient::open(url, None)?;
+        let global = app_client.get_managed_connection().await?;
+        let partition_zero = app_client.get_managed_connection().await?;
+        let partition_one = app_client.get_managed_connection().await?;
+        let matchmaking = MatchmakingManager::new(global.clone())?;
+        let mut partition_connections: Vec<RedisConnection> =
+            (0..PARTITION_COUNT).map(|_| global.clone()).collect();
+        partition_connections[0] = partition_zero.clone();
+        partition_connections[1] = partition_one;
+        let bus = Arc::new(GameBus::new(
+            global.clone(),
+            partition_connections,
+            global.clone(),
+            global,
+            app_client,
+            CancellationToken::new(),
+        )?);
+
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let base_game_id = random_game_id_base();
+        let partition_zero_game_id = base_game_id;
+        let partition_one_game_id = base_game_id + 1;
+        let partition_zero_field = partition_zero_game_id.to_string();
+        let partition_one_field = partition_one_game_id.to_string();
+        let partition_zero_payload =
+            game_created_outbox_delivery(partition_zero_game_id)?.expected_payload;
+        let partition_one_payload =
+            game_created_outbox_delivery(partition_one_game_id)?.expected_payload;
+
+        let outbox_key = RedisKeys::matchmaking_game_created_outbox();
+        let partition_zero_stream = RedisKeys::stream_commands(0);
+        let partition_one_stream = RedisKeys::stream_commands(1);
+        let partition_zero_marker =
+            RedisKeys::matchmaking_game_created_delivery(partition_zero_game_id);
+        let partition_one_marker =
+            RedisKeys::matchmaking_game_created_delivery(partition_one_game_id);
+        let stall_key = format!("snaketron:test:game-created-outbox-stall:{salt}");
+        let lane_name = format!("snaketron-outbox-lane-stall-{salt}");
+        let mut inspector = client.get_multiplexed_async_connection().await?;
+        let _: usize = inspector
+            .hdel(
+                &outbox_key,
+                &[partition_zero_field.as_str(), partition_one_field.as_str()],
+            )
+            .await?;
+        let _: usize = inspector
+            .del(&[
+                stall_key.as_str(),
+                partition_zero_stream.as_str(),
+                partition_one_stream.as_str(),
+                partition_zero_marker.as_str(),
+                partition_one_marker.as_str(),
+            ])
+            .await?;
+        let _: usize = inspector
+            .hset(&outbox_key, &partition_zero_field, &partition_zero_payload)
+            .await?;
+        let _: usize = inspector
+            .hset(&outbox_key, &partition_one_field, &partition_one_payload)
+            .await?;
+
+        let mut stalled_connection = partition_zero.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg(&lane_name)
+            .query_async(&mut stalled_connection)
+            .await?;
+        let blocked_key = stall_key.clone();
+        let blocked_read = tokio::spawn(async move {
+            redis::cmd("BLPOP")
+                .arg(blocked_key)
+                .arg(0)
+                .query_async::<Option<(String, String)>>(&mut stalled_connection)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let clients: String = redis::cmd("CLIENT")
+                    .arg("LIST")
+                    .query_async(&mut inspector)
+                    .await?;
+                if clients.lines().any(|line| {
+                    line.contains(&format!("name={lane_name}")) && line.contains("cmd=blpop")
+                }) {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("partition-zero outbox lane never entered its blocking operation")??;
+
+        let cancellation = CancellationToken::new();
+        let outbox_loop = tokio::spawn(run_game_created_outbox_loop(
+            matchmaking,
+            bus,
+            cancellation.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let source: Option<String> =
+                    inspector.hget(&outbox_key, &partition_one_field).await?;
+                let stream_len: u64 = inspector.xlen(&partition_one_stream).await?;
+                let marker_ttl_ms: i64 = inspector.pttl(&partition_one_marker).await?;
+                if source.is_none() && stream_len == 1 && marker_ttl_ms > 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("partition-one GameCreated was delayed behind stalled partition zero")??;
+        let partition_zero_source: Option<String> =
+            inspector.hget(&outbox_key, &partition_zero_field).await?;
+        anyhow::ensure!(
+            partition_zero_source.as_deref() == Some(partition_zero_payload.as_str()),
+            "partition-zero source record changed while its publish was blocked"
+        );
+        anyhow::ensure!(
+            inspector.xlen::<_, u64>(&partition_zero_stream).await? == 0,
+            "partition-zero command was delivered before its lane was released"
+        );
+        anyhow::ensure!(
+            !blocked_read.is_finished() && !outbox_loop.is_finished(),
+            "blocked lane or critical outbox loop exited before release"
+        );
+
+        let _: usize = inspector.rpush(&stall_key, "release").await?;
+        tokio::time::timeout(Duration::from_secs(1), blocked_read)
+            .await
+            .context("partition-zero blocking operation did not release")???;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let source: Option<String> =
+                    inspector.hget(&outbox_key, &partition_zero_field).await?;
+                let stream_len: u64 = inspector.xlen(&partition_zero_stream).await?;
+                let marker_ttl_ms: i64 = inspector.pttl(&partition_zero_marker).await?;
+                if source.is_none() && stream_len == 1 && marker_ttl_ms > 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("partition-zero GameCreated did not complete after release")??;
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), outbox_loop)
+            .await
+            .context("game-created outbox loop did not stop after cancellation")???;
+        let _: usize = inspector
+            .hdel(
+                &outbox_key,
+                &[partition_zero_field.as_str(), partition_one_field.as_str()],
+            )
+            .await?;
+        let _: usize = inspector
+            .del(&[
+                stall_key.as_str(),
+                partition_zero_stream.as_str(),
+                partition_one_stream.as_str(),
+                partition_zero_marker.as_str(),
+                partition_one_marker.as_str(),
+            ])
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn game_created_lane_continues_after_one_record_fails() -> Result<()> {
+        let _test_lock = OUTBOX_DB10_TEST_LOCK.lock().await;
+        let url = "redis://127.0.0.1:6379/10?protocol=resp3";
+        let client = redis::Client::open(url)?;
+        let app_client = RedisClient::open(url, None)?;
+        let global = app_client.get_managed_connection().await?;
+        let partition_redis = app_client.get_managed_connection().await?;
+        let matchmaking = MatchmakingManager::new(global.clone())?;
+        let partition_id = 2;
+        let mut partition_connections = (0..PARTITION_COUNT)
+            .map(|_| global.clone())
+            .collect::<Vec<_>>();
+        partition_connections[partition_id as usize] = partition_redis;
+        let bus = Arc::new(GameBus::new(
+            global.clone(),
+            partition_connections,
+            global.clone(),
+            global,
+            app_client,
+            CancellationToken::new(),
+        )?);
+
+        let base_game_id = random_game_id_base();
+        let failing_game_id = base_game_id + partition_id;
+        let valid_game_id = failing_game_id + PARTITION_COUNT;
+        let failing_field = failing_game_id.to_string();
+        let valid_field = valid_game_id.to_string();
+        let failing_delivery = game_created_outbox_delivery(failing_game_id)?;
+        let valid_delivery = game_created_outbox_delivery(valid_game_id)?;
+        let failing_payload = failing_delivery.expected_payload.clone();
+        let valid_payload = valid_delivery.expected_payload.clone();
+        let outbox_key = RedisKeys::matchmaking_game_created_outbox();
+        let command_stream = RedisKeys::stream_commands(partition_id);
+        let failing_marker = RedisKeys::matchmaking_game_created_delivery(failing_game_id);
+        let valid_marker = RedisKeys::matchmaking_game_created_delivery(valid_game_id);
+        let mut inspector = client.get_multiplexed_async_connection().await?;
+        let _: usize = inspector
+            .hdel(&outbox_key, &[failing_field.as_str(), valid_field.as_str()])
+            .await?;
+        let _: usize = inspector
+            .del(&[
+                command_stream.as_str(),
+                failing_marker.as_str(),
+                valid_marker.as_str(),
+            ])
+            .await?;
+        let _: usize = inspector
+            .hset(&outbox_key, &failing_field, &failing_payload)
+            .await?;
+        let _: usize = inspector
+            .hset(&outbox_key, &valid_field, &valid_payload)
+            .await?;
+        // GET inside the idempotent publish script fails only for this record.
+        let _: usize = inspector.rpush(&failing_marker, "wrong-type").await?;
+
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(run_game_created_outbox_worker(
+            partition_id,
+            matchmaking,
+            bus,
+            receiver,
+            cancellation.clone(),
+        ));
+        sender
+            .send(vec![failing_delivery, valid_delivery])
+            .await
+            .context("same-partition outbox worker closed before receiving its batch")?;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let valid_source: Option<String> =
+                    inspector.hget(&outbox_key, &valid_field).await?;
+                let stream_len: u64 = inspector.xlen(&command_stream).await?;
+                let marker_ttl_ms: i64 = inspector.pttl(&valid_marker).await?;
+                if valid_source.is_none() && stream_len == 1 && marker_ttl_ms > 0 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("valid record remained starved behind a failed same-partition record")??;
+        let failing_source: Option<String> = inspector.hget(&outbox_key, &failing_field).await?;
+        anyhow::ensure!(
+            failing_source.as_deref() == Some(failing_payload.as_str()),
+            "failed source record was unexpectedly acknowledged"
+        );
+
+        cancellation.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .context("same-partition outbox worker did not stop after cancellation")???;
+        let _: usize = inspector
+            .hdel(&outbox_key, &[failing_field.as_str(), valid_field.as_str()])
+            .await?;
+        let _: usize = inspector
+            .del(&[
+                command_stream.as_str(),
+                failing_marker.as_str(),
+                valid_marker.as_str(),
+            ])
+            .await?;
+        Ok(())
     }
 
     #[test]

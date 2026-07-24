@@ -4114,11 +4114,14 @@ mod tests {
             let token = CancellationToken::new();
             let bus = Arc::new(GameBus::new(
                 manager.clone(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
                 manager.clone(),
                 manager.clone(),
                 client,
                 token.clone(),
-            ));
+            )?);
             let mut owners = serde_json::Map::new();
             owners.insert(
                 partition.to_string(),

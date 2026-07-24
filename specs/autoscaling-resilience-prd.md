@@ -253,6 +253,21 @@ The assignment coordinator is control plane only. Existing assignments and activ
 11. `XACK` removes an entry from the pending-entry list; it does not by itself delete the stream entry.
 12. Recovery backlog processing must use batches of at most 512 while preserving per-partition stream order.
 13. Every delivered executor item must retain its Redis stream ID through dispatch and checkpointing. A malformed/poison entry needs a durable quarantine or terminal disposition before it can be ACKed.
+14. Before a task becomes ready, independently bootstrap exactly one
+    `redis-rs` cluster connection for each of the ten fixed executor partitions.
+    Every latency-sensitive, partition-scoped `GameBus` command, event,
+    consumer-group, snapshot-anchor, and fenced mutation must use the
+    deterministic lane for that partition. Do not clone one connection across
+    partitions: clones share the same bounded client dispatcher and underlying
+    per-node connection set.
+15. Keep `PartitionLeaseStore` acquire/renew/release, membership, assignment,
+    matchmaking, and readiness on the low-volume global control connection.
+    Partition-hot fenced scripts still validate the lease key atomically from
+    their partition lane. Recovery reads, checkpoint writes, RESP3 Pub/Sub, and
+    stream fan-out readers retain their separately bootstrapped connections.
+    This is a fixed ten-lane topology matching the existing partition count,
+    not a dynamic pool, per-game connection, priority scheduler, or retry
+    system.
 
 ### R5 — Command acknowledgement, idempotency, and resend
 
@@ -403,9 +418,19 @@ The assignment coordinator is control plane only. Existing assignments and activ
 5. Allocate the durable DynamoDB game ID before the Valkey commit. Unused IDs after a failed claim are acceptable.
 6. Exactly one concurrent claim may succeed. Losing workers must leave the winning match intact and must not partially remove other queue state.
 7. Every task may scan the small matchmaking outbox. Delivery into the destination partition slot must atomically compare/create a per-game delivery marker and append `GameCreated`; retries after an ambiguous response return the original delivery rather than append a duplicate. Remove the source outbox field only by compare-and-delete after destination success. No singleton is required.
-8. `GameCreated` carries the full initial state. The executor remains the only checkpoint writer: it creates the initial recovery checkpoint and active-game index entry before ACKing `GameCreated`.
-9. `MatchFound` remains a hint. A connected lobby listener must subscribe first, then read the durable lobby-to-game mapping; every hint triggers another authoritative mapping read, and a five-second fallback reconciliation covers a missed hint or subscription reconnect. Deduplicate forwarded `JoinGame` messages by game ID. Disconnected recipients resolve the same durable mapping during authentication.
-10. The atomic admission predicates and atomic eligibility/commit are the matchmaking fences. A separate matchmaking ownership epoch or general saga framework is not required; the one outbox is the narrow cross-slot bridge imposed by Redis Cluster.
+8. Outbox scanning must route validated records through exactly one bounded,
+   sequential delivery worker per fixed executor partition. Routing is
+   nonblocking: each scan page becomes at most one complete batch per
+   partition, and a lane holds at most one queued batch behind its active
+   batch. A full lane leaves the batch's records in the authoritative Redis
+   hash for a later scan. The worker must continue through the batch after a
+   record-specific delivery error. A slow partition's publish, compare-delete,
+   or marker expiry must not delay another partition, and an unexpected
+   delivery-worker exit is task-fatal. Do not add an unbounded spawn-per-record
+   path or a generic worker pool.
+9. `GameCreated` carries the full initial state. The executor remains the only checkpoint writer: it creates the initial recovery checkpoint and active-game index entry before ACKing `GameCreated`.
+10. `MatchFound` remains a hint. A connected lobby listener must subscribe first, then read the durable lobby-to-game mapping; every hint triggers another authoritative mapping read, and a five-second fallback reconciliation covers a missed hint or subscription reconnect. Deduplicate forwarded `JoinGame` messages by game ID. Disconnected recipients resolve the same durable mapping during authentication.
+11. The atomic admission predicates and atomic eligibility/commit are the matchmaking fences. A separate matchmaking ownership epoch or general saga framework is not required; the one outbox is the narrow cross-slot bridge imposed by Redis Cluster.
 
 ### R10 — Truthful liveness, readiness, and routing
 
@@ -669,7 +694,9 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
 | Run the fixed 224-session / 112-duel `every-tick` continuity calibration from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to force the transition, adjust the fixed cohort again, or weaken the budget. |
 | Hold 256 authenticated sessions / 128 duels at four new sessions per second with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
-| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; loss-tolerant Pub/Sub, bulk recovery reads, and full-state checkpoint writes each use independently bootstrapped connections isolated from authoritative hot/control commands, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes and the independently bootstrapped control, recovery-read, checkpoint-write, loss-tolerant Pub/Sub, and stream-fan-out connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Stall one partition's `GameCreated` destination lane while another partition has a valid durable outbox record | The unstalled partition publishes and compare-deletes its record within one second while the stalled record remains authoritative in the outbox; after release, the stalled partition publishes exactly once and is acknowledged. |
+| Make one `GameCreated` delivery fail for a record-specific wrong-type marker, followed by a valid record in the same partition batch | The failed record remains in the durable outbox, while the later record still publishes, is compare-deleted, and receives marker expiry within one second. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
 
 ## 16. Delivery plan
@@ -733,10 +760,10 @@ criteria pass before the production ramp.
 | --- | --- |
 | Assignment module + `redis_keys.rs` | Membership, coordinator, canonical assignment, monotonic partition views, allocator, and explicit Cluster hash-slot families. |
 | `server/src/redis_utils.rs` | One standalone/cluster-aware connection abstraction; TLS and Redis Cluster selection from the deployment URL. |
-| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, lease-aware single-slot scripts, versioned checkpoint APIs, idempotent outbox delivery, and separately retryable completion cleanup. |
+| `server/src/game_bus.rs` | Executor consumer-group reader, safe command retention, deterministic routing through ten prewarmed partition-hot lanes, lease-aware single-slot scripts, versioned checkpoint APIs, idempotent outbox delivery, and separately retryable completion cleanup. |
 | `server/src/game_executor_v2.rs` | Recovery envelope, dedupe, active-game index, backlog-first resume, cooperative checkpoint/release, idempotent finalization. |
 | `server/src/game_server.rs` and `main.rs` | SIGTERM, lifecycle state, readiness state, critical-worker failure policy, one bounded drain deadline. |
-| `server/src/matchmaking.rs` and manager | Atomic queue admission/cancellation/commit scripts, durable user-to-game mappings, and a bounded `GameCreated` outbox. |
+| `server/src/matchmaking.rs` and manager | Atomic queue admission/cancellation/commit scripts, durable user-to-game mappings, and a bounded `GameCreated` outbox routed through one nonblocking delivery worker per fixed partition. |
 | `server/src/ws_server.rs` | Explicit auth response, drain protocol, generation-safe cleanup, active-game resolution, retryable warming. |
 | `client/web/contexts/WebSocketContext.tsx` | Immediate/backoff reconnect, socket generations, dual-socket drain, explicit auth, one command owner. |
 | Client game integration | Stable session command IDs, external outbox, resolved watermark/sparse outcomes, terminal rejection. |
@@ -939,7 +966,41 @@ work, and restoring idle overhead projects 76.4--82.8% CPU: wholly above the
 70% target without aiming near saturation. This revision replaces a falsified
 cross-topology projection; it does not lower a gate, force desired count, or
 add adaptive load. The 224-session cohort must not be adjusted again to make a
-later run pass. Complete planned and SIGKILL AWS runs are still required.
+later run pass.
+
+The first run at that frozen cohort
+([GitHub Actions 30050625836](https://github.com/lopatin/snaketron-io/actions/runs/30050625836))
+used the same exact server binary and the same ECS availability zone as run
+`30046381977`, but ordinary successful Serverless Valkey request latency was
+about 1.2--1.3 milliseconds rather than about 0.2 milliseconds. Valkey still
+reported zero throttling and zero eviction, while service CPU stayed around
+40%, so neither cache capacity nor the CPU target was the limiting resource.
+The run failed before scale-out: 220 of 488 sessions failed while waiting for
+their initial game snapshot. All 156,742 submitted commands eventually
+received terminal outcomes, but only 70,137 were scheduled, 86,605 were
+rejected after the backlog formed, maximum outcome latency reached 65.749
+seconds, and oldest pending age reached 95.251 seconds.
+
+All ten partition command consumers and their hot writes had been cloning one
+`redis-rs` cluster connection. Those clones share one bounded client
+dispatcher and the same underlying per-node multiplexed connections, allowing
+one partition's work to create head-of-line queueing for every other partition
+when ordinary cache latency rises. `ClusterConnection` supports multiple
+in-flight requests, so this is not a claim that Redis strictly serializes
+requests; the run instead implicates shared client-dispatcher/socket coupling,
+not Serverless capacity. The minimum correction is the fixed topology in R4:
+ten deterministic prewarmed partition-hot lanes, with the low-volume global
+control connection and the existing recovery-read, checkpoint-write, Pub/Sub,
+and fan-out connections kept separate. The durable `GameCreated` scanner also
+routes to one bounded sequential worker per fixed partition so a caller does
+not recreate cross-partition queueing above those lanes. `PartitionLeaseStore`
+remains on control. This adds no dynamic pool, per-game connection, new
+persistence format, or retry policy.
+
+Run `30050625836` is diagnostic evidence only. The 224-session / 112-duel
+cohort, CPU 70% / memory 80% targets, one-second outcome gate, and all planned
+and crash acceptance criteria remain unchanged. Fresh complete planned and
+SIGKILL AWS runs are still required after the ten-lane correction.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

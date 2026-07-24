@@ -1,9 +1,8 @@
 //! Integration tests for the Streams game bus.
 //!
-//! Run against the test-deps Redis (test-deps.sh). Isolation: these tests use
-//! partition ids far outside the live range (game partitions are 0..10) so
-//! their stream keys cannot collide with a dev server or other tests sharing
-//! the same Redis.
+//! Run against the test-deps Redis (test-deps.sh). Partition-scoped production
+//! paths reject IDs outside the fixed executor range, so these tests serialize
+//! their mutations of the ten regional stream keys.
 //!
 //! The headline test is `paused_consumer_loses_nothing`: the exact scenario —
 //! a subscriber that stops draining for a while — where the old Pub/Sub
@@ -18,26 +17,38 @@ use common::{
 use server::cluster_membership::{BootIdentity, ClusterNamespace};
 use server::completion::{COMPLETION_SCHEMA_VERSION, CompletionEffect, CompletionRecordV1};
 use server::game_bus::GameBus;
-use server::game_executor::StreamEvent;
+use server::game_executor::{PARTITION_COUNT, StreamEvent};
 use server::matchmaking_manager::{ActiveMatch, MatchStatus, QueuedPlayer};
 use server::partition_lease::PartitionLeaseStore;
 use server::recovery::{RecoveryEnvelopeV2, ResolvedCommandState};
 use server::redis_keys::RedisKeys;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-const REDIS_URL: &str = "redis://127.0.0.1:6379/1?protocol=resp3";
+// Dedicated logical DB for this binary: startup deletes the ten regional
+// stream triplets so stale prior runs cannot affect exact-length assertions.
+const REDIS_URL: &str = "redis://127.0.0.1:6379/11?protocol=resp3";
 const TEST_EVENTS_MAXLEN: usize = 8192;
+static STREAMS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static TEST_NAMESPACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Unique high partition id per test run, far above the live range 0..10.
+/// Select one real executor partition; the suite-level lock isolates its
+/// regional stream keys from the other tests in this file.
 fn test_partition(salt: u32) -> u32 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    1_000_000 + (nanos % 100_000) + salt * 1_000_000
+    nanos.wrapping_add(salt) % PARTITION_COUNT
+}
+
+fn unique_namespace(label: &str) -> Result<ClusterNamespace> {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sequence = TEST_NAMESPACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    ClusterNamespace::new(format!("{label}-{}-{nanos}-{sequence}", std::process::id()))
 }
 
 /// Integration tests intentionally seed fan-out events without owning an
@@ -79,14 +90,33 @@ async fn streams_bus(token: CancellationToken) -> Result<StreamsTestBus> {
     let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(64);
     let redis =
         server::redis_utils::create_connection_manager(client.clone(), pubsub_tx.clone()).await?;
+    let mut cleanup_connection = redis.clone();
+    let mut regional_streams = Vec::with_capacity(PARTITION_COUNT as usize * 3);
+    for partition in 0..PARTITION_COUNT {
+        regional_streams.push(RedisKeys::stream_events(partition));
+        regional_streams.push(RedisKeys::stream_commands(partition));
+        regional_streams.push(RedisKeys::stream_snapshot_requests(partition));
+    }
+    let _: () = redis::cmd("DEL")
+        .arg(&regional_streams)
+        .query_async(&mut cleanup_connection)
+        .await?;
     Ok(StreamsTestBus {
-        bus: GameBus::new(redis.clone(), redis.clone(), redis.clone(), client, token),
+        bus: GameBus::new(
+            redis.clone(),
+            (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
+            redis.clone(),
+            redis.clone(),
+            client,
+            token,
+        )?,
         publisher: redis,
     })
 }
 
 #[tokio::test]
 async fn one_expired_recovery_is_isolated_from_valid_games() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         use redis::AsyncCommands;
 
@@ -94,8 +124,8 @@ async fn one_expired_recovery_is_isolated_from_valid_games() -> Result<()> {
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(30);
         let valid_game_id = partition;
-        let expired_game_id = partition + 1;
-        let namespace = ClusterNamespace::new(format!("recovery-isolation-{partition}"))?;
+        let expired_game_id = partition + PARTITION_COUNT;
+        let namespace = unique_namespace("recovery-isolation")?;
         let boot_id = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -203,6 +233,7 @@ async fn one_expired_recovery_is_isolated_from_valid_games() -> Result<()> {
 
 #[tokio::test]
 async fn indexed_recovery_ignores_ten_thousand_unrelated_snapshots() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(30), async {
         use redis::AsyncCommands;
 
@@ -210,8 +241,8 @@ async fn indexed_recovery_ignores_ten_thousand_unrelated_snapshots() -> Result<(
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(35);
-        let game_ids = [partition, partition + 1];
-        let namespace = ClusterNamespace::new(format!("indexed-recovery-{partition}"))?;
+        let game_ids = [partition, partition + PARTITION_COUNT];
+        let namespace = unique_namespace("indexed-recovery")?;
         let boot_id = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -316,6 +347,7 @@ async fn indexed_recovery_ignores_ten_thousand_unrelated_snapshots() -> Result<(
 
 #[tokio::test]
 async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         use redis::AsyncCommands;
 
@@ -323,8 +355,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
         let bus = streams_bus(token.clone()).await?;
         let partition = 9;
         let game_id = 19;
-        let salt = test_partition(31);
-        let namespace = ClusterNamespace::new(format!("stale-token-{salt}"))?;
+        let namespace = unique_namespace("stale-token")?;
         let boot_id = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -488,6 +519,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
 
 #[tokio::test]
 async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(30), async {
         use redis::AsyncCommands;
 
@@ -495,7 +527,7 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(32);
-        let namespace = ClusterNamespace::new(format!("trim-safety-{partition}"))?;
+        let namespace = unique_namespace("trim-safety")?;
         let boot_id = BootIdentity::new();
         let successor_boot_id = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
@@ -611,13 +643,14 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
 
 #[tokio::test]
 async fn group_created_after_publish_starts_at_zero_and_delivers_history() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         use redis::AsyncCommands;
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(34);
-        let namespace = ClusterNamespace::new(format!("group-zero-{partition}"))?;
+        let namespace = unique_namespace("group-zero")?;
         let owner = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -684,12 +717,12 @@ async fn group_created_after_publish_starts_at_zero_and_delivers_history() -> Re
 
 #[tokio::test]
 async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(15), async {
         use redis::AsyncCommands;
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
-        let salt = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         // These correctness paths require a real executor partition (0..10).
         // Give each such test a fixed, distinct partition so parallel tests
         // cannot delete one another's shared partition stream.
@@ -699,7 +732,7 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
             + (partition + server::game_executor::PARTITION_COUNT
                 - base_game_id % server::game_executor::PARTITION_COUNT)
                 % server::game_executor::PARTITION_COUNT;
-        let namespace = ClusterNamespace::new(format!("game-created-checkpoint-{salt}"))?;
+        let namespace = unique_namespace("game-created-checkpoint")?;
         let owner = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -837,13 +870,14 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
 
 #[tokio::test]
 async fn stale_group_reader_cannot_capture_a_post_takeover_command() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         use redis::AsyncCommands;
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(33);
-        let namespace = ClusterNamespace::new(format!("stale-group-reader-{partition}"))?;
+        let namespace = unique_namespace("stale-group-reader")?;
         let owner_a = BootIdentity::new();
         let owner_b = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
@@ -1014,19 +1048,19 @@ async fn stale_group_reader_cannot_capture_a_post_takeover_command() -> Result<(
 
 #[tokio::test]
 async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(15), async {
         use redis::AsyncCommands;
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
-        let salt = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let partition = 8;
         let base_game_id = 1_500_000_000u32;
         let game_id = base_game_id
             + (partition + server::game_executor::PARTITION_COUNT
                 - base_game_id % server::game_executor::PARTITION_COUNT)
                 % server::game_executor::PARTITION_COUNT;
-        let namespace = ClusterNamespace::new(format!("replyable-rejection-{salt}"))?;
+        let namespace = unique_namespace("replyable-rejection")?;
         let boot_id = BootIdentity::new();
         let client = redis::Client::open(REDIS_URL)?;
         let mut redis = client.get_multiplexed_async_connection().await?;
@@ -1065,7 +1099,7 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
         let command_id = ClientCommandIdentityV2 {
             game_id,
             user_id: 77,
-            client_game_session_id: format!("session-{salt}"),
+            client_game_session_id: format!("session-{}", namespace.region()),
             sequence: 1,
         };
         let command = StreamEvent::GameCommandSubmittedV2 {
@@ -1213,16 +1247,17 @@ async fn cleanup(partition: u32) {
 
 #[tokio::test]
 async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(15), async {
         use redis::AsyncCommands;
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
         let partition = test_partition(20);
+        cleanup(partition).await;
         let game_id = partition;
         let newer_game_id = game_id + 1;
-        let region = format!("completion-test-{partition}");
-        let namespace = ClusterNamespace::new(region)?;
+        let namespace = unique_namespace("completion-test")?;
         let boot_id = BootIdentity::new();
 
         let client = redis::Client::open(REDIS_URL)?;
@@ -1588,6 +1623,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
 
 #[tokio::test]
 async fn paused_consumer_loses_nothing() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1629,6 +1665,7 @@ async fn paused_consumer_loses_nothing() -> Result<()> {
 
 #[tokio::test]
 async fn three_streams_route_to_their_channels_in_order() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1679,6 +1716,7 @@ async fn three_streams_route_to_their_channels_in_order() -> Result<()> {
 
 #[tokio::test]
 async fn subscription_starts_at_now_not_history() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(10), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1711,6 +1749,7 @@ async fn subscription_starts_at_now_not_history() -> Result<()> {
 
 #[tokio::test]
 async fn streams_are_trimmed_at_publish_time() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(30), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1748,6 +1787,7 @@ async fn streams_are_trimmed_at_publish_time() -> Result<()> {
 /// while still catching any reintroduction of poll-quantized delivery.
 #[tokio::test]
 async fn delivery_latency_is_push_like() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(60), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1805,6 +1845,7 @@ async fn delivery_latency_is_push_like() -> Result<()> {
 /// Pub/Sub fundamentally cannot provide across a reconnect.
 #[tokio::test]
 async fn reader_reconnect_resumes_without_loss_or_duplicates() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(15), async {
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
@@ -1875,6 +1916,7 @@ async fn reader_reconnect_resumes_without_loss_or_duplicates() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn bench_streams() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
     let token = CancellationToken::new();
     let bus = streams_bus(token.clone()).await?;
     let partition = test_partition(6);

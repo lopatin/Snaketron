@@ -30,11 +30,12 @@ async fn test_game_bus() -> Result<(GameBus, redis::aio::ConnectionManager)> {
     let inspection_connection = redis.clone();
     let bus = GameBus::new(
         redis.clone(),
+        (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
         redis.clone(),
         redis,
         client,
         CancellationToken::new(),
-    );
+    )?;
 
     Ok((bus, inspection_connection))
 }

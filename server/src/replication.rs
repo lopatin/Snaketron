@@ -773,32 +773,12 @@ impl ReplicationManager {
     pub async fn new(
         partitions: Vec<u32>,
         cancellation_token: CancellationToken,
-        redis_url: &str,
+        bus: Arc<GameBus>,
     ) -> Result<Self> {
         let replica_store = Arc::new(RwLock::new(HashMap::new()));
         let game_event_broadcasters = Arc::new(RwLock::new(HashMap::new()));
         let statuses = Arc::new(RwLock::new(HashMap::new()));
         let mut workers = Vec::new();
-
-        // The replication workers get their own Redis connection, isolated
-        // from the main server's connection. The push channel only satisfies
-        // the shared connection-manager config; nothing here subscribes to
-        // Pub/Sub pushes.
-        let (pubsub_tx, _pubsub_rx) = tokio::sync::broadcast::channel(5000);
-        let redis_client = crate::redis_utils::RedisClient::open(redis_url, Some(pubsub_tx))?;
-        let redis = crate::redis_utils::create_connection_manager_until_available(
-            redis_client.clone(),
-            cancellation_token.clone(),
-        )
-        .await?;
-
-        let bus = Arc::new(GameBus::new(
-            redis.clone(),
-            redis.clone(),
-            redis,
-            redis_client,
-            cancellation_token.clone(),
-        ));
 
         for partition_id in partitions {
             // Create worker

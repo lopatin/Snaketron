@@ -273,6 +273,21 @@ impl GameServer {
         .await?;
         info!("Redis connection manager created successfully");
 
+        // Every fixed executor partition gets its own independently-created
+        // redis-rs dispatcher. Clones would share one bounded request queue,
+        // recreating cross-partition head-of-line blocking under load.
+        let partition_redis = futures_util::future::try_join_all((0..PARTITION_COUNT).map(|_| {
+            create_connection_manager_until_available(
+                redis_client.clone(),
+                cancellation_token.clone(),
+            )
+        }))
+        .await?;
+        info!(
+            connections = partition_redis.len(),
+            "Redis partition-hot connections created successfully"
+        );
+
         // Large recovery reads must not share redis-rs' bounded cluster
         // dispatcher with latency-sensitive commands, events, or leases.
         // Cloning `redis` would share that dispatcher, so establish one
@@ -287,8 +302,9 @@ impl GameServer {
 
         // Checkpoint and terminal-completion writes carry the full recovery
         // envelope. Give them one independent dispatcher so a scale-out burst
-        // of recovery reads cannot delay authoritative actors. This is one
-        // connection per task, not a per-partition pool.
+        // of recovery reads cannot delay authoritative actors. This remains
+        // one checkpoint connection per task, not a per-partition checkpoint
+        // pool.
         let checkpoint_redis = create_connection_manager_until_available(
             redis_client.clone(),
             cancellation_token.clone(),
@@ -311,11 +327,12 @@ impl GameServer {
         // Create the game-critical message bus (Redis Streams).
         let game_bus = Arc::new(GameBus::new(
             redis.clone(),
+            partition_redis,
             recovery_redis.clone(),
             checkpoint_redis,
             redis_client.clone(),
             cancellation_token.clone(),
-        ));
+        )?);
 
         // Create the LobbyManager
         let lobby_manager = Arc::new(LobbyManager::new(
@@ -391,7 +408,7 @@ impl GameServer {
             ReplicationManager::new(
                 replication_partitions,
                 cancellation_token.clone(),
-                &redis_url,
+                game_bus.clone(),
             )
             .await
             .context("Failed to create replication manager")?,

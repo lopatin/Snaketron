@@ -407,13 +407,38 @@ Run A is fixed once from this same-version evidence at 224 sessions / 112
 duels. After subtracting the measured 3.5% idle CPU, the observed range projects
 to 76.4--82.8% at 224. Keep the existing CPU 70% / memory 80% targets,
 one-second gate, one-stage 20-minute runner, and eight-minute target-tracking
-budget. Do not adjust the cohort again if the next run fails.
+budget. Do not adjust the cohort again if a later run fails.
 One hundred two best-effort active-game mapping lookups also timed out during
 the 144-session ownership bursts without causing a failed admission or usable
 gap; retain this as a diagnostic risk and investigate the matchmaking-manager
 critical section only if it recurs at the bounded 224-session run. Cleanup
 succeeded and its full absence verification passed for both follow-ups. The
 capacity and SIGKILL phases did not run in either one.
+
+The first run at the frozen cohort, GitHub Actions
+[`30050625836`](https://github.com/lopatin/snaketron-io/actions/runs/30050625836),
+used the same exact server binary and the same ECS availability zone as
+`30046381977`. Its ordinary successful Serverless Valkey request latency was
+about 1.2--1.3 milliseconds instead of about 0.2 milliseconds, with zero
+throttling, zero eviction, and service CPU around 40%. The run failed before
+scale-out: 220 of 488 sessions timed out waiting for their initial game
+snapshot. All 156,742 commands eventually received terminal outcomes, but only
+70,137 were scheduled, 86,605 were rejected after the backlog formed, maximum
+outcome latency reached 65.749 seconds, and oldest pending age reached 95.251
+seconds. This is not evidence of cache capacity exhaustion or of reaching the
+CPU target.
+
+The causal risk is cross-partition head-of-line coupling in the client.
+All ten partition consumers and hot-path writes cloned one `redis-rs`
+`ClusterConnection`; the clones share one bounded dispatcher and the same
+underlying per-node multiplexed connections. `ClusterConnection` does support
+multiple in-flight requests, so do not describe this as strict Redis request
+serialization. The correction below isolates the fixed partition hot paths
+from one another while preserving the existing control and bulk-role
+connections. Run `30050625836` is diagnostic evidence only. Do not change the
+224-session / 112-duel cohort, the CPU 70% / memory 80% policy, the one-second
+gate, or any other acceptance criterion. A fresh full planned run and a
+separate authorized SIGKILL run remain mandatory.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
@@ -439,16 +464,37 @@ Pub/Sub. Subscription confirmations must never share the reply queue used by
 matchmaking, executor, or recovery commands; this role separation is required
 for Serverless certification.
 
-The server also opens two independently bootstrapped bulk connections per task.
-Full-state periodic checkpoints and terminal completion commits use the
+Before declaring ready, each task independently bootstraps exactly ten
+partition-hot `redis-rs` cluster connections, one deterministic lane for each
+fixed executor partition. Partition-scoped `GameBus` command publication and
+consumption, ordinary events, snapshot anchors, acknowledgements, and fenced
+mutations use the lane selected by partition. A lane must not be a clone of the
+global control connection or of another lane: clones share the bounded
+client-side dispatcher and underlying per-node connection set. This fixed
+one-lane-per-partition map is intentional; do not replace it with a tunable
+generic pool, per-game connections, a priority scheduler, or retries that hide
+queueing.
+
+The durable `GameCreated` scanner groups each validated scan page by partition
+and uses nonblocking sends to ten delivery workers, one per fixed partition.
+Each lane holds one active and at most one queued batch. Its worker preserves
+publish, compare-delete, and marker-expiry order while continuing through the
+batch after a record-specific error. A full worker leaves the batch's records
+in the authoritative Redis outbox for a later scan, so one slow lane cannot
+stall admission for another partition and the in-memory queue never becomes a
+retry source.
+
+Keep one low-volume global control connection for `PartitionLeaseStore`
+acquire/renew/release, membership, assignment, matchmaking, and readiness.
+Fenced partition-hot scripts execute through their partition lane and validate
+the live lease key atomically there; moving lease liveness traffic onto a busy
+data lane would weaken takeover timing. Full-state periodic checkpoints and
+terminal completion commits keep the independently bootstrapped
 checkpoint-write dispatcher. Takeover journal/envelope loads, reconnect outcome
-reads, immutable completion-record loads, and regional recovery metrics use the
-recovery-read dispatcher. Commands, ordinary events, leases, assignment,
-matchmaking, and readiness remain on the hot/control dispatcher. Cloning a
-redis-rs cluster connection is insufficient because clones share its bounded
-client-side dispatcher. Do not add per-partition pools, a priority scheduler,
-or a telemetry-only connection unless fresh Serverless evidence shows that
-this fixed task-level split is insufficient.
+reads, immutable completion-record loads, and regional recovery metrics keep
+the recovery-read dispatcher. RESP3 Pub/Sub and stream fan-out readers also
+keep their separate connections. This is the minimum role topology required by
+the observed Serverless latency variance.
 
 Before launching load or changing desired count, the opt-in runner verifies the
 AWS caller account and the Project=Snaketron, Environment, Region, and
