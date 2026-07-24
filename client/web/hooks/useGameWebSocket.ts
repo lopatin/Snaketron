@@ -1,9 +1,20 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../contexts/WebSocketContext';
+import { useAuth } from '../contexts/AuthContext';
 import { GameState, GameType, GameCommand, Command, CustomGameSettings, GameLoadFailure } from '../types';
 import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
+import {
+  clearGameCommandOutbox,
+  enqueueGameCommandV2,
+  gameEventTerminatesCommandOutbox,
+  gameLoadOutboxAction,
+  recoveryOutcomesReadyForResend,
+  reconcileGameCommandOutcomes,
+  resolveGameCommandV2,
+  takeGameCommandsDueForRetry,
+} from '../services/gameCommandOutbox';
 
 interface UseGameWebSocketReturn {
   isConnected: boolean;
@@ -38,7 +49,14 @@ interface UseGameWebSocketReturn {
 }
 
 export const useGameWebSocket = (): UseGameWebSocketReturn => {
-  const { isConnected, isSessionAuthenticated, sendMessage, onMessage } = useWebSocket();
+  const {
+    isConnected,
+    isSessionAuthenticated,
+    serverCapabilities,
+    sendMessage,
+    onMessage,
+  } = useWebSocket();
+  const { user } = useAuth();
   const navigate = useNavigate();
   const [currentGameId, setCurrentGameId] = useState<string | null>(null);
   const [customGameCode, setCustomGameCode] = useState<string | null>(null);
@@ -60,6 +78,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const serverAssignedGameRef = useRef<number | null>(null);
   const awaitingGameSnapshotRef = useRef<string | null>(null);
   const isGameSnapshotSynchronizedRef = useRef(false);
+  const completedOutcomeBarriersRef = useRef<Set<number>>(new Set());
 
   const updateAwaitingGameSnapshot = useCallback((routeGameId: string | null) => {
     awaitingGameSnapshotRef.current = routeGameId;
@@ -80,6 +99,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   // Handle game-specific messages
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
+    let warmingRetryTimeout: ReturnType<typeof setTimeout> | null = null;
 
     console.log('Creating game WebSocket listeners (initial state issue)');
 
@@ -96,6 +116,19 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
 
         const eventGameId = parseU32GameId(eventMessage.game_id);
         const event = eventMessage.event || eventMessage;
+
+        if (event?.CommandScheduledV2?.command_id) {
+          resolveGameCommandV2(event.CommandScheduledV2.command_id);
+        } else if (event?.CommandRejected?.command_id) {
+          resolveGameCommandV2(event.CommandRejected.command_id);
+        }
+        if (
+          eventGameId !== null &&
+          user &&
+          gameEventTerminatesCommandOutbox(event)
+        ) {
+          clearGameCommandOutbox(eventGameId, user.id);
+        }
 
         // useGameWebSocket is currently instantiated independently by the global
         // matchmaking banner and the game arena. The banner's instance sees the
@@ -192,7 +225,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     // A game may have existed but no longer have a loadable live or persisted snapshot.
     unsubscribers.push(
       onMessage('GameLoadFailed', (message: any) => {
-        const payload = message?.data ?? message?.GameLoadFailed ?? message;
+        const payload = message?.data;
         const gameId = parseU32GameId(payload?.game_id);
 
         if (gameId === null) {
@@ -200,21 +233,30 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
 
-        if (serverAssignedGameRef.current === gameId) {
-          serverAssignedGameRef.current = null;
-          setIsQueued(false);
-          setIsJoiningGame(false);
-        }
-
         const requestedGame = requestedGameRef.current;
-        if (!requestedGame || requestedGame.gameId !== gameId) {
+        if (
+          !requestedGame ||
+          gameLoadOutboxAction(
+            'GameLoadFailed',
+            gameId,
+            requestedGame.gameId,
+          ) !== 'clear-terminal'
+        ) {
           console.warn(
             'Ignoring GameLoadFailed for a game other than the active request:',
             gameId,
             'requested:',
-            requestedGame?.gameId ?? null
+            requestedGame?.gameId ?? null,
           );
           return;
+        }
+
+        if (user) {
+          clearGameCommandOutbox(gameId, user.id);
+        }
+        if (serverAssignedGameRef.current === gameId) {
+          serverAssignedGameRef.current = null;
+          setIsQueued(false);
         }
 
         const reason =
@@ -231,6 +273,52 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           requestedGameId: requestedGame.routeGameId,
           reason,
         });
+      })
+    );
+
+    unsubscribers.push(
+      onMessage('GameWarming', (message: any) => {
+        const payload = message?.data;
+        const gameId = parseU32GameId(payload?.game_id);
+        if (gameId === null) {
+          return;
+        }
+
+        const requestedGame = requestedGameRef.current;
+        if (!requestedGame) {
+          // Authentication recovered a durably committed match before this
+          // gateway's replica was warm. Navigate first; GameArena will issue
+          // the retry once the route is mounted.
+          serverAssignedGameRef.current = gameId;
+          setCurrentGameId(gameId.toString());
+          setIsQueued(false);
+          setIsJoiningGame(true);
+          navigate(`/play/${gameId}`);
+          return;
+        }
+        if (
+          gameLoadOutboxAction('GameWarming', gameId, requestedGame.gameId) !==
+          'preserve-and-retry'
+        ) {
+          return;
+        }
+
+        updateGameSnapshotSynchronization(false);
+        updateAwaitingGameSnapshot(requestedGame.routeGameId);
+        setGameLoadFailure(null);
+        setIsJoiningGame(true);
+        if (warmingRetryTimeout) {
+          clearTimeout(warmingRetryTimeout);
+        }
+        const retryAfterMs = Math.max(
+          100,
+          Math.min(2000, Number(payload?.retry_after_ms) || 500),
+        );
+        warmingRetryTimeout = setTimeout(() => {
+          if (requestedGameRef.current?.gameId === gameId) {
+            sendMessage({ JoinGame: gameId });
+          }
+        }, retryAfterMs);
       })
     );
 
@@ -309,22 +397,62 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       })
     );
 
+    unsubscribers.push(
+      onMessage('CommandOutcomes', (message: any) => {
+        const payload = message?.data ?? message?.CommandOutcomes ?? message;
+        if (user && parseU32GameId(payload?.game_id) !== null) {
+          reconcileGameCommandOutcomes(payload, user.id);
+        }
+      })
+    );
+
+    unsubscribers.push(
+      onMessage('CommandOutcomesComplete', (message: any) => {
+        const payload = message?.data ?? message?.CommandOutcomesComplete ?? message;
+        const gameId = parseU32GameId(payload?.game_id);
+        if (gameId === null) {
+          return;
+        }
+        completedOutcomeBarriersRef.current.add(gameId);
+        if (
+          user &&
+          requestedGameRef.current?.gameId === gameId &&
+          recoveryOutcomesReadyForResend(
+            gameId,
+            isGameSnapshotSynchronizedRef.current,
+            serverCapabilities,
+            completedOutcomeBarriersRef.current,
+          )
+        ) {
+          for (const command of takeGameCommandsDueForRetry(gameId, user.id, Date.now(), 0)) {
+            sendMessage({ GameCommandV2: command });
+          }
+        }
+      })
+    );
+
     // Cleanup
     return () => {
       console.log('Cleaning up game WebSocket listeners (initial state issue)');
+      if (warmingRetryTimeout) {
+        clearTimeout(warmingRetryTimeout);
+      }
       unsubscribers.forEach(unsub => unsub());
     };
   }, [
     onMessage,
     navigate,
     sendMessage,
+    serverCapabilities,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
+    user,
   ]);
 
   useEffect(() => {
     const requestedGame = requestedGameRef.current;
     if (requestedGame && (!isConnected || !isSessionAuthenticated)) {
+      completedOutcomeBarriersRef.current.delete(requestedGame.gameId);
       updateGameSnapshotSynchronization(false);
       updateAwaitingGameSnapshot(requestedGame.routeGameId);
       setIsJoiningGame(true);
@@ -371,6 +499,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       gameId: parsedGameId,
     };
     updateGameSnapshotSynchronization(false);
+    completedOutcomeBarriersRef.current.delete(parsedGameId);
     setCurrentGameId(parsedGameId.toString());
     gameEventQueueRef.current = [];
     setGameLoadFailure(null);
@@ -396,7 +525,56 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     updateAwaitingGameSnapshot(null);
     setGameLoadFailure(null);
     setIsJoiningGame(false);
-  }, [updateAwaitingGameSnapshot, updateGameSnapshotSynchronization]);
+    if (
+      !user ||
+      !serverCapabilities.has('command-delivery-v2') ||
+      !recoveryOutcomesReadyForResend(
+        gameId,
+        isGameSnapshotSynchronizedRef.current,
+        serverCapabilities,
+        completedOutcomeBarriersRef.current,
+      )
+    ) {
+      return;
+    }
+    for (const command of takeGameCommandsDueForRetry(gameId, user.id, Date.now(), 0)) {
+      sendMessage({ GameCommandV2: command });
+    }
+  }, [sendMessage, serverCapabilities, updateAwaitingGameSnapshot, updateGameSnapshotSynchronization, user]);
+
+  // A semantic executor result is the acknowledgement. Periodic exact resends
+  // cover an ambiguous gateway/XADD failure without adding a weaker receipt
+  // acknowledgement. The outbox atomically claims due entries, so the two
+  // existing hook instances cannot create duplicate retry loops.
+  useEffect(() => {
+    const gameId = currentGameId === null ? null : parseU32GameId(currentGameId);
+    if (
+      gameId === null ||
+      !user ||
+      !isConnected ||
+      !isSessionAuthenticated ||
+      !serverCapabilities.has('command-delivery-v2')
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (
+        awaitingGameSnapshotRef.current !== null ||
+        !recoveryOutcomesReadyForResend(
+          gameId,
+          isGameSnapshotSynchronizedRef.current,
+          serverCapabilities,
+          completedOutcomeBarriersRef.current,
+        )
+      ) {
+        return;
+      }
+      for (const command of takeGameCommandsDueForRetry(gameId, user.id, Date.now(), 1_000)) {
+        sendMessage({ GameCommandV2: command });
+      }
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [currentGameId, isConnected, isSessionAuthenticated, sendMessage, serverCapabilities, user]);
 
   const updateCustomGameSettings = useCallback((settings: Partial<CustomGameSettings>) => {
     sendMessage({
@@ -425,11 +603,25 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       return;
     }
 
-    console.log('Sending game command (sendGameCommand):', command);
-    sendMessage({
-      GameCommand: command
-    });
-  }, [isConnected, isSessionAuthenticated, sendMessage]);
+    const gameId = requestedGameRef.current?.gameId;
+    if (gameId === undefined) {
+      console.warn('Ignoring game command without an active game identity');
+      return;
+    }
+    if (!user) {
+      console.warn('Ignoring game command without an authenticated user identity');
+      return;
+    }
+    let stableCommand: ReturnType<typeof enqueueGameCommandV2>;
+    try {
+      stableCommand = enqueueGameCommandV2(gameId, user.id, command);
+    } catch (error) {
+      console.error('Cannot queue game command safely:', error);
+      return;
+    }
+    console.log('Sending v2 game command:', stableCommand);
+    sendMessage({ GameCommandV2: stableCommand });
+  }, [isConnected, isSessionAuthenticated, sendMessage, serverCapabilities, user]);
 
   // Ask the game executor for a fresh snapshot when the engine detects
   // a stream gap / hash divergence, matching WSMessage::RequestResync
@@ -485,7 +677,14 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     console.log('Sending LeaveGame message (initial state issue):');
     sendMessage('LeaveGame');
     // Clear current game state
+    const leavingGameId = requestedGameRef.current?.gameId;
     requestedGameRef.current = null;
+    if (leavingGameId !== undefined) {
+      completedOutcomeBarriersRef.current.delete(leavingGameId);
+    }
+    if (leavingGameId !== undefined && user) {
+      clearGameCommandOutbox(leavingGameId, user.id);
+    }
     serverAssignedGameRef.current = null;
     updateGameSnapshotSynchronization(false);
     gameEventQueueRef.current = [];
@@ -500,6 +699,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     sendMessage,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
+    user,
   ]);
 
   // Create a quick match or competitive game

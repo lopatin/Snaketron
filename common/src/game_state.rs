@@ -8,6 +8,24 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod sorted_hash_set {
+    use serde::{Serialize, Serializer};
+    use std::collections::HashSet;
+
+    pub fn serialize<T, S>(
+        values: &HashSet<T>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        T: Ord + Serialize,
+        S: Serializer,
+    {
+        let mut values: Vec<_> = values.iter().collect();
+        values.sort_unstable();
+        values.serialize(serializer)
+    }
+}
+
 const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -19,6 +37,16 @@ pub enum GameCommand {
     UpdateStatus { status: GameStatus },
 }
 
+/// Stable identity for the at-least-once command protocol. Unlike the engine's
+/// tick-scoped `CommandId`, this survives reconstruction and WebSocket reconnect.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientCommandIdentityV2 {
+    pub game_id: u32,
+    pub user_id: u32,
+    pub client_game_session_id: String,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GameEventMessage {
     pub game_id: u32,
@@ -27,7 +55,8 @@ pub struct GameEventMessage {
     /// Transport-level sequence, assigned by the publishing game executor and
     /// strictly monotonic per game across ALL published messages (events,
     /// snapshots, tick hashes). Receivers detect lost messages by checking
-    /// contiguity. 0 means "unassigned" (legacy or locally constructed).
+    /// contiguity. 0 is reserved for locally constructed or explicitly
+    /// out-of-band messages that do not advance replicated state.
     #[serde(default)]
     pub stream_seq: u64,
     pub user_id: Option<u32>,
@@ -59,6 +88,20 @@ pub enum GameEvent {
     },
     CommandScheduled {
         command_message: GameCommandMessage,
+    },
+    /// Positive semantic result for the v2 at-least-once command protocol.
+    /// This is still CommandScheduled—not a gateway receipt/CommandAccepted.
+    CommandScheduledV2 {
+        command_id: ClientCommandIdentityV2,
+        command_message: GameCommandMessage,
+        /// True when the executor is returning a previously recorded outcome;
+        /// replicas must not schedule the same logical command again.
+        deduplicated_replay: bool,
+    },
+    /// Terminal negative semantic result for a v2 player command.
+    CommandRejected {
+        command_id: ClientCommandIdentityV2,
+        reason: String,
     },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated {
@@ -295,7 +338,9 @@ pub enum GameStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandQueue {
     queue: BinaryHeap<Reverse<GameCommandMessage>>,
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     active_ids: HashSet<CommandId>,
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     tombstone_ids: HashSet<CommandId>,
 }
 
@@ -327,8 +372,13 @@ impl CommandQueue {
         // eprintln!("COMMON DEBUG: Command added to queue: {:?}", command_message);
         self.queue.push(Reverse(command_message.clone()));
 
-        // Delete the non-server-sent command from the queue.
-        if command_message.command_id_server.is_some() {
+        if command_message.command_id_server.is_none() {
+            self.active_ids
+                .insert(command_message.command_id_client.clone());
+        } else if self.active_ids.contains(&command_message.command_id_client) {
+            // Delete the matching speculative command from the queue. An
+            // authoritative-only queue has no active client copy and therefore
+            // must not retain one tombstone per server command forever.
             // debug!("CommandQueue::push: Tombstoning client command {:?}", command_message.command_id_client);
             // eprintln!("COMMON DEBUG: Tombstoning client command {:?}", command_message.command_id_client);
             self.tombstone_ids.insert(command_message.command_id_client);
@@ -351,20 +401,21 @@ impl CommandQueue {
         if let Some(Reverse(command_message)) = self.queue.pop() {
             // debug!("CommandQueue::pop: Popped command: {:?}", command_message);
             // eprintln!("COMMON DEBUG: Popped command: {:?}", command_message);
-            if command_message.command_id_server.is_none()
-                && self
+            if command_message.command_id_server.is_none() {
+                self.active_ids.remove(&command_message.command_id_client);
+                if self
                     .tombstone_ids
                     .remove(&command_message.command_id_client)
-            {
-                // eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
-                // Ignore the command if it's a tombstone.
-                // Continue popping the next command.
-                self.pop(max_tick)
-            } else {
-                // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
-                // eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
-                Some(command_message)
+                {
+                    // eprintln!("COMMON DEBUG: Command {:?} is tombstoned, skipping and popping next", command_message.command_id_client);
+                    // Ignore the command if it's a tombstone.
+                    // Continue popping the next command.
+                    return self.pop(max_tick);
+                }
             }
+            // debug!("CommandQueue::pop: Returning command: {:?}", command_message);
+            // eprintln!("COMMON DEBUG: Returning command: {:?}", command_message);
+            Some(command_message)
         } else {
             // debug!("CommandQueue::pop: Queue is empty");
             // eprintln!("COMMON DEBUG: CommandQueue::pop: Queue is empty");
@@ -396,6 +447,7 @@ pub struct GameState {
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
     // Spectators by user_id (do not have snakes/players)
+    #[serde(serialize_with = "sorted_hash_set::serialize")]
     pub spectators: HashSet<u32>,
     // Score tracking - snake_id -> score
     pub scores: HashMap<u32, u32>,
@@ -1529,6 +1581,20 @@ impl GameState {
                 self.command_queue.push(command_message);
             }
 
+            GameEvent::CommandScheduledV2 {
+                command_message,
+                deduplicated_replay,
+                ..
+            } => {
+                if !deduplicated_replay {
+                    self.command_queue.push(command_message);
+                }
+            }
+
+            // Rejections are terminal protocol outcomes, not game-state
+            // mutations. They are retained in the server recovery envelope.
+            GameEvent::CommandRejected { .. } => {}
+
             GameEvent::StatusUpdated { status } => {
                 self.status = status;
             }
@@ -2082,11 +2148,14 @@ mod tests {
         // Push client command
         let client_cmd = create_command_message(10, 1, 1, false);
         queue.push(client_cmd.clone());
+        assert!(queue.active_ids.contains(&client_cmd.command_id_client));
+        assert!(queue.tombstone_ids.is_empty());
 
         // Push server command with same client_id - should tombstone the client command
         let mut server_cmd = client_cmd.clone();
         server_cmd.command_id_server = Some(create_command_id(10, 1, 1));
         queue.push(server_cmd.clone());
+        assert!(queue.tombstone_ids.contains(&server_cmd.command_id_client));
 
         // Pop should return the server command (not the tombstoned client command)
         let popped = queue.pop(10).unwrap();
@@ -2094,6 +2163,30 @@ mod tests {
 
         // Queue should now be empty (client command was tombstoned)
         assert!(queue.pop(10).is_none());
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
+    }
+
+    #[test]
+    fn test_command_queue_authoritative_commands_do_not_create_tombstones() {
+        let mut queue = CommandQueue::new();
+
+        for sequence_number in 1..=2048 {
+            let mut command = create_command_message(10, 1, sequence_number, false);
+            command.command_id_server = Some(create_command_id(10, 1, sequence_number));
+            queue.push(command);
+        }
+
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
+
+        let mut popped = 0;
+        while queue.pop(10).is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 2048);
+        assert!(queue.active_ids.is_empty());
+        assert!(queue.tombstone_ids.is_empty());
     }
 
     #[test]
@@ -2511,5 +2604,56 @@ mod tests {
 
         let third = heap.pop().unwrap().0;
         assert_eq!(third.tick(), 20);
+    }
+
+    #[test]
+    fn game_state_hash_sets_serialize_in_stable_order() {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.spectators.extend([9, 2, 5]);
+
+        for sequence_number in [7, 3] {
+            let client_command = create_command_message(10, 1, sequence_number, false);
+            state.command_queue.push(client_command.clone());
+            let mut server_command = client_command;
+            server_command.command_id_server = Some(create_command_id(10, 1, sequence_number));
+            state.command_queue.push(server_command);
+        }
+
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["spectators"], serde_json::json!([2, 5, 9]));
+
+        let active_sequences: Vec<u64> = json["command_queue"]["active_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(active_sequences, vec![3, 7]);
+
+        let tombstone_sequences: Vec<u64> = json["command_queue"]["tombstone_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(tombstone_sequences, vec![3, 7]);
+
+        let round_trip: GameState = serde_json::from_value(json).unwrap();
+        let round_trip_json = serde_json::to_value(round_trip).unwrap();
+        assert_eq!(round_trip_json["spectators"], serde_json::json!([2, 5, 9]));
+        assert_eq!(
+            round_trip_json["command_queue"]["active_ids"],
+            serde_json::json!([
+                {"tick": 10, "user_id": 1, "sequence_number": 3},
+                {"tick": 10, "user_id": 1, "sequence_number": 7}
+            ])
+        );
+        assert_eq!(
+            round_trip_json["command_queue"]["tombstone_ids"],
+            serde_json::json!([
+                {"tick": 10, "user_id": 1, "sequence_number": 3},
+                {"tick": 10, "user_id": 1, "sequence_number": 7}
+            ])
+        );
     }
 }

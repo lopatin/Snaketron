@@ -1,9 +1,9 @@
 use crate::db::Database;
 use crate::db::models::User;
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -11,12 +11,12 @@ const EXPIRATION_SECONDS: u64 = 3600; // 1 hour
 
 #[derive(Clone)]
 pub struct UserCache {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     db: Arc<dyn Database>,
 }
 
 impl UserCache {
-    pub fn new(redis: ConnectionManager, db: Arc<dyn Database>) -> Self {
+    pub fn new(redis: RedisConnection, db: Arc<dyn Database>) -> Self {
         Self { redis, db }
     }
 
@@ -34,7 +34,6 @@ impl UserCache {
         Ok(None)
     }
 
-    // use redis mget
     pub async fn get_all(&self, user_ids: &[u32]) -> Result<Vec<Option<User>>> {
         let mut results = HashMap::new();
         let mut missing_ids = Vec::new();
@@ -45,11 +44,18 @@ impl UserCache {
 
         // First try to get from Redis
         let mut redis = self.redis.clone();
-        let keys: Vec<String> = user_ids.iter().map(|&id| RedisKeys::user(id)).collect();
-        let user_jsons: Vec<Option<String>> = redis
-            .mget(keys)
-            .await
-            .map_err(|e| anyhow!("Failed to mget user jsons from Redis: {}", e))?;
+        // User cache keys intentionally distribute across slots. Independent
+        // GETs preserve that distribution without relying on a cross-slot
+        // MGET implementation.
+        let mut user_jsons: Vec<Option<String>> = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            user_jsons.push(
+                redis
+                    .get(RedisKeys::user(*user_id))
+                    .await
+                    .map_err(|e| anyhow!("Failed to get user JSON from Redis: {e}"))?,
+            );
+        }
 
         for (i, user_json_opt) in user_jsons.into_iter().enumerate() {
             if let Some(user_json) = user_json_opt {

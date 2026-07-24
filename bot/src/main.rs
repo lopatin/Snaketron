@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::Parser;
 use common::{
-    GameCommand, GameEngine, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
-    QueueMode, calculate_ai_move,
+    ClientCommandIdentityV2, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState,
+    GameStatus, GameType, QueueMode, calculate_ai_move,
 };
 use futures_util::{Sink, SinkExt, StreamExt};
 use reqwest::Client;
@@ -56,6 +56,35 @@ struct GuestResponse {
 struct GuestUser {
     id: i32,
     username: String,
+}
+
+struct BotCommandSession {
+    user_id: u32,
+    id: String,
+    next_sequence: u64,
+}
+
+impl BotCommandSession {
+    fn new(user_id: u32) -> Self {
+        Self {
+            user_id,
+            id: Uuid::new_v4().to_string(),
+            next_sequence: 1,
+        }
+    }
+
+    fn next_identity(&mut self, game_id: u32) -> Result<ClientCommandIdentityV2> {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .context("bot command sequence exhausted")?;
+        Ok(ClientCommandIdentityV2 {
+            game_id,
+            user_id: self.user_id,
+            client_game_session_id: self.id.clone(),
+            sequence,
+        })
+    }
 }
 
 #[tokio::main]
@@ -203,6 +232,7 @@ async fn play_single_game(
     let mut game_id: Option<u32> = None;
     let mut game_started = false;
     let mut game_completed = false;
+    let mut command_session = BotCommandSession::new(user_id);
     let hang_timer = tokio::time::sleep(GAME_OVER_TIMEOUT);
     tokio::pin!(hang_timer);
 
@@ -276,9 +306,17 @@ async fn play_single_game(
                     interval.tick().await;
                 }
             }, if tick_interval.is_some() => {
-                if let (Some(engine), Some(snake_id)) = (engine.as_mut(), snake_id) {
+                if let (Some(engine), Some(snake_id), Some(game_id)) = (engine.as_mut(), snake_id, game_id) {
                     let tick = engine.get_committed_state().current_tick();
-                    drive_bot(idx, engine, &mut ws_writer, snake_id).await?;
+                    drive_bot(
+                        idx,
+                        engine,
+                        &mut ws_writer,
+                        snake_id,
+                        game_id,
+                        &mut command_session,
+                    )
+                    .await?;
                     send_status(status_tx, game_idx, total_games, format!("playing tick {}", tick));
                 }
             }
@@ -386,8 +424,16 @@ where
         WSMessage::AccessDenied { reason } => {
             return Err(anyhow!("Bot {} access denied: {}", idx + 1, reason));
         }
-        WSMessage::Shutdown => {
-            warn!("Bot {} received shutdown signal from server", idx + 1);
+        WSMessage::Drain {
+            task_boot_id,
+            deadline_unix_ms,
+        } => {
+            warn!(
+                "Bot {} received drain signal from task {} (deadline {})",
+                idx + 1,
+                task_boot_id,
+                deadline_unix_ms
+            );
             return Ok(true);
         }
         _ => {
@@ -512,6 +558,8 @@ async fn drive_bot<S>(
     engine: &mut GameEngine,
     ws_writer: &mut S,
     snake_id: u32,
+    game_id: u32,
+    command_session: &mut BotCommandSession,
 ) -> Result<()>
 where
     S: Sink<Message> + Unpin,
@@ -544,7 +592,14 @@ where
         command_msg.command_id_client.tick,
         direction
     );
-    send_ws(ws_writer, WSMessage::GameCommand(command_msg)).await?;
+    send_ws(
+        ws_writer,
+        WSMessage::GameCommandV2 {
+            command_id: command_session.next_identity(game_id)?,
+            command: command_msg,
+        },
+    )
+    .await?;
     Ok(())
 }
 

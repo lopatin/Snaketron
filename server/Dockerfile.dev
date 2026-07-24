@@ -1,5 +1,5 @@
 # Development Dockerfile with hot reloading
-FROM rust:1.89-trixie
+FROM rust:1.94.1-trixie
 
 # Install cargo-watch for auto-reloading
 RUN cargo install cargo-watch

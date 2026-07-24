@@ -1,8 +1,10 @@
 use ::common::{GameEvent, GameType};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::future::join_all;
+use redis::AsyncCommands;
+use server::redis_keys::RedisKeys;
 use server::ws_server::WSMessage;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 // IMPORTANT: These tests must be run with SNAKETRON_ENV=test
 // Example: SNAKETRON_ENV=test cargo test -p server --test matchmaking_integration_tests
@@ -452,12 +454,34 @@ async fn test_rejoin_active_game() -> Result<()> {
     let game_id2 = wait_for_match(&mut client2).await?;
     assert_eq!(game_id, game_id2, "Both players should be in same game");
 
+    let committed_mapping: Option<u32> = redis_conn
+        .get(RedisKeys::matchmaking_user_active_game(
+            env.user_ids()[0] as u32,
+        ))
+        .await?;
+    assert_eq!(committed_mapping, Some(game_id));
+
     // Client1 disconnects
     client1.disconnect().await?;
 
     // Client1 reconnects and rejoins
     let mut client1_new = TestClient::connect(&server_addr).await?;
     client1_new.authenticate(env.user_ids()[0]).await?;
+
+    // Matchmaking commit and its per-user mapping are durable even if the
+    // original Pub/Sub notification was missed while this socket was down.
+    // Authentication on any gateway must replay the routing notification.
+    let recovered_game_id = timeout(Duration::from_secs(10), async {
+        loop {
+            if let WSMessage::JoinGame(recovered_game_id) = client1_new.receive_message().await? {
+                return Ok::<u32, anyhow::Error>(recovered_game_id);
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for durable JoinGame recovery")??;
+    assert_eq!(recovered_game_id, game_id);
+
     client1_new
         .send_message(WSMessage::JoinGame(game_id))
         .await?;
@@ -480,29 +504,12 @@ async fn wait_for_match_with_timeout(
     client: &mut TestClient,
     timeout_duration: Duration,
 ) -> Result<u32> {
-    timeout(timeout_duration, async {
-        // First wait for JoinGame message
-        let game_id = loop {
-            match client.receive_message().await? {
-                WSMessage::JoinGame(id) => {
-                    break id;
-                }
-                _ => {
-                    // Ignore other messages
-                }
-            }
-        };
-
-        // Send JoinGame acknowledgment
-        client.send_message(WSMessage::JoinGame(game_id)).await?;
-
-        // Now wait for the snapshot
+    let deadline = Instant::now() + timeout_duration;
+    let game_id = timeout_at(deadline, async {
         loop {
             match client.receive_message().await? {
-                WSMessage::GameEvent(event) => {
-                    if matches!(event.event, GameEvent::Snapshot { .. }) {
-                        return Ok(event.game_id);
-                    }
+                WSMessage::JoinGame(id) => {
+                    return Ok::<u32, anyhow::Error>(id);
                 }
                 _ => {
                     // Ignore other messages
@@ -510,7 +517,40 @@ async fn wait_for_match_with_timeout(
             }
         }
     })
-    .await?
+    .await
+    .context("Timed out waiting for matchmaking to route the client")??;
+
+    timeout_at(deadline, async {
+        client.send_message(WSMessage::JoinGame(game_id)).await?;
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        return Ok(event.game_id);
+                    }
+                }
+                WSMessage::GameWarming {
+                    game_id: warming_game_id,
+                    retry_after_ms,
+                } if warming_game_id == game_id => {
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms.clamp(100, 2_000)))
+                        .await;
+                    client.send_message(WSMessage::JoinGame(game_id)).await?;
+                }
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    anyhow::bail!("Matched game {failed_game_id} could not load: {reason}");
+                }
+                _ => {
+                    // Ignore other messages
+                }
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for the matched game's authoritative snapshot")?
 }
 
 async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {

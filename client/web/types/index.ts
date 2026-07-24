@@ -59,6 +59,7 @@ export interface LobbyPreferences {
 export interface WebSocketContextType {
   isConnected: boolean;
   isSessionAuthenticated: boolean;
+  serverCapabilities: ReadonlySet<string>;
   sendMessage: (message: any) => void;
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
@@ -184,6 +185,35 @@ export interface GameCommand {
   command: Command;
 }
 
+export interface ClientCommandIdentityV2 {
+  game_id: number;
+  user_id: number;
+  client_game_session_id: string;
+  sequence: number;
+}
+
+export interface GameCommandV2 {
+  command_id: ClientCommandIdentityV2;
+  command: GameCommand;
+}
+
+export type CommandOutcome =
+  | { result: 'SCHEDULED'; command: GameCommand }
+  | { result: 'REJECTED'; reason: string };
+
+export interface CommandOutcomesPayload {
+  game_id: number;
+  client_game_session_id: string;
+  contiguous_through: number;
+  outcomes: Record<string, CommandOutcome>;
+}
+
+export interface CommandOutcomesCompleteMessage {
+  CommandOutcomesComplete: {
+    game_id: number;
+  };
+}
+
 export type Command = 
   | { Turn: { direction: 'Up' | 'Down' | 'Left' | 'Right' } }
   | 'Respawn';
@@ -214,6 +244,13 @@ export interface GameLoadFailedMessage {
   GameLoadFailed: GameLoadFailedPayload;
 }
 
+export interface GameWarmingMessage {
+  GameWarming: {
+    game_id: number;
+    retry_after_ms: number;
+  };
+}
+
 export interface GameLoadFailure {
   gameId: number | null;
   requestedGameId: string;
@@ -234,8 +271,8 @@ export interface QueueForMatchMultiMessage {
   };
 }
 
-export interface GameCommandMessage {
-  GameCommand: GameCommand;
+export interface GameCommandV2Message {
+  GameCommandV2: GameCommandV2;
 }
 
 export interface TokenMessage {
@@ -247,9 +284,11 @@ export type WebSocketMessage =
   | JoinCustomGameMessage
   | JoinGameMessage
   | GameLoadFailedMessage
+  | GameWarmingMessage
+  | CommandOutcomesCompleteMessage
   | QueueForMatchMessage
   | QueueForMatchMultiMessage
-  | GameCommandMessage
+  | GameCommandV2Message
   | TokenMessage
   | string;
 

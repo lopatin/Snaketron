@@ -120,18 +120,21 @@ async fn test_game_events_delivered() -> Result<()> {
 
     // Send a command from client1
     client1
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: env.user_ids()[0] as u32,
-                sequence_number: 0,
+        .send_game_command(
+            game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: env.user_ids()[0] as u32,
+                    sequence_number: 0,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: snake1_id,
+                    direction: Direction::Up,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id: snake1_id,
-                direction: Direction::Up,
-            },
-        }))
+        )
         .await?;
 
     // Both clients should receive game events
@@ -237,18 +240,21 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
 
     // Send a command
     client
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: env.user_ids()[0] as u32,
-                sequence_number: 0,
+        .send_game_command(
+            game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: env.user_ids()[0] as u32,
+                    sequence_number: 0,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction: Direction::Up,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id,
-                direction: Direction::Up,
-            },
-        }))
+        )
         .await?;
 
     // Should receive event
@@ -285,18 +291,21 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
 
     // Send another command (using the same snake_id from earlier)
     client
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: env.user_ids()[0] as u32,
-                sequence_number: 1,
+        .send_game_command(
+            game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: env.user_ids()[0] as u32,
+                    sequence_number: 1,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id,
+                    direction: Direction::Down,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id,
-                direction: Direction::Down,
-            },
-        }))
+        )
         .await?;
 
     // Should still receive events

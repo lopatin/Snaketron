@@ -5,8 +5,8 @@
 //! `game_bus.rs`, which is ordered, replayable, and backpressured. Pub/Sub
 //! is at-most-once by design; everything published here must tolerate loss.
 
+use crate::redis_utils::RedisConnection;
 use anyhow::{Result, anyhow};
-use redis::aio::ConnectionManager;
 use redis::{PushInfo, PushKind, Value};
 use serde::de::DeserializeOwned;
 use tracing::warn;
@@ -78,17 +78,20 @@ impl ChannelReceiver {
 /// Manager for PubSub operations
 #[derive(Clone)]
 pub struct PubSubManager {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     pubsub_tx: tokio::sync::broadcast::Sender<PushInfo>,
 }
 
 impl PubSubManager {
     /// Create a new PubSub manager
     pub fn new(
-        redis: ConnectionManager,
+        redis: impl Into<RedisConnection>,
         pubsub_tx: tokio::sync::broadcast::Sender<PushInfo>,
     ) -> Self {
-        Self { redis, pubsub_tx }
+        Self {
+            redis: redis.into(),
+            pubsub_tx,
+        }
     }
 
     pub async fn subscribe_to_channel(&mut self, channel: &str) -> Result<ChannelReceiver> {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use common::{GameState, GameStatus, GameType, QueueMode};
+use common::{GameEvent, GameEventMessage, GameState, GameStatus, GameType, QueueMode};
 use redis::AsyncCommands;
 use server::{
     game_bus::GameBus, game_executor::PARTITION_COUNT, redis_keys::RedisKeys,
@@ -28,7 +28,14 @@ async fn test_game_bus() -> Result<(GameBus, redis::aio::ConnectionManager)> {
         .await
         .context("Redis is required for this integration test; start it with ./test-deps.sh")?;
     let inspection_connection = redis.clone();
-    let bus = GameBus::new(redis, client, CancellationToken::new());
+    let bus = GameBus::new(
+        redis.clone(),
+        (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
+        (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
+        redis,
+        client,
+        CancellationToken::new(),
+    )?;
 
     Ok((bus, inspection_connection))
 }
@@ -57,6 +64,47 @@ fn completed_game_state() -> GameState {
     state
 }
 
+async fn store_snapshot_for_test(
+    redis: &mut redis::aio::ConnectionManager,
+    game_id: u32,
+    snapshot: &GameState,
+) -> Result<()> {
+    let _: () = redis
+        .set_ex(
+            RedisKeys::game_snapshot(game_id),
+            serde_json::to_vec(snapshot)?,
+            300,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn publish_snapshot_for_test(
+    redis: &mut redis::aio::ConnectionManager,
+    game_id: u32,
+    snapshot: &GameState,
+) -> Result<()> {
+    let partition = game_id % PARTITION_COUNT;
+    let event = GameEventMessage {
+        game_id,
+        tick: snapshot.tick,
+        sequence: snapshot.event_sequence,
+        stream_seq: 0,
+        user_id: None,
+        event: GameEvent::Snapshot {
+            game_state: snapshot.clone(),
+        },
+    };
+    let _: String = redis::cmd("XADD")
+        .arg(RedisKeys::stream_events(partition))
+        .arg("*")
+        .arg("data")
+        .arg(serde_json::to_vec(&event)?)
+        .query_async(&mut *redis)
+        .await?;
+    store_snapshot_for_test(redis, game_id, snapshot).await
+}
+
 #[tokio::test]
 async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
     let (bus, mut redis) = test_game_bus().await?;
@@ -64,8 +112,7 @@ async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
     let key = RedisKeys::game_snapshot(game_id);
     let expected = completed_game_state();
 
-    bus.publish_snapshot(game_id % PARTITION_COUNT, game_id, &expected, 0)
-        .await?;
+    publish_snapshot_for_test(&mut redis, game_id, &expected).await?;
 
     let actual = bus
         .get_stored_snapshot(game_id)
@@ -82,7 +129,9 @@ async fn completed_game_snapshot_round_trips_through_redis() -> Result<()> {
         "completed snapshot should have the configured five-minute TTL; got {ttl_seconds} seconds"
     );
 
-    let _: usize = redis.del(&key).await?;
+    let _: usize = redis
+        .del(&[key, RedisKeys::stream_events(game_id % PARTITION_COUNT)])
+        .await?;
     Ok(())
 }
 
@@ -93,7 +142,7 @@ async fn terminal_snapshot_can_be_cached_before_completion_is_broadcast() -> Res
     let key = RedisKeys::game_snapshot(game_id);
     let expected = completed_game_state();
 
-    bus.store_snapshot(game_id, &expected).await?;
+    store_snapshot_for_test(&mut redis, game_id, &expected).await?;
 
     let actual = bus
         .get_stored_snapshot(game_id)

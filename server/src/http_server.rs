@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    body::Body,
     extract::{State, ws::WebSocketUpgrade},
-    http::StatusCode,
+    http::{Request, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, options, post},
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -18,17 +22,107 @@ use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::auth_middleware;
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
+use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::game_bus::GameBus;
+use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
+use crate::redis_keys::RedisKeys;
 use crate::region_cache::RegionCache;
 use crate::replication::ReplicationManager;
 use crate::user_cache::UserCache;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 
+use crate::redis_utils::RedisConnection;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const ACTIVE_SERVER_METRIC_TTL_MS: u64 = 10_000;
+
+/// A dependency-free listener that serves liveness immediately and installs
+/// the full application router once Redis-dependent bootstrap has converged.
+/// The listener is never rebound, so cold recovery introduces no port gap.
+#[derive(Clone)]
+pub struct DeferredHttpServer {
+    application: Arc<RwLock<Option<Router>>>,
+}
+
+#[derive(Clone)]
+struct DeferredHttpState {
+    lifecycle: TaskLifecycle,
+    application: Arc<RwLock<Option<Router>>>,
+}
+
+impl DeferredHttpServer {
+    pub async fn bind(
+        addr: &str,
+        lifecycle: TaskLifecycle,
+        cancellation: CancellationToken,
+    ) -> Result<(Self, JoinHandle<Result<()>>)> {
+        let application = Arc::new(RwLock::new(None));
+        let state = DeferredHttpState {
+            lifecycle: lifecycle.clone(),
+            application: application.clone(),
+        };
+        let app = Router::new()
+            .route("/health", get(health_live))
+            .route("/health/live", get(health_live))
+            .route("/health/ready", get(health_ready))
+            .fallback(deferred_application)
+            .with_state(state);
+
+        let listener = TcpListener::bind(addr).await?;
+        lifecycle.mark_listener_bound();
+        info!("HTTP liveness listener bound on {}", addr);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    cancellation.cancelled().await;
+                    info!("HTTP server received shutdown signal");
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("HTTP server error: {error}"))
+        });
+        Ok((Self { application }, task))
+    }
+
+    fn install(&self, application: Router) -> Result<()> {
+        let mut current = self
+            .application
+            .write()
+            .map_err(|_| anyhow::anyhow!("deferred HTTP router lock poisoned"))?;
+        *current = Some(application);
+        Ok(())
+    }
+}
+
+async fn deferred_application(
+    State(state): State<DeferredHttpState>,
+    request: Request<Body>,
+) -> Response {
+    let application = match state.application.read() {
+        Ok(application) => application.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application router unavailable",
+            )
+                .into_response();
+        }
+    };
+    let Some(application) = application else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "task is warming",
+        )
+            .into_response();
+    };
+    application
+        .oneshot(request)
+        .await
+        .expect("Axum Router service is infallible")
+}
 
 /// Combined HTTP server state containing both API and WebSocket dependencies
 #[derive(Clone)]
@@ -40,7 +134,7 @@ pub struct HttpServerState {
     /// JWT verifier for WebSocket authentication
     pub jwt_verifier: Arc<dyn JwtVerifier>,
     /// Cloneable Redis connection manager
-    pub redis: ConnectionManager,
+    pub redis: RedisConnection,
     /// Redis URL for creating new connections
     pub redis_url: String,
     /// PubSub manager for loss-tolerant fan-out (chat, lobby, counters)
@@ -66,16 +160,21 @@ pub struct HttpServerState {
     pub lobby_manager: Arc<LobbyManager>,
     /// User cache for quick user lookups
     pub user_cache: UserCache,
+    /// Process lifecycle used for truthful readiness and planned drain.
+    pub lifecycle: TaskLifecycle,
+    /// Region-scoped authoritative recovery namespace.
+    pub cluster_namespace: ClusterNamespace,
 }
 
-/// Run the combined HTTP server with both API and WebSocket endpoints
+/// Install the combined API and WebSocket application behind the already-bound
+/// liveness listener.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_http_server(
-    addr: &str,
+pub async fn install_http_application(
+    deferred: &DeferredHttpServer,
     db: Arc<dyn Database>,
     jwt_manager: Arc<JwtManager>,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
     game_bus: Arc<GameBus>,
@@ -86,6 +185,8 @@ pub async fn run_http_server(
     region: String,
     region_cache: Arc<RegionCache>,
     lobby_manager: Arc<LobbyManager>,
+    lifecycle: TaskLifecycle,
+    cluster_namespace: ClusterNamespace,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -108,6 +209,8 @@ pub async fn run_http_server(
         region_cache,
         lobby_manager,
         user_cache,
+        lifecycle: lifecycle.clone(),
+        cluster_namespace,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -202,10 +305,9 @@ pub async fn run_http_server(
         .merge(debug_routes)
         .with_state(auth_state);
 
-    // Build main router combining API and WebSocket endpoints
+    // Health routes live in the dependency-free outer router so liveness
+    // remains available before this application is installed.
     let app = Router::new()
-        // Health check endpoint
-        .route("/health", get(health_check))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
         // Nest API routes
@@ -213,18 +315,9 @@ pub async fn run_http_server(
         .layer(cors)
         .with_state(state);
 
-    // Start server
-    let listener = TcpListener::bind(addr).await?;
-    info!("HTTP server (API + WebSocket) listening on {}", addr);
-
-    // Serve with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            cancellation_token.cancelled().await;
-            info!("HTTP server received shutdown signal");
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("HTTP server error: {}", e))
+    deferred.install(app)?;
+    info!("HTTP API and WebSocket routes installed");
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -292,14 +385,27 @@ async fn upload_client_trace(
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpServerState>,
-) -> impl IntoResponse {
-    // Increment connection count
-    let count = state.connection_count.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::debug!("WebSocket connection opened, total connections: {}", count);
+) -> axum::response::Response {
+    if !state.lifecycle.is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "task is not ready for new WebSocket sessions",
+        )
+            .into_response();
+    }
 
     let connection_count = state.connection_count.clone();
+    let lifecycle = state.lifecycle.clone();
 
     ws.on_upgrade(move |socket| async move {
+        // Count only upgrades that actually became WebSockets. Incrementing in
+        // the HTTP handler leaks the drain counter when a client disappears
+        // after the 101 response is prepared but before Axum runs this future.
+        let count = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        lifecycle.websocket_opened();
+        tracing::debug!("WebSocket connection opened, total connections: {}", count);
+
         // Handle the WebSocket connection
         handle_websocket(
             socket,
@@ -315,23 +421,42 @@ async fn websocket_handler(
             state.cancellation_token,
             state.lobby_manager,
             state.region,
+            lifecycle.clone(),
+            state.cluster_namespace,
         )
         .await;
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        lifecycle.websocket_closed();
         tracing::debug!("WebSocket connection closed, total connections: {}", count);
     })
+    .into_response()
 }
 
-/// Health check handler
-async fn health_check() -> &'static str {
-    "OK"
+/// ECS liveness: a Valkey outage must not create a task replacement storm.
+async fn health_live(State(state): State<DeferredHttpState>) -> impl IntoResponse {
+    debug_assert!(state.lifecycle.is_live());
+    (StatusCode::OK, "OK")
+}
+
+/// Traefik readiness: only admit new users after local dependencies have
+/// converged, and withdraw the task immediately when drain begins.
+async fn health_ready(State(state): State<DeferredHttpState>) -> impl IntoResponse {
+    let application_installed = state
+        .application
+        .read()
+        .is_ok_and(|application| application.is_some());
+    if application_installed && state.lifecycle.is_ready() {
+        (StatusCode::OK, "READY")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "NOT_READY")
+    }
 }
 
 /// Background task to update Redis metrics every 5 seconds
 fn spawn_metrics_updater(
-    redis: ConnectionManager,
+    redis: RedisConnection,
     server_id: u64,
     region: String,
     connection_count: Arc<AtomicUsize>,
@@ -362,31 +487,59 @@ fn spawn_metrics_updater(
 
 /// Update server metrics in Redis
 async fn update_redis_metrics(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     server_id: u64,
     region: &str,
     count: usize,
 ) -> Result<()> {
-    // let mut redis = redis;
-
-    // Set user count with 10-second TTL (auto-cleanup for dead servers)
-    let _: () = redis
-        .set_ex(format!("server:{}:user_count", server_id), count, 10)
-        .await
-        .context("Failed to set user count in Redis")?;
-
-    // Set region (no TTL, persistent)
-    let _: () = redis
-        .set(format!("server:{}:region", server_id), region)
-        .await
-        .context("Failed to set region in Redis")?;
+    let metric = regions::ActiveServerMetric {
+        region: region.to_string(),
+        user_count: u32::try_from(count).unwrap_or(u32::MAX),
+    };
+    let payload = serde_json::to_string(&metric).context("Failed to serialize server metric")?;
+    let result: i32 = redis::Script::new(
+        r#"
+        local function key_type(key)
+            local response = redis.call('TYPE', key)
+            if type(response) == 'table' then return response['ok'] end
+            return response
+        end
+        local metrics_type = key_type(KEYS[1])
+        local expiry_type = key_type(KEYS[2])
+        if metrics_type ~= 'none' and metrics_type ~= 'hash' then
+            return redis.error_reply('active server metrics key has wrong type')
+        end
+        if expiry_type ~= 'none' and expiry_type ~= 'zset' then
+            return redis.error_reply('active server expiry key has wrong type')
+        end
+        local now = redis.call('TIME')
+        local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+        -- Write the expiry first. If a later command fails, an orphaned index
+        -- member is harmless and self-pruning; a hash field without an expiry
+        -- would be counted forever.
+        redis.call('ZADD', KEYS[2], now_ms + tonumber(ARGV[3]), ARGV[1])
+        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+        return 1
+        "#,
+    )
+    .key(RedisKeys::active_server_metrics())
+    .key(RedisKeys::active_server_metrics_expiry())
+    .arg(server_id)
+    .arg(payload)
+    .arg(ACTIVE_SERVER_METRIC_TTL_MS)
+    .invoke_async(&mut redis)
+    .await
+    .context("Failed to refresh active server metric")?;
+    if result != 1 {
+        anyhow::bail!("active server metric refresh returned {result}");
+    }
 
     Ok(())
 }
 
 /// Background task to broadcast user count updates every 5 seconds
 fn spawn_user_count_broadcaster(
-    redis: ConnectionManager,
+    redis: RedisConnection,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -409,51 +562,17 @@ fn spawn_user_count_broadcaster(
 }
 
 /// Aggregate user counts from Redis and broadcast to all WebSocket clients
-async fn broadcast_user_counts(mut redis: ConnectionManager) -> Result<()> {
-    use redis::AsyncCommands;
+async fn broadcast_user_counts(mut redis: RedisConnection) -> Result<()> {
     use std::collections::HashMap;
 
-    // Query all server user count keys
-    let server_keys: Vec<String> = redis::cmd("KEYS")
-        .arg("server:*:user_count")
-        .query_async(&mut redis)
+    let metrics = regions::load_active_server_metrics(&mut redis)
         .await
-        .context("Failed to query server keys")?;
+        .context("Failed to query active server metrics")?;
 
     let mut region_counts: HashMap<String, u32> = HashMap::new();
-
-    for key in server_keys {
-        // Get user count for this server
-        let count: u32 = match redis::cmd("GET").arg(&key).query_async(&mut redis).await {
-            Ok(count) => count,
-            Err(e) => {
-                tracing::warn!("Failed to get user count for {}: {}", key, e);
-                continue;
-            }
-        };
-
-        // Extract server_id from key "server:{server_id}:user_count"
-        let server_id = match key.split(':').nth(1) {
-            Some(id) => id,
-            None => {
-                tracing::warn!("Invalid key format: {}", key);
-                continue;
-            }
-        };
-
-        // Get region for this server
-        let region_key = format!("server:{}:region", server_id);
-        let region: String = match redis::cmd("GET")
-            .arg(&region_key)
-            .query_async(&mut redis)
-            .await
-        {
-            Ok(region) => region,
-            Err(_) => continue, // Skip if no region set
-        };
-
-        // Aggregate counts by region
-        *region_counts.entry(region).or_insert(0) += count;
+    for metric in metrics {
+        let regional_count = region_counts.entry(metric.region).or_insert(0_u32);
+        *regional_count = regional_count.saturating_add(metric.user_count);
     }
 
     // Serialize and publish to Redis channel
@@ -467,4 +586,118 @@ async fn broadcast_user_counts(mut redis: ConnectionManager) -> Result<()> {
 
     tracing::trace!("Broadcasted user counts: {:?}", region_counts);
     Ok(())
+}
+
+#[cfg(test)]
+mod deferred_http_tests {
+    use super::*;
+    use axum::routing::get;
+    use std::time::Duration;
+
+    static ACTIVE_SERVER_METRICS_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn active_server_registry_refreshes_and_prunes_expired_tasks() -> Result<()> {
+        let _guard = ACTIVE_SERVER_METRICS_TEST_LOCK.lock().await;
+        let client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let mut manager = crate::redis_utils::create_connection_manager(client, push_tx).await?;
+        let keys = [
+            RedisKeys::active_server_metrics(),
+            RedisKeys::active_server_metrics_expiry(),
+        ];
+        let _: () = manager.del(&keys).await?;
+
+        update_redis_metrics(manager.clone().into(), 101, "use1", 2).await?;
+        update_redis_metrics(manager.clone().into(), 202, "euw1", 3).await?;
+        let mut connection: RedisConnection = manager.clone().into();
+        let mut metrics = regions::load_active_server_metrics(&mut connection).await?;
+        metrics.sort_by(|left, right| left.region.cmp(&right.region));
+        assert_eq!(
+            metrics,
+            vec![
+                regions::ActiveServerMetric {
+                    region: "euw1".into(),
+                    user_count: 3,
+                },
+                regions::ActiveServerMetric {
+                    region: "use1".into(),
+                    user_count: 2,
+                },
+            ]
+        );
+
+        let _: () = manager
+            .zadd(RedisKeys::active_server_metrics_expiry(), 101, 0_i64)
+            .await?;
+        let metrics = regions::load_active_server_metrics(&mut connection).await?;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].region, "euw1");
+        assert!(
+            !manager
+                .hexists::<_, _, bool>(RedisKeys::active_server_metrics(), 101)
+                .await?
+        );
+
+        let _: () = manager.del(&keys).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_boot_is_live_unready_then_installs_application_without_rebind() -> Result<()> {
+        let port = crate::game_server::get_available_port();
+        let address = format!("127.0.0.1:{port}");
+        let lifecycle = TaskLifecycle::new("cold-boot-test");
+        let cancellation = CancellationToken::new();
+        let (deferred, task) =
+            DeferredHttpServer::bind(&address, lifecycle.clone(), cancellation.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()?;
+
+        let live = client
+            .get(format!("http://{address}/health/live"))
+            .send()
+            .await?;
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
+        let ready = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let warming = client.get(format!("http://{address}/probe")).send().await?;
+        assert_eq!(warming.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!task.is_finished());
+
+        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_assignment_ready(true);
+        lifecycle.mark_membership_ready(true);
+        lifecycle.mark_redis_success_now();
+        lifecycle.activate();
+        let no_application = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(
+            no_application.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        deferred
+            .install(Router::new().route("/probe", get(|| async { StatusCode::NO_CONTENT })))?;
+
+        let ready = client
+            .get(format!("http://{address}/health/ready"))
+            .send()
+            .await?;
+        assert_eq!(ready.status(), reqwest::StatusCode::OK);
+        let installed = client.get(format!("http://{address}/probe")).send().await?;
+        assert_eq!(installed.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await??;
+        Ok(())
+    }
 }

@@ -48,9 +48,7 @@ async fn main() -> Result<()> {
         .context("SNAKETRON_REGION environment variable is required")?;
 
     // Server configuration
-    let http_port = env::var("SNAKETRON_HTTP_PORT")
-        .or_else(|_| env::var("SNAKETRON_WS_PORT")) // Fallback to old WS_PORT for compatibility
-        .unwrap_or_else(|_| "8080".to_string());
+    let http_port = env::var("SNAKETRON_HTTP_PORT").unwrap_or_else(|_| "8080".to_string());
     let http_addr = format!("0.0.0.0:{}", http_port);
 
     // Get JWT secret from environment or use a default for development
@@ -116,14 +114,50 @@ async fn main() -> Result<()> {
         redis_url: redis_url.clone(),
     };
 
-    let game_server = GameServer::start(config).await?;
+    let mut game_server = GameServer::start(config).await?;
 
-    info!("Server started. Waiting for shutdown signal (Ctrl+C)...");
-    tokio::signal::ctrl_c().await?;
+    info!("Server started. Waiting for SIGINT, SIGTERM, or a critical worker failure...");
+    let fatal = tokio::select! {
+        signal = shutdown_signal() => {
+            signal?;
+            None
+        }
+        failure = game_server.wait_for_fatal() => failure,
+    };
 
-    info!("Received shutdown signal. Shutting down gracefully...");
+    if let Some(error) = &fatal {
+        tracing::error!("Critical worker failed: {}", error);
+    } else {
+        info!("Received shutdown signal. Shutting down gracefully...");
+    }
     game_server.shutdown().await?;
 
     info!("Server shut down successfully");
-    Ok(())
+    match fatal {
+        Some(error) => Err(error.context("critical server worker exited")),
+        None => Ok(()),
+    }
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("Failed to install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("Failed to listen for Ctrl+C")?;
+            }
+            _ = terminate.recv() => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to listen for Ctrl+C")
+    }
 }

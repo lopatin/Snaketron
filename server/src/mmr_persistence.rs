@@ -10,6 +10,54 @@ use skillratings::weng_lin::{
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmrEffectSpec {
+    pub user_id: u32,
+    pub delta: i32,
+    pub won: bool,
+}
+
+/// Calculate immutable MMR effects without applying them. Completion recovery
+/// calls this before committing its authoritative record, ensuring a retry
+/// cannot derive different deltas from later ratings.
+pub async fn calculate_mmr_effect_specs(
+    db: &dyn Database,
+    game_state: &GameState,
+) -> Result<Vec<MmrEffectSpec>> {
+    if matches!(game_state.game_type, GameType::Solo) {
+        return Ok(Vec::new());
+    }
+
+    let (deltas, winners) = match &game_state.game_type {
+        GameType::TeamMatch { per_team } => (
+            calculate_team_match_mmr_deltas(db, game_state, *per_team).await?,
+            get_team_match_winners(game_state),
+        ),
+        GameType::FreeForAll { .. } => (
+            calculate_ffa_mmr_deltas(db, game_state).await?,
+            get_ffa_winners(game_state),
+        ),
+        GameType::Custom { .. } if game_state.team_scores.is_some() => (
+            calculate_team_match_mmr_deltas(db, game_state, 1).await?,
+            get_team_match_winners(game_state),
+        ),
+        GameType::Custom { .. } => (
+            calculate_ffa_mmr_deltas(db, game_state).await?,
+            get_ffa_winners(game_state),
+        ),
+        GameType::Solo => unreachable!("solo returned above"),
+    };
+
+    Ok(deltas
+        .into_iter()
+        .map(|(user_id, delta)| MmrEffectSpec {
+            user_id,
+            delta,
+            won: winners.contains(&user_id),
+        })
+        .collect())
+}
+
 /// Persist MMR changes for all players in a completed game to the database.
 /// Uses the Weng-Lin algorithm to calculate new ratings and atomic ADD operations for updates.
 /// For Solo games, persists high scores instead of MMR.
@@ -97,23 +145,26 @@ async fn calculate_team_match_mmr_deltas(
         .ok_or_else(|| anyhow!("Team scores missing for team match"))?;
 
     // Determine winning team
-    let winning_team = team_scores
-        .iter()
-        .max_by_key(|(_, score)| *score)
-        .map(|(team_id, _)| *team_id);
+    let winning_team = unique_winning_team(team_scores);
 
     // Build team rosters
     let mut team_0_users = Vec::new();
     let mut team_1_users = Vec::new();
 
     for (user_id, player) in &game_state.players {
-        let snake = &game_state.arena.snakes[player.snake_id as usize];
+        let snake = game_state
+            .arena
+            .snakes
+            .get(player.snake_id as usize)
+            .ok_or_else(|| anyhow!("Player {user_id} references a missing snake"))?;
         match snake.team_id {
             Some(TeamId(0)) => team_0_users.push(*user_id),
             Some(TeamId(1)) => team_1_users.push(*user_id),
             _ => warn!("Player {} has invalid team ID in game", user_id),
         }
     }
+    team_0_users.sort_unstable();
+    team_1_users.sort_unstable();
 
     if team_0_users.is_empty() || team_1_users.is_empty() {
         return Err(anyhow!("One or both teams are empty"));
@@ -126,6 +177,7 @@ async fn calculate_team_match_mmr_deltas(
         .map(|&id| id as i32)
         .collect();
     let mmr_map = db.get_user_mmrs(&all_users).await?;
+    ensure_all_mmr_users_exist(&mmr_map, &all_users)?;
 
     // Extract MMRs based on queue mode
     let get_mmr = |user_id: u32| -> i32 {
@@ -135,7 +187,7 @@ async fn calculate_team_match_mmr_deltas(
                 QueueMode::Competitive => *ranked,
                 QueueMode::Quickmatch => *casual,
             })
-            .unwrap_or(1000)
+            .expect("all participant MMRs checked above")
     };
 
     // Create Weng-Lin ratings
@@ -196,6 +248,26 @@ async fn calculate_team_match_mmr_deltas(
     Ok(deltas)
 }
 
+fn ensure_all_mmr_users_exist(mmr_map: &HashMap<i32, (i32, i32)>, user_ids: &[i32]) -> Result<()> {
+    if let Some(missing) = user_ids
+        .iter()
+        .find(|user_id| !mmr_map.contains_key(user_id))
+    {
+        Err(anyhow!("Cannot materialize MMR for missing user {missing}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn unique_winning_team(team_scores: &HashMap<TeamId, u32>) -> Option<TeamId> {
+    let max_score = team_scores.values().copied().max()?;
+    let mut leaders = team_scores
+        .iter()
+        .filter_map(|(team, score)| (*score == max_score).then_some(*team));
+    let winner = leaders.next()?;
+    leaders.next().is_none().then_some(winner)
+}
+
 /// Calculate MMR deltas for free-for-all matches
 async fn calculate_ffa_mmr_deltas(
     db: &dyn Database,
@@ -216,11 +288,12 @@ async fn calculate_ffa_mmr_deltas(
         .collect();
 
     // Sort by score descending (higher score = better placement)
-    player_scores.sort_by_key(|p| std::cmp::Reverse(p.1));
+    player_scores.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
     // Get current MMRs
     let all_users: Vec<i32> = player_scores.iter().map(|(id, _)| *id as i32).collect();
     let mmr_map = db.get_user_mmrs(&all_users).await?;
+    ensure_all_mmr_users_exist(&mmr_map, &all_users)?;
 
     // Extract MMRs based on queue mode
     let get_mmr = |user_id: u32| -> i32 {
@@ -230,7 +303,7 @@ async fn calculate_ffa_mmr_deltas(
                 QueueMode::Competitive => *ranked,
                 QueueMode::Quickmatch => *casual,
             })
-            .unwrap_or(1000)
+            .expect("all participant MMRs checked above")
     };
 
     // If only 2 players, use 1v1 algorithm
@@ -247,8 +320,13 @@ async fn calculate_ffa_mmr_deltas(
             uncertainty: 350.0,
         };
 
+        let outcome = if player_scores[0].1 == player_scores[1].1 {
+            Outcomes::DRAW
+        } else {
+            Outcomes::WIN
+        };
         let config = WengLinConfig::new();
-        let (new_rating_0, new_rating_1) = weng_lin(&rating_0, &rating_1, &Outcomes::WIN, &config);
+        let (new_rating_0, new_rating_1) = weng_lin(&rating_0, &rating_1, &outcome, &config);
 
         let mut deltas = HashMap::new();
         deltas.insert(user_0, new_rating_0.rating as i32 - get_mmr(user_0));
@@ -269,14 +347,15 @@ async fn calculate_ffa_mmr_deltas(
         .collect();
 
     // Convert ranks to MultiTeamOutcome (lower rank = better placement)
+    let mut rank = 1;
     let teams_with_outcomes: Vec<(&[WengLinRating], MultiTeamOutcome)> = teams_with_ratings
         .iter()
         .enumerate()
-        .map(|(rank, team)| {
-            (
-                team.as_slice(),
-                MultiTeamOutcome::new(rank + 1), // 1-indexed rank (1st place, 2nd place, etc.)
-            )
+        .map(|(index, team)| {
+            if index > 0 && player_scores[index].1 < player_scores[index - 1].1 {
+                rank = index + 1;
+            }
+            (team.as_slice(), MultiTeamOutcome::new(rank))
         })
         .collect();
 
@@ -395,15 +474,16 @@ async fn apply_mmr_deltas(
 fn get_team_match_winners(game_state: &GameState) -> HashSet<u32> {
     let mut winners = HashSet::new();
 
-    if let Some(team_scores) = &game_state.team_scores {
-        // Find the winning team(s)
-        if let Some((winning_team, _)) = team_scores.iter().max_by_key(|(_, score)| *score) {
-            // Add all players from the winning team
-            for (user_id, player) in &game_state.players {
-                let snake = &game_state.arena.snakes[player.snake_id as usize];
-                if snake.team_id == Some(*winning_team) {
-                    winners.insert(*user_id);
-                }
+    if let Some(team_scores) = &game_state.team_scores
+        && let Some(winning_team) = unique_winning_team(team_scores)
+    {
+        // Add all players from the winning team
+        for (user_id, player) in &game_state.players {
+            let Some(snake) = game_state.arena.snakes.get(player.snake_id as usize) else {
+                continue;
+            };
+            if snake.team_id == Some(winning_team) {
+                winners.insert(*user_id);
             }
         }
     }

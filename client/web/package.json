@@ -13,6 +13,8 @@
     "start": "npm run kill-port && webpack-dev-server --port 3000",
     "stop": "npm run kill-port",
     "test": "playwright test",
+    "test:drain": "playwright test --config playwright.drain.config.js",
+    "test:unit": "node --test tests/unit/*.test.ts",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
     "test:headed": "playwright test --headed",

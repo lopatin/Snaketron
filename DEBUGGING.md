@@ -181,9 +181,9 @@ harness lock each one in:
 | `clockSync.reset()` on every WS close snapped the time base to zero drift until 3 new Pongs | `reset()` carries the last drift estimate forward ([clockSync.ts](client/web/utils/clockSync.ts)) |
 | One clock spike poisoned `last_command_tick` forever — all later commands scheduled in the far future (snake stops responding) | First mitigated by bounding the ratchet to predicted + 8 ticks; the ratchet was later removed entirely: local commands are stamped at the current predicted tick with a monotonic client sequence number, and the engine's one-turn-per-snake-per-tick deferral derives the spacing deterministically on every replica ([game_engine.rs](common/src/game_engine.rs), [game_state.rs](common/src/game_state.rs)) |
 | `HashSet` iteration order made multi-death respawn processing nondeterministic across native/WASM | Deaths processed in sorted order ([game_state.rs](common/src/game_state.rs)) |
-| Redis PING timeout `?`-exited the cluster singleton without stopping the service — zombie executor + split-brain duplicate games | Timeout takes the step-down path ([cluster_singleton.rs](server/src/cluster_singleton.rs)) |
+| Reusable server-ID singleton leases could leave a paused executor publishing after a replacement took over | Region-scoped assignment selects one desired owner, every acquisition has a unique boot/acquisition token, and authoritative event/checkpoint/ACK writes validate that exact token. The independent lease watchdog fails closed or enters bounded cooperative handoff ([partition_assignment.rs](server/src/partition_assignment.rs), [partition_lease.rs](server/src/partition_lease.rs), [game_executor_v2.rs](server/src/game_executor_v2.rs)) |
 | The web UI delivered every WS game event to the engine through a single-slot React state (`lastGameEvent`); React's last-write-wins batching silently dropped events whenever two frames landed in one commit. A crash tick is exactly such a burst (`SnakeDied` + `SnakeRespawned` + score updates as adjacent frames): with `SnakeRespawned` dropped, the delivered `SnakeDied` re-kills the snake the client's committed catch-up had already respawned locally, and nothing revives it until the stream-gap snapshot resync — the "enemy vanishes on crash, reappears mid-screen seconds later" report. Per-event full-state `console.log` serialization amplified the trigger by stalling the main thread | Game events now flow through a lossless ref-based FIFO drained strictly in order ([useGameWebSocket.ts](client/web/hooks/useGameWebSocket.ts), [GameArena.tsx](client/web/components/GameArena.tsx)); the state-serializing debug logging is gone ([useGameEngine.ts](client/web/hooks/useGameEngine.ts)); the failure shape (respawn lost, death delivered) is frozen in `lost_enemy_respawn_is_detected_and_healed_by_resync` ([sync_equivalence_test.rs](server/tests/sync_equivalence_test.rs)) |
-| Executor lease loss cancelled every in-flight game permanently; a lost `GameCreated` message meant a game that never started | Full failover path: 3 s lease with a 60 % grace window for *transient* renewal errors (a Redis blip no longer cancels games — safety proof in `renew_error_should_step_down`), Lua own-lease reclaim after blips, stored snapshots refreshed at TickHash cadence, and `resume_partition_games` on executor (re)start restarts every non-complete game from replica or stored-snapshot state. Snapshots re-anchor `stream_seq` watermarks at every hop (`FilteredEventReceiver`, replica, client), so a restarted executor's new stream is adopted instead of filtered as stale ([game_executor.rs](server/src/game_executor.rs), [cluster_singleton.rs](server/src/cluster_singleton.rs), [replication.rs](server/src/replication.rs)) |
+| Executor loss cancelled every in-flight game permanently; a tail-anchored command subscription could also lose `GameCreated` | Commands now use durable consumer groups; a successor reclaims the old consumer's pending entries before reading new work. The partition's active-game index and fenced per-game recovery envelopes restore actors without scanning cache keys, while command identities/outcomes make replay idempotent ([game_bus.rs](server/src/game_bus.rs), [recovery.rs](server/src/recovery.rs), [executor_cluster.rs](server/src/executor_cluster.rs), [game_executor_v2.rs](server/src/game_executor_v2.rs)) |
 
 Known, intentionally unfixed (documented behavior):
 
@@ -192,11 +192,6 @@ Known, intentionally unfixed (documented behavior):
   inherent to the current netcode model; it is now *measurable* (trace_rca
   reports per-command tick deltas) rather than invisible. Eliminating it
   requires input-delay or rollback netcode — an architectural decision.
-- **Executor failover loses the dead window** — commands sent while no
-  executor held the partition are dropped (clients see the reconnect overlay
-  and the resumed game fast-forwards to wall-clock time). Bounded by the ~3 s
-  lease + claim jitter; games whose executor stays dead longer than the 5-min
-  stored-snapshot TTL are not resumable.
 
 ## Why these bugs reached production (postmortem)
 
@@ -229,9 +224,9 @@ Why tests never caught it:
   (Since repaired: all pass again, and CI runs `cargo test --all --no-run`
   so a test binary can never silently rot out of coverage again. Note:
   running these against a Redis shared with a live dev server causes
-  cross-talk — the dev server registers in the shared service registry and
-  cluster singletons, so it literally forms a cluster with the test
-  processes: matchmaking can route test games to it and its executor can
+  cross-talk — the dev server registers in the shared membership registry,
+  so it literally forms a cluster with the test processes: matchmaking can
+  route test games to it and its executor can
   claim test partitions. Symptoms: join snapshots stuck at `Stopped`,
   matchmaking tests hitting their 30s timeouts — persisting for a short
   while after shutdown until its heartbeat expires. Stop any local

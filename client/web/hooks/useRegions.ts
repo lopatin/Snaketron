@@ -6,6 +6,7 @@ import {
   measureRegionPing,
   saveRegionPreference,
 } from '../utils/regionPreference';
+import { reconnectDelayMs } from '../services/websocketLifecycle';
 
 export interface UseRegionsReturn {
   regions: Region[];
@@ -43,7 +44,7 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
   }, []);
 
   // Initialize regions with metadata + ping + user counts
-  const initializeRegions = useCallback(async () => {
+  const initializeRegions = useCallback(async (): Promise<boolean> => {
     try {
       setIsLoading(true);
       setError(null);
@@ -116,8 +117,10 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
           });
         }
       }
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to initialize regions');
+      return false;
     } finally {
       setIsLoading(false);
     }
@@ -161,7 +164,26 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
 
   // Initialize on mount
   useEffect(() => {
-    initializeRegions();
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryAttempt = 0;
+
+    const initializeWithRetry = async () => {
+      const initialized = await initializeRegions();
+      if (initialized || cancelled) return;
+
+      const delayMs = reconnectDelayMs(retryAttempt);
+      retryAttempt += 1;
+      retryTimer = setTimeout(() => {
+        void initializeWithRetry();
+      }, delayMs);
+    };
+
+    void initializeWithRetry();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+    };
   }, [initializeRegions]);
 
   // Update isConnected status based on WebSocket connection and selected region
@@ -174,6 +196,10 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
     })));
   }, [selectedRegionId, isWebSocketConnected]);
 
+  const refreshRegions = useCallback(async () => {
+    await initializeRegions();
+  }, [initializeRegions]);
+
   const selectedRegion = regions.find(r => r.id === selectedRegionId) ?? null;
 
   return {
@@ -183,6 +209,6 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
     selectRegion,
     isLoading,
     error,
-    refreshRegions: initializeRegions,
+    refreshRegions,
   };
 }

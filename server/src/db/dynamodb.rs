@@ -4,10 +4,10 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::create_table::{CreateTableError, CreateTableOutput};
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndexAction,
-    GlobalSecondaryIndex, GlobalSecondaryIndexUpdate, KeySchemaElement, KeyType, Projection,
-    ProjectionType, ReturnValue, ScalarAttributeType, TableStatus, TimeToLiveSpecification,
-    TimeToLiveStatus,
+    AttributeDefinition, AttributeValue, BillingMode, ConditionCheck,
+    CreateGlobalSecondaryIndexAction, Delete, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
+    KeySchemaElement, KeyType, Projection, ProjectionType, Put, ReturnValue, ScalarAttributeType,
+    TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem, Update,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
@@ -16,8 +16,9 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::models::*;
-use super::{
-    DURABLE_GAME_ID_FLOOR, Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration,
+use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
+use crate::completion::{
+    CompletionEffect, CompletionRecordV1, EffectApplyResult, canonical_json_bytes,
 };
 use crate::season::Season;
 
@@ -31,6 +32,8 @@ const DEFAULT_COMPLETED_GAME_RETENTION_DAYS: i64 = 30;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
+const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
 
 /// How long a SERVER registration item lives past its last heartbeat before
 /// DynamoDB TTL reaps it. Deliberately generous: staleness is already handled
@@ -43,13 +46,27 @@ const SERVER_REGISTRATION_TTL_SECONDS: i64 = 3600;
 /// response timeout, so a hung request would otherwise stall its caller
 /// indefinitely without ever erroring. Every DynamoDB client in the server
 /// must be built through this function.
+fn dynamodb_retry_config() -> aws_config::retry::RetryConfig {
+    aws_config::retry::RetryConfig::standard().with_max_attempts(DYNAMODB_RUNTIME_MAX_ATTEMPTS)
+}
+
 pub async fn dynamodb_client() -> Client {
     let timeouts = aws_config::timeout::TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(2))
         .operation_attempt_timeout(Duration::from_secs(5))
         .operation_timeout(Duration::from_secs(15))
         .build();
-    let config = aws_config::from_env().timeout_config(timeouts).load().await;
+    // Completion waves can briefly consume a fresh table key range. Keep
+    // admission and task registration on the SDK's operation-safe retry path:
+    // each retry replays the same request, while counter ambiguity can only
+    // leave an unused ID. The default is three attempts, which proved too
+    // short during the fixed autoscaling envelope.
+    let retries = dynamodb_retry_config();
+    let config = aws_config::from_env()
+        .timeout_config(timeouts)
+        .retry_config(retries)
+        .load()
+        .await;
     Client::new(&config)
 }
 
@@ -754,33 +771,266 @@ impl DynamoDatabase {
         Ok(response.item.is_some())
     }
 
-    async fn ensure_durable_game_id_floor(&self) -> Result<()> {
-        let floor_predecessor = DURABLE_GAME_ID_FLOOR - 1;
-        let result = self
-            .client
-            .update_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s("COUNTER"))
-            .key("sk", Self::av_s("GAME"))
-            .update_expression("SET #counter = :floor_predecessor")
-            .condition_expression("attribute_not_exists(#counter) OR #counter < :floor_predecessor")
-            .expression_attribute_names("#counter", "counter")
-            .expression_attribute_values(":floor_predecessor", Self::av_n(floor_predecessor))
-            .send()
-            .await;
+    fn canonical_fingerprint<T: serde::Serialize>(value: &T) -> Result<String> {
+        let bytes = canonical_json_bytes(value)
+            .context("Failed to serialize canonical completion fingerprint")?;
+        // This fingerprint detects internal identity/payload mismatches; it is
+        // not an authentication primitive. FNV-1a/128 keeps the implementation
+        // stable without introducing another cryptography dependency.
+        let mut hash = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+        for byte in bytes {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b_u128);
+        }
+        Ok(format!("{hash:032x}"))
+    }
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|error| error.is_conditional_check_failed_exception()) =>
+    fn completion_record_hash(completion: &CompletionRecordV1) -> Result<String> {
+        Self::canonical_fingerprint(completion)
+    }
+
+    fn completion_effect_hash(
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+    ) -> Result<String> {
+        Self::canonical_fingerprint(&(completion, effect))
+    }
+
+    fn completion_revision_anchor(
+        &self,
+        completion: &CompletionRecordV1,
+        record_hash: &str,
+    ) -> Result<TransactWriteItem> {
+        let revision = completion.revision.to_string();
+        let anchor = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .item("sk", Self::av_s("COMPLETION"))
+            .item("gameId", Self::av_n(completion.game_id))
+            .item("completionRevision", Self::av_s(&revision))
+            .item("completionHash", Self::av_s(record_hash))
+            .item("schemaVersion", Self::av_n(completion.schema_version))
+            .item("endedAtMs", Self::av_n(completion.ended_at_ms))
+            .condition_expression(concat!(
+                "attribute_not_exists(pk) OR ",
+                "(completionRevision=:revision AND completionHash=:hash)"
+            ))
+            .expression_attribute_values(":revision", Self::av_s(revision))
+            .expression_attribute_values(":hash", Self::av_s(record_hash))
+            .build()
+            .context("Failed to build immutable completion revision anchor")?;
+        Ok(TransactWriteItem::builder().put(anchor).build())
+    }
+
+    fn game_completion_revision_guard(
+        &self,
+        completion: &CompletionRecordV1,
+    ) -> Result<TransactWriteItem> {
+        let guard = ConditionCheck::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression(
+                "attribute_not_exists(completionRevision) OR completionRevision=:revision",
+            )
+            .expression_attribute_values(":revision", Self::av_s(completion.revision.to_string()))
+            .build()
+            .context("Failed to build completed-game revision guard")?;
+        Ok(TransactWriteItem::builder().condition_check(guard).build())
+    }
+
+    fn completion_effect_dependency_guard(
+        &self,
+        completion: &CompletionRecordV1,
+        dependency_id: &str,
+    ) -> Result<TransactWriteItem> {
+        let dependency = completion
+            .effect(dependency_id)
+            .ok_or_else(|| anyhow!("completion is missing dependency effect {dependency_id}"))?;
+        let dependency_hash = Self::completion_effect_hash(completion, dependency)?;
+        let guard = ConditionCheck::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .key(
+                "sk",
+                Self::av_s(format!("EFFECT#{}#{}", completion.revision, dependency_id)),
+            )
+            .condition_expression("effectHash=:effect_hash")
+            .expression_attribute_values(":effect_hash", Self::av_s(dependency_hash))
+            .build()
+            .with_context(|| {
+                format!("Failed to build completion dependency guard for {dependency_id}")
+            })?;
+        Ok(TransactWriteItem::builder().condition_check(guard).build())
+    }
+
+    fn completion_effect_marker(
+        &self,
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+        effect_hash: &str,
+    ) -> Result<TransactWriteItem> {
+        let marker = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .item(
+                "sk",
+                Self::av_s(format!("EFFECT#{}#{}", completion.revision, effect.id())),
+            )
+            .item("gameId", Self::av_n(completion.game_id))
+            .item(
+                "completionRevision",
+                Self::av_s(completion.revision.to_string()),
+            )
+            .item("effectId", Self::av_s(effect.id()))
+            .item("effectHash", Self::av_s(effect_hash))
+            .item("appliedAtMs", Self::av_n(completion.ended_at_ms))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build completion effect marker")?;
+        Ok(TransactWriteItem::builder().put(marker).build())
+    }
+
+    async fn completion_effect_marker_hash(
+        &self,
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+    ) -> Result<Option<String>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .key(
+                "sk",
+                Self::av_s(format!("EFFECT#{}#{}", completion.revision, effect.id())),
+            )
+            .consistent_read(true)
+            .projection_expression("effectHash")
+            .send()
+            .await
+            .context("Failed to read completion effect marker")?;
+        Ok(response
+            .item
+            .as_ref()
+            .and_then(|item| Self::extract_string(item, "effectHash")))
+    }
+
+    async fn completion_anchor_identity(
+        &self,
+        completion: &CompletionRecordV1,
+    ) -> Result<Option<(String, String)>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+            .key("sk", Self::av_s("COMPLETION"))
+            .consistent_read(true)
+            .projection_expression("completionRevision, completionHash")
+            .send()
+            .await
+            .context("Failed to read immutable completion revision anchor")?;
+        Ok(response.item.and_then(|item| {
+            Some((
+                Self::extract_string(&item, "completionRevision")?,
+                Self::extract_string(&item, "completionHash")?,
+            ))
+        }))
+    }
+
+    async fn completion_user_target(&self, user_id: u32) -> Result<(String, bool)> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("username, isGuest")
+            .send()
+            .await
+            .context("Failed to read completion effect user")?;
+        let item = response
+            .item
+            .ok_or_else(|| anyhow!("user {user_id} disappeared before completion effect"))?;
+        let username = Self::extract_string(&item, "username")
+            .ok_or_else(|| anyhow!("user {user_id} has no username"))?;
+        Ok((
+            username,
+            Self::extract_bool(&item, "isGuest").unwrap_or(false),
+        ))
+    }
+
+    async fn transact_completion_effect(
+        &self,
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+        mut mutations: Vec<TransactWriteItem>,
+    ) -> Result<EffectApplyResult> {
+        let record_hash = Self::completion_record_hash(completion)?;
+        let effect_hash = Self::completion_effect_hash(completion, effect)?;
+        mutations.insert(
+            0,
+            self.completion_effect_marker(completion, effect, &effect_hash)?,
+        );
+        mutations.insert(
+            1,
+            self.completion_revision_anchor(completion, &record_hash)?,
+        );
+        if !matches!(effect, CompletionEffect::PersistGame { .. }) {
+            mutations.insert(2, self.game_completion_revision_guard(completion)?);
+            mutations.insert(
+                3,
+                self.completion_effect_dependency_guard(completion, "game")?,
+            );
+        }
+
+        // The persistent conditional marker is the idempotency boundary. We
+        // intentionally do not rely on DynamoDB's ten-minute client-token
+        // window: a replay years later must still converge, and a conditional
+        // cancellation lets us classify it by strongly reading the marker.
+        match self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(mutations))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(EffectApplyResult::Applied),
+            Err(error) => match self
+                .completion_effect_marker_hash(completion, effect)
+                .await?
             {
-                // The counter is already inside the durable namespace (or another allocator
-                // moved it there concurrently).
-                Ok(())
-            }
-            Err(error) => Err(error).context("Failed to reserve the durable game ID namespace"),
+                Some(existing) if existing == effect_hash => Ok(EffectApplyResult::AlreadyApplied),
+                Some(existing) => Err(anyhow!(
+                    "completion effect {} for game {} reused revision {} with a different payload (stored {}, attempted {})",
+                    effect.id(),
+                    completion.game_id,
+                    completion.revision,
+                    existing,
+                    effect_hash
+                )),
+                None => match self.completion_anchor_identity(completion).await? {
+                    Some((revision, hash))
+                        if revision != completion.revision.to_string() || hash != record_hash =>
+                    {
+                        Err(anyhow!(
+                            "game {} already has immutable completion revision {} with hash {} (attempted {} with hash {})",
+                            completion.game_id,
+                            revision,
+                            hash,
+                            completion.revision,
+                            record_hash
+                        ))
+                    }
+                    _ => Err(error).context(format!(
+                        "Failed to atomically apply completion effect {} for game {}",
+                        effect.id(),
+                        completion.game_id
+                    )),
+                },
+            },
         }
     }
 }
@@ -1350,11 +1600,6 @@ impl Database for DynamoDatabase {
 
     // Game operations
     async fn allocate_game_id(&self) -> Result<i32> {
-        // Legacy nodes continue allocating below DURABLE_GAME_ID_FLOOR from Redis while new
-        // nodes allocate exclusively from this DynamoDB epoch. The disjoint namespaces remain
-        // safe even if Redis is lost during a rolling deployment.
-        self.ensure_durable_game_id_floor().await?;
-
         // Skip physically retained rows as an additional guard for restored/imported tables.
         for _ in 0..1024 {
             let candidate = self.generate_id_for_entity("GAME").await?;
@@ -1621,6 +1866,447 @@ impl Database for DynamoDatabase {
             game_id, retention_days
         );
         Ok(())
+    }
+
+    async fn apply_completion_effect(
+        &self,
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+    ) -> Result<EffectApplyResult> {
+        completion.validate_effect(effect)?;
+
+        let max_attempts = if matches!(effect, CompletionEffect::UpdateRanking { .. }) {
+            COMPLETION_RANKING_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        for attempt in 0..max_attempts {
+            let mutations = match effect {
+                CompletionEffect::PersistGame { .. } => {
+                    let ended_at = DateTime::<Utc>::from_timestamp_millis(completion.ended_at_ms)
+                        .ok_or_else(|| anyhow!("invalid completion timestamp"))?;
+                    let created_at =
+                        DateTime::<Utc>::from_timestamp_millis(completion.final_state.start_ms)
+                            .unwrap_or(ended_at);
+                    let retention_days = Self::completed_game_retention_days(
+                        std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV)
+                            .ok()
+                            .as_deref(),
+                    );
+                    let ttl = ended_at
+                        .timestamp()
+                        .saturating_add(retention_days.saturating_mul(SECONDS_PER_DAY));
+                    let state_json = serde_json::to_string(&completion.final_state)
+                        .context("Failed to serialize immutable final game state")?;
+                    let game_type_json =
+                        serde_json::to_string(&completion.final_state.game_type)
+                            .context("Failed to serialize immutable final game type")?;
+                    let game_mode = if matches!(
+                        completion.final_state.game_type,
+                        common::GameType::Custom { .. }
+                    ) {
+                        "custom"
+                    } else {
+                        "matchmaking"
+                    };
+                    let runtime_identity = Self::runtime_game_identity(
+                        completion.game_id as i32,
+                        &completion.final_state,
+                    );
+
+                    let mut expression = concat!(
+                        "SET gsi1pk=:gsi1pk, gsi1sk=:gsi1sk, id=:id, serverId=:server, ",
+                        "gameType=:game_type, gameState=:game_state, #status=:status, ",
+                        "endedAt=:ended, lastActivity=:ended, createdAt=:created, ",
+                        "gameMode=:mode, isPrivate=:private, runtimeIdentity=:runtime, ",
+                        "completionRevision=:revision, #ttl=:ttl"
+                    )
+                    .to_string();
+                    if completion.final_state.game_code.is_some() {
+                        expression.push_str(", gameCode=:game_code");
+                    }
+
+                    let mut update = Update::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+                        .key("sk", Self::av_s("META"))
+                        .update_expression(expression)
+                        .condition_expression(concat!(
+                            "attribute_not_exists(pk) OR completionRevision=:revision OR ",
+                            "(attribute_not_exists(completionRevision) AND ",
+                            "(runtimeIdentity=:runtime OR ",
+                            "(attribute_not_exists(runtimeIdentity) AND ",
+                            "attribute_not_exists(gameState) AND id=:id AND #status<>:status)))"
+                        ))
+                        .expression_attribute_names("#status", "status")
+                        .expression_attribute_names("#ttl", "ttl")
+                        .expression_attribute_values(":gsi1pk", Self::av_s("GAME"))
+                        .expression_attribute_values(
+                            ":gsi1sk",
+                            Self::av_s(format!("complete#{}", ended_at.to_rfc3339())),
+                        )
+                        .expression_attribute_values(":id", Self::av_n(completion.game_id))
+                        .expression_attribute_values(":server", Self::av_n(completion.server_id))
+                        .expression_attribute_values(":game_type", Self::av_s(game_type_json))
+                        .expression_attribute_values(":game_state", Self::av_s(state_json))
+                        .expression_attribute_values(":status", Self::av_s("complete"))
+                        .expression_attribute_values(":ended", Self::av_s(ended_at.to_rfc3339()))
+                        .expression_attribute_values(
+                            ":created",
+                            Self::av_s(created_at.to_rfc3339()),
+                        )
+                        .expression_attribute_values(":mode", Self::av_s(game_mode))
+                        .expression_attribute_values(
+                            ":private",
+                            Self::av_bool(completion.final_state.game_code.is_some()),
+                        )
+                        .expression_attribute_values(":runtime", Self::av_s(runtime_identity))
+                        .expression_attribute_values(
+                            ":revision",
+                            Self::av_s(completion.revision.to_string()),
+                        )
+                        .expression_attribute_values(":ttl", Self::av_n(ttl));
+                    if let Some(game_code) = &completion.final_state.game_code {
+                        update =
+                            update.expression_attribute_values(":game_code", Self::av_s(game_code));
+                    }
+                    vec![
+                        TransactWriteItem::builder()
+                            .update(
+                                update
+                                    .build()
+                                    .context("Failed to build completed-game update")?,
+                            )
+                            .build(),
+                    ]
+                }
+                CompletionEffect::AddXp {
+                    user_id, amount, ..
+                } => {
+                    let (current_username, is_guest) =
+                        self.completion_user_target(*user_id).await?;
+                    let main_update = Update::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{user_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .update_expression("ADD xp :delta")
+                        .condition_expression(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND username=:username",
+                        )
+                        .expression_attribute_values(":delta", Self::av_n(amount))
+                        .expression_attribute_values(":username", Self::av_s(&current_username))
+                        .build()
+                        .context("Failed to build idempotent XP update")?;
+                    let mut mutations =
+                        vec![TransactWriteItem::builder().update(main_update).build()];
+                    if !is_guest {
+                        let mirror_update = Update::builder()
+                            .table_name(self.usernames_table())
+                            .key("username", Self::av_s(current_username))
+                            .update_expression("ADD xp :delta")
+                            .condition_expression("attribute_exists(username) AND userId=:user")
+                            .expression_attribute_values(":delta", Self::av_n(amount))
+                            .expression_attribute_values(":user", Self::av_n(user_id))
+                            .build()
+                            .context("Failed to build idempotent XP mirror update")?;
+                        mutations.push(TransactWriteItem::builder().update(mirror_update).build());
+                    }
+                    mutations
+                }
+                CompletionEffect::AddMmr {
+                    user_id,
+                    delta,
+                    queue_mode,
+                    ..
+                } => {
+                    let (current_username, is_guest) =
+                        self.completion_user_target(*user_id).await?;
+                    let field = match queue_mode {
+                        common::QueueMode::Competitive => "rankedMmr",
+                        common::QueueMode::Quickmatch => "casualMmr",
+                    };
+                    let main_update = Update::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{user_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .update_expression(format!("ADD {field} :delta"))
+                        .condition_expression(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND username=:username",
+                        )
+                        .expression_attribute_values(":delta", Self::av_n(delta))
+                        .expression_attribute_values(":username", Self::av_s(&current_username))
+                        .build()
+                        .context("Failed to build idempotent MMR update")?;
+                    let mut mutations =
+                        vec![TransactWriteItem::builder().update(main_update).build()];
+                    if !is_guest {
+                        let mirror_update = Update::builder()
+                            .table_name(self.usernames_table())
+                            .key("username", Self::av_s(current_username))
+                            .update_expression(format!("ADD {field} :delta"))
+                            .condition_expression("attribute_exists(username) AND userId=:user")
+                            .expression_attribute_values(":delta", Self::av_n(delta))
+                            .expression_attribute_values(":user", Self::av_n(user_id))
+                            .build()
+                            .context("Failed to build idempotent MMR mirror update")?;
+                        mutations.push(TransactWriteItem::builder().update(mirror_update).build());
+                    }
+                    mutations
+                }
+                CompletionEffect::UpdateRanking {
+                    user_id,
+                    username,
+                    queue_mode,
+                    game_type,
+                    region,
+                    season,
+                    won,
+                    ..
+                } => {
+                    let user_response = self
+                        .client
+                        .get_item()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{user_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .consistent_read(true)
+                        .projection_expression("rankedMmr, casualMmr")
+                        .send()
+                        .await
+                        .context("Failed to strongly read MMR for ranking effect")?;
+                    let user_item = user_response.item.ok_or_else(|| {
+                        anyhow!("user {user_id} disappeared before ranking effect")
+                    })?;
+                    let mmr_field = match queue_mode {
+                        common::QueueMode::Competitive => "rankedMmr",
+                        common::QueueMode::Quickmatch => "casualMmr",
+                    };
+                    let mmr = Self::extract_number(&user_item, mmr_field).unwrap_or(1000);
+
+                    // Prevent a stale ranking read from committing after another
+                    // game's MMR transaction. A failed condition causes this
+                    // effect to re-read both user and ranking state.
+                    let user_mmr_guard = ConditionCheck::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{user_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .condition_expression(format!("{mmr_field}=:expected_mmr"))
+                        .expression_attribute_values(":expected_mmr", Self::av_n(mmr))
+                        .build()
+                        .context("Failed to build ranking MMR consistency guard")?;
+
+                    // Ranking is a projection of the MMR effect and must never be
+                    // marked complete before that effect's atomic user/mirror
+                    // transaction has succeeded.
+                    let mmr_effect_id = format!("mmr:{user_id}");
+                    let mmr_effect_guard =
+                        self.completion_effect_dependency_guard(completion, &mmr_effect_id)?;
+
+                    let queue = match queue_mode {
+                        common::QueueMode::Competitive => "ranked",
+                        common::QueueMode::Quickmatch => "casual",
+                    };
+                    let game_type_string = Self::game_type_to_string(game_type);
+                    let pk = format!("RANKING#{queue}#{game_type_string}#{region}#{season}");
+                    let inverted = 99_999_999 - mmr.clamp(0, 99_999_999);
+                    let new_sk = format!("MMR#{inverted:08}#USER#{user_id}");
+                    let existing = self
+                        .get_user_ranking(*user_id as i32, queue_mode, game_type, region, *season)
+                        .await?;
+                    let (games, wins, losses) =
+                        existing
+                            .as_ref()
+                            .map_or((1, i32::from(*won), i32::from(!*won)), |entry| {
+                                (
+                                    entry.games_played + 1,
+                                    entry.wins + i32::from(*won),
+                                    entry.losses + i32::from(!*won),
+                                )
+                            });
+                    let now = DateTime::<Utc>::from_timestamp_millis(completion.ended_at_ms)
+                        .ok_or_else(|| anyhow!("invalid completion timestamp"))?
+                        .to_rfc3339();
+                    let game_type_season = format!("{queue}#{game_type_string}#{season}");
+
+                    let mut item = HashMap::new();
+                    item.insert("pk".into(), Self::av_s(&pk));
+                    item.insert("sk".into(), Self::av_s(&new_sk));
+                    item.insert("gameTypeSeason".into(), Self::av_s(game_type_season));
+                    item.insert("userId".into(), Self::av_n(user_id));
+                    item.insert("username".into(), Self::av_s(username));
+                    item.insert("mmr".into(), Self::av_n(mmr));
+                    item.insert("gamesPlayed".into(), Self::av_n(games));
+                    item.insert("wins".into(), Self::av_n(wins));
+                    item.insert("losses".into(), Self::av_n(losses));
+                    item.insert("region".into(), Self::av_s(region));
+                    item.insert("queueMode".into(), Self::av_s(queue));
+                    item.insert("gameType".into(), Self::av_s(game_type_string));
+                    item.insert("season".into(), Self::av_n(season));
+                    item.insert("updatedAt".into(), Self::av_s(&now));
+
+                    let mut ranking_mutations = match existing {
+                        None => {
+                            let put = Put::builder()
+                                .table_name(self.rankings_table())
+                                .set_item(Some(item))
+                                .condition_expression(
+                                    "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                                )
+                                .build()
+                                .context("Failed to build first ranking effect")?;
+                            vec![TransactWriteItem::builder().put(put).build()]
+                        }
+                        Some(entry) => {
+                            let old_inverted = 99_999_999 - entry.mmr.clamp(0, 99_999_999);
+                            let old_sk = format!("MMR#{old_inverted:08}#USER#{user_id}");
+                            if old_sk == new_sk {
+                                let update = Update::builder()
+                                .table_name(self.rankings_table())
+                                .key("pk", Self::av_s(&pk))
+                                .key("sk", Self::av_s(&new_sk))
+                                .update_expression(concat!(
+                                    "SET username=:username, mmr=:new_mmr, gamesPlayed=:new_games, ",
+                                    "wins=:new_wins, losses=:new_losses, updatedAt=:updated"
+                                ))
+                                .condition_expression(
+                                    "userId=:user AND mmr=:old_mmr AND gamesPlayed=:old_games AND wins=:old_wins AND losses=:old_losses",
+                                )
+                                .expression_attribute_values(":username", Self::av_s(username))
+                                .expression_attribute_values(":new_mmr", Self::av_n(mmr))
+                                .expression_attribute_values(":new_games", Self::av_n(games))
+                                .expression_attribute_values(":new_wins", Self::av_n(wins))
+                                .expression_attribute_values(":new_losses", Self::av_n(losses))
+                                .expression_attribute_values(":updated", Self::av_s(now))
+                                .expression_attribute_values(":user", Self::av_n(user_id))
+                                .expression_attribute_values(":old_mmr", Self::av_n(entry.mmr))
+                                .expression_attribute_values(
+                                    ":old_games",
+                                    Self::av_n(entry.games_played),
+                                )
+                                .expression_attribute_values(":old_wins", Self::av_n(entry.wins))
+                                .expression_attribute_values(
+                                    ":old_losses",
+                                    Self::av_n(entry.losses),
+                                )
+                                .build()
+                                .context("Failed to build in-place ranking effect")?;
+                                vec![TransactWriteItem::builder().update(update).build()]
+                            } else {
+                                let delete = Delete::builder()
+                                .table_name(self.rankings_table())
+                                .key("pk", Self::av_s(&pk))
+                                .key("sk", Self::av_s(old_sk))
+                                .condition_expression(
+                                    "userId=:user AND mmr=:old_mmr AND gamesPlayed=:old_games AND wins=:old_wins AND losses=:old_losses",
+                                )
+                                .expression_attribute_values(":user", Self::av_n(user_id))
+                                .expression_attribute_values(":old_mmr", Self::av_n(entry.mmr))
+                                .expression_attribute_values(
+                                    ":old_games",
+                                    Self::av_n(entry.games_played),
+                                )
+                                .expression_attribute_values(":old_wins", Self::av_n(entry.wins))
+                                .expression_attribute_values(
+                                    ":old_losses",
+                                    Self::av_n(entry.losses),
+                                )
+                                .build()
+                                .context("Failed to build old-ranking delete")?;
+                                let put = Put::builder()
+                                    .table_name(self.rankings_table())
+                                    .set_item(Some(item))
+                                    .condition_expression(
+                                        "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                                    )
+                                    .build()
+                                    .context("Failed to build moved ranking effect")?;
+                                vec![
+                                    TransactWriteItem::builder().delete(delete).build(),
+                                    TransactWriteItem::builder().put(put).build(),
+                                ]
+                            }
+                        }
+                    };
+                    ranking_mutations.insert(
+                        0,
+                        TransactWriteItem::builder()
+                            .condition_check(user_mmr_guard)
+                            .build(),
+                    );
+                    ranking_mutations.insert(1, mmr_effect_guard);
+                    ranking_mutations
+                }
+                CompletionEffect::InsertHighScore {
+                    user_id,
+                    username,
+                    score,
+                    game_type,
+                    region,
+                    season,
+                    ..
+                } => {
+                    let game_type_string = Self::game_type_to_string(game_type);
+                    let inverted = 99_999_999_i64 - i64::from(*score);
+                    let pk = format!("SCORE#{game_type_string}#{season}#{region}");
+                    let sk = format!(
+                        "SCORE#{:08}#GAME#{}#USER#{}",
+                        inverted.max(0),
+                        completion.game_id,
+                        user_id
+                    );
+                    let timestamp = DateTime::<Utc>::from_timestamp_millis(completion.ended_at_ms)
+                        .ok_or_else(|| anyhow!("invalid completion timestamp"))?
+                        .to_rfc3339();
+                    let put = Put::builder()
+                        .table_name(self.high_scores_table())
+                        .item("pk", Self::av_s(pk))
+                        .item("sk", Self::av_s(sk))
+                        .item("gameId", Self::av_s(completion.game_id.to_string()))
+                        .item("userId", Self::av_s(user_id.to_string()))
+                        .item("username", Self::av_s(username))
+                        .item("score", Self::av_n(score))
+                        .item("region", Self::av_s(region))
+                        .item("gameType", Self::av_s(&game_type_string))
+                        .item("season", Self::av_n(season))
+                        .item(
+                            "gameTypeSeason",
+                            Self::av_s(format!("{game_type_string}#{season}")),
+                        )
+                        .item("timestamp", Self::av_s(timestamp))
+                        .item(
+                            "completionRevision",
+                            Self::av_s(completion.revision.to_string()),
+                        )
+                        .condition_expression(
+                            "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                        )
+                        .build()
+                        .context("Failed to build idempotent high-score effect")?;
+                    vec![TransactWriteItem::builder().put(put).build()]
+                }
+            };
+
+            match self
+                .transact_completion_effect(completion, effect, mutations)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) if attempt + 1 < max_attempts => {
+                    // Ranking rows are sorted by MMR, so concurrent games for
+                    // one user race a conditional delete/put. Re-read and
+                    // rebuild the transaction until one observes the winner.
+                    let exponent = attempt.min(6) as u32;
+                    sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    debug!(
+                        "Retrying completion ranking effect {} after concurrent mutation: {}",
+                        effect.id(),
+                        error
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("completion effect attempt loop always returns")
     }
 
     async fn add_player_to_game(&self, game_id: i32, user_id: i32, team_id: i32) -> Result<()> {
@@ -2070,6 +2756,7 @@ impl Database for DynamoDatabase {
             .table_name(self.rankings_table())
             .key_condition_expression("pk = :pk")
             .expression_attribute_values(":pk", Self::av_s(&pk))
+            .consistent_read(true)
             .send()
             .await
             .context("Failed to query rankings")?;
@@ -2697,6 +3384,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_dynamodb_standard_retry_policy_is_capped_at_five_attempts() {
+        assert_eq!(
+            dynamodb_retry_config().max_attempts(),
+            DYNAMODB_RUNTIME_MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
     fn completed_game_retention_uses_configured_positive_days() {
         assert_eq!(
             DynamoDatabase::completed_game_retention_days(Some("45")),
@@ -2756,5 +3451,20 @@ mod tests {
 
         let item_without_ttl = HashMap::new();
         assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
+    }
+
+    #[test]
+    fn completion_fingerprint_is_independent_of_hash_map_order() {
+        let mut left = HashMap::new();
+        left.insert("b", 2);
+        left.insert("a", 1);
+        let mut right = HashMap::new();
+        right.insert("a", 1);
+        right.insert("b", 2);
+
+        assert_eq!(
+            DynamoDatabase::canonical_fingerprint(&left).unwrap(),
+            DynamoDatabase::canonical_fingerprint(&right).unwrap()
+        );
     }
 }
