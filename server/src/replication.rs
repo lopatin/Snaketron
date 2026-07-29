@@ -926,6 +926,7 @@ mod tests {
                 sequence: 1,
             },
             reason: "invalid command".to_owned(),
+            session_rejected_from: None,
         };
         tx.send(rejection).unwrap();
         let got = filtered.recv().await.unwrap();

@@ -307,7 +307,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
 1. Use `CommandScheduledV2` as the positive semantic acknowledgement. Do not add a redundant gateway-level `CommandAccepted` event.
 2. Add a terminal `CommandRejected` result containing the stable client command identity and reason.
 3. Each player command must use the current `GameCommandV2` envelope with a stable identity scoped by game, authenticated user, client game-session ID, and monotonic session sequence. No legacy command envelope is accepted on the WebSocket path.
-4. The browser must keep the command sequence and an in-memory pending outbox outside the WASM engine instance so snapshot-driven engine reconstruction does not reset command identity. Cap it at 512 unresolved commands per client game session; at the cap, do not create or send another command identity until an entry resolves.
+4. The browser must keep the command sequence and an in-memory pending outbox outside the WASM engine instance so snapshot-driven engine reconstruction does not reset command identity. Cap it at 128 unresolved commands per client game session. It must also prevent the next sequence from moving more than 128 positions above the earliest unresolved sequence; otherwise out-of-order terminal results could free client slots while overflowing the server's bounded sparse-result map. A disconnected, unauthenticated, snapshot-waiting, or unsynchronized browser must not create a new command identity. At the certified ten-command-per-second profile, the bound also covers 12.8 seconds of continued submission without outcomes. At either cap, do not create or send another command identity until the blocking entry resolves.
 5. Only one WebSocket generation may send game commands during a planned dual-socket overlap.
 6. After reconnect, the client must wait for authentication, game rejoin, and fresh resolved-command state before resending unresolved commands in original order.
 7. The server must deduplicate by stable client command identity before scheduling. A duplicate must return the recorded `CommandScheduledV2` or `CommandRejected` outcome. Repeated physical delivery must not repeat the logical game effect.
@@ -315,7 +315,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - the highest contiguous terminally resolved sequence for each client game session;
    - a bounded sparse result map above that point when outcomes have gaps or arrive out of order.
 9. A rejected or never-received sequence must not be represented as accepted merely because a higher sequence resolved. The contiguous watermark never advances across an unresolved gap.
-10. Retain at most 512 exact outcomes per client game session and at most 64 client game sessions per game. The contiguous watermark remains in every recovery checkpoint for the checkpoint lifetime.
+10. Retain at most 128 exact outcomes per client game session and at most 64 client game sessions per game. Keep this bound equal to the browser outbox bound. The contiguous watermark remains in every recovery checkpoint for the checkpoint lifetime and permanently fences older resolved identities, so pruning an exact result does not permit its logical effect to run again.
 11. Recovery checkpoints must contain the resolved watermark and sparse command outcomes. After a recovery snapshot, the server sends that user's `CommandOutcomes` records followed by an explicit `CommandOutcomesComplete` barrier before the client may resend unresolved commands.
 12. A client may remove an outbox entry only after matching `CommandScheduledV2`, matching `CommandRejected`, matching `CommandOutcomes`, or an authoritative terminal game state (`Complete` or definitive `GameLoadFailed`) proving no command can still execute.
 13. Before publishing a client-visible `CommandScheduledV2` or `CommandRejected`
@@ -328,6 +328,21 @@ The assignment coordinator is control plane only. Existing assignments and activ
     This uses the existing outcome-publication round trip;
     it must not introduce a full checkpoint per command.
 14. The delivery contract is at-least-once physical delivery with exactly-once logical effect, not literal exactly-once message publication.
+15. If the bounded sparse-result map is already full when a new noncontiguous
+    identity arrives, the executor must install one checkpointed terminal
+    rejection fence for that client game session, starting at the offending
+    sequence. If that first rejection is published before a checkpoint, it uses
+    the ordinary decision-journal and positive-stream-sequence path and its
+    command remains pending until a checkpoint containing the fence ACKs it.
+    Bootstrap may instead install the fence without publishing and atomically
+    checkpoint plus ACK it before exposing recovery state. The same fence is
+    restored after takeover and included in reconnect `CommandOutcomes`; an
+    exact outcome or the contiguous watermark takes precedence. The client
+    clears covered pending entries, creates no later identity in the fenced
+    session, preserves any unresolved lower gap, and rotates to a fresh session
+    only after those lower entries resolve. Do not add another Redis key,
+    per-command checkpoint, or rejection persistence mechanism for this edge
+    case.
 
 ### R6 — Per-game checkpoints and recovery
 
@@ -675,6 +690,8 @@ The stored source token is diagnostic only. On recovery, the successor's newly a
 | Failure after schedule but before checkpoint | The command and its exact write-ahead decision remain pending. The successor restores the recorded schedule, counter, outcome, and event watermark from the prior checkpoint and produces one logical state effect without another incremental confirmation. |
 | Failure after checkpoint but before visible confirmation | Successor skips reapplication; resolved snapshot state eventually clears the client outbox. |
 | Failure after visible confirmation but before `XACK` | If checkpointed, the successor skips the command; otherwise it loads the decision keyed by the pending stream ID and restores that exact result. In both cases no duplicate logical effect or incremental schedule is produced before the recovery snapshot reanchors the client. |
+| Sparse-result overflow after its rejection is published but before the fence is checkpointed | The command and journaled fence decision remain pending. A successor restores and checkpoints the identical fence without applying the command or duplicating the incremental event; recovery outcomes expose it to reconnecting clients. |
+| Sparse-result rejection fence checkpointed before its event is observed | Reconnect `CommandOutcomes` carries the fence, clears every covered pending identity, preserves lower unresolved gaps, and prevents reuse of the rejected identities. |
 | Checkpoint write failure | Do not ACK covered entries. Emit positive confirmation only while the original entry remains durably recoverable, retry, and expose unhealthy checkpoint age. Step down only if lease/fencing validity cannot be established or an explicit fail-closed age budget is exceeded. |
 | Matchmaker crash before atomic commit | Entrants remain queued; an allocated game ID may be unused. |
 | Matchmaker crash after atomic commit but before outbox delivery or Pub/Sub | Durable mappings and the `GameCreated` outbox record remain. Any task idempotently delivers it into the partition stream; reconnect discovers the match without Pub/Sub. |
@@ -748,6 +765,10 @@ Critical alerts:
 ## 15. Acceptance and chaos test matrix
 
 Each test must assert the concrete identifiers relevant to its invariant: game and command IDs for execution tests, assignment versions and lease tokens for ownership tests, and socket generations for handoff tests. Passing because logs contain no errors is insufficient.
+The fixed Gate A, B, and C clients must observe zero sparse-window rejection
+fences. A fence is valid protective protocol behavior for a pathological
+session, but it fails load certification rather than counting its covered
+rejections as healthy command throughput.
 
 | Test | Pass criteria |
 | --- | --- |
@@ -758,8 +779,11 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Kill after schedule, before checkpoint | Replay does not lose or double-apply the command. |
 | Kill after checkpoint, before `CommandScheduledV2` publication | Replayed `CommandOutcomes` clears the outbox without reapplying the command. |
 | Kill after `CommandScheduledV2`, before `XACK` | Successor reclaims and retires or replays as required, but one logical effect and no pre-reanchor duplicate incremental schedule reaches consumers. |
+| Fill one client session's sparse exact-result window, then crash before the overflow rejection is checkpointed | The overflow command remains in the consumer-group pending list with its exact journaled decision; takeover installs the same rejection fence, emits no conflicting incremental outcome, and does not change engine state or the server command counter. |
+| Crash after checkpointing a sparse-window rejection fence but before its event reaches the client | Recovery outcomes expose the same fence; the client clears covered entries, keeps lower gaps pending, never resends a covered identity, and rotates only after every lower pending identity resolves. |
 | Reject sequence N, accept N+1, and lose both terminal events | Reconnect does not treat the higher sequence as proof that N was accepted; resolved watermark/sparse outcomes clear each entry according to its own result. |
-| Hold 512 client commands unresolved, then submit one more | The first 512 identities remain intact and resendable; the client does not allocate or send identity 513 until one entry resolves. |
+| Hold 128 client commands unresolved, then submit one more | The first 128 identities remain intact and resendable; the client does not allocate or send identity 129 until one entry resolves. |
+| Leave client sequence 1 unresolved while sequences 2 through 129 resolve, then submit sequence 130 | The client retains sequence 1, does not allocate sequence 130, and therefore cannot overflow the server's 128-entry sparse-result window. After sequence 1 resolves, the next allocated identity is exactly sequence 130. |
 | Pause owner A beyond its lease, let B acquire, then resume A | Every event, checkpoint, finalization, active-index mutation, and ACK from A is rejected. |
 | Let stale consumer A read or claim after B acquires exclusive authority | A's atomically fenced read/claim is rejected without changing the PEL or last-delivered ID; B receives the exact entry in stream order and A cannot dispatch a committed mutation. |
 | Crash coordinator during assignment write | Readers observe a complete old or new document; recovery reconciles monotonic versions. |
@@ -794,7 +818,7 @@ Each test must assert the concrete identifiers relevant to its invariant: game a
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 224-session / 112-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and the automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. Failure to trigger or to remain inside the command budget is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
+| Run the fixed 224-session / 112-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
 | Ramp at four new sessions per second, then hold 256 authenticated sessions / 128 duels with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Exhaust the CPU of a planned scale-in destination until control operations miss their deadlines | The run fails the destination-capacity gate and is not classified as a handoff-protocol defect. No stale or unproven mutation commits: fencing rejects it, the executor fails closed, cooperative drain is not advertised, and ordinary lease-expiry recovery remains authoritative. |
 | Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
@@ -1324,6 +1348,61 @@ Cleanup for run `30089020521` succeeded and an independent absence audit found
 no active development stack, compute, cache, database, ingress, DNS, logging,
 or scaling resource. The imported production VPC, every production stack
 timestamp, and both production services remained unchanged and healthy.
+
+Exact-source run
+([GitHub Actions 30425964773](https://github.com/lopatin/snaketron-io/actions/runs/30425964773),
+outer commit `fe4652b72aa82c39f9773b3beaec412f01cc8308`, Snaketron
+commit `c179d966c0aac6c908e0d5ac8999f7bfadcc503a`) disproved the prior
+working assumption that only a sub-two-second failover exception remained.
+Gate A naturally scaled `1 -> 2`; the successor recovered 51 active games and
+replayed 380 commands. All 2,790 sessions, 1,395 games, and 2,450,883 submitted
+commands completed with terminal outcomes, with zero disconnect, reconnect, or
+usable-session gap. No application warning/error, Serverless Valkey throttle or
+eviction, or DynamoDB throttle occurred.
+
+The run nevertheless failed the unchanged ordinary-operation command gate.
+Of 330 complete pre-movement seconds, 141 failed and the maximum terminal
+outcome latency was 3,617 milliseconds; 48 seconds exceeded two seconds.
+Movement had 29 failing seconds out of 46 and a 2,715-millisecond maximum.
+Every failed second still had exact submitted-to-terminal-outcome accounting,
+so this is sustained processing delay rather than loss or duplicate execution.
+The initial task remained near 95--100% CPU for about five minutes and the
+two-task service remained about 79--84% in aggregate. The old report ended its
+strict Gate A window when movement finished; replaying the full post-ready
+interval also finds seven later seconds above one second in this run and 39 in
+run `30089020521`. Gate A therefore now covers every complete sent-time second
+from post-movement readiness through the load stage's recorded finish as a
+separate required section and requires at least 60 complete post-ready seconds.
+
+The same serving image and fixed cohort had passed the earlier movement window.
+The differentiating evidence is higher Serverless service latency amplified by
+full JSON recovery checkpoints: at steady load, each of 112 games wrote a
+roughly 242--244 KiB envelope every second, including up to 512 exact outcomes
+per client session. The minimum remediation is the aligned 128-entry
+client/server bound in R5. Disconnected or resynchronizing browsers create no
+new identities; at the certified ten-command-per-second profile, the bound also
+permits 12.8 seconds of continued submission without outcomes. The unbounded
+contiguous deduplication watermark fences pruned contiguous identities. This
+reduces the dominant checkpoint payload by approximately four times without
+changing checkpoint cadence, persistence format, CPU/memory targets, fixed
+cohort, or any acceptance deadline.
+
+The planned suite stopped at Gate A. The separate crash invocation also did not
+inject SIGKILL because a residual target-tracking action changed the service
+from one to two tasks before its strict entry check. Crash certification now
+suspends target tracking first, normalizes and verifies an independent
+`desired/running/pending = 1/1/0` baseline, and restores the canonical enabled
+`1/1/0` state in cleanup. This is test isolation only; production crash
+recovery remains independent of SIGTERM. The pending-completion backlog alarm
+uses the per-minute maximum because every task emits the environment aggregate
+while only the elected reporter has the real value; a minimum would let
+non-reporting zeroes hide a real backlog after scale-out.
+
+Cleanup and the independent absence audit passed. No development resource
+remained; all nine production stack timestamps and resource identities were
+unchanged, and production remained healthy. This run is diagnostic, not
+release certification. A fresh exact-source planned run and separate SIGKILL
+run with all unchanged acceptance thresholds are still required.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

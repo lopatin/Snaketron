@@ -1061,10 +1061,14 @@ impl GameBus {
         let GameEvent::CommandRejected {
             command_id,
             reason: event_reason,
+            session_rejected_from,
         } = &event.event
         else {
             anyhow::bail!("replyable command disposition requires CommandRejected");
         };
+        if session_rejected_from.is_some() {
+            anyhow::bail!("out-of-band command rejection cannot fence a client session");
+        }
         crate::recovery::validate_client_command_identity(command_id)?;
         if event.game_id % crate::game_executor::PARTITION_COUNT != guard.partition()
             || command_id.game_id != event.game_id

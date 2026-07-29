@@ -11,7 +11,9 @@ pub const RECOVERY_SCHEMA_VERSION: u16 = 2;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);
-pub const DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION: usize = 512;
+/// Shared bounded protocol/storage budget for exact command results. The
+/// contiguous watermark permanently fences older contiguous identities.
+pub const DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION: usize = 128;
 /// A reconnect reuses its in-memory client session, while a page reload may
 /// legitimately create a new one. Keep a generous game-wide allowance for
 /// those rotations, but never let an authenticated client grow every recovery
@@ -22,6 +24,8 @@ pub const RECOVERY_FAILURE_SCHEMA_VERSION: u16 = 1;
 pub const COMMAND_DECISION_SCHEMA_VERSION: u16 = 1;
 pub const PUBLIC_UNRECOVERABLE_GAME_REASON: &str =
     "The authoritative game state is unavailable after failover";
+pub const SPARSE_COMMAND_WINDOW_REJECTION_REASON: &str =
+    "client command session exceeded its recoverable sparse sequence window";
 
 /// Durable terminal marker for one indexed game whose authoritative recovery
 /// envelope cannot be reconstructed. Keeping this separate from the active
@@ -107,7 +111,9 @@ impl CommandDecisionV1 {
                     command: command_message.clone(),
                 },
             )),
-            GameEvent::CommandRejected { command_id, reason } => Ok((
+            GameEvent::CommandRejected {
+                command_id, reason, ..
+            } => Ok((
                 command_id,
                 CommandOutcome::Rejected {
                     reason: reason.clone(),
@@ -130,6 +136,14 @@ impl CommandDecisionV1 {
         if identity.game_id != self.event.game_id {
             bail!("command decision game identity does not match its event");
         }
+        if let GameEvent::CommandRejected {
+            session_rejected_from: Some(from_sequence),
+            ..
+        } = &self.event.event
+            && (*from_sequence == 0 || *from_sequence > identity.sequence)
+        {
+            bail!("command-session rejection fence does not cover its decision identity");
+        }
         if let CommandOutcome::Scheduled { command } = outcome {
             let server_id = command
                 .command_id_server
@@ -148,6 +162,28 @@ impl CommandDecisionV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandRejectionFence {
+    pub from_sequence: u64,
+    pub reason: String,
+}
+
+impl SessionCommandRejectionFence {
+    fn validate(&self) -> Result<()> {
+        if self.from_sequence == 0 {
+            bail!("command-session rejection fence must start at one");
+        }
+        if self.reason.is_empty() {
+            bail!("command-session rejection fence reason cannot be empty");
+        }
+        Ok(())
+    }
+
+    pub fn covers(&self, sequence: u64) -> bool {
+        sequence >= self.from_sequence
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionCommandOutcomes {
     /// Highest terminally resolved sequence with no unresolved gap below it.
@@ -155,16 +191,87 @@ pub struct SessionCommandOutcomes {
     /// Recent exact results, including sparse outcomes above the watermark.
     /// Old contiguous results may be pruned only beyond the resend guarantee.
     pub outcomes: BTreeMap<u64, CommandOutcome>,
+    /// Bounded terminal disposition used only when the sparse exact-result
+    /// window is exhausted. Exact outcomes and the contiguous watermark win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_fence: Option<SessionCommandRejectionFence>,
 }
 
 impl SessionCommandOutcomes {
+    fn validate(&self) -> Result<()> {
+        if self.outcomes.contains_key(&0) {
+            bail!("resolved client command sequence must start at one");
+        }
+        if let Some(fence) = &self.rejection_fence {
+            fence.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn get(&self, sequence: u64) -> Option<&CommandOutcome> {
         self.outcomes.get(&sequence)
     }
 
     pub fn is_terminally_resolved(&self, sequence: u64) -> bool {
         sequence > 0
-            && (sequence <= self.contiguous_through || self.outcomes.contains_key(&sequence))
+            && (sequence <= self.contiguous_through
+                || self.outcomes.contains_key(&sequence)
+                || self
+                    .rejection_fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.covers(sequence)))
+    }
+
+    pub fn rejection_fence_for(&self, sequence: u64) -> Option<&SessionCommandRejectionFence> {
+        if sequence == 0
+            || sequence <= self.contiguous_through
+            || self.outcomes.contains_key(&sequence)
+        {
+            return None;
+        }
+        self.rejection_fence
+            .as_ref()
+            .filter(|fence| fence.covers(sequence))
+    }
+
+    fn sparse_window_is_full(&self, sequence: u64, max_results: usize) -> bool {
+        max_results > 0
+            && !self.outcomes.contains_key(&sequence)
+            && self.rejection_fence_for(sequence).is_none()
+            && Some(sequence) != self.contiguous_through.checked_add(1)
+            && self
+                .outcomes
+                .range((
+                    std::ops::Bound::Excluded(self.contiguous_through),
+                    std::ops::Bound::Unbounded,
+                ))
+                .count()
+                >= max_results
+    }
+
+    pub fn install_rejection_fence(
+        &mut self,
+        from_sequence: u64,
+        reason: &str,
+    ) -> Result<SessionCommandRejectionFence> {
+        let proposed = SessionCommandRejectionFence {
+            from_sequence,
+            reason: reason.to_owned(),
+        };
+        proposed.validate()?;
+        match &mut self.rejection_fence {
+            Some(existing) => {
+                if existing.reason != proposed.reason {
+                    bail!("client command session has conflicting rejection fences");
+                }
+                existing.from_sequence = existing.from_sequence.min(proposed.from_sequence);
+                Ok(existing.clone())
+            }
+            None => {
+                self.rejection_fence = Some(proposed.clone());
+                Ok(proposed)
+            }
+        }
     }
 
     pub fn record(
@@ -222,11 +329,15 @@ impl SessionCommandOutcomes {
         if self.outcomes.contains_key(&sequence) {
             return Ok(());
         }
-        // Do not mutate state when the bounded sparse window is full. The
-        // caller can quarantine this one command without taking down its game
-        // actor or the partition.
-        let next_contiguous = self.contiguous_through.checked_add(1);
-        if self.outcomes.len() >= max_results && Some(sequence) != next_contiguous {
+        if self
+            .rejection_fence
+            .as_ref()
+            .is_some_and(|fence| fence.covers(sequence))
+        {
+            bail!("client command identity is covered by its session rejection fence");
+        }
+        // Do not mutate state when the bounded sparse window is full.
+        if self.sparse_window_is_full(sequence, max_results) {
             bail!("too many sparse command outcomes; session must resynchronize");
         }
         Ok(())
@@ -254,6 +365,42 @@ impl ResolvedCommandState {
         self.sessions
             .get(&Self::session_key(identity))
             .is_some_and(|session| session.is_terminally_resolved(identity.sequence))
+    }
+
+    pub fn rejection_fence_for(
+        &self,
+        identity: &ClientCommandIdentityV2,
+    ) -> Option<&SessionCommandRejectionFence> {
+        self.sessions
+            .get(&Self::session_key(identity))?
+            .rejection_fence_for(identity.sequence)
+    }
+
+    pub fn sparse_window_is_full(
+        &self,
+        identity: &ClientCommandIdentityV2,
+        max_results: usize,
+    ) -> bool {
+        self.sessions
+            .get(&Self::session_key(identity))
+            .is_some_and(|session| session.sparse_window_is_full(identity.sequence, max_results))
+    }
+
+    pub fn install_rejection_fence(
+        &mut self,
+        identity: &ClientCommandIdentityV2,
+        from_sequence: u64,
+        reason: &str,
+    ) -> Result<SessionCommandRejectionFence> {
+        validate_client_command_identity(identity)?;
+        if from_sequence == 0 || from_sequence > identity.sequence {
+            bail!("command-session rejection fence does not cover its command identity");
+        }
+        let key = Self::session_key(identity);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            bail!("cannot fence an unrecorded client command session");
+        };
+        session.install_rejection_fence(from_sequence, reason)
     }
 
     pub fn record(
@@ -345,6 +492,9 @@ impl RecoveryEnvelopeV2 {
             bail!("unsupported executor protocol version");
         }
         validate_stream_id(&self.command_cursor)?;
+        for session in self.resolved_client_commands.sessions.values() {
+            session.validate()?;
+        }
         Ok(())
     }
 }
@@ -557,6 +707,41 @@ mod tests {
     }
 
     #[test]
+    fn old_contiguous_results_do_not_consume_sparse_capacity() {
+        let mut outcomes = SessionCommandOutcomes::default();
+        for sequence in 1..=DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 {
+            outcomes
+                .record(
+                    sequence,
+                    rejected("contiguous"),
+                    DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+                )
+                .unwrap();
+        }
+
+        outcomes
+            .record(
+                DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 2,
+                rejected("first sparse"),
+                DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+            )
+            .unwrap();
+        assert_eq!(
+            outcomes.outcomes.len(),
+            DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION
+        );
+        assert_eq!(
+            outcomes.contiguous_through,
+            DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64
+        );
+        assert!(
+            outcomes
+                .outcomes
+                .contains_key(&(DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 2))
+        );
+    }
+
+    #[test]
     fn pruned_exact_outcome_remains_terminally_resolved() {
         let mut outcomes = SessionCommandOutcomes::default();
         outcomes.record(1, rejected("one"), 1).unwrap();
@@ -564,6 +749,129 @@ mod tests {
         assert_eq!(outcomes.contiguous_through, 2);
         assert!(outcomes.get(1).is_none());
         assert!(outcomes.is_terminally_resolved(1));
+    }
+
+    #[test]
+    fn default_sparse_window_fails_without_mutation_then_recovers() {
+        assert_eq!(DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION, 128);
+        let mut outcomes = SessionCommandOutcomes::default();
+        for sequence in 2..=(DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 1) {
+            outcomes
+                .record(
+                    sequence,
+                    rejected("resolved"),
+                    DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            outcomes.outcomes.len(),
+            DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION
+        );
+        let before = outcomes.clone();
+        assert!(
+            outcomes
+                .record(
+                    DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 2,
+                    rejected("overflow"),
+                    DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+                )
+                .is_err()
+        );
+        assert_eq!(outcomes, before);
+
+        outcomes
+            .record(
+                1,
+                rejected("gap closed"),
+                DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+            )
+            .unwrap();
+        outcomes
+            .record(
+                DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 2,
+                rejected("accepted after gap closed"),
+                DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION,
+            )
+            .unwrap();
+        assert_eq!(
+            outcomes.contiguous_through,
+            DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION as u64 + 2
+        );
+        assert_eq!(
+            outcomes.outcomes.len(),
+            DEFAULT_MAX_RECORDED_OUTCOMES_PER_SESSION
+        );
+        assert!(outcomes.is_terminally_resolved(1));
+    }
+
+    #[test]
+    fn rejection_fence_is_constant_size_and_exact_results_take_precedence() {
+        let mut outcomes = SessionCommandOutcomes::default();
+        outcomes.record(10, rejected("exact ten"), 2).unwrap();
+        outcomes.record(12, rejected("exact twelve"), 2).unwrap();
+
+        let fence = outcomes
+            .install_rejection_fence(11, SPARSE_COMMAND_WINDOW_REJECTION_REASON)
+            .unwrap();
+        assert_eq!(fence.from_sequence, 11);
+        assert_eq!(
+            outcomes.get(12),
+            Some(&rejected("exact twelve")),
+            "an exact result must win even when it overlaps the fence"
+        );
+        assert!(
+            outcomes.rejection_fence_for(12).is_none(),
+            "the reconnect protocol must not replace an exact result with the fence"
+        );
+        assert_eq!(
+            outcomes.rejection_fence_for(11),
+            Some(&SessionCommandRejectionFence {
+                from_sequence: 11,
+                reason: SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+            })
+        );
+        assert_eq!(
+            outcomes.rejection_fence_for(u64::MAX),
+            outcomes.rejection_fence_for(11),
+            "one fence resolves an unbounded tail without adding exact entries"
+        );
+        assert_eq!(outcomes.outcomes.len(), 2);
+    }
+
+    #[test]
+    fn contiguous_watermark_takes_precedence_over_rejection_fence() {
+        let mut outcomes = SessionCommandOutcomes::default();
+        outcomes.record(2, rejected("exact two"), 2).unwrap();
+        outcomes
+            .install_rejection_fence(2, SPARSE_COMMAND_WINDOW_REJECTION_REASON)
+            .unwrap();
+        outcomes.record(1, rejected("gap closed"), 2).unwrap();
+
+        assert_eq!(outcomes.contiguous_through, 2);
+        assert!(outcomes.rejection_fence_for(1).is_none());
+        assert!(outcomes.rejection_fence_for(2).is_none());
+        assert!(outcomes.rejection_fence_for(3).is_some());
+    }
+
+    #[test]
+    fn recovery_envelope_rejects_a_malformed_persisted_fence() {
+        let mut resolved = ResolvedCommandState::default();
+        resolved.sessions.insert(
+            "9:session-a".into(),
+            SessionCommandOutcomes {
+                rejection_fence: Some(SessionCommandRejectionFence {
+                    from_sequence: 0,
+                    reason: String::new(),
+                }),
+                ..SessionCommandOutcomes::default()
+            },
+        );
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(7), 0);
+        let envelope =
+            RecoveryEnvelopeV2::new(4, 4, state, "0-0".into(), resolved, 0, 0, 5, "token".into());
+
+        assert!(envelope.validate().is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ import {
   enqueueGameCommandV2,
   gameEventTerminatesCommandOutbox,
   gameLoadOutboxAction,
+  rejectGameCommandV2,
   recoveryOutcomesReadyForResend,
   reconcileGameCommandOutcomes,
   resolveGameCommandV2,
@@ -120,7 +121,10 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         if (event?.CommandScheduledV2?.command_id) {
           resolveGameCommandV2(event.CommandScheduledV2.command_id);
         } else if (event?.CommandRejected?.command_id) {
-          resolveGameCommandV2(event.CommandRejected.command_id);
+          rejectGameCommandV2(
+            event.CommandRejected.command_id,
+            event.CommandRejected.session_rejected_from,
+          );
         }
         if (
           eventGameId !== null &&

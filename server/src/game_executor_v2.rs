@@ -7,7 +7,7 @@ use crate::game_executor::{PARTITION_COUNT, StreamEvent, authorize_game_command}
 use crate::partition_lease::{PartitionLeaseGuard, PartitionLeaseStore};
 use crate::recovery::{
     CommandDecisionV1, CommandOutcome, RecoveryConfig, RecoveryEnvelopeV2, ResolvedCommandState,
-    stream_id_leq, validate_client_command_identity,
+    SPARSE_COMMAND_WINDOW_REJECTION_REASON, stream_id_leq, validate_client_command_identity,
 };
 use anyhow::{Context, Result, bail};
 use common::{
@@ -882,8 +882,26 @@ impl GameActor {
             crate::resilience_metrics::record_command_deduplications(1);
             crate::resilience_metrics::record_command_resends(1);
             if self.live {
-                self.publish_outcome(stream_id, &identity, &outcome, true)
+                self.publish_outcome(stream_id, &identity, &outcome, true, None)
                     .await?;
+            }
+            return Ok(V2Incorporation::Incorporated);
+        }
+        if let Some(fence) = self.resolved.rejection_fence_for(&identity).cloned() {
+            crate::resilience_metrics::record_command_deduplications(1);
+            crate::resilience_metrics::record_command_resends(1);
+            let outcome = CommandOutcome::Rejected {
+                reason: fence.reason,
+            };
+            if self.live {
+                self.publish_outcome(
+                    stream_id,
+                    &identity,
+                    &outcome,
+                    true,
+                    Some(fence.from_sequence),
+                )
+                .await?;
             }
             return Ok(V2Incorporation::Incorporated);
         }
@@ -891,6 +909,31 @@ impl GameActor {
             crate::resilience_metrics::record_command_deduplications(1);
             crate::resilience_metrics::record_command_resends(1);
             return Ok(V2Incorporation::PrunedDuplicate);
+        }
+        if self
+            .resolved
+            .sparse_window_is_full(&identity, self.config.max_recorded_outcomes_per_session)
+        {
+            let fence = self.resolved.install_rejection_fence(
+                &identity,
+                identity.sequence,
+                SPARSE_COMMAND_WINDOW_REJECTION_REASON,
+            )?;
+            let outcome = CommandOutcome::Rejected {
+                reason: fence.reason,
+            };
+            crate::resilience_metrics::record_command_rejections(1);
+            if self.live {
+                self.publish_outcome(
+                    stream_id,
+                    &identity,
+                    &outcome,
+                    false,
+                    Some(fence.from_sequence),
+                )
+                .await?;
+            }
+            return Ok(V2Incorporation::Incorporated);
         }
         if let Err(error) = self
             .resolved
@@ -923,7 +966,7 @@ impl GameActor {
             self.config.max_recorded_outcomes_per_session,
         )?;
         if self.live {
-            self.publish_outcome(stream_id, &identity, &outcome, false)
+            self.publish_outcome(stream_id, &identity, &outcome, false, None)
                 .await?;
         }
         Ok(V2Incorporation::Incorporated)
@@ -947,9 +990,38 @@ impl GameActor {
             );
         }
 
+        let rejection_fence = match &decision.event.event {
+            GameEvent::CommandRejected {
+                reason,
+                session_rejected_from: Some(from_sequence),
+                ..
+            } => Some((*from_sequence, reason.as_str())),
+            _ => None,
+        };
+
+        if let Some((from_sequence, reason)) = rejection_fence {
+            if outcome
+                != (CommandOutcome::Rejected {
+                    reason: reason.to_owned(),
+                })
+            {
+                bail!("command-session rejection fence has a non-rejection outcome");
+            }
+            self.resolved
+                .install_rejection_fence(identity, from_sequence, reason)?;
+        }
+
         if let Some(existing) = self.resolved.get(identity) {
             if existing != &outcome {
                 bail!("durable command decision conflicts with checkpointed outcome");
+            }
+        } else if let Some(fence) = self.resolved.rejection_fence_for(identity) {
+            if outcome
+                != (CommandOutcome::Rejected {
+                    reason: fence.reason.clone(),
+                })
+            {
+                bail!("durable command decision conflicts with session rejection fence");
             }
         } else if !self.resolved.is_terminally_resolved(identity) {
             self.resolved
@@ -981,16 +1053,23 @@ impl GameActor {
         identity: &ClientCommandIdentityV2,
         outcome: &CommandOutcome,
         deduplicated_replay: bool,
+        session_rejected_from: Option<u64>,
     ) -> Result<()> {
         let event = match outcome {
-            CommandOutcome::Scheduled { command } => GameEvent::CommandScheduledV2 {
-                command_id: identity.clone(),
-                command_message: command.clone(),
-                deduplicated_replay,
-            },
+            CommandOutcome::Scheduled { command } => {
+                if session_rejected_from.is_some() {
+                    bail!("scheduled command outcome cannot carry a session rejection fence");
+                }
+                GameEvent::CommandScheduledV2 {
+                    command_id: identity.clone(),
+                    command_message: command.clone(),
+                    deduplicated_replay,
+                }
+            }
             CommandOutcome::Rejected { reason } => GameEvent::CommandRejected {
                 command_id: identity.clone(),
                 reason: reason.clone(),
+                session_rejected_from,
             },
         };
         let stream_seq = self
@@ -1758,6 +1837,7 @@ async fn reject_or_quarantine_delivery(
         event: GameEvent::CommandRejected {
             command_id: command_id.clone(),
             reason: reason.to_string(),
+            session_rejected_from: None,
         },
     };
     bus.reject_and_ack_fenced(guard, stream_id, &rejection, reason)
@@ -4406,6 +4486,41 @@ mod tests {
             .collect()
     }
 
+    async fn prepare_sparse_window_overflow(
+        harness: &mut CrashBoundaryHarness,
+    ) -> Result<RecoveryEnvelopeV2> {
+        let mut checkpoint = harness.recovery().await?;
+        let sparse_identity = ClientCommandIdentityV2 {
+            sequence: 2,
+            ..harness.command_id.clone()
+        };
+        checkpoint.resolved_client_commands.record(
+            &sparse_identity,
+            CommandOutcome::Rejected {
+                reason: "seed sparse result".to_owned(),
+            },
+            1,
+        )?;
+        checkpoint.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+        harness
+            .bus
+            .checkpoint_and_ack_fenced(&harness.guard, &checkpoint, &[], Duration::from_secs(60))
+            .await?;
+
+        harness.command_id.sequence = 3;
+        let StreamEvent::GameCommandSubmittedV2 {
+            command_id,
+            command,
+            ..
+        } = &mut harness.command
+        else {
+            bail!("crash-boundary harness command must be v2");
+        };
+        *command_id = harness.command_id.clone();
+        command.command_id_client.sequence_number = 3;
+        Ok(checkpoint)
+    }
+
     async fn wait_for_game_snapshot(
         subscription: &mut crate::game_bus::PartitionSubscription,
         game_id: u32,
@@ -4503,6 +4618,313 @@ mod tests {
             assert!(!actor.snapshot_requested);
 
             harness.cleanup(&actor.guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_rejection_fence_recovers_from_crash_before_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut harness = CrashBoundaryHarness::new("sparse-fence-before-checkpoint").await?;
+            let checkpoint = prepare_sparse_window_overflow(&mut harness).await?;
+            let checkpoint_state = serde_json::to_value(&checkpoint.game_state)?;
+            let pending_id = harness.append_command().await?;
+            let mut original_consumer = harness
+                .bus
+                .subscribe_executor_commands(harness.guard.clone())
+                .await?;
+            let mut deliveries = original_consumer.read_new_now().await?;
+            assert_eq!(deliveries.len(), 1);
+
+            let mut original = harness.actor(checkpoint, harness.guard.clone());
+            original.config.max_recorded_outcomes_per_session = 1;
+            original.live = true;
+            assert!(matches!(
+                original.incorporate(deliveries.remove(0)).await?,
+                DeliveryDisposition::Incorporated
+            ));
+            assert_eq!(original.engine.next_server_command_sequence(), 0);
+            assert_eq!(
+                serde_json::to_value(original.engine.get_committed_state())?,
+                checkpoint_state,
+                "overflow rejection must not execute the command"
+            );
+            let volatile_fence = original
+                .resolved
+                .rejection_fence_for(&harness.command_id)
+                .context("overflow did not install its volatile rejection fence")?;
+            assert_eq!(volatile_fence.from_sequence, harness.command_id.sequence);
+            assert_eq!(
+                volatile_fence.reason,
+                SPARSE_COMMAND_WINDOW_REJECTION_REASON
+            );
+
+            let visible_events = read_game_events(&mut harness.raw, harness.partition).await?;
+            assert!(matches!(
+                visible_events.as_slice(),
+                [GameEventMessage {
+                    stream_seq,
+                    event:
+                        GameEvent::CommandRejected {
+                            command_id,
+                            reason,
+                            session_rejected_from: Some(3),
+                        },
+                    ..
+                }] if *stream_seq > 0
+                    && command_id == &harness.command_id
+                    && reason == SPARSE_COMMAND_WINDOW_REJECTION_REASON
+            ));
+            assert!(
+                harness
+                    .recovery()
+                    .await?
+                    .resolved_client_commands
+                    .rejection_fence_for(&harness.command_id)
+                    .is_none(),
+                "the test must crash before the fence reaches a checkpoint"
+            );
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                1,
+                "the positive-sequence rejection must be write-ahead journaled"
+            );
+
+            drop(original);
+            drop(original_consumer);
+            let successor_guard = harness.takeover().await?;
+            let recovered = harness.recovery().await?;
+            let mut successor_consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let mut reclaimed = successor_consumer.reclaim_next().await?;
+            assert_eq!(reclaimed.deliveries.len(), 1);
+            assert_eq!(reclaimed.deliveries[0].stream_id, pending_id);
+            let mut decisions = harness
+                .bus
+                .load_command_decisions_fenced(&successor_guard)
+                .await?;
+            assert!(matches!(
+                decisions
+                    .get(&pending_id)
+                    .map(|decision| &decision.event.event),
+                Some(GameEvent::CommandRejected {
+                    session_rejected_from: Some(3),
+                    ..
+                })
+            ));
+            attach_command_decisions(&mut reclaimed.deliveries, &mut decisions);
+            assert!(decisions.is_empty());
+
+            let mut successor = harness.actor(recovered, successor_guard.clone());
+            successor.config.max_recorded_outcomes_per_session = 1;
+            assert!(matches!(
+                successor
+                    .incorporate(reclaimed.deliveries.remove(0))
+                    .await?,
+                DeliveryDisposition::Incorporated
+            ));
+            assert_eq!(successor.engine.next_server_command_sequence(), 0);
+            assert_eq!(
+                serde_json::to_value(successor.engine.get_committed_state())?,
+                checkpoint_state
+            );
+            let recovered_fence = successor
+                .resolved
+                .rejection_fence_for(&harness.command_id)
+                .context("decision replay did not restore the rejection fence")?;
+            assert_eq!(recovered_fence.from_sequence, 3);
+            assert_eq!(
+                recovered_fence.reason,
+                SPARSE_COMMAND_WINDOW_REJECTION_REASON
+            );
+
+            successor.activate().await?;
+            let persisted = harness.recovery().await?;
+            assert_eq!(persisted.command_cursor, pending_id);
+            assert!(
+                persisted
+                    .resolved_client_commands
+                    .rejection_fence_for(&harness.command_id)
+                    .is_some()
+            );
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(pending.ids.is_empty());
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                0
+            );
+            let rejection_count = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| {
+                    matches!(
+                        &message.event,
+                        GameEvent::CommandRejected { command_id, .. }
+                            if command_id == &harness.command_id
+                    )
+                })
+                .count();
+            assert_eq!(
+                rejection_count, 1,
+                "takeover replay must not duplicate the already-visible rejection"
+            );
+
+            harness.cleanup(&successor_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_rejection_fence_survives_crash_after_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut harness = CrashBoundaryHarness::new("sparse-fence-after-checkpoint").await?;
+            let checkpoint = prepare_sparse_window_overflow(&mut harness).await?;
+            let checkpoint_state = serde_json::to_value(&checkpoint.game_state)?;
+            let first_stream_id = harness.append_command().await?;
+            let mut original_consumer = harness
+                .bus
+                .subscribe_executor_commands(harness.guard.clone())
+                .await?;
+            let mut deliveries = original_consumer.read_new_now().await?;
+
+            let mut original = harness.actor(checkpoint, harness.guard.clone());
+            original.config.max_recorded_outcomes_per_session = 1;
+            original.live = true;
+            original.incorporate(deliveries.remove(0)).await?;
+            original.checkpoint().await?;
+
+            let checkpointed = harness.recovery().await?;
+            assert_eq!(checkpointed.command_cursor, first_stream_id);
+            assert!(
+                checkpointed
+                    .resolved_client_commands
+                    .rejection_fence_for(&harness.command_id)
+                    .is_some()
+            );
+            assert_eq!(
+                checkpointed.next_server_command_sequence, 0,
+                "overflow rejection must not execute the command"
+            );
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(pending.ids.is_empty());
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                0
+            );
+
+            drop(original);
+            drop(original_consumer);
+            let successor_guard = harness.takeover().await?;
+            let mut successor = harness.actor(checkpointed, successor_guard.clone());
+            successor.config.max_recorded_outcomes_per_session = 1;
+            assert!(
+                successor
+                    .resolved
+                    .rejection_fence_for(&harness.command_id)
+                    .is_some(),
+                "takeover must load the checkpointed fence without a journal"
+            );
+
+            let duplicate_stream_id = harness.append_command().await?;
+            let mut successor_consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let mut duplicate = successor_consumer.read_new_now().await?;
+            assert_eq!(duplicate.len(), 1);
+            assert_eq!(duplicate[0].stream_id, duplicate_stream_id);
+            successor.incorporate(duplicate.remove(0)).await?;
+            assert_eq!(successor.engine.next_server_command_sequence(), 0);
+            assert_eq!(
+                serde_json::to_value(successor.engine.get_committed_state())?,
+                checkpoint_state,
+                "a covered resend must not execute after takeover"
+            );
+            assert!(
+                successor.resolved.get(&harness.command_id).is_none(),
+                "covered resends must not grow the exact outcome map"
+            );
+
+            successor.activate().await?;
+            let persisted = harness.recovery().await?;
+            assert_eq!(persisted.command_cursor, duplicate_stream_id);
+            assert!(
+                persisted
+                    .resolved_client_commands
+                    .rejection_fence_for(&harness.command_id)
+                    .is_some()
+            );
+            let pending: redis::streams::StreamPendingCountReply = harness
+                .raw
+                .xpending_count(
+                    RedisKeys::stream_commands(harness.partition),
+                    harness.namespace.command_group(harness.partition),
+                    "-",
+                    "+",
+                    10,
+                )
+                .await?;
+            assert!(pending.ids.is_empty());
+            assert_eq!(
+                harness
+                    .raw
+                    .hlen::<_, usize>(harness.namespace.command_decisions(harness.partition))
+                    .await?,
+                0
+            );
+            let rejection_count = read_game_events(&mut harness.raw, harness.partition)
+                .await?
+                .into_iter()
+                .filter(|message| {
+                    matches!(
+                        &message.event,
+                        GameEvent::CommandRejected {
+                            command_id,
+                            session_rejected_from: Some(3),
+                            ..
+                        } if command_id == &harness.command_id
+                    )
+                })
+                .count();
+            assert_eq!(
+                rejection_count, 1,
+                "checkpointed fence recovery must not republish the original rejection"
+            );
+
+            harness.cleanup(&successor_guard).await?;
             Result::<()>::Ok(())
         })
         .await??;
@@ -4893,6 +5315,7 @@ mod tests {
                     event: GameEvent::CommandRejected {
                         command_id: harness.command_id.clone(),
                         reason: "recorded rejection".into(),
+                        session_rejected_from: None,
                     },
                 },
             );
@@ -6322,6 +6745,7 @@ mod tests {
                             exact_identity.sequence,
                             exact_outcome,
                         )]),
+                        rejection_fence: None,
                     },
                 )]),
             };

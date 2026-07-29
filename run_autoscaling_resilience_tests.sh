@@ -14,6 +14,9 @@ report_dir=""
 scaling_resource=""
 original_desired=""
 scaling_state=""
+canonical_scaling_state=$'1\t10\tFalse\tFalse\tFalse'
+suspended_scaling_state=$'1\t10\tTrue\tTrue\tTrue'
+gate_a_post_ready_required_full_seconds=60
 load_pid=""
 capacity_pid=""
 admission_population_pid=""
@@ -30,6 +33,23 @@ require_command() {
     echo "Required command not found: $1" >&2
     exit 1
   }
+}
+
+staging_entry_state_is_valid() {
+  local certification_mode="$1"
+  local desired_count="$2"
+  local target_state="$3"
+  case "$certification_mode" in
+    planned)
+      [[ "$desired_count" == "1" && "$target_state" == "$canonical_scaling_state" ]]
+      ;;
+    crash)
+      [[ "$desired_count" == "1" && "$target_state" == "$suspended_scaling_state" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 unix_time_ms() {
@@ -85,9 +105,11 @@ command_outcome_window_diagnostics() {
   local window="$2"
   local max_latency_ms="${3:-1000}"
   local required_partition_count="${4:-0}"
+  local required_full_seconds="${5:-1}"
   jq \
     --argjson max_latency_ms "$max_latency_ms" \
     --argjson required_partition_count "$required_partition_count" \
+    --argjson required_full_seconds "$required_full_seconds" \
     --slurpfile window "$window" '
       . as $report
       | (($window[0].started_at_unix_ms / 1000) | ceil) as $first_second
@@ -126,12 +148,13 @@ command_outcome_window_diagnostics() {
       | {
           max_latency_ms: $max_latency_ms,
           required_partition_count: $required_partition_count,
+          required_full_seconds: $required_full_seconds,
           first_full_second: $first_second,
           after_last_full_second: $after_last_second,
           full_second_count: ($after_last_second - $first_second),
           failed_seconds: $failed_seconds,
           passed:
-            (($after_last_second - $first_second) >= 1
+            (($after_last_second - $first_second) >= $required_full_seconds
               and ($failed_seconds | length) == 0)
         }
     ' "$summary"
@@ -141,18 +164,35 @@ command_outcomes_meet_window_budget() {
   command_outcome_window_diagnostics "$@" | jq -e '.passed' >/dev/null
 }
 
+write_gate_a_post_ready_window() {
+  local summary="$1"
+  local started_at_unix_ms="$2"
+  jq \
+    --argjson started_at_unix_ms "$started_at_unix_ms" '
+      (.ramp_stages[0].finished_at_unix_ms // $started_at_unix_ms)
+        as $finished_at_unix_ms
+      | {
+          started_at_unix_ms: $started_at_unix_ms,
+          finished_at_unix_ms: $finished_at_unix_ms,
+          duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
+        }
+    ' "$summary"
+}
+
 write_gate_a_acceptance_report() {
   local summary="$1"
   local baseline_diagnostics="$2"
   local movement_diagnostics="$3"
-  local zero_load_summary="$4"
-  local runner_exit_status="$5"
-  local output="$6"
+  local post_ready_steady_diagnostics="$4"
+  local zero_load_summary="$5"
+  local runner_exit_status="$6"
+  local output="$7"
   jq -n \
     --argjson runner_exit_status "$runner_exit_status" \
     --slurpfile summary "$summary" \
     --slurpfile baseline "$baseline_diagnostics" \
     --slurpfile movement "$movement_diagnostics" \
+    --slurpfile post_ready_steady "$post_ready_steady_diagnostics" \
     --slurpfile zero_load "$zero_load_summary" '
       ($summary[0] // {}) as $report
       | {
@@ -192,7 +232,7 @@ write_gate_a_acceptance_report() {
         } as $outcomes
       | (($report.missing // false) | not) as $summary_available
       | {
-          schema_version: 1,
+          schema_version: 2,
           gate: "natural-scale-out",
           runner: {
             exit_status: $runner_exit_status,
@@ -220,7 +260,9 @@ write_gate_a_acceptance_report() {
             final_sample: (($zero_load[0].samples // []) | last // null)
           },
           baseline: ($baseline[0] // {passed: false}),
-          movement: ($movement[0] // {passed: false})
+          movement: ($movement[0] // {passed: false}),
+          post_ready_steady:
+            ($post_ready_steady[0] // {passed: false})
         }
       | .passed = (
           .runner.passed
@@ -228,6 +270,7 @@ write_gate_a_acceptance_report() {
           and .zero_load.passed
           and .baseline.passed
           and .movement.passed
+          and .post_ready_steady.passed
         )
     ' >"$output"
 }
@@ -529,6 +572,7 @@ test_command_outcome_window_gate() {
   local invalid="$fixture_dir/invalid.json"
   jq -n '{
     schema_version: 10,
+    finished_at_unix_ms: 13000,
     configured_max_concurrency: 224,
     metadata: {
       threshold_result: "passed",
@@ -547,7 +591,10 @@ test_command_outcome_window_gate() {
     },
     sessions: [{outcome: "completed", failure_phase: null}],
     games: {pairing_violations: 0},
-    ramp_stages: [{target_reached: true}],
+    ramp_stages: [{
+      target_reached: true,
+      finished_at_unix_ms: 12500
+    }],
     metrics: {
       traffic: {disconnects: 0, reconnects: 0, commands_sent: 11},
       usable_session_gap_ms: {max_ms: 0},
@@ -624,10 +671,41 @@ test_command_outcome_window_gate() {
 
   local baseline="$fixture_dir/baseline.json"
   local movement="$fixture_dir/movement.json"
+  local post_ready_window="$fixture_dir/post-ready-window.json"
+  local post_ready_steady="$fixture_dir/post-ready-steady.json"
+  local insufficient_post_ready_steady="$fixture_dir/insufficient-post-ready-steady.json"
+  local failing_post_ready_steady="$fixture_dir/failing-post-ready-steady.json"
   local zero_load="$fixture_dir/zero-load.json"
   local output="$fixture_dir/gate-a-acceptance.json"
   jq -n '{passed: true, failed_seconds: []}' >"$baseline"
   jq -n '{passed: true, failed_seconds: []}' >"$movement"
+  write_gate_a_post_ready_window "$summary" 10500 >"$post_ready_window"
+  jq -e '
+    .started_at_unix_ms == 10500
+    and .finished_at_unix_ms == 12500
+    and .duration_ms == 2000
+  ' "$post_ready_window" >/dev/null || result=1
+  command_outcome_window_diagnostics \
+    "$summary" "$post_ready_window" 1000 10 >"$post_ready_steady"
+  jq -e '
+    .passed
+    and .required_full_seconds == 1
+    and .first_full_second == 11
+    and .after_last_full_second == 12
+    and .full_second_count == 1
+  ' "$post_ready_steady" >/dev/null || result=1
+  command_outcome_window_diagnostics \
+    "$summary" "$post_ready_window" 1000 10 2 \
+    >"$insufficient_post_ready_steady"
+  jq -e '
+    .passed == false
+    and .required_full_seconds == 2
+    and .full_second_count == 1
+    and (.failed_seconds | length) == 0
+  ' "$insufficient_post_ready_steady" >/dev/null || result=1
+  if (( gate_a_post_ready_required_full_seconds != 60 )); then
+    result=1
+  fi
   jq -n '{
     passed: true,
     samples: [
@@ -636,14 +714,38 @@ test_command_outcome_window_gate() {
   }' >"$zero_load"
 
   write_gate_a_acceptance_report \
-    "$summary" "$baseline" "$movement" "$zero_load" 0 "$output"
+    "$summary" "$baseline" "$movement" "$post_ready_steady" \
+    "$zero_load" 0 "$output"
   jq -e '
-    .passed
+    .schema_version == 2
+    and .passed
     and .runner.passed
     and .envelope.passed
     and .zero_load.passed
     and .baseline.passed
     and .movement.passed
+    and .post_ready_steady.passed
+  ' "$output" >/dev/null || result=1
+
+  jq '
+    .passed = false
+    | .failed_seconds = [{
+        unix_second: 11,
+        sent: 6,
+        outcomes: 6,
+        outcome_max_latency_ms: 1001,
+        scheduled: 5,
+        missing_partitions: []
+      }]
+  ' "$post_ready_steady" >"$failing_post_ready_steady"
+  write_gate_a_acceptance_report \
+    "$summary" "$baseline" "$movement" "$failing_post_ready_steady" \
+    "$zero_load" 0 "$output"
+  jq -e '
+    .passed == false
+    and .baseline.passed
+    and .movement.passed
+    and .post_ready_steady.passed == false
   ' "$output" >/dev/null || result=1
 
   jq '
@@ -652,7 +754,8 @@ test_command_outcome_window_gate() {
     | .metrics.command_outcome_counts_by_sent_unix_second = {}
   ' "$summary" >"$invalid"
   write_gate_a_acceptance_report \
-    "$invalid" "$baseline" "$movement" "$zero_load" 0 "$output"
+    "$invalid" "$baseline" "$movement" "$post_ready_steady" \
+    "$zero_load" 0 "$output"
   jq -e '
     .passed == false
     and .envelope.outcomes.command_accounting_and_partitions == false
@@ -660,7 +763,8 @@ test_command_outcome_window_gate() {
 
   jq -n '{missing: true}' >"$invalid"
   write_gate_a_acceptance_report \
-    "$invalid" "$baseline" "$movement" "$zero_load" 1 "$output"
+    "$invalid" "$baseline" "$movement" "$post_ready_steady" \
+    "$zero_load" 1 "$output"
   jq -e '
     .passed == false
     and .envelope.summary_available == false
@@ -673,11 +777,39 @@ test_command_outcome_window_gate() {
   fi
 }
 
+test_staging_entry_state_contract() {
+  local result=0
+  staging_entry_state_is_valid \
+    planned 1 "$canonical_scaling_state" || result=1
+  staging_entry_state_is_valid \
+    crash 1 "$suspended_scaling_state" || result=1
+  if staging_entry_state_is_valid planned 2 "$canonical_scaling_state"; then
+    result=1
+  fi
+  if staging_entry_state_is_valid planned 1 "$suspended_scaling_state"; then
+    result=1
+  fi
+  if staging_entry_state_is_valid crash 2 "$suspended_scaling_state"; then
+    result=1
+  fi
+  if staging_entry_state_is_valid crash 1 "$canonical_scaling_state"; then
+    result=1
+  fi
+  if staging_entry_state_is_valid unknown 1 "$canonical_scaling_state"; then
+    result=1
+  fi
+  if (( result != 0 )); then
+    echo "Staging phase-entry state contract accepted a non-isolated baseline" >&2
+    return 1
+  fi
+}
+
 test_evidence_safety_helpers() {
   test_task_definition_evidence_sanitizer
   test_live_task_definition_gate
   test_traefik_server_up_parser
   test_command_outcome_window_gate
+  test_staging_entry_state_contract
 }
 
 run_offline_cdk_synth() {
@@ -1280,6 +1412,8 @@ verify_scaling_policies() {
 
 wait_for_running_count() {
   local wanted="$1"
+  local stable_samples="${2:-1}"
+  local consecutive=0
   local deadline=$((SECONDS + 600))
   while (( SECONDS < deadline )); do
     local counts
@@ -1290,7 +1424,12 @@ wait_for_running_count() {
       --query 'services[0].[desiredCount,runningCount,pendingCount]' \
       --output text)"
     if [[ "$counts" == "$wanted"$'\t'"$wanted"$'\t'"0" ]]; then
-      return 0
+      consecutive=$((consecutive + 1))
+      if (( consecutive >= stable_samples )); then
+        return 0
+      fi
+    else
+      consecutive=0
     fi
     sleep 5
   done
@@ -1327,6 +1466,32 @@ wait_for_policy_activity() {
     sleep 5
   done
   echo "No successful CPU/memory target-tracking scaling activity appeared after the observation began" >&2
+  return 1
+}
+
+wait_for_no_active_scaling_activity() {
+  local output="$1"
+  local candidate="$output.pending"
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    aws application-autoscaling describe-scaling-activities \
+      --region "$SNAKETRON_AWS_REGION" \
+      --service-namespace ecs \
+      --resource-id "$scaling_resource" \
+      --scalable-dimension ecs:service:DesiredCount \
+      --max-results 50 >"$candidate"
+    if jq -e '
+      [.ScalingActivities[]
+        | select(.StatusCode == "Pending" or .StatusCode == "InProgress")]
+      | length == 0
+    ' "$candidate" >/dev/null; then
+      mv "$candidate" "$output"
+      return 0
+    fi
+    sleep 2
+  done
+  [[ -f "$candidate" ]] && mv "$candidate" "$output"
+  echo "Application Auto Scaling still has an active service write after three minutes" >&2
   return 1
 }
 
@@ -2702,28 +2867,12 @@ run_staging_suite() {
       }
   fi
 
-  original_desired="$(aws ecs describe-services \
-    --region "$SNAKETRON_AWS_REGION" \
-    --cluster "$SNAKETRON_ECS_CLUSTER" \
-    --services "$SNAKETRON_ECS_SERVICE" \
-    --query 'services[0].desiredCount' \
-    --output text)"
-  if [[ "$original_desired" != "1" ]]; then
-    echo "Staging service must begin at desiredCount=1; found $original_desired" >&2
-    exit 1
-  fi
-
-  scaling_state="$(aws application-autoscaling describe-scalable-targets \
-    --region "$SNAKETRON_AWS_REGION" \
-    --service-namespace ecs \
-    --scalable-dimension ecs:service:DesiredCount \
-    --resource-ids "$scaling_resource" \
-    --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,SuspendedState.DynamicScalingInSuspended,SuspendedState.DynamicScalingOutSuspended,SuspendedState.ScheduledScalingSuspended]' \
-    --output text)"
-  if [[ "$scaling_state" != "1"$'\t'"10"$'\t'"False"$'\t'"False"$'\t'"False" ]]; then
-    echo "Staging autoscaling must be min=1, max=10, and fully enabled; found: $scaling_state" >&2
-    exit 1
-  fi
+  # Cleanup always restores the supported canonical service state. Planned
+  # certification must already be in that state; crash certification first
+  # isolates itself from any delayed target-tracking action left by a prior
+  # phase.
+  original_desired="1"
+  scaling_state="$canonical_scaling_state"
 
   load_pid=""
   capacity_pid=""
@@ -2773,12 +2922,27 @@ run_staging_suite() {
     # Suspend policy writes while restoring the exact count, then restore the
     # original fully enabled policy state. Every step retries and is verified.
     retry_command 5 set_scaling_suspended true || cleanup_ok=false
+    wait_for_no_active_scaling_activity \
+      "$report_dir/cleanup-scaling-activities.json" || cleanup_ok=false
     retry_command 5 aws ecs update-service \
       --region "$SNAKETRON_AWS_REGION" \
       --cluster "$SNAKETRON_ECS_CLUSTER" \
       --service "$SNAKETRON_ECS_SERVICE" \
       --desired-count "$original_desired" >/dev/null || cleanup_ok=false
     wait_for_running_count "$original_desired" || cleanup_ok=false
+    local restored_counts
+    restored_counts="$(aws ecs describe-services \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --services "$SNAKETRON_ECS_SERVICE" \
+      --query 'services[0].[desiredCount,runningCount,pendingCount]' \
+      --output text 2>/dev/null)"
+    if [[ "$restored_counts" != "$original_desired"$'\t'"$original_desired"$'\t'"0" ]]; then
+      cleanup_ok=false
+    fi
+    # Verify the exact count while policy writes are still suspended. Enabling
+    # target tracking is the final mutation; a still-hot historical metric may
+    # legitimately request new capacity immediately afterward.
     retry_command 5 set_scaling_suspended false || cleanup_ok=false
     local restored_scaling_state
     restored_scaling_state="$(aws application-autoscaling describe-scalable-targets \
@@ -2791,21 +2955,15 @@ run_staging_suite() {
     if [[ "$restored_scaling_state" != "$scaling_state" ]]; then
       cleanup_ok=false
     fi
-    local restored_counts
-    restored_counts="$(aws ecs describe-services \
-      --region "$SNAKETRON_AWS_REGION" \
-      --cluster "$SNAKETRON_ECS_CLUSTER" \
-      --services "$SNAKETRON_ECS_SERVICE" \
-      --query 'services[0].[desiredCount,runningCount,pendingCount]' \
-      --output text 2>/dev/null)"
-    if [[ "$restored_counts" != "$original_desired"$'\t'"$original_desired"$'\t'"0" ]]; then
-      cleanup_ok=false
-    fi
     jq -n \
       --argjson restored "$cleanup_ok" \
       --arg scaling_state "$restored_scaling_state" \
       --arg counts "$restored_counts" \
-      '{restored: $restored, scaling_state: $scaling_state, counts: $counts}' \
+      '{
+        restored: $restored,
+        scaling_state: $scaling_state,
+        counts_verified_while_suspended: $counts
+      }' \
       >"$report_dir/cleanup.json"
     if [[ "$cleanup_ok" != true ]]; then
       echo "Staging cleanup could not verify restoration of desired count and autoscaling policy; inspect cleanup.json" >&2
@@ -2813,7 +2971,112 @@ run_staging_suite() {
     fi
     exit "$exit_code"
   }
-  trap restore_and_verify EXIT
+  local observed_desired
+  observed_desired="$(aws ecs describe-services \
+    --region "$SNAKETRON_AWS_REGION" \
+    --cluster "$SNAKETRON_ECS_CLUSTER" \
+    --services "$SNAKETRON_ECS_SERVICE" \
+    --query 'services[0].desiredCount' \
+    --output text)"
+  local observed_scaling_state
+  observed_scaling_state="$(aws application-autoscaling describe-scalable-targets \
+    --region "$SNAKETRON_AWS_REGION" \
+    --service-namespace ecs \
+    --scalable-dimension ecs:service:DesiredCount \
+    --resource-ids "$scaling_resource" \
+    --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,SuspendedState.DynamicScalingInSuspended,SuspendedState.DynamicScalingOutSuspended,SuspendedState.ScheduledScalingSuspended]' \
+    --output text)"
+
+  if [[ "$crash_mode" == false ]]; then
+    if [[ "$observed_desired" != "1" ]]; then
+      echo "Staging service must begin at desiredCount=1; found $observed_desired" >&2
+      exit 1
+    fi
+    if ! staging_entry_state_is_valid \
+      planned "$observed_desired" "$observed_scaling_state"; then
+      echo "Staging autoscaling must be min=1, max=10, and fully enabled; found: $observed_scaling_state" >&2
+      exit 1
+    fi
+    trap restore_and_verify EXIT
+  fi
+
+  if [[ "$crash_mode" == true ]]; then
+    # Install cleanup before the first mutation. Suspension prevents a late
+    # target-tracking action from a prior planned phase from racing this
+    # explicit one-task baseline.
+    trap restore_and_verify EXIT
+    retry_command 5 set_scaling_suspended true
+    local pre_normalization_scaling_state
+    pre_normalization_scaling_state="$(aws application-autoscaling describe-scalable-targets \
+      --region "$SNAKETRON_AWS_REGION" \
+      --service-namespace ecs \
+      --scalable-dimension ecs:service:DesiredCount \
+      --resource-ids "$scaling_resource" \
+      --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,SuspendedState.DynamicScalingInSuspended,SuspendedState.DynamicScalingOutSuspended,SuspendedState.ScheduledScalingSuspended]' \
+      --output text)"
+    if [[ "$pre_normalization_scaling_state" != "$suspended_scaling_state" ]]; then
+      echo "Crash certification could not suspend target tracking; found: $pre_normalization_scaling_state" >&2
+      exit 1
+    fi
+    wait_for_no_active_scaling_activity \
+      "$report_dir/crash-entry-scaling-activities.json"
+    retry_command 5 aws ecs update-service \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --service "$SNAKETRON_ECS_SERVICE" \
+      --desired-count 1 >/dev/null
+    # Require three exact observations after suspension so an already
+    # in-flight target-tracking write cannot pass through between setup and
+    # crash selection.
+    wait_for_running_count 1 3
+
+    local normalized_counts
+    normalized_counts="$(aws ecs describe-services \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --services "$SNAKETRON_ECS_SERVICE" \
+      --query 'services[0].[desiredCount,runningCount,pendingCount]' \
+      --output text)"
+    local normalized_desired
+    local normalized_running
+    local normalized_pending
+    IFS=$'\t' read -r \
+      normalized_desired normalized_running normalized_pending \
+      <<<"$normalized_counts"
+    local normalized_scaling_state
+    normalized_scaling_state="$(aws application-autoscaling describe-scalable-targets \
+      --region "$SNAKETRON_AWS_REGION" \
+      --service-namespace ecs \
+      --scalable-dimension ecs:service:DesiredCount \
+      --resource-ids "$scaling_resource" \
+      --query 'ScalableTargets[0].[MinCapacity,MaxCapacity,SuspendedState.DynamicScalingInSuspended,SuspendedState.DynamicScalingOutSuspended,SuspendedState.ScheduledScalingSuspended]' \
+      --output text)"
+    if [[ "$normalized_running" != "1" || "$normalized_pending" != "0" ]] \
+      || ! staging_entry_state_is_valid \
+        crash "$normalized_desired" "$normalized_scaling_state"; then
+      echo "Crash certification could not establish an isolated one-task baseline; found ECS counts: $normalized_counts, autoscaling: $normalized_scaling_state" >&2
+      exit 1
+    fi
+    jq -n \
+      --arg observed_desired "$observed_desired" \
+      --arg observed_scaling_state "$observed_scaling_state" \
+      --arg normalized_desired "$normalized_desired" \
+      --arg normalized_running "$normalized_running" \
+      --arg normalized_pending "$normalized_pending" \
+      --arg normalized_scaling_state "$normalized_scaling_state" \
+      '{
+        observed: {
+          desired_count: ($observed_desired | tonumber),
+          scaling_state: $observed_scaling_state
+        },
+        normalized: {
+          desired_count: ($normalized_desired | tonumber),
+          running_count: ($normalized_running | tonumber),
+          pending_count: ($normalized_pending | tonumber),
+          scaling_state: $normalized_scaling_state
+        }
+      }' >"$report_dir/crash-phase-entry.json"
+  fi
 
   cd "$repo_dir"
   cargo build -p server --release --bin resilience_admin
@@ -3307,12 +3570,12 @@ run_staging_suite() {
         finished_at_unix_ms: $finished_at_unix_ms,
         duration_ms: ($finished_at_unix_ms - $started_at_unix_ms)
       }
-    ' >"$report_dir/automatic-scale-out-window.json"
+  ' >"$report_dir/automatic-scale-out-window.json"
   require_load_running
-  # Gate A ends here. Its high-load clients may prove natural scale-out, but
-  # they are not a capacity-valid destination load for the forced ten-to-one
-  # handoff. Let the runner finish and prove that all of its sockets and games
-  # are gone before resetting the service.
+  # Ownership movement ends here. Keep the clients running so Gate A can also
+  # verify steady post-ready command delivery; this cohort is not a
+  # capacity-valid destination load for the forced ten-to-one handoff. Let the
+  # runner finish and prove that all sockets and games are gone before reset.
   local natural_scale_out_exit_status=0
   wait "$load_pid" || natural_scale_out_exit_status=$?
   load_pid=""
@@ -3327,6 +3590,8 @@ run_staging_suite() {
   set -e
   local gate_a_baseline_diagnostics="$report_dir/gate-a-baseline-diagnostics.json"
   local gate_a_movement_diagnostics="$report_dir/gate-a-movement-diagnostics.json"
+  local gate_a_post_ready_window="$report_dir/automatic-scale-out-post-ready-window.json"
+  local gate_a_post_ready_steady_diagnostics="$report_dir/gate-a-post-ready-steady-diagnostics.json"
   local gate_a_summary="$natural_scale_out_summary"
   if [[ -s "$natural_scale_out_summary" ]]; then
     command_outcome_window_diagnostics \
@@ -3337,6 +3602,18 @@ run_staging_suite() {
       "$gate_a_summary" \
       "$report_dir/automatic-scale-out-window.json" \
       1000 10 >"$gate_a_movement_diagnostics"
+    # Once every new task is healthy and visible through Traefik/control-plane
+    # readiness, keep enforcing the same strict command budget through the
+    # load stage's recorded finish. The shared window helper evaluates only
+    # complete sent-time seconds.
+    write_gate_a_post_ready_window \
+      "$gate_a_summary" "$automatic_scale_out_finished_ms" \
+      >"$gate_a_post_ready_window"
+    command_outcome_window_diagnostics \
+      "$gate_a_summary" \
+      "$gate_a_post_ready_window" \
+      1000 10 "$gate_a_post_ready_required_full_seconds" \
+      >"$gate_a_post_ready_steady_diagnostics"
   else
     gate_a_summary="$report_dir/gate-a-missing-load-summary.json"
     jq -n '{missing: true}' >"$gate_a_summary"
@@ -3346,11 +3623,14 @@ run_staging_suite() {
       failed_seconds: []
     }' >"$gate_a_baseline_diagnostics"
     cp "$gate_a_baseline_diagnostics" "$gate_a_movement_diagnostics"
+    cp "$gate_a_baseline_diagnostics" \
+      "$gate_a_post_ready_steady_diagnostics"
   fi
   write_gate_a_acceptance_report \
     "$gate_a_summary" \
     "$gate_a_baseline_diagnostics" \
     "$gate_a_movement_diagnostics" \
+    "$gate_a_post_ready_steady_diagnostics" \
     "$report_dir/zero-load-after-natural-scale-out.json" \
     "$natural_scale_out_exit_status" \
     "$report_dir/gate-a-acceptance.json"

@@ -41,6 +41,10 @@ const GAME_TIMEOUT_MARGIN: Duration = Duration::from_secs(45);
 const PLANNED_HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
 const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(1);
 const POPULATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+// Shared with the executor's bounded exact-outcome window. Browser clients
+// backpressure here, but a fixed certification cohort must fail instead of
+// silently reducing its submitted workload.
+const MAX_PENDING_COMMANDS_PER_GAME_SESSION: usize = 128;
 const REQUIRED_SERVER_CAPABILITIES: [&str; 6] = [
     "explicit-auth-v1",
     "planned-drain-v1",
@@ -353,7 +357,7 @@ impl PreGameWaitError {
 }
 
 enum DriveAiError {
-    Engine(anyhow::Error),
+    Fatal(anyhow::Error),
     Transport(anyhow::Error),
 }
 
@@ -972,7 +976,9 @@ async fn next_pre_game_candidate_message(
             result.map_err(PreGameHandoffAttemptError::Candidate)?
         }
     };
-    session.observe_received(&message);
+    session
+        .observe_received(&message)
+        .map_err(PreGameHandoffAttemptError::Fatal)?;
     Ok(message)
 }
 
@@ -1164,7 +1170,9 @@ async fn prepare_pre_game_candidate(
             }
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PreGameHandoffAttemptError::Candidate)?;
-                session.observe_received(&message);
+                session
+                    .observe_received(&message)
+                    .map_err(PreGameHandoffAttemptError::Fatal)?;
                 match message {
                     WSMessage::Drain { .. } => {
                         return Err(PreGameHandoffAttemptError::Candidate(anyhow!(
@@ -2285,7 +2293,7 @@ async fn play_session_inner(
                     &mut runtime.pending_direction,
                 ).await {
                     Ok(()) => {}
-                    Err(DriveAiError::Engine(error)) => return Err(error),
+                    Err(DriveAiError::Fatal(error)) => return Err(error),
                     Err(DriveAiError::Transport(error)) => {
                         let snapshot_complete = synchronize_game_runtime(
                             session,
@@ -2339,6 +2347,9 @@ async fn play_session_inner(
             incoming = session.next_message() => {
                 let message = match incoming {
                     Ok(message) => message,
+                    Err(error) if is_rejection_fence_error(&error) => {
+                        return Err(error);
+                    }
                     Err(error) => {
                         let snapshot_complete = synchronize_game_runtime(
                             session,
@@ -2596,7 +2607,13 @@ async fn wait_for_game_snapshot(
                 )));
             }
             incoming = session.next_message() => {
-                incoming.map_err(SnapshotWaitError::Retryable)?
+                incoming.map_err(|error| {
+                    if is_rejection_fence_error(&error) {
+                        SnapshotWaitError::Fatal(error)
+                    } else {
+                        SnapshotWaitError::Retryable(error)
+                    }
+                })?
             }
         };
 
@@ -2665,7 +2682,13 @@ async fn wait_for_command_outcome_barrier(
                 )));
             }
             incoming = session.next_message() => {
-                incoming.map_err(SnapshotWaitError::Retryable)?
+                incoming.map_err(|error| {
+                    if is_rejection_fence_error(&error) {
+                        SnapshotWaitError::Fatal(error)
+                    } else {
+                        SnapshotWaitError::Retryable(error)
+                    }
+                })?
             }
         };
         match message {
@@ -3049,7 +3072,7 @@ async fn prepare_planned_candidate(
                     &mut runtime.pending_direction,
                 ).await {
                     Ok(()) => {}
-                    Err(DriveAiError::Engine(error)) => {
+                    Err(DriveAiError::Fatal(error)) => {
                         return Err(PlannedHandoffAttemptError::Fatal(error));
                     }
                     Err(DriveAiError::Transport(error)) => {
@@ -3199,7 +3222,7 @@ async fn prepare_planned_candidate(
                     &mut runtime.pending_direction,
                 ).await {
                     Ok(()) => {}
-                    Err(DriveAiError::Engine(error)) => {
+                    Err(DriveAiError::Fatal(error)) => {
                         return Err(PlannedHandoffAttemptError::Fatal(error));
                     }
                     Err(DriveAiError::Transport(error)) => {
@@ -3226,7 +3249,9 @@ async fn prepare_planned_candidate(
             }
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PlannedHandoffAttemptError::Candidate)?;
-                session.observe_received(&message);
+                session
+                    .observe_received(&message)
+                    .map_err(PlannedHandoffAttemptError::Fatal)?;
                 match message {
                     WSMessage::Authenticated {
                         task_boot_id: candidate_task_boot_id,
@@ -3685,7 +3710,7 @@ async fn perform_planned_handoff(
                                 &mut runtime.pending_direction,
                             ).await {
                                 Ok(()) => {}
-                                Err(DriveAiError::Engine(error))
+                                Err(DriveAiError::Fatal(error))
                                 | Err(DriveAiError::Transport(error)) => {
                                     record_planned_handoff_failure(session, started, &error);
                                     return Err(error);
@@ -3896,7 +3921,7 @@ async fn drive_ai(
         .saturating_add(session.clock_offset_ms);
     engine
         .rebuild_predicted_state(now)
-        .map_err(DriveAiError::Engine)?;
+        .map_err(DriveAiError::Fatal)?;
     let predicted_tick = engine.get_predicted_tick();
     if *last_decision_tick == Some(predicted_tick) {
         return Ok(());
@@ -3916,6 +3941,12 @@ async fn drive_ai(
     if *pending_direction == Some(current_direction) {
         *pending_direction = None;
     }
+    if command_submission_is_backpressured(session.next_command_sequence, &session.pending_commands)
+    {
+        return Err(DriveAiError::Fatal(anyhow!(
+            "certification command producer reached the {MAX_PENDING_COMMANDS_PER_GAME_SESSION}-command session outcome window"
+        )));
+    }
     let direction =
         calculate_ai_move(state, snake_id, current_direction).unwrap_or(current_direction);
     if direction == current_direction && !command_profile.sends_unchanged_turns() {
@@ -3930,7 +3961,7 @@ async fn drive_ai(
             snake_id,
             direction,
         })
-        .map_err(DriveAiError::Engine)?;
+        .map_err(DriveAiError::Fatal)?;
     session
         .send_game_command(engine.game_id(), command)
         .await
@@ -3988,6 +4019,105 @@ fn record_scheduled_pending_command_resolution(
         .or_default();
     *total = total.saturating_add(1);
     true
+}
+
+fn command_submission_is_backpressured(
+    next_sequence: u64,
+    pending_commands: &BTreeMap<u64, PendingCommand>,
+) -> bool {
+    if pending_commands.len() >= MAX_PENDING_COMMANDS_PER_GAME_SESSION {
+        return true;
+    }
+    pending_commands
+        .first_key_value()
+        .is_some_and(|(earliest, _)| {
+            next_sequence.saturating_sub(*earliest) > MAX_PENDING_COMMANDS_PER_GAME_SESSION as u64
+        })
+}
+
+#[derive(Debug)]
+struct CommandSessionRejectionFenceError {
+    source: &'static str,
+    from_sequence: u64,
+}
+
+impl std::fmt::Display for CommandSessionRejectionFenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} reported a command-session rejection fence from sequence {}; certification cannot treat fenced commands as successful outcomes",
+            self.source, self.from_sequence
+        )
+    }
+}
+
+impl std::error::Error for CommandSessionRejectionFenceError {}
+
+fn rejection_fence_error(source: &'static str, from_sequence: u64) -> anyhow::Error {
+    CommandSessionRejectionFenceError {
+        source,
+        from_sequence,
+    }
+    .into()
+}
+
+fn is_rejection_fence_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<CommandSessionRejectionFenceError>()
+        .is_some()
+}
+
+fn rejection_fence_for_current_session(
+    message: &WSMessage,
+    user_id: u32,
+    client_game_session_id: &str,
+) -> Option<(&'static str, u64)> {
+    match message {
+        WSMessage::GameEvent(GameEventMessage {
+            event:
+                GameEvent::CommandRejected {
+                    command_id,
+                    session_rejected_from: Some(from_sequence),
+                    ..
+                },
+            ..
+        }) if command_id.user_id == user_id
+            && command_id.client_game_session_id == client_game_session_id =>
+        {
+            Some(("live command rejection", *from_sequence))
+        }
+        WSMessage::CommandOutcomes {
+            client_game_session_id: message_session_id,
+            rejection_fence: Some(fence),
+            ..
+        } if message_session_id == client_game_session_id => {
+            Some(("recovery command outcomes", fence.from_sequence))
+        }
+        _ => None,
+    }
+}
+
+fn reconcile_command_outcomes(
+    pending_commands: &mut BTreeMap<u64, PendingCommand>,
+    metrics: &mut SessionMetrics,
+    contiguous_through: u64,
+    outcomes: &BTreeMap<u64, CommandOutcome>,
+) {
+    let resolved = pending_commands
+        .keys()
+        .copied()
+        .filter(|sequence| *sequence <= contiguous_through || outcomes.contains_key(sequence))
+        .collect::<Vec<_>>();
+    for sequence in resolved {
+        if matches!(
+            outcomes.get(&sequence),
+            Some(CommandOutcome::Scheduled { .. })
+        ) {
+            record_scheduled_pending_command_resolution(pending_commands, metrics, sequence);
+        } else {
+            record_pending_command_resolution(pending_commands, metrics, sequence);
+        }
+    }
 }
 
 impl LiveSession {
@@ -4069,14 +4199,6 @@ impl LiveSession {
         self.remember(format!("sent:{kind}"));
     }
 
-    fn record_command_resolution(&mut self, sequence: u64) -> Option<u64> {
-        record_pending_command_resolution(
-            &mut self.pending_commands,
-            &mut self.record.metrics,
-            sequence,
-        )
-    }
-
     fn record_terminal_game_resolutions(&mut self) {
         record_all_pending_command_resolutions(
             &mut self.pending_commands,
@@ -4092,7 +4214,12 @@ impl LiveSession {
         )
     }
 
-    fn observe_received(&mut self, message: &WSMessage) {
+    fn observe_received(&mut self, message: &WSMessage) -> Result<()> {
+        if let Some((source, from_sequence)) =
+            rejection_fence_for_current_session(message, self.user_id, &self.client_game_session_id)
+        {
+            return Err(rejection_fence_error(source, from_sequence));
+        }
         self.record.metrics.messages_received =
             self.record.metrics.messages_received.saturating_add(1);
         let kind = message_kind(message);
@@ -4142,7 +4269,11 @@ impl LiveSession {
                         if command_id.user_id == self.user_id
                             && command_id.client_game_session_id == self.client_game_session_id =>
                     {
-                        self.record_command_resolution(command_id.sequence);
+                        record_pending_command_resolution(
+                            &mut self.pending_commands,
+                            &mut self.record.metrics,
+                            command_id.sequence,
+                        );
                     }
                     _ => {}
                 }
@@ -4152,29 +4283,18 @@ impl LiveSession {
                 client_game_session_id,
                 contiguous_through,
                 outcomes,
+                ..
             } if client_game_session_id == &self.client_game_session_id => {
-                let resolved: Vec<u64> = self
-                    .pending_commands
-                    .keys()
-                    .copied()
-                    .filter(|sequence| {
-                        *sequence <= *contiguous_through || outcomes.contains_key(sequence)
-                    })
-                    .collect();
-                for sequence in resolved {
-                    let scheduled = matches!(
-                        outcomes.get(&sequence),
-                        Some(CommandOutcome::Scheduled { .. })
-                    );
-                    if scheduled {
-                        self.record_scheduled_command_resolution(sequence);
-                    } else {
-                        self.record_command_resolution(sequence);
-                    }
-                }
+                reconcile_command_outcomes(
+                    &mut self.pending_commands,
+                    &mut self.record.metrics,
+                    *contiguous_through,
+                    outcomes,
+                );
             }
             _ => {}
         }
+        Ok(())
     }
 
     async fn send_cancellable(
@@ -4200,7 +4320,7 @@ impl LiveSession {
                     let message: WSMessage = serde_json::from_str(&text).with_context(|| {
                         format!("unrecognized websocket payload ({} bytes)", text.len())
                     })?;
-                    self.observe_received(&message);
+                    self.observe_received(&message)?;
                     return Ok(message);
                 }
                 Message::Ping(payload) => {
@@ -4896,6 +5016,101 @@ mod tests {
             BTreeMap::from([(123, 3)])
         );
         assert!(metrics.command_outcome_max_latency_ms_by_sent_unix_second[&123] >= 5);
+    }
+
+    fn pending_command(sequence: u64) -> PendingCommand {
+        use common::CommandId;
+
+        PendingCommand {
+            message: GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 1,
+                    user_id: 7,
+                    sequence_number: u32::try_from(sequence).unwrap(),
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: 0,
+                    direction: Direction::Up,
+                },
+            },
+            sent_at_unix_ms: 123_456,
+            sent_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn command_submission_limits_detect_a_full_or_overwide_window() {
+        let full = (1..=MAX_PENDING_COMMANDS_PER_GAME_SESSION as u64)
+            .map(|sequence| (sequence, pending_command(sequence)))
+            .collect::<BTreeMap<_, _>>();
+        assert!(command_submission_is_backpressured(129, &full));
+
+        let sparse_gap = BTreeMap::from([(1, pending_command(1))]);
+        assert!(!command_submission_is_backpressured(129, &sparse_gap));
+        assert!(command_submission_is_backpressured(130, &sparse_gap));
+    }
+
+    #[test]
+    fn recovery_rejection_fence_precheck_is_fatal_and_side_effect_free() {
+        let pending = (1..=2)
+            .map(|sequence| (sequence, pending_command(sequence)))
+            .collect::<BTreeMap<_, _>>();
+        let metrics = SessionMetrics::default();
+        let message = WSMessage::CommandOutcomes {
+            game_id: 42,
+            client_game_session_id: "current-session".to_owned(),
+            contiguous_through: 2,
+            outcomes: BTreeMap::from([(
+                1,
+                CommandOutcome::Scheduled {
+                    command: pending.get(&1).unwrap().message.clone(),
+                },
+            )]),
+            rejection_fence: Some(server::recovery::SessionCommandRejectionFence {
+                from_sequence: 2,
+                reason: "bounded outcome window exhausted".to_owned(),
+            }),
+        };
+        let (source, from_sequence) =
+            rejection_fence_for_current_session(&message, 7, "current-session").unwrap();
+        let error = rejection_fence_error(source, from_sequence);
+
+        assert!(is_rejection_fence_error(&error));
+        assert_eq!(pending.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(metrics, SessionMetrics::default());
+        assert!(rejection_fence_for_current_session(&message, 7, "stale-session").is_none());
+    }
+
+    #[test]
+    fn live_rejection_fence_precheck_is_fatal_and_side_effect_free() {
+        let pending = BTreeMap::from([(1, pending_command(1))]);
+        let metrics = SessionMetrics::default();
+        let message = WSMessage::GameEvent(GameEventMessage {
+            game_id: 42,
+            tick: 1,
+            sequence: 1,
+            stream_seq: 1,
+            user_id: Some(7),
+            event: GameEvent::CommandRejected {
+                command_id: ClientCommandIdentityV2 {
+                    game_id: 42,
+                    user_id: 7,
+                    client_game_session_id: "current-session".to_owned(),
+                    sequence: 1,
+                },
+                reason: "bounded outcome window exhausted".to_owned(),
+                session_rejected_from: Some(1),
+            },
+        });
+        let (source, from_sequence) =
+            rejection_fence_for_current_session(&message, 7, "current-session").unwrap();
+        let error = rejection_fence_error(source, from_sequence);
+
+        assert!(is_rejection_fence_error(&error));
+        assert_eq!(pending.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(metrics, SessionMetrics::default());
+        assert!(rejection_fence_for_current_session(&message, 8, "current-session").is_none());
     }
 
     #[test]
@@ -5609,6 +5824,7 @@ mod tests {
                         client_game_session_id: "test-session-7".to_owned(),
                         contiguous_through: 1,
                         outcomes: BTreeMap::new(),
+                        rejection_fence: None,
                     })
                     .unwrap(),
                 ))

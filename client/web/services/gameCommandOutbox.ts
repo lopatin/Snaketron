@@ -9,6 +9,9 @@ interface GameSession {
   id: string;
   nextSequence: number;
   pending: Map<number, PendingCommand>;
+  rejectionFence?: {
+    fromSequence: number;
+  };
 }
 
 interface PendingCommand {
@@ -18,7 +21,9 @@ interface PendingCommand {
 
 type SessionIdFactory = () => string;
 
-export const MAX_PENDING_COMMANDS_PER_GAME_SESSION = 512;
+// Shared bounded protocol/storage budget with the server's exact-result
+// window. Disconnected or resynchronizing clients do not create identities.
+export const MAX_PENDING_COMMANDS_PER_GAME_SESSION = 128;
 
 const defaultSessionIdFactory: SessionIdFactory = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -126,6 +131,43 @@ export class GameCommandOutbox {
     return session;
   }
 
+  private retireFencedSessionIfDrained(
+    key: string,
+    session: GameSession,
+  ): void {
+    if (session.rejectionFence && session.pending.size === 0) {
+      this.sessions.delete(key);
+    }
+  }
+
+  private installRejectionFence(
+    key: string,
+    session: GameSession,
+    fromSequence: number,
+  ): number {
+    if (!Number.isSafeInteger(fromSequence) || fromSequence < 1) {
+      this.retireFencedSessionIfDrained(key, session);
+      return 0;
+    }
+    if (
+      !session.rejectionFence ||
+      fromSequence < session.rejectionFence.fromSequence
+    ) {
+      session.rejectionFence = { fromSequence };
+    }
+
+    let removed = 0;
+    const effectiveFrom = session.rejectionFence.fromSequence;
+    for (const sequence of session.pending.keys()) {
+      if (sequence >= effectiveFrom) {
+        session.pending.delete(sequence);
+        removed += 1;
+      }
+    }
+    this.retireFencedSessionIfDrained(key, session);
+    return removed;
+  }
+
   enqueue(
     gameId: number,
     userId: number,
@@ -133,8 +175,19 @@ export class GameCommandOutbox {
     nowMs: number = Date.now(),
   ): GameCommandV2 {
     const session = this.getOrCreateSession(gameId, userId);
+    if (session.rejectionFence) {
+      throw new Error('client game command session rejected');
+    }
     if (session.pending.size >= MAX_PENDING_COMMANDS_PER_GAME_SESSION) {
       throw new Error('pending game command capacity exhausted');
+    }
+    const earliestPendingSequence = session.pending.keys().next().value;
+    if (
+      earliestPendingSequence !== undefined &&
+      session.nextSequence - earliestPendingSequence >
+        MAX_PENDING_COMMANDS_PER_GAME_SESSION
+    ) {
+      throw new Error('pending game command sequence window exhausted');
     }
     if (session.nextSequence > Number.MAX_SAFE_INTEGER) {
       throw new Error('client command sequence exhausted');
@@ -157,7 +210,8 @@ export class GameCommandOutbox {
   }
 
   resolve(identity: ClientCommandIdentityV2): boolean {
-    const session = this.sessions.get(sessionKey(identity.game_id, identity.user_id));
+    const key = sessionKey(identity.game_id, identity.user_id);
+    const session = this.sessions.get(key);
     if (!session || session.id !== identity.client_game_session_id) {
       return false;
     }
@@ -166,11 +220,43 @@ export class GameCommandOutbox {
       return false;
     }
     session.pending.delete(identity.sequence);
+    this.retireFencedSessionIfDrained(key, session);
     return true;
   }
 
+  reject(
+    identity: ClientCommandIdentityV2,
+    sessionRejectedFrom: number | undefined,
+  ): number {
+    const key = sessionKey(identity.game_id, identity.user_id);
+    const session = this.sessions.get(key);
+    if (!session || session.id !== identity.client_game_session_id) {
+      return 0;
+    }
+
+    // The event's exact outcome is authoritative even when it also announces
+    // a wider fence.
+    let removed = 0;
+    const pending = session.pending.get(identity.sequence);
+    if (pending && identityMatches(pending.envelope.command_id, identity)) {
+      session.pending.delete(identity.sequence);
+      removed += 1;
+    }
+    if (sessionRejectedFrom !== undefined) {
+      removed += this.installRejectionFence(
+        key,
+        session,
+        sessionRejectedFrom,
+      );
+    } else {
+      this.retireFencedSessionIfDrained(key, session);
+    }
+    return removed;
+  }
+
   reconcile(payload: CommandOutcomesPayload, userId: number): number {
-    const session = this.sessions.get(sessionKey(payload.game_id, userId));
+    const key = sessionKey(payload.game_id, userId);
+    const session = this.sessions.get(key);
     if (!session || session.id !== payload.client_game_session_id) {
       return 0;
     }
@@ -192,6 +278,18 @@ export class GameCommandOutbox {
         session.pending.delete(sequence);
         removed += 1;
       }
+    }
+    // Exact outcomes and the contiguous watermark are applied before the
+    // terminal session fence.
+    const fence = payload.rejection_fence;
+    if (fence) {
+      removed += this.installRejectionFence(
+        key,
+        session,
+        fence.from_sequence,
+      );
+    } else {
+      this.retireFencedSessionIfDrained(key, session);
     }
     return removed;
   }
@@ -217,6 +315,13 @@ export class GameCommandOutbox {
     }
     const due: GameCommandV2[] = [];
     for (const pending of session.pending.values()) {
+      if (
+        session.rejectionFence &&
+        pending.envelope.command_id.sequence >=
+          session.rejectionFence.fromSequence
+      ) {
+        continue;
+      }
       if (nowMs - pending.lastSentAtMs >= retryIntervalMs) {
         pending.lastSentAtMs = nowMs;
         due.push(pending.envelope);
@@ -242,6 +347,13 @@ export function enqueueGameCommandV2(
 
 export function resolveGameCommandV2(identity: ClientCommandIdentityV2): boolean {
   return browserOutbox.resolve(identity);
+}
+
+export function rejectGameCommandV2(
+  identity: ClientCommandIdentityV2,
+  sessionRejectedFrom: number | undefined,
+): number {
+  return browserOutbox.reject(identity, sessionRejectedFrom);
 }
 
 export function reconcileGameCommandOutcomes(

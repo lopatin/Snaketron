@@ -201,11 +201,17 @@ export type CommandOutcome =
   | { result: 'SCHEDULED'; command: GameCommand }
   | { result: 'REJECTED'; reason: string };
 
+export interface CommandRejectionFence {
+  from_sequence: number;
+  reason: string;
+}
+
 export interface CommandOutcomesPayload {
   game_id: number;
   client_game_session_id: string;
   contiguous_through: number;
   outcomes: Record<string, CommandOutcome>;
+  rejection_fence?: CommandRejectionFence;
 }
 
 export interface CommandOutcomesCompleteMessage {

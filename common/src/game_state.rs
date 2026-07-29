@@ -102,6 +102,11 @@ pub enum GameEvent {
     CommandRejected {
         command_id: ClientCommandIdentityV2,
         reason: String,
+        /// When present, unresolved identities in this client game session at
+        /// or above this sequence have the same terminal rejection. Exact
+        /// outcomes and the contiguous resolved watermark take precedence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_rejected_from: Option<u64>,
     },
     // PlayerJoined { user_id: u32, snake_id: u32 },
     StatusUpdated {

@@ -11,7 +11,7 @@ use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
     CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
-    validate_client_command_identity,
+    SessionCommandRejectionFence, validate_client_command_identity,
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
@@ -56,6 +56,8 @@ pub enum WSMessage {
         client_game_session_id: String,
         contiguous_through: u64,
         outcomes: BTreeMap<u64, CommandOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rejection_fence: Option<SessionCommandRejectionFence>,
     },
     /// Ordered barrier emitted only after every outcome batch for the
     /// immediately preceding snapshot has reached this socket's send queue.
@@ -2411,6 +2413,7 @@ async fn send_command_outcomes_from_resolved(
             client_game_session_id,
             contiguous_through: session.contiguous_through,
             outcomes: session.outcomes,
+            rejection_fence: session.rejection_fence,
         };
         let json = match serde_json::to_string(&response) {
             Ok(json) => json,
@@ -4344,7 +4347,10 @@ mod lifecycle_protocol_tests {
     use crate::lifecycle::DrainNotice;
     use crate::lobby_manager::{Lobby, LobbyPreferences};
     use crate::pubsub_manager::PubSubManager;
-    use crate::recovery::{RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes};
+    use crate::recovery::{
+        RecoveryEnvelopeV2, ResolvedCommandState, SPARSE_COMMAND_WINDOW_REJECTION_REASON,
+        SessionCommandOutcomes, SessionCommandRejectionFence,
+    };
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::create_connection_manager;
     use common::{ClientCommandIdentityV2, GameEvent, GameState, GameStatus, GameType, QueueMode};
@@ -4709,6 +4715,44 @@ mod lifecycle_protocol_tests {
         assert!(
             send_command_outcomes_from_resolved(&tx, 42, 5, ResolvedCommandState::default(),).await
         );
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete { game_id: 42 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_outcomes_include_the_session_rejection_fence() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let resolved = ResolvedCommandState {
+            sessions: BTreeMap::from([(
+                "5:session-a".to_owned(),
+                SessionCommandOutcomes {
+                    contiguous_through: 7,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: Some(SessionCommandRejectionFence {
+                        from_sequence: 9,
+                        reason: SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+                    }),
+                },
+            )]),
+        };
+
+        assert!(send_command_outcomes_from_resolved(&tx, 42, 5, resolved).await);
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomes {
+                game_id: 42,
+                client_game_session_id,
+                contiguous_through: 7,
+                rejection_fence: Some(SessionCommandRejectionFence {
+                    from_sequence: 9,
+                    reason,
+                }),
+                ..
+            } if client_game_session_id == "session-a"
+                && reason == SPARSE_COMMAND_WINDOW_REJECTION_REASON
+        ));
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
             WSMessage::CommandOutcomesComplete { game_id: 42 }

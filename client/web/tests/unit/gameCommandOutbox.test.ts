@@ -51,16 +51,31 @@ test('only one retry coordinator can claim an overdue exact envelope', () => {
 });
 
 test('pending commands fail closed at the server recovery bound', () => {
+  assert.equal(MAX_PENDING_COMMANDS_PER_GAME_SESSION, 128);
   const outbox = new GameCommandOutbox(() => 'session-bounded');
   for (let index = 0; index < MAX_PENDING_COMMANDS_PER_GAME_SESSION; index += 1) {
     outbox.enqueue(42, 7, command(index));
   }
 
   assert.throws(
-    () => outbox.enqueue(42, 7, command(513)),
+    () => outbox.enqueue(
+      42,
+      7,
+      command(MAX_PENDING_COMMANDS_PER_GAME_SESSION + 1),
+    ),
     /pending game command capacity exhausted/,
   );
   assert.equal(outbox.pending(42, 7).length, MAX_PENDING_COMMANDS_PER_GAME_SESSION);
+
+  const first = outbox.pending(42, 7)[0];
+  assert.equal(outbox.resolve(first.command_id), true);
+  const next = outbox.enqueue(42, 7, command(999));
+  assert.equal(next.command_id.sequence, 129);
+  assert.equal(outbox.pending(42, 7).length, MAX_PENDING_COMMANDS_PER_GAME_SESSION);
+  assert.deepEqual(
+    outbox.pending(42, 7).map(({ command_id }) => command_id.sequence),
+    Array.from({ length: 128 }, (_, index) => index + 2),
+  );
 });
 
 test('snapshot reconciliation clears the contiguous watermark and sparse outcomes', () => {
@@ -86,6 +101,27 @@ test('snapshot reconciliation clears the contiguous watermark and sparse outcome
     outbox.pending(42, 7).map((entry) => entry.command_id.sequence),
     [2, 4],
   );
+});
+
+test('a missing low sequence bounds later resolved identities to the server window', () => {
+  const outbox = new GameCommandOutbox(() => 'session-sparse-window');
+  const missing = outbox.enqueue(42, 7, command(1));
+
+  for (let sequence = 2; sequence <= 129; sequence += 1) {
+    const resolved = outbox.enqueue(42, 7, command(sequence));
+    assert.equal(outbox.resolve(resolved.command_id), true);
+  }
+  assert.deepEqual(
+    outbox.pending(42, 7).map(({ command_id }) => command_id.sequence),
+    [1],
+  );
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(130)),
+    /pending game command sequence window exhausted/,
+  );
+
+  assert.equal(outbox.resolve(missing.command_id), true);
+  assert.equal(outbox.enqueue(42, 7, command(130)).command_id.sequence, 130);
 });
 
 test('a higher sparse result never resolves an earlier lost command outcome', () => {
@@ -117,6 +153,70 @@ test('a higher sparse result never resolves an earlier lost command outcome', ()
   assert.deepEqual(outbox.pending(42, 7), []);
 });
 
+test('a recovery fence rejects its range and rotates only after lower gaps drain', () => {
+  const sessionIds = ['session-fenced', 'session-after-fence'];
+  const outbox = new GameCommandOutbox(() => sessionIds.shift()!);
+  const first = outbox.enqueue(42, 7, command(1), 1_000);
+  const second = outbox.enqueue(42, 7, command(2), 1_000);
+  const third = outbox.enqueue(42, 7, command(3), 1_000);
+  outbox.enqueue(42, 7, command(4), 1_000);
+
+  const removed = outbox.reconcile({
+    game_id: 42,
+    client_game_session_id: 'session-fenced',
+    contiguous_through: 1,
+    outcomes: {
+      '3': { result: 'SCHEDULED', command: third.command },
+    },
+    rejection_fence: {
+      from_sequence: 3,
+      reason: 'command session sparse outcome capacity exhausted',
+    },
+  }, 7);
+
+  // The watermark and exact outcome win first; the fence then rejects only
+  // still-unresolved entries at or above its boundary.
+  assert.equal(removed, 3);
+  assert.deepEqual(outbox.pending(42, 7), [second]);
+  assert.deepEqual(outbox.takeDue(42, 7, 2_000, 1_000), [second]);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(5), 2_000),
+    /client game command session rejected/,
+  );
+
+  assert.equal(outbox.resolve(first.command_id), false);
+  assert.equal(outbox.resolve(second.command_id), true);
+  const fresh = outbox.enqueue(42, 7, command(5), 2_000);
+  assert.equal(fresh.command_id.client_game_session_id, 'session-after-fence');
+  assert.equal(fresh.command_id.sequence, 1);
+});
+
+test('a live rejection fence resolves the exact event before fencing its session', () => {
+  const sessionIds = ['session-live-fence', 'session-live-fresh'];
+  const outbox = new GameCommandOutbox(() => sessionIds.shift()!);
+  const lowerGap = outbox.enqueue(42, 7, command(1), 1_000);
+  const exactRejection = outbox.enqueue(42, 7, command(2), 1_000);
+  outbox.enqueue(42, 7, command(3), 1_000);
+
+  assert.equal(
+    outbox.reject(
+      exactRejection.command_id,
+      2,
+    ),
+    2,
+  );
+  assert.deepEqual(outbox.pending(42, 7), [lowerGap]);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(4)),
+    /client game command session rejected/,
+  );
+
+  assert.equal(outbox.resolve(lowerGap.command_id), true);
+  const fresh = outbox.enqueue(42, 7, command(4));
+  assert.equal(fresh.command_id.client_game_session_id, 'session-live-fresh');
+  assert.equal(fresh.command_id.sequence, 1);
+});
+
 test('another user or browser game session cannot resolve this outbox', () => {
   const outbox = new GameCommandOutbox(() => 'session-c');
   const entry = outbox.enqueue(42, 7, command(1));
@@ -129,8 +229,19 @@ test('another user or browser game session cannot resolve this outbox', () => {
         client_game_session_id: 'other-session',
         contiguous_through: 999,
         outcomes: {},
+        rejection_fence: {
+          from_sequence: 1,
+          reason: 'stale session fence',
+        },
       },
       7,
+    ),
+    0,
+  );
+  assert.equal(
+    outbox.reject(
+      { ...entry.command_id, client_game_session_id: 'other-session' },
+      1,
     ),
     0,
   );

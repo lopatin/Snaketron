@@ -241,10 +241,13 @@ Certification has three independent load gates.
 existing one-second command-outcome budget. It does not use synthetic CPU,
 lower a target, force the transition, or adapt load from live metrics. CPU or
 memory target tracking must add capacity naturally; failure to trigger or to
-preserve command continuity fails this gate. Once the automatic scale-out
-evidence is complete, let this runner finish and require its WebSockets and
-authoritative games to reach zero. Gate A traffic must not be carried into the
-reset or forced staircase.
+preserve command continuity fails this gate. After the added tasks are ready in
+ECS, Traefik, and the executor control plane, require at least 60 complete
+post-ready seconds under the same outcome and all-partition productivity
+budgets. A late transition with less evidence fails instead of certifying one
+healthy second. Once the automatic scale-out evidence is complete, let this
+runner finish and require its WebSockets and authoritative games to reach zero.
+Gate A traffic must not be carried into the reset or forced staircase.
 
 **Gate B — planned ownership and socket transition.** With Gate A traffic
 gone, suspend policy writes, return to one healthy task, and launch a separate
@@ -697,6 +700,60 @@ Serverless or node cache, DynamoDB table, ECR repository, log group, dashboard,
 or staging DNS record. The shared production VPC, all production stack
 timestamps, and both healthy production services remained unchanged.
 
+Exact-source run
+[`30425964773`](https://github.com/lopatin/snaketron-io/actions/runs/30425964773)
+used outer commit `fe4652b72aa82c39f9773b3beaec412f01cc8308` and
+Snaketron commit `c179d966c0aac6c908e0d5ac8999f7bfadcc503a`. Gate A
+naturally scaled `1 -> 2`; all 2,790 sessions, 1,395 games, and 2,450,883
+commands completed with exact terminal accounting and zero disconnect,
+reconnect, or usable-session gap. The successor recovered 51 games and replayed
+380 commands. No Serverless Valkey or DynamoDB throttle and no Valkey eviction
+occurred.
+
+This was not a passing run with one tolerable failover outlier. Before ownership
+movement, 141 of 330 complete seconds exceeded the one-second command budget,
+with a 3,617-millisecond maximum and 48 seconds above two seconds. During
+movement, 29 of 46 seconds failed with a 2,715-millisecond maximum. The first
+task remained near saturation and the two-task aggregate stayed heavily loaded.
+Gate A stopped the planned suite; the crash suite did not inject SIGKILL
+because a late target-tracking action from the prior phase violated its
+one-task entry check.
+
+Steady load produced roughly 242--244 KiB full checkpoints per game every
+second, dominated by the 512-entry exact command-outcome maps. Keep the
+one-second cadence and persistence format, but use the aligned 128-entry client
+outbox and server exact-result window. Disconnected or resynchronizing clients
+create no command identities; at the certified ten-command-per-second profile
+the bound also permits 12.8 seconds of continued submission without outcomes.
+The contiguous watermark still fences all older contiguous identities. The
+load runner now separately gates every complete post-ready second through the
+stage finish and requires at least 60 such seconds, so a quiet movement window
+or one healthy trailing second cannot hide later backlog. Crash mode suspends
+target tracking before establishing and recording an independent `1/1/0`
+baseline, then cleanup restores enabled
+`1/1/0`. The `PendingCompletionBacklogAlarm` retains the one-minute maximum
+across three periods. Regional gauges are emitted only with a real value by one
+reporter while other tasks emit zero on the same environment-wide series, so a
+minimum statistic would suppress a real backlog after scale-out.
+
+The 128-entry bound also exposes one adversarial case that must be durable:
+after 128 sparse results above an unresolved lower gap, immediately ACKing a
+later rejection would allow that identity to be reused after a crash. The
+executor therefore stores one per-session rejection fence in the existing
+recovery checkpoint. A live first rejection is journaled through the normal
+outcome-publication path and remains pending until the fence is checkpointed;
+bootstrap may checkpoint and ACK without first publishing an incremental
+event. Reconnect outcomes carry the fence. Clients clear covered entries,
+retain lower gaps, and rotate the command session only when those lower entries
+have resolved. This reuses the existing decision journal and checkpoint; it
+adds no Redis key or per-command checkpoint.
+
+Cleanup and an independent absence audit found no development resources. All
+nine production stack timestamps and resource identities were unchanged, and
+production remained healthy. Fresh complete planned and SIGKILL certification
+remain required; do not relax the one-second ordinary-operation gate or any
+fixed cohort.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -886,7 +943,10 @@ whose write outcome was ambiguous may be absent from that first response and is
 then resent with the same stable identity. Certification instead requires every
 session to finish with zero pending commands; first-seen terminal outcomes and
 the deterministic deduplication tests enforce one logical result despite a
-physical resend.
+physical resend. A sparse-window rejection fence is protective behavior for an
+invalid or pathological command session, not healthy load-test throughput; any
+such fence in Gate A, B, or C fails that certification session immediately
+before covered commands can be counted as successful outcomes.
 While a session is already playing, `GameWarming` pauses its command generator
 and schedules same-socket `JoinGame` retries from the server hint. Only a fresh
 snapshot plus `CommandOutcomesComplete` resumes commands and triggers stable-ID
