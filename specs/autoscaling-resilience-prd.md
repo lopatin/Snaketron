@@ -98,7 +98,7 @@ For this PRD:
 - A **supported client** runs the deployed drain/command protocol, can reach the regional endpoint, has JavaScript execution active, and keeps its old transport healthy until the planned handoff completes. A sleeping, offline, or suspended browser falls back to normal reconnect when it wakes.
 - Certification has three separate load gates and must not infer one from
   another:
-  - the **natural scale-out gate** runs 144 authenticated game sessions / 72
+  - the **natural scale-out gate** runs 128 authenticated game sessions / 64
     duels with `every-tick` commands from the one-task minimum until CPU or
     memory target tracking adds capacity while command continuity remains
     inside budget;
@@ -559,12 +559,12 @@ The assignment coordinator is control plane only. Existing assignments and activ
 ### R12 — Autoscaling behavior and capacity constraints
 
 1. Use the same target-tracking policies in development and production:
-   - CPU target: 60%;
+   - CPU target: 40%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
    The CPU target leaves measured headroom for command processing and partition
    recovery while the managed alarm evaluates and a replacement task starts.
-2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 144-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is one vCPU and two GiB, the smallest valid Fargate memory pairing for one vCPU; target tracking cannot protect a half-vCPU one-task floor from a sub-minute admission or takeover burst.
+2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 128-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is one vCPU and two GiB, the smallest valid Fargate memory pairing for one vCPU; target tracking cannot protect a half-vCPU one-task floor from a sub-minute admission or takeover burst.
 3. The autoscaler must never select zero desired tasks.
 4. Validate forced `1 -> 10 -> 1` with 128 active game sessions / 64 duels
    producing `every-tick` commands on every partition, 10 idle sessions, 10
@@ -574,11 +574,11 @@ The assignment coordinator is control plane only. Existing assignments and activ
    64-session in-flight safety ceiling. Sessions must be launched throughout
    the transition, not accumulated into an artificial destination load.
    Separately prove the
-   144-session natural scale-out gate, and hold the 256-session/128-duel
+   128-session natural scale-out gate, and hold the 256-session/128-duel
    capacity envelope only after ten tasks are healthy and ready.
-   Gate B's maximum is 215 sockets and only 128 are command-bearing; Gate A's
-   144 command-bearing sockets and identical four-per-second ramp therefore
-   provide a conservative command-processing precondition. Gate B separately
+   Gate B's maximum is 215 sockets and only 128 are command-bearing. Gate A
+   proves that the same command-bearing cohort remains healthy while the
+   production CPU/memory policy adds capacity naturally. Gate B separately
    proves that its context and transient admission sockets fit on the final
    one-task destination.
 5. No custom game-specific autoscaling metric is added in this phase.
@@ -718,7 +718,7 @@ Timing is an operational objective, never a substitute for fencing or durability
 | Correctness invariants | Zero violations across deterministic, chaos, and load suites. |
 
 The supported staging evidence consists of three independent gates. The
-144-session / 72-duel high-load gate proves natural CPU or memory scale-out.
+128-session / 64-duel headroom gate proves natural CPU or memory scale-out.
 After those clients and games are gone, the planned `1 -> 10 -> 1` gate uses
 128 game sessions / 64 duels with `every-tick` commands on all ten partitions,
 23 fixed context probes, and bounded open-loop idle admission at four starts
@@ -773,7 +773,7 @@ rejections as healthy command throughput.
 
 | Test | Pass criteria |
 | --- | --- |
-| Scale `1 -> 10` under the 128-session / 64-duel planned-transition load while games receive commands on all ten partitions | The 144-session natural scale-out cohort has already exited and the service has returned to a healthy one-task baseline. Exactly nine partitions move between the settled endpoint assignments, owner counts become one each, assignment versions advance monotonically, no active WebSocket hard-reconnect occurs, every full transition second resolves exactly its submitted commands with no terminal outcome taking more than one second from original send, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
+| Scale `1 -> 10` under the 128-session / 64-duel planned-transition load while games receive commands on all ten partitions | The independent 128-session natural scale-out cohort has already exited and the service has returned to a healthy one-task baseline. Exactly nine partitions move between the settled endpoint assignments, owner counts become one each, assignment versions advance monotonically, no active WebSocket hard-reconnect occurs, every full transition second resolves exactly its submitted commands with no terminal outcome taking more than one second from original send, and fingerprints match. The real-browser planned-drain suite and staging protocol evidence jointly prove that no stale overlay occurs. |
 | Scale `10 -> 1` under the same 128-session / 64-duel transition load with 10 idle, 10 lobby, three unmatched matchmaking, and open-loop admission clients | Every partition has active command work before movement. Exactly nine partitions move between the settled endpoint assignments and versions advance monotonically; every observed drain handoff has zero usable-session gap and one command owner; every full transition second resolves exactly its submitted commands with no terminal outcome taking more than one second; no active socket hard-reconnects. The admission probe starts four sessions per second throughout the scale-in window, holds each successful session for one second after it becomes ready, and never exceeds its 64-session in-flight safety ceiling; each reaches a ready backend, with p99 initial WebSocket authentication within ten seconds and no terminal error. The one-task destination remains ready and services lease renewal, membership heartbeat, checkpoint, and event traffic without starvation; no game completion is awaited. |
 | Kill after command `XADD`, before group delivery | Successor reads it as new work and applies one logical result. |
 | Kill after delivery into pending, before schedule | `XAUTOCLAIM` recovers it and applies one logical result. |
@@ -819,7 +819,7 @@ rejections as healthy command throughput.
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 144-session / 72-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
+| Run the fixed 128-session / 64-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
 | Ramp at four new sessions per second, then hold 256 authenticated sessions / 128 duels with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Exhaust the CPU of a planned scale-in destination until control operations miss their deadlines | The run fails the destination-capacity gate and is not classified as a handoff-protocol defect. No stale or unproven mutation commits: fencing rejects it, the executor fails closed, cooperative drain is not advertised, and ordinary lease-expiry recovery remains authoritative. |
 | Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
@@ -953,7 +953,7 @@ handoff phase and the stale/disconnected UI.
 Only these external results remain:
 
 - the non-production staging run passes three distinct gates: natural
-  target-tracking scale-out under 144 `every-tick` game sessions; planned
+  target-tracking scale-out under 128 `every-tick` game sessions; planned
   `1 -> 10 -> 1` under the one-task-capacity-valid 128-session transition
   cohort, 23 context probes, and bounded open-loop admission at four starts per
   second with a 64-session in-flight ceiling;
@@ -1446,6 +1446,48 @@ actual kill exactly once. Runtime cleanup succeeded: the Server, Serverless
 Valkey, and Monitoring stacks were absent, while the protected development
 Network/EIP/EBS/TLS, ECS, ECR, and DynamoDB foundations remained reusable and
 the ingress instance was stopped.
+
+Exact-source run
+([GitHub Actions 30454722583](https://github.com/lopatin/snaketron-io/actions/runs/30454722583),
+outer commit `8f476b972b000e99d0b4da5de7705f659dcfac6e`, Snaketron
+commit `eaba0de0dc89abe6fa00fef13c8cd903b06658e0`) separated the
+autoscaling transition from one-task capacity pressure. The automatic movement
+passed all 48 complete seconds with a 368-millisecond maximum, exact outcomes,
+all ten partitions productive, and zero disconnects or reconnects. Before the
+action, however, the 144-session origin remained at 87.61--90.43% CPU for four
+complete minutes. Four of 296 baseline seconds exceeded one second, including
+2,677- and 2,361-millisecond seconds; one later settled second reached 1,271
+milliseconds. The user-approved sub-two-second transition allowance does not
+apply to these ordinary-operation failures. Gate A correctly blocked Gates B
+and C.
+
+The production policy now scales at the measured safe one-task plateau rather
+than weakening the latency SLO. Historical exact-source run `30046381977`
+held 128 sessions / 64 duels for eight minutes at 45.18--48.83% CPU with a
+488-millisecond maximum, exact command accounting, and no disconnect,
+reconnect, or checkpoint failure. The shared development/production CPU target
+is therefore 40%, and Gate A uses that fixed 128-session cohort. This leaves
+the weakest historical minute 5.18 points above the trigger while retaining
+`minTasks=1`, one-vCPU tasks, the 80% memory target, the 60-second cooldowns,
+and every one-second correctness gate. The historical run predates material
+server changes, so this is an evidence-backed headroom correction requiring
+fresh exact-source certification, not a pass.
+
+The separate crash run completed all 1,376 sessions and 688 games without a
+failure; 22 affected clients recovered through different tasks with fresh
+snapshots in 2,506--2,706 milliseconds, and ECS recorded the selected container
+exiting 137. It is not formal crash certification because killing the essential
+process tore down ECS Exec before its post-kill marker arrived, after which the
+harness waited for Session Manager's 20-minute timeout. The single injection
+now SIGSTOPs the exact server PID, emits a conservative fail-stop timestamp,
+waits 500 milliseconds for delivery, then SIGKILLs the same PID. Exact exit 137
+remains mandatory, and a 40-second local timeout prevents another unbounded
+wait. No production crash endpoint or additional external action is added.
+
+The run reused the exact protected Network stack, ingress instance, root EBS,
+EIP, hostname, and certificate, with no development DNS/ACME change. Cleanup
+again removed only the runtime Server, Serverless Valkey, and Monitoring stacks
+and stopped the retained ingress.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

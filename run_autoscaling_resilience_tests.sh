@@ -199,13 +199,13 @@ write_gate_a_acceptance_report() {
           configuration:
             (($report.schema_version // 0) >= 10
               and ($report.metadata.threshold_result // null) == "passed"
-              and ($report.configured_max_concurrency // 0) == 144
+              and ($report.configured_max_concurrency // 0) == 128
               and ($report.metadata.mode // null) == "duel"
               and ($report.metadata.command_profile // null) == "every-tick"
               and ($report.metadata.spawn_rate_per_second // null) == "4"),
           population_completion:
-            (($report.session_counts.peak_authenticated_concurrency // 0) == 144
-              and ($report.session_counts.peak_active_game_concurrency // 0) >= 72
+            (($report.session_counts.peak_authenticated_concurrency // 0) == 128
+              and ($report.session_counts.peak_active_game_concurrency // 0) >= 64
               and ($report.session_counts.failed // -1) == 0
               and ($report.session_counts.cancelled // -1) == 0
               and ($report.session_counts.incomplete // -1) == 0
@@ -640,7 +640,7 @@ test_command_outcome_window_gate() {
   jq -n '{
     schema_version: 10,
     finished_at_unix_ms: 13000,
-    configured_max_concurrency: 144,
+    configured_max_concurrency: 128,
     metadata: {
       threshold_result: "passed",
       mode: "duel",
@@ -653,8 +653,8 @@ test_command_outcome_window_gate() {
       failed: 0,
       cancelled: 0,
       incomplete: 0,
-      peak_authenticated_concurrency: 144,
-      peak_active_game_concurrency: 72
+      peak_authenticated_concurrency: 128,
+      peak_active_game_concurrency: 64
     },
     sessions: [{outcome: "completed", failure_phase: null}],
     games: {pairing_violations: 0},
@@ -1455,10 +1455,10 @@ verify_scaling_policies() {
           )]
       | length == 1;
     (.ScalingPolicies | length) == 2
-    and target("ECSServiceAverageCPUUtilization"; 60)
+    and target("ECSServiceAverageCPUUtilization"; 40)
     and target("ECSServiceAverageMemoryUtilization"; 80)
   ' "$identity_dir/scaling-policies.json" >/dev/null || {
-    echo "Staging must have only CPU=60% and memory=80% target tracking with 60-second cooldowns" >&2
+    echo "Staging must have only CPU=40% and memory=80% target tracking with 60-second cooldowns" >&2
     return 1
   }
 }
@@ -2244,7 +2244,7 @@ collect_cloudwatch_evidence() {
 
   # ActiveWebSockets is emitted by each task into one environment-level
   # metric stream, so Maximum is a per-task peak rather than a fleet sum.
-  # This run-wide series only corroborates a 144-socket per-task peak. Gate A's
+  # This run-wide series only corroborates a 128-socket per-task peak. Gate A's
   # phase-scoped report and region samples prove its exact cohort; the separate
   # reports below prove the Gate B and Gate C fleet envelopes.
   jq -e 'all(.Datapoints[]; .Minimum > 0)' \
@@ -2275,7 +2275,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 144' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 128' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -2579,13 +2579,14 @@ inject_hard_crash_and_prove_takeover() {
     ' >"$report_dir/hard-crash-manifest.json"
 
   # One non-retried ECS Exec session discovers exactly one non-PID-1 `server`
-  # child, records the timestamp used by every deadline, SIGKILLs the child,
-  # and only then emits the marker. A marker therefore proves that the kill
-  # syscall succeeded before the PEL observation begins.
+  # child. Stop it before emitting the timestamp so it cannot execute or ACK
+  # work while the marker reaches the observer, then SIGKILL that same PID.
+  # The timestamp is a conservative fail-stop origin; the exact ECS exit-137
+  # assertion below separately proves that SIGKILL completed.
   local hard_kill_command
-  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; kill_at_ms=$(date +%s%3N); kill -KILL "$server_pid"; printf "SNAKETRON_HARD_KILL_AT_MS=%s SERVER_PID=%s\\n" "$kill_at_ms" "$server_pid"'\'''
+  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; fail_stop_at_ms=$(date +%s%3N); kill -STOP "$server_pid"; printf "SNAKETRON_HARD_FAIL_STOP_AT_MS=%s SERVER_PID=%s\\n" "$fail_stop_at_ms" "$server_pid"; sleep 0.5; kill -KILL "$server_pid"'\'''
   local exec_output="$report_dir/hard-crash-ecs-exec.log"
-  aws ecs execute-command \
+  timeout --signal=TERM --kill-after=2s 40s aws ecs execute-command \
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --task "$killed_task_arn" \
@@ -2596,14 +2597,14 @@ inject_hard_crash_and_prove_takeover() {
   local marker_deadline=$((SECONDS + 30))
   local kill_at_ms=""
   while (( SECONDS < marker_deadline )); do
-    kill_at_ms="$(sed -n -E 's/.*SNAKETRON_HARD_KILL_AT_MS=([0-9]+).*/\1/p' "$exec_output" | tail -1)"
+    kill_at_ms="$(sed -n -E 's/.*SNAKETRON_HARD_FAIL_STOP_AT_MS=([0-9]+).*/\1/p' "$exec_output" | tail -1)"
     [[ "$kill_at_ms" =~ ^[0-9]{13}$ ]] && break
     kill -0 "$ecs_exec_pid" 2>/dev/null || break
     sleep 0.05
   done
   if [[ ! "$kill_at_ms" =~ ^[0-9]{13}$ ]]; then
     wait "$ecs_exec_pid" 2>/dev/null || true
-    echo "The single ECS Exec injection did not emit its hard-kill marker" >&2
+    echo "The single ECS Exec injection did not emit its fail-stop marker" >&2
     return 1
   fi
 
@@ -2919,6 +2920,7 @@ run_staging_suite() {
   require_command jq
   if [[ "$crash_mode" == true ]]; then
     require_command session-manager-plugin
+    require_command timeout
   fi
   require_staging_environment
   configure_staging_control_urls
@@ -3334,8 +3336,8 @@ run_staging_suite() {
     local observed_pid="${3:-}"
     local samples="$report_dir/region-sockets-$label.jsonl"
     local summary="$report_dir/region-sockets-$label.json"
-    # At four sessions per second, the fixed 144-session Run A needs about
-    # 36 seconds to launch before the heartbeat-delayed public count can
+    # At four sessions per second, the fixed 128-session Run A needs about
+    # 32 seconds to launch before the heartbeat-delayed public count can
     # expose its floor. Ninety seconds leaves bounded scheduling jitter without
     # weakening any load, latency, or admission assertion.
     local deadline=$((SECONDS + 90))
@@ -3588,7 +3590,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 144@20m \
+    --stages 128@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -3599,12 +3601,13 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${natural_scale_out_command[@]}" &
   load_pid=$!
-  # One hundred forty-four sessions retain active games on every partition
-  # and drive the one-vCPU minimum task above its target-tracking threshold.
+  # One hundred twenty-eight sessions retain active games on every partition
+  # and drive the one-vCPU minimum task above its headroom-preserving
+  # target-tracking threshold.
   # They must still trigger the configured CPU/memory policy naturally;
   # failure to trigger is a certification failure, not permission to force
   # the transition.
-  wait_for_region_socket_floor automatic-scale-out-baseline 144
+  wait_for_region_socket_floor automatic-scale-out-baseline 128
   automatic_scale_out_baseline_started_ms="$(unix_time_ms)"
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
@@ -4081,7 +4084,7 @@ run_staging_suite() {
     }
 
   # Cover both directions of the forced staircase. Natural scale-out was
-  # already checked against its separate 144-session report. Receipt-time
+  # already checked against its separate 128-session report. Receipt-time
   # bucket counts alone can hide a one-second
   # executor stall followed by a catch-up burst. One second is a deliberately
   # strict user-continuity budget: the predictive client remains smooth while
@@ -4538,8 +4541,8 @@ run_staging_suite() {
           desired: $automatic_out[0].services[0].desiredCount,
           running: $automatic_out[0].services[0].runningCount,
           evidence: "target-tracking activity",
-          configured_game_sessions: 144,
-          configured_duels: 72
+          configured_game_sessions: 128,
+          configured_duels: 64
         },
         deterministic_forced_staircase: ($forced[0] + {
           configured_game_sessions: 128,

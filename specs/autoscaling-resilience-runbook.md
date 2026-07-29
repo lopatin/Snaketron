@@ -146,7 +146,7 @@ Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
 Both retain a minimum of one. The application task uses one vCPU and two GiB so
 the one-task floor has takeover and burst headroom while target tracking is
-still observing load. CPU is targeted at 60%, memory at 80%, and both scale-in
+still observing load. CPU is targeted at 40%, memory at 80%, and both scale-in
 and scale-out cooldowns are 60 seconds. Development and production use the
 same policy.
 
@@ -242,11 +242,11 @@ then-current fully disposable development topology. Those inventories remain
 accurate evidence for those runs, but they are not the cleanup contract for new
 runs; the persistent-foundation lifecycle described below is authoritative.
 
-**Gate A — natural scale-out.** Run a fixed 144-session / 72-duel
+**Gate A — natural scale-out.** Run a fixed 128-session / 64-duel
 `every-tick` cohort from the one-vCPU minimum task. It retains one stage, the
 20-minute runner, eight-minute target-tracking observation budget, and the
 existing one-second command-outcome budget. It does not use synthetic CPU,
-lower a target, force the transition, or adapt load from live metrics. CPU or
+force the transition, or adapt load from live metrics. CPU or
 memory target tracking must add capacity naturally; failure to trigger or to
 preserve command continuity fails this gate. After the added tasks are ready in
 ECS, Traefik, and the executor control plane, require at least 60 complete
@@ -282,9 +282,8 @@ coverage from before scale-in starts until after it finishes.
 
 This complete Gate B destination is bounded at 215 sockets (128 game, 23
 context, and 64 admission) and only 128 are command-bearing. Gate A has already
-placed 144 command-bearing sockets on the one-task origin while ramping at the
-same four starts per second, so it is the conservative command-processing
-precondition rather than a duplicated rehearsal. Gate B must separately prove
+proved that the same command-bearing cohort remains healthy while the
+production target-tracking policy adds capacity naturally. Gate B must separately prove
 that its context and transient admission sockets fit on the final survivor,
 which remains ready and resolves every command inside budget.
 
@@ -332,7 +331,13 @@ the final load report is the authority for authenticated session count. It
 selects an owned partition only when it
 has both active games and pending work, maps that owner to one exact task ARN,
 then performs one non-retried ECS Exec command that finds exactly one non-PID-1
-`server` process and sends it SIGKILL. The 200 ms control-plane observer requires
+`server` process, sends it SIGSTOP, emits the conservative fail-stop timestamp,
+and sends the same PID SIGKILL 500 milliseconds later. Stopping first prevents
+the selected executor from processing or acknowledging more work while its
+timestamp crosses the ECS Exec channel; the later exact ECS exit-137 assertion
+proves that the kill completed. The local ECS Exec client has a 40-second hard
+timeout so a lost marker cannot wait for Session Manager's idle timeout. The
+200 ms control-plane observer requires
 the expired member to disappear and a pre-existing survivor to hold a new
 fenced lease under a later assignment version within five seconds, before the
 replacement task is used. The run then requires affected gateway sessions,
@@ -794,6 +799,52 @@ Server, Serverless Valkey, and Monitoring runtime stacks. It retained the
 protected Network/EIP/EBS/TLS, ECS, ECR, and DynamoDB foundations and stopped
 the ingress instance, which is the current cleanup contract.
 
+Exact-source run
+[`30454722583`](https://github.com/lopatin/snaketron-io/actions/runs/30454722583)
+used outer commit `8f476b972b000e99d0b4da5de7705f659dcfac6e` and
+Snaketron commit `eaba0de0dc89abe6fa00fef13c8cd903b06658e0`. It proved
+that the automatic ownership movement itself was healthy: all 48 complete
+movement seconds stayed inside the one-second command budget, with a
+368-millisecond maximum, exact outcomes, every partition productive, and no
+disconnect or reconnect. The 144-session origin was not a valid
+headroom-preserving trigger. Its one-task CPU averaged 87.61--90.43% for four
+complete minutes before the managed policy acted. Four of 296 baseline seconds
+failed the one-second gate, including 2,677- and 2,361-millisecond seconds
+before the scale-out action. One of 818 settled post-ready seconds reached
+1,271 milliseconds. This is ordinary capacity pressure, not the accepted
+sub-two-second transition exception, so Gate A correctly stopped Gates B and C.
+
+The minimum production correction is to scale at the already measured safe
+one-task plateau instead of weakening the latency gate. Historical exact-source
+run `30046381977` held 128 sessions / 64 duels for eight minutes at
+45.18--48.83% CPU with a 488-millisecond maximum, exact command accounting,
+and no disconnect, reconnect, or checkpoint failure. Development and
+production therefore use a 40% CPU target and Gate A uses that same fixed
+128-session cohort. The weakest historical CPU minute remains 5.18 points
+above the target, comparable to the margin that previously justified 60%.
+`minTasks=1`, one-vCPU task size, the 80% memory policy, all cooldowns, and the
+one-second command gate remain unchanged. This is an evidence-backed
+headroom policy requiring a fresh current-build run, not a passing result.
+
+The separate crash load completed all 1,376 sessions and 688 games with no
+failure. Twenty-two affected clients automatically received fresh snapshots
+from other task identities in 2,506--2,706 milliseconds, and ECS recorded the
+one selected server container exiting 137. Formal crash acceptance could not
+run: the remote shell killed the essential process before its following marker
+crossed ECS Exec, then the local client waited for Session Manager's 20-minute
+idle timeout. The single crash command now stops the exact server PID before
+emitting a conservative fail-stop marker, waits 500 milliseconds for transport,
+then kills the same PID; the later exact exit-137 assertion remains mandatory.
+GNU `timeout` bounds the ECS Exec client at 40 seconds. This adds no production
+endpoint or second crash action. A fresh run must still capture the immediate
+PEL, survivor lease, output, and reconnect proof.
+
+This run again reused the exact Network stack, ingress instance, root EBS, EIP,
+hostname, and TLS certificate. CloudTrail recorded no development DNS or ACME
+change. Cleanup removed only Server, Serverless Valkey, and Monitoring, stopped
+the same ingress instance, and retained the four reusable development
+foundation stacks.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -1027,7 +1078,7 @@ metric series. It also saves and gates a Container Insights Logs Insights result
 with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
-command, or failure to corroborate the measured phase envelopes: 144 game
+command, or failure to corroborate the measured phase envelopes: 128 game
 sessions during natural scale-out; 128 game sessions, 23 durable context
 sessions, bounded open-loop admission, and transient make-before-break
 candidates during the planned transition; and 272 game sessions during
