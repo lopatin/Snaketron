@@ -2362,6 +2362,11 @@ collect_container_insights_evidence() {
 verify_crash_exec_configuration() {
   local report_dir="$1"
   local phase="$2"
+  local phase_dir="$report_dir/ecs-$phase"
+  local tasks_path="$report_dir/ecs-$phase/tasks.json"
+  local exec_ready_path="$phase_dir/exec-ready-tasks.json"
+  local candidate="$exec_ready_path.pending"
+
   jq -e '
     .services[0].enableExecuteCommand == true
   ' "$report_dir/identity/ecs-service.json" >/dev/null \
@@ -2372,21 +2377,62 @@ verify_crash_exec_configuration() {
             and .essential == true
             and .linuxParameters.initProcessEnabled == true)]
       | length == 1
-    ' "$report_dir/identity/task-definition.json" >/dev/null \
-    && jq -e '
-      (.failures | length) == 0
-      and (.tasks | length) > 0
-      and all(.tasks[];
-        .enableExecuteCommand == true
-        and any(.containers[];
-          .name == "snaketron-server"
-          and any(.managedAgents[]?;
-            .name == "ExecuteCommandAgent"
-            and .lastStatus == "RUNNING")))
-    ' "$report_dir/ecs-$phase/tasks.json" >/dev/null || {
-      echo "Hard-crash certification requires ECS Exec, tini, and a RUNNING execute-command agent on every task" >&2
+    ' "$report_dir/identity/task-definition.json" >/dev/null || {
+      echo "Hard-crash certification requires ECS Exec and tini" >&2
       return 1
     }
+
+  local expected_task_arns
+  expected_task_arns="$(jq -c '[.tasks[].taskArn] | sort' "$tasks_path")"
+  local task_arns
+  task_arns="$(jq -r '.tasks[].taskArn' "$tasks_path" | tr '\n' ' ')"
+  [[ -n "$task_arns" ]] || {
+    echo "Hard-crash certification has no verified ECS tasks" >&2
+    return 1
+  }
+
+  # A task can be application-healthy before ECS starts its managed exec
+  # agent. Poll the exact already-verified task cohort so test setup does not
+  # mistake that short initialization window for a product failure.
+  local deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    if aws ecs describe-tasks \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --tasks $task_arns >"$candidate" \
+      && jq -e \
+        --argjson expected_task_arns "$expected_task_arns" \
+        --arg task_definition "$staging_task_definition_arn" \
+        --arg image "$staging_image_uri" \
+        --arg digest "$staging_image_digest" '
+          (.failures | length) == 0
+          and ([.tasks[].taskArn] | sort) == $expected_task_arns
+          and all(.tasks[];
+            .desiredStatus == "RUNNING"
+            and .lastStatus == "RUNNING"
+            and .healthStatus == "HEALTHY"
+            and .taskDefinitionArn == $task_definition
+            and .enableExecuteCommand == true
+            and any(.containers[];
+              .name == "snaketron-server"
+              and .image == $image
+              and .imageDigest == $digest
+              and .lastStatus == "RUNNING"
+              and .healthStatus == "HEALTHY"
+              and any(.managedAgents[]?;
+                .name == "ExecuteCommandAgent"
+                and .lastStatus == "RUNNING")))
+        ' "$candidate" >/dev/null; then
+      mv "$candidate" "$exec_ready_path"
+      return 0
+    fi
+    sleep 2
+  done
+
+  [[ -f "$candidate" ]] \
+    && mv "$candidate" "$phase_dir/exec-ready-tasks-final.json"
+  echo "Hard-crash certification requires a RUNNING execute-command agent on every verified healthy task" >&2
+  return 1
 }
 
 capture_control_status() {
