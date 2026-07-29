@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Barrier, mpsc};
 use tokio::task::{Id, JoinError, JoinSet};
-use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use url::Url;
@@ -378,8 +378,8 @@ async fn run(config: Config) -> Result<()> {
     let mut signal = Box::pin(shutdown_signal());
     let mut observation_interval = interval(OBSERVATION_INTERVAL);
     observation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut spawn_interval = interval_at(Instant::now() + SPAWN_INTERVAL, SPAWN_INTERVAL);
-    spawn_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut spawn_interval = fixed_rate_spawn_interval(Instant::now());
+    let mut infrastructure_tasks = JoinSet::new();
     let baseline_backend_hints = resolver.backend_hints().observed_backend_count();
     let baseline_server_count = preflight
         .initial_server_counts
@@ -439,6 +439,10 @@ async fn run(config: Config) -> Result<()> {
         let stage_deadline = Instant::now() + stage.duration;
         while Instant::now() < stage_deadline {
             tokio::select! {
+                // A wave and an observation are due together every five
+                // seconds. Poll the fixed-rate launch ahead of diagnostics so
+                // diagnostics can never perturb the workload they measure.
+                biased;
                 signal_result = &mut signal => {
                     match signal_result {
                         Ok(()) => warn!("interrupt received; stopping ramp and draining sessions"),
@@ -447,37 +451,19 @@ async fn run(config: Config) -> Result<()> {
                     interrupted = true;
                     break;
                 }
-                event = activity_rx.recv() => {
-                    if let Some(event) = event {
-                        observe_stage_activity(
-                            event,
-                            &mut activity_rx,
-                            &mut concurrency,
-                            stage.target_concurrency,
-                            &mut target_reached,
-                            &mut target_reached_at,
-                        );
-                    }
-                }
-                joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
-                    if let Some(joined) = joined {
-                        drain_stage_activity_events(
-                            &mut activity_rx,
-                            &mut concurrency,
-                            stage.target_concurrency,
-                            &mut target_reached,
-                            &mut target_reached_at,
-                        );
-                        collect_group_result(joined, &mut planned_groups, &mut run, &mut concurrency);
-                    }
-                    if let Some(reason) = failure_circuit_breaker(&run) {
-                        error!(%reason, "failure circuit breaker stopped further load generation");
-                        run.metadata.insert("circuit_breaker".to_owned(), reason);
-                        interrupted = true;
-                        break;
-                    }
-                }
+                _ = tokio::time::sleep_until(stage_deadline) => break,
                 _ = spawn_interval.tick() => {
+                    // Terminal activity can become ready at the same instant
+                    // as the next fixed-rate wave. Refresh reservations before
+                    // enforcing the concurrency ceiling so biased timer
+                    // priority cannot create an artificial missing wave.
+                    drain_stage_activity_events(
+                        &mut activity_rx,
+                        &mut concurrency,
+                        stage.target_concurrency,
+                        &mut target_reached,
+                        &mut target_reached_at,
+                    );
                     if concurrency.reserved() < stage.target_concurrency
                         && Instant::now() < stage_deadline
                     {
@@ -516,10 +502,48 @@ async fn run(config: Config) -> Result<()> {
                             .saturating_add(config.expected_games(launched));
                     }
                 }
-                _ = observation_interval.tick() => {
-                    sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
+                event = activity_rx.recv() => {
+                    if let Some(event) = event {
+                        observe_stage_activity(
+                            event,
+                            &mut activity_rx,
+                            &mut concurrency,
+                            stage.target_concurrency,
+                            &mut target_reached,
+                            &mut target_reached_at,
+                        );
+                    }
                 }
-                _ = tokio::time::sleep_until(stage_deadline) => break,
+                joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    if let Some(joined) = joined {
+                        drain_stage_activity_events(
+                            &mut activity_rx,
+                            &mut concurrency,
+                            stage.target_concurrency,
+                            &mut target_reached,
+                            &mut target_reached_at,
+                        );
+                        collect_group_result(joined, &mut planned_groups, &mut run, &mut concurrency);
+                    }
+                    if let Some(reason) = failure_circuit_breaker(&run) {
+                        error!(%reason, "failure circuit breaker stopped further load generation");
+                        run.metadata.insert("circuit_breaker".to_owned(), reason);
+                        interrupted = true;
+                        break;
+                    }
+                }
+                sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                    if let Some(sampled) = sampled {
+                        record_infrastructure_sample(sampled, &resolver, &mut run);
+                    }
+                }
+                _ = observation_interval.tick(), if infrastructure_tasks.is_empty() => {
+                    spawn_infrastructure_sample(
+                        &mut infrastructure_tasks,
+                        &resolver,
+                        &preflight.api_origin,
+                    );
+                }
             }
         }
 
@@ -564,8 +588,17 @@ async fn run(config: Config) -> Result<()> {
                     collect_group_result(joined, &mut planned_groups, &mut run, &mut concurrency);
                 }
             }
-            _ = observation_interval.tick() => {
-                sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
+            sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                if let Some(sampled) = sampled {
+                    record_infrastructure_sample(sampled, &resolver, &mut run);
+                }
+            }
+            _ = observation_interval.tick(), if infrastructure_tasks.is_empty() => {
+                spawn_infrastructure_sample(
+                    &mut infrastructure_tasks,
+                    &resolver,
+                    &preflight.api_origin,
+                );
             }
             _ = tokio::time::sleep_until(drain_deadline) => break,
         }
@@ -603,6 +636,11 @@ async fn run(config: Config) -> Result<()> {
 
     drain_activity_events(&mut activity_rx, &mut concurrency);
 
+    // Preserve any final periodic observation without allowing its network I/O
+    // to interfere with launch cadence or session result collection.
+    while let Some(sampled) = infrastructure_tasks.join_next().await {
+        record_infrastructure_sample(sampled, &resolver, &mut run);
+    }
     sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
     run.finished_at_unix_ms = unix_time_ms();
     let observed_backend_hints = resolver.backend_hints().observed_backend_count();
@@ -1109,7 +1147,49 @@ fn launch_budget(config: &Config, total_sessions_launched: usize) -> usize {
     )
 }
 
+fn fixed_rate_spawn_interval(start: Instant) -> Interval {
+    let mut spawn_interval = interval_at(start + SPAWN_INTERVAL, SPAWN_INTERVAL);
+    // Keep future waves anchored after a late poll without emitting every
+    // elapsed tick as a catch-up burst. A delayed observation must neither
+    // shift the remainder of the run nor manufacture excess admission load.
+    spawn_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    spawn_interval
+}
+
+fn spawn_infrastructure_sample(
+    tasks: &mut JoinSet<InfrastructureSample>,
+    resolver: &TargetResolver,
+    api_origin: &str,
+) {
+    let resolver = resolver.clone();
+    let api_origin = api_origin.to_owned();
+    tasks.spawn(async move { capture_infrastructure_sample(&resolver, &api_origin).await });
+}
+
+fn record_infrastructure_sample(
+    sampled: Result<InfrastructureSample, JoinError>,
+    resolver: &TargetResolver,
+    run: &mut LoadTestRun,
+) {
+    let sample = sampled.unwrap_or_else(|error| InfrastructureSample {
+        observed_at_unix_ms: unix_time_ms(),
+        regional_user_counts: Default::default(),
+        regional_server_counts: Default::default(),
+        observed_backend_hints: resolver.backend_hints().observed_backend_count(),
+        error: Some(format!("infrastructure sampler task failed: {error}")),
+    });
+    run.infrastructure_samples.push(sample);
+}
+
 async fn sample_infrastructure(resolver: &TargetResolver, api_origin: &str, run: &mut LoadTestRun) {
+    run.infrastructure_samples
+        .push(capture_infrastructure_sample(resolver, api_origin).await);
+}
+
+async fn capture_infrastructure_sample(
+    resolver: &TargetResolver,
+    api_origin: &str,
+) -> InfrastructureSample {
     let (users, servers) = tokio::join!(
         resolver.sample_user_counts_from_origin(api_origin),
         resolver.sample_server_counts_from_origin(api_origin),
@@ -1129,13 +1209,13 @@ async fn sample_infrastructure(resolver: &TargetResolver, api_origin: &str, run:
             Default::default()
         }
     };
-    run.infrastructure_samples.push(InfrastructureSample {
+    InfrastructureSample {
         observed_at_unix_ms: unix_time_ms(),
         regional_user_counts,
         regional_server_counts,
         observed_backend_hints: resolver.backend_hints().observed_backend_count(),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
-    });
+    }
 }
 
 fn game_type(mode: GameMode) -> GameType {
@@ -1263,10 +1343,62 @@ fn plan_session_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+    use tokio::time::advance;
 
     #[test]
     fn four_duel_sessions_are_planned_as_two_deterministic_games() {
         assert_eq!(plan_session_groups(1, 2, 2), vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_rate_spawn_interval_skips_missed_ticks_without_bursting() {
+        let start = Instant::now();
+        let mut spawn_interval = fixed_rate_spawn_interval(start);
+
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(1));
+        advance(Duration::from_millis(2_394)).await;
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(2));
+        // Tick three is already overdue. Skip must discard it; Burst would
+        // return that tick on the next poll even after time reaches tick four.
+        advance(Duration::from_millis(606)).await;
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_infrastructure_sample_does_not_delay_actual_launch_cadence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_origin = format!("http://{}", listener.local_addr().unwrap());
+        let blackhole = tokio::spawn(async move {
+            let mut held_connections = Vec::new();
+            while let Ok((connection, _)) = listener.accept().await {
+                held_connections.push(connection);
+            }
+        });
+        let resolver = TargetResolver::new(Duration::from_millis(1_394)).unwrap();
+        let mut infrastructure_tasks = JoinSet::new();
+        spawn_infrastructure_sample(&mut infrastructure_tasks, &resolver, &api_origin);
+
+        let start = Instant::now();
+        let mut spawn_interval = fixed_rate_spawn_interval(start);
+        let mut actual_launches = vec![start];
+        let mut run = LoadTestRun::new("run", api_origin, 0, 4);
+        while actual_launches.len() < 4 {
+            tokio::select! {
+                biased;
+                _ = spawn_interval.tick() => actual_launches.push(Instant::now()),
+                sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                    record_infrastructure_sample(sampled.unwrap(), &resolver, &mut run);
+                }
+            }
+        }
+
+        assert!(actual_launches.windows(2).all(|launches| {
+            launches[1].duration_since(launches[0]) <= Duration::from_millis(1_100)
+        }));
+        assert_eq!(run.infrastructure_samples.len(), 1);
+        assert!(run.infrastructure_samples[0].error.is_some());
+        blackhole.abort();
     }
 
     #[test]

@@ -655,11 +655,47 @@ a robust certification or operating threshold.
 Do not change any command, handoff, capacity, or crash criterion. Fresh complete
 planned and SIGKILL runs remain required.
 
-Cleanup succeeded. Independent inventory found no active development stack,
-ECS task or service, EC2/EIP/NAT resource, security group, Serverless or node
-cache, DynamoDB table, ECR repository, log group, dashboard, or staging DNS
-record. The shared production VPC, all production stack timestamps, and both
-healthy production services remained unchanged.
+Exact-source run
+[`30089020521`](https://github.com/lopatin/snaketron-io/actions/runs/30089020521)
+used outer commit `dad79987a3e3ac3bab23bb3e8f5dc292c25f658b` and
+Snaketron commit `960ca7e62866dbd4a5a37cee7acda6cd37f35d0e`. Gate A
+naturally scaled `1 -> 2`; all 2,876 sessions and 1,438 games completed, and
+all 2,572,277 submitted commands received terminal outcomes, with zero
+disconnect, reconnect, or observed usable gap. Maximum command-outcome latency
+was 326 milliseconds in the baseline and 892 milliseconds during movement.
+Gate B then passed its service-side
+`1 -> 10 -> 1` assertions: exactly nine partitions moved each way, all 1,280
+sessions and 640 games completed, all 1,144,974 submitted commands received
+terminal outcomes, and 114 of 114 planned game handoffs had zero observed
+usable gap. Handoff preparation took at most 1,820 milliseconds while the old
+socket remained usable; scale-out and scale-in command outcomes peaked at 429
+and 756 milliseconds.
+
+All 480 open-loop admissions also completed without an error or reconnect,
+with 311-millisecond p99 and 1,672-millisecond maximum readiness; peak
+in-flight admission was 12 sessions, below the unchanged 64-session safety
+ceiling. The run failed only the next observed assertion: one synthetic
+four-session wave was launched 1,394 milliseconds after its predecessor
+instead of within the unchanged 1,100-millisecond cadence allowance. This was
+load-generator self-interference, not failover: the inline five-second
+infrastructure sample overlapped that launch tick and the timer retained the
+delay. Because the runner failed closed there, capacity Gate C, automatic
+scale-in, complete metrics gates, and SIGKILL did not run. Per-task evidence
+also showed transient post-scale-out CPU skew (roughly 82--89% successor
+versus 36--41% incumbent with five leases each); preserve that diagnostic in
+the final run.
+
+The narrow runner correction moves the one-at-a-time infrastructure sample off
+the launch loop and keeps the launch timer anchored. No cohort or acceptance
+threshold changes. Hard-crash mode now requires a zero-WebSocket,
+zero-authoritative-game, fully drained one-task baseline, and the workflow runs
+both suites and retains both statuses when the first returns a failure.
+
+Cleanup for run `30089020521` succeeded. Independent inventory found no active
+development stack, ECS task or service, EC2/EIP/NAT resource, security group,
+Serverless or node cache, DynamoDB table, ECR repository, log group, dashboard,
+or staging DNS record. The shared production VPC, all production stack
+timestamps, and both healthy production services remained unchanged.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.

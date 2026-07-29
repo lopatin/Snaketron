@@ -5,7 +5,7 @@
 | Status | Direct-only implementation acceptance draft |
 | Product | Snaketron regional game service |
 | Owners | Engineering / Product |
-| Last updated | 2026-07-24 |
+| Last updated | 2026-07-28 |
 | Scope | Executor ownership, task lifecycle, WebSocket continuity, matchmaking safety, readiness, and autoscaling |
 
 ## 1. Executive summary
@@ -1275,10 +1275,55 @@ keeps real command and takeover headroom. Idle cost is unchanged because the
 one-task floor remains. This policy change is not certified by the diagnostic
 run; fresh complete planned and SIGKILL evidence is still mandatory.
 
-Cleanup succeeded and an independent absence audit found no active development
-stack, compute, cache, database, ingress, DNS, logging, or scaling resource.
-The imported production VPC, every production stack timestamp, and both
-production services remained unchanged and healthy.
+The next exact-source run
+([GitHub Actions 30089020521](https://github.com/lopatin/snaketron-io/actions/runs/30089020521),
+outer commit `dad79987a3e3ac3bab23bb3e8f5dc292c25f658b`, Snaketron
+commit `960ca7e62866dbd4a5a37cee7acda6cd37f35d0e`) validated the 60% CPU
+policy. Gate A naturally scaled `1 -> 2`; all 2,876 sessions and 1,438 games
+completed, and all 2,572,277 submitted commands received terminal outcomes,
+with zero disconnect, reconnect, or observed usable gap.
+The maximum command outcome was 326 milliseconds in the full baseline seconds
+and 892 milliseconds during movement. Gate B then moved exactly nine
+partitions in each direction through forced `1 -> 10 -> 1`. All 1,280
+continuity sessions and 640 games completed, and all 1,144,974 submitted
+commands received terminal outcomes. All 114 planned game handoffs succeeded
+with zero observed usable gap; their total preparation time was at most 1,820
+milliseconds while the old socket remained usable.
+Scale-out and scale-in command outcomes remained below one second, peaking at
+429 and 756 milliseconds respectively. The idle, lobby, and unmatched
+matchmaking cohorts also survived intact. Serverless Valkey reported no
+throttling or eviction in the executed phases.
+
+The sole observed assertion failure before the script stopped was not a
+failover delay. All 480 open-loop admission sessions completed without an
+error or reconnect, with 311-millisecond p99 and 1,672-millisecond maximum
+readiness; peak in-flight admission was 12 sessions, below the unchanged
+64-session safety ceiling. One four-session wave began 1,394 milliseconds after
+the prior wave instead of within the unchanged 1,100-millisecond
+generator-cadence allowance.
+The load coordinator awaited its five-second infrastructure HTTP sample inline
+at the coincident 15-second launch tick, then `MissedTickBehavior::Delay`
+shifted every subsequent timer deadline. Gate C, automatic target-tracking
+scale-in, final metrics assertions, and the hard-crash suite therefore did not
+run and remain mandatory. This run also observed transient per-task CPU skew
+after natural scale-out (about 82--89% on the successor versus 36--41% on the
+incumbent despite five leases each); it caused no correctness failure but must
+remain visible in the final per-task evidence.
+
+The minimum test-tool correction runs at most one infrastructure sample
+concurrently, keeps the one-second launch timer on its original fixed-rate
+anchor, and prioritizes a coincident launch after refreshing terminal-session
+bookkeeping. It does not alter any service code, cohort, cadence allowance,
+latency budget, handoff criterion, or safety ceiling. Crash certification now
+also proves zero WebSockets, zero authoritative games, and drained executor
+queues at its independent one-task start, and the workflow retains both suite
+statuses so a returned planned-suite failure cannot suppress hard-crash
+evidence.
+
+Cleanup for run `30089020521` succeeded and an independent absence audit found
+no active development stack, compute, cache, database, ingress, DNS, logging,
+or scaling resource. The imported production VPC, every production stack
+timestamp, and both production services remained unchanged and healthy.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

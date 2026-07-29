@@ -3149,6 +3149,12 @@ run_staging_suite() {
   }
 
   if [[ "$crash_mode" == true ]]; then
+    # A prior planned-suite failure may have restored desired count and policy
+    # state while its short-lived clients or durable executor work were still
+    # draining. Prove this crash run starts from an independent empty one-task
+    # baseline before adding capacity or selecting any affected partition.
+    wait_for_zero_certification_load crash-initial-zero
+    wait_for_executor_drain crash-initial-drained-1 1
     # Crash certification is capacity testing, not a scale-out trigger. Reach
     # ten verified ready tasks before creating the first synthetic user.
     retry_command 5 set_scaling_suspended true
