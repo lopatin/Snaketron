@@ -1606,6 +1606,36 @@ test_hard_crash_evidence_selectors() {
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-computed-during-observation.json" \
     >"$selected" || result=1
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = ($stopped - 1)
+      | .assignment.computed_at_ms = ($stopped + 1)
+    ' "$owner_valid" >"$fixture_dir/owner-spans-stop.json"
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = ($stopped + 500)
+    ' "$fixture_dir/owner-spans-stop.json" \
+    >"$fixture_dir/owner-after-spanning-sample.json"
+  select_hard_crash_owner_candidate_ownership_sample \
+    "$pre" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-spans-stop.json" >"$selected" || result=1
+  if select_hard_crash_owner_ready_ownership_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-spans-stop.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  select_hard_crash_owner_candidate_ownership_sample \
+    "$pre" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-after-spanning-sample.json" \
+    >"$selected" || result=1
+  select_hard_crash_owner_ready_ownership_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-after-spanning-sample.json" \
+    >"$selected" || result=1
   select_hard_crash_authoritative_output_sample \
     "$execution_stopped_at_ms" "$partition" \
     "$((execution_stopped_at_ms + 2450))-1" \
@@ -3795,7 +3825,8 @@ inject_hard_crash_and_prove_takeover() {
     local observer_stop_requested=false
     trap 'observer_stop_requested=true' TERM INT
     local observation_sequence=0
-    local captured_authority_identity=""
+    local captured_ambiguous_authority_identity=""
+    local captured_definitive_authority_identity=""
     while [[ "$observer_stop_requested" != true \
       && ! -e "$ownership_observer_stop_file" ]]; do
       observation_sequence=$((observation_sequence + 1))
@@ -3804,6 +3835,7 @@ inject_hard_crash_and_prove_takeover() {
       local observation_raw
       local observation_pending
       local observation_sample
+      local candidate_assignment_computed_at_ms
       local candidate_authority_identity
       local output_raw
       local output_pending
@@ -3882,8 +3914,18 @@ inject_hard_crash_and_prove_takeover() {
                 | @json
               ' "$observation_sample"
             )" \
+            && candidate_assignment_computed_at_ms="$(
+              jq -er '
+                .assignment.computed_at_ms
+                | select(type == "number")
+              ' "$observation_sample"
+            )" \
             && [[ "$candidate_authority_identity" \
-              != "$captured_authority_identity" ]]; then
+              != "$captured_definitive_authority_identity" ]] \
+            && [[ "$observation_started_at_ms" \
+                -ge "$candidate_assignment_computed_at_ms" \
+              || "$candidate_authority_identity" \
+                != "$captured_ambiguous_authority_identity" ]]; then
             local authority_event_tail_id
             local output_observation_started_at_ms
             local output_observation_completed_at_ms
@@ -3921,7 +3963,12 @@ inject_hard_crash_and_prove_takeover() {
                     }
                 ' "$output_raw" >"$output_pending"; then
                 mv "$output_pending" "$output_sample"
-                captured_authority_identity="$candidate_authority_identity"
+                if (( observation_started_at_ms \
+                  >= candidate_assignment_computed_at_ms )); then
+                  captured_definitive_authority_identity="$candidate_authority_identity"
+                else
+                  captured_ambiguous_authority_identity="$candidate_authority_identity"
+                fi
               fi
             fi
           fi
