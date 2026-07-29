@@ -146,7 +146,7 @@ Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
 Both retain a minimum of one. The application task uses two vCPU and four GiB
 so the one-task floor has takeover and burst headroom while target tracking is
-still observing load. CPU is targeted at 35%, memory at 80%, and both scale-in
+still observing load. CPU is targeted at 30%, memory at 80%, and both scale-in
 and scale-out cooldowns are 60 seconds. Development and production use the
 same policy.
 
@@ -946,12 +946,23 @@ outage. INFO volume was not correlated with the failed seconds; no speculative
 metrics concurrency or production log suppression is added.
 
 Development and production now use two-vCPU / four-GiB tasks, retain
-`minTasks=1`, and target CPU at 35%. The measured 128-session load consumed
-about 0.71--0.85 vCPU, so this leaves a second runtime worker and headroom
-during the managed alarm delay while projecting to about 35.5--42.5%
-utilization. Fresh Gate A must prove the CPU-only scale-out; memory stays at
-80%, cooldowns remain 60 seconds, and the load and one-second acceptance gates
-are unchanged.
+`minTasks=1`, and target CPU at 30%. Diagnostic run `30496453531` tested outer
+commit `9c729f8f075a556d3caee6e2a37302f8da0981e6` and nested commit
+`a424647639b156abfc8d0731b3fbf51ecbded634`. Its configured 35% managed 3/3
+CPU alarm never fired: Gate A timed out, so planned Gates B and C did not run.
+The nine consecutive load periods measured 30.33--35.36%. A 30% target would
+have supplied seven valid three-period alarm windows, while whole-percent
+targets from 31% through 35% would have supplied at most one. Fresh Gate A must
+prove the CPU-only scale-out; memory stays at 80%, cooldowns remain 60 seconds,
+and the load and one-second acceptance gates are unchanged.
+
+The interrupted Gate A stimulus still supplied clean diagnostic one-task
+capacity evidence: all 768 sessions, 384 games, and 687,693 command outcomes
+completed exactly, with zero failed sessions and zero evaluated command
+seconds above one second. The worst per-second command-outcome latency was 914
+milliseconds. This is not formal Gate A or capacity acceptance because the
+stage plan did not complete; it isolates the observed failure to the 35%
+managed scaling trigger rather than workload instability or command loss.
 
 The independent exit-137 suite also exposed proof issues after successful
 product recovery. ECS recorded the selected task exiting 137. A pre-existing
@@ -980,6 +991,16 @@ when the replacement assignment was computed after that exact stop and both
 timestamps correlate to the unchanged five-second window. The unrelated-stop
 check also snapshots and excludes tasks already stopping before crash evidence
 begins.
+
+The independent crash phase of run `30496453531` then formally passed all 12
+hard-crash checks. Its one selected ECS task exited 137. The narrow PEL
+observation completed 1.161 seconds after exact `executionStoppedAt`; the
+survivor's fenced owner-ready sample completed at 4.022 seconds and its first
+causal authoritative output appeared at 4.006 seconds. All 32 affected clients
+recovered with a formal 4.314-second upper bound. All 1,378 sessions, 689
+games, and 1,234,049 command outcomes completed with exact accounting and no
+pending commands. Traefik recorded zero zero-backend samples or scrape errors
+across 308 observations, and ECS recorded no unrelated task stop.
 
 Cleanup for `30486700133` succeeded and honored the cost boundary: only Server,
 Serverless Valkey, and Monitoring were removed; ingress was stopped; and the
