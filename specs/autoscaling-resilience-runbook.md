@@ -853,6 +853,57 @@ change. Cleanup removed only Server, Serverless Valkey, and Monitoring, stopped
 the same ingress instance, and retained the four reusable development
 foundation stacks.
 
+Exact-source run
+[`30475852468`](https://github.com/lopatin/snaketron-io/actions/runs/30475852468)
+used outer commit `be4040cafd8ddce72be51eab63ff4de158994e55` and
+Snaketron commit `2c3f6c06a725b585c6f161aa7a32cdf98938b547`. Gate A
+naturally scaled `1 -> 3`. All 1,664 sessions, 832 games, and 1,476,683
+commands completed with exact terminal accounting and zero disconnect or
+reconnect. It was still not a passing run: 22 of 332 baseline seconds, two of
+46 movement seconds, and 17 later settled seconds exceeded the unchanged
+one-second outcome budget. The maximum was 5,852 milliseconds. Gate A
+therefore correctly stopped the planned staircase and capacity gate.
+
+Twenty-nine ordinary failures clustered in the first three seconds of a minute.
+The elected reporter was serially inspecting every full active recovery record;
+its top-of-minute collections took as long as 4,719 milliseconds and coincided
+with receipt collapse only on that task's four owned partitions. Separately,
+partition 3 failed closed after six fenced event publications timed out, then
+restarted locally and recovered six games plus 124 commands without loss. A
+pending-completion index read and group-aware trim shared its hot dispatcher;
+the evidence does not prove which queued operation initiated that incident.
+
+The narrow correction preserves exact telemetry semantics but fetches bounded
+recovery headers and tails in fixed 32-key same-slot batches, bounds the
+complete normal collection to 500 milliseconds, and emits a separately gated
+`RegionalCollectionFailures` metric so a skipped collection cannot look like
+zero mismatches. One task-wide maintenance dispatcher now owns only
+pending-completion index reads and bounded approximate stream trimming.
+Separate at-most-one background completion and trim workers keep both off the
+authoritative partition loop and keep DynamoDB completion effects from starving
+trim. The 750-millisecond fenced-operation timeout, checkpoint cadence,
+partition topology, CPU/memory policies, and acceptance budgets are unchanged.
+
+The separate exit-137 run completed all 788 sessions, 394 games, and 705,108
+commands observed before the proof failure. Twenty-six killed-task sessions
+recovered through fresh snapshots; 27 balanced disconnect/reconnect attempts
+include one retryable replacement socket before final game readiness. Recovery
+took 2,311--2,518 milliseconds from client detection. ECS
+`executionStoppedAt` showed successor assignment and a new fenced lease in
+about 3.3 seconds and all 53 sampled pending entries by 3.88 seconds. The rich
+PEL/status command needed just over five seconds to finish one coherent sample,
+so the harness failed even though product takeover was inside the five-second
+budget. Crash certification now keeps that rich observer only for the
+unchanged two-second PEL proof and uses a prestarted lightweight coherent
+assignment/lease/membership observer for the unchanged five-second ownership
+proof. No production endpoint or coordination mechanism was added.
+
+Cleanup for `30475852468` deleted only the Server, Serverless Valkey, and
+Monitoring runtime stacks and stopped ingress. The fixed hostname, DNS, EIP,
+certificate-bearing EBS volume, shared production VPC, and reusable
+Network/ECS/ECR/DynamoDB foundations remained. Fresh complete Gate A/B/C,
+automatic scale-in, and exit-137 evidence remain mandatory.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -918,7 +969,10 @@ recovery-read connections and route takeover journal/envelope loads,
 stored-snapshot and recovery-failure loads, reconnect outcome reads, and
 immutable completion-record loads by partition. Regional resilience metrics
 use one additional best-effort dispatcher so telemetry cannot queue ahead of
-recovery.
+recovery. Pending-completion index scans and bounded approximate command-stream
+trimming use one separate task-wide maintenance dispatcher and run only in
+at-most-one background workers per partition; they must never be awaited by the
+authoritative partition loop.
 RESP3 Pub/Sub and stream readers also keep their separate connections. This is
 the minimum role topology required by the observed Serverless latency
 variance. Do not add a dynamic or per-game pool, longer deadlines, a recovery

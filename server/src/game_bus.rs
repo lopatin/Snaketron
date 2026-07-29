@@ -119,6 +119,10 @@ const READER_RECONNECT_BACKOFF_MS: u64 = 100;
 const EXECUTOR_GROUP_BATCH: usize = 512;
 const EXECUTOR_GROUP_IDLE: Duration = Duration::from_millis(50);
 const FENCED_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+// Group-aware cleanup is best effort. Approximate trimming may retain complete
+// stream macro-nodes, while LIMIT bounds one maintenance pass so cleanup
+// cannot monopolize a partition's Valkey shard.
+const COMMAND_TRIM_LIMIT: usize = 1_024;
 const GAME_CREATED_DELIVERY_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
@@ -164,11 +168,16 @@ pub struct GameBus {
     /// dispatcher, so production bootstrap must prewarm exactly one distinct
     /// connection for every partition.
     partition_redis: Vec<RedisConnection>,
-    /// One independently-created recovery-read dispatcher per partition.
-    /// Takeover and reconnect fan-out can move many full recovery envelopes;
-    /// isolating partitions prevents one large partition from exhausting the
-    /// bounded redis-rs queue used by every other partition.
+    /// One independently-created recovery dispatcher per partition. Takeover
+    /// and reconnect fan-out can move many full recovery envelopes. Isolating
+    /// partitions prevents one large partition from exhausting the bounded
+    /// redis-rs queue used by every other partition.
     recovery_redis: Vec<RedisConnection>,
+    /// One task-wide dispatcher for best-effort cleanup and retry-index scans.
+    /// These operations may be delayed without blocking live execution or
+    /// crash recovery, so cross-partition head-of-line blocking is acceptable
+    /// on this lane.
+    maintenance_redis: RedisConnection,
     /// Independent dispatcher for full-state checkpoint and completion
     /// writes. Keeping these writes off the recovery-read dispatcher prevents
     /// a scale-out snapshot burst from stalling authoritative actors.
@@ -189,6 +198,7 @@ impl GameBus {
         redis: impl Into<RedisConnection>,
         partition_redis: Vec<RedisConnection>,
         recovery_redis: Vec<RedisConnection>,
+        maintenance_redis: impl Into<RedisConnection>,
         checkpoint_redis: impl Into<RedisConnection>,
         redis_client: impl Into<RedisClient>,
         cancellation_token: CancellationToken,
@@ -209,6 +219,7 @@ impl GameBus {
             redis: redis.into(),
             partition_redis,
             recovery_redis,
+            maintenance_redis: maintenance_redis.into(),
             checkpoint_redis: checkpoint_redis.into(),
             redis_client: redis_client.into(),
             cancellation_token,
@@ -942,7 +953,10 @@ impl GameBus {
         &self,
         guard: &PartitionLeaseGuard,
     ) -> Result<usize> {
-        let mut redis = self.partition_connection(guard.partition())?;
+        // Trimming is not authority-bearing progress. Keep it off the
+        // partition-hot dispatcher so a slow maintenance request cannot
+        // head-of-line block event and command-decision publication.
+        let mut redis = self.maintenance_redis.clone();
         let operation = async {
             let script = redis::Script::new(
                 r#"
@@ -967,7 +981,9 @@ impl GameBus {
                     end
                 end
                 if not threshold or threshold == '0-0' then return 0 end
-                return redis.call('XTRIM', KEYS[2], 'MINID', threshold)
+                return redis.call(
+                    'XTRIM', KEYS[2], 'MINID', '~', threshold, 'LIMIT', ARGV[3]
+                )
                 "#,
             );
             script
@@ -975,6 +991,7 @@ impl GameBus {
                 .key(RedisKeys::stream_commands(guard.partition()))
                 .arg(guard.encoded_token())
                 .arg(guard.namespace().command_group(guard.partition()))
+                .arg(COMMAND_TRIM_LIMIT)
                 .invoke_async(&mut redis)
                 .await
         };
@@ -1714,7 +1731,10 @@ impl GameBus {
         namespace: &ClusterNamespace,
         partition: u32,
     ) -> Result<Vec<u32>> {
-        let mut redis = self.partition_connection(partition)?;
+        // This one-second retry scan is maintenance work. The individual
+        // fenced completion mutations still use the hot partition lane, but
+        // an empty or unexpectedly large index must not delay game events.
+        let mut redis = self.maintenance_redis.clone();
         let mut game_ids: Vec<u32> = redis
             .smembers(namespace.pending_completions(partition))
             .await
@@ -2583,6 +2603,7 @@ mod tests {
             (0..PARTITION_COUNT)
                 .map(|_| global.clone().into())
                 .collect(),
+            global.clone(),
             global,
             client.clone(),
             CancellationToken::new(),
@@ -2701,6 +2722,7 @@ mod tests {
             global.clone(),
             partition_connections,
             recovery_connections,
+            global.clone(),
             global,
             client.clone(),
             CancellationToken::new(),
@@ -2779,16 +2801,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_hot_recovery_and_checkpoint_paths_use_configured_connections() -> Result<()>
-    {
+    async fn stalled_maintenance_lane_does_not_delay_partition_traffic() -> Result<()> {
+        let client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (global_push, _global_push_rx) = tokio::sync::broadcast::channel(8);
+        let (maintenance_push, _maintenance_push_rx) = tokio::sync::broadcast::channel(8);
+        let global = create_connection_manager(client.clone(), global_push).await?;
+        let maintenance = create_connection_manager(client.clone(), maintenance_push).await?;
+        let bus = std::sync::Arc::new(GameBus::new(
+            global.clone(),
+            (0..PARTITION_COUNT)
+                .map(|_| global.clone().into())
+                .collect(),
+            (0..PARTITION_COUNT)
+                .map(|_| global.clone().into())
+                .collect(),
+            maintenance.clone(),
+            global,
+            client.clone(),
+            CancellationToken::new(),
+        )?);
+
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("maintenance-lane-stall-{salt}"))?;
+        let stall_key = format!("snaketron:test:maintenance-lane-stall:{salt}");
+        let lane_name = format!("snaketron-maintenance-stall-{salt}");
+        let command_stream = RedisKeys::stream_commands(0);
+        let pending_completions = namespace.pending_completions(0);
+        let mut inspector = client.get_multiplexed_async_connection().await?;
+        let _: () = inspector
+            .del(&[&stall_key, &command_stream, &pending_completions])
+            .await?;
+
+        let mut stalled_connection = maintenance;
+        let _: () = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg(&lane_name)
+            .query_async(&mut stalled_connection)
+            .await?;
+        let blocked_key = stall_key.clone();
+        let blocked_read = tokio::spawn(async move {
+            redis::cmd("BLPOP")
+                .arg(blocked_key)
+                .arg(0)
+                .query_async::<Option<(String, String)>>(&mut stalled_connection)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let clients: String = redis::cmd("CLIENT")
+                    .arg("LIST")
+                    .query_async(&mut inspector)
+                    .await?;
+                if clients.lines().any(|line| {
+                    line.contains(&format!("name={lane_name}")) && line.contains("cmd=blpop")
+                }) {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("maintenance lane never entered its blocking operation")??;
+
+        let blocked_bus = bus.clone();
+        let blocked_namespace = namespace.clone();
+        let blocked_maintenance = tokio::spawn(async move {
+            blocked_bus
+                .list_pending_completion_ids(&blocked_namespace, 0)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !blocked_maintenance.is_finished(),
+            "maintenance read unexpectedly bypassed its stalled lane"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.publish_command(
+                0,
+                &StreamEvent::StatusUpdated {
+                    game_id: 0,
+                    status: common::GameStatus::Stopped,
+                },
+            ),
+        )
+        .await
+        .context("partition traffic queued behind maintenance")??;
+        assert_eq!(inspector.xlen::<_, u64>(&command_stream).await?, 1);
+
+        let _: usize = inspector.rpush(&stall_key, "release").await?;
+        tokio::time::timeout(Duration::from_secs(1), blocked_read)
+            .await
+            .context("maintenance blocking operation did not release")???;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), blocked_maintenance)
+                .await
+                .context("maintenance read did not resume after its lane released")???
+                .is_empty()
+        );
+        let _: () = inspector
+            .del(&[&stall_key, &command_stream, &pending_completions])
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_hot_recovery_maintenance_and_checkpoint_paths_use_configured_connections()
+    -> Result<()> {
+        let maintenance_client = redis::Client::open("redis://127.0.0.1:6379/11?protocol=resp3")?;
         let hot_client = redis::Client::open("redis://127.0.0.1:6379/12?protocol=resp3")?;
         let recovery_client = redis::Client::open("redis://127.0.0.1:6379/13?protocol=resp3")?;
         let checkpoint_client = redis::Client::open("redis://127.0.0.1:6379/14?protocol=resp3")?;
         let partition_client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (maintenance_push, _maintenance_push_rx) = tokio::sync::broadcast::channel(8);
         let (hot_push, _hot_push_rx) = tokio::sync::broadcast::channel(8);
         let (recovery_push, _recovery_push_rx) = tokio::sync::broadcast::channel(8);
         let (checkpoint_push, _checkpoint_push_rx) = tokio::sync::broadcast::channel(8);
         let (partition_push, _partition_push_rx) = tokio::sync::broadcast::channel(8);
+        let maintenance =
+            create_connection_manager(maintenance_client.clone(), maintenance_push).await?;
         let hot = create_connection_manager(hot_client.clone(), hot_push).await?;
         let recovery = create_connection_manager(recovery_client.clone(), recovery_push).await?;
         let checkpoint =
@@ -2807,6 +2942,7 @@ mod tests {
                 hot.clone(),
                 partition_connections[..PARTITION_COUNT as usize - 1].to_vec(),
                 recovery_connections.clone(),
+                maintenance.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2821,6 +2957,7 @@ mod tests {
                 hot.clone(),
                 extra_partition_connections,
                 recovery_connections.clone(),
+                maintenance.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2833,6 +2970,7 @@ mod tests {
                 hot.clone(),
                 partition_connections.clone(),
                 recovery_connections[..PARTITION_COUNT as usize - 1].to_vec(),
+                maintenance.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2847,6 +2985,7 @@ mod tests {
                 hot.clone(),
                 partition_connections.clone(),
                 extra_recovery_connections,
+                maintenance.clone(),
                 checkpoint.clone(),
                 hot_client.clone(),
                 CancellationToken::new(),
@@ -2858,6 +2997,7 @@ mod tests {
             hot.clone(),
             partition_connections,
             recovery_connections,
+            maintenance.clone(),
             checkpoint.clone(),
             hot_client.clone(),
             CancellationToken::new(),
@@ -2870,16 +3010,21 @@ mod tests {
         let checkpoint_game_id = game_id + PARTITION_COUNT;
         let recovery_key = namespace.recovery(game_id);
         let completion_key = namespace.completion(game_id);
+        let pending_completions_key = namespace.pending_completions(partition);
         let checkpoint_recovery_key = namespace.recovery(checkpoint_game_id);
         let checkpoint_snapshot_key = RedisKeys::game_snapshot(checkpoint_game_id);
         let active_games_key = namespace.active_games(partition);
         let assignment_key = namespace.partition_assignment(partition);
         let lease_key = namespace.partition_lease(partition);
         let command_stream = RedisKeys::stream_commands(partition);
+        let mut maintenance_raw = maintenance_client
+            .get_multiplexed_async_connection()
+            .await?;
         let mut hot_raw = hot_client.get_multiplexed_async_connection().await?;
         let mut recovery_raw = recovery_client.get_multiplexed_async_connection().await?;
         let mut checkpoint_raw = checkpoint_client.get_multiplexed_async_connection().await?;
         let mut partition_raw = partition_client.get_multiplexed_async_connection().await?;
+        let _: () = maintenance_raw.del(&pending_completions_key).await?;
         let _: () = redis::cmd("DEL")
             .arg(&recovery_key)
             .arg(&completion_key)
@@ -2922,6 +3067,16 @@ mod tests {
                 .to_string()
                 .contains("malformed record")
         );
+        let _: usize = maintenance_raw
+            .sadd(&pending_completions_key, game_id)
+            .await?;
+        assert_eq!(
+            bus.list_pending_completion_ids(&namespace, partition)
+                .await?,
+            vec![game_id]
+        );
+        assert!(!hot_raw.exists(&pending_completions_key).await?);
+        assert!(!recovery_raw.exists(&pending_completions_key).await?);
 
         let invalid_error = bus
             .publish_command(
@@ -3010,6 +3165,7 @@ mod tests {
             .query_async(&mut recovery_raw)
             .await?;
         let _: () = partition_raw.del(&command_stream).await?;
+        let _: () = maintenance_raw.del(&pending_completions_key).await?;
         let _: () = redis::cmd("DEL")
             .arg(&checkpoint_recovery_key)
             .arg(&checkpoint_snapshot_key)
@@ -3039,6 +3195,7 @@ mod tests {
             (0..PARTITION_COUNT)
                 .map(|_| manager.clone().into())
                 .collect(),
+            manager.clone(),
             manager.clone(),
             unreachable,
             CancellationToken::new(),

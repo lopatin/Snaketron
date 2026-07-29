@@ -317,6 +317,16 @@ impl GameServer {
             "Redis partition-recovery connections created successfully"
         );
 
+        // Cleanup and retry-index scans are best effort. Give them one
+        // task-wide dispatcher so a slow request cannot queue ahead of either
+        // authoritative partition traffic or crash-recovery reads.
+        let maintenance_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        info!("Redis maintenance connection created successfully");
+
         // Best-effort regional metrics scan partition indexes and recovery
         // metadata. Keep telemetry off the correctness-bearing recovery lanes.
         let metrics_redis = create_connection_manager_until_available(
@@ -355,6 +365,7 @@ impl GameServer {
             redis.clone(),
             partition_redis,
             recovery_redis,
+            maintenance_redis,
             checkpoint_redis,
             redis_client.clone(),
             cancellation_token.clone(),

@@ -107,6 +107,7 @@ async fn streams_bus(token: CancellationToken) -> Result<StreamsTestBus> {
             (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
             (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
             redis.clone(),
+            redis.clone(),
             client,
             token,
         )?,
@@ -518,7 +519,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
 }
 
 #[tokio::test]
-async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
+async fn group_aware_bounded_trim_never_deletes_large_pending_backlog() -> Result<()> {
     let _test_lock = STREAMS_TEST_LOCK.lock().await;
     timeout(Duration::from_secs(30), async {
         use redis::AsyncCommands;
@@ -624,9 +625,26 @@ async fn group_aware_trim_never_deletes_large_pending_backlog() -> Result<()> {
         for batch in pending_ids.chunks(128) {
             assert_eq!(bus.xack_fenced(&successor_guard, batch).await?, batch.len());
         }
-        let trimmed = bus.trim_executor_commands_fenced(&successor_guard).await?;
-        assert!(trimmed >= TOTAL - 1);
-        assert!(redis.xlen::<_, usize>(&stream).await? <= 1);
+        let mut total_trimmed = 0;
+        let mut trim_passes = 0;
+        let mut settled = false;
+        for _ in 0..16 {
+            trim_passes += 1;
+            let trimmed = bus.trim_executor_commands_fenced(&successor_guard).await?;
+            total_trimmed += trimmed;
+            if trimmed == 0 {
+                settled = true;
+                break;
+            }
+        }
+        let retained = redis.xlen::<_, usize>(&stream).await?;
+        assert!(settled, "bounded trim did not settle within 16 passes");
+        assert!(trim_passes > 2, "the maintenance limit was not exercised");
+        assert_eq!(retained, TOTAL - total_trimmed);
+        assert!(
+            retained <= 1_024,
+            "approximate trim retained more than one bounded macro-node window"
+        );
 
         let _: () = redis
             .del(&[

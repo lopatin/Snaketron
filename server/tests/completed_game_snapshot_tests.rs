@@ -32,6 +32,7 @@ async fn test_game_bus() -> Result<(GameBus, redis::aio::ConnectionManager)> {
         redis.clone(),
         (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
         (0..PARTITION_COUNT).map(|_| redis.clone().into()).collect(),
+        redis.clone(),
         redis,
         client,
         CancellationToken::new(),

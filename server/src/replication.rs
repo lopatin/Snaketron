@@ -1015,6 +1015,7 @@ mod tests {
                 (0..PARTITION_COUNT)
                     .map(|_| manager.clone().into())
                     .collect(),
+                manager.clone(),
                 manager,
                 client,
                 CancellationToken::new(),

@@ -1613,6 +1613,7 @@ async fn run_game_executor_v2(
     let mut completion_retry = tokio::time::interval(COMPLETION_RETRY_INTERVAL);
     completion_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut completion_worker: Option<JoinHandle<Result<()>>> = None;
+    let mut trim_worker: Option<JoinHandle<Result<usize>>> = None;
 
     let result: Result<()> = async {
         loop {
@@ -1697,6 +1698,14 @@ async fn run_game_executor_v2(
                                         Err(error) => warn!(partition, %error, "pending completion retry worker panicked"),
                                     }
                                 }
+                                if trim_worker.as_ref().is_some_and(|task| task.is_finished()) {
+                                    let task = trim_worker.take().expect("finished worker exists");
+                                    match task.await {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(error)) => warn!(partition, %error, "executor command trim failed"),
+                                        Err(error) => warn!(partition, %error, "executor command trim worker panicked"),
+                                    }
+                                }
                                 if completion_worker.is_none() {
                                     let retry_bus = bus.clone();
                                     let retry_guard = guard.clone();
@@ -1711,8 +1720,12 @@ async fn run_game_executor_v2(
                                         ).await
                                     }));
                                 }
-                                if let Err(error) = bus.trim_executor_commands_fenced(&guard).await {
-                                    warn!(partition, %error, "executor command trim failed");
+                                if trim_worker.is_none() {
+                                    let trim_bus = bus.clone();
+                                    let trim_guard = guard.clone();
+                                    trim_worker = Some(tokio::spawn(async move {
+                                        trim_bus.trim_executor_commands_fenced(&trim_guard).await
+                                    }));
                                 }
                             }
                             LiveExecutorWork::SnapshotRequest(request) => {
@@ -1756,6 +1769,9 @@ async fn run_game_executor_v2(
     // This also cancels an in-flight completion read through the child token.
     fatal.cancel();
     if let Some(worker) = completion_worker {
+        worker.abort();
+    }
+    if let Some(worker) = trim_worker {
         worker.abort();
     }
     watchdog_stop.cancel();
@@ -2620,6 +2636,7 @@ mod tests {
     use crate::db::ServerRegistration;
     use crate::db::models::{CustomLobby, Game, GamePlayer, HighScoreEntry, RankingEntry, User};
     use crate::redis_keys::RedisKeys;
+    use crate::redis_utils::RedisConnection;
     use common::{CommandId, Direction, GameCommand, GameState, GameType, Position, QueueMode};
     use redis::AsyncCommands;
 
@@ -4183,6 +4200,7 @@ mod tests {
         _test_lock: tokio::sync::MutexGuard<'static, ()>,
         token: CancellationToken,
         bus: Arc<GameBus>,
+        maintenance: RedisConnection,
         raw: redis::aio::MultiplexedConnection,
         leases: PartitionLeaseStore,
         namespace: ClusterNamespace,
@@ -4217,6 +4235,11 @@ mod tests {
             let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(8);
             let manager =
                 crate::redis_utils::create_connection_manager(client.clone(), pubsub_tx).await?;
+            let (maintenance_tx, _maintenance_rx) = tokio::sync::broadcast::channel(8);
+            let maintenance: RedisConnection =
+                crate::redis_utils::create_connection_manager(client.clone(), maintenance_tx)
+                    .await?
+                    .into();
             let token = CancellationToken::new();
             let bus = Arc::new(GameBus::new(
                 manager.clone(),
@@ -4226,6 +4249,7 @@ mod tests {
                 (0..PARTITION_COUNT)
                     .map(|_| manager.clone().into())
                     .collect(),
+                maintenance.clone(),
                 manager.clone(),
                 client,
                 token.clone(),
@@ -4308,6 +4332,7 @@ mod tests {
                 _test_lock: test_lock,
                 token,
                 bus,
+                maintenance,
                 raw,
                 leases,
                 namespace,
@@ -7083,6 +7108,109 @@ mod tests {
             executor_result?;
 
             let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_executor_processes_commands_while_maintenance_is_blocked() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("blocked-maintenance").await?;
+            let mut baseline = harness.recovery().await?;
+            baseline.game_state.start_ms = chrono::Utc::now().timestamp_millis() + 60_000;
+            baseline.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(&harness.guard, &baseline, &[], Duration::from_secs(60))
+                .await?;
+
+            let stall_key = format!("snaketron:test:blocked-maintenance:{}", harness.game_id);
+            let lane_name = format!("snaketron-maintenance-{}", harness.game_id);
+            let _: () = harness.raw.del(&stall_key).await?;
+            let mut stalled_maintenance = harness.maintenance.clone();
+            let _: () = redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(&lane_name)
+                .query_async(&mut stalled_maintenance)
+                .await?;
+            let blocked_key = stall_key.clone();
+            let blocked_read = tokio::spawn(async move {
+                redis::cmd("BLPOP")
+                    .arg(blocked_key)
+                    .arg(0)
+                    .query_async::<Option<(String, String)>>(&mut stalled_maintenance)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let clients: String = redis::cmd("CLIENT")
+                        .arg("LIST")
+                        .query_async(&mut harness.raw)
+                        .await?;
+                    if clients.lines().any(|line| {
+                        line.contains(&format!("name={lane_name}")) && line.contains("cmd=blpop")
+                    }) {
+                        return Result::<()>::Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .context("maintenance lane did not enter its blocking operation")??;
+
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let executor_cancel = CancellationToken::new();
+            let config = RecoveryConfig {
+                checkpoint_interval: Duration::from_millis(25),
+                ..RecoveryConfig::default()
+            };
+            let (_handle, task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                config,
+                executor_cancel.clone(),
+            );
+            wait_for_game_snapshot(&mut events, harness.game_id).await?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            let stream_id = harness.append_command().await?;
+            tokio::time::timeout(Duration::from_millis(600), async {
+                loop {
+                    if harness.recovery().await?.command_cursor == stream_id {
+                        return Result::<()>::Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("authoritative command processing waited for maintenance")??;
+            assert!(
+                !blocked_read.is_finished(),
+                "maintenance lane unexpectedly released before command processing"
+            );
+
+            let _: usize = harness.raw.rpush(&stall_key, "release").await?;
+            tokio::time::timeout(Duration::from_secs(1), blocked_read)
+                .await
+                .context("maintenance blocking operation did not release")???;
+            executor_cancel.cancel();
+            let executor_result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .context("executor did not stop after test cancellation")?
+                .context("executor task panicked")?;
+            executor_result?;
+
+            let live_guard = harness.guard.clone();
+            let _: () = harness.raw.del(&stall_key).await?;
             harness.cleanup(&live_guard).await?;
             Result::<()>::Ok(())
         })

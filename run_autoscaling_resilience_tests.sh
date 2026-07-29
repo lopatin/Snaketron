@@ -29,6 +29,8 @@ ecs_runtime_monitor_pid=""
 ecs_runtime_monitor_dir=""
 hard_crash_control_observer_pid=""
 hard_crash_control_observer_stop_file=""
+hard_crash_ownership_observer_pid=""
+hard_crash_ownership_observer_stop_file=""
 hard_crash_ecs_exec_pid=""
 
 require_command() {
@@ -121,7 +123,37 @@ select_post_kill_pending_control_sample() {
   ' "$@"
 }
 
-select_hard_crash_owner_ready_control_sample() {
+select_pre_fault_ownership_sample() {
+  local partition="$1"
+  local killed_boot_id="$2"
+  local killed_lease_token="$3"
+  shift 3
+  (( $# > 0 )) || return 1
+  jq -es \
+    --argjson partition "$partition" \
+    --arg killed_boot_id "$killed_boot_id" \
+    --arg killed_lease_token "$killed_lease_token" '
+      [.[]
+        | select(
+            .observation_started_at_ms <= .captured_at_ms
+            and .captured_at_ms <= .observation_completed_at_ms)
+        | (.runtime_partitions[]
+            | select(.partition == $partition)) as $runtime
+        | select(
+            .authority_stable
+            and .killed_member_live
+            and $runtime.owner_matches
+            and $runtime.desired_owner == $killed_boot_id
+            and $runtime.active_owner == $killed_boot_id
+            and $runtime.lease_token == $killed_lease_token
+            and any(.live_members[];
+              .boot_id == $killed_boot_id
+              and .lifecycle == "ACTIVE"))]
+      | min_by(.observation_completed_at_ms)
+  ' "$@"
+}
+
+select_hard_crash_owner_ready_ownership_sample() {
   local pre="$1"
   local execution_stopped_at_ms="$2"
   local partition="$3"
@@ -149,7 +181,8 @@ select_hard_crash_owner_ready_control_sample() {
           | (.runtime_partitions[]
               | select(.partition == $partition)) as $new
           | select(
-              ([.live_members[].boot_id] | index($killed_boot_id)) == null
+              .authority_stable
+              and .killed_member_live == false
               and .assignment.version > $pre[0].assignment.version
               and $new.owner_matches
               and $new.desired_owner != $killed_boot_id
@@ -1258,6 +1291,7 @@ test_hard_crash_evidence_selectors() {
   local killed_lease_token="${killed_boot_id}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   local survivor_lease_token="${survivor_boot_id}:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
   local pre="$fixture_dir/pre.json"
+  local ownership_pre="$fixture_dir/ownership-pre.json"
   local post_pending="$fixture_dir/post-pending.json"
   local owner_valid="$fixture_dir/owner-valid.json"
   local selected="$fixture_dir/selected.json"
@@ -1298,6 +1332,17 @@ test_hard_crash_evidence_selectors() {
       }
     ' >"$pre"
   jq \
+    --arg killed_boot "$killed_boot_id" \
+    --arg killed_task "$killed_task_id" '
+      .authority_stable = true
+      | .killed_member_live = true
+      | .live_members = [{
+          boot_id: $killed_boot,
+          ecs_task_id: $killed_task,
+          lifecycle: "ACTIVE"
+        }]
+    ' "$pre" >"$ownership_pre"
+  jq \
     --argjson stopped "$execution_stopped_at_ms" \
     --arg survivor_boot "$survivor_boot_id" \
     --arg survivor_task "$survivor_task_id" \
@@ -1321,6 +1366,8 @@ test_hard_crash_evidence_selectors() {
       .observation_started_at_ms = $stopped
       | .captured_at_ms = ($stopped + 2500)
       | .observation_completed_at_ms = ($stopped + 5000)
+      | .authority_stable = true
+      | .killed_member_live = false
       | .runtime_partitions[0].pending_entry_sample = []
     ' "$post_pending" >"$owner_valid"
 
@@ -1339,6 +1386,11 @@ test_hard_crash_evidence_selectors() {
     "$fixture_dir/pre-invalid-interval.json" >/dev/null 2>&1; then
     result=1
   fi
+  select_pre_fault_ownership_sample \
+    "$partition" "$killed_boot_id" "$killed_lease_token" \
+    "$ownership_pre" >"$selected" || result=1
+  jq -e '.authority_stable and .killed_member_live' \
+    "$selected" >/dev/null || result=1
 
   [[ "$(ecs_timestamp_to_unix_ms \
     "2026-07-29T15:50:36.421000+00:00")" == "$execution_stopped_at_ms" ]] \
@@ -1363,7 +1415,7 @@ test_hard_crash_evidence_selectors() {
       and .runtime_partitions[0].active_owner == $survivor
     ' "$selected" >/dev/null || result=1
 
-  select_hard_crash_owner_ready_control_sample \
+  select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$owner_valid" >"$selected" || result=1
@@ -1413,16 +1465,25 @@ test_hard_crash_evidence_selectors() {
       | .assignment.version = 41
       | .runtime_partitions[0].lease_token = $killed_token
     ' "$owner_valid" >"$fixture_dir/owner-unfenced.json"
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-unfenced.json" >/dev/null 2>&1; then
     result=1
   fi
-  jq --slurpfile pre "$pre" \
-    '.live_members += [$pre[0].live_members[0]]' \
+  jq \
+    '.authority_stable = false' \
+    "$owner_valid" >"$fixture_dir/owner-incoherent.json"
+  if select_hard_crash_owner_ready_ownership_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-incoherent.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    '.killed_member_live = true' \
     "$owner_valid" >"$fixture_dir/owner-killed-member-live.json"
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-killed-member-live.json" >/dev/null 2>&1; then
@@ -1440,7 +1501,7 @@ test_hard_crash_evidence_selectors() {
       | .runtime_partitions[0].lease_token =
           ($replacement_boot + ":cccccccc-cccc-4ccc-8ccc-cccccccccccc")
     ' "$owner_valid" >"$fixture_dir/owner-replacement.json"
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-replacement.json" >/dev/null 2>&1; then
@@ -1450,7 +1511,7 @@ test_hard_crash_evidence_selectors() {
     --argjson stopped "$execution_stopped_at_ms" \
     '.observation_completed_at_ms = ($stopped + 5001)' \
     "$owner_valid" >"$fixture_dir/owner-late.json"
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-late.json" >/dev/null 2>&1; then
@@ -1460,7 +1521,7 @@ test_hard_crash_evidence_selectors() {
     --argjson stopped "$execution_stopped_at_ms" '
       .observation_started_at_ms = ($stopped - 1)
     ' "$owner_valid" >"$fixture_dir/owner-started-early.json"
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-started-early.json" >/dev/null 2>&1; then
@@ -1477,7 +1538,7 @@ test_hard_crash_evidence_selectors() {
     >/dev/null 2>&1; then
     result=1
   fi
-  if select_hard_crash_owner_ready_control_sample \
+  if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     >/dev/null 2>&1; then
@@ -2768,6 +2829,9 @@ collect_cloudwatch_evidence() {
   cloudwatch_metric "$cloudwatch_dir/ready-tasks.json" \
     Snaketron/Resilience ReadyTasks Minimum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
+  cloudwatch_metric "$cloudwatch_dir/regional-collection-failures.json" \
+    Snaketron/Resilience RegionalCollectionFailures Sum \
+    Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/fingerprint-divergences.json" \
     Snaketron/Resilience RecoveryFingerprintDivergences Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
@@ -2871,6 +2935,8 @@ collect_cloudwatch_evidence() {
   # reports below prove the Gate B and Gate C fleet envelopes.
   jq -e 'all(.Datapoints[]; .Minimum > 0)' \
     "$cloudwatch_dir/ready-tasks.json" >/dev/null \
+    && jq -e '([.Datapoints[].Sum] | add) == 0' \
+      "$cloudwatch_dir/regional-collection-failures.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/fingerprint-divergences.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
@@ -3126,6 +3192,18 @@ capture_control_status() {
     --region-key "$SNAKETRON_REGION_CODE" >"$output"
 }
 
+capture_ownership_status() {
+  local output="$1"
+  local partition="$2"
+  local killed_boot_id="$3"
+  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+    timeout --signal=TERM --kill-after=1s 3s \
+      "$resilience_admin" ownership \
+      --region-key "$SNAKETRON_REGION_CODE" \
+      --partition "$partition" \
+      --killed-boot-id "$killed_boot_id" >"$output"
+}
+
 stop_hard_crash_control_observer() {
   if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
     if ! touch "$hard_crash_control_observer_stop_file" 2>/dev/null \
@@ -3139,8 +3217,22 @@ stop_hard_crash_control_observer() {
   if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
     rm -f "$hard_crash_control_observer_stop_file"
   fi
+  if [[ -n "$hard_crash_ownership_observer_stop_file" ]]; then
+    if ! touch "$hard_crash_ownership_observer_stop_file" 2>/dev/null \
+      && [[ -n "$hard_crash_ownership_observer_pid" ]]; then
+      kill -TERM "$hard_crash_ownership_observer_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "$hard_crash_ownership_observer_pid" ]]; then
+    wait "$hard_crash_ownership_observer_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$hard_crash_ownership_observer_stop_file" ]]; then
+    rm -f "$hard_crash_ownership_observer_stop_file"
+  fi
   hard_crash_control_observer_pid=""
   hard_crash_control_observer_stop_file=""
+  hard_crash_ownership_observer_pid=""
+  hard_crash_ownership_observer_stop_file=""
 }
 
 inject_hard_crash_and_prove_takeover() {
@@ -3223,9 +3315,8 @@ inject_hard_crash_and_prove_takeover() {
       }
     ' >"$report_dir/hard-crash-manifest.json"
 
-  # Bracket each read-only control-plane observation because the status command
-  # performs several Redis reads rather than one atomic snapshot. Acceptance
-  # requires the complete observation interval to fit inside its deadline.
+  # Keep the rich status observer for the exact PEL proof. It performs several
+  # Redis reads, so acceptance brackets and bounds the complete interval.
   local control_observation_dir="$report_dir/hard-crash-control-samples"
   mkdir -p "$control_observation_dir"
   hard_crash_control_observer_stop_file="$control_observation_dir/stop-requested"
@@ -3282,8 +3373,74 @@ inject_hard_crash_and_prove_takeover() {
   ) &
   hard_crash_control_observer_pid=$!
 
-  # Do not start the external fault until the observer has published a valid
-  # old-owner/token sample. This closes the fork-before-first-sample race.
+  # Ownership has a separate lightweight observer. Its command sandwiches one
+  # atomic membership read between two atomic partition-local assignment/lease
+  # reads, avoiding PEL enumeration on the five-second takeover path.
+  local ownership_observation_dir="$report_dir/hard-crash-ownership-samples"
+  mkdir -p "$ownership_observation_dir"
+  hard_crash_ownership_observer_stop_file="$ownership_observation_dir/stop-requested"
+  rm -f "$hard_crash_ownership_observer_stop_file"
+  local ownership_observer_stop_file="$hard_crash_ownership_observer_stop_file"
+  (
+    local observer_stop_requested=false
+    trap 'observer_stop_requested=true' TERM INT
+    local observation_sequence=0
+    while [[ "$observer_stop_requested" != true \
+      && ! -e "$ownership_observer_stop_file" ]]; do
+      observation_sequence=$((observation_sequence + 1))
+      local observation_started_at_ms
+      local observation_completed_at_ms
+      local observation_raw
+      local observation_pending
+      local observation_sample
+      printf -v observation_raw \
+        '%s/%06d.raw.pending' "$ownership_observation_dir" "$observation_sequence"
+      printf -v observation_pending \
+        '%s/%06d.json.pending' "$ownership_observation_dir" "$observation_sequence"
+      printf -v observation_sample \
+        '%s/%06d.json' "$ownership_observation_dir" "$observation_sequence"
+      observation_started_at_ms="$(unix_time_ms)"
+      if capture_ownership_status \
+        "$observation_raw" \
+        "$killed_partition" \
+        "$killed_boot_id" 2>/dev/null; then
+        observation_completed_at_ms="$(unix_time_ms)"
+        if jq -e \
+          --argjson partition "$killed_partition" \
+          --argjson observation_started_at_ms "$observation_started_at_ms" \
+          --argjson observation_completed_at_ms "$observation_completed_at_ms" '
+            {
+              observation_started_at_ms: $observation_started_at_ms,
+              observation_completed_at_ms: $observation_completed_at_ms,
+              captured_at_ms,
+              membership_observed_at_ms,
+              authority_stable,
+              killed_member_live,
+              assignment,
+              live_members: (
+                if .owner_member == null then [] else [.owner_member] end),
+              runtime_partitions: [
+                .runtime_partition
+                | select(.partition == $partition)
+              ]
+            }
+            | select(
+                (.runtime_partitions | length) == 1
+                and .observation_started_at_ms <= .captured_at_ms
+                and .captured_at_ms <= .observation_completed_at_ms)
+          ' "$observation_raw" >"$observation_pending"; then
+          mv "$observation_pending" "$observation_sample"
+        fi
+      fi
+      rm -f "$observation_raw" "$observation_pending"
+      sleep 0.05
+    done
+  ) &
+  hard_crash_ownership_observer_pid=$!
+
+  # Do not start the external fault until both observers have published valid
+  # old-owner/token samples. This closes the fork-before-first-sample race for
+  # both independently selected proofs.
   local observer_ready="$report_dir/control-plane-observer-ready-before-exec.json"
   local observer_ready_candidate="$observer_ready.pending"
   local observer_ready_deadline=$((SECONDS + 10))
@@ -3309,6 +3466,34 @@ inject_hard_crash_and_prove_takeover() {
     stop_hard_crash_control_observer
     rm -f "$observer_ready_candidate"
     echo "The hard-crash observer did not establish a valid pre-fault sample" >&2
+    return 1
+  fi
+  local ownership_observer_ready="$report_dir/ownership-observer-ready-before-exec.json"
+  local ownership_observer_ready_candidate="$ownership_observer_ready.pending"
+  local ownership_observer_ready_deadline=$((SECONDS + 10))
+  local -a ownership_observer_startup_samples=()
+  while (( SECONDS < ownership_observer_ready_deadline )); do
+    ownership_observer_startup_samples=( "$ownership_observation_dir"/*.json )
+    if [[ -e "${ownership_observer_startup_samples[0]}" ]]; then
+      if select_pre_fault_ownership_sample \
+        "$killed_partition" \
+        "$killed_boot_id" \
+        "$killed_lease_token" \
+        "${ownership_observer_startup_samples[@]}" \
+        >"$ownership_observer_ready_candidate" 2>/dev/null \
+        && jq -e 'type == "object"' \
+          "$ownership_observer_ready_candidate" >/dev/null; then
+        mv "$ownership_observer_ready_candidate" "$ownership_observer_ready"
+        break
+      fi
+      rm -f "$ownership_observer_ready_candidate"
+    fi
+    sleep 0.1
+  done
+  if [[ ! -f "$ownership_observer_ready" ]]; then
+    stop_hard_crash_control_observer
+    rm -f "$ownership_observer_ready_candidate"
+    echo "The ownership observer did not establish a valid pre-fault sample" >&2
     return 1
   fi
 
@@ -3377,10 +3562,11 @@ inject_hard_crash_and_prove_takeover() {
     fi
   fi
 
-  # Select both proofs from the same pre-started observation stream. The PEL
-  # proof requires exact old-consumer command IDs no later than two seconds
-  # after the stop. Ownership must advance to a new fenced token on a member
-  # that was already present before the crash, no later than five seconds.
+  # Select the PEL proof from the rich stream and ownership from the lightweight
+  # stream. The PEL proof requires exact old-consumer command IDs no later than
+  # two seconds after the stop. Ownership must advance to a new fenced token on
+  # a member that was already present before the crash, no later than five
+  # seconds.
   local pending_after_kill="$report_dir/control-plane-immediate-post-kill.json"
   local pending_candidate="$pending_after_kill.pending"
   local owner_ready="$report_dir/control-plane-hard-crash-owner-ready.json"
@@ -3388,6 +3574,7 @@ inject_hard_crash_and_prove_takeover() {
   if [[ -z "$failure_reason" ]]; then
     local proof_deadline=$((SECONDS + 10))
     local -a control_samples=()
+    local -a ownership_samples=()
     while (( SECONDS < proof_deadline )); do
       control_samples=( "$control_observation_dir"/*.json )
       if [[ -e "${control_samples[0]}" ]]; then
@@ -3403,24 +3590,27 @@ inject_hard_crash_and_prove_takeover() {
             rm -f "$pending_candidate"
           fi
         fi
+      fi
+      ownership_samples=( "$ownership_observation_dir"/*.json )
+      if [[ -e "${ownership_samples[0]}" ]]; then
         if [[ ! -f "$owner_ready" ]]; then
-          if select_hard_crash_owner_ready_control_sample \
+          if select_hard_crash_owner_ready_ownership_sample \
             "$pre" \
             "$execution_stopped_at_ms" \
             "$killed_partition" \
             "$killed_boot_id" \
             "$killed_task_id" \
             "$killed_lease_token" \
-            "${control_samples[@]}" >"$owner_candidate" 2>/dev/null \
+            "${ownership_samples[@]}" >"$owner_candidate" 2>/dev/null \
             && jq -e 'type == "object"' "$owner_candidate" >/dev/null; then
             mv "$owner_candidate" "$owner_ready"
           else
             rm -f "$owner_candidate"
           fi
         fi
-        if [[ -f "$pending_after_kill" && -f "$owner_ready" ]]; then
-          break
-        fi
+      fi
+      if [[ -f "$pending_after_kill" && -f "$owner_ready" ]]; then
+        break
       fi
       sleep 0.1
     done
@@ -3438,7 +3628,11 @@ inject_hard_crash_and_prove_takeover() {
     ecs_exec_session_started=true
   fi
 
-  rm -f "$task_stop_candidate" "$pending_candidate" "$owner_candidate"
+  rm -f \
+    "$task_stop_candidate" \
+    "$pending_candidate" \
+    "$owner_candidate" \
+    "$ownership_observer_ready_candidate"
   if [[ -z "$failure_reason" && "$ecs_exec_session_started" != true ]]; then
     failure_reason="ECS Exec did not establish the single non-retried session before the selected task stopped"
   fi
@@ -3466,6 +3660,7 @@ inject_hard_crash_and_prove_takeover() {
     --argjson ecs_exec_session_started "$ecs_exec_session_started" \
     --argjson partition "$killed_partition" \
     --slurpfile observer_ready "$observer_ready" \
+    --slurpfile ownership_observer_ready "$ownership_observer_ready" \
     --slurpfile observed "$pending_after_kill" \
     --slurpfile ready "$owner_ready" '
       . + {
@@ -3479,6 +3674,8 @@ inject_hard_crash_and_prove_takeover() {
         ecs_exec_session_started: $ecs_exec_session_started,
         observer_ready_before_exec_at_unix_ms:
           $observer_ready[0].observation_completed_at_ms,
+        ownership_observer_ready_before_exec_at_unix_ms:
+          $ownership_observer_ready[0].observation_completed_at_ms,
         pending_after_kill: {
           captured_at_unix_ms: $observed[0].captured_at_ms,
           observation_started_at_unix_ms:
@@ -3540,6 +3737,8 @@ collect_crash_ecs_runtime_evidence() {
         and $manifest[0].ecs_exec_session_started == true
         and $manifest[0].observer_ready_before_exec_at_unix_ms
           <= $manifest[0].ecs_exec_invoked_at_unix_ms
+        and $manifest[0].ownership_observer_ready_before_exec_at_unix_ms
+          <= $manifest[0].ecs_exec_invoked_at_unix_ms
         and $manifest[0].ecs_exec_invoked_at_unix_ms
           <= $manifest[0].execution_stopped_at_unix_ms
         and $manifest[0].execution_stopped_at_unix_ms
@@ -3592,6 +3791,7 @@ assert_hard_crash_report() {
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
     --slurpfile pre "$report_dir/control-plane-pre-crash-10.json" \
     --slurpfile observer_ready "$report_dir/control-plane-observer-ready-before-exec.json" \
+    --slurpfile ownership_observer_ready "$report_dir/ownership-observer-ready-before-exec.json" \
     --slurpfile pending_after_kill "$report_dir/control-plane-immediate-post-kill.json" \
     --slurpfile owner_ready "$report_dir/control-plane-hard-crash-owner-ready.json" \
     --slurpfile final "$report_dir/control-plane-hard-crash-final-10.json" '
@@ -3622,6 +3822,8 @@ assert_hard_crash_report() {
           | select(.partition == $partition)) as $new
       | ($observer_ready[0].runtime_partitions[]
           | select(.partition == $partition)) as $observer_partition
+      | ($ownership_observer_ready[0].runtime_partitions[]
+          | select(.partition == $partition)) as $ownership_observer_partition
       | ($m.pending_after_kill.entries | map(.id) | unique | sort) as $pending_ids
       | ([$pending_after_kill[0].runtime_partitions[]
           | select(.partition == $partition)
@@ -3703,7 +3905,22 @@ assert_hard_crash_report() {
                 == $m.selected_partition.lease_token
               and any($observer_partition.pending_entry_sample[];
                 .consumer == $m.selected_partition.lease_token)
+              and $m.ownership_observer_ready_before_exec_at_unix_ms
+                == $ownership_observer_ready[0].observation_completed_at_ms
+              and $ownership_observer_ready[0].authority_stable
+              and $ownership_observer_ready[0].killed_member_live
+              and $ownership_observer_ready[0].observation_started_at_ms
+                <= $ownership_observer_ready[0].captured_at_ms
+              and $ownership_observer_ready[0].captured_at_ms
+                <= $ownership_observer_ready[0].observation_completed_at_ms
+              and $ownership_observer_partition.owner_matches
+              and $ownership_observer_partition.active_owner
+                == $m.selected_member.boot_id
+              and $ownership_observer_partition.lease_token
+                == $m.selected_partition.lease_token
               and $m.observer_ready_before_exec_at_unix_ms
+                <= $m.ecs_exec_invoked_at_unix_ms
+              and $m.ownership_observer_ready_before_exec_at_unix_ms
                 <= $m.ecs_exec_invoked_at_unix_ms
               and $m.ecs_exec_invoked_at_unix_ms <= $exact_stop
               and $exact_stop <= $m.task_stop_observed_at_unix_ms
@@ -3724,8 +3941,14 @@ assert_hard_crash_report() {
             affected_reconnects: (
               ($affected | length) > 0
               and ($all_recoveries | length) == ($affected | length)
-              and $r.metrics.traffic.disconnects == ($affected | length)
-              and $r.metrics.traffic.reconnects == ($affected | length)),
+              # Traffic counters count connection attempts, including a
+              # retryable reconnect whose first replacement socket does not
+              # reach a fresh snapshot. Hard recoveries count completed
+              # game-ready outcomes, so require every attempt to be balanced
+              # without incorrectly requiring the populations to be equal.
+              and $r.metrics.traffic.disconnects >= ($affected | length)
+              and $r.metrics.traffic.reconnects
+                == $r.metrics.traffic.disconnects),
             pending_backlog: (
               $m.pending_after_kill.partition == $partition
               and $m.pending_after_kill.killed_lease_token
@@ -3767,8 +3990,8 @@ assert_hard_crash_report() {
                 == $owner_ready[0].assignment.version
               and $owner_ready[0].assignment.version
                 > $pre[0].assignment.version
-              and (([$owner_ready[0].live_members[].boot_id]
-                | index($m.selected_member.boot_id)) == null)
+              and $owner_ready[0].authority_stable
+              and $owner_ready[0].killed_member_live == false
               and $new.owner_matches
               and $new.desired_owner != $m.selected_member.boot_id
               and $new.active_owner == $new.desired_owner
@@ -3906,6 +4129,8 @@ run_staging_suite() {
   ecs_runtime_monitor_dir=""
   hard_crash_control_observer_pid=""
   hard_crash_control_observer_stop_file=""
+  hard_crash_ownership_observer_pid=""
+  hard_crash_ownership_observer_stop_file=""
   hard_crash_ecs_exec_pid=""
 
   set_scaling_suspended() {

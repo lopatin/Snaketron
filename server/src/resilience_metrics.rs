@@ -26,6 +26,8 @@ use tracing::warn;
 const EMF_NAMESPACE: &str = "Snaketron/Resilience";
 const DEFAULT_EMIT_INTERVAL_SECS: u64 = 15;
 const OWNERSHIP_SAMPLE_INTERVAL_MS: i64 = 500;
+const REGIONAL_COLLECTION_TIMEOUT_MS: u64 = 500;
+const RECOVERY_METADATA_BATCH_SIZE: usize = 32;
 const RECOVERY_TAIL_SAMPLE_BYTES: i64 = 512;
 const CHECKPOINTED_AT_MARKER: &[u8] = b"\"checkpointed_at_ms\":";
 const SOURCE_LEASE_TOKEN_MARKER: &[u8] = b"\"source_lease_token\":\"";
@@ -126,6 +128,7 @@ fn take_counter_snapshot() -> CounterSnapshot {
 
 #[derive(Default)]
 struct RegionalGauges {
+    regional_collection_failures: u64,
     ready_tasks: u64,
     live_tasks: u64,
     draining_tasks: u64,
@@ -151,6 +154,44 @@ fn expected_recovery_prefix(partition: u32, game_id: u32) -> String {
     format!(
         "{{\"schema_version\":{RECOVERY_SCHEMA_VERSION},\"executor_protocol_version\":{EXECUTOR_PROTOCOL_VERSION},\"game_id\":{game_id},\"partition_id\":{partition},"
     )
+}
+
+async fn read_recovery_metadata_batch(
+    redis: &mut RedisConnection,
+    namespace: &ClusterNamespace,
+    indexed_games: &[(u32, String, i64)],
+) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
+    if indexed_games.len() > RECOVERY_METADATA_BATCH_SIZE {
+        anyhow::bail!("recovery metadata batch exceeds fixed limit {RECOVERY_METADATA_BATCH_SIZE}");
+    }
+    let script = redis::Script::new(
+        r#"
+        local result = {}
+        local tail_bytes = tonumber(ARGV[#KEYS + 1])
+        for index, key in ipairs(KEYS) do
+            local checkpoint_bytes = redis.call('STRLEN', key)
+            result[index] = {
+                checkpoint_bytes,
+                redis.call('GETRANGE', key, 0, tonumber(ARGV[index])),
+                redis.call('GETRANGE', key, -tail_bytes, -1)
+            }
+        end
+        return result
+        "#,
+    );
+    let mut invocation = script.prepare_invoke();
+    for (game_id, _, _) in indexed_games {
+        invocation.key(namespace.recovery(*game_id));
+    }
+    for (_, _, prefix_end) in indexed_games {
+        invocation.arg(*prefix_end);
+    }
+    invocation.arg(RECOVERY_TAIL_SAMPLE_BYTES);
+    let metadata = invocation
+        .invoke_async(redis)
+        .await
+        .context("failed to inspect active recovery checkpoint metadata")?;
+    Ok(metadata)
 }
 
 fn checkpointed_at_ms_from_tail(tail: &[u8]) -> Option<i64> {
@@ -267,7 +308,6 @@ pub fn spawn_resilience_metrics(
         ));
         ownership_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut partition_outages = PartitionOutageTracker::default();
-
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
@@ -291,11 +331,17 @@ pub fn spawn_resilience_metrics(
                         Ok(Ok(gauges)) => gauges,
                         Ok(Err(error)) => {
                             warn!(%error, "final resilience metrics collection failed");
-                            RegionalGauges::default()
+                            RegionalGauges {
+                                regional_collection_failures: 1,
+                                ..RegionalGauges::default()
+                            }
                         }
                         Err(_) => {
                             warn!("final resilience metrics collection timed out");
-                            RegionalGauges::default()
+                            RegionalGauges {
+                                regional_collection_failures: 1,
+                                ..RegionalGauges::default()
+                            }
                         }
                     };
                     gauges.partition_unowned_ms = gauges
@@ -315,17 +361,20 @@ pub fn spawn_resilience_metrics(
                 },
                 _ = interval.tick() => {
                     let now_ms = chrono::Utc::now().timestamp_millis();
-                    let result = collect_regional_gauges(
-                        redis.clone(),
-                        &namespace,
-                        &membership,
-                        &assignment,
-                        server_id,
-                        now_ms,
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_millis(REGIONAL_COLLECTION_TIMEOUT_MS),
+                        collect_regional_gauges(
+                            redis.clone(),
+                            &namespace,
+                            &membership,
+                            &assignment,
+                            server_id,
+                            now_ms,
+                        ),
                     ).await;
                     let sampled_unowned_ms = partition_outages.take_window_max(now_ms);
                     match result {
-                        Ok(mut gauges) => {
+                        Ok(Ok(mut gauges)) => {
                             gauges.partition_unowned_ms = gauges
                                 .partition_unowned_ms
                                 .max(sampled_unowned_ms);
@@ -340,7 +389,7 @@ pub fn spawn_resilience_metrics(
                             now_ms,
                             )
                         },
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             warn!(%error, "regional resilience metrics collection failed");
                             // Local health must remain observable even when
                             // the regional Valkey-backed gauges cannot be
@@ -348,6 +397,25 @@ pub fn spawn_resilience_metrics(
                             // during a cache outage instead of relying only on
                             // CloudWatch missing-data behavior.
                             let gauges = RegionalGauges {
+                                regional_collection_failures: 1,
+                                partition_unowned_ms: sampled_unowned_ms,
+                                ..RegionalGauges::default()
+                            };
+                            emit_emf(
+                                &environment,
+                                namespace.region(),
+                                &task_boot_id,
+                                lifecycle.is_ready(),
+                                lifecycle.active_websockets() as u64,
+                                gauges,
+                                take_counter_snapshot(),
+                                now_ms,
+                            );
+                        },
+                        Err(_) => {
+                            warn!("regional resilience metrics collection timed out");
+                            let gauges = RegionalGauges {
+                                regional_collection_failures: 1,
                                 partition_unowned_ms: sampled_unowned_ms,
                                 ..RegionalGauges::default()
                             };
@@ -518,55 +586,61 @@ async fn collect_regional_gauges(
     gauges.pending_completions = pending_completions;
     gauges.quarantined_commands = quarantined_commands;
 
-    let mut indexed_games = Vec::new();
     for partition in 0..PARTITION_COUNT {
         let game_ids: Vec<u32> = redis
             .smembers(namespace.active_games(partition))
             .await
             .context("failed to inspect active-game index")?;
-        indexed_games.extend(game_ids.into_iter().map(|game_id| (partition, game_id)));
-    }
-    gauges.active_games = indexed_games.len() as u64;
-    if !indexed_games.is_empty() {
-        for (partition, game_id) in indexed_games {
-            let key = namespace.recovery(game_id);
+        gauges.active_games = gauges.active_games.saturating_add(game_ids.len() as u64);
+
+        // The active index and recovery keys for a valid game occupy the same
+        // partition hash slot. Reject a corrupt cross-partition index entry
+        // before batching so it is counted as a mismatch instead of making
+        // the entire cluster-mode request fail with CROSSSLOT.
+        let mut indexed_games = Vec::with_capacity(game_ids.len());
+        for game_id in game_ids {
+            if game_id % PARTITION_COUNT != partition {
+                gauges.active_game_index_mismatches =
+                    gauges.active_game_index_mismatches.saturating_add(1);
+                continue;
+            }
             let expected_prefix = expected_recovery_prefix(partition, game_id);
             let prefix_end = i64::try_from(expected_prefix.len().saturating_sub(1))
                 .context("recovery checkpoint prefix exceeds Redis range")?;
-            // Loading and deserializing every full recovery envelope made
-            // best-effort telemetry compete with authoritative execution. A
-            // checkpoint can be hundreds of KiB, while its identity lives at
-            // the start and its timestamp is deliberately one of the final
-            // fields. Fetch only those bounded slices plus STRLEN. Keeping all
-            // three commands in one same-key pipeline is cluster-slot safe.
-            // This gauge checks index/framing parity; authoritative takeover
-            // still deserializes and validates the complete envelope.
-            let (checkpoint_bytes, prefix, tail): (u64, Vec<u8>, Vec<u8>) = redis::pipe()
-                .cmd("STRLEN")
-                .arg(&key)
-                .cmd("GETRANGE")
-                .arg(&key)
-                .arg(0)
-                .arg(prefix_end)
-                .cmd("GETRANGE")
-                .arg(&key)
-                .arg(-RECOVERY_TAIL_SAMPLE_BYTES)
-                .arg(-1)
-                .query_async(&mut redis)
-                .await
-                .context("failed to inspect active recovery checkpoint metadata")?;
-            gauges.checkpoint_bytes = gauges.checkpoint_bytes.max(checkpoint_bytes);
-            let Some(checkpointed_at_ms) = checkpointed_at_ms_from_tail(&tail) else {
-                gauges.active_game_index_mismatches += 1;
-                continue;
-            };
-            if checkpoint_bytes == 0 || prefix != expected_prefix.as_bytes() {
-                gauges.active_game_index_mismatches += 1;
-                continue;
+            indexed_games.push((game_id, expected_prefix, prefix_end));
+        }
+        if indexed_games.is_empty() {
+            continue;
+        }
+
+        // A checkpoint can be hundreds of KiB, while its identity lives at the
+        // start and its timestamp is deliberately one of the final fields.
+        // Inspect every indexed game but fetch only those bounded slices.
+        // Fixed-size partition-local scripts replace a serial round trip per
+        // game while bounding each atomic shard operation and preserving exact
+        // fleet-wide mismatch and maximum-age semantics.
+        for batch in indexed_games.chunks(RECOVERY_METADATA_BATCH_SIZE) {
+            let metadata = read_recovery_metadata_batch(&mut redis, namespace, batch).await?;
+            if metadata.len() != batch.len() {
+                anyhow::bail!("active recovery metadata response length mismatch");
             }
-            gauges.checkpoint_age_ms = gauges
-                .checkpoint_age_ms
-                .max(now_ms.saturating_sub(checkpointed_at_ms).max(0) as u64);
+
+            for ((_, expected_prefix, _), (checkpoint_bytes, prefix, tail)) in
+                batch.iter().zip(metadata)
+            {
+                gauges.checkpoint_bytes = gauges.checkpoint_bytes.max(checkpoint_bytes);
+                let Some(checkpointed_at_ms) = checkpointed_at_ms_from_tail(&tail) else {
+                    gauges.active_game_index_mismatches += 1;
+                    continue;
+                };
+                if checkpoint_bytes == 0 || prefix != expected_prefix.as_bytes() {
+                    gauges.active_game_index_mismatches += 1;
+                    continue;
+                }
+                gauges.checkpoint_age_ms = gauges
+                    .checkpoint_age_ms
+                    .max(now_ms.saturating_sub(checkpointed_at_ms).max(0) as u64);
+            }
         }
     }
     Ok(gauges)
@@ -625,6 +699,11 @@ fn emit_emf(
     now_ms: i64,
 ) {
     let values = [
+        (
+            "RegionalCollectionFailures",
+            gauges.regional_collection_failures,
+            "Count",
+        ),
         ("ReadyTasks", gauges.ready_tasks, "Count"),
         ("LiveTasks", gauges.live_tasks, "Count"),
         ("DrainingTasks", gauges.draining_tasks, "Count"),
@@ -743,6 +822,7 @@ mod tests {
     use crate::cluster_membership::BootIdentity;
     use crate::partition_assignment::{ASSIGNMENT_SCHEMA_VERSION, AssignmentDocument};
     use crate::recovery::{RecoveryEnvelopeV2, ResolvedCommandState};
+    use crate::redis_utils::create_connection_manager;
     use common::{GameState, GameType, QueueMode};
     use std::collections::BTreeMap;
 
@@ -823,6 +903,74 @@ mod tests {
         tracker.observe(6_000, Some(&assignment), &leases);
         assert_eq!(tracker.take_window_max(15_000), 5_000);
         assert_eq!(tracker.take_window_max(15_000), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_metadata_batch_inspects_every_same_slot_recovery() -> Result<()> {
+        let client = redis::Client::open("redis://127.0.0.1:6379/15?protocol=resp3")?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let manager = create_connection_manager(client, push_tx).await?;
+        let mut redis: RedisConnection = manager.into();
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("metrics-batch-{salt}"))?;
+        let partition = 7;
+        let game_ids = [7, 17, 27];
+        let mut indexed_games = Vec::new();
+
+        for (offset, game_id) in game_ids.into_iter().enumerate() {
+            let prefix = expected_recovery_prefix(partition, game_id);
+            let checkpointed_at_ms = 1_000 + offset as i64;
+            let payload = format!(
+                "{prefix}\"checkpointed_at_ms\":{checkpointed_at_ms},\"source_lease_token\":\"test\"}}"
+            );
+            let _: () = redis
+                .set(namespace.recovery(game_id), payload.as_bytes())
+                .await?;
+            indexed_games.push((
+                game_id,
+                prefix.clone(),
+                i64::try_from(prefix.len().saturating_sub(1))?,
+            ));
+        }
+
+        let metadata = read_recovery_metadata_batch(&mut redis, &namespace, &indexed_games).await?;
+        assert_eq!(metadata.len(), indexed_games.len());
+        for (index, ((_, prefix, _), (bytes, observed_prefix, tail))) in
+            indexed_games.iter().zip(&metadata).enumerate()
+        {
+            assert!(*bytes > prefix.len() as u64);
+            assert_eq!(observed_prefix, prefix.as_bytes());
+            assert_eq!(
+                checkpointed_at_ms_from_tail(tail),
+                Some(1_000 + index as i64)
+            );
+        }
+        let oversized = (0..=RECOVERY_METADATA_BATCH_SIZE)
+            .map(|index| {
+                let game_id = partition + PARTITION_COUNT * index as u32;
+                let prefix = expected_recovery_prefix(partition, game_id);
+                (
+                    game_id,
+                    prefix.clone(),
+                    i64::try_from(prefix.len().saturating_sub(1)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            read_recovery_metadata_batch(&mut redis, &namespace, &oversized)
+                .await
+                .is_err(),
+            "one atomic metadata script must never exceed its fixed batch"
+        );
+
+        let keys = game_ids
+            .into_iter()
+            .map(|game_id| namespace.recovery(game_id))
+            .collect::<Vec<_>>();
+        let _: () = redis.del(keys).await?;
         Ok(())
     }
 

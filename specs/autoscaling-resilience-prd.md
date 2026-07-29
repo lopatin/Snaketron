@@ -822,8 +822,9 @@ rejections as healthy command throughput.
 | Run the fixed 128-session / 64-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
 | Ramp at four new sessions per second, then hold 256 authenticated sessions / 128 duels with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Exhaust the CPU of a planned scale-in destination until control operations miss their deadlines | The run fails the destination-capacity gate and is not classified as a handoff-protocol defect. No stale or unproven mutation commits: fencing rejects it, the executor fails closed, cooperative drain is not advertised, and ordinary lease-expiry recovery remains authoritative. |
-| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
+| Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, task-wide maintenance, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
 | Stall one partition's recovery-read lane while reading another partition's recovery envelope | The other partition completes its recovery read within one second, and the metrics dispatcher is independently bootstrapped from every correctness-bearing recovery lane. |
+| Stall the task-wide maintenance lane during live command delivery | Pending-completion scans and trim may pause, but the partition executor continues scheduling and checkpointing commands before maintenance is released; completion retry and trim each retain at most one background worker per partition. |
 | Stall one partition's `GameCreated` destination lane while another partition has a valid durable outbox record | The unstalled partition publishes and compare-deletes its record within one second while the stalled record remains authoritative in the outbox; after release, the stalled partition publishes exactly once and is acknowledged. |
 | Make one `GameCreated` delivery fail for a record-specific wrong-type marker, followed by a valid record in the same partition batch | The failed record remains in the durable outbox, while the later record still publishes, is compare-deleted, and receives marker expiry within one second. |
 | Remove all certification load from a verified ten-task baseline | CPU or memory target tracking returns the service automatically to `minTasks=1`; the activity is distinct from the forced continuity staircase. |
@@ -1491,6 +1492,47 @@ The run reused the exact protected Network stack, ingress instance, root EBS,
 EIP, hostname, and certificate, with no development DNS/ACME change. Cleanup
 again removed only the runtime Server, Serverless Valkey, and Monitoring stacks
 and stopped the retained ingress.
+
+Exact-source run
+([GitHub Actions 30475852468](https://github.com/lopatin/snaketron-io/actions/runs/30475852468),
+outer commit `be4040cafd8ddce72be51eab63ff4de158994e55`, Snaketron
+commit `2c3f6c06a725b585c6f161aa7a32cdf98938b547`) naturally scaled
+Gate A `1 -> 3`. All 1,664 sessions, 832 games, and 1,476,683 commands
+completed with exact outcomes and zero reconnects, but the unchanged
+one-second gate failed 22 of 332 baseline seconds, two of 46 movement seconds,
+and 17 later settled seconds; the maximum was 5,852 milliseconds. Twenty-nine
+ordinary failures clustered at seconds `:01` through `:03` while the elected
+reporter's serial full recovery scan took as long as 4,719 milliseconds.
+Partition 3 also failed closed once, then recovered six games and 124 commands
+without loss. Gate A correctly blocked the planned staircase and capacity gate.
+
+The minimum correction keeps exact all-game gauges while replacing serial
+per-game reads with fixed 32-key same-slot metadata batches under a
+500-millisecond whole-collection bound. A nonzero
+`RegionalCollectionFailures` metric makes a timeout fail certification rather
+than emit a misleading healthy zero. Pending-completion index scans and bounded
+approximate trim use one separate task-wide maintenance dispatcher. Separate
+at-most-one background completion and trim workers ensure neither Valkey
+maintenance nor DynamoDB effects pause authoritative command ingestion. No
+authority deadline, checkpoint cadence, load envelope, or scaling policy was
+changed.
+
+The separate exit-137 load completed 788 sessions, 394 games, and 705,108
+commands before proof generation stopped. Twenty-six affected sessions
+recovered with fresh snapshots in 2,311--2,518 milliseconds from detection;
+27 balanced attempts include one retryable replacement. Successor assignment,
+new fenced lease, and all 53 sampled pending entries were present within
+3.88 seconds of exact ECS stop. The rich PEL/status observation itself completed
+just outside five seconds, so certification now keeps it for the two-second PEL
+proof and uses a prestarted lightweight coherent ownership observer for the
+unchanged five-second gate. This changes proof cost, not the product deadline
+or production coordination path.
+
+Cleanup removed only Server, Serverless Valkey, and Monitoring, stopped the
+same ingress instance, and retained the fixed hostname/DNS, EIP,
+certificate-bearing volume, shared production VPC, and all reusable
+development foundations. This run remains diagnostic evidence. Complete
+Gate A/B/C, automatic scale-in, and exit-137 certification are still required.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
