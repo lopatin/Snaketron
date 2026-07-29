@@ -27,6 +27,9 @@ traefik_monitor_pid=""
 traefik_monitor_dir=""
 ecs_runtime_monitor_pid=""
 ecs_runtime_monitor_dir=""
+hard_crash_control_observer_pid=""
+hard_crash_control_observer_stop_file=""
+hard_crash_ecs_exec_pid=""
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -54,6 +57,268 @@ staging_entry_state_is_valid() {
 
 unix_time_ms() {
   jq -nr 'now * 1000 | floor'
+}
+
+ecs_timestamp_to_unix_ms() {
+  local timestamp="$1"
+  jq -en --arg timestamp "$timestamp" '
+    $timestamp
+    | capture(
+        "^(?<second>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]+))?(?:Z|\\+00:00)$"
+      )
+    | ((.second + "Z" | fromdateiso8601) * 1000)
+      + (((.fraction // "0") + "000")[0:3] | tonumber)
+  '
+}
+
+select_pre_fault_control_sample() {
+  local partition="$1"
+  local killed_boot_id="$2"
+  local killed_lease_token="$3"
+  shift 3
+  (( $# > 0 )) || return 1
+  jq -es \
+    --argjson partition "$partition" \
+    --arg killed_boot_id "$killed_boot_id" \
+    --arg killed_lease_token "$killed_lease_token" '
+      [.[]
+        | select(
+            .observation_started_at_ms <= .captured_at_ms
+            and .captured_at_ms <= .observation_completed_at_ms)
+        | select(any(.runtime_partitions[];
+            .partition == $partition
+            and .owner_matches
+            and .active_owner == $killed_boot_id
+            and .lease_token == $killed_lease_token
+            and any(.pending_entry_sample[];
+              .consumer == $killed_lease_token)))]
+      | min_by(.observation_completed_at_ms)
+  ' "$@"
+}
+
+select_post_kill_pending_control_sample() {
+  local execution_stopped_at_ms="$1"
+  local partition="$2"
+  local killed_lease_token="$3"
+  shift 3
+  (( $# > 0 )) || return 1
+  jq -es \
+    --argjson execution_stopped_at_ms "$execution_stopped_at_ms" \
+    --argjson partition "$partition" \
+    --arg killed_lease_token "$killed_lease_token" '
+      [.[]
+        | select(
+            .observation_started_at_ms >= $execution_stopped_at_ms
+            and .captured_at_ms >= .observation_started_at_ms
+            and .captured_at_ms <= .observation_completed_at_ms
+            and .observation_completed_at_ms
+              <= ($execution_stopped_at_ms + 2000))
+        | select(any(.runtime_partitions[];
+            .partition == $partition
+            and any(.pending_entry_sample[];
+              .consumer == $killed_lease_token)))]
+      | min_by(.observation_completed_at_ms)
+  ' "$@"
+}
+
+select_hard_crash_owner_ready_control_sample() {
+  local pre="$1"
+  local execution_stopped_at_ms="$2"
+  local partition="$3"
+  local killed_boot_id="$4"
+  local killed_task_id="$5"
+  local killed_lease_token="$6"
+  shift 6
+  (( $# > 0 )) || return 1
+  jq -es \
+    --slurpfile pre "$pre" \
+    --argjson execution_stopped_at_ms "$execution_stopped_at_ms" \
+    --argjson partition "$partition" \
+    --arg killed_boot_id "$killed_boot_id" \
+    --arg killed_task_id "$killed_task_id" \
+    --arg killed_lease_token "$killed_lease_token" '
+      ($pre[0].runtime_partitions[]
+        | select(.partition == $partition)) as $old
+      | [.[]
+          | select(
+              .observation_started_at_ms >= $execution_stopped_at_ms
+              and .captured_at_ms >= .observation_started_at_ms
+              and .captured_at_ms <= .observation_completed_at_ms
+              and .observation_completed_at_ms
+                <= ($execution_stopped_at_ms + 5000))
+          | (.runtime_partitions[]
+              | select(.partition == $partition)) as $new
+          | select(
+              ([.live_members[].boot_id] | index($killed_boot_id)) == null
+              and .assignment.version > $pre[0].assignment.version
+              and $new.owner_matches
+              and $new.desired_owner != $killed_boot_id
+              and $new.active_owner == $new.desired_owner
+              and ($new.lease_token | type == "string" and length > 0)
+              and $new.lease_token != $killed_lease_token
+              and $new.lease_token != $old.lease_token
+              and ($new.desired_owner as $owner
+                | [.live_members[]
+                    | select(
+                        .boot_id == $owner
+                        and .lifecycle == "ACTIVE")] as $current
+                | ($current | length) == 1
+                  and $current[0].ecs_task_id != $killed_task_id
+                  and ($current[0].ecs_task_id as $owner_task_id
+                    | any($pre[0].live_members[];
+                        .boot_id == $owner
+                        and .ecs_task_id == $owner_task_id))))]
+      | min_by(.observation_completed_at_ms)
+  ' "$@"
+}
+
+write_capacity_acceptance_report() {
+  local summary="$1"
+  local output="$2"
+  local max_latency_ms=1000
+  local required_continuous_seconds=300
+  jq -n \
+    --slurpfile report "$summary" \
+    --argjson max_latency_ms "$max_latency_ms" \
+    --argjson required_continuous_seconds "$required_continuous_seconds" '
+      def fully_joined_duels_at($value; $midpoint):
+        ([$value.sessions[] | select(.game_id != null)]
+          | group_by(.game_id)
+          | map(select(
+              length == 2
+              and all(.[];
+                .playing_at_unix_ms != null
+                and .game_finished_at_unix_ms != null
+                and .playing_at_unix_ms <= $midpoint
+                and .game_finished_at_unix_ms > $midpoint)))
+          | length);
+      def longest_streak($samples):
+        reduce $samples[] as $sample (
+          {
+            current_seconds: 0,
+            current_started_at_second: null,
+            longest_seconds: 0,
+            longest_started_at_second: null,
+            longest_finished_at_second: null
+          };
+          if $sample.qualifying then
+            .current_seconds += 1
+            | if .current_seconds == 1 then
+                .current_started_at_second = $sample.unix_second
+              else .
+              end
+            | if .current_seconds > .longest_seconds then
+                .longest_seconds = .current_seconds
+                | .longest_started_at_second = .current_started_at_second
+                | .longest_finished_at_second = ($sample.unix_second + 1)
+              else .
+              end
+          else
+            .current_seconds = 0
+            | .current_started_at_second = null
+          end);
+      $report[0] as $r
+      | $r.ramp_stages[0].target_reached_at_unix_ms as $hold_started_at_ms
+      | $r.ramp_stages[0].finished_at_unix_ms as $hold_finished_at_ms
+      | (($hold_started_at_ms / 1000) | ceil) as $hold_first_second
+      | (($hold_finished_at_ms / 1000) | floor) as $hold_after_last_second
+      | 1280 as $minimum_commands_per_second
+      | [range($hold_first_second; $hold_after_last_second)
+          | . as $second
+          | (($second * 1000) + 500) as $midpoint
+          | ([$r.sessions[]
+              | select(
+                  .authenticated_at_unix_ms != null
+                  and .authenticated_at_unix_ms <= $midpoint
+                  and .finished_at_unix_ms > $midpoint)] | length)
+              as $authenticated_sessions
+          | fully_joined_duels_at($r; $midpoint) as $fully_joined_duels
+          | ($r.metrics.command_counts_by_unix_second
+              [($second | tostring)] // 0) as $commands_sent
+          | ($r.metrics.command_outcome_counts_by_sent_unix_second
+              [($second | tostring)] // 0) as $command_outcomes
+          | ($r.metrics.command_outcome_max_latency_ms_by_sent_unix_second
+              [($second | tostring)] // null) as $max_outcome_latency_ms
+          | ([range(0; 10)
+              | . as $partition
+              | select(
+                  ($r.metrics
+                    .scheduled_command_counts_by_partition_and_unix_second
+                    [($partition | tostring)][($second | tostring)] // 0) > 0)]
+              | length) as $productive_partitions
+          | {
+              unix_second: $second,
+              authenticated_sessions: $authenticated_sessions,
+              fully_joined_duels: $fully_joined_duels,
+              commands_sent: $commands_sent,
+              command_outcomes: $command_outcomes,
+              max_outcome_latency_ms: $max_outcome_latency_ms,
+              productive_partitions: $productive_partitions,
+              qualifying: (
+                $authenticated_sessions >= 256
+                and $fully_joined_duels >= 128
+                and $commands_sent >= $minimum_commands_per_second
+                and $command_outcomes == $commands_sent
+                and $max_outcome_latency_ms != null
+                and $max_outcome_latency_ms <= $max_latency_ms
+                and $productive_partitions == 10)
+            }] as $seconds
+      | longest_streak($seconds) as $streak
+      | {
+          required_continuous_seconds: $required_continuous_seconds,
+          max_outcome_latency_ms: $max_latency_ms,
+          hold_started_at_unix_ms: $hold_started_at_ms,
+          hold_finished_at_unix_ms: $hold_finished_at_ms,
+          evaluated_first_second: $hold_first_second,
+          evaluated_after_last_second: $hold_after_last_second,
+          evaluated_seconds: ($seconds | length),
+          longest_qualifying_streak: $streak,
+          nonqualifying_seconds: [
+            $seconds[]
+            | select(.qualifying | not)
+          ],
+          global_checks: {
+            schema: ($r.schema_version >= 10),
+            load_threshold: ($r.metadata.threshold_result == "passed"),
+            configured_concurrency: ($r.configured_max_concurrency == 272),
+            mode: ($r.metadata.mode == "duel"),
+            command_profile: ($r.metadata.command_profile == "every-tick"),
+            spawn_rate: ($r.metadata.spawn_rate_per_second == "4"),
+            exact_peak_authenticated:
+              ($r.session_counts.peak_authenticated_concurrency == 272),
+            peak_active_games:
+              ($r.session_counts.peak_active_game_concurrency >= 136),
+            sessions_clean: (
+              $r.session_counts.failed == 0
+              and $r.session_counts.cancelled == 0
+              and $r.session_counts.incomplete == 0
+              and $r.session_counts.completed == $r.session_counts.total
+              and all($r.sessions[];
+                .outcome == "completed" and .failure_phase == null)),
+            pairing_clean: ($r.games.pairing_violations == 0),
+            one_reached_stage: (
+              ($r.ramp_stages | length) == 1
+              and $r.ramp_stages[0].target_reached),
+            socket_continuity: (
+              $r.metrics.traffic.disconnects == 0
+              and $r.metrics.traffic.reconnects == 0
+              and ($r.metrics.usable_session_gap_ms.max_ms // 0) == 0),
+            exact_command_accounting: (
+              ([$r.metrics.command_counts_by_unix_second[]] | add // 0)
+                == $r.metrics.traffic.commands_sent
+              and ([
+                  $r.metrics.command_outcome_counts_by_sent_unix_second[]
+                ] | add // 0) == $r.metrics.traffic.commands_sent
+              and $r.metrics.planned_handoffs.pending_commands_at_finish == 0),
+            admission_budget:
+              (($r.metrics.initial_admission_ready_ms.p99_ms // 10001) <= 10000)
+          }
+        }
+      | .passed = (
+          ([.global_checks[]] | all)
+          and .longest_qualifying_streak.longest_seconds
+            >= .required_continuous_seconds)
+    ' >"$output"
 }
 
 traefik_sample_has_healthy_backend() {
@@ -871,6 +1136,361 @@ test_staging_entry_state_contract() {
   fi
 }
 
+test_capacity_continuous_window_contract() {
+  local result=0
+  local fixture_dir
+  fixture_dir="$(mktemp -d)"
+  local summary="$fixture_dir/summary.json"
+  local acceptance="$fixture_dir/acceptance.json"
+  jq -n '
+    def per_second($value):
+      [range(1; 602)
+        | {key: (. | tostring), value: $value}]
+      | from_entries;
+    def per_partition:
+      [range(0; 10)
+        | . as $partition
+        | {
+            key: ($partition | tostring),
+            value: per_second(128)
+          }]
+      | from_entries;
+    {
+      schema_version: 10,
+      configured_max_concurrency: 272,
+      metadata: {
+        threshold_result: "passed",
+        mode: "duel",
+        command_profile: "every-tick",
+        spawn_rate_per_second: "4"
+      },
+      session_counts: {
+        total: 272,
+        completed: 272,
+        failed: 0,
+        cancelled: 0,
+        incomplete: 0,
+        peak_authenticated_concurrency: 272,
+        peak_active_game_concurrency: 136
+      },
+      games: {pairing_violations: 0},
+      ramp_stages: [{
+        target_reached: true,
+        target_reached_at_unix_ms: 1000,
+        finished_at_unix_ms: 602000
+      }],
+      sessions: [
+        range(0; 272)
+        | {
+            game_id: ((. / 2) | floor),
+            authenticated_at_unix_ms: 0,
+            playing_at_unix_ms: 0,
+            game_finished_at_unix_ms: 1000000000,
+            finished_at_unix_ms: 1000000000,
+            outcome: "completed",
+            failure_phase: null
+          }
+      ],
+      metrics: {
+        traffic: {
+          commands_sent: (601 * 1280),
+          disconnects: 0,
+          reconnects: 0
+        },
+        command_counts_by_unix_second: per_second(1280),
+        command_outcome_counts_by_sent_unix_second: per_second(1280),
+        command_outcome_max_latency_ms_by_sent_unix_second: per_second(100),
+        scheduled_command_counts_by_partition_and_unix_second: per_partition,
+        planned_handoffs: {pending_commands_at_finish: 0},
+        usable_session_gap_ms: {max_ms: 0},
+        initial_admission_ready_ms: {p99_ms: 100}
+      }
+    }
+  ' >"$summary"
+
+  # A nonqualifying extra observation second must not invalidate either
+  # adjacent 300-second qualifying window.
+  jq '
+    .metrics.command_outcome_max_latency_ms_by_sent_unix_second["301"] = 1001
+  ' "$summary" >"$fixture_dir/one-gap.json"
+  write_capacity_acceptance_report \
+    "$fixture_dir/one-gap.json" "$acceptance"
+  jq -e '
+    .passed
+    and .required_continuous_seconds == 300
+    and .max_outcome_latency_ms == 1000
+    and .evaluated_seconds == 601
+    and .longest_qualifying_streak.longest_seconds == 300
+    and (.nonqualifying_seconds | map(.unix_second)) == [301]
+  ' "$acceptance" >/dev/null || result=1
+
+  # Three separated gaps leave no five-minute continuous interval.
+  jq '
+    .metrics.command_outcome_max_latency_ms_by_sent_unix_second["150"] = 1001
+    | .metrics.command_outcome_max_latency_ms_by_sent_unix_second["450"] = 1001
+  ' "$fixture_dir/one-gap.json" >"$fixture_dir/three-gaps.json"
+  write_capacity_acceptance_report \
+    "$fixture_dir/three-gaps.json" "$acceptance"
+  jq -e '
+    (.passed | not)
+    and .longest_qualifying_streak.longest_seconds < 300
+    and (.nonqualifying_seconds | map(.unix_second)) == [150, 301, 450]
+  ' "$acceptance" >/dev/null || result=1
+
+  rm -rf "$fixture_dir"
+  if (( result != 0 )); then
+    echo "Capacity continuous-window evidence contract failed" >&2
+    return 1
+  fi
+}
+
+test_hard_crash_evidence_selectors() {
+  local result=0
+  local fixture_dir
+  fixture_dir="$(mktemp -d)"
+  local execution_stopped_at_ms=1785340236421
+  local partition=3
+  local killed_boot_id="11111111-1111-4111-8111-111111111111"
+  local survivor_boot_id="22222222-2222-4222-8222-222222222222"
+  local replacement_boot_id="33333333-3333-4333-8333-333333333333"
+  local killed_task_id="task-killed"
+  local survivor_task_id="task-survivor"
+  local killed_lease_token="${killed_boot_id}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  local survivor_lease_token="${survivor_boot_id}:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  local pre="$fixture_dir/pre.json"
+  local post_pending="$fixture_dir/post-pending.json"
+  local owner_valid="$fixture_dir/owner-valid.json"
+  local selected="$fixture_dir/selected.json"
+
+  jq -n \
+    --argjson stopped "$execution_stopped_at_ms" \
+    --argjson partition "$partition" \
+    --arg killed_boot "$killed_boot_id" \
+    --arg survivor_boot "$survivor_boot_id" \
+    --arg killed_task "$killed_task_id" \
+    --arg survivor_task "$survivor_task_id" \
+    --arg killed_token "$killed_lease_token" '
+      {
+        observation_started_at_ms: ($stopped - 2),
+        captured_at_ms: ($stopped - 1),
+        observation_completed_at_ms: ($stopped - 1),
+        live_members: [
+          {
+            boot_id: $killed_boot,
+            ecs_task_id: $killed_task,
+            lifecycle: "ACTIVE"
+          },
+          {
+            boot_id: $survivor_boot,
+            ecs_task_id: $survivor_task,
+            lifecycle: "ACTIVE"
+          }
+        ],
+        assignment: {version: 41},
+        runtime_partitions: [{
+          partition: $partition,
+          desired_owner: $killed_boot,
+          active_owner: $killed_boot,
+          owner_matches: true,
+          lease_token: $killed_token,
+          pending_entry_sample: [{id: "1-0", consumer: $killed_token}]
+        }]
+      }
+    ' >"$pre"
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" \
+    --arg survivor_boot "$survivor_boot_id" \
+    --arg survivor_task "$survivor_task_id" \
+    --arg survivor_token "$survivor_lease_token" '
+      .observation_started_at_ms = $stopped
+      | .captured_at_ms = ($stopped + 1000)
+      | .observation_completed_at_ms = ($stopped + 2000)
+      | .live_members = [{
+          boot_id: $survivor_boot,
+          ecs_task_id: $survivor_task,
+          lifecycle: "ACTIVE"
+        }]
+      | .assignment.version = 42
+      | .runtime_partitions[0].desired_owner = $survivor_boot
+      | .runtime_partitions[0].active_owner = $survivor_boot
+      | .runtime_partitions[0].owner_matches = true
+      | .runtime_partitions[0].lease_token = $survivor_token
+    ' "$pre" >"$post_pending"
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = $stopped
+      | .captured_at_ms = ($stopped + 2500)
+      | .observation_completed_at_ms = ($stopped + 5000)
+      | .runtime_partitions[0].pending_entry_sample = []
+    ' "$post_pending" >"$owner_valid"
+
+  select_pre_fault_control_sample \
+    "$partition" "$killed_boot_id" "$killed_lease_token" \
+    "$pre" >"$selected" || result=1
+  jq -e \
+    --argjson expected "$((execution_stopped_at_ms - 1))" '
+      .observation_completed_at_ms == $expected
+    ' "$selected" >/dev/null || result=1
+  jq '
+    .observation_completed_at_ms = (.observation_started_at_ms - 1)
+  ' "$pre" >"$fixture_dir/pre-invalid-interval.json"
+  if select_pre_fault_control_sample \
+    "$partition" "$killed_boot_id" "$killed_lease_token" \
+    "$fixture_dir/pre-invalid-interval.json" >/dev/null 2>&1; then
+    result=1
+  fi
+
+  [[ "$(ecs_timestamp_to_unix_ms \
+    "2026-07-29T15:50:36.421000+00:00")" == "$execution_stopped_at_ms" ]] \
+    || result=1
+  [[ "$(ecs_timestamp_to_unix_ms \
+    "2026-07-29T15:50:36Z")" == "1785340236000" ]] || result=1
+  if ecs_timestamp_to_unix_ms \
+    "2026-07-29T15:50:36.421000+01:00" >/dev/null 2>&1; then
+    result=1
+  fi
+  if ecs_timestamp_to_unix_ms "not-a-timestamp" >/dev/null 2>&1; then
+    result=1
+  fi
+
+  select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$pre" "$post_pending" >"$selected" || result=1
+  jq -e \
+    --argjson expected "$((execution_stopped_at_ms + 2000))" \
+    --arg survivor "$survivor_boot_id" '
+      .observation_completed_at_ms == $expected
+      and .runtime_partitions[0].active_owner == $survivor
+    ' "$selected" >/dev/null || result=1
+
+  select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$owner_valid" >"$selected" || result=1
+  jq -e \
+    --argjson expected "$((execution_stopped_at_ms + 5000))" \
+    --arg survivor "$survivor_boot_id" '
+      .observation_completed_at_ms == $expected
+      and .runtime_partitions[0].active_owner == $survivor
+    ' "$selected" >/dev/null || result=1
+
+  if select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$pre" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" \
+    '.observation_completed_at_ms = ($stopped + 2001)' \
+    "$post_pending" >"$fixture_dir/pending-late.json"
+  if select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$fixture_dir/pending-late.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = ($stopped - 1)
+    ' "$post_pending" >"$fixture_dir/pending-started-early.json"
+  if select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$fixture_dir/pending-started-early.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq --arg token "$survivor_lease_token" \
+    '.runtime_partitions[0].pending_entry_sample[0].consumer = $token' \
+    "$post_pending" >"$fixture_dir/pending-wrong-consumer.json"
+  if select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$fixture_dir/pending-wrong-consumer.json" >/dev/null 2>&1; then
+    result=1
+  fi
+
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" \
+    --arg killed_token "$killed_lease_token" '
+      .captured_at_ms = ($stopped + 100)
+      | .assignment.version = 41
+      | .runtime_partitions[0].lease_token = $killed_token
+    ' "$owner_valid" >"$fixture_dir/owner-unfenced.json"
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-unfenced.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq --slurpfile pre "$pre" \
+    '.live_members += [$pre[0].live_members[0]]' \
+    "$owner_valid" >"$fixture_dir/owner-killed-member-live.json"
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-killed-member-live.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --arg replacement_boot "$replacement_boot_id" '
+      .live_members = [{
+        boot_id: $replacement_boot,
+        ecs_task_id: "task-replacement",
+        lifecycle: "ACTIVE"
+      }]
+      | .runtime_partitions[0].desired_owner = $replacement_boot
+      | .runtime_partitions[0].active_owner = $replacement_boot
+      | .runtime_partitions[0].lease_token =
+          ($replacement_boot + ":cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    ' "$owner_valid" >"$fixture_dir/owner-replacement.json"
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-replacement.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" \
+    '.observation_completed_at_ms = ($stopped + 5001)' \
+    "$owner_valid" >"$fixture_dir/owner-late.json"
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-late.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = ($stopped - 1)
+    ' "$owner_valid" >"$fixture_dir/owner-started-early.json"
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-started-early.json" >/dev/null 2>&1; then
+    result=1
+  fi
+
+  if select_post_kill_pending_control_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    >/dev/null 2>&1; then
+    result=1
+  fi
+  if select_pre_fault_control_sample \
+    "$partition" "$killed_boot_id" "$killed_lease_token" \
+    >/dev/null 2>&1; then
+    result=1
+  fi
+  if select_hard_crash_owner_ready_control_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    >/dev/null 2>&1; then
+    result=1
+  fi
+
+  rm -rf "$fixture_dir"
+  if (( result != 0 )); then
+    echo "Hard-crash evidence selector contract failed" >&2
+    return 1
+  fi
+}
+
 test_evidence_safety_helpers() {
   test_task_definition_evidence_sanitizer
   test_live_task_definition_gate
@@ -878,6 +1498,8 @@ test_evidence_safety_helpers() {
   test_traefik_server_up_parser
   test_command_outcome_window_gate
   test_staging_entry_state_contract
+  test_capacity_continuous_window_contract
+  test_hard_crash_evidence_selectors
 }
 
 run_offline_cdk_synth() {
@@ -2491,9 +3113,34 @@ verify_crash_exec_configuration() {
 
 capture_control_status() {
   local output="$1"
+  if [[ $# -eq 2 ]]; then
+    SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+      timeout --signal=TERM --kill-after=1s 3s \
+        "$resilience_admin" status \
+        --region-key "$SNAKETRON_REGION_CODE" \
+        --partition "$2" >"$output"
+    return
+  fi
   SNAKETRON_REDIS_URL="$staging_redis_control_url" \
     "$resilience_admin" status \
     --region-key "$SNAKETRON_REGION_CODE" >"$output"
+}
+
+stop_hard_crash_control_observer() {
+  if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
+    if ! touch "$hard_crash_control_observer_stop_file" 2>/dev/null \
+      && [[ -n "$hard_crash_control_observer_pid" ]]; then
+      kill -TERM "$hard_crash_control_observer_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "$hard_crash_control_observer_pid" ]]; then
+    wait "$hard_crash_control_observer_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
+    rm -f "$hard_crash_control_observer_stop_file"
+  fi
+  hard_crash_control_observer_pid=""
+  hard_crash_control_observer_stop_file=""
 }
 
 inject_hard_crash_and_prove_takeover() {
@@ -2567,148 +3214,288 @@ inject_hard_crash_and_prove_takeover() {
     --argjson selected_partition "$partition_json" \
     --argjson selected_member "$member_json" \
     --arg task_arn "$killed_task_arn" \
-    --arg task_boot_id "$killed_task_boot_id" \
-    --argjson ecs_exec_attempts 1 '
+    --arg task_boot_id "$killed_task_boot_id" '
       {
         selected_partition: $selected_partition,
         selected_member: $selected_member,
         task_arn: $task_arn,
-        task_boot_id: $task_boot_id,
-        ecs_exec_attempts: $ecs_exec_attempts
+        task_boot_id: $task_boot_id
       }
     ' >"$report_dir/hard-crash-manifest.json"
 
+  # Bracket each read-only control-plane observation because the status command
+  # performs several Redis reads rather than one atomic snapshot. Acceptance
+  # requires the complete observation interval to fit inside its deadline.
+  local control_observation_dir="$report_dir/hard-crash-control-samples"
+  mkdir -p "$control_observation_dir"
+  hard_crash_control_observer_stop_file="$control_observation_dir/stop-requested"
+  rm -f "$hard_crash_control_observer_stop_file"
+  local control_observer_stop_file="$hard_crash_control_observer_stop_file"
+  (
+    local observer_stop_requested=false
+    trap 'observer_stop_requested=true' TERM INT
+    local observation_sequence=0
+    while [[ "$observer_stop_requested" != true \
+      && ! -e "$control_observer_stop_file" ]]; do
+      observation_sequence=$((observation_sequence + 1))
+      local observation_started_at_ms
+      local observation_completed_at_ms
+      local observation_raw
+      local observation_pending
+      local observation_sample
+      printf -v observation_raw \
+        '%s/%06d.raw.pending' "$control_observation_dir" "$observation_sequence"
+      printf -v observation_pending \
+        '%s/%06d.json.pending' "$control_observation_dir" "$observation_sequence"
+      printf -v observation_sample \
+        '%s/%06d.json' "$control_observation_dir" "$observation_sequence"
+      observation_started_at_ms="$(unix_time_ms)"
+      if capture_control_status \
+        "$observation_raw" "$killed_partition" 2>/dev/null; then
+        observation_completed_at_ms="$(unix_time_ms)"
+        if jq -e \
+          --argjson partition "$killed_partition" \
+          --argjson observation_started_at_ms "$observation_started_at_ms" \
+          --argjson observation_completed_at_ms "$observation_completed_at_ms" '
+            {
+              observation_started_at_ms: $observation_started_at_ms,
+              observation_completed_at_ms: $observation_completed_at_ms,
+              captured_at_ms,
+              live_members,
+              assignment,
+              runtime_partitions: [
+                .runtime_partitions[]
+                | select(.partition == $partition)
+              ]
+            }
+            | select(
+                (.runtime_partitions | length) == 1
+                and .observation_started_at_ms <= .captured_at_ms
+                and .captured_at_ms <= .observation_completed_at_ms)
+          ' "$observation_raw" >"$observation_pending"; then
+          mv "$observation_pending" "$observation_sample"
+        fi
+      fi
+      rm -f "$observation_raw" "$observation_pending"
+      sleep 0.2
+    done
+  ) &
+  hard_crash_control_observer_pid=$!
+
+  # Do not start the external fault until the observer has published a valid
+  # old-owner/token sample. This closes the fork-before-first-sample race.
+  local observer_ready="$report_dir/control-plane-observer-ready-before-exec.json"
+  local observer_ready_candidate="$observer_ready.pending"
+  local observer_ready_deadline=$((SECONDS + 10))
+  local -a observer_startup_samples=()
+  while (( SECONDS < observer_ready_deadline )); do
+    observer_startup_samples=( "$control_observation_dir"/*.json )
+    if [[ -e "${observer_startup_samples[0]}" ]]; then
+      if select_pre_fault_control_sample \
+        "$killed_partition" \
+        "$killed_boot_id" \
+        "$killed_lease_token" \
+        "${observer_startup_samples[@]}" >"$observer_ready_candidate" \
+        2>/dev/null \
+        && jq -e 'type == "object"' "$observer_ready_candidate" >/dev/null; then
+        mv "$observer_ready_candidate" "$observer_ready"
+        break
+      fi
+      rm -f "$observer_ready_candidate"
+    fi
+    sleep 0.1
+  done
+  if [[ ! -f "$observer_ready" ]]; then
+    stop_hard_crash_control_observer
+    rm -f "$observer_ready_candidate"
+    echo "The hard-crash observer did not establish a valid pre-fault sample" >&2
+    return 1
+  fi
+
   # One non-retried ECS Exec session discovers exactly one non-PID-1 `server`
-  # child. Stop it before emitting the timestamp so it cannot execute or ACK
-  # work while the marker reaches the observer, then SIGKILL that same PID.
-  # The timestamp is a conservative fail-stop origin; the exact ECS exit-137
-  # assertion below separately proves that SIGKILL completed.
+  # child and sends that process SIGKILL directly. There is no SIGSTOP,
+  # in-container marker, delay, graceful cleanup, or second fault action.
   local hard_kill_command
-  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; fail_stop_at_ms=$(date +%s%3N); kill -STOP "$server_pid"; printf "SNAKETRON_HARD_FAIL_STOP_AT_MS=%s SERVER_PID=%s\\n" "$fail_stop_at_ms" "$server_pid"; sleep 0.5; kill -KILL "$server_pid"'\'''
+  hard_kill_command='/bin/sh -c '\''set -eu; count=0; server_pid=; for comm_file in /proc/[0-9]*/comm; do IFS= read -r comm < "$comm_file" || continue; [ "$comm" = server ] || continue; server_pid=${comm_file#/proc/}; server_pid=${server_pid%/comm}; count=$((count + 1)); done; [ "$count" -eq 1 ]; [ "$server_pid" -ne 1 ]; kill -KILL "$server_pid"'\'''
   local exec_output="$report_dir/hard-crash-ecs-exec.log"
-  timeout --signal=TERM --kill-after=2s 40s aws ecs execute-command \
+  local ecs_exec_invoked_at_ms
+  local ecs_exec_max_attempts=1
+  ecs_exec_invoked_at_ms="$(unix_time_ms)"
+  AWS_MAX_ATTEMPTS="$ecs_exec_max_attempts" \
+    timeout --signal=TERM --kill-after=2s 40s aws ecs execute-command \
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --task "$killed_task_arn" \
     --container snaketron-server \
     --interactive \
     --command "$hard_kill_command" >"$exec_output" 2>&1 &
-  local ecs_exec_pid=$!
-  local marker_deadline=$((SECONDS + 30))
-  local kill_at_ms=""
-  while (( SECONDS < marker_deadline )); do
-    kill_at_ms="$(sed -n -E 's/.*SNAKETRON_HARD_FAIL_STOP_AT_MS=([0-9]+).*/\1/p' "$exec_output" | tail -1)"
-    [[ "$kill_at_ms" =~ ^[0-9]{13}$ ]] && break
-    kill -0 "$ecs_exec_pid" 2>/dev/null || break
-    sleep 0.05
-  done
-  if [[ ! "$kill_at_ms" =~ ^[0-9]{13}$ ]]; then
-    wait "$ecs_exec_pid" 2>/dev/null || true
-    echo "The single ECS Exec injection did not emit its fail-stop marker" >&2
-    return 1
-  fi
+  hard_crash_ecs_exec_pid=$!
+  local ecs_exec_pid="$hard_crash_ecs_exec_pid"
 
-  # Capture the Redis PEL immediately after the fail-stop marker and before
-  # polling for successor ownership. This ties the takeover proof to exact
-  # command IDs that the killed lease could no longer acknowledge.
-  local pending_after_kill="$report_dir/control-plane-immediate-post-kill.json"
-  local pending_candidate="$pending_after_kill.pending"
-  local pending_deadline=$((SECONDS + 2))
-  while (( SECONDS < pending_deadline )); do
-    if capture_control_status "$pending_candidate" 2>/dev/null \
-      && jq -e \
-        --arg killed_lease_token "$killed_lease_token" \
-        --argjson partition "$killed_partition" \
-        --argjson kill_at_ms "$kill_at_ms" '
-          .captured_at_ms >= $kill_at_ms
-          and ([.runtime_partitions[]
-            | select(.partition == $partition)
-            | .pending_entry_sample[]
-            | select(.consumer == $killed_lease_token)] | length) > 0
-        ' "$pending_candidate" >/dev/null; then
-      mv "$pending_candidate" "$pending_after_kill"
+  # Poll only the selected task ARN. executionStoppedAt is the ECS control
+  # plane's exact container-exit time; stoppedAt can lag it by many seconds and
+  # is therefore unsuitable as a recovery origin.
+  local task_stop="$report_dir/hard-crash-task-stop.json"
+  local task_stop_candidate="$task_stop.pending"
+  local task_stop_deadline=$((SECONDS + 45))
+  local task_stop_observed_at_ms=""
+  while (( SECONDS < task_stop_deadline )); do
+    if aws ecs describe-tasks \
+      --region "$SNAKETRON_AWS_REGION" \
+      --cluster "$SNAKETRON_ECS_CLUSTER" \
+      --tasks "$killed_task_arn" >"$task_stop_candidate" 2>/dev/null \
+      && jq -e --arg task_arn "$killed_task_arn" '
+        (.failures | length) == 0
+        and (.tasks | length) == 1
+        and .tasks[0].taskArn == $task_arn
+        and (.tasks[0].executionStoppedAt | type) == "string"
+      ' "$task_stop_candidate" >/dev/null; then
+      mv "$task_stop_candidate" "$task_stop"
+      task_stop_observed_at_ms="$(unix_time_ms)"
       break
     fi
-    sleep 0.05
+    sleep 1
   done
-  if [[ ! -f "$pending_after_kill" ]]; then
-    [[ -f "$pending_candidate" ]] && mv "$pending_candidate" "$pending_after_kill"
-    wait "$ecs_exec_pid" 2>/dev/null || true
-    echo "No exact pending command remained under the killed lease immediately after SIGKILL" >&2
+
+  local execution_stopped_at=""
+  local execution_stopped_at_ms=""
+  local recovery_timing_origin_ms=""
+  local failure_reason=""
+  if [[ ! -f "$task_stop" ]]; then
+    failure_reason="The selected ECS task never exposed an authoritative executionStoppedAt after the single SIGKILL attempt"
+  else
+    execution_stopped_at="$(jq -er '.tasks[0].executionStoppedAt' "$task_stop")"
+    if ! execution_stopped_at_ms="$(ecs_timestamp_to_unix_ms "$execution_stopped_at")" \
+      || [[ ! "$execution_stopped_at_ms" =~ ^[0-9]{13}$ ]]; then
+      failure_reason="ECS returned an executionStoppedAt value that could not be parsed at millisecond precision"
+    else
+      recovery_timing_origin_ms=$(( (execution_stopped_at_ms / 1000) * 1000 ))
+      if (( execution_stopped_at_ms < ecs_exec_invoked_at_ms \
+        || execution_stopped_at_ms > task_stop_observed_at_ms )); then
+        failure_reason="ECS executionStoppedAt did not fall between the ECS Exec invocation and its control-plane observation"
+      fi
+    fi
+  fi
+
+  # Select both proofs from the same pre-started observation stream. The PEL
+  # proof requires exact old-consumer command IDs no later than two seconds
+  # after the stop. Ownership must advance to a new fenced token on a member
+  # that was already present before the crash, no later than five seconds.
+  local pending_after_kill="$report_dir/control-plane-immediate-post-kill.json"
+  local pending_candidate="$pending_after_kill.pending"
+  local owner_ready="$report_dir/control-plane-hard-crash-owner-ready.json"
+  local owner_candidate="$owner_ready.pending"
+  if [[ -z "$failure_reason" ]]; then
+    local proof_deadline=$((SECONDS + 10))
+    local -a control_samples=()
+    while (( SECONDS < proof_deadline )); do
+      control_samples=( "$control_observation_dir"/*.json )
+      if [[ -e "${control_samples[0]}" ]]; then
+        if [[ ! -f "$pending_after_kill" ]]; then
+          if select_post_kill_pending_control_sample \
+            "$execution_stopped_at_ms" \
+            "$killed_partition" \
+            "$killed_lease_token" \
+            "${control_samples[@]}" >"$pending_candidate" 2>/dev/null \
+            && jq -e 'type == "object"' "$pending_candidate" >/dev/null; then
+            mv "$pending_candidate" "$pending_after_kill"
+          else
+            rm -f "$pending_candidate"
+          fi
+        fi
+        if [[ ! -f "$owner_ready" ]]; then
+          if select_hard_crash_owner_ready_control_sample \
+            "$pre" \
+            "$execution_stopped_at_ms" \
+            "$killed_partition" \
+            "$killed_boot_id" \
+            "$killed_task_id" \
+            "$killed_lease_token" \
+            "${control_samples[@]}" >"$owner_candidate" 2>/dev/null \
+            && jq -e 'type == "object"' "$owner_candidate" >/dev/null; then
+            mv "$owner_candidate" "$owner_ready"
+          else
+            rm -f "$owner_candidate"
+          fi
+        fi
+        if [[ -f "$pending_after_kill" && -f "$owner_ready" ]]; then
+          break
+        fi
+      fi
+      sleep 0.1
+    done
+  fi
+
+  stop_hard_crash_control_observer
+  set +e
+  wait "$ecs_exec_pid"
+  local ecs_exec_exit_code=$?
+  set -e
+  hard_crash_ecs_exec_pid=""
+  local ecs_exec_session_started=false
+  if grep -Eq \
+    'Starting session with SessionId: ecs-execute-command-' "$exec_output"; then
+    ecs_exec_session_started=true
+  fi
+
+  rm -f "$task_stop_candidate" "$pending_candidate" "$owner_candidate"
+  if [[ -z "$failure_reason" && "$ecs_exec_session_started" != true ]]; then
+    failure_reason="ECS Exec did not establish the single non-retried session before the selected task stopped"
+  fi
+  if [[ -z "$failure_reason" && ! -f "$pending_after_kill" ]]; then
+    failure_reason="No exact pending command remained under the killed lease within two seconds after ECS executionStoppedAt"
+  fi
+  if [[ -z "$failure_reason" && ! -f "$owner_ready" ]]; then
+    failure_reason="Killed membership and fenced partition ownership did not fail over to a pre-existing survivor within five seconds"
+  fi
+  if [[ -n "$failure_reason" ]]; then
+    echo "$failure_reason" >&2
     return 1
   fi
 
   local manifest_pending="$report_dir/hard-crash-manifest.pending.json"
   jq \
+    --arg execution_stopped_at "$execution_stopped_at" \
     --arg killed_lease_token "$killed_lease_token" \
+    --argjson execution_stopped_at_unix_ms "$execution_stopped_at_ms" \
+    --argjson recovery_timing_origin_unix_ms "$recovery_timing_origin_ms" \
+    --argjson task_stop_observed_at_unix_ms "$task_stop_observed_at_ms" \
+    --argjson ecs_exec_invoked_at_unix_ms "$ecs_exec_invoked_at_ms" \
+    --argjson ecs_exec_max_attempts "$ecs_exec_max_attempts" \
+    --argjson ecs_exec_exit_code "$ecs_exec_exit_code" \
+    --argjson ecs_exec_session_started "$ecs_exec_session_started" \
     --argjson partition "$killed_partition" \
-    --slurpfile observed "$pending_after_kill" '
+    --slurpfile observer_ready "$observer_ready" \
+    --slurpfile observed "$pending_after_kill" \
+    --slurpfile ready "$owner_ready" '
       . + {
+        execution_stopped_at: $execution_stopped_at,
+        execution_stopped_at_unix_ms: $execution_stopped_at_unix_ms,
+        recovery_timing_origin_unix_ms: $recovery_timing_origin_unix_ms,
+        task_stop_observed_at_unix_ms: $task_stop_observed_at_unix_ms,
+        ecs_exec_invoked_at_unix_ms: $ecs_exec_invoked_at_unix_ms,
+        ecs_exec_max_attempts: $ecs_exec_max_attempts,
+        ecs_exec_exit_code: $ecs_exec_exit_code,
+        ecs_exec_session_started: $ecs_exec_session_started,
+        observer_ready_before_exec_at_unix_ms:
+          $observer_ready[0].observation_completed_at_ms,
         pending_after_kill: {
           captured_at_unix_ms: $observed[0].captured_at_ms,
+          observation_started_at_unix_ms:
+            $observed[0].observation_started_at_ms,
+          observation_completed_at_unix_ms:
+            $observed[0].observation_completed_at_ms,
           partition: $partition,
           killed_lease_token: $killed_lease_token,
           entries: [$observed[0].runtime_partitions[]
             | select(.partition == $partition)
             | .pending_entry_sample[]
             | select(.consumer == $killed_lease_token)]
-        }
-      }
-    ' "$report_dir/hard-crash-manifest.json" >"$manifest_pending"
-  mv "$manifest_pending" "$report_dir/hard-crash-manifest.json"
-
-  local owner_ready="$report_dir/control-plane-hard-crash-owner-ready.json"
-  local owner_candidate="$owner_ready.pending"
-  local poll_deadline=$((SECONDS + 8))
-  while (( SECONDS < poll_deadline )); do
-    if capture_control_status "$owner_candidate" 2>/dev/null \
-      && jq -e \
-        --arg killed_boot_id "$killed_boot_id" \
-        --arg killed_task_id "$killed_task_id" \
-        --argjson partition "$killed_partition" \
-        --argjson kill_at_ms "$kill_at_ms" \
-        --slurpfile pre "$pre" '
-          ($pre[0].runtime_partitions[] | select(.partition == $partition)) as $old
-          | (.runtime_partitions[] | select(.partition == $partition)) as $new
-          | ([.live_members[].boot_id] | index($killed_boot_id)) == null
-          and .assignment.version > $pre[0].assignment.version
-          and .captured_at_ms >= $kill_at_ms
-          and .captured_at_ms <= ($kill_at_ms + 5000)
-          and $new.owner_matches
-          and $new.desired_owner != $killed_boot_id
-          and $new.active_owner == $new.desired_owner
-          and $new.lease_token != $old.lease_token
-          and ($new.desired_owner as $owner
-            | [.live_members[]
-                | select(.boot_id == $owner and .lifecycle == "ACTIVE")] as $current
-            | ($current | length) == 1
-              and $current[0].ecs_task_id != $killed_task_id
-              and ($current[0].ecs_task_id as $owner_task_id
-                | any($pre[0].live_members[];
-                    .boot_id == $owner and .ecs_task_id == $owner_task_id)))
-        ' "$owner_candidate" >/dev/null; then
-      mv "$owner_candidate" "$owner_ready"
-      break
-    fi
-    sleep 0.2
-  done
-  set +e
-  wait "$ecs_exec_pid"
-  local ecs_exec_exit_code=$?
-  set -e
-  if [[ ! -f "$owner_ready" ]]; then
-    [[ -f "$owner_candidate" ]] && mv "$owner_candidate" "$owner_ready"
-    echo "Killed membership and fenced partition ownership did not fail over to a pre-existing survivor within five seconds" >&2
-    return 1
-  fi
-  jq \
-    --argjson kill_at_unix_ms "$kill_at_ms" \
-    --argjson ecs_exec_exit_code "$ecs_exec_exit_code" \
-    --slurpfile ready "$owner_ready" '
-      . + {
-        kill_at_unix_ms: $kill_at_unix_ms,
-        ecs_exec_exit_code: $ecs_exec_exit_code,
-        owner_ready_at_unix_ms: $ready[0].captured_at_ms,
+        },
+        owner_observation_started_at_unix_ms:
+          $ready[0].observation_started_at_ms,
+        owner_sample_captured_at_unix_ms: $ready[0].captured_at_ms,
+        owner_ready_at_unix_ms: $ready[0].observation_completed_at_ms,
         assignment_version_after: $ready[0].assignment.version
       }
     ' "$report_dir/hard-crash-manifest.json" >"$manifest_pending"
@@ -2727,27 +3514,43 @@ collect_crash_ecs_runtime_evidence() {
   jq -e \
     --arg task_definition "$staging_task_definition_arn" \
     --argjson started "$evidence_started_epoch" \
-    --slurpfile manifest "$report_dir/hard-crash-manifest.json" '
+    --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
+    --slurpfile injected_stop "$report_dir/hard-crash-task-stop.json" '
       def epoch:
         sub("\\.[0-9]+\\+00:00$"; "Z")
         | sub("\\.[0-9]+Z$"; "Z")
         | sub("\\+00:00$"; "Z")
         | fromdateiso8601;
-      ($manifest[0].kill_at_unix_ms / 1000 | floor) as $kill_epoch
-      | [.tasks[]
+      [.tasks[]
           | select(.taskArn == $manifest[0].task_arn)
-          | select((.stoppedAt | epoch) >= $kill_epoch)] as $expected
+          | select(
+              .executionStoppedAt
+                == $manifest[0].execution_stopped_at)] as $expected
       | [.tasks[]
           | select((.stoppedAt | epoch) >= $started)
-          | select(.taskArn != $manifest[0].task_arn)
-          | select(
-              .stopCode != "ServiceSchedulerInitiated"
-              or ((.stoppedReason // "") | test("unhealthy|out.of.memory|failed"; "i"))
-            )] as $unexpected
+          | select(.taskArn != $manifest[0].task_arn)] as $unexpected
       | (.failures | length) == 0
         and ($expected | length) == 1
+        and ($injected_stop[0].failures | length) == 0
+        and ($injected_stop[0].tasks | length) == 1
+        and $injected_stop[0].tasks[0].taskArn == $manifest[0].task_arn
+        and $injected_stop[0].tasks[0].executionStoppedAt
+          == $manifest[0].execution_stopped_at
+        and $manifest[0].ecs_exec_max_attempts == 1
+        and $manifest[0].ecs_exec_session_started == true
+        and $manifest[0].observer_ready_before_exec_at_unix_ms
+          <= $manifest[0].ecs_exec_invoked_at_unix_ms
+        and $manifest[0].ecs_exec_invoked_at_unix_ms
+          <= $manifest[0].execution_stopped_at_unix_ms
+        and $manifest[0].execution_stopped_at_unix_ms
+          <= $manifest[0].task_stop_observed_at_unix_ms
         and $expected[0].taskDefinitionArn == $task_definition
         and $expected[0].stopCode == "EssentialContainerExited"
+        and (($expected[0].stoppedReason // "")
+          | test("out.?of.?memory|oom|unhealthy|failed"; "i") | not)
+        and all($expected[0].containers[];
+          ((.reason // "")
+            | test("out.?of.?memory|oom|unhealthy|failed"; "i") | not))
         and ([ $expected[0].containers[]
           | select(
               .name == "snaketron-server"
@@ -2787,6 +3590,8 @@ assert_hard_crash_report() {
   jq -n \
     --slurpfile report "$summary" \
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
+    --slurpfile pre "$report_dir/control-plane-pre-crash-10.json" \
+    --slurpfile observer_ready "$report_dir/control-plane-observer-ready-before-exec.json" \
     --slurpfile pending_after_kill "$report_dir/control-plane-immediate-post-kill.json" \
     --slurpfile owner_ready "$report_dir/control-plane-hard-crash-owner-ready.json" \
     --slurpfile final "$report_dir/control-plane-hard-crash-final-10.json" '
@@ -2808,8 +3613,15 @@ assert_hard_crash_report() {
           | length);
       $report[0] as $r
       | $manifest[0] as $m
-      | $m.kill_at_unix_ms as $kill
+      | $m.execution_stopped_at_unix_ms as $exact_stop
+      | $m.recovery_timing_origin_unix_ms as $timing_origin
       | $m.selected_partition.partition as $partition
+      | ($pre[0].runtime_partitions[]
+          | select(.partition == $partition)) as $old
+      | ($owner_ready[0].runtime_partitions[]
+          | select(.partition == $partition)) as $new
+      | ($observer_ready[0].runtime_partitions[]
+          | select(.partition == $partition)) as $observer_partition
       | ($m.pending_after_kill.entries | map(.id) | unique | sort) as $pending_ids
       | ([$pending_after_kill[0].runtime_partitions[]
           | select(.partition == $partition)
@@ -2817,15 +3629,20 @@ assert_hard_crash_report() {
           | select(.consumer == $m.selected_partition.lease_token)]) as $observed_pending
       # Exclude any bucket that began before the observer proved the successor
       # lease. The selected bucket end remains the conservative output bound.
-      | ($owner_ready[0].captured_at_ms / 1000 | ceil) as $first_post_second
-      | (($kill / 1000 | floor) - 30) as $stable_first_second
-      | ($kill / 1000 | floor) as $stable_after_last_second
-      | [$r.sessions[].hard_recoveries[]?
+      | ($owner_ready[0].observation_completed_at_ms / 1000 | ceil)
+          as $first_post_second
+      | (($timing_origin / 1000) - 30) as $stable_first_second
+      | ($timing_origin / 1000) as $stable_after_last_second
+      | [$r.sessions[].hard_recoveries[]?] as $all_recoveries
+      | [$all_recoveries[]
           | select(
               .from_task_boot_id == $m.task_boot_id
-              and .detected_at_unix_ms >= $kill
+              and .detected_at_unix_ms >= $timing_origin
+              and .detected_at_unix_ms >= $m.ecs_exec_invoked_at_unix_ms
+              and .ready_at_unix_ms >= $exact_stop
               and .ready_at_unix_ms >= .detected_at_unix_ms)] as $affected
-      | ([$affected[].ready_at_unix_ms - $kill] | p99) as $kill_to_ready_p99_ms
+      | ([$affected[].ready_at_unix_ms - $timing_origin] | p99)
+          as $crash_to_ready_p99_upper_bound_ms
       | ([$r.metrics.scheduled_command_counts_by_partition_and_unix_second
             [($partition | tostring)]
             | to_entries[]
@@ -2839,63 +3656,164 @@ assert_hard_crash_report() {
             $r.metrics.planned_handoffs.pending_commands_at_finish,
           pending_ids_observed_after_kill: $pending_ids,
           pending_observed_at_unix_ms: $m.pending_after_kill.captured_at_unix_ms,
-          kill_to_ready_p99_ms: $kill_to_ready_p99_ms,
+          pending_observation_completed_at_unix_ms:
+            $m.pending_after_kill.observation_completed_at_unix_ms,
+          execution_stopped_at_unix_ms: $exact_stop,
+          recovery_timing_origin_unix_ms: $timing_origin,
+          owner_ready_at_unix_ms:
+            $owner_ready[0].observation_completed_at_ms,
+          crash_to_ready_p99_upper_bound_ms:
+            $crash_to_ready_p99_upper_bound_ms,
           first_authoritative_output_second: $first_output_second,
           first_authoritative_output_upper_bound_ms: (
             if $first_output_second == null then null
-            else (($first_output_second + 1) * 1000) - $kill
+            else (($first_output_second + 1) * 1000) - $timing_origin
             end),
-          passed: (
-            $r.schema_version >= 10
-            and $r.metadata.threshold_result == "passed"
-            and $r.configured_max_concurrency == 272
-            and $r.metadata.mode == "duel"
-            and $r.metadata.command_profile == "every-tick"
-            and $r.metadata.spawn_rate_per_second == "4"
-            and $r.session_counts.peak_authenticated_concurrency == 272
-            and $r.session_counts.peak_active_game_concurrency >= 136
-            and $r.session_counts.failed == 0
-            and $r.session_counts.cancelled == 0
-            and $r.session_counts.incomplete == 0
-            and $r.games.pairing_violations == 0
-            and all($r.sessions[]; .outcome == "completed" and .failure_phase == null)
-            and ($stable_after_last_second - $stable_first_second) == 30
-            and all(range($stable_first_second; $stable_after_last_second);
-              . as $second
-              | (($second * 1000) + 500) as $midpoint
-              | ([$r.sessions[]
-                  | select(
-                      .authenticated_at_unix_ms != null
-                      and .authenticated_at_unix_ms <= $midpoint
-                      and .finished_at_unix_ms > $midpoint)] | length) >= 256
-                and fully_joined_duels_at($r; $midpoint) >= 128
-                and (($r.metrics.command_counts_by_unix_second
-                      [($second | tostring)] // 0) >= 1280))
-            and ($affected | length) > 0
-            and $m.pending_after_kill.partition == $partition
-            and $m.pending_after_kill.killed_lease_token == $m.selected_partition.lease_token
-            and $m.pending_after_kill.captured_at_unix_ms >= $kill
-            and $m.pending_after_kill.captured_at_unix_ms
-              == $pending_after_kill[0].captured_at_ms
-            and ($pending_ids | length) > 0
-            and ($pending_ids | length) == ($m.pending_after_kill.entries | length)
-            and $m.pending_after_kill.entries == $observed_pending
-            and $kill_to_ready_p99_ms != null
-            and $kill_to_ready_p99_ms <= 10000
-            and all($affected[];
-              .to_task_boot_id != .from_task_boot_id
-              and .fresh_snapshot_received)
-            and $r.metrics.planned_handoffs.pending_commands_at_finish == 0
-            and $first_output_second != null
-            and ((($first_output_second + 1) * 1000) - $kill) <= 5000
-            and all($final[0].runtime_partitions[];
-              .consumer_group_exists
-              and .owner_matches
-              and .pending_count == 0
-              and .pending_completion_count == 0
-              and .quarantined_command_count == 0)
-          )
+          checks: {
+            load_contract: (
+              $r.schema_version >= 10
+              and $r.metadata.threshold_result == "passed"
+              and $r.configured_max_concurrency == 272
+              and $r.metadata.mode == "duel"
+              and $r.metadata.command_profile == "every-tick"
+              and $r.metadata.spawn_rate_per_second == "4"
+              and $r.session_counts.peak_authenticated_concurrency == 272
+              and $r.session_counts.peak_active_game_concurrency >= 136),
+            clean_completion: (
+              $r.session_counts.failed == 0
+              and $r.session_counts.cancelled == 0
+              and $r.session_counts.incomplete == 0
+              and $r.session_counts.completed == $r.session_counts.total
+              and $r.games.pairing_violations == 0
+              and all($r.sessions[];
+                .outcome == "completed" and .failure_phase == null)),
+            single_observed_fault: (
+              $m.ecs_exec_max_attempts == 1
+              and $m.ecs_exec_session_started == true
+              and $m.observer_ready_before_exec_at_unix_ms
+                == $observer_ready[0].observation_completed_at_ms
+              and $observer_ready[0].observation_started_at_ms
+                <= $observer_ready[0].captured_at_ms
+              and $observer_ready[0].captured_at_ms
+                <= $observer_ready[0].observation_completed_at_ms
+              and $observer_partition.owner_matches
+              and $observer_partition.active_owner
+                == $m.selected_member.boot_id
+              and $observer_partition.lease_token
+                == $m.selected_partition.lease_token
+              and any($observer_partition.pending_entry_sample[];
+                .consumer == $m.selected_partition.lease_token)
+              and $m.observer_ready_before_exec_at_unix_ms
+                <= $m.ecs_exec_invoked_at_unix_ms
+              and $m.ecs_exec_invoked_at_unix_ms <= $exact_stop
+              and $exact_stop <= $m.task_stop_observed_at_unix_ms
+              and $timing_origin == (($exact_stop / 1000 | floor) * 1000)),
+            pre_crash_envelope: (
+              ($stable_after_last_second - $stable_first_second) == 30
+              and all(range($stable_first_second; $stable_after_last_second);
+                . as $second
+                | (($second * 1000) + 500) as $midpoint
+                | ([$r.sessions[]
+                    | select(
+                        .authenticated_at_unix_ms != null
+                        and .authenticated_at_unix_ms <= $midpoint
+                        and .finished_at_unix_ms > $midpoint)] | length) >= 256
+                  and fully_joined_duels_at($r; $midpoint) >= 128
+                  and (($r.metrics.command_counts_by_unix_second
+                        [($second | tostring)] // 0) >= 1280))),
+            affected_reconnects: (
+              ($affected | length) > 0
+              and ($all_recoveries | length) == ($affected | length)
+              and $r.metrics.traffic.disconnects == ($affected | length)
+              and $r.metrics.traffic.reconnects == ($affected | length)),
+            pending_backlog: (
+              $m.pending_after_kill.partition == $partition
+              and $m.pending_after_kill.killed_lease_token
+                == $m.selected_partition.lease_token
+              and $m.pending_after_kill.observation_started_at_unix_ms
+                >= $exact_stop
+              and $m.pending_after_kill.captured_at_unix_ms
+                >= $m.pending_after_kill.observation_started_at_unix_ms
+              and $m.pending_after_kill.captured_at_unix_ms
+                <= $m.pending_after_kill.observation_completed_at_unix_ms
+              and $m.pending_after_kill.observation_completed_at_unix_ms
+                <= ($exact_stop + 2000)
+              and $m.pending_after_kill.captured_at_unix_ms
+                == $pending_after_kill[0].captured_at_ms
+              and $m.pending_after_kill.observation_started_at_unix_ms
+                == $pending_after_kill[0].observation_started_at_ms
+              and $m.pending_after_kill.observation_completed_at_unix_ms
+                == $pending_after_kill[0].observation_completed_at_ms
+              and ($pending_ids | length) > 0
+              and ($pending_ids | length)
+                == ($m.pending_after_kill.entries | length)
+              and $m.pending_after_kill.entries == $observed_pending
+              and $m.selected_partition == $old),
+            fenced_survivor: (
+              $m.owner_observation_started_at_unix_ms
+                == $owner_ready[0].observation_started_at_ms
+              and $m.owner_sample_captured_at_unix_ms
+                == $owner_ready[0].captured_at_ms
+              and $m.owner_ready_at_unix_ms
+                == $owner_ready[0].observation_completed_at_ms
+              and $owner_ready[0].observation_started_at_ms >= $exact_stop
+              and $owner_ready[0].captured_at_ms
+                >= $owner_ready[0].observation_started_at_ms
+              and $owner_ready[0].captured_at_ms
+                <= $owner_ready[0].observation_completed_at_ms
+              and $owner_ready[0].observation_completed_at_ms
+                <= ($exact_stop + 5000)
+              and $m.assignment_version_after
+                == $owner_ready[0].assignment.version
+              and $owner_ready[0].assignment.version
+                > $pre[0].assignment.version
+              and (([$owner_ready[0].live_members[].boot_id]
+                | index($m.selected_member.boot_id)) == null)
+              and $new.owner_matches
+              and $new.desired_owner != $m.selected_member.boot_id
+              and $new.active_owner == $new.desired_owner
+              and ($new.lease_token | type == "string" and length > 0)
+              and $new.lease_token != $m.selected_partition.lease_token
+              and ($new.desired_owner as $owner
+                | [$owner_ready[0].live_members[]
+                    | select(
+                        .boot_id == $owner
+                        and .lifecycle == "ACTIVE")] as $current
+                | ($current | length) == 1
+                  and $current[0].ecs_task_id
+                    != $m.selected_member.ecs_task_id
+                  and ($current[0].ecs_task_id as $owner_task_id
+                    | any($pre[0].live_members[];
+                        .boot_id == $owner
+                        and .ecs_task_id == $owner_task_id)))),
+            client_recovery_budget: (
+              $crash_to_ready_p99_upper_bound_ms != null
+              and $crash_to_ready_p99_upper_bound_ms <= 10000),
+            client_recovery_integrity: (
+              all($affected[];
+                .to_task_boot_id != .from_task_boot_id
+                and .fresh_snapshot_received)),
+            exact_command_accounting: (
+              ([ $r.metrics.command_counts_by_unix_second[] ] | add // 0)
+                == $r.metrics.traffic.commands_sent
+              and ([
+                  $r.metrics.command_outcome_counts_by_sent_unix_second[]
+                ] | add // 0) == $r.metrics.traffic.commands_sent
+              and $r.metrics.planned_handoffs.pending_commands_at_finish == 0),
+            authoritative_output_budget: (
+              $first_output_second != null
+              and ((($first_output_second + 1) * 1000) - $timing_origin)
+                <= 5000),
+            final_executor_drain: (
+              all($final[0].runtime_partitions[];
+                .consumer_group_exists
+                and .owner_matches
+                and .pending_count == 0
+                and .pending_completion_count == 0
+                and .quarantined_command_count == 0))
+          }
         }
+      | .passed = ([.checks[]] | all)
     ' >"$report_dir/hard-crash-acceptance.json"
   jq -e '.passed' "$report_dir/hard-crash-acceptance.json" >/dev/null || {
     echo "Hard-crash recovery failed its session, command, ownership, or five-second output gates" >&2
@@ -2986,6 +3904,9 @@ run_staging_suite() {
   traefik_monitor_dir=""
   ecs_runtime_monitor_pid=""
   ecs_runtime_monitor_dir=""
+  hard_crash_control_observer_pid=""
+  hard_crash_control_observer_stop_file=""
+  hard_crash_ecs_exec_pid=""
 
   set_scaling_suspended() {
     local value="$1"
@@ -3008,6 +3929,7 @@ run_staging_suite() {
     local cleanup_ok=true
     stop_traefik_monitor
     stop_ecs_runtime_monitor
+    stop_hard_crash_control_observer
     local population_pid
     for population_pid in \
       "$load_pid" \
@@ -3015,7 +3937,8 @@ run_staging_suite() {
       "$admission_population_pid" \
       "$idle_population_pid" \
       "$lobby_population_pid" \
-      "$matchmaking_population_pid"; do
+      "$matchmaking_population_pid" \
+      "$hard_crash_ecs_exec_pid"; do
       if [[ -n "$population_pid" ]] && kill -0 "$population_pid" 2>/dev/null; then
         kill -TERM "$population_pid" 2>/dev/null || true
         wait "$population_pid" 2>/dev/null || true
@@ -4383,7 +5306,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 272@8m \
+    --stages 272@10m \
     --spawn-rate 4 \
     --max-total-sessions 8192 \
     --command-profile every-tick \
@@ -4398,73 +5321,9 @@ run_staging_suite() {
   capacity_pid=""
   local capacity_summary="$report_dir/$capacity_run_id/summary.json"
 
-  jq -e '
-    def fully_joined_duels_at($report; $midpoint):
-      ([$report.sessions[] | select(.game_id != null)]
-        | group_by(.game_id)
-        | map(select(
-            length == 2
-            and all(.[];
-              .playing_at_unix_ms != null
-              and .game_finished_at_unix_ms != null
-              and .playing_at_unix_ms <= $midpoint
-              and .game_finished_at_unix_ms > $midpoint)))
-        | length);
-    . as $report
-    | .ramp_stages[0].target_reached_at_unix_ms as $hold_started_at_ms
-    | .ramp_stages[0].finished_at_unix_ms as $hold_finished_at_ms
-    | (($hold_started_at_ms / 1000) | ceil) as $hold_first_second
-    | (($hold_finished_at_ms / 1000) | floor) as $hold_after_last_second
-    | 1280 as $minimum_commands_per_second
-    | .schema_version >= 10
-    and .metadata.threshold_result == "passed"
-    and .configured_max_concurrency == 272
-    and .metadata.mode == "duel"
-    and .metadata.command_profile == "every-tick"
-    and .metadata.spawn_rate_per_second == "4"
-    and .session_counts.peak_authenticated_concurrency == 272
-    and .session_counts.peak_active_game_concurrency >= 136
-    and .session_counts.failed == 0
-    and .session_counts.cancelled == 0
-    and .session_counts.incomplete == 0
-    and .session_counts.completed == .session_counts.total
-    and all(.sessions[]; .outcome == "completed" and .failure_phase == null)
-    and .games.pairing_violations == 0
-    and (.ramp_stages | length) == 1
-    and .ramp_stages[0].target_reached
-    and ($hold_finished_at_ms - $hold_started_at_ms) >= 300000
-    and ($hold_after_last_second - $hold_first_second) >= 299
-    and all(range($hold_first_second; $hold_after_last_second);
-      . as $second
-      | (($second * 1000) + 500) as $midpoint
-      | ([$report.sessions[]
-          | select(
-              .authenticated_at_unix_ms != null
-              and .authenticated_at_unix_ms <= $midpoint
-              and .finished_at_unix_ms > $midpoint)] | length) >= 256
-        and fully_joined_duels_at($report; $midpoint) >= 128
-        and (($report.metrics.command_counts_by_unix_second
-            [($second | tostring)] // 0) as $sent
-          | $sent >= $minimum_commands_per_second
-            and ($report.metrics.command_outcome_counts_by_sent_unix_second
-              [($second | tostring)] // 0) == $sent
-            and ($report.metrics.command_outcome_max_latency_ms_by_sent_unix_second
-              [($second | tostring)] // 1001) <= 1000)
-        and all(range(0; 10);
-          . as $partition
-          | (($report.metrics.scheduled_command_counts_by_partition_and_unix_second
-                [($partition | tostring)][($second | tostring)] // 0) > 0)))
-    and .metrics.traffic.disconnects == 0
-    and .metrics.traffic.reconnects == 0
-    and (.metrics.usable_session_gap_ms.max_ms // 0) == 0
-    and ([.metrics.command_counts_by_unix_second[]] | add)
-      == .metrics.traffic.commands_sent
-    and ([.metrics.command_outcome_counts_by_sent_unix_second[]] | add)
-      == .metrics.traffic.commands_sent
-    and .metrics.planned_handoffs.pending_commands_at_finish == 0
-    and (.metrics.initial_admission_ready_ms.p99_ms // 10001) <= 10000
-    and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
-  ' "$capacity_summary" >/dev/null || {
+  write_capacity_acceptance_report \
+    "$capacity_summary" "$report_dir/capacity-acceptance.json"
+  jq -e '.passed' "$report_dir/capacity-acceptance.json" >/dev/null || {
     echo "Ten-task Run B did not hold the 256-session/128-duel every-tick envelope for five continuous minutes" >&2
     exit 1
   }

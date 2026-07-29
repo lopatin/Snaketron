@@ -20,6 +20,7 @@ const PENDING_ENTRY_SAMPLE_LIMIT: usize = 128;
 struct Args {
     region_key: String,
     redis_url: String,
+    partition: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -68,7 +69,17 @@ struct Status {
 }
 
 fn usage() -> &'static str {
-    "Usage: resilience_admin status --region-key REGION [--redis-url URL]"
+    "Usage: resilience_admin status --region-key REGION [--redis-url URL] [--partition NUMBER]"
+}
+
+fn parse_partition(value: &str) -> Result<u32> {
+    let parsed = value
+        .parse::<u32>()
+        .with_context(|| format!("invalid partition {value:?}"))?;
+    if parsed >= PARTITION_COUNT {
+        bail!("partition must be less than {PARTITION_COUNT}, found {parsed}");
+    }
+    Ok(parsed)
 }
 
 fn parse_args() -> Result<Args> {
@@ -78,6 +89,7 @@ fn parse_args() -> Result<Args> {
     }
     let mut region_key = None;
     let mut redis_url = None;
+    let mut partition = None;
     while let Some(argument) = values.next() {
         match argument.as_str() {
             "--region-key" => {
@@ -85,6 +97,10 @@ fn parse_args() -> Result<Args> {
             }
             "--redis-url" => {
                 redis_url = Some(values.next().context("--redis-url requires a value")?);
+            }
+            "--partition" => {
+                let value = values.next().context("--partition requires a value")?;
+                partition = Some(parse_partition(&value)?);
             }
             "-h" | "--help" => bail!(usage()),
             other => bail!("unknown argument {other:?}\n{}", usage()),
@@ -95,6 +111,7 @@ fn parse_args() -> Result<Args> {
         redis_url: redis_url
             .or_else(|| env::var("SNAKETRON_REDIS_URL").ok())
             .context("--redis-url or SNAKETRON_REDIS_URL is required")?,
+        partition,
     })
 }
 
@@ -231,8 +248,12 @@ async fn main() -> Result<()> {
         ))
         .await
         .context("failed to inspect the quickmatch 2v2 queue")?;
-    let mut runtime_partitions = Vec::with_capacity(PARTITION_COUNT as usize);
-    for partition in 0..PARTITION_COUNT {
+    let partitions = args.partition.map_or_else(
+        || (0..PARTITION_COUNT).collect(),
+        |partition| vec![partition],
+    );
+    let mut runtime_partitions = Vec::with_capacity(partitions.len());
+    for partition in partitions {
         runtime_partitions
             .push(read_partition(&mut redis, &namespace, assignment.as_ref(), partition).await?);
     }
@@ -283,5 +304,17 @@ mod tests {
                 "delivery_count": 3,
             })
         );
+    }
+
+    #[test]
+    fn accepts_only_configured_partition_numbers() {
+        assert_eq!(parse_partition("0").unwrap(), 0);
+        assert_eq!(
+            parse_partition(&(PARTITION_COUNT - 1).to_string()).unwrap(),
+            PARTITION_COUNT - 1
+        );
+        assert!(parse_partition(&PARTITION_COUNT.to_string()).is_err());
+        assert!(parse_partition("-1").is_err());
+        assert!(parse_partition("not-a-number").is_err());
     }
 }

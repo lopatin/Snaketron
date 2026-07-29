@@ -980,11 +980,11 @@ fn groups_to_launch(
     if reserved >= target || players_per_game == 0 {
         return 0;
     }
-    // Replacements remain full match groups. If a single VU from a group
-    // exits early, the bounded overshoot is therefore less than one group.
-    (target - reserved)
-        .div_ceil(players_per_game)
-        .min(launch_budget / players_per_game)
+    // Replacements remain full match groups, but a partially vacated group
+    // does not create enough room for another complete group. Stage targets
+    // are validated as group-aligned, so rounding down reaches the exact
+    // target once the remaining member(s) finish without ever overshooting it.
+    ((target - reserved) / players_per_game).min(launch_budget / players_per_game)
 }
 
 fn record_successful_game_outcome(
@@ -1413,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn individual_terminal_session_releases_capacity_before_its_group_finishes() {
+    fn partial_group_exit_does_not_overshoot_the_stage_target() {
         let mut concurrency = SessionConcurrencyTracker::default();
         concurrency.reserve(&[1, 2]);
         concurrency.observe(SessionActivityEvent::Connected { session_index: 1 });
@@ -1423,16 +1423,35 @@ mod tests {
 
         assert_eq!(concurrency.connected(), 1);
         assert_eq!(concurrency.reserved(), 1);
+        assert_eq!(groups_to_launch(2, concurrency.reserved(), 2, 2), 0);
+
+        concurrency.observe(SessionActivityEvent::Terminal { session_index: 2 });
         assert_eq!(groups_to_launch(2, concurrency.reserved(), 2, 2), 1);
     }
 
     #[test]
-    fn replacement_launches_stay_match_group_aligned_and_bounded() {
-        // One missing member of a four-player group requires one complete
-        // replacement group, producing at most a three-session overshoot.
-        assert_eq!(groups_to_launch(4, 3, 8, 4), 1);
-        assert_eq!(3 + groups_to_launch(4, 3, 8, 4) * 4, 7);
+    fn replacement_launches_stay_match_group_aligned_without_overshoot() {
+        assert_eq!(groups_to_launch(4, 3, 8, 4), 0);
+        assert_eq!(groups_to_launch(4, 0, 8, 4), 1);
         assert_eq!(groups_to_launch(4, 4, 8, 4), 0);
+    }
+
+    #[test]
+    fn replacement_launches_never_exceed_target_or_budget() {
+        for players_per_game in 1..=4 {
+            for group_target in 1..=8 {
+                let target = group_target * players_per_game;
+                for reserved in 0..=target {
+                    for launch_budget in 0..=(target + players_per_game) {
+                        let groups =
+                            groups_to_launch(target, reserved, launch_budget, players_per_game);
+                        let launched = groups * players_per_game;
+                        assert!(reserved + launched <= target);
+                        assert!(launched <= launch_budget);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -302,7 +302,11 @@ partition leases. Configure 272 game sessions / 136 duels so ordinary churn
 cannot turn one brief peak into false evidence. Require at least 256 concurrent
 authenticated game sessions / 128 duels and `every-tick` traffic on every
 partition for five continuous minutes after ramping at four new sessions per
-second. This capacity envelope never runs on the one-task baseline.
+second. The load stage runs for ten minutes so ramp time and nonqualifying
+observation seconds cannot masquerade as a five-minute proof; acceptance uses
+the longest unchanged per-second qualifying interval and still requires at
+least 300 consecutive seconds. This capacity envelope never runs on the
+one-task baseline.
 
 A forced scale-in is valid only when its complete destination load is sized
 from demonstrated one-task capacity. Gate B proves the command-bearing cohort
@@ -331,19 +335,23 @@ the final load report is the authority for authenticated session count. It
 selects an owned partition only when it
 has both active games and pending work, maps that owner to one exact task ARN,
 then performs one non-retried ECS Exec command that finds exactly one non-PID-1
-`server` process, sends it SIGSTOP, emits the conservative fail-stop timestamp,
-and sends the same PID SIGKILL 500 milliseconds later. Stopping first prevents
-the selected executor from processing or acknowledging more work while its
-timestamp crosses the ECS Exec channel; the later exact ECS exit-137 assertion
-proves that the kill completed. The local ECS Exec client has a 40-second hard
-timeout so a lost marker cannot wait for Session Manager's idle timeout. The
-200 ms control-plane observer requires
-the expired member to disappear and a pre-existing survivor to hold a new
-fenced lease under a later assignment version within five seconds, before the
-replacement task is used. The run then requires affected gateway sessions,
-fresh snapshots/outcome barriers, zero unresolved commands, the affected
-partition's command output, the exact expected ECS exit-137 record, and restored
-ten-task ECS/Traefik health.
+`server` process and sends that PID SIGKILL directly. A read-only control-plane
+observer proves one old-owner sample before ECS Exec and brackets every later
+multi-read status observation with start and completion timestamps. The entire
+observation interval must fit inside its deadline. The proof is anchored to the
+selected task's millisecond-precision ECS
+`executionStoppedAt`, because ECS Exec output disappears with the container and
+`stoppedAt` may lag the actual exit. An old-consumer PEL entry must be observed
+within two seconds after that exact stop, and the expired member must disappear
+with a pre-existing survivor holding a new fenced lease under a later
+assignment version within five seconds. Exact exit 137 remains mandatory. The
+mutating AWS CLI call has retries disabled and acceptance rejects an explicit
+OOM or unhealthy stop reason. The
+whole-second floor of `executionStoppedAt` is used only as a conservative
+cross-host origin for client and per-second output timing. The run then requires
+affected gateway sessions, fresh snapshots/outcome barriers, zero unresolved
+commands, the affected partition's command output, and restored ten-task
+ECS/Traefik health.
 A separate Fargate-host failure adds no application failure mode. A remote
 Valkey outage is also not an external release action: availability during that
 accepted dependency outage is out of scope, while deterministic local
@@ -832,12 +840,12 @@ from other task identities in 2,506--2,706 milliseconds, and ECS recorded the
 one selected server container exiting 137. Formal crash acceptance could not
 run: the remote shell killed the essential process before its following marker
 crossed ECS Exec, then the local client waited for Session Manager's 20-minute
-idle timeout. The single crash command now stops the exact server PID before
-emitting a conservative fail-stop marker, waits 500 milliseconds for transport,
-then kills the same PID; the later exact exit-137 assertion remains mandatory.
-GNU `timeout` bounds the ECS Exec client at 40 seconds. This adds no production
-endpoint or second crash action. A fresh run must still capture the immediate
-PEL, survivor lease, output, and reconnect proof.
+idle timeout. The single crash command now kills the exact server PID directly
+while a read-only observer samples the selected partition.
+Certification uses ECS `executionStoppedAt` and exact exit 137 instead of ECS
+Exec stdout, which is inherently lost during container teardown. This adds no
+production endpoint or second crash action. A fresh run must still capture the
+immediate PEL, survivor lease, output, and reconnect proof.
 
 This run again reused the exact Network stack, ingress instance, root EBS, EIP,
 hostname, and TLS certificate. CloudTrail recorded no development DNS or ACME

@@ -1478,11 +1478,14 @@ failure; 22 affected clients recovered through different tasks with fresh
 snapshots in 2,506--2,706 milliseconds, and ECS recorded the selected container
 exiting 137. It is not formal crash certification because killing the essential
 process tore down ECS Exec before its post-kill marker arrived, after which the
-harness waited for Session Manager's 20-minute timeout. The single injection
-now SIGSTOPs the exact server PID, emits a conservative fail-stop timestamp,
-waits 500 milliseconds for delivery, then SIGKILLs the same PID. Exact exit 137
-remains mandatory, and a 40-second local timeout prevents another unbounded
-wait. No production crash endpoint or additional external action is added.
+harness waited for Session Manager's 20-minute timeout. The single injection now
+SIGKILLs the exact server PID directly while a read-only control-plane observer
+brackets each selected-partition observation with start and completion times.
+Certification disables AWS CLI retries for the one mutating call, anchors the
+bounded observations to ECS `executionStoppedAt`, requires exact exit 137, and
+rejects explicit OOM/unhealthy reasons rather than relying on stdout that is
+inherently lost during container teardown. No production crash endpoint or
+additional external action is added.
 
 The run reused the exact protected Network stack, ingress instance, root EBS,
 EIP, hostname, and certificate, with no development DNS/ACME change. Cleanup
