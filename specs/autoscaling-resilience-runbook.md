@@ -144,9 +144,9 @@ DynamicScalingInSuspended=false,DynamicScalingOutSuspended=false,ScheduledScalin
 
 Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
-Both retain a minimum of one. The application task uses one vCPU and two GiB so
-the one-task floor has takeover and burst headroom while target tracking is
-still observing load. CPU is targeted at 40%, memory at 80%, and both scale-in
+Both retain a minimum of one. The application task uses two vCPU and four GiB
+so the one-task floor has takeover and burst headroom while target tracking is
+still observing load. CPU is targeted at 35%, memory at 80%, and both scale-in
 and scale-out cooldowns are 60 seconds. Development and production use the
 same policy.
 
@@ -243,7 +243,7 @@ accurate evidence for those runs, but they are not the cleanup contract for new
 runs; the persistent-foundation lifecycle described below is authoritative.
 
 **Gate A — natural scale-out.** Run a fixed 128-session / 64-duel
-`every-tick` cohort from the one-vCPU minimum task. It retains one stage, the
+`every-tick` cohort from the two-vCPU minimum task. It retains one stage, the
 20-minute runner, eight-minute target-tracking observation budget, and the
 existing one-second command-outcome budget. It does not use synthetic CPU,
 force the transition, or adapt load from live metrics. CPU or
@@ -335,11 +335,14 @@ the final load report is the authority for authenticated session count. It
 selects an owned partition only when it
 has both active games and pending work, maps that owner to one exact task ARN,
 then performs one non-retried ECS Exec command that finds exactly one non-PID-1
-`server` process and sends that PID SIGKILL directly. A read-only control-plane
-observer proves one old-owner sample before ECS Exec and brackets every later
-multi-read status observation with start and completion timestamps. The entire
-observation interval must fit inside its deadline. The proof is anchored to the
-selected task's millisecond-precision ECS
+`server` process and sends that PID SIGKILL directly. One prestarted read-only
+observer uses a single partition-local Lua operation to read the exact
+old-consumer PEL entry and Redis time atomically; a second lightweight observer
+sandwiches membership between assignment/lease reads for coherent ownership
+proof. Its final partition-slot read also records the exact authoritative-event
+stream tail. Both bracket their calls with local start and completion timestamps, and
+the entire selected observation interval must fit inside its deadline. The
+proof is anchored to the selected task's millisecond-precision ECS
 `executionStoppedAt`, because ECS Exec output disappears with the container and
 `stoppedAt` may lag the actual exit. An old-consumer PEL entry must be observed
 within two seconds after that exact stop, and the expired member must disappear
@@ -348,10 +351,15 @@ assignment version within five seconds. Exact exit 137 remains mandatory. The
 mutating AWS CLI call has retries disabled and acceptance rejects an explicit
 OOM or unhealthy stop reason. The
 whole-second floor of `executionStoppedAt` is used only as a conservative
-cross-host origin for client and per-second output timing. The run then requires
+cross-host origin for client timing and the pre-crash whole-second load window.
+After ownership is proven, a read-only durable-stream query requires the first
+non-replay `CommandScheduledV2` after that exact tail anchor to carry a Valkey
+stream timestamp no later than five seconds after the exact ECS stop. Because
+the tail, assignment, and lease are read atomically from the same partition
+slot, buffered pre-crash events cannot satisfy this gate. The run then requires
 affected gateway sessions, fresh snapshots/outcome barriers, zero unresolved
-commands, the affected partition's command output, and restored ten-task
-ECS/Traefik health.
+commands, that causal partition output, and restored ten-task ECS/Traefik
+health.
 A separate Fargate-host failure adds no application failure mode. A remote
 Valkey outage is also not an external release action: availability during that
 accepted dependency outage is out of scope, while deterministic local
@@ -875,7 +883,7 @@ the evidence does not prove which queued operation initiated that incident.
 
 The narrow correction preserves exact telemetry semantics but fetches bounded
 recovery headers and tails in fixed 32-key same-slot batches, bounds the
-complete normal collection to 500 milliseconds, and emits a separately gated
+complete normal collection to two seconds, and emits a separately gated
 `RegionalCollectionFailures` metric so a skipped collection cannot look like
 zero mismatches. One task-wide maintenance dispatcher now owns only
 pending-completion index reads and bounded approximate stream trimming.
@@ -903,6 +911,82 @@ Monitoring runtime stacks and stopped ingress. The fixed hostname, DNS, EIP,
 certificate-bearing EBS volume, shared production VPC, and reusable
 Network/ECS/ECR/DynamoDB foundations remained. Fresh complete Gate A/B/C,
 automatic scale-in, and exit-137 evidence remain mandatory.
+
+Exact-source run
+[`30486700133`](https://github.com/lopatin/snaketron-io/actions/runs/30486700133)
+used outer commit `d2ba3692b4841f6ea0ba1a929c164239c3bc0b8b` and
+Snaketron commit `9d176c3be3a4510cfd86f583ca5e2aa915312125`. Gate A
+naturally scaled `1 -> 2`. All 1,664
+sessions, 832 games, and 1,488,138 commands completed with exact outcomes and
+zero disconnects or reconnects. The transition itself passed: all 50 movement
+seconds stayed below one second with a 608-millisecond maximum, and all 789
+post-ready seconds passed with a 461-millisecond maximum. Five of 323
+one-task baseline seconds still failed, reaching 1,701--2,531 milliseconds, so
+Gates B and C correctly did not run.
+
+The task averaged 70.91--84.87% CPU and peaked at 90.04% on one vCPU, while
+memory remained below 9%. The managed CPU alarm did not act until six minutes
+after load began because its one-minute observations arrived late and required
+three breaching datapoints. The final failure cluster stalled receipts across
+every partition and then drained in the next second. Valkey and DynamoDB
+reported zero throttling, Valkey reported zero evictions, and no executor,
+lease, fencing, completion, or checkpoint failure occurred. The evidence is
+most consistent with one-task compute pressure during target-tracking
+observation, not a rebalancing failure.
+
+The regional reporter contributes only about 0.07% of Valkey traffic and
+normally finishes in about 100 milliseconds on its separate connection. It is
+not a sufficient explanation for Gate A and is not treated as the capacity
+fix. Three valid collections did exceed the old 500-millisecond telemetry
+deadline by 12--45 milliseconds, so the deadline has two seconds of
+operational margin and any `RegionalCollectionFailures` remains a hard
+certification failure. The outage tracker uses the actual gap between
+successful ownership samples, so a longer regional scan cannot hide a lease
+outage. INFO volume was not correlated with the failed seconds; no speculative
+metrics concurrency or production log suppression is added.
+
+Development and production now use two-vCPU / four-GiB tasks, retain
+`minTasks=1`, and target CPU at 35%. The measured 128-session load consumed
+about 0.71--0.85 vCPU, so this leaves a second runtime worker and headroom
+during the managed alarm delay while projecting to about 35.5--42.5%
+utilization. Fresh Gate A must prove the CPU-only scale-out; memory stays at
+80%, cooldowns remain 60 seconds, and the load and one-second acceptance gates
+are unchanged.
+
+The independent exit-137 suite also exposed proof issues after successful
+product recovery. ECS recorded the selected task exiting 137. A pre-existing
+survivor completed fenced partition-6 bootstrap 3.72 seconds after exact stop,
+recovering 15 games and replaying 151 commands. All 28 affected clients
+received fresh snapshots in 2.512--2.658 seconds from exact stop; all 954
+sessions, 477 games, and 855,103 terminal outcomes completed. Another 138
+sessions admitted after the stop also completed, and Traefik never had zero
+healthy backends.
+
+The rich post-stop status observation began at +168 milliseconds and found
+151 exact pending entries under the killed lease, but its multi-read interval
+completed at +2.300 seconds. The selector correctly refused to claim the
+unchanged two-second PEL proof. A prestarted narrow partition-local atomic
+`TIME` / consumer-filtered `XPENDING` observer now supplies that proof without
+changing the deadline. The prior load report showed a post-stop receipt bucket
+with a 4.2-second upper bound, but receipt time could not exclude a buffered
+pre-crash event and is not accepted as causal proof. The corrected harness atomically
+anchors the new owner's partition event-stream tail with its assignment and
+lease, then immediately saves the first exact later fenced, non-replay
+`CommandScheduledV2` stream entry. The bounded, paged read prevents an
+unbounded diagnostic query, and immediate capture prevents the approximately
+bounded event stream from trimming valid recovery evidence while ECS exposes
+the exact stop timestamp. The saved ownership/output pair is accepted only
+when the replacement assignment was computed after that exact stop and both
+timestamps correlate to the unchanged five-second window. The unrelated-stop
+check also snapshots and excludes tasks already stopping before crash evidence
+begins.
+
+Cleanup for `30486700133` succeeded and honored the cost boundary: only Server,
+Serverless Valkey, and Monitoring were removed; ingress was stopped; and the
+fixed hostname, DNS, EIP, certificate-bearing EBS volume, shared production
+VPC, and reusable Network/ECS/ECR/DynamoDB foundations were retained. No
+certificate was created. Fresh complete Gate A/B/C, automatic scale-in, and
+exit-137 evidence remain mandatory.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.

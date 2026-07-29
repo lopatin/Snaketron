@@ -2,9 +2,11 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use common::{GameType, QueueMode};
+use common::{ClientCommandIdentityV2, GameEvent, GameEventMessage, GameType, QueueMode};
 use redis::AsyncCommands;
-use redis::streams::{StreamPendingCountReply, StreamPendingId, StreamPendingReply};
+use redis::streams::{
+    StreamPendingCountReply, StreamPendingId, StreamPendingReply, StreamRangeReply,
+};
 use serde::Serialize;
 use server::cluster_membership::{
     BootIdentity, ClusterNamespace, MEMBERSHIP_SCHEMA_VERSION, TaskMembership,
@@ -17,6 +19,8 @@ use std::env;
 use uuid::Uuid;
 
 const PENDING_ENTRY_SAMPLE_LIMIT: usize = 128;
+const OUTPUT_SCAN_PAGE_SIZE: usize = 512;
+const OUTPUT_SCAN_LIMIT: usize = 8_192;
 
 #[derive(Debug)]
 struct Args {
@@ -33,6 +37,14 @@ enum Operation {
     Ownership {
         partition: u32,
         killed_boot_id: BootIdentity,
+    },
+    Pending {
+        partition: u32,
+        consumer: String,
+    },
+    Output {
+        partition: u32,
+        after_stream_id: String,
     },
 }
 
@@ -86,6 +98,8 @@ struct AuthoritySnapshot {
     assignment_payload: Vec<u8>,
     lease_token: String,
     lease_ttl_ms: i64,
+    observed_at_ms: i64,
+    event_tail_id: String,
 }
 
 #[derive(Serialize)]
@@ -103,6 +117,8 @@ struct OwnershipStatus {
     region_key: String,
     captured_at_ms: i64,
     membership_observed_at_ms: i64,
+    authority_observed_at_ms: i64,
+    authority_event_tail_id: String,
     authority_stable: bool,
     killed_member_live: bool,
     owner_member: Option<TaskMembership>,
@@ -110,10 +126,39 @@ struct OwnershipStatus {
     runtime_partition: OwnershipRuntimePartition,
 }
 
+#[derive(Serialize)]
+struct PendingStatus {
+    region_key: String,
+    captured_at_ms: i64,
+    partition: u32,
+    requested_consumer: String,
+    pending_entry: Option<PendingEntry>,
+}
+
+#[derive(Serialize)]
+struct AuthoritativeOutput {
+    stream_id: String,
+    stream_unix_ms: i64,
+    game_id: u32,
+    command_id: ClientCommandIdentityV2,
+    deduplicated_replay: bool,
+}
+
+#[derive(Serialize)]
+struct OutputStatus {
+    region_key: String,
+    captured_at_ms: i64,
+    partition: u32,
+    after_stream_id: String,
+    first_scheduled_output: Option<AuthoritativeOutput>,
+}
+
 fn usage() -> &'static str {
     "Usage:
   resilience_admin status --region-key REGION [--redis-url URL] [--partition NUMBER]
-  resilience_admin ownership --region-key REGION [--redis-url URL] --partition NUMBER --killed-boot-id UUID"
+  resilience_admin ownership --region-key REGION [--redis-url URL] --partition NUMBER --killed-boot-id UUID
+  resilience_admin pending --region-key REGION [--redis-url URL] --partition NUMBER --consumer LEASE_TOKEN
+  resilience_admin output --region-key REGION [--redis-url URL] --partition NUMBER --after-stream-id STREAM_ID"
 }
 
 fn parse_partition(value: &str) -> Result<u32> {
@@ -137,6 +182,8 @@ where
     let mut redis_url = None;
     let mut partition = None;
     let mut killed_boot_id = None;
+    let mut consumer = None;
+    let mut after_stream_id = None;
     while let Some(argument) = values.next() {
         match argument.as_str() {
             "--region-key" => {
@@ -153,21 +200,65 @@ where
                 let value = values.next().context("--killed-boot-id requires a value")?;
                 killed_boot_id = Some(BootIdentity::parse(value)?);
             }
+            "--consumer" => {
+                consumer = Some(values.next().context("--consumer requires a value")?);
+            }
+            "--after-stream-id" => {
+                let value = values
+                    .next()
+                    .context("--after-stream-id requires a value")?;
+                server::recovery::validate_stream_id(&value)
+                    .context("invalid --after-stream-id")?;
+                after_stream_id = Some(value);
+            }
             "-h" | "--help" => bail!(usage()),
             other => bail!("unknown argument {other:?}\n{}", usage()),
         }
     }
     let operation = match operation.as_str() {
         "status" => {
-            if killed_boot_id.is_some() {
-                bail!("--killed-boot-id is valid only for ownership\n{}", usage());
+            if killed_boot_id.is_some() || consumer.is_some() || after_stream_id.is_some() {
+                bail!(
+                    "fault-proof arguments are not valid for status\n{}",
+                    usage()
+                );
             }
             Operation::Status { partition }
         }
-        "ownership" => Operation::Ownership {
-            partition: partition.context("ownership requires --partition")?,
-            killed_boot_id: killed_boot_id.context("ownership requires --killed-boot-id")?,
-        },
+        "ownership" => {
+            if consumer.is_some() || after_stream_id.is_some() {
+                bail!(
+                    "ownership accepts only its documented arguments\n{}",
+                    usage()
+                );
+            }
+            Operation::Ownership {
+                partition: partition.context("ownership requires --partition")?,
+                killed_boot_id: killed_boot_id.context("ownership requires --killed-boot-id")?,
+            }
+        }
+        "pending" => {
+            if killed_boot_id.is_some() || after_stream_id.is_some() {
+                bail!("pending accepts only its documented arguments\n{}", usage());
+            }
+            let consumer = consumer.context("pending requires --consumer")?;
+            if parse_active_owner(&consumer).is_none() {
+                bail!("--consumer must be a fenced executor lease token");
+            }
+            Operation::Pending {
+                partition: partition.context("pending requires --partition")?,
+                consumer,
+            }
+        }
+        "output" => {
+            if killed_boot_id.is_some() || consumer.is_some() {
+                bail!("output accepts only its documented arguments\n{}", usage());
+            }
+            Operation::Output {
+                partition: partition.context("output requires --partition")?,
+                after_stream_id: after_stream_id.context("output requires --after-stream-id")?,
+            }
+        }
         _ => bail!(usage()),
     };
     Ok(Args {
@@ -297,27 +388,43 @@ async fn read_authority_snapshot(
     namespace: &ClusterNamespace,
     partition: u32,
 ) -> Result<AuthoritySnapshot> {
-    let (assignment_payload, lease_token, lease_ttl_ms): (Vec<u8>, String, i64) =
-        redis::Script::new(
-            r#"
+    let (assignment_payload, lease_token, lease_ttl_ms, observed_at_ms, event_tail_id): (
+        Vec<u8>,
+        String,
+        i64,
+        i64,
+        String,
+    ) = redis::Script::new(
+        r#"
             local assignment = redis.call('GET', KEYS[1])
             local lease = redis.call('GET', KEYS[2])
+            local tail = redis.call('XREVRANGE', KEYS[3], '+', '-', 'COUNT', 1)
+            local tail_id = '0-0'
+            if #tail > 0 then tail_id = tail[1][1] end
+            local now = redis.call('TIME')
+            local now_ms =
+                tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
             return {
                 assignment or '',
                 lease or '',
-                redis.call('PTTL', KEYS[2])
+                redis.call('PTTL', KEYS[2]),
+                now_ms,
+                tail_id
             }
             "#,
-        )
-        .key(namespace.partition_assignment(partition))
-        .key(namespace.partition_lease(partition))
-        .invoke_async(redis)
-        .await
-        .context("failed to atomically inspect partition assignment and lease")?;
+    )
+    .key(namespace.partition_assignment(partition))
+    .key(namespace.partition_lease(partition))
+    .key(RedisKeys::stream_events(partition))
+    .invoke_async(redis)
+    .await
+    .context("failed to atomically inspect partition assignment and lease")?;
     Ok(AuthoritySnapshot {
         assignment_payload,
         lease_token,
         lease_ttl_ms,
+        observed_at_ms,
+        event_tail_id,
     })
 }
 
@@ -328,6 +435,7 @@ fn authority_is_stable(before: &AuthoritySnapshot, after: &AuthoritySnapshot) ->
         && before.lease_token == after.lease_token
         && before.lease_ttl_ms > 0
         && after.lease_ttl_ms > 0
+        && before.observed_at_ms <= after.observed_at_ms
 }
 
 fn decode_live_member(
@@ -417,6 +525,8 @@ async fn read_ownership_status(
             .filter(|member| member.is_assignment_eligible(membership_observed_at_ms));
     let after = read_authority_snapshot(redis, namespace, partition).await?;
     let captured_at_ms = Utc::now().timestamp_millis();
+    let authority_observed_at_ms = after.observed_at_ms;
+    let authority_event_tail_id = after.event_tail_id.clone();
     let authority_stable = authority_is_stable(&before, &after);
     let active_owner = parse_active_owner(&before.lease_token);
     let lease_ttl_ms = before.lease_ttl_ms.min(after.lease_ttl_ms);
@@ -427,6 +537,8 @@ async fn read_ownership_status(
         region_key,
         captured_at_ms,
         membership_observed_at_ms,
+        authority_observed_at_ms,
+        authority_event_tail_id,
         authority_stable,
         killed_member_live: killed_member.is_some(),
         owner_member,
@@ -441,6 +553,167 @@ async fn read_ownership_status(
             lease_token,
             lease_ttl_ms,
         },
+    })
+}
+
+async fn read_output_status(
+    redis: &mut RedisConnection,
+    region_key: String,
+    partition: u32,
+    after_stream_id: String,
+) -> Result<OutputStatus> {
+    let after_id = server::recovery::validate_stream_id(&after_stream_id)?;
+    let stream = RedisKeys::stream_events(partition);
+    let mut cursor = after_stream_id.clone();
+    let mut scanned = 0;
+    let mut first_scheduled_output = None;
+    'pages: while scanned < OUTPUT_SCAN_LIMIT {
+        let page_size = OUTPUT_SCAN_PAGE_SIZE.min(OUTPUT_SCAN_LIMIT - scanned);
+        let start = format!("({cursor}");
+        let entries: StreamRangeReply =
+            redis
+                .xrange_count(&stream, &start, "+", page_size)
+                .await
+                .context("failed to inspect authoritative partition output")?;
+        let entry_count = entries.ids.len();
+        if entry_count == 0 {
+            break;
+        }
+        for entry in entries.ids {
+            scanned += 1;
+            cursor.clone_from(&entry.id);
+            let stream_id = server::recovery::validate_stream_id(&entry.id)?;
+            if stream_id <= after_id {
+                bail!("Valkey returned an event at or before the output anchor");
+            }
+            let stream_unix_ms = stream_id.0;
+            let stream_unix_ms =
+                i64::try_from(stream_unix_ms).context("event stream timestamp exceeds i64")?;
+            let payload = entry
+                .map
+                .get("data")
+                .context("authoritative event stream entry has no data field")?;
+            let payload = redis::from_redis_value::<Vec<u8>>(payload)
+                .context("authoritative event stream data is not binary-safe")?;
+            let event: GameEventMessage = serde_json::from_slice(&payload)
+                .context("authoritative event stream contains malformed JSON")?;
+            if event.game_id % PARTITION_COUNT != partition {
+                bail!("authoritative event is stored under the wrong partition");
+            }
+            if let GameEvent::CommandScheduledV2 {
+                command_id,
+                deduplicated_replay,
+                ..
+            } = event.event
+            {
+                server::recovery::validate_client_command_identity(&command_id)?;
+                if event.stream_seq == 0
+                    || command_id.game_id != event.game_id
+                    || event.user_id.is_some()
+                {
+                    bail!("authoritative scheduled output has inconsistent identity");
+                }
+                if deduplicated_replay {
+                    continue;
+                }
+                first_scheduled_output = Some(AuthoritativeOutput {
+                    stream_id: entry.id,
+                    stream_unix_ms,
+                    game_id: event.game_id,
+                    command_id,
+                    deduplicated_replay,
+                });
+                break 'pages;
+            }
+        }
+        if entry_count < page_size {
+            break;
+        }
+    }
+
+    // Route TIME through the event-stream slot so this diagnostic timestamp
+    // and Redis-generated stream IDs use the same Valkey shard clock.
+    let captured_at_ms: i64 = redis::Script::new(
+        r#"
+        local now = redis.call('TIME')
+        return tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+        "#,
+    )
+    .key(&stream)
+    .invoke_async(redis)
+    .await
+    .context("failed to capture authoritative-output observation time")?;
+
+    Ok(OutputStatus {
+        region_key,
+        captured_at_ms,
+        partition,
+        after_stream_id,
+        first_scheduled_output,
+    })
+}
+
+async fn read_pending_status(
+    redis: &mut RedisConnection,
+    namespace: &ClusterNamespace,
+    region_key: String,
+    partition: u32,
+    requested_consumer: String,
+) -> Result<PendingStatus> {
+    // TIME follows XPENDING in the same stream-slot script, so captured_at_ms
+    // is a server timestamp at or after the exact old-consumer PEL read.
+    let (captured_at_ms, entry_id, entry_consumer, idle_ms, delivery_count): (
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+    ) = redis::Script::new(
+        r#"
+        local pending =
+            redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2])
+        local now = redis.call('TIME')
+        local now_ms =
+            tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+        if #pending == 0 then
+            return {now_ms, '', '', -1, -1}
+        end
+        return {
+            now_ms,
+            pending[1][1],
+            pending[1][2],
+            pending[1][3],
+            pending[1][4]
+        }
+        "#,
+    )
+    .key(RedisKeys::stream_commands(partition))
+    .arg(namespace.command_group(partition))
+    .arg(&requested_consumer)
+    .invoke_async(redis)
+    .await
+    .context("failed to atomically inspect exact executor pending entry")?;
+
+    let pending_entry = if entry_id.is_empty() {
+        None
+    } else {
+        if entry_consumer != requested_consumer || idle_ms < 0 || delivery_count < 0 {
+            bail!("Valkey returned malformed exact executor pending metadata");
+        }
+        Some(PendingEntry {
+            id: entry_id,
+            consumer: entry_consumer,
+            idle_ms: idle_ms as u64,
+            delivery_count: delivery_count as u64,
+        })
+    };
+
+    Ok(PendingStatus {
+        region_key,
+        captured_at_ms,
+        partition,
+        requested_consumer,
+        pending_entry,
     })
 }
 
@@ -505,6 +778,25 @@ async fn main() -> Result<()> {
                 &killed_boot_id,
             )
             .await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Operation::Pending {
+            partition,
+            consumer,
+        } => {
+            let mut redis = connection;
+            let status =
+                read_pending_status(&mut redis, &namespace, args.region_key, partition, consumer)
+                    .await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Operation::Output {
+            partition,
+            after_stream_id,
+        } => {
+            let mut redis = connection;
+            let status =
+                read_output_status(&mut redis, args.region_key, partition, after_stream_id).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
     }
@@ -584,7 +876,69 @@ mod tests {
                 assert_eq!(partition, 3);
                 assert_eq!(parsed, killed_boot_id);
             }
-            Operation::Status { .. } => panic!("parsed ownership as status"),
+            Operation::Status { .. } | Operation::Pending { .. } | Operation::Output { .. } => {
+                panic!("parsed ownership as another operation")
+            }
+        }
+    }
+
+    #[test]
+    fn parses_exact_pending_probe_arguments() {
+        let boot_id = BootIdentity::new();
+        let consumer = format!("{}:{}", boot_id.as_str(), Uuid::new_v4());
+        let args = parse_args_from(
+            [
+                "pending",
+                "--region-key",
+                "use1",
+                "--partition",
+                "6",
+                "--consumer",
+                &consumer,
+            ],
+            Some("redis://127.0.0.1".to_string()),
+        )
+        .unwrap();
+        match args.operation {
+            Operation::Pending {
+                partition,
+                consumer: parsed,
+            } => {
+                assert_eq!(partition, 6);
+                assert_eq!(parsed, consumer);
+            }
+            Operation::Status { .. } | Operation::Ownership { .. } | Operation::Output { .. } => {
+                panic!("parsed pending as another operation")
+            }
+        }
+    }
+
+    #[test]
+    fn parses_bounded_authoritative_output_probe_arguments() {
+        let args = parse_args_from(
+            [
+                "output",
+                "--region-key",
+                "use1",
+                "--partition",
+                "4",
+                "--after-stream-id",
+                "1000-2",
+            ],
+            Some("redis://127.0.0.1".to_string()),
+        )
+        .unwrap();
+        match args.operation {
+            Operation::Output {
+                partition,
+                after_stream_id,
+            } => {
+                assert_eq!(partition, 4);
+                assert_eq!(after_stream_id, "1000-2");
+            }
+            Operation::Status { .. } | Operation::Ownership { .. } | Operation::Pending { .. } => {
+                panic!("parsed output as another operation")
+            }
         }
     }
 
@@ -593,6 +947,28 @@ mod tests {
         assert!(
             parse_args_from(
                 ["ownership", "--region-key", "use1", "--killed-boot-id",],
+                Some("redis://127.0.0.1".to_string()),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_args_from(
+                ["pending", "--region-key", "use1", "--partition", "0"],
+                Some("redis://127.0.0.1".to_string()),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_args_from(
+                [
+                    "pending",
+                    "--region-key",
+                    "use1",
+                    "--partition",
+                    "0",
+                    "--consumer",
+                    "not-a-lease-token",
+                ],
                 Some("redis://127.0.0.1".to_string()),
             )
             .is_err()
@@ -610,6 +986,21 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            parse_args_from(
+                [
+                    "output",
+                    "--region-key",
+                    "use1",
+                    "--partition",
+                    "0",
+                    "--after-stream-id",
+                    "not-a-stream-id",
+                ],
+                Some("redis://127.0.0.1".to_string()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -618,11 +1009,15 @@ mod tests {
             assignment_payload: br#"{"version":1}"#.to_vec(),
             lease_token: format!("{}:{}", Uuid::new_v4(), Uuid::new_v4()),
             lease_ttl_ms: 100,
+            observed_at_ms: 10,
+            event_tail_id: "1-0".to_string(),
         };
         let mut after = AuthoritySnapshot {
             assignment_payload: before.assignment_payload.clone(),
             lease_token: before.lease_token.clone(),
             lease_ttl_ms: 50,
+            observed_at_ms: 11,
+            event_tail_id: "2-0".to_string(),
         };
         assert!(authority_is_stable(&before, &after));
         after.lease_token = format!("{}:{}", Uuid::new_v4(), Uuid::new_v4());
@@ -633,6 +1028,280 @@ mod tests {
         after.assignment_payload = before.assignment_payload.clone();
         after.lease_ttl_ms = 0;
         assert!(!authority_is_stable(&before, &after));
+        after.lease_ttl_ms = 1;
+        after.observed_at_ms = 9;
+        assert!(!authority_is_stable(&before, &after));
+    }
+
+    #[tokio::test]
+    async fn pending_probe_reads_exact_consumer_atomically_from_live_valkey() -> Result<()> {
+        let redis_url = "redis://127.0.0.1:6379/15?protocol=resp3";
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let client = RedisClient::open(redis_url, Some(push_tx))?;
+        let connection = client.get_managed_connection().await?;
+        let mut redis = connection;
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("admin-pending-{salt}"))?;
+        let partition = PARTITION_COUNT - 1;
+        let stream = RedisKeys::stream_commands(partition);
+        let group = namespace.command_group(partition);
+        let consumer = format!("{}:{}", BootIdentity::new().as_str(), Uuid::new_v4());
+        let other_consumer = format!("{}:{}", BootIdentity::new().as_str(), Uuid::new_v4());
+
+        let _: String = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg(&group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(&mut redis)
+            .await?;
+        let entry_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("test")
+            .arg("1")
+            .query_async(&mut redis)
+            .await?;
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(&group)
+            .arg(&consumer)
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(&stream)
+            .arg(">")
+            .query_async(&mut redis)
+            .await?;
+        let (setup_seconds, setup_micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut redis).await?;
+        let setup_at_ms = setup_seconds * 1_000 + setup_micros / 1_000;
+
+        let status = read_pending_status(
+            &mut redis,
+            &namespace,
+            namespace.region().to_string(),
+            partition,
+            consumer.clone(),
+        )
+        .await?;
+        assert!(status.captured_at_ms >= setup_at_ms);
+        assert_eq!(status.partition, partition);
+        assert_eq!(status.requested_consumer, consumer);
+        let pending = status
+            .pending_entry
+            .context("missing exact pending entry")?;
+        assert_eq!(pending.id, entry_id);
+        assert_eq!(pending.consumer, consumer);
+        assert_eq!(pending.delivery_count, 1);
+
+        let wrong_consumer = read_pending_status(
+            &mut redis,
+            &namespace,
+            namespace.region().to_string(),
+            partition,
+            other_consumer.clone(),
+        )
+        .await?;
+        assert_eq!(wrong_consumer.requested_consumer, other_consumer);
+        assert!(wrong_consumer.pending_entry.is_none());
+
+        let _: i64 = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(&stream)
+            .arg(&group)
+            .query_async(&mut redis)
+            .await?;
+        let _: i64 = redis::cmd("XDEL")
+            .arg(&stream)
+            .arg(&entry_id)
+            .query_async(&mut redis)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_probe_pages_past_exact_tail_and_skips_replay() -> Result<()> {
+        use common::{CommandId, Direction, GameCommand, GameCommandMessage};
+
+        let redis_url = "redis://127.0.0.1:6379/15?protocol=resp3";
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let client = RedisClient::open(redis_url, Some(push_tx))?;
+        let connection = client.get_managed_connection().await?;
+        let mut redis = connection;
+        let partition = PARTITION_COUNT - 2;
+        let stream = RedisKeys::stream_events(partition);
+        let _: i64 = redis.del(&stream).await?;
+        let game_id = 100 + partition;
+
+        let event = |stream_seq, event| GameEventMessage {
+            game_id,
+            tick: 10,
+            sequence: stream_seq,
+            stream_seq,
+            user_id: None,
+            event,
+        };
+        let anchor_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("data")
+            .arg(serde_json::to_vec(&event(
+                1,
+                GameEvent::SnakeDied { snake_id: 1 },
+            ))?)
+            .query_async(&mut redis)
+            .await?;
+        for offset in 0..OUTPUT_SCAN_PAGE_SIZE {
+            let stream_seq = u64::try_from(offset + 2)?;
+            let _: String = redis::cmd("XADD")
+                .arg(&stream)
+                .arg("*")
+                .arg("data")
+                .arg(serde_json::to_vec(&event(
+                    stream_seq,
+                    GameEvent::SnakeDied { snake_id: 2 },
+                ))?)
+                .query_async(&mut redis)
+                .await?;
+        }
+
+        let replay_command_id = ClientCommandIdentityV2 {
+            game_id,
+            user_id: 77,
+            client_game_session_id: "output-proof-session".to_string(),
+            sequence: 1,
+        };
+        let command_message = GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 10,
+                user_id: replay_command_id.user_id,
+                sequence_number: 1,
+            },
+            command_id_server: Some(CommandId {
+                tick: 11,
+                user_id: replay_command_id.user_id,
+                sequence_number: 2,
+            }),
+            command: GameCommand::Turn {
+                snake_id: 1,
+                direction: Direction::Up,
+            },
+        };
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("data")
+            .arg(serde_json::to_vec(&event(
+                u64::try_from(OUTPUT_SCAN_PAGE_SIZE + 2)?,
+                GameEvent::CommandScheduledV2 {
+                    command_id: replay_command_id,
+                    command_message: command_message.clone(),
+                    deduplicated_replay: true,
+                },
+            ))?)
+            .query_async(&mut redis)
+            .await?;
+
+        let command_id = ClientCommandIdentityV2 {
+            game_id,
+            user_id: 77,
+            client_game_session_id: "output-proof-session".to_string(),
+            sequence: 2,
+        };
+        let scheduled_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("data")
+            .arg(serde_json::to_vec(&event(
+                u64::try_from(OUTPUT_SCAN_PAGE_SIZE + 3)?,
+                GameEvent::CommandScheduledV2 {
+                    command_id: command_id.clone(),
+                    command_message,
+                    deduplicated_replay: false,
+                },
+            ))?)
+            .query_async(&mut redis)
+            .await?;
+
+        let status = read_output_status(
+            &mut redis,
+            "output-proof".to_string(),
+            partition,
+            anchor_id.clone(),
+        )
+        .await?;
+        assert_eq!(status.partition, partition);
+        assert_eq!(status.after_stream_id, anchor_id);
+        let output = status
+            .first_scheduled_output
+            .context("missing scheduled authoritative output")?;
+        assert_eq!(output.stream_id, scheduled_id);
+        assert_eq!(output.game_id, game_id);
+        assert_eq!(output.command_id, command_id);
+        assert!(!output.deduplicated_replay);
+
+        let empty = read_output_status(
+            &mut redis,
+            "output-proof".to_string(),
+            partition,
+            scheduled_id,
+        )
+        .await?;
+        assert!(empty.first_scheduled_output.is_none());
+        let _: i64 = redis.del(&stream).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authority_snapshot_atomically_includes_partition_event_tail() -> Result<()> {
+        let redis_url = "redis://127.0.0.1:6379/15?protocol=resp3";
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let client = RedisClient::open(redis_url, Some(push_tx))?;
+        let connection = client.get_managed_connection().await?;
+        let mut redis = connection;
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("admin-authority-{salt}"))?;
+        let partition = PARTITION_COUNT - 3;
+        let assignment_key = namespace.partition_assignment(partition);
+        let lease_key = namespace.partition_lease(partition);
+        let stream = RedisKeys::stream_events(partition);
+        let _: i64 = redis.del(&stream).await?;
+        let assignment = br#"{"version":7}"#.to_vec();
+        let lease_token = format!("{}:{}", BootIdentity::new().as_str(), Uuid::new_v4());
+        let _: () = redis.set(&assignment_key, &assignment).await?;
+        let _: () = redis.set_ex(&lease_key, &lease_token, 10).await?;
+        let tail_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("test")
+            .arg("tail")
+            .query_async(&mut redis)
+            .await?;
+        let (before_seconds, before_micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut redis).await?;
+        let before_ms = before_seconds * 1_000 + before_micros / 1_000;
+
+        let snapshot = read_authority_snapshot(&mut redis, &namespace, partition).await?;
+        let (after_seconds, after_micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut redis).await?;
+        let after_ms = after_seconds * 1_000 + after_micros / 1_000;
+        assert_eq!(snapshot.assignment_payload, assignment);
+        assert_eq!(snapshot.lease_token, lease_token);
+        assert!(snapshot.lease_ttl_ms > 0);
+        assert!(snapshot.observed_at_ms >= before_ms);
+        assert!(snapshot.observed_at_ms <= after_ms);
+        assert_eq!(snapshot.event_tail_id, tail_id);
+
+        let _: i64 = redis.del(&assignment_key).await?;
+        let _: i64 = redis.del(&lease_key).await?;
+        let _: i64 = redis.del(&stream).await?;
+        Ok(())
     }
 
     #[test]

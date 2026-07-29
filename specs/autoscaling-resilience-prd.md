@@ -559,12 +559,12 @@ The assignment coordinator is control plane only. Existing assignments and activ
 ### R12 — Autoscaling behavior and capacity constraints
 
 1. Use the same target-tracking policies in development and production:
-   - CPU target: 40%;
+   - CPU target: 35%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
    The CPU target leaves measured headroom for command processing and partition
    recovery while the managed alarm evaluates and a replacement task starts.
-2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 128-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is one vCPU and two GiB, the smallest valid Fargate memory pairing for one vCPU; target tracking cannot protect a half-vCPU one-task floor from a sub-minute admission or takeover burst.
+2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 128-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is two vCPU and four GiB, the smallest valid Fargate memory pairing for two vCPU; target tracking cannot protect a saturated one-task floor during the managed alarm's observation delay.
 3. The autoscaler must never select zero desired tasks.
 4. Validate forced `1 -> 10 -> 1` with 128 active game sessions / 64 duels
    producing `every-tick` commands on every partition, 10 idle sessions, 10
@@ -580,7 +580,11 @@ The assignment coordinator is control plane only. Existing assignments and activ
    proves that the same command-bearing cohort remains healthy while the
    production CPU/memory policy adds capacity naturally. Gate B separately
    proves that its context and transient admission sockets fit on the final
-   one-task destination.
+   one-task destination. The minimum application task is two vCPU and four GiB,
+   the smallest valid Fargate memory pairing for two vCPU. Current exact-source
+   evidence measured about 0.71--0.85 vCPU at this cohort; one vCPU did not
+   preserve the one-second latency budget during the managed policy's
+   observation lag.
 5. No custom game-specific autoscaling metric is added in this phase.
 6. Every task currently replicates every partition, so task-local replica memory may not fall on scale-out. Scaling tests must prove memory behavior is acceptable; otherwise the replication model or memory policy needs a separate decision.
 7. Existing WebSockets do not redistribute on scale-up, so service-average CPU can hide a hot gateway task. Record per-task CPU, memory, connections, and event-forwarding load during validation.
@@ -819,7 +823,7 @@ rejections as healthy command throughput.
 | Make Valkey unavailable through the deterministic local fault proxy | Readiness drops within seven seconds, liveness remains healthy, and restoration creates no conflicting authority. A remote ElastiCache outage is not a separate release test because availability during that accepted dependency outage is out of scope. |
 | With recovery retention set to 60 seconds, crash the sole task and delay replacement 30 seconds | The documented availability gap occurs, then games recover automatically. |
 | With recovery retention set to 60 seconds, delay sole-task replacement 61 seconds | The game returns the explicit unrecoverable outcome and no fabricated state. |
-| Run the fixed 128-session / 64-duel `every-tick` natural scale-out gate from the one-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
+| Run the fixed 128-session / 64-duel `every-tick` natural scale-out gate from the two-vCPU minimum task | CPU or memory target tracking produces a successful scale-out above one while the pre-movement baseline and automatic movement window both keep every command outcome within one second, without a task exit, readiness failure, or manual desired-count update. After the added tasks are ready in ECS, Traefik, and the executor control plane, at least 60 complete post-ready seconds satisfy the same command budget and produce scheduled work on all ten partitions. Failure to trigger, insufficient post-ready duration, or a budget violation is a failed certification, not permission to adjust the fixed cohort or weaken the budget. The load then finishes, all of its clients and games reach zero, and none are reused for the forced staircase. |
 | Ramp at four new sessions per second, then hold 256 authenticated sessions / 128 duels with `every-tick` commands for at least five minutes | The run begins only after ten tasks are healthy in ECS and Traefik and settled in the executor control plane; every full hold second resolves exactly its submitted commands with no terminal outcome taking more than one second; Serverless Valkey reports zero `Evictions` and `ThrottledCmds`, no write failure occurs, and there is no zero-ready interval, ECS health failure, or Traefik health failure. |
 | Exhaust the CPU of a planned scale-in destination until control operations miss their deadlines | The run fails the destination-capacity gate and is not classified as a handoff-protocol defect. No stale or unproven mutation commits: fencing rejects it, the executor fails closed, cooperative drain is not advertised, and ordinary lease-expiry recovery remains authoritative. |
 | Run the complete protocol against actual ElastiCache Serverless Valkey 8 | The AWS cache identity reports major/full engine version 8; TLS certificate validation, RESP3, and cluster discovery through the advertised 6379 primary and 6380 read endpoints succeed, as do operations across every hash-slot family; all ten deterministic partition-hot lanes, all ten independently bootstrapped partition-scoped recovery-read lanes, and the independently bootstrapped control, single per-task checkpoint-write, task-wide maintenance, separate metrics, loss-tolerant Pub/Sub, and stream-reader connections operate under the fixed load without cross-role or cross-partition queue amplification, and no subscription push confirmation is consumed as an ordinary command response; no `CROSSSLOT`, `MOVED` exhaustion, unsupported `KEYS`, or nonzero database error occurs; all Lua/multi-key key-family tests pass. A standalone local Valkey run alone is insufficient evidence. |
@@ -922,8 +926,8 @@ criteria pass before the production ramp.
 - Checkpoints remain full and per game.
 - Recovery reads use ten fixed partition lanes, resilience metrics use a
   separate dispatcher, and full-state checkpoint/completion writes retain one
-  dispatcher per task. No additional pools, deadline increases, or cache layer
-  are part of this release.
+  dispatcher per task. No additional pools, correctness-bearing deadline
+  increases, or cache layer are part of this release.
 - Gateway and executor remain in the same binary/service but are logically independent.
 - Planned task removal uses dual sockets; executor movement alone never moves sockets.
 - Matchmaking safety comes from atomic admission/cancellation and one matchmaking-slot commit, plus one narrow idempotent outbox bridge into the executor partition slot; it does not require a singleton or generic saga system.
@@ -1508,7 +1512,7 @@ without loss. Gate A correctly blocked the planned staircase and capacity gate.
 
 The minimum correction keeps exact all-game gauges while replacing serial
 per-game reads with fixed 32-key same-slot metadata batches under a
-500-millisecond whole-collection bound. A nonzero
+two-second whole-collection bound. A nonzero
 `RegionalCollectionFailures` metric makes a timeout fail certification rather
 than emit a misleading healthy zero. Pending-completion index scans and bounded
 approximate trim use one separate task-wide maintenance dispatcher. Separate
@@ -1533,6 +1537,88 @@ same ingress instance, and retained the fixed hostname/DNS, EIP,
 certificate-bearing volume, shared production VPC, and all reusable
 development foundations. This run remains diagnostic evidence. Complete
 Gate A/B/C, automatic scale-in, and exit-137 certification are still required.
+
+Exact-source run
+([GitHub Actions 30486700133](https://github.com/lopatin/snaketron-io/actions/runs/30486700133),
+outer commit `d2ba3692b4841f6ea0ba1a929c164239c3bc0b8b`, Snaketron
+commit `9d176c3be3a4510cfd86f583ca5e2aa915312125`) naturally scaled
+Gate A `1 -> 2`. All 1,664
+sessions, 832 games, and 1,488,138 commands completed with exact terminal
+accounting and zero disconnects or reconnects. All 50 ownership-movement
+seconds passed the unchanged one-second gate with a 608-millisecond maximum,
+and all 789 post-ready seconds passed with a 461-millisecond maximum. The
+one-task baseline still failed five of 323 complete seconds, however, with
+maxima from 1,701 to 2,531 milliseconds. Gates B and C therefore correctly did
+not run.
+
+The evidence is most consistent with insufficient one-task compute headroom,
+not an ownership or cache failure. The one-vCPU task averaged 70.91--84.87%
+CPU and reached 90.04%;
+memory remained below 9%. Load began at 20:24:42 UTC, but delayed one-minute
+samples kept the managed target-tracking alarm from entering `ALARM` until
+20:30:42, so one task carried the full 128-session / 64-game envelope for six
+minutes. During the final cluster of failures, scheduled receipts fell across
+all partitions and then drained in the next second. Valkey and DynamoDB had
+zero throttling, Valkey had zero evictions, and there were no lease, fencing,
+checkpoint, completion, or executor errors.
+
+The exact regional metrics scan was correlated with some failures but is not a
+sufficient explanation: it contributes about 0.07% of observed Valkey command
+volume, uses a separate connection, and normally completes in about 100
+milliseconds. Its 500-millisecond telemetry deadline was nevertheless too
+tight for three otherwise successful 512--545-millisecond samples, so the
+deadline now has two seconds of operational margin while
+`RegionalCollectionFailures == 0` remains release-blocking. The ownership
+outage tracker conservatively accounts for the actual gap between successful
+samples, including time spent in that scan. INFO volume also did not track the
+failed seconds. Neither metrics concurrency nor log suppression is added.
+
+The minimum evidence-backed capacity correction is a two-vCPU / four-GiB
+Fargate task with `minTasks=1`. It supplies a second runtime worker and
+headroom during the managed alarm delay without changing game execution,
+checkpointing, connection topology, or the one-second gate. The CPU target is
+35%; the observed workload projects to approximately 35.5--42.5% on two vCPU,
+so a fresh unchanged Gate A must prove that it still produces a CPU-only
+natural scale-out. Memory remains 80% and both cooldowns remain 60 seconds.
+
+The independent exit-137 run demonstrated clean product recovery before its
+proof harness returned early. ECS recorded one selected container exiting 137.
+The successor acquired a new fenced partition-6 lease on a pre-existing task
+and completed bootstrap 3.72 seconds after exact `executionStoppedAt`,
+recovering 15 games and replaying 151 commands. All 28 affected clients
+reconnected through fresh snapshots in 2.512--2.658 seconds from exact stop;
+all 954 sessions, 477 games, and 855,103 terminal command outcomes completed,
+and 138 sessions admitted after the stop also completed. Traefik retained at
+least one healthy backend throughout.
+
+Formal crash acceptance stopped on an observation artifact. The first rich
+post-stop status call began at +168 milliseconds and returned 151 exact
+old-consumer pending entries, but its fully bracketed multi-read interval ended
+at +2.300 seconds and therefore could not prove the unchanged two-second PEL
+criterion. The harness now uses one narrow partition-local atomic `TIME` /
+consumer-filtered `XPENDING` probe and retains the full-interval two-second
+bound.
+The prior report's first complete post-stop receipt bucket gave a 4.2-second
+upper bound, but that measurement could admit an event buffered before the
+crash and therefore is not accepted as causal successor proof. The corrected
+harness atomically reads the new assignment, fenced lease, and exact
+event-stream tail from the same partition slot, then immediately saves the
+first later non-replay `CommandScheduledV2` stream entry using a bounded,
+paged read. This avoids both an unbounded diagnostic query and loss of valid
+evidence to approximate event-stream retention while ECS exposes the exact
+stop timestamp. The saved ownership/output pair is accepted only when its
+replacement assignment was computed after that exact stop and its Valkey
+timestamps correlate to the unchanged five-second window. Tasks already
+stopping when crash evidence begins are also excluded from the unrelated-stop
+check. These are proof corrections only; no production recovery mechanism or
+deadline changes.
+
+Workflow cleanup succeeded. It removed the Server, Serverless Valkey, and
+Monitoring runtime stacks, stopped ingress, and retained the reusable
+hostname, DNS, certificate-bearing EBS volume, EIP, shared production VPC, and
+Network/ECS/ECR/DynamoDB foundations. No certificate was issued or recreated.
+This remains diagnostic evidence; fresh complete Gate A/B/C, automatic
+scale-in, and exit-137 acceptance are required.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

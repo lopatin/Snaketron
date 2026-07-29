@@ -26,7 +26,10 @@ use tracing::warn;
 const EMF_NAMESPACE: &str = "Snaketron/Resilience";
 const DEFAULT_EMIT_INTERVAL_SECS: u64 = 15;
 const OWNERSHIP_SAMPLE_INTERVAL_MS: i64 = 500;
-const REGIONAL_COLLECTION_TIMEOUT_MS: u64 = 500;
+// The exact regional scan performs roughly sixty independently routed cluster
+// operations at the certification cardinality. Keep a finite deadline, but
+// allow ordinary Serverless Valkey network and task-scheduling tails.
+const REGIONAL_COLLECTION_TIMEOUT_MS: u64 = 2_000;
 const RECOVERY_METADATA_BATCH_SIZE: usize = 32;
 const RECOVERY_TAIL_SAMPLE_BYTES: i64 = 512;
 const CHECKPOINTED_AT_MARKER: &[u8] = b"\"checkpointed_at_ms\":";
@@ -218,11 +221,13 @@ fn checkpointed_at_ms_from_tail(tail: &[u8]) -> Option<i64> {
 /// Tracks lease-absence windows at control-loop resolution while the regional
 /// metrics scan remains on its normal 15-second cadence. Without this
 /// rolling maximum, an outage that starts and ends between EMF samples is
-/// invisible. The first observation is conservatively backdated by one sample
-/// interval so a near-five-second outage cannot be reported as safely shorter.
+/// invisible. The first missing observation is conservatively backdated to the
+/// prior completed observation so a delayed sample cannot make a
+/// near-five-second outage look safely shorter.
 struct PartitionOutageTracker {
     missing_since_ms: [Option<i64>; PARTITION_COUNT as usize],
     window_max_ms: u64,
+    last_observed_at_ms: Option<i64>,
 }
 
 impl Default for PartitionOutageTracker {
@@ -230,6 +235,7 @@ impl Default for PartitionOutageTracker {
         Self {
             missing_since_ms: array::from_fn(|_| None),
             window_max_ms: 0,
+            last_observed_at_ms: None,
         }
     }
 }
@@ -241,13 +247,17 @@ impl PartitionOutageTracker {
         assignment: Option<&crate::partition_assignment::AssignmentDocument>,
         leases: &[Option<Vec<u8>>],
     ) {
+        let conservative_missing_since_ms = self
+            .last_observed_at_ms
+            .replace(now_ms)
+            .unwrap_or_else(|| now_ms.saturating_sub(OWNERSHIP_SAMPLE_INTERVAL_MS));
         for partition in 0..PARTITION_COUNT as usize {
             let desired = assignment
                 .is_some_and(|document| document.owners.contains_key(&(partition as u32)));
             let missing = desired && leases.get(partition).is_none_or(Option::is_none);
             if missing {
-                let since = self.missing_since_ms[partition]
-                    .get_or_insert_with(|| now_ms.saturating_sub(OWNERSHIP_SAMPLE_INTERVAL_MS));
+                let since =
+                    self.missing_since_ms[partition].get_or_insert(conservative_missing_since_ms);
                 self.window_max_ms = self
                     .window_max_ms
                     .max(now_ms.saturating_sub(*since).max(0) as u64);
@@ -316,7 +326,7 @@ pub fn spawn_resilience_metrics(
                     // so those counters are not silently lost on task exit.
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let mut gauges = match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_millis(REGIONAL_COLLECTION_TIMEOUT_MS),
                         collect_regional_gauges(
                             redis.clone(),
                             &namespace,
@@ -433,7 +443,6 @@ pub fn spawn_resilience_metrics(
                     }
                 },
                 _ = ownership_interval.tick() => {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
                     // The regular collector logs failures and emits local
                     // readiness. This fast observation is deliberately silent
                     // during Valkey outages so it cannot create a warning storm.
@@ -441,7 +450,6 @@ pub fn spawn_resilience_metrics(
                         redis.clone(),
                         &namespace,
                         &assignment,
-                        now_ms,
                         &mut partition_outages,
                     ).await;
                 }
@@ -454,7 +462,6 @@ async fn observe_partition_outages(
     mut redis: RedisConnection,
     namespace: &ClusterNamespace,
     assignment_store: &AssignmentStore,
-    now_ms: i64,
     tracker: &mut PartitionOutageTracker,
 ) -> Result<()> {
     let assignment = assignment_store.load().await?;
@@ -467,7 +474,11 @@ async fn observe_partition_outages(
                 .context("failed to sample partition lease for outage timing")?,
         );
     }
-    tracker.observe(now_ms, assignment.as_ref(), &leases);
+    tracker.observe(
+        chrono::Utc::now().timestamp_millis(),
+        assignment.as_ref(),
+        &leases,
+    );
     Ok(())
 }
 
@@ -903,6 +914,39 @@ mod tests {
         tracker.observe(6_000, Some(&assignment), &leases);
         assert_eq!(tracker.take_window_max(15_000), 5_000);
         assert_eq!(tracker.take_window_max(15_000), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_outage_uses_actual_previous_observation_after_delayed_sample() -> Result<()> {
+        let owner = BootIdentity::parse("11111111-1111-4111-8111-111111111111")?;
+        let acquisition = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let assignment = AssignmentDocument {
+            schema_version: ASSIGNMENT_SCHEMA_VERSION,
+            version: 1,
+            region: "test".into(),
+            computed_at_ms: 1,
+            eligible_members: vec![owner.clone()],
+            owners: (0..PARTITION_COUNT)
+                .map(|partition| (partition, owner.clone()))
+                .collect(),
+        };
+        let mut leases = (0..PARTITION_COUNT)
+            .map(|_| Some(format!("{owner}:{acquisition}").into_bytes()))
+            .collect::<Vec<_>>();
+        let mut tracker = PartitionOutageTracker::default();
+
+        tracker.observe(1_000, Some(&assignment), &leases);
+        leases[0] = None;
+
+        // A regional collection can delay this nominally 500-millisecond
+        // sampler. Bound the possible outage from the prior real observation,
+        // rather than pretending the delayed samples remained 500 ms apart.
+        tracker.observe(3_500, Some(&assignment), &leases);
+        assert_eq!(tracker.take_window_max(3_500), 2_500);
+
+        tracker.observe(6_500, Some(&assignment), &leases);
+        assert_eq!(tracker.take_window_max(6_500), 5_500);
         Ok(())
     }
 
