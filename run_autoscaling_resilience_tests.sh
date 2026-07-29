@@ -382,6 +382,21 @@ select_verified_task_service_name() {
     '
 }
 
+select_exact_tag_image_digest() {
+  local expected_tag="$1"
+  local checkout_commit="$2"
+  [[ "$expected_tag" =~ ^[0-9a-f]{40}$ \
+    && "$checkout_commit" =~ ^[0-9a-f]{40}$ \
+    && "$expected_tag" == "$checkout_commit" ]] || return 1
+  jq -er --arg expected_tag "$expected_tag" '
+    select((.imageDetails | length) == 1)
+    | .imageDetails[0]
+    | select((.imageTags // []) | index($expected_tag) != null)
+    | .imageDigest
+    | select(test("^sha256:[0-9a-f]{64}$"))
+  '
+}
+
 test_task_definition_evidence_sanitizer() {
   local sensitive="fixture-sensitive-value-do-not-persist"
   local sanitized
@@ -509,6 +524,58 @@ test_live_task_definition_gate() {
       return 1
     fi
   done
+}
+
+test_exact_tag_image_digest_gate() {
+  local expected_tag="1111111111111111111111111111111111111111"
+  local previous_tag="2222222222222222222222222222222222222222"
+  local expected_digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local fixture
+  fixture="$(jq -n \
+    --arg expected_tag "$expected_tag" \
+    --arg previous_tag "$previous_tag" \
+    --arg expected_digest "$expected_digest" '{
+      imageDetails: [{
+        imageDigest: $expected_digest,
+        imageTags: [$previous_tag, $expected_tag]
+      }]
+    }')"
+
+  local selected_digest
+  selected_digest="$(printf '%s\n' "$fixture" \
+    | select_exact_tag_image_digest "$expected_tag" "$expected_tag")" || {
+    echo "Exact image-tag gate rejected a reused digest carrying the deployed commit tag" >&2
+    return 1
+  }
+  if [[ "$selected_digest" != "$expected_digest" ]]; then
+    echo "Exact image-tag gate returned the wrong digest" >&2
+    return 1
+  fi
+  if printf '%s\n' "$fixture" \
+    | select_exact_tag_image_digest \
+      "$previous_tag" "$expected_tag" >/dev/null 2>&1; then
+    echo "Exact image-tag gate accepted a task-definition tag from a different commit" >&2
+    return 1
+  fi
+  if printf '%s\n' "$fixture" \
+    | select_exact_tag_image_digest \
+      "3333333333333333333333333333333333333333" \
+      "3333333333333333333333333333333333333333" >/dev/null 2>&1; then
+    echo "Exact image-tag gate accepted a digest without the deployed commit tag" >&2
+    return 1
+  fi
+  if jq '.imageDetails += [.imageDetails[0]]' <<<"$fixture" \
+    | select_exact_tag_image_digest "$expected_tag" "$expected_tag" \
+      >/dev/null 2>&1; then
+    echo "Exact image-tag gate accepted multiple image details" >&2
+    return 1
+  fi
+  if jq '.imageDetails[0].imageDigest = "sha256:bad"' <<<"$fixture" \
+    | select_exact_tag_image_digest "$expected_tag" "$expected_tag" \
+      >/dev/null 2>&1; then
+    echo "Exact image-tag gate accepted a malformed image digest" >&2
+    return 1
+  fi
 }
 
 test_traefik_server_up_parser() {
@@ -807,6 +874,7 @@ test_staging_entry_state_contract() {
 test_evidence_safety_helpers() {
   test_task_definition_evidence_sanitizer
   test_live_task_definition_gate
+  test_exact_tag_image_digest_gate
   test_traefik_server_up_parser
   test_command_outcome_window_gate
   test_staging_entry_state_contract
@@ -1186,30 +1254,15 @@ verify_staging_identity() {
     --repository-name "$staging_image_repository" \
     --image-ids imageTag="$staging_image_tag" \
     >"$identity_dir/server-image.json"
-  staging_image_digest="$(jq -er '
-    select((.imageDetails | length) == 1)
-    | .imageDetails[0].imageDigest
-    | select(test("^sha256:[0-9a-f]{64}$"))
-  ' "$identity_dir/server-image.json")" || {
-    echo "The task-definition image tag did not resolve to one ECR digest" >&2
-    return 1
-  }
-  staging_image_commit="$(jq -er '
-    [.imageDetails[0].imageTags[]
-      | select(test("^[0-9a-f]{40}$"))]
-    | unique
-    | select(length == 1)
-    | .[0]
-  ' "$identity_dir/server-image.json")" || {
-    echo "The deployed image digest is not bound to exactly one full commit tag" >&2
-    return 1
-  }
   local runner_checkout_commit
   runner_checkout_commit="$(git -C "$repo_dir/.." rev-parse HEAD)"
-  if [[ "$runner_checkout_commit" != "$staging_image_commit" ]]; then
-    echo "The staging image commit $staging_image_commit does not match runner checkout $runner_checkout_commit" >&2
+  staging_image_digest="$(select_exact_tag_image_digest \
+    "$staging_image_tag" "$runner_checkout_commit" \
+    <"$identity_dir/server-image.json")" || {
+    echo "The task-definition tag must match the runner checkout and resolve to one valid ECR digest" >&2
     return 1
-  fi
+  }
+  staging_image_commit="$staging_image_tag"
 
   aws elasticache describe-serverless-caches \
     --region "$SNAKETRON_AWS_REGION" \

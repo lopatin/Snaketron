@@ -872,11 +872,13 @@ Traefik instance. It also verifies the task definition points at that
 environment, logical/AWS region, public origin, and exact TLS/RESP3/cluster
 Valkey endpoint; DNS points at that Traefik instance; the cache is available;
 and the supplied Prometheus endpoint belongs to that same instance.
-The running image digest must carry exactly one outer-repository commit tag
-matching the runner's outer checkout. Both the outer checkout and Snaketron
-submodule must be clean, and the submodule HEAD must equal the outer commit's
-gitlink. A missing tag, identifier, metric endpoint, account confirmation, or
-exact source binding fails before mutation.
+The task-definition image tag must equal the clean outer-repository checkout
+commit and its exact ECR tag lookup must resolve one valid digest. Every running
+task must use that image URI and digest; earlier commit tags may legitimately
+alias the same content digest. Both the outer checkout and Snaketron submodule
+must be clean, and the submodule HEAD must equal the outer commit's gitlink. A
+missing tag, identifier, metric endpoint, account confirmation, or exact source
+binding fails before mutation.
 
 The runner changes only that verified non-production ECS service. Cleanup
 retries restoration, waits for the original desired/running count, restores the
