@@ -465,7 +465,7 @@ test_live_task_definition_gate() {
             {name: "SNAKETRON_ENVIRONMENT", value: "dev"},
             {name: "SNAKETRON_REGION", value: "use1"},
             {name: "SNAKETRON_AWS_REGION", value: "us-east-1"},
-            {name: "SNAKETRON_ORIGIN", value: "https://stg-123-1.snaketron.io"},
+            {name: "SNAKETRON_ORIGIN", value: "https://dev.snaketron.io"},
             {name: "SNAKETRON_REDIS_URL", value: "rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true"},
             {name: "AWS_REGION", value: "us-east-1"},
             {name: "DYNAMODB_TABLE_PREFIX", value: "snaketron-dev"},
@@ -481,7 +481,7 @@ test_live_task_definition_gate() {
   service_name="$(printf '%s\n' "$fixture" \
     | select_verified_task_service_name \
       dev use1 us-east-1 \
-      https://stg-123-1.snaketron.io \
+      https://dev.snaketron.io \
       'rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true' \
       "$router_service_key")" || {
     echo "Live task-definition gate rejected its safe fixture" >&2
@@ -502,7 +502,7 @@ test_live_task_definition_gate() {
     if printf '%s\n' "$unsafe" \
       | select_verified_task_service_name \
         dev use1 us-east-1 \
-        https://stg-123-1.snaketron.io \
+        https://dev.snaketron.io \
         'rediss://fixture.serverless.use1.cache.amazonaws.com:6379/?protocol=resp3&cluster=true' \
         "$router_service_key" >/dev/null 2>&1; then
       echo "Live task-definition gate accepted unsafe $mutation" >&2

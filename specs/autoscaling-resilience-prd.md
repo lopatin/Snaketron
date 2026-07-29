@@ -900,7 +900,7 @@ criteria pass before the production ramp.
 | Client game integration | Stable session command IDs, external outbox, resolved watermark/sparse outcomes, terminal rejection. |
 | `cdk/lib/valkey-stack.ts` and `fargate-stack.ts` | Serverless Valkey, TLS cluster URL, Serverless metrics/alarms, liveness/readiness routing, sticky-cookie removal, health timing, and stop timeout. |
 | Production deployment workflow | Manual-only mutation, successful exact-commit staging-certification gate, destructive one-time legacy cutoff, and post-cutover verification. |
-| Ephemeral development infrastructure | Public run-unique stage reuses but never owns or mutates the production VPC; the run owns and destroys its cache, compute, security groups, ingress/EIP, and DNS. |
+| Development certification infrastructure | Fixed public `dev.snaketron.io` reuses but never owns or mutates the production VPC. Protected Network ingress/EIP/A-record/EBS/TLS state plus the ECS cluster, ECR repository, and DynamoDB tables remain reusable between runs; each run creates and deletes only its Serverless Valkey, Server, and Monitoring stacks and stops the persistent ingress after cleanup. |
 | Traefik configuration | Automatic health-based withdrawal/discovery and valid self-health endpoint. |
 | Test runners | Deterministic failure points, scaling/load scenarios, stale-owner and pending-entry tests. |
 
@@ -932,8 +932,13 @@ criteria pass before the production ramp.
 - Production planning and mutation are manual-only, restricted to current
   `main`, and require a successful main-branch Ephemeral Development
   Certification run for the exact outer-repository commit.
+- Development certification uses the fixed `dev.snaketron.io` hostname. Its
+  protected ingress/EIP/EBS/ACME state and ECS/ECR/DynamoDB foundations carry no
+  run expiry; the ingress instance is started for certification and stopped
+  afterward.
 - CloudFormation retains the production Serverless cache on stack deletion or
-  replacement; ephemeral development remains disposable.
+  replacement. Development Serverless Valkey, Server, and Monitoring are
+  disposable runtime stacks; the reusable development foundations are not.
 
 ### External release evidence still required
 
@@ -972,7 +977,9 @@ without strengthening the user-visible guarantee.
 
 The records below preserve the earlier combined-harness `Run A` / `Run B`
 terminology and its then-current load decisions. They are historical diagnostic
-evidence, not the current three-gate requirement.
+evidence, not the current three-gate requirement. Their full-absence cleanup
+inventories also describe the then-current fully disposable infrastructure and
+must not be read as the cleanup contract for the current persistent foundations.
 
 Neither external result has a passing report attached. The fixed-node attempt
 exposed cache saturation and handoff defects. The first Serverless-backed

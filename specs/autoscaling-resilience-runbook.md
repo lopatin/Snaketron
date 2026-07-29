@@ -34,9 +34,9 @@ Production deployment is manual-only and restricted to the current `main`
 commit. Every dispatch, including a dry run with credentialed CDK planning,
 must provide the GitHub Actions run ID of a successful main-branch Ephemeral
 Development Certification for that exact outer-repository commit. That run
-must complete the planned suite, hard-crash suite, and verified cleanup; a run
-for another commit, branch, repository, or workflow is rejected before AWS
-credentials are used.
+must complete the planned suite, hard-crash suite, verified runtime-stack
+cleanup, and verified ingress stop; a run for another commit, branch,
+repository, or workflow is rejected before AWS credentials are used.
 
 For each production region, the workflow detects the old
 `AWS::ElastiCache::ReplicationGroup`, deletes and waits for the Monitoring and
@@ -58,9 +58,10 @@ available Valkey 8 Serverless cache per region, no old Snaketron replication
 group, and an exact task URL of
 `rediss://HOST:6379/?protocol=resp3&cluster=true`.
 The production cache has CloudFormation deletion and replacement policies of
-`Retain`; ephemeral development does not, so its mandatory cleanup remains
-unchanged. Deleting a retained production cache is a separate deliberate
-operator action, not a consequence of deleting its stack.
+`Retain`. The development Serverless cache is deliberately runtime-only and is
+deleted after certification; that deletion does not remove the persistent
+development foundations. Deleting a retained production cache is a separate
+deliberate operator action, not a consequence of deleting its stack.
 
 For steady-state inspection after startup:
 
@@ -83,8 +84,8 @@ Local mode runs the deterministic Rust and browser tests for executor recovery,
 fencing, pending entries, completion, matchmaking, and socket lifecycle, then
 the load-report, production web build, parsed Traefik YAML, infrastructure
 tests, and complete offline development and explicitly selected production CDK
-synths. The development synth uses the same mandatory ephemeral contexts as the
-certification workflow. It fails when
+synths. The development synth uses the same mandatory run-lifecycle contexts as
+the certification workflow. It fails when
 a required dependency is absent. The Rust suite includes a real-child-process
 executor-protocol fault test using the production lease, consumer-group, and
 checkpoint APIs: it SIGKILLs one incumbent and SIGSTOP/SIGCONTs another after
@@ -113,8 +114,9 @@ after ACK, and that the one-second checkpoint cadence and fail-closed checkpoint
 age budget are independent of game tick duration. These are deterministic local
 acceptance results, not additional staging fault actions. Local standalone
 Valkey preserves numbered test databases; static key-family tests cover Cluster
-slot compatibility. Only the public ephemeral run against actual ElastiCache
-Serverless proves TLS, cluster routing across every slot family, and provider behavior.
+slot compatibility. Only the public development certification against actual
+ElastiCache Serverless proves TLS, cluster routing across every slot family, and
+provider behavior.
 
 That test is deliberately local-only and mutation-safe: it refuses non-loopback
 hosts, requires dedicated standalone Valkey database 14, serializes itself with a Redis
@@ -234,6 +236,11 @@ consumer-group cursors, or edit assignments by hand to force recovery.
 ## Required staging evidence
 
 Certification has three independent load gates.
+
+Historical run records below preserve the cleanup inventories produced by the
+then-current fully disposable development topology. Those inventories remain
+accurate evidence for those runs, but they are not the cleanup contract for new
+runs; the persistent-foundation lifecycle described below is authoritative.
 
 **Gate A — natural scale-out.** Run a fixed 224-session / 112-duel
 `every-tick` cohort from the one-vCPU minimum task. It retains one stage, the
@@ -846,12 +853,13 @@ environment tags, and prod-labeled ECS identifiers:
 
 The runner passes the load tool's generic production-host confirmation because
 that tool conservatively protects every snaketron.io subdomain, including the
-run-unique staging hostname. The stricter account/resource identity gate above
-runs first; this flag is not permission to target a production-tagged deployment.
+fixed `dev.snaketron.io` development hostname. The stricter account/resource
+identity gate above runs first; this flag is not permission to target a
+production-tagged deployment.
 
 ```bash
 export SNAKETRON_STAGING_CONFIRM=RUN_SNAKETRON_STAGING_CHAOS \
-SNAKETRON_STAGING_TARGET=https://STAGING_HOST \
+SNAKETRON_STAGING_TARGET=https://dev.snaketron.io \
 SNAKETRON_STAGING_ACCOUNT_ID=123456789012 \
 SNAKETRON_STAGING_ENVIRONMENT=dev \
 SNAKETRON_ECS_CLUSTER=STAGING_CLUSTER \
@@ -869,20 +877,29 @@ SNAKETRON_TRAEFIK_METRICS_CONTROL_URL=http://127.0.0.1:19090/metrics \
 ./run_autoscaling_resilience_tests.sh --staging-crash
 ```
 
-The “Ephemeral Development Certification” workflow provisions one short-lived
-development environment, opens three SSM sessions (Valkey 6379, Valkey 6380,
-and Traefik metrics), runs those commands in that order, uploads both evidence
-directories, and always destroys and verifies the absence of the ephemeral
-stacks afterward. The workflow discovers and validates the production Network
-stack's VPC, then imports it read-only. Development owns only its separately
-tagged security groups, Serverless cache, ECS resources, Traefik/EIP, and
-run-unique DNS record; cleanup must prove the shared VPC still exists and must
-never create, replace, or delete its routes, endpoints, or flow logs.
-Each run-unique public host can consume one new certificate, so the workflow
-fails closed after 30 attempts in a rolling seven-day window. This preserves
-20 issuance opportunities against Let's Encrypt's current 50-certificate
-registered-domain allowance; it is a conservative workflow budget, not proof
-of the domain's live CA quota.
+The “Ephemeral Development Certification” workflow reuses the fixed public
+`dev.snaketron.io` endpoint and its protected development foundations. The
+Network foundation imports the production Network stack's VPC read-only and
+owns only development security groups, one EIP and A record, and the Traefik
+instance. Its root EBS volume retains Traefik's ACME account and TLS certificate
+state while the instance is stopped. The reusable ECS cluster, ECR repository,
+and DynamoDB tables also remain provisioned between runs. None of these
+foundations carries a run expiry.
+
+For a certification run, the workflow starts that same ingress instance,
+creates only the Serverless Valkey, Server, and Monitoring runtime stacks, opens
+three SSM sessions (Valkey 6379, Valkey 6380, and Traefik metrics), runs the
+planned and hard-crash commands in that order, and uploads both evidence
+directories. Cleanup deletes and verifies the absence of those three
+run-identified runtime stacks, then stops and verifies the persistent ingress.
+It preserves the EIP, `dev.snaketron.io` record, EBS/TLS state, security groups,
+ECS/ECR/DynamoDB foundations, and Traefik log groups. It must also prove that
+the shared production VPC still exists and must never create, replace, or delete
+that VPC's routes, endpoints, or flow logs.
+
+Normal ACME renewal for the fixed hostname can still occur when necessary, but
+certification runs do not derive new hostnames or request one certificate per
+deployment. No workflow-attempt certificate quota is part of this lifecycle.
 
 At settled Gate B task counts `1`, `10`, and `1`, the runner records membership, the
 complete assignment map/version, active lease tokens/TTLs, pending commands,
