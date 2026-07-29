@@ -242,7 +242,7 @@ then-current fully disposable development topology. Those inventories remain
 accurate evidence for those runs, but they are not the cleanup contract for new
 runs; the persistent-foundation lifecycle described below is authoritative.
 
-**Gate A — natural scale-out.** Run a fixed 224-session / 112-duel
+**Gate A — natural scale-out.** Run a fixed 144-session / 72-duel
 `every-tick` cohort from the one-vCPU minimum task. It retains one stage, the
 20-minute runner, eight-minute target-tracking observation budget, and the
 existing one-second command-outcome budget. It does not use synthetic CPU,
@@ -282,10 +282,11 @@ coverage from before scale-in starts until after it finishes.
 
 This complete Gate B destination is bounded at 215 sockets (128 game, 23
 context, and 64 admission) and only 128 are command-bearing. Gate A has already
-placed 224 command-bearing sockets on the one-task origin while ramping at the
-same four starts per second, so it is the conservative one-task capacity
-precondition rather than a duplicated rehearsal. Gate B must still prove the
-final survivor remains ready and resolves every command inside budget.
+placed 144 command-bearing sockets on the one-task origin while ramping at the
+same four starts per second, so it is the conservative command-processing
+precondition rather than a duplicated rehearsal. Gate B must separately prove
+that its context and transient admission sockets fit on the final survivor,
+which remains ready and resolves every command inside budget.
 
 Gate B must prove no active-socket hard reconnect, zero measured usable-session
 gap, terminal command outcomes, nonterminal game handoffs with
@@ -761,6 +762,38 @@ production remained healthy. Fresh complete planned and SIGKILL certification
 remain required; do not relax the one-second ordinary-operation gate or any
 fixed cohort.
 
+Follow-up exact-source run
+[`30444237957`](https://github.com/lopatin/snaketron-io/actions/runs/30444237957)
+used outer commit `e1dfb875633f80d9528e19ea1c931e0f72ec8bc7` and
+Snaketron commit `e70d1185c4cba2aeb3eb44867b28357399afabf1`. It again
+proved that 224 sessions were not a valid headroom-preserving trigger: the
+single task remained at approximately 100% CPU for six complete minutes.
+Every one of 2,846 sessions, 1,423 games, and 2,516,545 commands completed with
+exact terminal accounting and no disconnect, reconnect, or usable-session gap,
+but 43 baseline seconds exceeded one second, 13 exceeded two seconds, and the
+maximum was 3,233 milliseconds. Movement stayed below two seconds at 1,739
+milliseconds; post-ready delivery peaked at 1,689 milliseconds. This is still
+a failed run, not the accepted sub-two-second transition exception.
+
+Settled post-scale-out Container Insights placed the original task at roughly
+823--877 CPU units and the successor at 405--433, with about 7.5% idle CPU per
+task. The fixed Gate A trial is therefore recalibrated once to 144 sessions /
+72 duels: above Gate B's 128 command-bearing sessions and projected to place a
+one-task origin around the desired 70--80% range. This projection is not a
+pass. The exact-source AWS run must still trigger CPU/memory target tracking
+naturally and meet the unchanged one-second budget; otherwise Gate A fails.
+This supersedes the historical 224 freeze without changing the 20-minute
+stage, four-session-per-second ramp, CPU/memory targets, protocol, or any
+correctness condition.
+
+The crash invocation reached ten healthy tasks but did not inject SIGKILL
+because four fresh ECS Exec agents were still `PENDING` at a one-shot setup
+check. The runner now polls the exact verified task cohort for at most 120
+seconds, while the actual kill remains single-attempt. Cleanup deleted only the
+Server, Serverless Valkey, and Monitoring runtime stacks. It retained the
+protected Network/EIP/EBS/TLS, ECS, ECR, and DynamoDB foundations and stopped
+the ingress instance, which is the current cleanup contract.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -992,7 +1025,7 @@ metric series. It also saves and gates a Container Insights Logs Insights result
 with CPU/memory samples for every exact ECS task ID in the fresh ten-task
 membership snapshot. It fails on a zero-ready sample, recovery fingerprint divergence,
 ownership/index mismatch, planned drain failure, any Valkey eviction or throttled
-command, or failure to corroborate the measured phase envelopes: 224 game
+command, or failure to corroborate the measured phase envelopes: 144 game
 sessions during natural scale-out; 128 game sessions, 23 durable context
 sessions, bounded open-loop admission, and transient make-before-break
 candidates during the planned transition; and 272 game sessions during

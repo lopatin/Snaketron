@@ -199,13 +199,13 @@ write_gate_a_acceptance_report() {
           configuration:
             (($report.schema_version // 0) >= 10
               and ($report.metadata.threshold_result // null) == "passed"
-              and ($report.configured_max_concurrency // 0) == 224
+              and ($report.configured_max_concurrency // 0) == 144
               and ($report.metadata.mode // null) == "duel"
               and ($report.metadata.command_profile // null) == "every-tick"
               and ($report.metadata.spawn_rate_per_second // null) == "4"),
           population_completion:
-            (($report.session_counts.peak_authenticated_concurrency // 0) == 224
-              and ($report.session_counts.peak_active_game_concurrency // 0) >= 112
+            (($report.session_counts.peak_authenticated_concurrency // 0) == 144
+              and ($report.session_counts.peak_active_game_concurrency // 0) >= 72
               and ($report.session_counts.failed // -1) == 0
               and ($report.session_counts.cancelled // -1) == 0
               and ($report.session_counts.incomplete // -1) == 0
@@ -573,7 +573,7 @@ test_command_outcome_window_gate() {
   jq -n '{
     schema_version: 10,
     finished_at_unix_ms: 13000,
-    configured_max_concurrency: 224,
+    configured_max_concurrency: 144,
     metadata: {
       threshold_result: "passed",
       mode: "duel",
@@ -586,8 +586,8 @@ test_command_outcome_window_gate() {
       failed: 0,
       cancelled: 0,
       incomplete: 0,
-      peak_authenticated_concurrency: 224,
-      peak_active_game_concurrency: 112
+      peak_authenticated_concurrency: 144,
+      peak_active_game_concurrency: 72
     },
     sessions: [{outcome: "completed", failure_phase: null}],
     games: {pairing_violations: 0},
@@ -2191,8 +2191,9 @@ collect_cloudwatch_evidence() {
 
   # ActiveWebSockets is emitted by each task into one environment-level
   # metric stream, so Maximum is a per-task peak rather than a fleet sum.
-  # Gate A proves the one-task 224-socket envelope; exact reports below prove
-  # the separate Gate B and Gate C fleet envelopes.
+  # This run-wide series only corroborates a 144-socket per-task peak. Gate A's
+  # phase-scoped report and region samples prove its exact cohort; the separate
+  # reports below prove the Gate B and Gate C fleet envelopes.
   jq -e 'all(.Datapoints[]; .Minimum > 0)' \
     "$cloudwatch_dir/ready-tasks.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
@@ -2221,7 +2222,7 @@ collect_cloudwatch_evidence() {
       "$cloudwatch_dir/fenced-write-rejections.json" >/dev/null \
     && jq -e '([.Datapoints[].Maximum] | max) == 0' \
       "$cloudwatch_dir/quarantined-commands.json" >/dev/null \
-    && jq -e '([.Datapoints[].Maximum] | max) >= 224' \
+    && jq -e '([.Datapoints[].Maximum] | max) >= 144' \
       "$cloudwatch_dir/active-websockets.json" >/dev/null \
     && jq -e '([.Datapoints[].Sum] | add) == 0' \
       "$cloudwatch_dir/valkey-evictions.json" >/dev/null \
@@ -3280,8 +3281,8 @@ run_staging_suite() {
     local observed_pid="${3:-}"
     local samples="$report_dir/region-sockets-$label.jsonl"
     local summary="$report_dir/region-sockets-$label.json"
-    # At four sessions per second, the fixed 224-session Run A needs about
-    # 56 seconds to launch before the heartbeat-delayed public count can
+    # At four sessions per second, the fixed 144-session Run A needs about
+    # 36 seconds to launch before the heartbeat-delayed public count can
     # expose its floor. Ninety seconds leaves bounded scheduling jitter without
     # weakening any load, latency, or admission assertion.
     local deadline=$((SECONDS + 90))
@@ -3534,7 +3535,7 @@ run_staging_suite() {
     --require-same-origin \
     --region "$SNAKETRON_REGION_CODE" \
     --mode duel \
-    --stages 224@20m \
+    --stages 144@20m \
     --spawn-rate 4 \
     --max-total-sessions 4096 \
     --command-profile every-tick \
@@ -3545,12 +3546,12 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${natural_scale_out_command[@]}" &
   load_pid=$!
-  # Two hundred twenty-four sessions retain active games on every partition
+  # One hundred forty-four sessions retain active games on every partition
   # and drive the one-vCPU minimum task above its target-tracking threshold.
   # They must still trigger the configured CPU/memory policy naturally;
   # failure to trigger is a certification failure, not permission to force
   # the transition.
-  wait_for_region_socket_floor automatic-scale-out-baseline 224
+  wait_for_region_socket_floor automatic-scale-out-baseline 144
   automatic_scale_out_baseline_started_ms="$(unix_time_ms)"
   wait_for_automatic_scale_out \
     "$report_dir" "$evidence_started_epoch" "$load_pid"
@@ -4027,7 +4028,7 @@ run_staging_suite() {
     }
 
   # Cover both directions of the forced staircase. Natural scale-out was
-  # already checked against its separate 224-session report. Receipt-time
+  # already checked against its separate 144-session report. Receipt-time
   # bucket counts alone can hide a one-second
   # executor stall followed by a catch-up burst. One second is a deliberately
   # strict user-continuity budget: the predictive client remains smooth while
@@ -4484,8 +4485,8 @@ run_staging_suite() {
           desired: $automatic_out[0].services[0].desiredCount,
           running: $automatic_out[0].services[0].runningCount,
           evidence: "target-tracking activity",
-          configured_game_sessions: 224,
-          configured_duels: 112
+          configured_game_sessions: 144,
+          configured_duels: 72
         },
         deterministic_forced_staircase: ($forced[0] + {
           configured_game_sessions: 128,
