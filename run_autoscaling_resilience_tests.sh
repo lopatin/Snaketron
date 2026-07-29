@@ -188,9 +188,9 @@ select_pre_fault_ownership_sample() {
   ' "$@"
 }
 
-select_hard_crash_owner_ready_ownership_sample() {
+select_hard_crash_owner_ownership_sample() {
   local pre="$1"
-  local execution_stopped_at_ms="$2"
+  local execution_stopped_at_ms_json="$2"
   local partition="$3"
   local killed_boot_id="$4"
   local killed_task_id="$5"
@@ -199,7 +199,7 @@ select_hard_crash_owner_ready_ownership_sample() {
   (( $# > 0 )) || return 1
   jq -es \
     --slurpfile pre "$pre" \
-    --argjson execution_stopped_at_ms "$execution_stopped_at_ms" \
+    --argjson execution_stopped_at_ms "$execution_stopped_at_ms_json" \
     --argjson partition "$partition" \
     --arg killed_boot_id "$killed_boot_id" \
     --arg killed_task_id "$killed_task_id" \
@@ -208,8 +208,7 @@ select_hard_crash_owner_ready_ownership_sample() {
         | select(.partition == $partition)) as $old
       | [.[]
           | select(
-              .observation_started_at_ms >= $execution_stopped_at_ms
-              and .captured_at_ms >= .observation_started_at_ms
+              .captured_at_ms >= .observation_started_at_ms
               and .captured_at_ms <= .observation_completed_at_ms
               and .membership_observed_at_ms >= .observation_started_at_ms
               and .membership_observed_at_ms <= .observation_completed_at_ms
@@ -218,15 +217,21 @@ select_hard_crash_owner_ready_ownership_sample() {
               and (.authority_event_tail_id
                 | type == "string"
                 and test("^[0-9]+-[0-9]+$"))
-              and .observation_completed_at_ms
-                <= ($execution_stopped_at_ms + 5000))
+              and (
+                $execution_stopped_at_ms == null
+                or (
+                  .observation_started_at_ms >= $execution_stopped_at_ms
+                  and .observation_completed_at_ms
+                    <= ($execution_stopped_at_ms + 5000))))
           | (.runtime_partitions[]
               | select(.partition == $partition)) as $new
           | select(
               .authority_stable
               and .killed_member_live == false
               and .assignment.version > $pre[0].assignment.version
-              and .assignment.computed_at_ms >= $execution_stopped_at_ms
+              and (
+                $execution_stopped_at_ms == null
+                or .assignment.computed_at_ms >= $execution_stopped_at_ms)
               and $new.owner_matches
               and $new.desired_owner != $killed_boot_id
               and $new.active_owner == $new.desired_owner
@@ -246,6 +251,27 @@ select_hard_crash_owner_ready_ownership_sample() {
                         and .ecs_task_id == $owner_task_id))))]
       | min_by(.observation_completed_at_ms)
   ' "$@"
+}
+
+select_hard_crash_owner_ready_ownership_sample() {
+  select_hard_crash_owner_ownership_sample "$@"
+}
+
+select_hard_crash_owner_candidate_ownership_sample() {
+  local pre="$1"
+  local partition="$2"
+  local killed_boot_id="$3"
+  local killed_task_id="$4"
+  local killed_lease_token="$5"
+  shift 5
+  select_hard_crash_owner_ownership_sample \
+    "$pre" \
+    null \
+    "$partition" \
+    "$killed_boot_id" \
+    "$killed_task_id" \
+    "$killed_lease_token" \
+    "$@"
 }
 
 select_hard_crash_authoritative_output_sample() {
@@ -1566,6 +1592,20 @@ test_hard_crash_evidence_selectors() {
       .observation_completed_at_ms == $expected
       and .runtime_partitions[0].active_owner == $survivor
     ' "$selected" >/dev/null || result=1
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .assignment.computed_at_ms = ($stopped + 600)
+    ' "$owner_valid" >"$fixture_dir/owner-computed-during-observation.json"
+  select_hard_crash_owner_candidate_ownership_sample \
+    "$pre" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-computed-during-observation.json" \
+    >"$selected" || result=1
+  select_hard_crash_owner_ready_ownership_sample \
+    "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$fixture_dir/owner-computed-during-observation.json" \
+    >"$selected" || result=1
   select_hard_crash_authoritative_output_sample \
     "$execution_stopped_at_ms" "$partition" \
     "$((execution_stopped_at_ms + 2450))-1" \
@@ -1771,6 +1811,12 @@ test_hard_crash_evidence_selectors() {
   fi
   if select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    >/dev/null 2>&1; then
+    result=1
+  fi
+  if select_hard_crash_owner_candidate_ownership_sample \
+    "$pre" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     >/dev/null 2>&1; then
     result=1
@@ -3749,7 +3795,7 @@ inject_hard_crash_and_prove_takeover() {
     local observer_stop_requested=false
     trap 'observer_stop_requested=true' TERM INT
     local observation_sequence=0
-    local output_evidence_captured=false
+    local captured_authority_identity=""
     while [[ "$observer_stop_requested" != true \
       && ! -e "$ownership_observer_stop_file" ]]; do
       observation_sequence=$((observation_sequence + 1))
@@ -3758,7 +3804,7 @@ inject_hard_crash_and_prove_takeover() {
       local observation_raw
       local observation_pending
       local observation_sample
-      local candidate_assignment_computed_at_ms
+      local candidate_authority_identity
       local output_raw
       local output_pending
       local output_sample
@@ -3818,21 +3864,26 @@ inject_hard_crash_and_prove_takeover() {
                   and test("^[0-9]+-[0-9]+$")))
           ' "$observation_raw" >"$observation_pending"; then
           mv "$observation_pending" "$observation_sample"
-          if [[ "$output_evidence_captured" != true ]] \
-            && candidate_assignment_computed_at_ms="$(
-              jq -er '
-                .assignment.computed_at_ms
-                | select(type == "number")
-              ' "$observation_sample"
-            )" \
-            && select_hard_crash_owner_ready_ownership_sample \
+          if select_hard_crash_owner_candidate_ownership_sample \
               "$pre" \
-              "$candidate_assignment_computed_at_ms" \
               "$killed_partition" \
               "$killed_boot_id" \
               "$killed_task_id" \
               "$killed_lease_token" \
-              "$observation_sample" >/dev/null 2>&1; then
+              "$observation_sample" >/dev/null 2>&1 \
+            && candidate_authority_identity="$(
+              jq -er --argjson partition "$killed_partition" '
+                (.runtime_partitions[]
+                  | select(.partition == $partition)) as $runtime
+                | [
+                    .assignment.version,
+                    $runtime.lease_token
+                  ]
+                | @json
+              ' "$observation_sample"
+            )" \
+            && [[ "$candidate_authority_identity" \
+              != "$captured_authority_identity" ]]; then
             local authority_event_tail_id
             local output_observation_started_at_ms
             local output_observation_completed_at_ms
@@ -3870,7 +3921,7 @@ inject_hard_crash_and_prove_takeover() {
                     }
                 ' "$output_raw" >"$output_pending"; then
                 mv "$output_pending" "$output_sample"
-                output_evidence_captured=true
+                captured_authority_identity="$candidate_authority_identity"
               fi
             fi
           fi
