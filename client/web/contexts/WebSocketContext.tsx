@@ -1408,6 +1408,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return false;
     }
     if (slot.authenticated && slot.authTokenSent === token) {
+      setAuthHandshakeState(true);
       return true;
     }
     if (slot.authTokenSent !== token) {
@@ -1417,7 +1418,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       lastAuthTokenRef.current = token;
     }
     return slot.authenticated;
-  }, [getToken]);
+  }, [getToken, setAuthHandshakeState]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
     const trimmed = message.trim();

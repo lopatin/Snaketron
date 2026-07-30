@@ -89,6 +89,7 @@ enum Operation {
     Status {
         partition: Option<u32>,
     },
+    Envelope,
     Ownership {
         partition: u32,
         killed_boot_id: BootIdentity,
@@ -153,6 +154,26 @@ struct Status {
     assignment: Option<AssignmentDocument>,
     runtime_partitions: Vec<RuntimePartition>,
     quickmatch_two_v_two_queued_lobbies: u64,
+}
+
+#[derive(Serialize)]
+struct EnvelopeRuntimePartition {
+    partition: u32,
+    desired_owner: Option<String>,
+    active_owner: Option<String>,
+    owner_matches: bool,
+    lease_ttl_ms: i64,
+    active_games: u64,
+}
+
+#[derive(Serialize)]
+struct EnvelopeStatus {
+    region_key: String,
+    observation_started_at_ms: i64,
+    observation_completed_at_ms: i64,
+    live_members: Vec<TaskMembership>,
+    assignment: Option<AssignmentDocument>,
+    runtime_partitions: Vec<EnvelopeRuntimePartition>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -260,6 +281,7 @@ struct TakeoverOutputRequest {
 fn usage() -> &'static str {
     "Usage:
   resilience_admin status --region-key REGION [--redis-url URL] [--partition NUMBER]
+  resilience_admin envelope --region-key REGION [--redis-url URL]
   resilience_admin ownership --region-key REGION [--redis-url URL] --partition NUMBER --killed-boot-id UUID [--watch-interval-ms MILLISECONDS]
   resilience_admin pending --region-key REGION [--redis-url URL] --partition NUMBER --consumer LEASE_TOKEN [--watch-interval-ms MILLISECONDS]
   resilience_admin output --region-key REGION [--redis-url URL] --partition NUMBER --after-stream-id STREAM_ID [--wait-ms MILLISECONDS]
@@ -389,6 +411,24 @@ where
                 );
             }
             Operation::Status { partition }
+        }
+        "envelope" => {
+            if partition.is_some()
+                || killed_boot_id.is_some()
+                || consumer.is_some()
+                || after_stream_id.is_some()
+                || watch_interval_ms.is_some()
+                || wait_ms.is_some()
+                || baseline_status_path.is_some()
+                || ready_output_path.is_some()
+                || anchor_output_path.is_some()
+            {
+                bail!(
+                    "envelope accepts only its documented arguments\n{}",
+                    usage()
+                );
+            }
+            Operation::Envelope
         }
         "ownership" => {
             if consumer.is_some()
@@ -588,6 +628,79 @@ async fn read_partition(
         pending_completion_count,
         quarantined_command_count,
         active_games,
+    })
+}
+
+async fn read_envelope_partition(
+    redis: &mut RedisConnection,
+    namespace: &ClusterNamespace,
+    assignment: Option<&AssignmentDocument>,
+    partition: u32,
+) -> Result<EnvelopeRuntimePartition> {
+    // These keys share the executor partition hash slot. One small script
+    // gives the certification harness the authoritative game count and the
+    // corresponding live lease without scanning pending command metadata.
+    let (lease_token, lease_ttl_ms, active_games): (String, i64, u64) = redis::Script::new(
+        r#"
+            local lease = redis.call('GET', KEYS[1])
+            return {
+                lease or '',
+                redis.call('PTTL', KEYS[1]),
+                redis.call('SCARD', KEYS[2])
+            }
+            "#,
+    )
+    .key(namespace.partition_lease(partition))
+    .key(namespace.active_games(partition))
+    .invoke_async(redis)
+    .await
+    .context("failed to inspect executor capacity envelope")?;
+    let active_owner = parse_active_owner(&lease_token);
+    let desired_owner = assignment
+        .and_then(|document| document.desired_owner(partition))
+        .map(ToString::to_string);
+
+    Ok(EnvelopeRuntimePartition {
+        partition,
+        owner_matches: desired_owner.is_some() && desired_owner == active_owner && lease_ttl_ms > 0,
+        desired_owner,
+        active_owner,
+        lease_ttl_ms,
+        active_games,
+    })
+}
+
+async fn read_envelope_status(
+    connection: &RedisConnection,
+    namespace: &ClusterNamespace,
+    observer_clock: &ObserverClock,
+    region_key: String,
+) -> Result<EnvelopeStatus> {
+    let observation_started_at_ms = observer_clock.observation_start_ms();
+    let now_ms = Utc::now().timestamp_millis();
+    let assignment_store = AssignmentStore::new(connection.clone(), namespace.clone());
+    let mut membership_redis = connection.clone();
+    let (assignment, live_members) = tokio::try_join!(
+        assignment_store.load(),
+        read_live_members(&mut membership_redis, namespace, now_ms),
+    )?;
+    let assignment_ref = assignment.as_ref();
+    let partition_reads =
+        (0..PARTITION_COUNT).map(|partition| {
+            let mut redis = connection.clone();
+            async move {
+                read_envelope_partition(&mut redis, namespace, assignment_ref, partition).await
+            }
+        });
+    let runtime_partitions = futures_util::future::try_join_all(partition_reads).await?;
+
+    Ok(EnvelopeStatus {
+        region_key,
+        observation_started_at_ms,
+        observation_completed_at_ms: observer_clock.observation_completion_ms(),
+        live_members,
+        assignment,
+        runtime_partitions,
     })
 }
 
@@ -1342,6 +1455,12 @@ async fn main() -> Result<()> {
                 })?
             );
         }
+        Operation::Envelope => {
+            let status =
+                read_envelope_status(&connection, &namespace, &observer_clock, args.region_key)
+                    .await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Operation::Ownership {
             partition,
             killed_boot_id,
@@ -1541,6 +1660,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_exact_capacity_envelope_arguments() {
+        let args = parse_args_from(
+            ["envelope", "--region-key", "use1"],
+            Some("redis://127.0.0.1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(args.region_key, "use1");
+        assert!(matches!(args.operation, Operation::Envelope));
+        assert!(
+            parse_args_from(
+                ["envelope", "--region-key", "use1", "--partition", "0",],
+                Some("redis://127.0.0.1".to_string()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_ownership_probe_arguments() {
         let killed_boot_id = BootIdentity::new();
         let args = parse_args_from(
@@ -1571,6 +1708,7 @@ mod tests {
                 assert_eq!(parsed, killed_boot_id);
             }
             Operation::Status { .. }
+            | Operation::Envelope
             | Operation::Pending { .. }
             | Operation::Output { .. }
             | Operation::TakeoverOutput { .. } => {
@@ -1609,6 +1747,7 @@ mod tests {
                 assert_eq!(parsed, consumer);
             }
             Operation::Status { .. }
+            | Operation::Envelope
             | Operation::Ownership { .. }
             | Operation::Output { .. }
             | Operation::TakeoverOutput { .. } => {
@@ -1645,6 +1784,7 @@ mod tests {
                 assert_eq!(after_stream_id, "1000-2");
             }
             Operation::Status { .. }
+            | Operation::Envelope
             | Operation::Ownership { .. }
             | Operation::Pending { .. }
             | Operation::TakeoverOutput { .. } => {
@@ -1692,6 +1832,7 @@ mod tests {
                 assert_eq!(anchor_output_path, PathBuf::from("/tmp/anchor.json"));
             }
             Operation::Status { .. }
+            | Operation::Envelope
             | Operation::Ownership { .. }
             | Operation::Pending { .. }
             | Operation::Output { .. } => panic!("parsed takeover output as another operation"),
@@ -1978,6 +2119,54 @@ mod tests {
         after.lease_ttl_ms = 1;
         after.observed_at_ms = 9;
         assert!(!authority_is_stable(&before, &after));
+    }
+
+    #[tokio::test]
+    async fn capacity_envelope_reads_lease_and_active_games_atomically() -> Result<()> {
+        let redis_url = "redis://127.0.0.1:6379/15?protocol=resp3";
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let client = RedisClient::open(redis_url, Some(push_tx))?;
+        let connection = client.get_managed_connection().await?;
+        let mut redis = connection;
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let namespace = ClusterNamespace::new(format!("admin-envelope-{salt}"))?;
+        let partition = PARTITION_COUNT - 1;
+        let owner = BootIdentity::new();
+        let lease_token = format!("{}:{}", owner.as_str(), Uuid::new_v4());
+        let assignment = AssignmentDocument {
+            schema_version: server::partition_assignment::ASSIGNMENT_SCHEMA_VERSION,
+            version: 1,
+            region: namespace.region().to_string(),
+            computed_at_ms: 1,
+            eligible_members: vec![owner.clone()],
+            owners: [(partition, owner.clone())].into_iter().collect(),
+        };
+        let lease_key = namespace.partition_lease(partition);
+        let active_games_key = namespace.active_games(partition);
+        let _: () = redis.set_ex(&lease_key, &lease_token, 10).await?;
+        let _: u64 = redis.sadd(&active_games_key, &[41_u32, 51_u32]).await?;
+
+        let status =
+            read_envelope_partition(&mut redis, &namespace, Some(&assignment), partition).await?;
+        assert_eq!(status.partition, partition);
+        assert_eq!(status.active_games, 2);
+        assert_eq!(status.active_owner.as_deref(), Some(owner.as_str()));
+        assert_eq!(status.desired_owner.as_deref(), Some(owner.as_str()));
+        assert!(status.lease_ttl_ms > 0);
+        assert!(status.owner_matches);
+
+        let replacement = BootIdentity::new();
+        let replacement_token = format!("{}:{}", replacement.as_str(), Uuid::new_v4());
+        let _: () = redis.set_ex(&lease_key, replacement_token, 10).await?;
+        let mismatch =
+            read_envelope_partition(&mut redis, &namespace, Some(&assignment), partition).await?;
+        assert!(!mismatch.owner_matches);
+
+        let _: u64 = redis.del(lease_key).await?;
+        let _: u64 = redis.del(active_games_key).await?;
+        Ok(())
     }
 
     #[tokio::test]

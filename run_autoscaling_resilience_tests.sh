@@ -1634,6 +1634,15 @@ test_hard_crash_envelope_contract() {
             }
         ]
       } as $online
+    | ($online
+        | .samples |= (
+            to_entries
+            | map(
+                .value.observed_at_unix_ms =
+                  (100000 + (.key * hard_crash_max_online_sample_gap_ms))
+              )
+            | map(.value)
+          )) as $maximum_cadence_online
     | (($online.samples | last | .observed_at_unix_ms) + 1)
         as $exec_invoked_at
     | [
@@ -1643,6 +1652,13 @@ test_hard_crash_envelope_contract() {
           == $required_seconds),
         ($positive_seconds | last | .qualifying),
         passes($positive_seconds; $online; $exec_invoked_at),
+        passes(
+          $positive_seconds;
+          $maximum_cadence_online;
+          (($maximum_cadence_online.samples
+              | last
+              | .observed_at_unix_ms) + 1)
+        ),
         (passes(
           $short_streak_seconds;
           $online;
@@ -4060,6 +4076,18 @@ capture_control_status() {
     --region-key "$SNAKETRON_REGION_CODE" >"$output"
 }
 
+capture_control_envelope() {
+  local output="$1"
+  # This probe intentionally excludes pending-entry and completion diagnostics.
+  # The dedicated admin operation reads only membership, owner leases, and
+  # authoritative active-game sets, and its outer bound keeps evidence cadence
+  # below the unchanged ten-second acceptance limit even on a failed probe.
+  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+    timeout --signal=TERM --kill-after=1s 4s \
+      "$resilience_admin" envelope \
+      --region-key "$SNAKETRON_REGION_CODE" >"$output"
+}
+
 observer_process_is_running() {
   local pid="$1"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -5574,7 +5602,7 @@ run_staging_suite() {
       if curl -fsS --max-time 3 \
         "${SNAKETRON_STAGING_TARGET%/}/api/regions/user-counts" \
         >"$user_candidate" \
-        && capture_control_status "$control_candidate" 2>/dev/null; then
+        && capture_control_envelope "$control_candidate" 2>/dev/null; then
         users="$(jq -r --arg region "$SNAKETRON_REGION_CODE" \
           '.[$region] // 0' "$user_candidate")"
         games="$(jq -r \

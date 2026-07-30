@@ -76,6 +76,7 @@ impl DeferredHttpServer {
         info!("HTTP liveness listener bound on {}", addr);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
+                .tcp_nodelay(true)
                 .with_graceful_shutdown(async move {
                     cancellation.cancelled().await;
                     info!("HTTP server received shutdown signal");
