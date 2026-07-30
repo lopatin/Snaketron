@@ -9,6 +9,7 @@ interface GameSession {
   id: string;
   nextSequence: number;
   pending: Map<number, PendingCommand>;
+  terminalAwaitingOutcomeBarrier?: boolean;
   rejectionFence?: {
     fromSequence: number;
   };
@@ -20,6 +21,8 @@ interface PendingCommand {
 }
 
 type SessionIdFactory = () => string;
+
+export type TerminalOutboxCompletion = 'not-terminal' | 'pending' | 'cleared';
 
 // Shared bounded protocol/storage budget with the server's exact-result
 // window. Disconnected or resynchronizing clients do not create identities.
@@ -67,7 +70,10 @@ export function recoveryOutcomesReadyForResend(
     && completedOutcomeBarriers.has(gameId);
 }
 
-/** A completed game can no longer produce a per-command outcome. */
+/**
+ * A terminal event parks the outbox until the server's immediately following
+ * durable outcome replay and completion barrier have been processed.
+ */
 export function gameEventTerminatesCommandOutbox(event: unknown): boolean {
   if (!event || typeof event !== 'object') {
     return false;
@@ -135,7 +141,11 @@ export class GameCommandOutbox {
     key: string,
     session: GameSession,
   ): void {
-    if (session.rejectionFence && session.pending.size === 0) {
+    if (
+      session.rejectionFence &&
+      session.pending.size === 0 &&
+      !session.terminalAwaitingOutcomeBarrier
+    ) {
       this.sessions.delete(key);
     }
   }
@@ -175,6 +185,9 @@ export class GameCommandOutbox {
     nowMs: number = Date.now(),
   ): GameCommandV2 {
     const session = this.getOrCreateSession(gameId, userId);
+    if (session.terminalAwaitingOutcomeBarrier) {
+      throw new Error('terminal game is awaiting command outcomes');
+    }
     if (session.rejectionFence) {
       throw new Error('client game command session rejected');
     }
@@ -310,7 +323,7 @@ export class GameCommandOutbox {
     retryIntervalMs: number,
   ): GameCommandV2[] {
     const session = this.sessions.get(sessionKey(gameId, userId));
-    if (!session) {
+    if (!session || session.terminalAwaitingOutcomeBarrier) {
       return [];
     }
     const due: GameCommandV2[] = [];
@@ -328,6 +341,35 @@ export class GameCommandOutbox {
       }
     }
     return due.sort((left, right) => left.command_id.sequence - right.command_id.sequence);
+  }
+
+  markTerminal(gameId: number, userId: number): boolean {
+    const key = sessionKey(gameId, userId);
+    let session = this.sessions.get(key);
+    if (!session) {
+      session = {
+        id: this.sessionIdFactory(),
+        nextSequence: 1,
+        pending: new Map(),
+      };
+      this.sessions.set(key, session);
+    }
+    session.terminalAwaitingOutcomeBarrier = true;
+    return true;
+  }
+
+  completeTerminal(gameId: number, userId: number): TerminalOutboxCompletion {
+    const session = this.sessions.get(sessionKey(gameId, userId));
+    if (!session?.terminalAwaitingOutcomeBarrier) {
+      return 'not-terminal';
+    }
+    if (session.pending.size > 0) {
+      return 'pending';
+    }
+    // Keep the tombstone after successful reconciliation. React can process
+    // this barrier before the queued terminal event reaches the game engine;
+    // only explicit leave/navigation may make this game commandable again.
+    return 'cleared';
   }
 
   clear(gameId: number, userId: number): void {
@@ -374,6 +416,20 @@ export function takeGameCommandsDueForRetry(
   retryIntervalMs: number,
 ): GameCommandV2[] {
   return browserOutbox.takeDue(gameId, userId, nowMs, retryIntervalMs);
+}
+
+export function markGameCommandOutboxTerminal(
+  gameId: number,
+  userId: number,
+): boolean {
+  return browserOutbox.markTerminal(gameId, userId);
+}
+
+export function completeGameCommandOutboxTerminal(
+  gameId: number,
+  userId: number,
+): TerminalOutboxCompletion {
+  return browserOutbox.completeTerminal(gameId, userId);
 }
 
 export function clearGameCommandOutbox(gameId: number, userId: number): void {

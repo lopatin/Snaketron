@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 10;
+pub const REPORT_SCHEMA_VERSION: u32 = 11;
 const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
 
 /// Keep the slowest evidence while reserving one representative for every
@@ -216,8 +216,8 @@ pub struct HardRecoveryObservation {
 
 /// How a pending command first became semantically final at the load
 /// generator. This diagnostic distinguishes a live authoritative event from
-/// an outcome replay or terminal-game cleanup without changing pass/fail
-/// semantics.
+/// an outcome replay without changing pass/fail semantics. Terminal game state
+/// alone is deliberately not a command outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResolutionSource {
@@ -226,7 +226,6 @@ pub enum CommandResolutionSource {
     RecoveryScheduledOutcome,
     RecoveryRejectedOutcome,
     RecoveryContiguousOutcome,
-    TerminalGameState,
 }
 
 /// Bounded provenance retained only for commands that violate the fixed
@@ -248,6 +247,32 @@ pub struct SlowCommandResolution {
     /// correlated separately by partition and timestamp.
     pub gateway_task_boot_id: Option<String>,
     pub socket_generation: Option<u64>,
+}
+
+/// Constant-space evidence of delay after the dedicated socket reader has
+/// received a frame but before the virtual user's driver processes it. This is
+/// load-generator health telemetry, not part of the service latency gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketDispatchLagSummary {
+    pub observations: u64,
+    pub maximum_ms: u64,
+    pub over_one_second: u64,
+}
+
+impl WebSocketDispatchLagSummary {
+    pub fn observe(&mut self, milliseconds: u64) {
+        self.observations = self.observations.saturating_add(1);
+        self.maximum_ms = self.maximum_ms.max(milliseconds);
+        if milliseconds > 1_000 {
+            self.over_one_second = self.over_one_second.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.observations = self.observations.saturating_add(other.observations);
+        self.maximum_ms = self.maximum_ms.max(other.maximum_ms);
+        self.over_one_second = self.over_one_second.saturating_add(other.over_one_second);
+    }
 }
 
 impl SessionFailureRecord {
@@ -291,6 +316,10 @@ pub struct SessionMetrics {
     pub game_duration_ms: Option<u64>,
     #[serde(default)]
     pub websocket_rtt_ms: Vec<u64>,
+    /// Delay between the continuously polled socket reader receiving a parsed
+    /// frame and the virtual-user driver observing it.
+    #[serde(default)]
+    pub websocket_dispatch_lag: WebSocketDispatchLagSummary,
     /// Transport loss/drain detection through a usable replacement.
     #[serde(default)]
     pub reconnect_duration_ms: Vec<u64>,
@@ -353,11 +382,13 @@ pub struct SessionMetrics {
     pub scheduled_command_counts_by_sent_unix_second: BTreeMap<u64, u64>,
     /// Every first terminal executor outcome, grouped by the command's
     /// original send second. This includes scheduled, rejected, and commands
-    /// made definitive no-ops by terminal game state.
+    /// resolved by executor-authored live or recovered outcomes.
     #[serde(default)]
     pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
-    /// Worst original-send-to-terminal-outcome latency for each send second.
-    /// Resends retain the original timestamp.
+    /// Worst original-send-to-terminal-outcome transport receipt latency for
+    /// each send second. The dedicated socket reader timestamps the frame
+    /// before lossless handoff to the virtual-user driver. Resends retain the
+    /// original timestamp.
     #[serde(default)]
     pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
     /// Bounded slow command outcomes with one representative retained for as
@@ -653,6 +684,11 @@ pub struct AggregateMetrics {
     pub game_join_ms: DistributionSummary,
     pub game_duration_ms: DistributionSummary,
     pub websocket_rtt_ms: DistributionSummary,
+    /// Constant-space aggregate of reader-receipt-to-driver delay. It diagnoses
+    /// an overloaded synthetic client independently from the service latency
+    /// gate.
+    #[serde(default)]
+    pub websocket_dispatch_lag: WebSocketDispatchLagSummary,
     pub reconnect_duration_ms: DistributionSummary,
     pub rejoin_lobby_ms: DistributionSummary,
     pub rejoin_snapshot_ms: DistributionSummary,
@@ -680,8 +716,8 @@ pub struct AggregateMetrics {
     /// resolution without confusing receipt-time bucket boundaries.
     #[serde(default)]
     pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
-    /// Maximum first-send-to-terminal-outcome latency observed in each send
-    /// second across every session.
+    /// Maximum first-send-to-terminal-outcome transport receipt latency in
+    /// each send second across every session.
     #[serde(default)]
     pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
     /// Bounded command outcomes above the fixed one-second gate. The cap first
@@ -819,6 +855,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut game_join = Vec::new();
     let mut game_duration = Vec::new();
     let mut websocket_rtt = Vec::new();
+    let mut websocket_dispatch_lag = WebSocketDispatchLagSummary::default();
     let mut reconnect_duration = Vec::new();
     let mut rejoin_lobby = Vec::new();
     let mut rejoin_snapshot = Vec::new();
@@ -861,6 +898,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             push_option(&mut game_join, session.metrics.game_join_ms);
             push_option(&mut game_duration, session.metrics.game_duration_ms);
             websocket_rtt.extend(session.metrics.websocket_rtt_ms.iter().copied());
+            websocket_dispatch_lag.merge(session.metrics.websocket_dispatch_lag);
             reconnect_duration.extend(session.metrics.reconnect_duration_ms.iter().copied());
             rejoin_lobby.extend(session.metrics.rejoin_lobby_ms.iter().copied());
             rejoin_snapshot.extend(session.metrics.rejoin_snapshot_ms.iter().copied());
@@ -1097,6 +1135,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             game_join_ms: DistributionSummary::from_samples(&game_join),
             game_duration_ms: DistributionSummary::from_samples(&game_duration),
             websocket_rtt_ms: DistributionSummary::from_samples(&websocket_rtt),
+            websocket_dispatch_lag,
             reconnect_duration_ms: DistributionSummary::from_samples(&reconnect_duration),
             rejoin_lobby_ms: DistributionSummary::from_samples(&rejoin_lobby),
             rejoin_snapshot_ms: DistributionSummary::from_samples(&rejoin_snapshot),
@@ -1561,6 +1600,7 @@ fn render_html(report: &AggregateReport) -> String {
     );
 
     let traffic = &report.metrics.traffic;
+    let dispatch_lag = &report.metrics.websocket_dispatch_lag;
     let _ = write!(
         html,
         "<h2>Traffic</h2><div class=\"cards\">\
@@ -1569,13 +1609,19 @@ fn render_html(report: &AggregateReport) -> String {
          <div class=\"card\"><span class=\"label\">Game events</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Commands sent</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Disconnects</span><b>{}</b></div>\
-         <div class=\"card\"><span class=\"label\">Reconnects</span><b>{}</b></div></div>",
+         <div class=\"card\"><span class=\"label\">Reconnects</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Reader dispatch observations</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Maximum reader dispatch lag</span><b>{} ms</b></div>\
+         <div class=\"card\"><span class=\"label\">Reader dispatch lag &gt; 1 s</span><b>{}</b></div></div>",
         traffic.messages_sent,
         traffic.messages_received,
         traffic.game_events_received,
         traffic.commands_sent,
         traffic.disconnects,
         traffic.reconnects,
+        dispatch_lag.observations,
+        dispatch_lag.maximum_ms,
+        dispatch_lag.over_one_second,
     );
 
     if !report.ramp_stages.is_empty() {
@@ -1793,6 +1839,11 @@ mod tests {
         first.metrics.guest_auth_ms = Some(10);
         first.metrics.matchmaking_wait_ms = Some(20);
         first.metrics.websocket_rtt_ms = vec![5, 15];
+        first.metrics.websocket_dispatch_lag = WebSocketDispatchLagSummary {
+            observations: 3,
+            maximum_ms: 1_500,
+            over_one_second: 1,
+        };
         first.metrics.websocket_auth_ms = vec![7, 9];
         first.metrics.initial_admission_ready_ms = Some(12);
         first.metrics.reconnect_duration_ms = vec![30];
@@ -1873,6 +1924,11 @@ mod tests {
         second.metrics.guest_auth_ms = Some(20);
         second.metrics.matchmaking_wait_ms = Some(100);
         second.metrics.websocket_rtt_ms = vec![25];
+        second.metrics.websocket_dispatch_lag = WebSocketDispatchLagSummary {
+            observations: 2,
+            maximum_ms: 50,
+            over_one_second: 0,
+        };
         second.metrics.messages_sent = 11;
         second.metrics.command_counts_by_unix_second = BTreeMap::from([(10, 2)]);
         second.metrics.scheduled_command_counts_by_unix_second = BTreeMap::from([(10, 1)]);
@@ -1938,7 +1994,7 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
-        assert_eq!(report.schema_version, 10);
+        assert_eq!(report.schema_version, 11);
         assert_eq!(report.sessions[0].started_at_unix_ms, 0);
         assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
         assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
@@ -1977,6 +2033,14 @@ mod tests {
         assert_eq!(report.metrics.guest_auth_ms.p95_ms, Some(30));
         assert_eq!(report.metrics.matchmaking_wait_ms.p50_ms, Some(60));
         assert_eq!(report.metrics.websocket_rtt_ms.p95_ms, Some(25));
+        assert_eq!(
+            report.metrics.websocket_dispatch_lag,
+            WebSocketDispatchLagSummary {
+                observations: 5,
+                maximum_ms: 1_500,
+                over_one_second: 1,
+            }
+        );
         assert_eq!(report.metrics.websocket_auth_ms.p95_ms, Some(9));
         assert_eq!(report.metrics.initial_admission_ready_ms.p95_ms, Some(12));
         assert_eq!(report.metrics.reconnect_duration_ms.p95_ms, Some(30));
@@ -2050,6 +2114,10 @@ mod tests {
         assert_eq!(
             report_json.pointer("/metrics/slow_command_resolutions/0/gateway_task_boot_id"),
             Some(&serde_json::json!("boot-b"))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/websocket_dispatch_lag/maximum_ms"),
+            Some(&serde_json::json!(1_500))
         );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);

@@ -124,9 +124,11 @@ async fn joining_an_unknown_game_returns_an_explicit_load_failure_and_can_retry(
         .await?;
     client.join_game(missing_game_id).await?;
 
-    let retried_state = receive_snapshot(&mut client).await?;
+    let (retried_state, replayed_outcome_sessions) =
+        receive_terminal_snapshot_and_barrier(&mut client, missing_game_id).await?;
     assert_eq!(retried_state.status, final_state.status);
     assert_eq!(retried_state.tick, final_state.tick);
+    assert_eq!(replayed_outcome_sessions, 0);
 
     client.disconnect().await?;
     env.shutdown().await?;
@@ -172,12 +174,14 @@ async fn joining_a_durably_saved_completed_game_returns_its_final_snapshot() -> 
     client.authenticate(user_id).await?;
     client.join_game(game_id).await?;
 
-    let loaded_state = receive_snapshot(&mut client).await?;
+    let (loaded_state, replayed_outcome_sessions) =
+        receive_terminal_snapshot_and_barrier(&mut client, game_id).await?;
 
     assert_eq!(loaded_state.status, final_state.status);
     assert_eq!(loaded_state.tick, final_state.tick);
     assert_eq!(loaded_state.event_sequence, final_state.event_sequence);
     assert_eq!(loaded_state.scores, final_state.scores);
+    assert_eq!(replayed_outcome_sessions, 0);
 
     client.disconnect().await?;
     env.shutdown().await?;
@@ -227,12 +231,14 @@ async fn completed_game_snapshots_are_denied_to_non_players_in_redis_and_dynamo(
     let mut spectator_client = TestClient::connect(&server_addr).await?;
     spectator_client.authenticate(spectator_user_id).await?;
     spectator_client.join_game(game_id).await?;
-    let spectator_state = receive_snapshot(&mut spectator_client).await?;
+    let (spectator_state, replayed_outcome_sessions) =
+        receive_terminal_snapshot_and_barrier(&mut spectator_client, game_id).await?;
     assert!(
         spectator_state
             .spectators
             .contains(&(spectator_user_id as u32))
     );
+    assert_eq!(replayed_outcome_sessions, 0);
     spectator_client.disconnect().await?;
 
     let mut client = TestClient::connect(&server_addr).await?;
@@ -851,6 +857,57 @@ async fn receive_snapshot(client: &mut TestClient) -> Result<GameState> {
     })
     .await
     .context("timed out waiting for a game snapshot")?
+}
+
+async fn receive_terminal_snapshot_and_barrier(
+    client: &mut TestClient,
+    expected_game_id: u32,
+) -> Result<(GameState, usize)> {
+    timeout(Duration::from_secs(10), async {
+        let mut snapshot = None;
+        let mut replayed_outcome_sessions = 0;
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) if event.game_id == expected_game_id => {
+                    if let GameEvent::Snapshot { game_state } = event.event {
+                        if !matches!(game_state.status, GameStatus::Complete { .. }) {
+                            return Err(anyhow::anyhow!(
+                                "expected terminal snapshot for game {expected_game_id}"
+                            ));
+                        }
+                        snapshot = Some(game_state);
+                    }
+                }
+                WSMessage::CommandOutcomes { game_id, .. } if game_id == expected_game_id => {
+                    if snapshot.is_none() {
+                        return Err(anyhow::anyhow!(
+                            "terminal command outcomes preceded game {expected_game_id} snapshot"
+                        ));
+                    }
+                    replayed_outcome_sessions += 1;
+                }
+                WSMessage::CommandOutcomesComplete { game_id } if game_id == expected_game_id => {
+                    let snapshot = snapshot.context(format!(
+                        "terminal outcome barrier preceded game {expected_game_id} snapshot"
+                    ))?;
+                    return Ok::<_, anyhow::Error>((snapshot, replayed_outcome_sessions));
+                }
+                WSMessage::GameWarming { game_id, .. } if game_id == expected_game_id => {
+                    return Err(anyhow::anyhow!(
+                        "durable terminal game {expected_game_id} remained indefinitely warming"
+                    ));
+                }
+                WSMessage::GameLoadFailed { game_id, reason } if game_id == expected_game_id => {
+                    return Err(anyhow::anyhow!(
+                        "durable terminal game {expected_game_id} failed to load: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for terminal snapshot and outcome barrier")?
 }
 
 async fn receive_snapshot_without_join_failure(

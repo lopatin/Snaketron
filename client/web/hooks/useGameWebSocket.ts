@@ -7,9 +7,11 @@ import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 import {
   clearGameCommandOutbox,
+  completeGameCommandOutboxTerminal,
   enqueueGameCommandV2,
   gameEventTerminatesCommandOutbox,
   gameLoadOutboxAction,
+  markGameCommandOutboxTerminal,
   rejectGameCommandV2,
   recoveryOutcomesReadyForResend,
   reconcileGameCommandOutcomes,
@@ -131,7 +133,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           user &&
           gameEventTerminatesCommandOutbox(event)
         ) {
-          clearGameCommandOutbox(eventGameId, user.id);
+          markGameCommandOutboxTerminal(eventGameId, user.id);
         }
 
         // useGameWebSocket is currently instantiated independently by the global
@@ -417,7 +419,32 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         if (gameId === null) {
           return;
         }
+        const terminalCompletion = user
+          ? completeGameCommandOutboxTerminal(gameId, user.id)
+          : 'not-terminal';
+        if (terminalCompletion === 'pending') {
+          completedOutcomeBarriersRef.current.delete(gameId);
+          console.error(
+            `Terminal outcome barrier for game ${gameId} left pending commands; retaining the parked outbox`,
+          );
+          const requestedGame = requestedGameRef.current;
+          if (requestedGame?.gameId === gameId) {
+            setGameLoadFailure({
+              gameId,
+              requestedGameId: requestedGame.routeGameId,
+              reason:
+                'Game completion did not reconcile every pending command. Your command outbox was retained safely.',
+            });
+          }
+          return;
+        }
         completedOutcomeBarriersRef.current.add(gameId);
+        if (terminalCompletion === 'cleared') {
+          if (requestedGameRef.current?.gameId === gameId) {
+            setGameLoadFailure(null);
+          }
+          return;
+        }
         if (
           user &&
           requestedGameRef.current?.gameId === gameId &&

@@ -317,6 +317,10 @@ async fn run(config: Config) -> Result<()> {
         config.command_profile.to_string(),
     );
     run.metadata.insert(
+        "command_outcome_latency_basis".to_owned(),
+        "original-send-to-dedicated-reader-frame-receipt".to_owned(),
+    );
+    run.metadata.insert(
         "spawn_rate_per_second".to_owned(),
         config.spawn_rate.to_string(),
     );

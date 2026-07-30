@@ -329,17 +329,23 @@ has both active games and pending work, maps that owner to one exact task ARN,
 then performs one non-retried ECS Exec command that finds exactly one non-PID-1
 `server` process and sends that PID SIGKILL directly. One prestarted read-only
 observer uses a single partition-local Lua operation to read the exact
-old-consumer PEL entry and Redis time atomically; a second lightweight observer
-sandwiches membership between assignment/lease reads for coherent ownership
-proof. Its final partition-slot read also records the exact authoritative-event
-stream tail. Both bracket their calls with local start and completion timestamps, and
-the entire selected observation interval must fit inside its deadline. The
+old-consumer PEL entry and Redis time atomically. A second long-lived observer
+first proves the old membership and assignment/lease state, then atomically
+latches the first eligible pre-existing successor and that successor's exact
+authoritative-event stream tail. It continues on the same connection until it
+captures the first later non-replay scheduled output. Both observers bracket
+their calls with local start and completion timestamps, and each selected
+observation interval must fit inside its deadline. The
 proof is anchored to the selected task's millisecond-precision ECS
 `executionStoppedAt`, because ECS Exec output disappears with the container and
 `stoppedAt` may lag the actual exit. An old-consumer PEL entry must be observed
 within two seconds after that exact stop, and the expired member must disappear
 with a pre-existing survivor holding a new fenced lease under a later
 assignment version within five seconds. Exact exit 137 remains mandatory. The
+deadline comparison assumes the certification runner and AWS ECS clocks are
+NTP-synchronized. Each runner-side read is bracketed with a monotonic clock and
+uses a conservative wall-clock interval; Valkey server timestamps are recorded
+for correlation only and are never compared to the ECS timestamp. The
 mutating AWS CLI call has retries disabled and acceptance rejects an explicit
 OOM or unhealthy stop reason. The
 whole-second floor of `executionStoppedAt` is used only as a conservative

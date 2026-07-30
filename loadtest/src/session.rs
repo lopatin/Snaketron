@@ -13,7 +13,7 @@ use common::{
     ClientCommandIdentityV2, Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent,
     GameEventMessage, GameState, GameStatus, GameType, QueueMode, calculate_ai_move,
 };
-use futures_util::{SinkExt, StreamExt, future::join_all};
+use futures_util::{SinkExt, StreamExt, future::join_all, stream::SplitSink};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use server::lobby_manager::LobbyPreferences;
@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{Barrier, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, interval_at};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -32,7 +33,8 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type SocketSink = SplitSink<RawSocket, Message>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -41,6 +43,7 @@ const RECENT_EVENT_LIMIT: usize = 32;
 const GAME_TIMEOUT_MARGIN: Duration = Duration::from_secs(45);
 const PLANNED_HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
 const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ADMISSION_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const POPULATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 // Shared with the executor's bounded exact-outcome window. Browser clients
 // backpressure here, but a fixed certification cohort must fail instead of
@@ -178,6 +181,108 @@ struct PendingCommandResolution {
     resolved_at_unix_ms: u64,
     latency_ms: u64,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct FrameObservation {
+    received_at_unix_ms: u64,
+    received_at: Instant,
+}
+
+impl FrameObservation {
+    fn now() -> Self {
+        Self {
+            received_at_unix_ms: unix_time_ms(),
+            received_at: Instant::now(),
+        }
+    }
+}
+
+struct ObservedFrame {
+    observation: FrameObservation,
+    frame: std::result::Result<Message, WebSocketError>,
+}
+
+/// One continuously polled WebSocket reader plus an independently awaited
+/// sink. This load-generator-only handoff is lossless and unbounded so a
+/// stalled synthetic driver cannot backpressure the transport and contaminate
+/// later frame receipt timestamps. Dropping the session aborts the reader and
+/// releases its queued frames.
+struct Socket {
+    sink: SocketSink,
+    inbound: mpsc::UnboundedReceiver<ObservedFrame>,
+    reader: JoinHandle<()>,
+    last_observation: Option<FrameObservation>,
+}
+
+impl Socket {
+    fn new(raw: RawSocket) -> Self {
+        let (sink, mut stream) = raw.split();
+        let (sender, inbound) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(async move {
+            while let Some(frame) = stream.next().await {
+                let observed = ObservedFrame {
+                    observation: FrameObservation::now(),
+                    frame,
+                };
+                if sender.send(observed).is_err() {
+                    break;
+                }
+                // Poll again immediately. Tungstenite queues automatic Ping and
+                // Close replies while reading and flushes them on the next read,
+                // so control-frame progress does not wait for the game driver.
+            }
+        });
+        Self {
+            sink,
+            inbound,
+            reader,
+            last_observation: None,
+        }
+    }
+
+    async fn send(&mut self, message: Message) -> std::result::Result<(), WebSocketError> {
+        self.sink.send(message).await
+    }
+
+    async fn next(&mut self) -> Option<std::result::Result<Message, WebSocketError>> {
+        let observed = self.inbound.recv().await?;
+        self.last_observation = Some(observed.observation);
+        Some(observed.frame)
+    }
+
+    fn last_observation(&self) -> Option<FrameObservation> {
+        self.last_observation
+    }
+
+    async fn close(&mut self) -> std::result::Result<(), WebSocketError> {
+        let result = self.sink.close().await;
+        self.reader.abort();
+        result
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+#[derive(Debug)]
+struct WebSocketConnectTimeout {
+    timeout: Duration,
+}
+
+impl std::fmt::Display for WebSocketConnectTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "websocket connection attempt timed out after {:?}",
+            self.timeout
+        )
+    }
+}
+
+impl std::error::Error for WebSocketConnectTimeout {}
 
 const SLOW_COMMAND_RESOLUTION_THRESHOLD_MS: u64 = 1_000;
 const MAX_SESSION_SLOW_COMMAND_RESOLUTIONS: usize = 32;
@@ -442,7 +547,7 @@ pub async fn run_match_group(
                             "another member of this deterministic match group failed preparation",
                         );
                     }
-                    let _ = live.socket.close(None).await;
+                    let _ = live.socket.close().await;
                     sessions.push(live.into_record());
                 }
                 Err(record) => sessions.push(record),
@@ -707,7 +812,7 @@ async fn hold_population_session(
             session.fail(phase, format!("{error:#}"));
         }
     }
-    let _ = session.socket.close(None).await;
+    let _ = session.socket.close().await;
     session.into_record()
 }
 
@@ -1033,8 +1138,13 @@ async fn next_pre_game_candidate_message(
             result.map_err(PreGameHandoffAttemptError::Candidate)?
         }
     };
+    let observation = socket.last_observation().ok_or_else(|| {
+        PreGameHandoffAttemptError::Candidate(anyhow!(
+            "candidate text frame was missing its reader receipt timestamp"
+        ))
+    })?;
     session
-        .observe_received_from(&message, task_boot_id, socket_generation)
+        .observe_received_from(&message, task_boot_id, socket_generation, observation)
         .map_err(PreGameHandoffAttemptError::Fatal)?;
     Ok(message)
 }
@@ -1251,11 +1361,17 @@ async fn prepare_pre_game_candidate(
             }
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PreGameHandoffAttemptError::Candidate)?;
+                let observation = socket.last_observation().ok_or_else(|| {
+                    PreGameHandoffAttemptError::Candidate(anyhow!(
+                        "candidate text frame was missing its reader receipt timestamp"
+                    ))
+                })?;
                 session
                     .observe_received_from(
                         &message,
                         Some(&task_boot_id),
                         Some(socket_generation),
+                        observation,
                     )
                     .map_err(PreGameHandoffAttemptError::Fatal)?;
                 match message {
@@ -1403,7 +1519,7 @@ async fn perform_pre_game_planned_handoff(
                     )
                     .with_message("planned pre-game handoff promoted a ready candidate"),
                 );
-                let _ = old_socket.close(None).await;
+                let _ = old_socket.close().await;
                 return Ok(());
             }
             Err(PreGameHandoffAttemptError::Candidate(error)) => {
@@ -1520,9 +1636,10 @@ async fn prepare_session(
     // One admission budget starts at the first connection attempt and ends only
     // after an ordered application pong. A draining task can race Traefik route
     // withdrawal and return HTTP 502/503, while the bounded ingress limiter can
-    // return HTTP 429 during a valid make-before-break burst. Retry only those
-    // transient responses while retaining this session's guest token and
-    // logical identity.
+    // return HTTP 429 during a valid make-before-break burst. A dead TCP route
+    // can also consume an attempt until its transport timeout. Retry those
+    // transient failures while retaining this session's guest token, logical
+    // identity, and original end-to-end admission deadline.
     let admission_started = Instant::now();
     let admission_deadline = tokio::time::Instant::now() + settings.connect_timeout;
     let mut admission_attempts = 0u32;
@@ -1537,6 +1654,7 @@ async fn prepare_session(
             );
             return Err(record);
         }
+        let attempt_timeout = remaining.min(ADMISSION_CONNECT_ATTEMPT_TIMEOUT);
         let connect_result = tokio::select! {
             _ = cancellation.cancelled() => {
                 record.cancel(
@@ -1548,7 +1666,7 @@ async fn prepare_session(
             result = connect_socket(
                 &settings.websocket_url,
                 &settings.origin,
-                remaining,
+                attempt_timeout,
                 &settings.backend_hints,
                 None,
             ) => result,
@@ -1559,7 +1677,7 @@ async fn prepare_session(
                 record.record_lifecycle(
                     SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
                         .with_message(
-                            "transient HTTP 429/502/503 admission response; retrying the same guest token",
+                            "transient WebSocket admission failure; retrying the same guest token",
                         ),
                 );
                 let remaining =
@@ -1569,7 +1687,7 @@ async fn prepare_session(
                         &mut record,
                         SessionPhase::WebSocketConnect,
                         format!(
-                            "transient HTTP admission retries exhausted the bounded budget: {error:#}"
+                            "transient WebSocket admission retries exhausted the bounded budget: {error:#}"
                         ),
                     );
                     return Err(record);
@@ -2305,7 +2423,7 @@ async fn play_session(
             }
         }
     };
-    let _ = session.socket.close(None).await;
+    let _ = session.socket.close().await;
     PlayedSession {
         record: session.into_record(),
         snapshot_user_ids,
@@ -2373,6 +2491,18 @@ async fn play_session_inner(
     let game_deadline = tokio::time::Instant::now() + start_delay + active_game_window;
     let (initial_user_ids, _) = snapshot_identity(game_id, session.user_id, &game_state)?;
     if matches!(&game_state.status, GameStatus::Complete { .. }) {
+        if !session
+            .server_capabilities
+            .contains("command-outcome-barrier-v1")
+        {
+            return Err(anyhow!(
+                "server did not advertise the required terminal command outcome barrier"
+            ));
+        }
+        wait_for_command_outcome_barrier(session, game_id, settings.connect_timeout, cancellation)
+            .await
+            .map_err(SnapshotWaitError::into_anyhow)?;
+        session.validate_terminal_outcome_barrier(game_id)?;
         session.record.metrics.game_duration_ms = Some(0);
         session.record.complete(unix_time_ms());
         return Ok(initial_user_ids);
@@ -2393,6 +2523,7 @@ async fn play_session_inner(
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut warmup = PlayingWarmupState::default();
+    let mut terminal_state_observed = false;
 
     loop {
         tokio::select! {
@@ -2401,31 +2532,42 @@ async fn play_session_inner(
                 return Ok(runtime.snapshot_user_ids.clone());
             }
             _ = tokio::time::sleep_until(game_deadline) => {
-                if timeboxed_untimed_game {
-                    let previous_ping = runtime
-                        .outstanding_ping
-                        .as_ref()
-                        .map(|(client_time, _)| *client_time);
-                    leave_game_and_confirm(
-                        session,
-                        previous_ping,
-                        settings.connect_timeout,
-                        cancellation,
-                    )
-                    .await
-                    .context("leaving a successfully timeboxed untimed game")?;
-                    let finished_at = unix_time_ms();
-                    session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
-                    session.record.diagnostics.insert(
-                        "completion_kind".to_owned(),
-                        "timeboxed".to_owned(),
-                    );
-                    session.record.record_lifecycle(
-                        SessionLifecycleRecord::new(SessionPhase::Cleanup, finished_at)
-                            .with_message("configured untimed play window completed"),
-                    );
-                    session.record.complete(finished_at);
-                    return Ok(runtime.snapshot_user_ids.clone());
+                match game_deadline_disposition(
+                    timeboxed_untimed_game,
+                    terminal_state_observed,
+                ) {
+                    GameDeadlineDisposition::MissingTerminalOutcomeBarrier => {
+                        return Err(anyhow!(
+                            "game {game_id} reached its deadline after terminal state but before the paired command outcome barrier"
+                        ));
+                    }
+                    GameDeadlineDisposition::CompleteTimebox => {
+                        let previous_ping = runtime
+                            .outstanding_ping
+                            .as_ref()
+                            .map(|(client_time, _)| *client_time);
+                        leave_game_and_confirm(
+                            session,
+                            previous_ping,
+                            settings.connect_timeout,
+                            cancellation,
+                        )
+                        .await
+                        .context("leaving a successfully timeboxed untimed game")?;
+                        let finished_at = unix_time_ms();
+                        session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
+                        session.record.diagnostics.insert(
+                            "completion_kind".to_owned(),
+                            "timeboxed".to_owned(),
+                        );
+                        session.record.record_lifecycle(
+                            SessionLifecycleRecord::new(SessionPhase::Cleanup, finished_at)
+                                .with_message("configured untimed play window completed"),
+                        );
+                        session.record.complete(finished_at);
+                        return Ok(runtime.snapshot_user_ids.clone());
+                    }
+                    GameDeadlineDisposition::AuthoritativeTimeout => {}
                 }
                 return Err(anyhow!("game {game_id} exceeded its authoritative time limit plus margin"));
             }
@@ -2457,7 +2599,9 @@ async fn play_session_inner(
                     }
                 }
             }
-            _ = runtime.ai_interval.tick(), if !warmup.commands_paused() => {
+            _ = runtime.ai_interval.tick(),
+                if !warmup.commands_paused() && !terminal_state_observed =>
+            {
                 match drive_ai(
                     session,
                     &mut runtime.engine,
@@ -2572,11 +2716,9 @@ async fn play_session_inner(
                                     session.clock_offset_ms,
                                 )?;
                                 if snapshot_complete {
-                                    session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
-                                    session.record.complete(unix_time_ms());
-                                    return Ok(runtime.snapshot_user_ids.clone());
+                                    terminal_state_observed = true;
                                 }
-                                if warmup.observe_snapshot() {
+                                if warmup.observe_snapshot() && !snapshot_complete {
                                     session
                                         .resend_pending_commands(game_id)
                                         .await
@@ -2587,9 +2729,7 @@ async fn play_session_inner(
                             }
                             GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
                                 runtime.engine.process_server_event(&event)?;
-                                session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
-                                session.record.complete(unix_time_ms());
-                                return Ok(runtime.snapshot_user_ids.clone());
+                                terminal_state_observed = true;
                             }
                             _ => runtime.engine.process_server_event(&event)?,
                         }
@@ -2597,6 +2737,12 @@ async fn play_session_inner(
                     WSMessage::CommandOutcomesComplete { game_id: completed }
                         if completed == game_id =>
                     {
+                        if terminal_state_observed {
+                            session.validate_terminal_outcome_barrier(game_id)?;
+                            session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
+                            session.record.complete(unix_time_ms());
+                            return Ok(runtime.snapshot_user_ids.clone());
+                        }
                         if warmup.observe_outcome_barrier() {
                             session
                                 .resend_pending_commands(game_id)
@@ -2673,6 +2819,26 @@ fn configured_game_window(
             false,
         ),
         None => (untimed_play_duration, true),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameDeadlineDisposition {
+    CompleteTimebox,
+    MissingTerminalOutcomeBarrier,
+    AuthoritativeTimeout,
+}
+
+fn game_deadline_disposition(
+    timeboxed_untimed_game: bool,
+    terminal_state_observed: bool,
+) -> GameDeadlineDisposition {
+    if terminal_state_observed {
+        GameDeadlineDisposition::MissingTerminalOutcomeBarrier
+    } else if timeboxed_untimed_game {
+        GameDeadlineDisposition::CompleteTimebox
+    } else {
+        GameDeadlineDisposition::AuthoritativeTimeout
     }
 }
 
@@ -2911,16 +3077,19 @@ async fn wait_for_recovered_game_ready(
     let snapshot_started = Instant::now();
     let game_state = wait_for_game_snapshot(session, game_id, timeout, cancellation).await?;
     let snapshot_ms = elapsed_ms(snapshot_started);
-    if !matches!(game_state.status, GameStatus::Complete { .. }) {
-        if !session
-            .server_capabilities
-            .contains("command-outcome-barrier-v1")
-        {
-            return Err(SnapshotWaitError::Fatal(anyhow!(
-                "server did not advertise the required command outcome barrier"
-            )));
-        }
-        wait_for_command_outcome_barrier(session, game_id, timeout, cancellation).await?;
+    if !session
+        .server_capabilities
+        .contains("command-outcome-barrier-v1")
+    {
+        return Err(SnapshotWaitError::Fatal(anyhow!(
+            "server did not advertise the required command outcome barrier"
+        )));
+    }
+    wait_for_command_outcome_barrier(session, game_id, timeout, cancellation).await?;
+    if matches!(game_state.status, GameStatus::Complete { .. }) {
+        session
+            .validate_terminal_outcome_barrier(game_id)
+            .map_err(SnapshotWaitError::Fatal)?;
     }
     Ok((game_state, snapshot_ms))
 }
@@ -3076,7 +3245,40 @@ enum PlannedHandoffAttemptError {
 enum ActiveHandoffObservation {
     Continue,
     Pong(i64),
-    GameComplete,
+    TerminalState,
+    OutcomeBarrier,
+}
+
+fn observe_candidate_event_outcome_frontier(
+    event: &GameEvent,
+    terminal_state_observed: &mut bool,
+    outcomes_ready: &mut bool,
+) -> bool {
+    let terminal = matches!(
+        event,
+        GameEvent::Snapshot { game_state }
+            if matches!(game_state.status, GameStatus::Complete { .. })
+    ) || matches!(
+        event,
+        GameEvent::StatusUpdated {
+            status: GameStatus::Complete { .. },
+        }
+    );
+    let invalidates_outcomes = terminal || matches!(event, GameEvent::Snapshot { .. });
+    if terminal {
+        *terminal_state_observed = true;
+    }
+    if invalidates_outcomes {
+        *outcomes_ready = false;
+    }
+    invalidates_outcomes
+}
+
+fn candidate_covers_active_terminal_frontier(
+    active_terminal_state_observed: bool,
+    candidate_terminal_state_observed: bool,
+) -> bool {
+    !active_terminal_state_observed || candidate_terminal_state_observed
 }
 
 async fn send_candidate_message(
@@ -3146,17 +3348,20 @@ fn process_active_handoff_message(
                     // duplicate suppression across atomic promotion.
                     runtime.engine.process_server_event(&event)?;
                     if complete {
-                        return Ok(ActiveHandoffObservation::GameComplete);
+                        return Ok(ActiveHandoffObservation::TerminalState);
                     }
                 }
                 GameEvent::StatusUpdated {
                     status: GameStatus::Complete { .. },
                 } => {
                     runtime.engine.process_server_event(&event)?;
-                    return Ok(ActiveHandoffObservation::GameComplete);
+                    return Ok(ActiveHandoffObservation::TerminalState);
                 }
                 _ => runtime.engine.process_server_event(&event)?,
             }
+        }
+        WSMessage::CommandOutcomesComplete { game_id: completed } if completed == game_id => {
+            return Ok(ActiveHandoffObservation::OutcomeBarrier);
         }
         WSMessage::GameLoadFailed {
             game_id: failed,
@@ -3207,6 +3412,10 @@ async fn prepare_planned_candidate(
         sticky_cookie.as_deref(),
     );
     tokio::pin!(connect);
+    let mut active_terminal_state_observed = matches!(
+        runtime.engine.committed_state().status,
+        GameStatus::Complete { .. }
+    );
     let connect_result = loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
@@ -3229,14 +3438,23 @@ async fn prepare_planned_candidate(
                 )
                 .map_err(PlannedHandoffAttemptError::Active)?
                 {
-                    ActiveHandoffObservation::GameComplete => {
+                    ActiveHandoffObservation::TerminalState => {
+                        active_terminal_state_observed = true;
+                    }
+                    ActiveHandoffObservation::OutcomeBarrier
+                        if active_terminal_state_observed =>
+                    {
+                        session
+                            .validate_terminal_outcome_barrier(game_id)
+                            .map_err(PlannedHandoffAttemptError::Fatal)?;
                         return Err(PlannedHandoffAttemptError::GameComplete);
                     }
                     ActiveHandoffObservation::Continue
-                    | ActiveHandoffObservation::Pong(_) => {}
+                    | ActiveHandoffObservation::Pong(_)
+                    | ActiveHandoffObservation::OutcomeBarrier => {}
                 }
             }
-            _ = runtime.ai_interval.tick() => {
+            _ = runtime.ai_interval.tick(), if !active_terminal_state_observed => {
                 match drive_ai(
                     session,
                     &mut runtime.engine,
@@ -3296,10 +3514,24 @@ async fn prepare_planned_candidate(
         let required_watermark = promotion_frontier.unwrap_or(*active_watermark);
         let candidate_is_ready = authenticated
             && lobby_ready
-            && (snapshot_terminal || outcomes_ready)
+            && outcomes_ready
+            // A continuity Pong freezes the ordinary frontier, but terminal
+            // state observed later on the old stream cannot be truncated at
+            // that earlier watermark. Keep the old socket until either its
+            // paired barrier completes the game or the candidate observes the
+            // same terminal frontier and its following barrier.
+            && candidate_covers_active_terminal_frontier(
+                active_terminal_state_observed,
+                snapshot_terminal,
+            )
             && (snapshot_terminal || candidate_watermark.unwrap_or(0) >= required_watermark)
             && snapshot.is_some();
         if candidate_is_ready {
+            if snapshot_terminal {
+                session
+                    .validate_terminal_outcome_barrier(game_id)
+                    .map_err(PlannedHandoffAttemptError::Fatal)?;
+            }
             let ready_at = *candidate_ready_at.get_or_insert_with(Instant::now);
             if continuity_probe_client_time.is_none() {
                 // Do not infer continuity merely because neither socket has
@@ -3369,7 +3601,15 @@ async fn prepare_planned_candidate(
                 )
                 .map_err(PlannedHandoffAttemptError::Active)?
                 {
-                    ActiveHandoffObservation::GameComplete => {
+                    ActiveHandoffObservation::TerminalState => {
+                        active_terminal_state_observed = true;
+                    }
+                    ActiveHandoffObservation::OutcomeBarrier
+                        if active_terminal_state_observed =>
+                    {
+                        session
+                            .validate_terminal_outcome_barrier(game_id)
+                            .map_err(PlannedHandoffAttemptError::Fatal)?;
                         return Err(PlannedHandoffAttemptError::GameComplete);
                     }
                     ActiveHandoffObservation::Pong(client_time)
@@ -3383,10 +3623,11 @@ async fn prepare_planned_candidate(
                         promotion_frontier = Some(*active_watermark);
                     }
                     ActiveHandoffObservation::Continue
-                    | ActiveHandoffObservation::Pong(_) => {}
+                    | ActiveHandoffObservation::Pong(_)
+                    | ActiveHandoffObservation::OutcomeBarrier => {}
                 }
             }
-            _ = runtime.ai_interval.tick() => {
+            _ = runtime.ai_interval.tick(), if !active_terminal_state_observed => {
                 match drive_ai(
                     session,
                     &mut runtime.engine,
@@ -3423,11 +3664,17 @@ async fn prepare_planned_candidate(
             }
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PlannedHandoffAttemptError::Candidate)?;
+                let observation = socket.last_observation().ok_or_else(|| {
+                    PlannedHandoffAttemptError::Candidate(anyhow!(
+                        "candidate text frame was missing its reader receipt timestamp"
+                    ))
+                })?;
                 session
                     .observe_received_from(
                         &message,
                         authenticated.then_some(task_boot_id.as_str()),
                         authenticated.then_some(socket_generation),
+                        observation,
                     )
                     .map_err(PlannedHandoffAttemptError::Fatal)?;
                 match message {
@@ -3494,19 +3741,22 @@ async fn prepare_planned_candidate(
                             .metrics
                             .game_events_received
                             .saturating_add(1);
-                        if let GameEvent::Snapshot { game_state } = &event.event {
+                        if observe_candidate_event_outcome_frontier(
+                            &event.event,
+                            &mut snapshot_terminal,
+                            &mut outcomes_ready,
+                        ) {
+                            outcome_barrier_observed = false;
+                        }
+                        if let GameEvent::Snapshot { .. } = &event.event {
                             game_join_retry_at = None;
-                            snapshot_terminal = matches!(game_state.status, GameStatus::Complete { .. });
                             snapshot = Some(event.clone());
                             candidate_watermark = Some(event.stream_seq);
                             buffered_events.clear();
                             snapshot_rejoin_ms = snapshot_started.map(elapsed_ms);
-                            if !snapshot_terminal {
-                                // The server follows every live snapshot with
-                                // outcomes from the same recovery envelope. A
-                                // takeover snapshot invalidates an older barrier.
-                                outcomes_ready = false;
-                            }
+                            // Every snapshot, including terminal recovery,
+                            // invalidates an older barrier. Promotion waits for
+                            // the durable outcomes that follow this snapshot.
                         } else if let Some(watermark) = candidate_watermark {
                             if event.stream_seq == 0 || event.stream_seq == watermark.saturating_add(1) {
                                 if event.stream_seq > 0 {
@@ -3625,6 +3875,11 @@ fn record_planned_terminal_completion(
         .record
         .metrics
         .planned_handoff_terminal_completions
+        .saturating_add(1);
+    session.record.metrics.planned_handoff_outcome_barriers = session
+        .record
+        .metrics
+        .planned_handoff_outcome_barriers
         .saturating_add(1);
     session
         .record
@@ -3765,7 +4020,8 @@ async fn perform_planned_handoff(
                         .metrics
                         .planned_handoff_terminal_completions
                         .saturating_add(1);
-                } else if candidate.outcome_barrier_observed {
+                }
+                if candidate.outcome_barrier_observed {
                     session.record.metrics.planned_handoff_outcome_barriers = session
                         .record
                         .metrics
@@ -3809,7 +4065,7 @@ async fn perform_planned_handoff(
                             "planned handoff promoted a fully synchronized candidate"
                         }),
                 );
-                let _ = old_socket.close(None).await;
+                let _ = old_socket.close().await;
                 if !handoff_complete {
                     session
                         .resend_pending_commands(game_id)
@@ -3862,7 +4118,18 @@ async fn perform_planned_handoff(
                                 &mut active_watermark,
                                 message,
                             ) {
-                                Ok(ActiveHandoffObservation::GameComplete) => {
+                                Ok(ActiveHandoffObservation::OutcomeBarrier)
+                                    if matches!(
+                                        runtime.engine.committed_state().status,
+                                        GameStatus::Complete { .. }
+                                    ) =>
+                                {
+                                    if let Err(error) =
+                                        session.validate_terminal_outcome_barrier(game_id)
+                                    {
+                                        record_planned_handoff_failure(session, started, &error);
+                                        return Err(error);
+                                    }
                                     record_planned_terminal_completion(
                                         session,
                                         started,
@@ -3871,14 +4138,21 @@ async fn perform_planned_handoff(
                                     return Ok(true);
                                 }
                                 Ok(ActiveHandoffObservation::Continue)
-                                | Ok(ActiveHandoffObservation::Pong(_)) => {}
+                                | Ok(ActiveHandoffObservation::Pong(_))
+                                | Ok(ActiveHandoffObservation::TerminalState)
+                                | Ok(ActiveHandoffObservation::OutcomeBarrier) => {}
                                 Err(error) => {
                                     record_planned_handoff_failure(session, started, &error);
                                     return Err(error);
                                 }
                             }
                         }
-                        _ = runtime.ai_interval.tick() => {
+                        _ = runtime.ai_interval.tick(),
+                            if !matches!(
+                                runtime.engine.committed_state().status,
+                                GameStatus::Complete { .. }
+                            ) =>
+                        {
                             match drive_ai(
                                 session,
                                 &mut runtime.engine,
@@ -4181,11 +4455,16 @@ fn record_pending_command_resolution(
     pending_commands: &mut BTreeMap<u64, PendingCommand>,
     metrics: &mut SessionMetrics,
     sequence: u64,
+    observation: FrameObservation,
 ) -> Option<PendingCommandResolution> {
+    let pending = pending_commands.get(&sequence)?;
+    if observation.received_at < pending.sent_at {
+        return None;
+    }
     let command = pending_commands.remove(&sequence)?;
     let sent_second = command.sent_at_unix_ms / 1_000;
-    let latency_ms = elapsed_ms(command.sent_at);
-    let resolved_at_unix_ms = unix_time_ms();
+    let latency_ms = duration_between_ms(observation.received_at, command.sent_at);
+    let resolved_at_unix_ms = observation.received_at_unix_ms;
     let count = metrics
         .command_outcome_counts_by_sent_unix_second
         .entry(sent_second)
@@ -4208,8 +4487,10 @@ fn record_scheduled_pending_command_resolution(
     pending_commands: &mut BTreeMap<u64, PendingCommand>,
     metrics: &mut SessionMetrics,
     sequence: u64,
+    observation: FrameObservation,
 ) -> Option<PendingCommandResolution> {
-    let resolution = record_pending_command_resolution(pending_commands, metrics, sequence)?;
+    let resolution =
+        record_pending_command_resolution(pending_commands, metrics, sequence, observation)?;
     let total = metrics
         .scheduled_command_counts_by_sent_unix_second
         .entry(resolution.sent_second)
@@ -4311,21 +4592,28 @@ impl LiveSession {
         game_id: u32,
         sequence: u64,
         source: CommandResolutionSource,
-        scheduled: bool,
         gateway_task_boot_id: Option<&str>,
         socket_generation: Option<u64>,
+        observation: FrameObservation,
     ) -> bool {
+        let scheduled = matches!(
+            source,
+            CommandResolutionSource::LiveScheduledEvent
+                | CommandResolutionSource::RecoveryScheduledOutcome
+        );
         let resolution = if scheduled {
             record_scheduled_pending_command_resolution(
                 &mut self.pending_commands,
                 &mut self.record.metrics,
                 sequence,
+                observation,
             )
         } else {
             record_pending_command_resolution(
                 &mut self.pending_commands,
                 &mut self.record.metrics,
                 sequence,
+                observation,
             )
         };
         let Some(resolution) = resolution else {
@@ -4358,6 +4646,7 @@ impl LiveSession {
         outcomes: &BTreeMap<u64, CommandOutcome>,
         gateway_task_boot_id: Option<&str>,
         socket_generation: Option<u64>,
+        observation: FrameObservation,
     ) {
         let resolved = self
             .pending_commands
@@ -4366,22 +4655,22 @@ impl LiveSession {
             .filter(|sequence| *sequence <= contiguous_through || outcomes.contains_key(sequence))
             .collect::<Vec<_>>();
         for sequence in resolved {
-            let (source, scheduled) = match outcomes.get(&sequence) {
+            let source = match outcomes.get(&sequence) {
                 Some(CommandOutcome::Scheduled { .. }) => {
-                    (CommandResolutionSource::RecoveryScheduledOutcome, true)
+                    CommandResolutionSource::RecoveryScheduledOutcome
                 }
                 Some(CommandOutcome::Rejected { .. }) => {
-                    (CommandResolutionSource::RecoveryRejectedOutcome, false)
+                    CommandResolutionSource::RecoveryRejectedOutcome
                 }
-                None => (CommandResolutionSource::RecoveryContiguousOutcome, false),
+                None => CommandResolutionSource::RecoveryContiguousOutcome,
             };
             self.record_command_resolution(
                 game_id,
                 sequence,
                 source,
-                scheduled,
                 gateway_task_boot_id,
                 socket_generation,
+                observation,
             );
         }
     }
@@ -4453,6 +4742,16 @@ impl LiveSession {
         Ok(())
     }
 
+    fn validate_terminal_outcome_barrier(&self, game_id: u32) -> Result<()> {
+        if self.pending_commands.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "terminal game {game_id} outcome barrier left {} commands unresolved",
+            self.pending_commands.len()
+        ))
+    }
+
     async fn send(&mut self, message: WSMessage) -> Result<()> {
         let kind = message_kind(&message);
         let payload = serde_json::to_string(&message)?;
@@ -4466,50 +4765,35 @@ impl LiveSession {
         self.remember(format!("sent:{kind}"));
     }
 
-    fn record_terminal_game_resolutions(
-        &mut self,
-        gateway_task_boot_id: Option<&str>,
-        socket_generation: Option<u64>,
-    ) {
-        let Some(game_id) = self.record.game_id else {
-            return;
-        };
-        let sequences = self.pending_commands.keys().copied().collect::<Vec<_>>();
-        for sequence in sequences {
-            self.record_command_resolution(
-                game_id,
-                sequence,
-                CommandResolutionSource::TerminalGameState,
-                false,
-                gateway_task_boot_id,
-                socket_generation,
-            );
-        }
-    }
-
     fn record_scheduled_command_resolution(
         &mut self,
         game_id: u32,
         sequence: u64,
         gateway_task_boot_id: Option<&str>,
         socket_generation: Option<u64>,
+        observation: FrameObservation,
     ) -> bool {
         self.record_command_resolution(
             game_id,
             sequence,
             CommandResolutionSource::LiveScheduledEvent,
-            true,
             gateway_task_boot_id,
             socket_generation,
+            observation,
         )
     }
 
-    fn observe_received(&mut self, message: &WSMessage) -> Result<()> {
+    fn observe_received(
+        &mut self,
+        message: &WSMessage,
+        observation: FrameObservation,
+    ) -> Result<()> {
         let gateway_task_boot_id = self.current_task_boot_id.clone();
         self.observe_received_from(
             message,
             gateway_task_boot_id.as_deref(),
             self.current_socket_generation,
+            observation,
         )
     }
 
@@ -4518,7 +4802,12 @@ impl LiveSession {
         message: &WSMessage,
         gateway_task_boot_id: Option<&str>,
         socket_generation: Option<u64>,
+        observation: FrameObservation,
     ) -> Result<()> {
+        self.record
+            .metrics
+            .websocket_dispatch_lag
+            .observe(duration_between_ms(Instant::now(), observation.received_at));
         if let Some((source, from_sequence)) =
             rejection_fence_for_current_session(message, self.user_id, &self.client_game_session_id)
         {
@@ -4532,7 +4821,7 @@ impl LiveSession {
             self.record
                 .diagnostics
                 .entry("first_game_event_at_unix_ms".to_owned())
-                .or_insert_with(|| unix_time_ms().to_string());
+                .or_insert_with(|| observation.received_at_unix_ms.to_string());
         }
         if matches!(message, WSMessage::CommandOutcomesComplete { .. }) {
             self.record.metrics.command_outcome_barriers_received = self
@@ -4556,50 +4845,42 @@ impl LiveSession {
             self.pending_match_game_id = Some(*game_id);
         }
         match message {
-            WSMessage::GameEvent(event) => {
-                if terminal_event_completes_current_game(
-                    self.record.game_id,
-                    event.game_id,
-                    &event.event,
-                ) {
-                    self.record_terminal_game_resolutions(gateway_task_boot_id, socket_generation);
-                }
-                match &event.event {
-                    GameEvent::CommandScheduledV2 { command_id, .. }
-                        if command_id.user_id == self.user_id
-                            && command_id.client_game_session_id == self.client_game_session_id =>
-                    {
-                        if self.record_scheduled_command_resolution(
-                            command_id.game_id,
-                            command_id.sequence,
-                            gateway_task_boot_id,
-                            socket_generation,
-                        ) {
-                            let received_total = self
-                                .record
-                                .metrics
-                                .scheduled_command_counts_by_unix_second
-                                .entry(unix_time_ms() / 1_000)
-                                .or_default();
-                            *received_total = received_total.saturating_add(1);
-                        }
+            WSMessage::GameEvent(event) => match &event.event {
+                GameEvent::CommandScheduledV2 { command_id, .. }
+                    if command_id.user_id == self.user_id
+                        && command_id.client_game_session_id == self.client_game_session_id =>
+                {
+                    if self.record_scheduled_command_resolution(
+                        command_id.game_id,
+                        command_id.sequence,
+                        gateway_task_boot_id,
+                        socket_generation,
+                        observation,
+                    ) {
+                        let received_total = self
+                            .record
+                            .metrics
+                            .scheduled_command_counts_by_unix_second
+                            .entry(observation.received_at_unix_ms / 1_000)
+                            .or_default();
+                        *received_total = received_total.saturating_add(1);
                     }
-                    GameEvent::CommandRejected { command_id, .. }
-                        if command_id.user_id == self.user_id
-                            && command_id.client_game_session_id == self.client_game_session_id =>
-                    {
-                        self.record_command_resolution(
-                            command_id.game_id,
-                            command_id.sequence,
-                            CommandResolutionSource::LiveRejectedEvent,
-                            false,
-                            gateway_task_boot_id,
-                            socket_generation,
-                        );
-                    }
-                    _ => {}
                 }
-            }
+                GameEvent::CommandRejected { command_id, .. }
+                    if command_id.user_id == self.user_id
+                        && command_id.client_game_session_id == self.client_game_session_id =>
+                {
+                    self.record_command_resolution(
+                        command_id.game_id,
+                        command_id.sequence,
+                        CommandResolutionSource::LiveRejectedEvent,
+                        gateway_task_boot_id,
+                        socket_generation,
+                        observation,
+                    );
+                }
+                _ => {}
+            },
             WSMessage::CommandOutcomes {
                 game_id,
                 client_game_session_id,
@@ -4613,6 +4894,7 @@ impl LiveSession {
                     outcomes,
                     gateway_task_boot_id,
                     socket_generation,
+                    observation,
                 );
             }
             _ => {}
@@ -4643,12 +4925,14 @@ impl LiveSession {
                     let message: WSMessage = serde_json::from_str(&text).with_context(|| {
                         format!("unrecognized websocket payload ({} bytes)", text.len())
                     })?;
-                    self.observe_received(&message)?;
+                    let observation = self
+                        .socket
+                        .last_observation()
+                        .context("text frame was missing its reader receipt timestamp")?;
+                    self.observe_received(&message, observation)?;
                     return Ok(message);
                 }
-                Message::Ping(payload) => {
-                    self.socket.send(Message::Pong(payload)).await?;
-                }
+                Message::Ping(payload) => self.socket.send(Message::Pong(payload)).await?,
                 Message::Close(frame) => {
                     return Err(anyhow!("websocket closed: {frame:?}"));
                 }
@@ -4851,21 +5135,6 @@ impl LiveSession {
     }
 }
 
-fn terminal_event_completes_current_game(
-    current_game_id: Option<u32>,
-    event_game_id: u32,
-    event: &GameEvent,
-) -> bool {
-    let status = match event {
-        GameEvent::Snapshot { game_state } => &game_state.status,
-        GameEvent::StatusUpdated { status } => status,
-        _ => return false,
-    };
-    // Terminal authoritative state makes every unresolved command for this
-    // game a definitive no-op, including after reconnect snapshot replay.
-    current_game_id == Some(event_game_id) && matches!(status, GameStatus::Complete { .. })
-}
-
 async fn create_guest(
     client: &Client,
     api_origin: &Url,
@@ -4906,7 +5175,7 @@ async fn connect_socket(
     let request = websocket_request(websocket_url, origin, sticky_cookie)?;
     let (socket, response) = tokio::time::timeout(timeout, connect_async(request))
         .await
-        .map_err(|_| anyhow!("websocket connection timed out after {timeout:?}"))??;
+        .map_err(|_| WebSocketConnectTimeout { timeout })??;
     let sticky_cookie = response
         .headers()
         .get_all("set-cookie")
@@ -4918,20 +5187,22 @@ async fn connect_socket(
         .as_deref()
         .and_then(|raw| backend_hints.observe_sticky_value(raw))
         .map(|hint| hint.identifier);
-    Ok((socket, backend, sticky_cookie))
+    Ok((Socket::new(socket), backend, sticky_cookie))
 }
 
 fn is_retryable_websocket_admission(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.downcast_ref::<WebSocketError>().is_some_and(|error| {
-            matches!(error, WebSocketError::Http(response)
-            if matches!(
-                response.status(),
-                StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::SERVICE_UNAVAILABLE
-            ))
-        })
+        cause.is::<WebSocketConnectTimeout>()
+            || cause.downcast_ref::<WebSocketError>().is_some_and(|error| {
+                matches!(error, WebSocketError::Io(_))
+                    || matches!(error, WebSocketError::Http(response)
+                    if matches!(
+                        response.status(),
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                    ))
+            })
     })
 }
 
@@ -5063,7 +5334,7 @@ async fn fail_and_close_all(
 ) -> Vec<SessionRecord> {
     join_all(sessions.into_iter().map(|mut session| async move {
         session.fail(phase, message);
-        let _ = session.socket.close(None).await;
+        let _ = session.socket.close().await;
         session.into_record()
     }))
     .await
@@ -5072,7 +5343,7 @@ async fn fail_and_close_all(
 async fn cancel_and_close_all(sessions: Vec<LiveSession>, reason: &str) -> Vec<SessionRecord> {
     join_all(sessions.into_iter().map(|mut session| async move {
         session.record.cancel(unix_time_ms(), reason);
-        let _ = session.socket.close(None).await;
+        let _ = session.socket.close().await;
         session.into_record()
     }))
     .await
@@ -5171,7 +5442,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_transient_websocket_http_statuses_are_retryable_admission() {
+    fn only_transient_websocket_failures_are_retryable_admission() {
+        let timeout = anyhow::Error::new(WebSocketConnectTimeout {
+            timeout: ADMISSION_CONNECT_ATTEMPT_TIMEOUT,
+        });
+        assert!(is_retryable_websocket_admission(&timeout));
+
+        let io = anyhow::Error::new(WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        )));
+        assert!(is_retryable_websocket_admission(&io));
+
         let unavailable = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(None)
@@ -5236,47 +5518,7 @@ mod tests {
     }
 
     #[test]
-    fn only_current_game_terminal_events_resolve_pending_commands() {
-        let nonterminal = GameEvent::Snapshot {
-            game_state: duel_snapshot(&[7, 8]),
-        };
-        assert!(!terminal_event_completes_current_game(
-            Some(42),
-            42,
-            &nonterminal
-        ));
-
-        let terminal_status = GameEvent::StatusUpdated {
-            status: GameStatus::Complete {
-                winning_snake_id: None,
-            },
-        };
-        assert!(!terminal_event_completes_current_game(
-            Some(42),
-            99,
-            &terminal_status
-        ));
-        assert!(terminal_event_completes_current_game(
-            Some(42),
-            42,
-            &terminal_status
-        ));
-
-        let mut terminal_snapshot = duel_snapshot(&[7, 8]);
-        terminal_snapshot.status = GameStatus::Complete {
-            winning_snake_id: None,
-        };
-        assert!(terminal_event_completes_current_game(
-            Some(42),
-            42,
-            &GameEvent::Snapshot {
-                game_state: terminal_snapshot,
-            },
-        ));
-    }
-
-    #[test]
-    fn command_resolution_is_exactly_once_and_terminal_bulk_drains_remaining() {
+    fn command_resolution_is_exactly_once_for_scheduled_and_recovered_outcomes() {
         use common::CommandId;
 
         let message = GameCommandMessage {
@@ -5321,14 +5563,28 @@ mod tests {
             ),
         ]);
         let mut metrics = SessionMetrics::default();
+        let observation = FrameObservation {
+            received_at_unix_ms: 123_461,
+            received_at: sent_at + Duration::from_millis(5),
+        };
 
         assert!(
-            record_scheduled_pending_command_resolution(&mut pending_commands, &mut metrics, 1,)
-                .is_some()
+            record_scheduled_pending_command_resolution(
+                &mut pending_commands,
+                &mut metrics,
+                1,
+                observation,
+            )
+            .is_some()
         );
         assert!(
-            record_scheduled_pending_command_resolution(&mut pending_commands, &mut metrics, 1,)
-                .is_none()
+            record_scheduled_pending_command_resolution(
+                &mut pending_commands,
+                &mut metrics,
+                1,
+                observation,
+            )
+            .is_none()
         );
         assert_eq!(
             metrics.command_outcome_counts_by_sent_unix_second,
@@ -5340,17 +5596,30 @@ mod tests {
         );
 
         for sequence in [2, 3] {
-            record_pending_command_resolution(&mut pending_commands, &mut metrics, sequence);
+            record_pending_command_resolution(
+                &mut pending_commands,
+                &mut metrics,
+                sequence,
+                observation,
+            );
         }
         for sequence in [2, 3] {
-            record_pending_command_resolution(&mut pending_commands, &mut metrics, sequence);
+            record_pending_command_resolution(
+                &mut pending_commands,
+                &mut metrics,
+                sequence,
+                observation,
+            );
         }
         assert!(pending_commands.is_empty());
         assert_eq!(
             metrics.command_outcome_counts_by_sent_unix_second,
             BTreeMap::from([(123, 3)])
         );
-        assert!(metrics.command_outcome_max_latency_ms_by_sent_unix_second[&123] >= 5);
+        assert_eq!(
+            metrics.command_outcome_max_latency_ms_by_sent_unix_second[&123],
+            5
+        );
     }
 
     #[test]
@@ -5427,6 +5696,64 @@ mod tests {
             sent_at_unix_ms: 123_456,
             sent_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn command_resolution_uses_reader_receipt_instead_of_late_driver_time() {
+        let sent_at = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let mut command = pending_command(1);
+        command.sent_at = sent_at;
+        command.sent_at_unix_ms = 10_000;
+        let mut pending = BTreeMap::from([(1, command)]);
+        let mut metrics = SessionMetrics::default();
+        let observation = FrameObservation {
+            received_at_unix_ms: 10_125,
+            received_at: sent_at + Duration::from_millis(125),
+        };
+
+        let resolution =
+            record_pending_command_resolution(&mut pending, &mut metrics, 1, observation).unwrap();
+
+        assert_eq!(resolution.latency_ms, 125);
+        assert_eq!(resolution.resolved_at_unix_ms, 10_125);
+        assert!(
+            elapsed_ms(sent_at) >= 2_000,
+            "the test must exercise a driver that observes the outcome much later"
+        );
+    }
+
+    #[test]
+    fn observation_received_before_send_cannot_resolve_a_pending_command() {
+        let sent_at = Instant::now();
+        let mut command = pending_command(1);
+        command.sent_at = sent_at;
+        let mut pending = BTreeMap::from([(1, command)]);
+        let mut metrics = SessionMetrics::default();
+        let stale_observation = FrameObservation {
+            received_at_unix_ms: 123_455,
+            received_at: sent_at.checked_sub(Duration::from_millis(1)).unwrap(),
+        };
+
+        assert!(
+            record_scheduled_pending_command_resolution(
+                &mut pending,
+                &mut metrics,
+                1,
+                stale_observation,
+            )
+            .is_none()
+        );
+        assert!(pending.contains_key(&1));
+        assert!(
+            metrics
+                .command_outcome_counts_by_sent_unix_second
+                .is_empty()
+        );
+        assert!(
+            metrics
+                .scheduled_command_counts_by_sent_unix_second
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5602,6 +5929,254 @@ mod tests {
         assert_eq!(duration_until_server_time(1_000, 1_250), Duration::ZERO);
     }
 
+    #[test]
+    fn terminal_observation_cannot_use_untimed_timebox_completion() {
+        assert_eq!(
+            game_deadline_disposition(true, false),
+            GameDeadlineDisposition::CompleteTimebox
+        );
+        assert_eq!(
+            game_deadline_disposition(true, true),
+            GameDeadlineDisposition::MissingTerminalOutcomeBarrier
+        );
+        assert_eq!(
+            game_deadline_disposition(false, false),
+            GameDeadlineDisposition::AuthoritativeTimeout
+        );
+        assert_eq!(
+            game_deadline_disposition(false, true),
+            GameDeadlineDisposition::MissingTerminalOutcomeBarrier
+        );
+    }
+
+    #[test]
+    fn planned_candidate_terminal_delta_invalidates_prior_outcome_barrier() {
+        let mut terminal_state_observed = false;
+        let mut outcomes_ready = true;
+        let terminal = GameEvent::StatusUpdated {
+            status: GameStatus::Complete {
+                winning_snake_id: None,
+            },
+        };
+
+        assert!(observe_candidate_event_outcome_frontier(
+            &terminal,
+            &mut terminal_state_observed,
+            &mut outcomes_ready,
+        ));
+        assert!(terminal_state_observed);
+        assert!(
+            !outcomes_ready,
+            "a barrier preceding terminal state cannot authorize promotion"
+        );
+
+        // Only the subsequently received CommandOutcomesComplete may restore
+        // readiness; terminal state remains monotonic.
+        outcomes_ready = true;
+        let nonterminal_delta = GameEvent::ScoreUpdated {
+            snake_id: 0,
+            score: 1,
+        };
+        assert!(!observe_candidate_event_outcome_frontier(
+            &nonterminal_delta,
+            &mut terminal_state_observed,
+            &mut outcomes_ready,
+        ));
+        assert!(terminal_state_observed);
+        assert!(outcomes_ready);
+    }
+
+    #[test]
+    fn candidate_cannot_truncate_terminal_state_after_the_frozen_frontier() {
+        assert!(candidate_covers_active_terminal_frontier(false, false));
+        assert!(!candidate_covers_active_terminal_frontier(true, false));
+        assert!(candidate_covers_active_terminal_frontier(true, true));
+    }
+
+    #[tokio::test]
+    async fn socket_reader_stamps_a_frame_before_the_driver_polls_it() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time: 7,
+                        server_time: 9,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let url = format!("ws://{address}/ws");
+        let (raw, _) = connect_async(url).await.unwrap();
+        let mut socket = Socket::new(raw);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while socket.inbound.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dedicated reader did not enqueue the server frame");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let message = next_socket_message(&mut socket).await.unwrap();
+        let observation = socket
+            .last_observation()
+            .expect("reader did not attach a receipt timestamp");
+
+        assert!(matches!(
+            message,
+            WSMessage::Pong {
+                client_time: 7,
+                server_time: 9
+            }
+        ));
+        assert!(
+            duration_between_ms(Instant::now(), observation.received_at) >= 40,
+            "receipt timestamp was taken when the driver polled, not by the reader"
+        );
+        socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_reader_stamps_a_backlog_larger_than_the_old_capacity_before_driver_polling() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        const FRAME_COUNT: usize = 1_024;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for sequence in 0..FRAME_COUNT {
+                socket
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::Pong {
+                            client_time: sequence as i64,
+                            server_time: sequence as i64,
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let url = format!("ws://{address}/ws");
+        let (raw, _) = connect_async(url).await.unwrap();
+        let mut socket = Socket::new(raw);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while socket.inbound.len() < FRAME_COUNT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dedicated reader did not receive the complete frame backlog");
+        let driver_started_at = Instant::now();
+
+        for expected in 0..FRAME_COUNT {
+            let message = next_socket_message(&mut socket).await.unwrap();
+            let observation = socket
+                .last_observation()
+                .expect("reader did not attach a receipt timestamp");
+            assert!(matches!(
+                message,
+                WSMessage::Pong {
+                    client_time,
+                    server_time,
+                } if client_time == expected as i64 && server_time == expected as i64
+            ));
+            assert!(
+                observation.received_at <= driver_started_at,
+                "frame {expected} was stamped only after the driver began polling"
+            );
+        }
+
+        socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_reader_preserves_protocol_ping_and_close_semantics() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ping_payload = vec![1, 2, 3, 4];
+        let server_payload = ping_payload.clone();
+        let (pong_seen_sender, pong_seen_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Ping(server_payload.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Pong(server_payload)
+            );
+            pong_seen_sender.send(()).unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time: 11,
+                        server_time: 13,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Close(_) => break,
+                    Message::Pong(payload) => assert_eq!(payload, ping_payload),
+                    other => panic!("unexpected frame before close: {other:?}"),
+                }
+            }
+        });
+
+        let url = format!("ws://{address}/ws");
+        let (raw, _) = connect_async(url).await.unwrap();
+        let mut socket = Socket::new(raw);
+        tokio::time::timeout(Duration::from_secs(1), pong_seen_receiver)
+            .await
+            .expect("dedicated reader did not flush tungstenite's automatic Pong")
+            .expect("server dropped the Pong observation");
+        let message = next_socket_message(&mut socket).await.unwrap();
+
+        assert!(matches!(
+            message,
+            WSMessage::Pong {
+                client_time: 11,
+                server_time: 13
+            }
+        ));
+        assert!(socket.last_observation().is_some());
+        socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn timeboxed_leave_is_confirmed_by_an_ordered_ping() {
         use tokio::net::TcpListener;
@@ -5637,6 +6212,7 @@ mod tests {
         });
 
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
         let mut session = LiveSession {
             record: SessionRecord::new("session-1", "test-user", 0, "group", 0),
@@ -5823,6 +6399,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_state_waits_for_durable_pending_outcome_and_barrier() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (raw, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = planned_game_test_settings(websocket_url);
+        let mut session = planned_game_test_session(Socket::new(raw), &settings, "playing");
+        session.record.game_id = Some(42);
+
+        let sent_at = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        let mut command = pending_command(1);
+        command.sent_at = sent_at;
+        command.sent_at_unix_ms = 123_456;
+        session.pending_commands.insert(1, command);
+        let mut completed = duel_snapshot(&[7, 8]);
+        completed.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let terminal = WSMessage::GameEvent(GameEventMessage {
+            game_id: 42,
+            tick: completed.tick,
+            sequence: completed.event_sequence,
+            stream_seq: 9,
+            user_id: Some(7),
+            event: GameEvent::Snapshot {
+                game_state: completed,
+            },
+        });
+        session
+            .observe_received(
+                &terminal,
+                FrameObservation {
+                    received_at_unix_ms: 124_456,
+                    received_at: sent_at + Duration::from_millis(1_000),
+                },
+            )
+            .unwrap();
+
+        assert!(session.pending_commands.contains_key(&1));
+        assert!(
+            session
+                .record
+                .metrics
+                .command_outcome_counts_by_sent_unix_second
+                .is_empty()
+        );
+        assert!(session.record.metrics.slow_command_resolutions.is_empty());
+        assert!(session.validate_terminal_outcome_barrier(42).is_err());
+
+        session
+            .observe_received(
+                &WSMessage::CommandOutcomes {
+                    game_id: 42,
+                    client_game_session_id: "test-session-7".to_owned(),
+                    contiguous_through: 1,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: None,
+                },
+                FrameObservation {
+                    received_at_unix_ms: 124_956,
+                    received_at: sent_at + Duration::from_millis(1_500),
+                },
+            )
+            .unwrap();
+        session
+            .observe_received(
+                &WSMessage::CommandOutcomesComplete { game_id: 42 },
+                FrameObservation {
+                    received_at_unix_ms: 124_957,
+                    received_at: sent_at + Duration::from_millis(1_501),
+                },
+            )
+            .unwrap();
+
+        session.validate_terminal_outcome_barrier(42).unwrap();
+        assert!(session.pending_commands.is_empty());
+        assert_eq!(
+            session
+                .record
+                .metrics
+                .command_outcome_counts_by_sent_unix_second,
+            BTreeMap::from([(123, 1)])
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[0].source,
+            CommandResolutionSource::RecoveryContiguousOutcome
+        );
+        assert_eq!(session.record.metrics.command_outcome_barriers_received, 1);
+        session.socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_fence_is_fatal_and_leaves_pending_accounting_nonzero() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (raw, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = planned_game_test_settings(websocket_url);
+        let mut session = planned_game_test_session(Socket::new(raw), &settings, "playing");
+        session.record.game_id = Some(42);
+        session.pending_commands.insert(1, pending_command(1));
+
+        let error = session
+            .observe_received(
+                &WSMessage::CommandOutcomes {
+                    game_id: 42,
+                    client_game_session_id: "test-session-7".to_owned(),
+                    contiguous_through: 0,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: Some(server::recovery::SessionCommandRejectionFence {
+                        from_sequence: 1,
+                        reason: server::recovery::SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+                    }),
+                },
+                FrameObservation::now(),
+            )
+            .unwrap_err();
+
+        assert!(is_rejection_fence_error(&error));
+        assert_eq!(session.pending_commands.len(), 1);
+        assert!(session.validate_terminal_outcome_barrier(42).is_err());
+        session.socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn matchmaking_disconnect_reauthenticates_rejoins_and_preserves_roster() {
         use server::lobby_manager::LobbyMember;
         use tokio::net::TcpListener;
@@ -5837,6 +6562,7 @@ mod tests {
             accept_async(stream).await.unwrap()
         });
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let mut first_server = first_server.await.unwrap();
         first_server.close(None).await.unwrap();
 
@@ -6098,6 +6824,7 @@ mod tests {
         });
 
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let settings = SessionSettings {
             api_origin: Url::parse("http://127.0.0.1/").unwrap(),
             websocket_url,
@@ -6290,6 +7017,7 @@ mod tests {
         });
 
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let settings = planned_game_test_settings(websocket_url);
         let mut session = planned_game_test_session(socket, &settings, "waiting");
 
@@ -6317,7 +7045,7 @@ mod tests {
             Some("replacement-task")
         );
         assert_eq!(session.current_socket_generation, Some(2));
-        session.socket.close(None).await.unwrap();
+        session.socket.close().await.unwrap();
         server.await.unwrap();
     }
 
@@ -6404,6 +7132,7 @@ mod tests {
         });
 
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let settings = planned_game_test_settings(websocket_url);
         let mut session = planned_game_test_session(socket, &settings, "queued");
         let (group_game_id, _) = watch::channel(None);
@@ -6430,7 +7159,7 @@ mod tests {
         assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
         assert_eq!(session.record.metrics.disconnects, 0);
         assert_eq!(session.record.metrics.reconnects, 0);
-        session.socket.close(None).await.unwrap();
+        session.socket.close().await.unwrap();
         server.await.unwrap();
     }
 
@@ -6527,6 +7256,7 @@ mod tests {
         let connect =
             tokio::spawn(async move { connect_async(server_url.as_str()).await.unwrap() });
         let (socket, _) = connect.await.unwrap();
+        let socket = Socket::new(socket);
         let settings = SessionSettings {
             api_origin: Url::parse("http://127.0.0.1/").unwrap(),
             websocket_url: websocket_url.clone(),
@@ -6595,7 +7325,7 @@ mod tests {
         assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
         assert_eq!(session.record.metrics.disconnects, 0);
         assert_eq!(session.record.metrics.reconnects, 0);
-        session.socket.close(None).await.unwrap();
+        session.socket.close().await.unwrap();
         server.await.unwrap();
     }
 
@@ -7010,6 +7740,7 @@ mod tests {
         });
 
         let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let socket = Socket::new(socket);
         let settings = SessionSettings {
             api_origin: Url::parse("http://127.0.0.1/").unwrap(),
             websocket_url: websocket_url.clone(),
@@ -7196,7 +7927,7 @@ mod tests {
             Some("candidate-task")
         );
         assert_eq!(candidate_resolution.socket_generation, Some(2));
-        session.socket.close(None).await.unwrap();
+        session.socket.close().await.unwrap();
         server.await.unwrap();
     }
 

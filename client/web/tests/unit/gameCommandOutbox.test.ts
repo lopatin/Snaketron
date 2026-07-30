@@ -292,6 +292,95 @@ test('only authoritative completed game events terminate the command outbox', ()
   assert.equal(gameEventTerminatesCommandOutbox({ TickHash: {} }), false);
 });
 
+test('terminal state parks pending commands until outcomes and the following barrier', () => {
+  const outbox = new GameCommandOutbox(() => 'session-terminal');
+  const first = outbox.enqueue(42, 7, command(1), 1_000);
+  const second = outbox.enqueue(42, 7, command(2), 1_000);
+
+  assert.equal(outbox.markTerminal(42, 7), true);
+  assert.deepEqual(outbox.pending(42, 7), [first, second]);
+  assert.deepEqual(outbox.takeDue(42, 7, 10_000, 1_000), []);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(3), 10_000),
+    /terminal game is awaiting command outcomes/,
+  );
+  assert.equal(outbox.completeTerminal(42, 7), 'pending');
+  assert.deepEqual(outbox.pending(42, 7), [first, second]);
+
+  assert.equal(outbox.reconcile({
+    game_id: 42,
+    client_game_session_id: 'session-terminal',
+    contiguous_through: 1,
+    outcomes: {
+      '2': { result: 'REJECTED', reason: 'game complete' },
+    },
+  }, 7), 2);
+  assert.deepEqual(outbox.pending(42, 7), []);
+
+  assert.equal(outbox.completeTerminal(42, 7), 'cleared');
+  assert.deepEqual(outbox.pending(42, 7), []);
+  assert.equal(outbox.completeTerminal(42, 7), 'cleared');
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(3), 10_000),
+    /terminal game is awaiting command outcomes/,
+  );
+});
+
+test('terminal state before the first command keeps a tombstone through its barrier', () => {
+  const sessionIds = ['terminal-tombstone', 'session-after-terminal'];
+  const outbox = new GameCommandOutbox(() => sessionIds.shift()!);
+
+  assert.equal(outbox.markTerminal(42, 7), true);
+  assert.deepEqual(outbox.pending(42, 7), []);
+  assert.deepEqual(outbox.takeDue(42, 7, 10_000, 0), []);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(1), 10_000),
+    /terminal game is awaiting command outcomes/,
+  );
+
+  assert.equal(outbox.completeTerminal(42, 7), 'cleared');
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(1), 10_000),
+    /terminal game is awaiting command outcomes/,
+  );
+  outbox.clear(42, 7);
+  const next = outbox.enqueue(42, 7, command(1), 10_000);
+  assert.equal(next.command_id.client_game_session_id, 'session-after-terminal');
+  assert.equal(next.command_id.sequence, 1);
+});
+
+test('terminal recovery fence remains parked until its completion barrier', () => {
+  const sessionIds = ['session-terminal-fence', 'session-after-terminal'];
+  const outbox = new GameCommandOutbox(() => sessionIds.shift()!);
+  outbox.enqueue(42, 7, command(1), 1_000);
+
+  assert.equal(outbox.markTerminal(42, 7), true);
+  assert.equal(outbox.reconcile({
+    game_id: 42,
+    client_game_session_id: 'session-terminal-fence',
+    contiguous_through: 0,
+    outcomes: {},
+    rejection_fence: {
+      from_sequence: 1,
+      reason: 'command session sparse outcome capacity exhausted',
+    },
+  }, 7), 1);
+  assert.deepEqual(outbox.pending(42, 7), []);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(2), 2_000),
+    /terminal game is awaiting command outcomes/,
+  );
+
+  assert.equal(outbox.completeTerminal(42, 7), 'cleared');
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(2), 2_000),
+    /terminal game is awaiting command outcomes/,
+  );
+  outbox.clear(42, 7);
+  const fresh = outbox.enqueue(42, 7, command(2), 2_000);
+  assert.equal(fresh.command_id.client_game_session_id, 'session-after-terminal');
+});
+
 test('only a definitive failure for the active game clears its outbox', () => {
   const outbox = new GameCommandOutbox(() => 'session-load');
   const pending = outbox.enqueue(42, 7, command(1), 1_000);

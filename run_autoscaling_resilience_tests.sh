@@ -28,9 +28,7 @@ traefik_monitor_dir=""
 ecs_runtime_monitor_pid=""
 ecs_runtime_monitor_dir=""
 hard_crash_control_observer_pid=""
-hard_crash_control_observer_stop_file=""
-hard_crash_ownership_observer_pid=""
-hard_crash_ownership_observer_stop_file=""
+hard_crash_output_observer_pid=""
 hard_crash_ecs_exec_pid=""
 
 hard_crash_envelope_jq='
@@ -201,7 +199,9 @@ select_pre_fault_pending_sample() {
       [.[]
         | select(
             .observation_started_at_ms <= .captured_at_ms
-            and .captured_at_ms <= .observation_completed_at_ms)
+            and .captured_at_ms <= .observation_completed_at_ms
+            and .redis_observation_started_at_ms
+              <= .redis_observation_completed_at_ms)
         | select(
             .partition == $partition
             and .requested_consumer == $killed_lease_token
@@ -228,7 +228,9 @@ select_post_kill_pending_sample() {
             and .captured_at_ms >= .observation_started_at_ms
             and .captured_at_ms <= .observation_completed_at_ms
             and .observation_completed_at_ms
-              <= ($execution_stopped_at_ms + 2000))
+              <= ($execution_stopped_at_ms + 2000)
+            and .redis_observation_started_at_ms
+              <= .redis_observation_completed_at_ms)
         | select(
             .partition == $partition
             and .requested_consumer == $killed_lease_token
@@ -282,10 +284,8 @@ select_pre_fault_ownership_sample() {
         | select(
             .observation_started_at_ms <= .captured_at_ms
             and .captured_at_ms <= .observation_completed_at_ms
-            and .observation_started_at_ms <= .membership_observed_at_ms
-            and .membership_observed_at_ms <= .observation_completed_at_ms
-            and .observation_started_at_ms <= .authority_observed_at_ms
-            and .authority_observed_at_ms <= .observation_completed_at_ms
+            and (.redis_membership_observed_at_ms | type == "number")
+            and (.redis_authority_observed_at_ms | type == "number")
             and (.authority_event_tail_id
               | type == "string"
               and test("^[0-9]+-[0-9]+$")))
@@ -327,10 +327,8 @@ select_hard_crash_owner_ownership_sample() {
           | select(
               .captured_at_ms >= .observation_started_at_ms
               and .captured_at_ms <= .observation_completed_at_ms
-              and .membership_observed_at_ms >= .observation_started_at_ms
-              and .membership_observed_at_ms <= .observation_completed_at_ms
-              and .authority_observed_at_ms >= .observation_started_at_ms
-              and .authority_observed_at_ms <= .observation_completed_at_ms
+              and (.redis_membership_observed_at_ms | type == "number")
+              and (.redis_authority_observed_at_ms | type == "number")
               and (.authority_event_tail_id
                 | type == "string"
                 and test("^[0-9]+-[0-9]+$"))
@@ -346,9 +344,7 @@ select_hard_crash_owner_ownership_sample() {
               .authority_stable
               and .killed_member_live == false
               and .assignment.version > $pre[0].assignment.version
-              and (
-                $execution_stopped_at_ms == null
-                or .assignment.computed_at_ms >= $execution_stopped_at_ms)
+              and (.assignment.computed_at_ms | type == "number")
               and $new.owner_matches
               and $new.desired_owner != $killed_boot_id
               and $new.active_owner == $new.desired_owner
@@ -415,6 +411,8 @@ select_hard_crash_authoritative_output_sample() {
               .observation_started_at_ms >= $execution_stopped_at_ms
               and .captured_at_ms >= .observation_started_at_ms
               and .captured_at_ms <= .observation_completed_at_ms
+              and .observation_completed_at_ms
+                <= ($execution_stopped_at_ms + 5000)
               and .partition == $partition
               and .after_stream_id == $authority_event_tail_id
               and ($output.milliseconds > $anchor.milliseconds
@@ -422,11 +420,10 @@ select_hard_crash_authoritative_output_sample() {
                   and $output.sequence > $anchor.sequence))
               and .first_scheduled_output.stream_unix_ms
                 == $output.milliseconds
+              and .redis_observation_started_at_ms
+                <= .redis_observation_completed_at_ms
               and .first_scheduled_output.stream_unix_ms
-                >= $execution_stopped_at_ms
-              and .first_scheduled_output.stream_unix_ms
-                <= ($execution_stopped_at_ms + 5000)
-              and .first_scheduled_output.stream_unix_ms <= .captured_at_ms
+                <= .redis_observation_completed_at_ms
               and .first_scheduled_output.game_id % 10 == $partition
               and .first_scheduled_output.command_id.game_id
                 == .first_scheduled_output.game_id
@@ -484,6 +481,10 @@ write_capacity_acceptance_report() {
             | .current_started_at_second = null
           end);
       $report[0] as $r
+      | (($r.schema_version // 0) >= 11) as $schema_valid
+      | (($r.metadata.command_outcome_latency_basis // null)
+          == "original-send-to-dedicated-reader-frame-receipt")
+          as $latency_basis_valid
       | $r.ramp_stages[0].target_reached_at_unix_ms as $hold_started_at_ms
       | $r.ramp_stages[0].finished_at_unix_ms as $hold_finished_at_ms
       | (($hold_started_at_ms / 1000) | ceil) as $hold_first_second
@@ -544,7 +545,8 @@ write_capacity_acceptance_report() {
             | select(.qualifying | not)
           ],
           global_checks: {
-            schema: ($r.schema_version >= 10),
+            schema: $schema_valid,
+            command_outcome_latency_basis: $latency_basis_valid,
             load_threshold: ($r.metadata.threshold_result == "passed"),
             configured_concurrency: ($r.configured_max_concurrency == 272),
             mode: ($r.metadata.mode == "duel"),
@@ -643,6 +645,10 @@ command_outcome_window_diagnostics() {
     --argjson required_full_seconds "$required_full_seconds" \
     --slurpfile window "$window" '
       . as $report
+      | (($report.schema_version // 0) >= 11) as $schema_valid
+      | (($report.metadata.command_outcome_latency_basis // null)
+          == "original-send-to-dedicated-reader-frame-receipt")
+          as $latency_basis_valid
       | (($window[0].started_at_unix_ms / 1000) | ceil) as $first_second
       | (($window[0].finished_at_unix_ms / 1000) | floor) as $after_last_second
       | [range($first_second; $after_last_second) as $second
@@ -680,12 +686,18 @@ command_outcome_window_diagnostics() {
           max_latency_ms: $max_latency_ms,
           required_partition_count: $required_partition_count,
           required_full_seconds: $required_full_seconds,
+          evidence_contract: {
+            schema: $schema_valid,
+            command_outcome_latency_basis: $latency_basis_valid
+          },
           first_full_second: $first_second,
           after_last_full_second: $after_last_second,
           full_second_count: ($after_last_second - $first_second),
           failed_seconds: $failed_seconds,
           passed:
-            (($after_last_second - $first_second) >= $required_full_seconds
+            ($schema_valid
+              and $latency_basis_valid
+              and ($after_last_second - $first_second) >= $required_full_seconds
               and ($failed_seconds | length) == 0)
         }
     ' "$summary"
@@ -728,7 +740,9 @@ write_gate_a_acceptance_report() {
       ($summary[0] // {}) as $report
       | {
           configuration:
-            (($report.schema_version // 0) >= 10
+            (($report.schema_version // 0) >= 11
+              and ($report.metadata.command_outcome_latency_basis // null)
+                == "original-send-to-dedicated-reader-frame-receipt"
               and ($report.metadata.threshold_result // null) == "passed"
               and ($report.configured_max_concurrency // 0) == 128
               and ($report.metadata.mode // null) == "duel"
@@ -1169,10 +1183,12 @@ test_command_outcome_window_gate() {
   local window="$fixture_dir/window.json"
   local invalid="$fixture_dir/invalid.json"
   jq -n '{
-    schema_version: 10,
+    schema_version: 11,
     finished_at_unix_ms: 13000,
     configured_max_concurrency: 128,
     metadata: {
+      command_outcome_latency_basis:
+        "original-send-to-dedicated-reader-frame-receipt",
       threshold_result: "passed",
       mode: "duel",
       command_profile: "every-tick",
@@ -1209,6 +1225,19 @@ test_command_outcome_window_gate() {
 
   local result=0
   command_outcomes_meet_window_budget "$summary" "$window" || result=1
+  jq '.schema_version = 10' "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq '.metadata.command_outcome_latency_basis = "driver-dispatch-time"' \
+    "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
+  jq 'del(.metadata.command_outcome_latency_basis)' "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window"; then
+    result=1
+  fi
   jq '.metrics.command_outcome_max_latency_ms_by_sent_unix_second["11"] = 1001' \
     "$summary" >"$invalid"
   if command_outcomes_meet_window_budget "$invalid" "$window"; then
@@ -1422,9 +1451,11 @@ test_capacity_continuous_window_contract() {
           }]
       | from_entries;
     {
-      schema_version: 10,
+      schema_version: 11,
       configured_max_concurrency: 272,
       metadata: {
+        command_outcome_latency_basis:
+          "original-send-to-dedicated-reader-frame-receipt",
         threshold_result: "passed",
         mode: "duel",
         command_profile: "every-tick",
@@ -1473,6 +1504,23 @@ test_capacity_continuous_window_contract() {
       }
     }
   ' >"$summary"
+
+  jq '.schema_version = 10' "$summary" >"$fixture_dir/stale-schema.json"
+  write_capacity_acceptance_report \
+    "$fixture_dir/stale-schema.json" "$acceptance"
+  jq -e '
+    (.passed | not)
+    and (.global_checks.schema | not)
+  ' "$acceptance" >/dev/null || result=1
+
+  jq '.metadata.command_outcome_latency_basis = "driver-dispatch-time"' \
+    "$summary" >"$fixture_dir/wrong-latency-basis.json"
+  write_capacity_acceptance_report \
+    "$fixture_dir/wrong-latency-basis.json" "$acceptance"
+  jq -e '
+    (.passed | not)
+    and (.global_checks.command_outcome_latency_basis | not)
+  ' "$acceptance" >/dev/null || result=1
 
   # A nonqualifying extra observation second must not invalidate either
   # adjacent 300-second qualifying window.
@@ -1723,8 +1771,8 @@ test_hard_crash_evidence_selectors() {
     --arg killed_task "$killed_task_id" '
       .authority_stable = true
       | .killed_member_live = true
-      | .membership_observed_at_ms = .captured_at_ms
-      | .authority_observed_at_ms = .captured_at_ms
+      | .redis_membership_observed_at_ms = (.captured_at_ms - 20)
+      | .redis_authority_observed_at_ms = (.captured_at_ms - 19)
       | .authority_event_tail_id = "1785340236000-1"
       | .live_members = [{
           boot_id: $killed_boot,
@@ -1740,6 +1788,8 @@ test_hard_crash_evidence_selectors() {
         observation_started_at_ms: ($stopped - 2),
         captured_at_ms: ($stopped - 1),
         observation_completed_at_ms: ($stopped - 1),
+        redis_observation_started_at_ms: ($stopped - 20),
+        redis_observation_completed_at_ms: ($stopped - 19),
         partition: $partition,
         requested_consumer: $killed_token,
         pending_entry: {
@@ -1764,8 +1814,8 @@ test_hard_crash_evidence_selectors() {
       .observation_started_at_ms = ($stopped + 500)
       | .captured_at_ms = ($stopped + 2500)
       | .observation_completed_at_ms = ($stopped + 5000)
-      | .membership_observed_at_ms = ($stopped + 2400)
-      | .authority_observed_at_ms = ($stopped + 2450)
+      | .redis_membership_observed_at_ms = ($stopped + 2400)
+      | .redis_authority_observed_at_ms = ($stopped + 2450)
       | .authority_event_tail_id = (($stopped + 2450 | tostring) + "-1")
       | .authority_stable = true
       | .killed_member_live = false
@@ -1786,9 +1836,11 @@ test_hard_crash_evidence_selectors() {
     --argjson partition "$partition" \
     --arg anchor "$((execution_stopped_at_ms + 2450))-1" '
       {
-        observation_started_at_ms: ($stopped + 6000),
-        captured_at_ms: ($stopped + 6500),
-        observation_completed_at_ms: ($stopped + 7000),
+        observation_started_at_ms: ($stopped + 2600),
+        captured_at_ms: ($stopped + 3000),
+        observation_completed_at_ms: ($stopped + 3500),
+        redis_observation_started_at_ms: ($stopped + 2900),
+        redis_observation_completed_at_ms: ($stopped + 3100),
         partition: $partition,
         after_stream_id: $anchor,
         first_scheduled_output: {
@@ -1805,6 +1857,24 @@ test_hard_crash_evidence_selectors() {
         }
       }
     ' >"$output_valid"
+
+  local ownership_spool="$fixture_dir/ownership.ndjson"
+  local latched_anchor="$fixture_dir/latched-owner.json"
+  jq -c . "$owner_valid" >"$ownership_spool"
+  jq -c '
+    .observation_started_at_ms += 1
+    | .captured_at_ms += 1
+    | .observation_completed_at_ms += 1
+    | .authority_event_tail_id = "9999999999999-0"
+  ' "$owner_valid" >>"$ownership_spool"
+  select_hard_crash_owner_candidate_ownership_sample \
+    "$pre" "$partition" \
+    "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
+    "$ownership_spool" >"$latched_anchor" || result=1
+  jq -e \
+    --arg expected "$((execution_stopped_at_ms + 2450))-1" '
+      .authority_event_tail_id == $expected
+    ' "$latched_anchor" >/dev/null || result=1
 
   select_pre_fault_pending_sample \
     "$partition" "$killed_lease_token" \
@@ -1902,10 +1972,20 @@ test_hard_crash_evidence_selectors() {
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
     "$fixture_dir/owner-after-spanning-sample.json" \
     >"$selected" || result=1
+  # The fixed-anchor watcher may finish before ECS publishes
+  # executionStoppedAt. Selection must consume that already-buffered sample
+  # rather than starting a new observation after control-plane propagation.
+  local buffered_output="$fixture_dir/output-before-ecs-propagation.ndjson"
+  local ecs_stop_published_at_ms=$((execution_stopped_at_ms + 10700))
+  jq -c . "$output_valid" >"$buffered_output"
+  jq -e \
+    --argjson ecs_stop_published_at_ms "$ecs_stop_published_at_ms" '
+      .observation_completed_at_ms < $ecs_stop_published_at_ms
+    ' "$buffered_output" >/dev/null || result=1
   select_hard_crash_authoritative_output_sample \
     "$execution_stopped_at_ms" "$partition" \
     "$((execution_stopped_at_ms + 2450))-1" \
-    "$output_valid" >"$selected" || result=1
+    "$buffered_output" >"$selected" || result=1
   jq -e \
     --argjson expected "$((execution_stopped_at_ms + 3000))" '
       .first_scheduled_output.stream_unix_ms == $expected
@@ -1957,6 +2037,15 @@ test_hard_crash_evidence_selectors() {
     "$fixture_dir/pending-empty.json" >/dev/null 2>&1; then
     result=1
   fi
+  jq '
+    .redis_observation_started_at_ms =
+      (.redis_observation_completed_at_ms + 1)
+  ' "$post_pending" >"$fixture_dir/pending-invalid-redis-interval.json"
+  if select_post_kill_pending_sample \
+    "$execution_stopped_at_ms" "$partition" "$killed_lease_token" \
+    "$fixture_dir/pending-invalid-redis-interval.json" >/dev/null 2>&1; then
+    result=1
+  fi
 
   jq \
     --argjson stopped "$execution_stopped_at_ms" \
@@ -1975,12 +2064,11 @@ test_hard_crash_evidence_selectors() {
     --argjson stopped "$execution_stopped_at_ms" '
       .assignment.computed_at_ms = ($stopped - 1)
     ' "$owner_valid" >"$fixture_dir/owner-assigned-before-stop.json"
-  if select_hard_crash_owner_ready_ownership_sample \
+  select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
-    "$fixture_dir/owner-assigned-before-stop.json" >/dev/null 2>&1; then
-    result=1
-  fi
+    "$fixture_dir/owner-assigned-before-stop.json" \
+    >"$selected" || result=1
   jq \
     '.authority_stable = false' \
     "$owner_valid" >"$fixture_dir/owner-incoherent.json"
@@ -2038,14 +2126,13 @@ test_hard_crash_evidence_selectors() {
     result=1
   fi
   jq '
-    .authority_observed_at_ms = (.observation_completed_at_ms + 1)
+    .redis_authority_observed_at_ms = (.observation_completed_at_ms + 1)
   ' "$owner_valid" >"$fixture_dir/owner-authority-outside-interval.json"
-  if select_hard_crash_owner_ready_ownership_sample \
+  select_hard_crash_owner_ready_ownership_sample \
     "$pre" "$execution_stopped_at_ms" "$partition" \
     "$killed_boot_id" "$killed_task_id" "$killed_lease_token" \
-    "$fixture_dir/owner-authority-outside-interval.json" >/dev/null 2>&1; then
-    result=1
-  fi
+    "$fixture_dir/owner-authority-outside-interval.json" \
+    >"$selected" || result=1
   jq '.authority_event_tail_id = "not-a-stream-id"' \
     "$owner_valid" >"$fixture_dir/owner-invalid-tail.json"
   if select_hard_crash_owner_ready_ownership_sample \
@@ -2057,13 +2144,33 @@ test_hard_crash_evidence_selectors() {
 
   jq \
     --argjson stopped "$execution_stopped_at_ms" '
-      .first_scheduled_output.stream_id = (($stopped + 5001 | tostring) + "-0")
-      | .first_scheduled_output.stream_unix_ms = ($stopped + 5001)
+      .captured_at_ms = ($stopped + 5001)
+      | .observation_completed_at_ms = ($stopped + 5001)
     ' "$output_valid" >"$fixture_dir/output-late.json"
   if select_hard_crash_authoritative_output_sample \
     "$execution_stopped_at_ms" "$partition" \
     "$((execution_stopped_at_ms + 2450))-1" \
     "$fixture_dir/output-late.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq \
+    --argjson stopped "$execution_stopped_at_ms" '
+      .observation_started_at_ms = ($stopped - 1)
+    ' "$output_valid" >"$fixture_dir/output-started-early.json"
+  if select_hard_crash_authoritative_output_sample \
+    "$execution_stopped_at_ms" "$partition" \
+    "$((execution_stopped_at_ms + 2450))-1" \
+    "$fixture_dir/output-started-early.json" >/dev/null 2>&1; then
+    result=1
+  fi
+  jq '
+    .redis_observation_completed_at_ms =
+      (.first_scheduled_output.stream_unix_ms - 1)
+  ' "$output_valid" >"$fixture_dir/output-after-redis-observation.json"
+  if select_hard_crash_authoritative_output_sample \
+    "$execution_stopped_at_ms" "$partition" \
+    "$((execution_stopped_at_ms + 2450))-1" \
+    "$fixture_dir/output-after-redis-observation.json" >/dev/null 2>&1; then
     result=1
   fi
   jq \
@@ -2226,6 +2333,29 @@ test_unexpected_crash_stop_selector() {
   fi
 }
 
+test_observer_pid_supervision_contract() {
+  local result=0
+  sleep 5 &
+  hard_crash_control_observer_pid=$!
+  hard_crash_output_observer_pid=""
+  if hard_crash_observers_are_running; then
+    result=1
+  fi
+
+  sleep 5 &
+  hard_crash_output_observer_pid=$!
+  hard_crash_observers_are_running || result=1
+  kill -TERM "$hard_crash_output_observer_pid" 2>/dev/null || result=1
+  wait_for_observer_exit_bounded "$hard_crash_output_observer_pid"
+  if hard_crash_observers_are_running; then
+    result=1
+  fi
+  stop_hard_crash_control_observer
+  [[ -z "$hard_crash_control_observer_pid" \
+    && -z "$hard_crash_output_observer_pid" ]] || result=1
+  return "$result"
+}
+
 test_evidence_safety_helpers() {
   test_task_definition_evidence_sanitizer
   test_live_task_definition_gate
@@ -2237,6 +2367,7 @@ test_evidence_safety_helpers() {
   test_hard_crash_envelope_contract
   test_hard_crash_evidence_selectors
   test_unexpected_crash_stop_selector
+  test_observer_pid_supervision_contract
 }
 
 run_offline_cdk_synth() {
@@ -3929,71 +4060,49 @@ capture_control_status() {
     --region-key "$SNAKETRON_REGION_CODE" >"$output"
 }
 
-capture_ownership_status() {
-  local output="$1"
-  local partition="$2"
-  local killed_boot_id="$3"
-  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
-    timeout --signal=TERM --kill-after=1s 3s \
-      "$resilience_admin" ownership \
-      --region-key "$SNAKETRON_REGION_CODE" \
-      --partition "$partition" \
-      --killed-boot-id "$killed_boot_id" >"$output"
+observer_process_is_running() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  local process_state
+  process_state="$(ps -o stat= -p "$pid" 2>/dev/null)" || return 1
+  process_state="${process_state//[[:space:]]/}"
+  [[ -n "$process_state" && "$process_state" != Z* ]]
 }
 
-capture_pending_status() {
-  local output="$1"
-  local partition="$2"
-  local consumer="$3"
-  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
-    timeout --signal=TERM --kill-after=1s 3s \
-      "$resilience_admin" pending \
-      --region-key "$SNAKETRON_REGION_CODE" \
-      --partition "$partition" \
-      --consumer "$consumer" >"$output"
+wait_for_observer_exit_bounded() {
+  local pid="$1"
+  local attempt
+  for attempt in {1..20}; do
+    if ! observer_process_is_running "$pid"; then
+      wait "$pid" 2>/dev/null || true
+      return
+    fi
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 
-capture_authoritative_output_status() {
-  local output="$1"
-  local partition="$2"
-  local after_stream_id="$3"
-  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
-    timeout --signal=TERM --kill-after=1s 3s \
-      "$resilience_admin" output \
-      --region-key "$SNAKETRON_REGION_CODE" \
-      --partition "$partition" \
-      --after-stream-id "$after_stream_id" >"$output"
+hard_crash_observers_are_running() {
+  observer_process_is_running "$hard_crash_control_observer_pid" \
+    && observer_process_is_running "$hard_crash_output_observer_pid"
 }
 
 stop_hard_crash_control_observer() {
-  if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
-    if ! touch "$hard_crash_control_observer_stop_file" 2>/dev/null \
-      && [[ -n "$hard_crash_control_observer_pid" ]]; then
-      kill -TERM "$hard_crash_control_observer_pid" 2>/dev/null || true
-    fi
+  if [[ -n "$hard_crash_control_observer_pid" ]]; then
+    kill -TERM "$hard_crash_control_observer_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$hard_crash_output_observer_pid" ]]; then
+    kill -TERM "$hard_crash_output_observer_pid" 2>/dev/null || true
   fi
   if [[ -n "$hard_crash_control_observer_pid" ]]; then
-    wait "$hard_crash_control_observer_pid" 2>/dev/null || true
+    wait_for_observer_exit_bounded "$hard_crash_control_observer_pid"
   fi
-  if [[ -n "$hard_crash_control_observer_stop_file" ]]; then
-    rm -f "$hard_crash_control_observer_stop_file"
-  fi
-  if [[ -n "$hard_crash_ownership_observer_stop_file" ]]; then
-    if ! touch "$hard_crash_ownership_observer_stop_file" 2>/dev/null \
-      && [[ -n "$hard_crash_ownership_observer_pid" ]]; then
-      kill -TERM "$hard_crash_ownership_observer_pid" 2>/dev/null || true
-    fi
-  fi
-  if [[ -n "$hard_crash_ownership_observer_pid" ]]; then
-    wait "$hard_crash_ownership_observer_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$hard_crash_ownership_observer_stop_file" ]]; then
-    rm -f "$hard_crash_ownership_observer_stop_file"
+  if [[ -n "$hard_crash_output_observer_pid" ]]; then
+    wait_for_observer_exit_bounded "$hard_crash_output_observer_pid"
   fi
   hard_crash_control_observer_pid=""
-  hard_crash_control_observer_stop_file=""
-  hard_crash_ownership_observer_pid=""
-  hard_crash_ownership_observer_stop_file=""
+  hard_crash_output_observer_pid=""
 }
 
 inject_hard_crash_and_prove_takeover() {
@@ -4076,263 +4185,59 @@ inject_hard_crash_and_prove_takeover() {
       }
     ' >"$report_dir/hard-crash-manifest.json"
 
-  # The repeating two-second proof is one partition-local Lua snapshot:
-  # filtered XPENDING followed by Redis TIME. The rich status above remains
-  # sufficient for partition selection and the final executor-drain proof.
+  # Each watcher owns one long-lived Redis connection and writes flushed NDJSON
+  # directly. No per-sample shell process sits on the two-second evidence path.
   local control_observation_dir="$report_dir/hard-crash-control-samples"
   mkdir -p "$control_observation_dir"
-  hard_crash_control_observer_stop_file="$control_observation_dir/stop-requested"
-  rm -f "$hard_crash_control_observer_stop_file"
-  local control_observer_stop_file="$hard_crash_control_observer_stop_file"
-  (
-    local observer_stop_requested=false
-    trap 'observer_stop_requested=true' TERM INT
-    local observation_sequence=0
-    while [[ "$observer_stop_requested" != true \
-      && ! -e "$control_observer_stop_file" ]]; do
-      observation_sequence=$((observation_sequence + 1))
-      local observation_started_at_ms
-      local observation_completed_at_ms
-      local observation_raw
-      local observation_pending
-      local observation_sample
-      printf -v observation_raw \
-        '%s/%06d.raw.pending' "$control_observation_dir" "$observation_sequence"
-      printf -v observation_pending \
-        '%s/%06d.json.pending' "$control_observation_dir" "$observation_sequence"
-      printf -v observation_sample \
-        '%s/%06d.json' "$control_observation_dir" "$observation_sequence"
-      observation_started_at_ms="$(unix_time_ms)"
-      if capture_pending_status \
-        "$observation_raw" \
-        "$killed_partition" \
-        "$killed_lease_token" 2>/dev/null; then
-        observation_completed_at_ms="$(unix_time_ms)"
-        if jq -e \
-          --argjson partition "$killed_partition" \
-          --arg killed_lease_token "$killed_lease_token" \
-          --argjson observation_started_at_ms "$observation_started_at_ms" \
-          --argjson observation_completed_at_ms "$observation_completed_at_ms" '
-            . + {
-              observation_started_at_ms: $observation_started_at_ms,
-              observation_completed_at_ms: $observation_completed_at_ms
-            }
-            | select(
-                .partition == $partition
-                and .requested_consumer == $killed_lease_token
-                and .pending_entry != null
-                and (.pending_entry.id | type == "string" and length > 0)
-                and .pending_entry.consumer == $killed_lease_token
-                and .observation_started_at_ms <= .captured_at_ms
-                and .captured_at_ms <= .observation_completed_at_ms)
-          ' "$observation_raw" >"$observation_pending"; then
-          mv "$observation_pending" "$observation_sample"
-        fi
-      fi
-      rm -f "$observation_raw" "$observation_pending"
-      sleep 0.05
-    done
-  ) &
+  local pending_observation_spool="$control_observation_dir/observations.ndjson"
+  : >"$pending_observation_spool"
+  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+    "$resilience_admin" pending \
+    --region-key "$SNAKETRON_REGION_CODE" \
+    --partition "$killed_partition" \
+    --consumer "$killed_lease_token" \
+    --watch-interval-ms 25 >"$pending_observation_spool" \
+    2>"$control_observation_dir/watch-errors.log" &
   hard_crash_control_observer_pid=$!
 
-  # Ownership has a separate lightweight observer. Its command sandwiches one
-  # atomic membership read between two atomic partition-local assignment/lease
-  # reads, avoiding PEL enumeration on the five-second takeover path. Once it
-  # sees a possible successor, it also captures the first authoritative output
-  # after that exact snapshot's event-stream tail. Saving the pair immediately
-  # prevents the bounded event stream from trimming recovery evidence while ECS
-  # exposes the exact container-stop timestamp.
-  local ownership_observation_dir="$report_dir/hard-crash-ownership-samples"
+  # The combined ownership/output observer has its own supervised PID and
+  # connection. It proves an old-owner read before the fault, then publishes
+  # the first valid successor and observes only that immutable tail.
   local takeover_output_observation_dir="$report_dir/hard-crash-takeover-output-samples"
-  mkdir -p "$ownership_observation_dir"
   mkdir -p "$takeover_output_observation_dir"
-  hard_crash_ownership_observer_stop_file="$ownership_observation_dir/stop-requested"
-  rm -f "$hard_crash_ownership_observer_stop_file"
-  local ownership_observer_stop_file="$hard_crash_ownership_observer_stop_file"
-  (
-    local observer_stop_requested=false
-    trap 'observer_stop_requested=true' TERM INT
-    local observation_sequence=0
-    local captured_ambiguous_authority_identity=""
-    local captured_definitive_authority_identity=""
-    while [[ "$observer_stop_requested" != true \
-      && ! -e "$ownership_observer_stop_file" ]]; do
-      observation_sequence=$((observation_sequence + 1))
-      local observation_started_at_ms
-      local observation_completed_at_ms
-      local observation_raw
-      local observation_pending
-      local observation_sample
-      local candidate_assignment_computed_at_ms
-      local candidate_authority_identity
-      local output_raw
-      local output_pending
-      local output_sample
-      printf -v observation_raw \
-        '%s/%06d.raw.pending' "$ownership_observation_dir" "$observation_sequence"
-      printf -v observation_pending \
-        '%s/%06d.json.pending' "$ownership_observation_dir" "$observation_sequence"
-      printf -v observation_sample \
-        '%s/%06d.json' "$ownership_observation_dir" "$observation_sequence"
-      printf -v output_raw \
-        '%s/%06d.raw.pending' "$takeover_output_observation_dir" "$observation_sequence"
-      printf -v output_pending \
-        '%s/%06d.json.pending' "$takeover_output_observation_dir" "$observation_sequence"
-      printf -v output_sample \
-        '%s/%06d.json' "$takeover_output_observation_dir" "$observation_sequence"
-      observation_started_at_ms="$(unix_time_ms)"
-      if capture_ownership_status \
-        "$observation_raw" \
-        "$killed_partition" \
-        "$killed_boot_id" 2>/dev/null; then
-        observation_completed_at_ms="$(unix_time_ms)"
-        if jq -e \
-          --argjson partition "$killed_partition" \
-          --argjson observation_started_at_ms "$observation_started_at_ms" \
-          --argjson observation_completed_at_ms "$observation_completed_at_ms" '
-            {
-              observation_started_at_ms: $observation_started_at_ms,
-              observation_completed_at_ms: $observation_completed_at_ms,
-              captured_at_ms,
-              membership_observed_at_ms,
-              authority_observed_at_ms,
-              authority_event_tail_id,
-              authority_stable,
-              killed_member_live,
-              assignment,
-              live_members: (
-                if .owner_member == null then [] else [.owner_member] end),
-              runtime_partitions: [
-                .runtime_partition
-                | select(.partition == $partition)
-              ]
-            }
-            | select(
-                (.runtime_partitions | length) == 1
-                and .observation_started_at_ms <= .captured_at_ms
-                and .captured_at_ms <= .observation_completed_at_ms
-                and .observation_started_at_ms
-                  <= .membership_observed_at_ms
-                and .membership_observed_at_ms
-                  <= .observation_completed_at_ms
-                and .observation_started_at_ms
-                  <= .authority_observed_at_ms
-                and .authority_observed_at_ms
-                  <= .observation_completed_at_ms
-                and (.authority_event_tail_id
-                  | type == "string"
-                  and test("^[0-9]+-[0-9]+$")))
-          ' "$observation_raw" >"$observation_pending"; then
-          mv "$observation_pending" "$observation_sample"
-          if select_hard_crash_owner_candidate_ownership_sample \
-              "$pre" \
-              "$killed_partition" \
-              "$killed_boot_id" \
-              "$killed_task_id" \
-              "$killed_lease_token" \
-              "$observation_sample" >/dev/null 2>&1 \
-            && candidate_authority_identity="$(
-              jq -er --argjson partition "$killed_partition" '
-                (.runtime_partitions[]
-                  | select(.partition == $partition)) as $runtime
-                | [
-                    .assignment.version,
-                    $runtime.lease_token
-                  ]
-                | @json
-              ' "$observation_sample"
-            )" \
-            && candidate_assignment_computed_at_ms="$(
-              jq -er '
-                .assignment.computed_at_ms
-                | select(type == "number")
-              ' "$observation_sample"
-            )" \
-            && [[ "$candidate_authority_identity" \
-              != "$captured_definitive_authority_identity" ]] \
-            && [[ "$observation_started_at_ms" \
-                -ge "$candidate_assignment_computed_at_ms" \
-              || "$candidate_authority_identity" \
-                != "$captured_ambiguous_authority_identity" ]]; then
-            local authority_event_tail_id
-            local output_observation_started_at_ms
-            local output_observation_completed_at_ms
-            authority_event_tail_id="$(
-              jq -er '.authority_event_tail_id' "$observation_sample"
-            )"
-            output_observation_started_at_ms="$(unix_time_ms)"
-            if capture_authoritative_output_status \
-              "$output_raw" \
-              "$killed_partition" \
-              "$authority_event_tail_id" 2>/dev/null; then
-              output_observation_completed_at_ms="$(unix_time_ms)"
-              if jq -e \
-                --slurpfile ownership "$observation_sample" \
-                --argjson partition "$killed_partition" \
-                --arg authority_event_tail_id "$authority_event_tail_id" \
-                --argjson observation_started_at_ms \
-                  "$output_observation_started_at_ms" \
-                --argjson observation_completed_at_ms \
-                  "$output_observation_completed_at_ms" '
-                  . + {
-                    observation_started_at_ms: $observation_started_at_ms,
-                    observation_completed_at_ms:
-                      $observation_completed_at_ms
-                  }
-                  | select(
-                      .partition == $partition
-                      and .after_stream_id == $authority_event_tail_id
-                      and .first_scheduled_output != null
-                      and .observation_started_at_ms <= .captured_at_ms
-                      and .captured_at_ms <= .observation_completed_at_ms)
-                  | {
-                      ownership: $ownership[0],
-                      output: .
-                    }
-                ' "$output_raw" >"$output_pending"; then
-                mv "$output_pending" "$output_sample"
-                if (( observation_started_at_ms \
-                  >= candidate_assignment_computed_at_ms )); then
-                  captured_definitive_authority_identity="$candidate_authority_identity"
-                else
-                  captured_ambiguous_authority_identity="$candidate_authority_identity"
-                fi
-              fi
-            fi
-          fi
-        fi
-      fi
-      rm -f \
-        "$observation_raw" \
-        "$observation_pending" \
-        "$output_raw" \
-        "$output_pending"
-      sleep 0.05
-    done
-  ) &
-  hard_crash_ownership_observer_pid=$!
+  local output_observation_spool="$takeover_output_observation_dir/observations.ndjson"
+  local ownership_observer_ready="$report_dir/ownership-observer-ready-before-exec.json"
+  local successor_anchor="$report_dir/control-plane-first-successor-anchor.json"
+  : >"$output_observation_spool"
+  SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+    "$resilience_admin" takeover-output \
+    --region-key "$SNAKETRON_REGION_CODE" \
+    --partition "$killed_partition" \
+    --killed-boot-id "$killed_boot_id" \
+    --baseline-status "$pre" \
+    --ready-output "$ownership_observer_ready" \
+    --anchor-output "$successor_anchor" >"$output_observation_spool" \
+    2>"$takeover_output_observation_dir/watch-errors.log" &
+  hard_crash_output_observer_pid=$!
 
   # Do not start the external fault until both observers have published valid
   # old-consumer and old-owner/token samples. This closes the
-  # fork-before-first-sample race for both independently selected proofs.
+  # fork-before-first-sample race on each direct Redis connection.
   local observer_ready="$report_dir/control-plane-observer-ready-before-exec.json"
   local observer_ready_candidate="$observer_ready.pending"
   local observer_ready_deadline=$((SECONDS + 10))
-  local -a observer_startup_samples=()
   while (( SECONDS < observer_ready_deadline )); do
-    observer_startup_samples=( "$control_observation_dir"/*.json )
-    if [[ -e "${observer_startup_samples[0]}" ]]; then
-      if select_pre_fault_pending_sample \
+    hard_crash_observers_are_running || break
+    if [[ -s "$pending_observation_spool" ]] \
+      && select_pre_fault_pending_sample \
         "$killed_partition" \
         "$killed_lease_token" \
-        "${observer_startup_samples[@]}" >"$observer_ready_candidate" \
-        2>/dev/null \
-        && jq -e 'type == "object"' "$observer_ready_candidate" >/dev/null; then
-        mv "$observer_ready_candidate" "$observer_ready"
-        break
-      fi
-      rm -f "$observer_ready_candidate"
+        "$pending_observation_spool" >"$observer_ready_candidate" 2>/dev/null \
+      && jq -e 'type == "object"' "$observer_ready_candidate" >/dev/null; then
+      mv "$observer_ready_candidate" "$observer_ready"
+      break
     fi
+    rm -f "$observer_ready_candidate"
     sleep 0.1
   done
   if [[ ! -f "$observer_ready" ]]; then
@@ -4341,32 +4246,29 @@ inject_hard_crash_and_prove_takeover() {
     echo "The hard-crash observer did not establish a valid pre-fault sample" >&2
     return 1
   fi
-  local ownership_observer_ready="$report_dir/ownership-observer-ready-before-exec.json"
-  local ownership_observer_ready_candidate="$ownership_observer_ready.pending"
   local ownership_observer_ready_deadline=$((SECONDS + 10))
-  local -a ownership_observer_startup_samples=()
+  local ownership_observer_ready_valid=false
   while (( SECONDS < ownership_observer_ready_deadline )); do
-    ownership_observer_startup_samples=( "$ownership_observation_dir"/*.json )
-    if [[ -e "${ownership_observer_startup_samples[0]}" ]]; then
-      if select_pre_fault_ownership_sample \
+    hard_crash_observers_are_running || break
+    if [[ -s "$ownership_observer_ready" ]] \
+      && select_pre_fault_ownership_sample \
         "$killed_partition" \
         "$killed_boot_id" \
         "$killed_lease_token" \
-        "${ownership_observer_startup_samples[@]}" \
-        >"$ownership_observer_ready_candidate" 2>/dev/null \
-        && jq -e 'type == "object"' \
-          "$ownership_observer_ready_candidate" >/dev/null; then
-        mv "$ownership_observer_ready_candidate" "$ownership_observer_ready"
-        break
-      fi
-      rm -f "$ownership_observer_ready_candidate"
+        "$ownership_observer_ready" >/dev/null 2>&1; then
+      ownership_observer_ready_valid=true
+      break
     fi
     sleep 0.1
   done
-  if [[ ! -f "$ownership_observer_ready" ]]; then
+  if [[ "$ownership_observer_ready_valid" != true ]]; then
     stop_hard_crash_control_observer
-    rm -f "$ownership_observer_ready_candidate"
     echo "The ownership observer did not establish a valid pre-fault sample" >&2
+    return 1
+  fi
+  if ! hard_crash_observers_are_running; then
+    stop_hard_crash_control_observer
+    echo "A hard-crash watcher exited before fault injection" >&2
     return 1
   fi
 
@@ -4378,6 +4280,11 @@ inject_hard_crash_and_prove_takeover() {
   local exec_output="$report_dir/hard-crash-ecs-exec.log"
   local ecs_exec_invoked_at_ms
   local ecs_exec_max_attempts=1
+  if ! hard_crash_observers_are_running; then
+    stop_hard_crash_control_observer
+    echo "A hard-crash watcher exited immediately before fault injection" >&2
+    return 1
+  fi
   ecs_exec_invoked_at_ms="$(unix_time_ms)"
   AWS_MAX_ATTEMPTS="$ecs_exec_max_attempts" \
     timeout --signal=TERM --kill-after=2s 40s aws ecs execute-command \
@@ -4397,7 +4304,11 @@ inject_hard_crash_and_prove_takeover() {
   local task_stop_candidate="$task_stop.pending"
   local task_stop_deadline=$((SECONDS + 45))
   local task_stop_observed_at_ms=""
+  local observer_failed_after_fault=false
   while (( SECONDS < task_stop_deadline )); do
+    if ! hard_crash_observers_are_running; then
+      observer_failed_after_fault=true
+    fi
     if aws ecs describe-tasks \
       --region "$SNAKETRON_AWS_REGION" \
       --cluster "$SNAKETRON_ECS_CLUSTER" \
@@ -4414,12 +4325,17 @@ inject_hard_crash_and_prove_takeover() {
     fi
     sleep 1
   done
+  if ! hard_crash_observers_are_running; then
+    observer_failed_after_fault=true
+  fi
 
   local execution_stopped_at=""
   local execution_stopped_at_ms=""
   local recovery_timing_origin_ms=""
   local failure_reason=""
-  if [[ ! -f "$task_stop" ]]; then
+  if [[ "$observer_failed_after_fault" == true ]]; then
+    failure_reason="A hard-crash watcher exited after fault injection"
+  elif [[ ! -f "$task_stop" ]]; then
     failure_reason="The selected ECS task never exposed an authoritative executionStoppedAt after the single SIGKILL attempt"
   else
     execution_stopped_at="$(jq -er '.tasks[0].executionStoppedAt' "$task_stop")"
@@ -4428,6 +4344,10 @@ inject_hard_crash_and_prove_takeover() {
       failure_reason="ECS returned an executionStoppedAt value that could not be parsed at millisecond precision"
     else
       recovery_timing_origin_ms=$(( (execution_stopped_at_ms / 1000) * 1000 ))
+      # Certification compares runner-host UTC observations with ECS UTC
+      # timestamps and therefore assumes both clocks are NTP-synchronized.
+      # The host-monotonic interval prevents local clock steps from narrowing
+      # an observation; it does not claim distributed clock calibration.
       if (( execution_stopped_at_ms < ecs_exec_invoked_at_ms \
         || execution_stopped_at_ms > task_stop_observed_at_ms )); then
         failure_reason="ECS executionStoppedAt did not fall between the ECS Exec invocation and its control-plane observation"
@@ -4435,80 +4355,70 @@ inject_hard_crash_and_prove_takeover() {
     fi
   fi
 
-  # Select the PEL proof from the atomic partition-local stream and ownership
-  # from the lightweight ownership stream. The PEL proof requires an exact
-  # old-consumer command ID no later than two seconds after the stop. Ownership
-  # must advance to a new fenced token on a member that was already present
-  # before the crash. The observer immediately paired that same-slot ownership
-  # snapshot's event-stream tail with a later CommandScheduledV2; after ECS
-  # exposes its timestamp, both halves of one saved pair must fit the five-second
-  # bound.
+  # Filter the buffered observations only after ECS exposes its exact stop
+  # timestamp. The independent output watcher latches the first eligible
+  # successor and captures its fixed-tail output while ECS polling proceeds,
+  # so delayed ECS propagation cannot erase the five-second evidence window.
   local pending_after_kill="$report_dir/control-plane-immediate-post-kill.json"
   local pending_candidate="$pending_after_kill.pending"
   local owner_ready="$report_dir/control-plane-hard-crash-owner-ready.json"
-  local owner_raw_candidate="$owner_ready.raw.pending"
   local owner_candidate="$owner_ready.pending"
   local authoritative_output="$report_dir/control-plane-hard-crash-output.json"
-  local authoritative_output_raw="$authoritative_output.raw.pending"
   local authoritative_output_candidate="$authoritative_output.pending"
   if [[ -z "$failure_reason" ]]; then
     local proof_deadline=$((SECONDS + 10))
-    local -a control_samples=()
-    local -a takeover_output_samples=()
     while (( SECONDS < proof_deadline )); do
-      control_samples=( "$control_observation_dir"/*.json )
-      if [[ -e "${control_samples[0]}" ]]; then
-        if [[ ! -f "$pending_after_kill" ]]; then
-          if select_post_kill_pending_sample \
-            "$execution_stopped_at_ms" \
-            "$killed_partition" \
-            "$killed_lease_token" \
-            "${control_samples[@]}" >"$pending_candidate" 2>/dev/null \
-            && jq -e 'type == "object"' "$pending_candidate" >/dev/null; then
-            mv "$pending_candidate" "$pending_after_kill"
-          else
-            rm -f "$pending_candidate"
-          fi
+      if ! hard_crash_observers_are_running; then
+        failure_reason="A hard-crash watcher exited while proof evidence was being selected"
+        break
+      fi
+      if [[ ! -f "$pending_after_kill" ]]; then
+        if select_post_kill_pending_sample \
+          "$execution_stopped_at_ms" \
+          "$killed_partition" \
+          "$killed_lease_token" \
+          "$pending_observation_spool" >"$pending_candidate" 2>/dev/null \
+          && jq -e 'type == "object"' "$pending_candidate" >/dev/null; then
+          mv "$pending_candidate" "$pending_after_kill"
+        else
+          rm -f "$pending_candidate"
         fi
       fi
-      takeover_output_samples=( "$takeover_output_observation_dir"/*.json )
-      if [[ -e "${takeover_output_samples[0]}" \
+
+      if [[ -f "$successor_anchor" && ! -f "$owner_ready" ]]; then
+        if select_hard_crash_owner_ready_ownership_sample \
+          "$pre" \
+          "$execution_stopped_at_ms" \
+          "$killed_partition" \
+          "$killed_boot_id" \
+          "$killed_task_id" \
+          "$killed_lease_token" \
+          "$successor_anchor" >"$owner_candidate" 2>/dev/null \
+          && jq -e 'type == "object"' "$owner_candidate" >/dev/null; then
+          mv "$owner_candidate" "$owner_ready"
+        else
+          rm -f "$owner_candidate"
+        fi
+      fi
+
+      if [[ -f "$successor_anchor" \
         && ! -f "$authoritative_output" ]]; then
-        local takeover_output_sample
-        for takeover_output_sample in "${takeover_output_samples[@]}"; do
-          if jq -e '.ownership' "$takeover_output_sample" \
-            >"$owner_raw_candidate" \
-            && select_hard_crash_owner_ready_ownership_sample \
-              "$pre" \
-              "$execution_stopped_at_ms" \
-              "$killed_partition" \
-              "$killed_boot_id" \
-              "$killed_task_id" \
-              "$killed_lease_token" \
-              "$owner_raw_candidate" >"$owner_candidate" 2>/dev/null \
-            && jq -e '.output' "$takeover_output_sample" \
-              >"$authoritative_output_raw"; then
-            local authority_event_tail_id
-            authority_event_tail_id="$(
-              jq -er '.authority_event_tail_id' "$owner_candidate"
-            )"
-            if select_hard_crash_authoritative_output_sample \
-              "$execution_stopped_at_ms" \
-              "$killed_partition" \
-              "$authority_event_tail_id" \
-              "$authoritative_output_raw" \
-              >"$authoritative_output_candidate" 2>/dev/null; then
-              mv "$owner_candidate" "$owner_ready"
-              mv "$authoritative_output_candidate" "$authoritative_output"
-              break
-            fi
-          fi
-          rm -f \
-            "$owner_raw_candidate" \
-            "$owner_candidate" \
-            "$authoritative_output_raw" \
-            "$authoritative_output_candidate"
-        done
+        local authority_event_tail_id
+        authority_event_tail_id="$(
+          jq -er '.authority_event_tail_id' "$successor_anchor"
+        )"
+        if select_hard_crash_authoritative_output_sample \
+          "$execution_stopped_at_ms" \
+          "$killed_partition" \
+          "$authority_event_tail_id" \
+          "$output_observation_spool" \
+          >"$authoritative_output_candidate" 2>/dev/null \
+          && jq -e 'type == "object"' \
+            "$authoritative_output_candidate" >/dev/null; then
+          mv "$authoritative_output_candidate" "$authoritative_output"
+        else
+          rm -f "$authoritative_output_candidate"
+        fi
       fi
       if [[ -f "$pending_after_kill" \
         && -f "$owner_ready" \
@@ -4534,11 +4444,8 @@ inject_hard_crash_and_prove_takeover() {
   rm -f \
     "$task_stop_candidate" \
     "$pending_candidate" \
-    "$owner_raw_candidate" \
     "$owner_candidate" \
-    "$authoritative_output_raw" \
-    "$authoritative_output_candidate" \
-    "$ownership_observer_ready_candidate"
+    "$authoritative_output_candidate"
   if [[ -z "$failure_reason" && "$ecs_exec_session_started" != true ]]; then
     failure_reason="ECS Exec did not establish the single non-retried session before the selected task stopped"
   fi
@@ -4592,6 +4499,10 @@ inject_hard_crash_and_prove_takeover() {
             $observed[0].observation_started_at_ms,
           observation_completed_at_unix_ms:
             $observed[0].observation_completed_at_ms,
+          redis_observation_started_at_valkey_ms:
+            $observed[0].redis_observation_started_at_ms,
+          redis_observation_completed_at_valkey_ms:
+            $observed[0].redis_observation_completed_at_ms,
           partition: $partition,
           killed_lease_token: $killed_lease_token,
           entries: [$observed[0].pending_entry]
@@ -4599,10 +4510,10 @@ inject_hard_crash_and_prove_takeover() {
         owner_observation_started_at_unix_ms:
           $ready[0].observation_started_at_ms,
         owner_sample_captured_at_unix_ms: $ready[0].captured_at_ms,
-        owner_membership_observed_at_unix_ms:
-          $ready[0].membership_observed_at_ms,
-        owner_authority_observed_at_unix_ms:
-          $ready[0].authority_observed_at_ms,
+        owner_membership_observed_at_valkey_ms:
+          $ready[0].redis_membership_observed_at_ms,
+        owner_authority_observed_at_valkey_ms:
+          $ready[0].redis_authority_observed_at_ms,
         owner_authority_event_tail_id:
           $ready[0].authority_event_tail_id,
         owner_ready_at_unix_ms: $ready[0].observation_completed_at_ms,
@@ -4613,6 +4524,10 @@ inject_hard_crash_and_prove_takeover() {
           captured_at_unix_ms: $output[0].captured_at_ms,
           observation_completed_at_unix_ms:
             $output[0].observation_completed_at_ms,
+          redis_observation_started_at_valkey_ms:
+            $output[0].redis_observation_started_at_ms,
+          redis_observation_completed_at_valkey_ms:
+            $output[0].redis_observation_completed_at_ms,
           partition: $output[0].partition,
           after_stream_id: $output[0].after_stream_id,
           first_scheduled_output: $output[0].first_scheduled_output
@@ -4789,10 +4704,12 @@ assert_hard_crash_report() {
             $crash_to_ready_p99_upper_bound_ms,
           first_authoritative_output_stream_id:
             $authoritative_output[0].first_scheduled_output.stream_id,
-          first_authoritative_output_at_unix_ms:
+          first_authoritative_output_stream_valkey_ms:
             $authoritative_output[0].first_scheduled_output.stream_unix_ms,
+          first_authoritative_output_observed_at_unix_ms:
+            $authoritative_output[0].observation_completed_at_ms,
           first_authoritative_output_ms:
-            ($authoritative_output[0].first_scheduled_output.stream_unix_ms
+            ($authoritative_output[0].observation_completed_at_ms
               - $exact_stop),
           pre_crash_capacity: {
             evaluated_first_second: $stable_first_second,
@@ -4813,7 +4730,9 @@ assert_hard_crash_report() {
           },
           checks: {
             load_contract: (
-              $r.schema_version >= 10
+              $r.schema_version >= 11
+              and $r.metadata.command_outcome_latency_basis
+                == "original-send-to-dedicated-reader-frame-receipt"
               and $r.metadata.threshold_result == "passed"
               and $r.configured_max_concurrency == 272
               and $r.metadata.mode == "duel"
@@ -4838,6 +4757,8 @@ assert_hard_crash_report() {
                 <= $observer_ready[0].captured_at_ms
               and $observer_ready[0].captured_at_ms
                 <= $observer_ready[0].observation_completed_at_ms
+              and $observer_ready[0].redis_observation_started_at_ms
+                <= $observer_ready[0].redis_observation_completed_at_ms
               and $observer_ready[0].partition == $partition
               and $observer_ready[0].requested_consumer
                 == $m.selected_partition.lease_token
@@ -4854,14 +4775,10 @@ assert_hard_crash_report() {
                 <= $ownership_observer_ready[0].captured_at_ms
               and $ownership_observer_ready[0].captured_at_ms
                 <= $ownership_observer_ready[0].observation_completed_at_ms
-              and $ownership_observer_ready[0].membership_observed_at_ms
-                >= $ownership_observer_ready[0].observation_started_at_ms
-              and $ownership_observer_ready[0].membership_observed_at_ms
-                <= $ownership_observer_ready[0].observation_completed_at_ms
-              and $ownership_observer_ready[0].authority_observed_at_ms
-                >= $ownership_observer_ready[0].observation_started_at_ms
-              and $ownership_observer_ready[0].authority_observed_at_ms
-                <= $ownership_observer_ready[0].observation_completed_at_ms
+              and ($ownership_observer_ready[0].redis_membership_observed_at_ms
+                | type == "number")
+              and ($ownership_observer_ready[0].redis_authority_observed_at_ms
+                | type == "number")
               and ($ownership_observer_ready[0].authority_event_tail_id
                 | type == "string" and test("^[0-9]+-[0-9]+$"))
               and $ownership_observer_partition.owner_matches
@@ -4918,6 +4835,14 @@ assert_hard_crash_report() {
                 == $pending_after_kill[0].observation_started_at_ms
               and $m.pending_after_kill.observation_completed_at_unix_ms
                 == $pending_after_kill[0].observation_completed_at_ms
+              and $m.pending_after_kill
+                .redis_observation_started_at_valkey_ms
+                == $pending_after_kill[0].redis_observation_started_at_ms
+              and $m.pending_after_kill
+                .redis_observation_completed_at_valkey_ms
+                == $pending_after_kill[0].redis_observation_completed_at_ms
+              and $pending_after_kill[0].redis_observation_started_at_ms
+                <= $pending_after_kill[0].redis_observation_completed_at_ms
               and ($pending_ids | length) > 0
               and ($pending_ids | length)
                 == ($m.pending_after_kill.entries | length)
@@ -4928,10 +4853,10 @@ assert_hard_crash_report() {
                 == $owner_ready[0].observation_started_at_ms
               and $m.owner_sample_captured_at_unix_ms
                 == $owner_ready[0].captured_at_ms
-              and $m.owner_membership_observed_at_unix_ms
-                == $owner_ready[0].membership_observed_at_ms
-              and $m.owner_authority_observed_at_unix_ms
-                == $owner_ready[0].authority_observed_at_ms
+              and $m.owner_membership_observed_at_valkey_ms
+                == $owner_ready[0].redis_membership_observed_at_ms
+              and $m.owner_authority_observed_at_valkey_ms
+                == $owner_ready[0].redis_authority_observed_at_ms
               and $m.owner_authority_event_tail_id
                 == $owner_ready[0].authority_event_tail_id
               and $m.owner_ready_at_unix_ms
@@ -4941,14 +4866,10 @@ assert_hard_crash_report() {
                 >= $owner_ready[0].observation_started_at_ms
               and $owner_ready[0].captured_at_ms
                 <= $owner_ready[0].observation_completed_at_ms
-              and $owner_ready[0].membership_observed_at_ms
-                >= $owner_ready[0].observation_started_at_ms
-              and $owner_ready[0].membership_observed_at_ms
-                <= $owner_ready[0].observation_completed_at_ms
-              and $owner_ready[0].authority_observed_at_ms
-                >= $owner_ready[0].observation_started_at_ms
-              and $owner_ready[0].authority_observed_at_ms
-                <= $owner_ready[0].observation_completed_at_ms
+              and ($owner_ready[0].redis_membership_observed_at_ms
+                | type == "number")
+              and ($owner_ready[0].redis_authority_observed_at_ms
+                | type == "number")
               and ($owner_ready[0].authority_event_tail_id
                 | type == "string" and test("^[0-9]+-[0-9]+$"))
               and $owner_ready[0].observation_completed_at_ms
@@ -4957,7 +4878,8 @@ assert_hard_crash_report() {
                 == $owner_ready[0].assignment.version
               and $owner_ready[0].assignment.version
                 > $pre[0].assignment.version
-              and $owner_ready[0].assignment.computed_at_ms >= $exact_stop
+              and ($owner_ready[0].assignment.computed_at_ms
+                | type == "number")
               and $owner_ready[0].authority_stable
               and $owner_ready[0].killed_member_live == false
               and $new.owner_matches
@@ -4998,6 +4920,12 @@ assert_hard_crash_report() {
                 == $authoritative_output[0].captured_at_ms
               and $m.authoritative_output.observation_completed_at_unix_ms
                 == $authoritative_output[0].observation_completed_at_ms
+              and $m.authoritative_output
+                .redis_observation_started_at_valkey_ms
+                == $authoritative_output[0].redis_observation_started_at_ms
+              and $m.authoritative_output
+                .redis_observation_completed_at_valkey_ms
+                == $authoritative_output[0].redis_observation_completed_at_ms
               and $m.authoritative_output.partition == $partition
               and $m.authoritative_output.partition
                 == $authoritative_output[0].partition
@@ -5013,17 +4941,17 @@ assert_hard_crash_report() {
                 >= $authoritative_output[0].observation_started_at_ms
               and $authoritative_output[0].captured_at_ms
                 <= $authoritative_output[0].observation_completed_at_ms
+              and $authoritative_output[0].observation_completed_at_ms
+                <= ($exact_stop + 5000)
               and ($output_id.milliseconds > $output_anchor.milliseconds
                 or ($output_id.milliseconds == $output_anchor.milliseconds
                   and $output_id.sequence > $output_anchor.sequence))
               and $authoritative_output[0].first_scheduled_output.stream_unix_ms
                 == $output_id.milliseconds
+              and $authoritative_output[0].redis_observation_started_at_ms
+                <= $authoritative_output[0].redis_observation_completed_at_ms
               and $authoritative_output[0].first_scheduled_output.stream_unix_ms
-                >= $exact_stop
-              and $authoritative_output[0].first_scheduled_output.stream_unix_ms
-                <= ($exact_stop + 5000)
-              and $authoritative_output[0].first_scheduled_output.stream_unix_ms
-                <= $authoritative_output[0].captured_at_ms
+                <= $authoritative_output[0].redis_observation_completed_at_ms
               and $authoritative_output[0].first_scheduled_output.game_id % 10
                 == $partition
               and $authoritative_output[0].first_scheduled_output
@@ -5071,6 +4999,7 @@ run_staging_suite() {
   require_command nc
   require_command timeout
   if [[ "$crash_mode" == true ]]; then
+    require_command ps
     require_command session-manager-plugin
   fi
   require_staging_environment
@@ -5138,9 +5067,7 @@ run_staging_suite() {
   ecs_runtime_monitor_pid=""
   ecs_runtime_monitor_dir=""
   hard_crash_control_observer_pid=""
-  hard_crash_control_observer_stop_file=""
-  hard_crash_ownership_observer_pid=""
-  hard_crash_ownership_observer_stop_file=""
+  hard_crash_output_observer_pid=""
   hard_crash_ecs_exec_pid=""
 
   set_scaling_suspended() {
@@ -6189,7 +6116,9 @@ run_staging_suite() {
         as $scale_in_first_second
       | (($scale_in[0].finished_at_unix_ms / 1000) | floor)
         as $scale_in_after_last_second
-      | .schema_version >= 10
+      | .schema_version >= 11
+      and .metadata.command_outcome_latency_basis
+        == "original-send-to-dedicated-reader-frame-receipt"
       and .metadata.threshold_result == "passed"
       and .configured_max_concurrency == 128
       and .metadata.mode == "duel"

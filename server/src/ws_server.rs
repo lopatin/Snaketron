@@ -1986,6 +1986,8 @@ async fn subscribe_to_game_events(
                 {
                     send_completed_game_snapshot(
                         &ws_tx,
+                        &game_bus,
+                        &cluster_namespace,
                         game_id,
                         user_id,
                         &game_state,
@@ -2059,6 +2061,8 @@ async fn subscribe_to_game_events(
                 {
                     send_completed_game_snapshot(
                         &ws_tx,
+                        &game_bus,
+                        &cluster_namespace,
                         game_id,
                         user_id,
                         &game_state,
@@ -2104,6 +2108,8 @@ async fn subscribe_to_game_events(
                             {
                                 send_completed_game_snapshot(
                                     &ws_tx,
+                                    &game_bus,
+                                    &cluster_namespace,
                                     game_id,
                                     user_id,
                                     &game_state,
@@ -2163,8 +2169,16 @@ async fn subscribe_to_game_events(
     };
 
     if matches!(game_state.status, GameStatus::Complete { .. }) {
-        send_completed_game_snapshot(&ws_tx, game_id, user_id, &game_state, "replication cache")
-            .await;
+        send_completed_game_snapshot(
+            &ws_tx,
+            &game_bus,
+            &cluster_namespace,
+            game_id,
+            user_id,
+            &game_state,
+            "replication cache",
+        )
+        .await;
         return;
     }
 
@@ -2224,6 +2238,7 @@ async fn subscribe_to_game_events(
                 match replication_manager.subscribe_to_game(game_id).await {
                     Ok((state, watermark, new_rx)) => {
                         rx = new_rx;
+                        let terminal = matches!(state.status, GameStatus::Complete { .. });
                         let resync = GameEventMessage {
                             game_id,
                             tick: state.tick,
@@ -2249,6 +2264,13 @@ async fn subscribe_to_game_events(
                         )
                         .await
                         {
+                            return;
+                        }
+                        if terminal {
+                            info!(
+                                game_id,
+                                "Lag resync reached terminal state after durable outcome replay"
+                            );
                             return;
                         }
                         continue;
@@ -2303,9 +2325,13 @@ async fn subscribe_to_game_events(
         };
 
         // Check if the game has ended
-        let is_final = matches!(
+        let is_terminal = matches!(
             &event_msg.event,
             GameEvent::StatusUpdated { status } if matches!(status, GameStatus::Complete { .. })
+        ) || matches!(
+            &event_msg.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
         );
         let is_snapshot = snapshot_requires_command_outcomes(&event_msg.event);
 
@@ -2336,17 +2362,18 @@ async fn subscribe_to_game_events(
             }
         }
 
-        if is_snapshot {
+        if is_snapshot || is_terminal {
             // A takeover snapshot can replace terminal command events that
             // were published by the old owner but never reached this socket.
-            // Reconcile before forwarding any later live delta.
+            // Terminal state also requires the same durable replay before a
+            // client may clear its command outbox or finish certification.
             if !send_command_outcomes(&ws_tx, &game_bus, &cluster_namespace, game_id, user_id).await
             {
                 return;
             }
         }
 
-        if is_final {
+        if is_terminal {
             info!("Game {} completed, stopping event subscription", game_id);
             break;
         }
@@ -2360,6 +2387,21 @@ async fn send_command_outcomes(
     game_id: u32,
     user_id: u32,
 ) -> bool {
+    let Some(resolved) =
+        load_command_outcomes(ws_tx, game_bus, cluster_namespace, game_id, user_id).await
+    else {
+        return false;
+    };
+    send_command_outcomes_from_resolved(ws_tx, game_id, user_id, resolved).await
+}
+
+async fn load_command_outcomes(
+    ws_tx: &mpsc::Sender<Message>,
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> Option<ResolvedCommandState> {
     let deadline = tokio::time::Instant::now() + COMMAND_OUTCOME_LOAD_TIMEOUT;
     let envelope = loop {
         match tokio::time::timeout(
@@ -2389,16 +2431,56 @@ async fn send_command_outcomes(
                 user_id, "Command outcomes did not become readable before the warm-up deadline"
             );
             send_game_warming(ws_tx, game_id).await;
-            return false;
+            return None;
         }
         tokio::select! {
-            _ = ws_tx.closed() => return false,
+            _ = ws_tx.closed() => return None,
             _ = tokio::time::sleep(COMMAND_OUTCOME_RETRY_DELAY) => {}
         }
     };
 
-    send_command_outcomes_from_resolved(ws_tx, game_id, user_id, envelope.resolved_client_commands)
-        .await
+    Some(envelope.resolved_client_commands)
+}
+
+async fn load_completed_command_outcomes(
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> Option<ResolvedCommandState> {
+    match tokio::time::timeout(
+        COMMAND_OUTCOME_READ_TIMEOUT,
+        game_bus.get_recovery(cluster_namespace, game_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(envelope))) => Some(envelope.resolved_client_commands),
+        Ok(Ok(None)) => {
+            warn!(
+                game_id,
+                user_id,
+                "Terminal recovery outcomes are no longer retained; sending an empty outcome barrier"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(
+                game_id,
+                user_id,
+                %error,
+                "Failed to load terminal recovery outcomes; sending an empty outcome barrier"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                game_id,
+                user_id,
+                "Timed out loading terminal recovery outcomes; sending an empty outcome barrier"
+            );
+            None
+        }
+    }
 }
 
 async fn send_command_outcomes_from_resolved(
@@ -2485,6 +2567,8 @@ async fn send_game_snapshot(
 
 async fn send_completed_game_snapshot(
     ws_tx: &mpsc::Sender<Message>,
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
     game_id: u32,
     user_id: u32,
     game_state: &GameState,
@@ -2515,16 +2599,35 @@ async fn send_completed_game_snapshot(
         "Loaded game {} state from {} for user {}",
         game_id, source, user_id
     );
-    if let Err(e) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
+    // The terminal snapshot remains useful after the short recovery envelope
+    // expires. An empty barrier fabricates no outcomes: clients with pending
+    // identities must retain them and fail closed, while clients with no
+    // pending commands can safely render the durable completed game.
+    let resolved = load_completed_command_outcomes(game_bus, cluster_namespace, game_id, user_id)
+        .await
+        .unwrap_or_default();
+    if !send_completed_game_snapshot_from_resolved(ws_tx, game_id, user_id, game_state, resolved)
+        .await
+    {
         error!(
-            "Failed to send {} for game {} to user {}: {}",
-            source, game_id, user_id, e
+            "Failed to send {} and its terminal command outcomes for game {} to user {}",
+            source, game_id, user_id
         );
-        return;
     }
-    // Terminal state itself clears every pending command, but replacement
-    // sockets still require the explicit protocol barrier before promotion.
-    let _ = send_command_outcome_barrier(ws_tx, game_id, user_id).await;
+}
+
+async fn send_completed_game_snapshot_from_resolved(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    game_state: &GameState,
+    resolved: ResolvedCommandState,
+) -> bool {
+    if let Err(error) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
+        error!(game_id, user_id, %error, "Failed to send completed game snapshot");
+        return false;
+    }
+    send_command_outcomes_from_resolved(ws_tx, game_id, user_id, resolved).await
 }
 
 async fn send_game_load_failed(
@@ -4066,7 +4169,7 @@ mod lifecycle_protocol_tests {
         command_outcomes_for_user, game_join_denied, game_join_failure_message,
         missing_game_join_failure, next_outbound_message, queue_planned_drain_notice,
         recovery_bridge_snapshot, send_command_outcomes_from_resolved,
-        send_completed_game_snapshot, send_recovery_bridge_snapshot,
+        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
         snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
         take_lobby_update_receiver, unsent_lobby_match,
     };
@@ -4486,19 +4589,51 @@ mod lifecycle_protocol_tests {
     }
 
     #[tokio::test]
-    async fn completed_snapshot_also_emits_the_promotion_barrier() {
+    async fn completed_snapshot_is_followed_by_terminal_recovery_fence_and_barrier() {
         let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
         state.add_player(5, None).unwrap();
         state.status = GameStatus::Complete {
             winning_snake_id: Some(0),
         };
         let (tx, mut rx) = mpsc::channel(3);
+        let resolved = ResolvedCommandState {
+            sessions: BTreeMap::from([(
+                "5:terminal-session".to_owned(),
+                SessionCommandOutcomes {
+                    contiguous_through: 3,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: Some(SessionCommandRejectionFence {
+                        from_sequence: 4,
+                        reason: SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+                    }),
+                },
+            )]),
+        };
 
-        send_completed_game_snapshot(&tx, 42, 5, &state, "test snapshot").await;
+        assert!(send_completed_game_snapshot_from_resolved(&tx, 42, 5, &state, resolved).await);
 
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
-            WSMessage::GameEvent(_)
+            WSMessage::GameEvent(event)
+                if matches!(
+                    &event.event,
+                    GameEvent::Snapshot { game_state }
+                        if matches!(game_state.status, GameStatus::Complete { .. })
+                )
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomes {
+                game_id: 42,
+                client_game_session_id,
+                contiguous_through: 3,
+                rejection_fence: Some(SessionCommandRejectionFence {
+                    from_sequence: 4,
+                    reason,
+                }),
+                ..
+            } if client_game_session_id == "terminal-session"
+                && reason == SPARSE_COMMAND_WINDOW_REJECTION_REASON
         ));
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),

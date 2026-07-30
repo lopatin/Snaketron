@@ -314,7 +314,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
 9. A rejected or never-received sequence must not be represented as accepted merely because a higher sequence resolved. The contiguous watermark never advances across an unresolved gap.
 10. Retain at most 128 exact outcomes per client game session and at most 64 client game sessions per game. Keep this bound equal to the browser outbox bound. The contiguous watermark remains in every recovery checkpoint for the checkpoint lifetime and permanently fences older resolved identities, so pruning an exact result does not permit its logical effect to run again.
 11. Recovery checkpoints must contain the resolved watermark and sparse command outcomes. After a recovery snapshot, the server sends that user's `CommandOutcomes` records followed by an explicit `CommandOutcomesComplete` barrier before the client may resend unresolved commands.
-12. A client may remove an outbox entry only after matching `CommandScheduledV2`, matching `CommandRejected`, matching `CommandOutcomes`, or an authoritative terminal game state (`Complete` or definitive `GameLoadFailed`) proving no command can still execute.
+12. A client may remove an outbox entry only after matching `CommandScheduledV2`, matching `CommandRejected`, matching `CommandOutcomes`, or a definitive `GameLoadFailed`. A terminal game event parks retries but does not resolve pending commands: the server must immediately follow it with the durable per-session outcomes (including any rejection fence) and `CommandOutcomesComplete`, and the client accepts terminal reconciliation only after processing that ordered barrier and proving that no command remains pending. The client retains an empty terminal tombstone until explicit leave/navigation so input cannot open a new command session either before or after the barrier while UI state catches up. If the short-lived recovery envelope has expired, an authorized completed-game reload may send the durable terminal snapshot followed by an empty barrier; this preserves read availability without fabricating an outcome, because any client that still has pending identities remains parked and fails closed.
 13. Before publishing a client-visible `CommandScheduledV2` or `CommandRejected`
     that is not yet checkpointed, the executor must atomically and under its
     live fence write the exact outcome, authoritative schedule/counter, and
@@ -541,7 +541,10 @@ The assignment coordinator is control plane only. Existing assignments and activ
     scale-in. A client or certification session that receives upgrade `429`
     retries through the ordinary reconnect path inside its existing admission
     deadline. This is burst capacity, not a higher sustained rate or a relaxed
-    readiness deadline.
+    readiness deadline. The certification load client bounds each physical
+    WebSocket connection attempt to two seconds so one dead route cannot consume
+    the unchanged ten-second end-to-end admission deadline; retries share, and
+    never extend, that original deadline.
 
 ### R11 — Idempotent finalization and external effects
 
@@ -701,7 +704,7 @@ The stored source token is diagnostic only. On recovery, the successor's newly a
 1. The client places the stable command ID in its outbox before sending.
 2. The gateway appends it to the partition command stream.
 3. The executor processes it at least once and schedules it at most once.
-4. The client clears it on `CommandScheduledV2`, `CommandRejected`, matching `CommandOutcomes`, or an authoritative terminal game state.
+4. The client clears individual entries on `CommandScheduledV2`, `CommandRejected`, or matching `CommandOutcomes`. A terminal game event parks the outbox; it does not clear unresolved identities. After reconciling the terminal event's immediately following durable outcomes and rejection fence, `CommandOutcomesComplete` succeeds only when the pending set is empty; otherwise the client retains it and fails closed. Even on success, an empty terminal tombstone blocks new commands until explicit leave/navigation. A definitive `GameLoadFailed` may also clear it.
 5. If the gateway/socket fails at any point, the client resends the same identity after recovery readiness.
 
 ## 12. Failure semantics
@@ -794,6 +797,18 @@ The fixed Gate A, B, and C clients must observe zero sparse-window rejection
 fences. A fence is valid protective protocol behavior for a pathological
 session, but it fails load certification rather than counting its covered
 rejections as healthy command throughput.
+Command-outcome latency starts immediately before the original awaited socket
+write and ends when a dedicated, continuously polled socket reader receives
+the terminal-outcome frame, before lossless delivery to the synthetic game
+driver. Reader-receipt-to-driver lag is reported separately as load-generator
+diagnostic evidence. No frame may be discarded because the handoff for an
+active socket reaches a capacity limit. Retiring a socket may discard its
+private unread queue; exact pending-command accounting and the durable outcome
+barrier must then recover every outcome or fail certification. The real-browser
+suite remains the authority for JavaScript rendering and stale-overlay behavior.
+Command-outcome certification accepts report schema 11 or newer only when
+`metadata.command_outcome_latency_basis` is exactly
+`original-send-to-dedicated-reader-frame-receipt`.
 
 | Test | Pass criteria |
 | --- | --- |
@@ -1516,8 +1531,12 @@ brackets each selected-partition observation with start and completion times.
 Certification disables AWS CLI retries for the one mutating call, anchors the
 bounded observations to ECS `executionStoppedAt`, requires exact exit 137, and
 rejects explicit OOM/unhealthy reasons rather than relying on stdout that is
-inherently lost during container teardown. No production crash endpoint or
-additional external action is added.
+inherently lost during container teardown. Those deadline comparisons assume
+that the certification runner and ECS UTC clocks are NTP-synchronized.
+Runner-side observations use conservative monotonic-bracketed wall-clock
+intervals; Valkey timestamps are retained only for same-Valkey correlation and
+are not compared with ECS time. No production crash endpoint, distributed
+clock-calibration subsystem, or additional external action is added.
 
 The run reused the exact protected Network stack, ingress instance, root EBS,
 EIP, hostname, and certificate, with no development DNS/ACME change. Cleanup
