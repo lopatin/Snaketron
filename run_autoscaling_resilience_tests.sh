@@ -3153,7 +3153,24 @@ collect_ecs_runtime_evidence() {
     --region "$SNAKETRON_AWS_REGION" \
     --cluster "$SNAKETRON_ECS_CLUSTER" \
     --services "$SNAKETRON_ECS_SERVICE" >"$ecs_dir/service.json"
-  collect_observed_stopped_tasks "$ecs_dir/stopped-tasks.json"
+  # ECS can report desired=running=1 while the final scale-in task is still
+  # STOPPING and its stoppedAt field is null. Wait for complete task records
+  # so the checks below prove every observed shutdown instead of racing ECS.
+  local stopped_tasks_deadline=$((SECONDS + 180))
+  while true; do
+    collect_observed_stopped_tasks "$ecs_dir/stopped-tasks.json"
+    if jq -e '
+      (.failures | length) == 0
+      and all(.tasks[]; .stoppedAt != null)
+    ' "$ecs_dir/stopped-tasks.json" >/dev/null; then
+      break
+    fi
+    if (( SECONDS >= stopped_tasks_deadline )); then
+      echo "ECS did not publish complete records for every observed task stop within three minutes" >&2
+      return 1
+    fi
+    sleep 2
+  done
 
   jq -e --argjson started "$evidence_started_epoch" '
     def epoch:
@@ -3163,7 +3180,7 @@ collect_ecs_runtime_evidence() {
       | fromdateiso8601;
     (.failures | length) == 0
     and ([.tasks[] |
-      select((.stoppedAt | epoch) >= $started)
+      select(.stoppedAt == null or (.stoppedAt | epoch) >= $started)
       | select(
           .stopCode != "ServiceSchedulerInitiated"
           or ((.stoppedReason // "") | test("unhealthy|out.of.memory|failed"; "i"))

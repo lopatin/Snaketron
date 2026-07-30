@@ -1432,7 +1432,7 @@ async fn prepare_session(
     ));
     // One admission budget starts at the first connection attempt and ends only
     // after an ordered application pong. A draining task can race Traefik route
-    // withdrawal and return HTTP 503, while the bounded ingress limiter can
+    // withdrawal and return HTTP 502/503, while the bounded ingress limiter can
     // return HTTP 429 during a valid make-before-break burst. Retry only those
     // transient responses while retaining this session's guest token and
     // logical identity.
@@ -1472,7 +1472,7 @@ async fn prepare_session(
                 record.record_lifecycle(
                     SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
                         .with_message(
-                            "transient HTTP 429/503 admission response; retrying the same guest token",
+                            "transient HTTP 429/502/503 admission response; retrying the same guest token",
                         ),
                 );
                 let remaining =
@@ -4603,7 +4603,9 @@ fn is_retryable_websocket_admission(error: &anyhow::Error) -> bool {
             matches!(error, WebSocketError::Http(response)
             if matches!(
                 response.status(),
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
             ))
         })
     })
@@ -4859,6 +4861,13 @@ mod tests {
             .unwrap();
         let rate_limited = anyhow::Error::new(WebSocketError::Http(rate_limited));
         assert!(is_retryable_websocket_admission(&rate_limited));
+
+        let bad_gateway = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(None)
+            .unwrap();
+        let bad_gateway = anyhow::Error::new(WebSocketError::Http(bad_gateway));
+        assert!(is_retryable_websocket_admission(&bad_gateway));
 
         let forbidden = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(StatusCode::FORBIDDEN)
