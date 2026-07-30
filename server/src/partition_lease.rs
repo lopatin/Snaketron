@@ -9,6 +9,9 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 pub const DEFAULT_PARTITION_LEASE_TTL: Duration = Duration::from_secs(3);
+// Assignment authority renews every 200 ms. Keep its crash expiry below
+// membership expiry so a dead coordinator cannot delay survivor reconciliation.
+pub const DEFAULT_COORDINATOR_LEASE_TTL: Duration = Duration::from_secs(2);
 pub const DEFAULT_COORDINATION_OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -397,6 +400,7 @@ mod tests {
         // public invariant through a helper-like comparison here as a regression
         // assertion for the constructor condition.
         assert!(DEFAULT_COORDINATION_OPERATION_TIMEOUT < DEFAULT_PARTITION_LEASE_TTL);
+        assert!(DEFAULT_COORDINATION_OPERATION_TIMEOUT < DEFAULT_COORDINATOR_LEASE_TTL);
         assert!(namespace.partition_lease(1).contains(":test:"));
     }
 }

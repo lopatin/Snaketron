@@ -26,6 +26,8 @@ use futures_util::SinkExt;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::{Future, pending};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -526,6 +528,16 @@ pub async fn handle_websocket(
     }
 }
 
+async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = handle.take() {
+        handle.abort();
+        // CommandOutcomesComplete is intentionally compact and has no wire
+        // generation. Joining guarantees the old forwarder cannot enqueue its
+        // barrier after a replacement forwarder enqueues a newer snapshot.
+        let _ = handle.await;
+    }
+}
+
 /// Internal function to handle the WebSocket connection logic
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_connection(
@@ -732,14 +744,15 @@ async fn handle_websocket_connection(
                                     if in_this_game && allowed {
                                         last_resync_at = Some(now);
                                         if let ConnectionState::Authenticated { metadata, .. } = &state {
+                                            let user_id = metadata.user_id as u32;
                                             info!(
                                                 "Resync requested by user {} for game {}; restarting event subscription",
                                                 metadata.user_id, resync_game_id
                                             );
-                                            if let Some(handle) = game_event_handle.take() {
-                                                handle.abort();
-                                            }
-                                            let user_id = metadata.user_id as u32;
+                                            abort_and_join_game_event_forwarder(
+                                                &mut game_event_handle,
+                                            )
+                                            .await;
                                             let ws_tx_clone = ws_tx.clone();
                                             let replication_manager_clone = replication_manager.clone();
                                             let db_clone = db.clone();
@@ -836,16 +849,17 @@ async fn handle_websocket_connection(
                                             // Handle state transitions
                                             if entering_game
                                                 && let ConnectionState::Authenticated { game_id: Some(game_id), metadata, .. } = &new_state {
+                                                    let game_id = *game_id;
+                                                    let user_id = metadata.user_id as u32;
                                                     // Subscribe to game events if entering a game
-                                                    if let Some(handle) = game_event_handle.take() {
-                                                        handle.abort();
-                                                    }
+                                                    abort_and_join_game_event_forwarder(
+                                                        &mut game_event_handle,
+                                                    )
+                                                    .await;
                                                     if let Some(handle) = game_chat_handle.take() {
                                                         handle.abort();
                                                     }
 
-                                                    let game_id = *game_id;
-                                                    let user_id = metadata.user_id as u32;
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let replication_manager_clone = replication_manager.clone();
                                                     let db_clone = db.clone();
@@ -1366,6 +1380,52 @@ const COMMAND_OUTCOME_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
 const COMMAND_OUTCOME_READ_TIMEOUT: Duration = Duration::from_millis(750);
 const COMMAND_OUTCOME_RETRY_DELAY: Duration = Duration::from_millis(100);
 const TERMINAL_COMMAND_REJECTION_REASON: &str = "game completed";
+
+type CommandOutcomeReplay =
+    Pin<Box<dyn Future<Output = Option<ResolvedCommandState>> + Send + 'static>>;
+
+// This short-lived select result is stack-local. Boxing the event variant would
+// add a heap allocation to every live game event only to reduce stack padding.
+#[allow(clippy::large_enum_variant)]
+enum GameSubscriptionInput {
+    SocketClosed,
+    CommandOutcomes(Option<ResolvedCommandState>),
+    Event(Result<GameEventMessage, broadcast::error::RecvError>),
+}
+
+fn start_command_outcome_replay(
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> CommandOutcomeReplay {
+    Box::pin(
+        async move { load_command_outcomes(&game_bus, &cluster_namespace, game_id, user_id).await },
+    )
+}
+
+async fn wait_for_command_outcome_replay(
+    replay: &mut Option<CommandOutcomeReplay>,
+) -> Option<ResolvedCommandState> {
+    match replay {
+        Some(replay) => replay.as_mut().await,
+        None => pending().await,
+    }
+}
+
+async fn next_game_subscription_input(
+    ws_tx: &mpsc::Sender<Message>,
+    rx: &mut crate::replication::FilteredEventReceiver,
+    replay: &mut Option<CommandOutcomeReplay>,
+) -> GameSubscriptionInput {
+    tokio::select! {
+        _ = ws_tx.closed() => GameSubscriptionInput::SocketClosed,
+        outcomes = wait_for_command_outcome_replay(replay) => {
+            GameSubscriptionInput::CommandOutcomes(outcomes)
+        }
+        event = rx.recv() => GameSubscriptionInput::Event(event),
+    }
+}
 
 #[derive(Debug)]
 enum GameJoinAuthorizationError {
@@ -2204,23 +2264,52 @@ async fn subscribe_to_game_events(
         }
     }
 
-    if !send_command_outcomes(
-        &ws_tx,
-        &game_bus,
-        &cluster_namespace,
+    // Loading recovery outcomes can take several bounded Redis attempts. Keep
+    // that I/O concurrent with the live broadcast receiver so a fresh
+    // snapshot never stalls CommandScheduled delivery. The replay result still
+    // returns through this one forwarding loop, which preserves socket order.
+    let mut command_outcome_replay = Some(start_command_outcome_replay(
+        game_bus.clone(),
+        cluster_namespace.clone(),
         game_id,
         user_id,
-        None,
-    )
-    .await
-    {
-        return;
-    }
+    ));
 
     loop {
-        let event_msg = match rx.recv().await {
-            Ok(event_msg) => event_msg,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+        let input =
+            next_game_subscription_input(&ws_tx, &mut rx, &mut command_outcome_replay).await;
+        let event_msg = match input {
+            GameSubscriptionInput::SocketClosed => {
+                debug!(
+                    "WebSocket send channel closed for game {}, stopping event subscription",
+                    game_id
+                );
+                return;
+            }
+            GameSubscriptionInput::CommandOutcomes(resolved) => {
+                // Taking the completed future makes the next select ignore
+                // replay until another snapshot explicitly starts one.
+                drop(command_outcome_replay.take());
+                let Some(resolved) = resolved else {
+                    send_game_warming(&ws_tx, game_id).await;
+                    return;
+                };
+                if !send_command_outcomes_from_resolved(&ws_tx, game_id, user_id, resolved, None)
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
+            GameSubscriptionInput::Event(Ok(event_msg)) => event_msg,
+            GameSubscriptionInput::Event(Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            )) => {
+                // Any barrier for the old snapshot is now stale. Dropping the
+                // in-flight future cancels its Redis read; only the replay
+                // paired with the replacement snapshot may emit a barrier.
+                drop(command_outcome_replay.take());
+
                 // This connection fell behind the broadcast and lost events.
                 // Recover by sending a fresh snapshot (with its watermark) so
                 // the client re-anchors instead of silently diverging.
@@ -2248,25 +2337,31 @@ async fn subscribe_to_game_events(
                             );
                             return;
                         }
-                        if !send_command_outcomes(
-                            &ws_tx,
-                            &game_bus,
-                            &cluster_namespace,
-                            game_id,
-                            user_id,
-                            terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
-                        )
-                        .await
-                        {
-                            return;
-                        }
                         if terminal {
+                            if !send_command_outcomes(
+                                &ws_tx,
+                                &game_bus,
+                                &cluster_namespace,
+                                game_id,
+                                user_id,
+                                Some(TERMINAL_COMMAND_REJECTION_REASON),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             info!(
                                 game_id,
                                 "Lag resync reached terminal state after durable outcome replay"
                             );
                             return;
                         }
+                        command_outcome_replay = Some(start_command_outcome_replay(
+                            game_bus.clone(),
+                            cluster_namespace.clone(),
+                            game_id,
+                            user_id,
+                        ));
                         continue;
                     }
                     Err(e) => {
@@ -2279,7 +2374,8 @@ async fn subscribe_to_game_events(
                     }
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            GameSubscriptionInput::Event(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                drop(command_outcome_replay.take());
                 // Broadcaster dropped. If the game is still live in the
                 // replica, hand the client one last authoritative snapshot so
                 // it can at least resync via RequestResync; either way, log
@@ -2331,6 +2427,13 @@ async fn subscribe_to_game_events(
         );
         let is_snapshot = snapshot_requires_command_outcomes(&event_msg.event);
 
+        if is_snapshot || is_terminal {
+            // A later snapshot (or terminal frontier) invalidates a barrier
+            // for any earlier snapshot. Cancel before enqueuing the new
+            // frontier so a stale replay can never follow it.
+            drop(command_outcome_replay.take());
+        }
+
         let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
         let msg = Message::Text(json.into());
         if let Err(e) = ws_tx.try_send(msg.clone()) {
@@ -2358,11 +2461,12 @@ async fn subscribe_to_game_events(
             }
         }
 
-        if is_snapshot || is_terminal {
-            // A takeover snapshot can replace terminal command events that
-            // were published by the old owner but never reached this socket.
-            // Terminal state also requires the same durable replay before a
-            // client may clear its command outbox or finish certification.
+        if is_terminal {
+            // A takeover can replace terminal command events that were
+            // published by the old owner but never reached this socket.
+            // Terminal state requires durable replay before the client may
+            // clear its command outbox or finish certification. No later live
+            // event needs forwarding, so waiting here cannot stall gameplay.
             if !send_command_outcomes(
                 &ws_tx,
                 &game_bus,
@@ -2375,11 +2479,17 @@ async fn subscribe_to_game_events(
             {
                 return;
             }
-        }
-
-        if is_terminal {
             info!("Game {} completed, stopping event subscription", game_id);
             break;
+        }
+
+        if is_snapshot {
+            command_outcome_replay = Some(start_command_outcome_replay(
+                game_bus.clone(),
+                cluster_namespace.clone(),
+                game_id,
+                user_id,
+            ));
         }
     }
 }
@@ -2392,9 +2502,12 @@ async fn send_command_outcomes(
     user_id: u32,
     terminal_rejection_reason: Option<&str>,
 ) -> bool {
-    let Some(resolved) =
-        load_command_outcomes(ws_tx, game_bus, cluster_namespace, game_id, user_id).await
-    else {
+    let resolved = tokio::select! {
+        _ = ws_tx.closed() => return false,
+        resolved = load_command_outcomes(game_bus, cluster_namespace, game_id, user_id) => resolved,
+    };
+    let Some(resolved) = resolved else {
+        send_game_warming(ws_tx, game_id).await;
         return false;
     };
     send_command_outcomes_from_resolved(
@@ -2408,7 +2521,6 @@ async fn send_command_outcomes(
 }
 
 async fn load_command_outcomes(
-    ws_tx: &mpsc::Sender<Message>,
     game_bus: &GameBus,
     cluster_namespace: &ClusterNamespace,
     game_id: u32,
@@ -2442,13 +2554,9 @@ async fn load_command_outcomes(
                 game_id,
                 user_id, "Command outcomes did not become readable before the warm-up deadline"
             );
-            send_game_warming(ws_tx, game_id).await;
             return None;
         }
-        tokio::select! {
-            _ = ws_tx.closed() => return None,
-            _ = tokio::time::sleep(COMMAND_OUTCOME_RETRY_DELAY) => {}
-        }
+        tokio::time::sleep(COMMAND_OUTCOME_RETRY_DELAY).await;
     };
 
     Some(envelope.resolved_client_commands)
@@ -4228,13 +4336,14 @@ async fn spectate_game(
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        GameJoinAuthorizationError, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
+        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
+        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
         canonical_command_identity, command_outcomes_for_user, game_join_denied,
-        game_join_failure_message, missing_game_join_failure, next_outbound_message,
-        queue_planned_drain_notice, recovery_bridge_snapshot, send_command_outcomes_from_resolved,
-        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
-        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        take_lobby_update_receiver, unsent_lobby_match,
+        game_join_failure_message, missing_game_join_failure, next_game_subscription_input,
+        next_outbound_message, queue_planned_drain_notice, recovery_bridge_snapshot,
+        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
+        send_recovery_bridge_snapshot, snapshot_requires_command_outcomes,
+        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
     };
     use crate::lifecycle::DrainNotice;
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -4245,11 +4354,14 @@ mod lifecycle_protocol_tests {
     };
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::create_connection_manager;
-    use common::{ClientCommandIdentityV2, GameEvent, GameState, GameStatus, GameType, QueueMode};
+    use common::{
+        ClientCommandIdentityV2, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
+        QueueMode,
+    };
     use redis::{AsyncCommands, Client};
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
@@ -4441,6 +4553,88 @@ mod lifecycle_protocol_tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_outcome_replay_does_not_block_live_game_events() {
+        let (ws_tx, _ws_rx) = mpsc::channel(2);
+        let (events_tx, events_rx) = broadcast::channel(2);
+        let mut events = crate::replication::FilteredEventReceiver::new(events_rx, 0, 42);
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut replay: Option<CommandOutcomeReplay> = Some(Box::pin(async move {
+            release_rx.await.expect("test replay release was dropped");
+            Some(ResolvedCommandState::default())
+        }));
+        let live_event = GameEventMessage {
+            game_id: 42,
+            tick: 3,
+            sequence: 4,
+            stream_seq: 5,
+            user_id: None,
+            event: GameEvent::TickHash {
+                hash: 6,
+                server_ts_ms: 7,
+            },
+        };
+        events_tx
+            .send(live_event)
+            .expect("filtered receiver should remain subscribed");
+
+        let input = timeout(
+            Duration::from_secs(1),
+            next_game_subscription_input(&ws_tx, &mut events, &mut replay),
+        )
+        .await
+        .expect("a pending Redis replay blocked a ready live event");
+        assert!(matches!(
+            input,
+            GameSubscriptionInput::Event(Ok(event))
+                if event.game_id == 42 && event.stream_seq == 5
+        ));
+
+        release_tx.send(()).expect("replay future disappeared");
+        let input = timeout(
+            Duration::from_secs(1),
+            next_game_subscription_input(&ws_tx, &mut events, &mut replay),
+        )
+        .await
+        .expect("completed outcome replay was not returned to the forwarding loop");
+        assert!(matches!(
+            input,
+            GameSubscriptionInput::CommandOutcomes(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_joins_the_cancelled_game_event_forwarder() {
+        struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut handle = Some(tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(dropped_tx));
+            started_tx.send(()).expect("test starter was dropped");
+            std::future::pending::<()>().await;
+        }));
+        started_rx
+            .await
+            .expect("forwarder did not reach its pending replay");
+
+        abort_and_join_game_event_forwarder(&mut handle).await;
+
+        assert!(handle.is_none());
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("replacement returned before the cancelled forwarder was dropped")
+            .expect("forwarder drop notification was lost");
     }
 
     #[test]

@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
 pub const EXECUTOR_PROTOCOL_VERSION: u16 = 2;
-pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(4);
+// Three missed one-second heartbeats prove task loss with enough margin for
+// assignment and executor bootstrap inside the five-second crash-output gate.
+pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);
 pub const DEFAULT_MEMBERSHIP_HEARTBEAT: Duration = Duration::from_secs(1);
 const RETIRED_MEMBERSHIP_TOMBSTONE: &str = "__snaketron_retired_membership_v2__";
 

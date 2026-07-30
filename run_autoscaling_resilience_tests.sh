@@ -4435,10 +4435,34 @@ inject_hard_crash_and_prove_takeover() {
   local ecs_exec_exit_code=$?
   set -e
   hard_crash_ecs_exec_pid=""
-  local ecs_exec_session_started=false
+  # The Session Manager plugin can lose its stdout marker when the command
+  # kills the container carrying the session. Preserve that marker only as a
+  # diagnostic; prove the single fault from ECS's authoritative record for the
+  # selected task instead.
+  local ecs_exec_cli_session_marker_observed=false
   if grep -Eq \
     'Starting session with SessionId: ecs-execute-command-' "$exec_output"; then
-    ecs_exec_session_started=true
+    ecs_exec_cli_session_marker_observed=true
+  fi
+  local fault_injection_proved_by_ecs_exit_137=false
+  if [[ -f "$task_stop" ]] \
+    && jq -e --arg task_arn "$killed_task_arn" '
+      (.failures | length) == 0
+      and (.tasks | length) == 1
+      and .tasks[0].taskArn == $task_arn
+      and (.tasks[0].executionStoppedAt | type) == "string"
+      and .tasks[0].stopCode == "EssentialContainerExited"
+      and ((.tasks[0].stoppedReason // "")
+        | test("out.?of.?memory|oom|unhealthy|failed"; "i") | not)
+      and all(.tasks[0].containers[];
+        ((.reason // "")
+          | test("out.?of.?memory|oom|unhealthy|failed"; "i") | not))
+      and ([.tasks[0].containers[]
+        | select(
+            .name == "snaketron-server"
+            and .exitCode == 137)] | length) == 1
+    ' "$task_stop" >/dev/null; then
+    fault_injection_proved_by_ecs_exit_137=true
   fi
 
   rm -f \
@@ -4446,8 +4470,9 @@ inject_hard_crash_and_prove_takeover() {
     "$pending_candidate" \
     "$owner_candidate" \
     "$authoritative_output_candidate"
-  if [[ -z "$failure_reason" && "$ecs_exec_session_started" != true ]]; then
-    failure_reason="ECS Exec did not establish the single non-retried session before the selected task stopped"
+  if [[ -z "$failure_reason" \
+    && "$fault_injection_proved_by_ecs_exit_137" != true ]]; then
+    failure_reason="The selected task did not expose one authoritative exit-137 server crash after the single ECS Exec invocation"
   fi
   if [[ -z "$failure_reason" && ! -f "$pending_after_kill" ]]; then
     failure_reason="No exact pending command remained under the killed lease within two seconds after ECS executionStoppedAt"
@@ -4473,7 +4498,10 @@ inject_hard_crash_and_prove_takeover() {
     --argjson ecs_exec_invoked_at_unix_ms "$ecs_exec_invoked_at_ms" \
     --argjson ecs_exec_max_attempts "$ecs_exec_max_attempts" \
     --argjson ecs_exec_exit_code "$ecs_exec_exit_code" \
-    --argjson ecs_exec_session_started "$ecs_exec_session_started" \
+    --argjson ecs_exec_cli_session_marker_observed \
+      "$ecs_exec_cli_session_marker_observed" \
+    --argjson fault_injection_proved_by_ecs_exit_137 \
+      "$fault_injection_proved_by_ecs_exit_137" \
     --argjson partition "$killed_partition" \
     --slurpfile observer_ready "$observer_ready" \
     --slurpfile ownership_observer_ready "$ownership_observer_ready" \
@@ -4488,7 +4516,10 @@ inject_hard_crash_and_prove_takeover() {
         ecs_exec_invoked_at_unix_ms: $ecs_exec_invoked_at_unix_ms,
         ecs_exec_max_attempts: $ecs_exec_max_attempts,
         ecs_exec_exit_code: $ecs_exec_exit_code,
-        ecs_exec_session_started: $ecs_exec_session_started,
+        ecs_exec_cli_session_marker_observed:
+          $ecs_exec_cli_session_marker_observed,
+        fault_injection_proved_by_ecs_exit_137:
+          $fault_injection_proved_by_ecs_exit_137,
         observer_ready_before_exec_at_unix_ms:
           $observer_ready[0].observation_completed_at_ms,
         ownership_observer_ready_before_exec_at_unix_ms:
@@ -4573,7 +4604,7 @@ collect_crash_ecs_runtime_evidence() {
         and $injected_stop[0].tasks[0].executionStoppedAt
           == $manifest[0].execution_stopped_at
         and $manifest[0].ecs_exec_max_attempts == 1
-        and $manifest[0].ecs_exec_session_started == true
+        and $manifest[0].fault_injection_proved_by_ecs_exit_137 == true
         and $manifest[0].observer_ready_before_exec_at_unix_ms
           <= $manifest[0].ecs_exec_invoked_at_unix_ms
         and $manifest[0].ownership_observer_ready_before_exec_at_unix_ms
@@ -4750,7 +4781,7 @@ assert_hard_crash_report() {
                 .outcome == "completed" and .failure_phase == null)),
             single_observed_fault: (
               $m.ecs_exec_max_attempts == 1
-              and $m.ecs_exec_session_started == true
+              and $m.fault_injection_proved_by_ecs_exit_137 == true
               and $m.observer_ready_before_exec_at_unix_ms
                 == $observer_ready[0].observation_completed_at_ms
               and $observer_ready[0].observation_started_at_ms

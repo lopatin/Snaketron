@@ -11,8 +11,8 @@ use crate::game_executor_v2::{PartitionExecutorV2Handle, spawn_game_executor_v2}
 use crate::lifecycle::TaskLifecycle as LocalTaskLifecycle;
 use crate::partition_assignment::{AssignmentDocument, AssignmentStore};
 use crate::partition_lease::{
-    CoordinatorLeaseStore, DEFAULT_COORDINATION_OPERATION_TIMEOUT, DEFAULT_PARTITION_LEASE_TTL,
-    LeaseToken, PartitionLeaseStore,
+    CoordinatorLeaseStore, DEFAULT_COORDINATION_OPERATION_TIMEOUT, DEFAULT_COORDINATOR_LEASE_TTL,
+    DEFAULT_PARTITION_LEASE_TTL, LeaseToken, PartitionLeaseStore,
 };
 use crate::recovery::RecoveryConfig;
 use crate::redis_utils::RedisConnection;
@@ -366,7 +366,7 @@ pub fn start_executor_cluster(
     let coordinator = CoordinatorLeaseStore::new(
         redis.clone(),
         namespace.clone(),
-        DEFAULT_PARTITION_LEASE_TTL,
+        DEFAULT_COORDINATOR_LEASE_TTL,
         DEFAULT_COORDINATION_OPERATION_TIMEOUT,
     )?;
     let leases = PartitionLeaseStore::new(
@@ -785,6 +785,20 @@ mod tests {
         let mut stabilizer = AssignmentStabilizer::default();
         let now = tokio::time::Instant::now();
         assert!(stabilizer.should_reconcile(None, &[], 0, now));
+    }
+
+    #[test]
+    fn crash_authority_ttls_preserve_detection_and_fencing_order() {
+        let membership_ttl = crate::cluster_membership::DEFAULT_MEMBERSHIP_TTL;
+        let heartbeat = crate::cluster_membership::DEFAULT_MEMBERSHIP_HEARTBEAT;
+
+        assert!(membership_ttl >= heartbeat * 3);
+        assert!(membership_ttl <= DEFAULT_PARTITION_LEASE_TTL);
+        assert!(DEFAULT_COORDINATOR_LEASE_TTL < membership_ttl);
+        assert!(
+            DEFAULT_COORDINATOR_LEASE_TTL
+                > CONTROL_TICK + DEFAULT_COORDINATION_OPERATION_TIMEOUT * 2
+        );
     }
 
     #[test]
