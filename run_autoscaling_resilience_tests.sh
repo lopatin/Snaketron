@@ -33,6 +33,123 @@ hard_crash_ownership_observer_pid=""
 hard_crash_ownership_observer_stop_file=""
 hard_crash_ecs_exec_pid=""
 
+hard_crash_envelope_jq='
+  def hard_crash_required_authenticated_sessions: 256;
+  def hard_crash_required_fully_joined_duels: 128;
+  def hard_crash_required_commands_per_second: 1280;
+  def hard_crash_required_report_seconds: 30;
+  def hard_crash_required_online_samples:
+    hard_crash_required_report_seconds + 1;
+  def hard_crash_max_online_sample_gap_ms: 10000;
+  def longest_qualifying_streak($samples):
+    reduce $samples[] as $sample (
+      {
+        current_seconds: 0,
+        current_started_at_second: null,
+        longest_seconds: 0,
+        longest_started_at_second: null,
+        longest_finished_at_second: null
+      };
+      if $sample.qualifying then
+        .current_seconds += 1
+        | if .current_seconds == 1 then
+            .current_started_at_second = $sample.unix_second
+          else .
+          end
+        | if .current_seconds > .longest_seconds then
+            .longest_seconds = .current_seconds
+            | .longest_started_at_second = .current_started_at_second
+            | .longest_finished_at_second = ($sample.unix_second + 1)
+          else .
+          end
+      else
+        .current_seconds = 0
+        | .current_started_at_second = null
+      end);
+  def fully_joined_duels_at($value; $midpoint):
+    ([$value.sessions[] | select(.game_id != null)]
+      | group_by(.game_id)
+      | map(select(
+          length == 2
+          and all(.[];
+            .playing_at_unix_ms != null
+            and .game_finished_at_unix_ms != null
+            and .playing_at_unix_ms <= $midpoint
+              and .game_finished_at_unix_ms > $midpoint)))
+      | length);
+  def hard_crash_report_second_qualifies:
+    .authenticated_sessions >= hard_crash_required_authenticated_sessions
+    and .fully_joined_duels >= hard_crash_required_fully_joined_duels
+    and .commands_sent >= hard_crash_required_commands_per_second;
+  def hard_crash_pre_crash_seconds($value; $timing_origin):
+    (($value.ramp_stages[0].target_reached_at_unix_ms / 1000) | ceil)
+      as $first_second
+    | ($timing_origin / 1000) as $after_last_second
+    | [range($first_second; $after_last_second)
+        | . as $second
+        | (($second * 1000) + 500) as $midpoint
+        | {
+            unix_second: $second,
+            authenticated_sessions: (
+              [$value.sessions[]
+                | select(
+                    .authenticated_at_unix_ms != null
+                    and .authenticated_at_unix_ms <= $midpoint
+                    and .finished_at_unix_ms > $midpoint)]
+              | length),
+            fully_joined_duels:
+              fully_joined_duels_at($value; $midpoint),
+            commands_sent: (
+              $value.metrics.command_counts_by_unix_second
+                [($second | tostring)] // 0)
+          }
+        | .qualifying = hard_crash_report_second_qualifies];
+  def nonnegative_integer:
+    type == "number" and . >= 0 and . == floor;
+  def bounded_sample_cadence($samples):
+    all(
+      range(1; ($samples | length));
+      . as $index
+      | (($samples[$index].observed_at_unix_ms
+            - $samples[$index - 1].observed_at_unix_ms) > 0)
+        and (($samples[$index].observed_at_unix_ms
+            - $samples[$index - 1].observed_at_unix_ms)
+              <= hard_crash_max_online_sample_gap_ms));
+  def hard_crash_envelope_passes(
+    $pre_crash_seconds;
+    $envelope;
+    $ecs_exec_invoked_at_unix_ms
+  ):
+    hard_crash_required_online_samples as $required_samples
+    | (if ($envelope.samples | type) == "array" then
+        $envelope.samples[-$required_samples:]
+      else []
+      end) as $online_tail
+    | longest_qualifying_streak($pre_crash_seconds) as $report_streak
+    | ($pre_crash_seconds | last) as $final_report_second
+    | $report_streak.longest_seconds
+        >= hard_crash_required_report_seconds
+      and $final_report_second.qualifying
+      and $envelope.required_stable_seconds
+        == hard_crash_required_report_seconds
+      and $envelope.required_qualifying_samples == $required_samples
+      and ($online_tail | length) == $required_samples
+      and all($online_tail[];
+        (.observed_at_unix_ms | nonnegative_integer)
+        and (.raw_websockets | nonnegative_integer)
+        and (.active_games | nonnegative_integer)
+        and .raw_websockets
+          >= hard_crash_required_authenticated_sessions
+        and .active_games >= hard_crash_required_fully_joined_duels)
+      and bounded_sample_cadence($online_tail)
+      and (($online_tail | last | .observed_at_unix_ms)
+        - ($online_tail | first | .observed_at_unix_ms))
+          >= (hard_crash_required_report_seconds * 1000)
+      and ($ecs_exec_invoked_at_unix_ms | nonnegative_integer)
+      and ($online_tail | last | .observed_at_unix_ms)
+        <= $ecs_exec_invoked_at_unix_ms;
+'
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Required command not found: $1" >&2
@@ -1393,6 +1510,155 @@ test_capacity_continuous_window_contract() {
   fi
 }
 
+test_hard_crash_envelope_contract() {
+  jq -en "$hard_crash_envelope_jq"'
+    def command_counts($first_second; $after_last_second; $value):
+      [range($first_second; $after_last_second)
+        | {key: (. | tostring), value: $value}]
+      | from_entries;
+    def passes($seconds; $envelope; $exec_invoked_at):
+      hard_crash_envelope_passes(
+        $seconds;
+        $envelope;
+        $exec_invoked_at
+      );
+    hard_crash_required_report_seconds as $required_seconds
+    | hard_crash_required_authenticated_sessions as $required_sessions
+    | hard_crash_required_fully_joined_duels as $required_duels
+    | hard_crash_required_commands_per_second as $required_commands
+    | hard_crash_required_online_samples as $required_samples
+    | 11 as $first_second
+    | ($first_second + $required_seconds) as $gap_second
+    | ($gap_second + 1) as $final_second
+    | (($final_second + 1) * 1000) as $timing_origin
+    | ([$required_sessions, ($required_duels * 2)] | max)
+        as $minimum_session_count
+    | (((($minimum_session_count + 1) / 2) | floor) * 2)
+        as $session_count
+    | ({
+        ramp_stages: [{
+          target_reached_at_unix_ms: (($first_second * 1000) - 500)
+        }],
+        sessions: [
+          range(0; $session_count)
+          | {
+              game_id: ((. / 2) | floor),
+              authenticated_at_unix_ms: 0,
+              playing_at_unix_ms: 0,
+              game_finished_at_unix_ms: ($timing_origin + 60000),
+              finished_at_unix_ms: ($timing_origin + 60000)
+            }
+        ],
+        metrics: {
+          command_counts_by_unix_second: command_counts(
+            $first_second;
+            ($final_second + 1);
+            $required_commands
+          )
+        }
+      }
+      | .metrics.command_counts_by_unix_second[
+          ($gap_second | tostring)
+        ] = 0) as $report
+    | hard_crash_pre_crash_seconds($report; $timing_origin)
+        as $positive_seconds
+    | ($report
+        | .metrics.command_counts_by_unix_second[
+            (($gap_second - 1) | tostring)
+          ] = 0
+        | hard_crash_pre_crash_seconds(.; $timing_origin))
+        as $short_streak_seconds
+    | ($report
+        | .metrics.command_counts_by_unix_second[
+            ($final_second | tostring)
+          ] = 0
+        | hard_crash_pre_crash_seconds(.; $timing_origin))
+        as $bad_final_seconds
+    | {
+        required_stable_seconds: $required_seconds,
+        required_qualifying_samples: $required_samples,
+        samples: [
+          range(0; $required_samples)
+          | {
+              observed_at_unix_ms: (100000 + (. * 5000)),
+              raw_websockets: $required_sessions,
+              active_games: $required_duels
+            }
+        ]
+      } as $online
+    | (($online.samples | last | .observed_at_unix_ms) + 1)
+        as $exec_invoked_at
+    | [
+        (($positive_seconds | first | .unix_second) == $first_second),
+        (($positive_seconds | last | .unix_second) == $final_second),
+        (longest_qualifying_streak($positive_seconds).longest_seconds
+          == $required_seconds),
+        ($positive_seconds | last | .qualifying),
+        passes($positive_seconds; $online; $exec_invoked_at),
+        (passes(
+          $short_streak_seconds;
+          $online;
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $bad_final_seconds;
+          $online;
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online | .samples = .samples[:-1]);
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online
+            | .samples[0].raw_websockets = ($required_sessions | tostring));
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online | .samples[0].active_games += 0.5);
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online | .samples[0].observed_at_unix_ms += 0.5);
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online
+            | .samples[1].observed_at_unix_ms =
+                .samples[0].observed_at_unix_ms);
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online
+            | .samples |= (
+                to_entries
+                | map(
+                    .value.observed_at_unix_ms +=
+                      (.key * (hard_crash_max_online_sample_gap_ms - 4999))
+                  )
+                | map(.value)
+              ));
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          $online;
+          ($online.samples | last | .observed_at_unix_ms) - 1
+        ) | not)
+      ]
+    | all
+  ' >/dev/null || {
+    echo "Hard-crash envelope evidence contract failed" >&2
+    return 1
+  }
+}
+
 test_hard_crash_evidence_selectors() {
   local result=0
   local fixture_dir
@@ -1968,6 +2234,7 @@ test_evidence_safety_helpers() {
   test_command_outcome_window_gate
   test_staging_entry_state_contract
   test_capacity_continuous_window_contract
+  test_hard_crash_envelope_contract
   test_hard_crash_evidence_selectors
   test_unexpected_crash_stop_selector
 }
@@ -4452,23 +4719,14 @@ assert_hard_crash_report() {
     --slurpfile pending_after_kill "$report_dir/control-plane-immediate-post-kill.json" \
     --slurpfile owner_ready "$report_dir/control-plane-hard-crash-owner-ready.json" \
     --slurpfile authoritative_output "$report_dir/control-plane-hard-crash-output.json" \
-    --slurpfile final "$report_dir/control-plane-hard-crash-final-10.json" '
+    --slurpfile envelope "$report_dir/envelope-hard-crash/summary.json" \
+    --slurpfile final "$report_dir/control-plane-hard-crash-final-10.json" \
+    "$hard_crash_envelope_jq"'
       def p99:
         sort as $values
         | if ($values | length) == 0 then null
           else $values[(((((($values | length) * 99) + 99) / 100) | floor) - 1)]
           end;
-      def fully_joined_duels_at($value; $midpoint):
-        ([$value.sessions[] | select(.game_id != null)]
-          | group_by(.game_id)
-          | map(select(
-              length == 2
-              and all(.[];
-                .playing_at_unix_ms != null
-                and .game_finished_at_unix_ms != null
-                and .playing_at_unix_ms <= $midpoint
-                  and .game_finished_at_unix_ms > $midpoint)))
-          | length);
       def parsed_stream_id:
         capture("^(?<milliseconds>[0-9]+)-(?<sequence>[0-9]+)$")
         | {
@@ -4492,8 +4750,17 @@ assert_hard_crash_report() {
           as $output_anchor
       | ($authoritative_output[0].first_scheduled_output.stream_id
           | parsed_stream_id) as $output_id
-      | (($timing_origin / 1000) - 30) as $stable_first_second
+      | (($r.ramp_stages[0].target_reached_at_unix_ms / 1000) | ceil)
+          as $stable_first_second
       | ($timing_origin / 1000) as $stable_after_last_second
+      | hard_crash_pre_crash_seconds($r; $timing_origin)
+          as $pre_crash_seconds
+      | longest_qualifying_streak($pre_crash_seconds)
+          as $pre_crash_streak
+      | ($pre_crash_seconds | last) as $final_pre_crash_second
+      | hard_crash_required_online_samples as $required_online_samples
+      | ($envelope[0].samples[-$required_online_samples:] // [])
+          as $online_envelope_tail
       | [$r.sessions[].hard_recoveries[]?] as $all_recoveries
       | [$all_recoveries[]
           | select(
@@ -4527,6 +4794,23 @@ assert_hard_crash_report() {
           first_authoritative_output_ms:
             ($authoritative_output[0].first_scheduled_output.stream_unix_ms
               - $exact_stop),
+          pre_crash_capacity: {
+            evaluated_first_second: $stable_first_second,
+            evaluated_after_last_second: $stable_after_last_second,
+            longest_qualifying_streak: $pre_crash_streak,
+            final_complete_second: $final_pre_crash_second,
+            online_envelope: {
+              required_stable_seconds:
+                $envelope[0].required_stable_seconds,
+              required_qualifying_samples:
+                $envelope[0].required_qualifying_samples,
+              qualifying_tail_samples: ($online_envelope_tail | length),
+              first_qualifying_at_unix_ms:
+                ($online_envelope_tail | first | .observed_at_unix_ms),
+              last_qualifying_at_unix_ms:
+                ($online_envelope_tail | last | .observed_at_unix_ms)
+            }
+          },
           checks: {
             load_contract: (
               $r.schema_version >= 10
@@ -4592,19 +4876,11 @@ assert_hard_crash_report() {
               and $m.ecs_exec_invoked_at_unix_ms <= $exact_stop
               and $exact_stop <= $m.task_stop_observed_at_unix_ms
               and $timing_origin == (($exact_stop / 1000 | floor) * 1000)),
-            pre_crash_envelope: (
-              ($stable_after_last_second - $stable_first_second) == 30
-              and all(range($stable_first_second; $stable_after_last_second);
-                . as $second
-                | (($second * 1000) + 500) as $midpoint
-                | ([$r.sessions[]
-                    | select(
-                        .authenticated_at_unix_ms != null
-                        and .authenticated_at_unix_ms <= $midpoint
-                        and .finished_at_unix_ms > $midpoint)] | length) >= 256
-                  and fully_joined_duels_at($r; $midpoint) >= 128
-                  and (($r.metrics.command_counts_by_unix_second
-                        [($second | tostring)] // 0) >= 1280))),
+            pre_crash_envelope: hard_crash_envelope_passes(
+              $pre_crash_seconds;
+              $envelope[0];
+              $m.ecs_exec_invoked_at_unix_ms
+            ),
             affected_reconnects: (
               ($affected | length) > 0
               and ($all_recoveries | length) == ($affected | length)

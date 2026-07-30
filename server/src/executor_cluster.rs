@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_warming_heartbeat_never_sets_http_readiness() -> Result<()> {
+    async fn executor_membership_can_activate_before_gateway_readiness() -> Result<()> {
         use redis::AsyncCommands;
 
         let client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")?;
@@ -1437,7 +1437,7 @@ mod tests {
                     .list_live(chrono::Utc::now().timestamp_millis())
                     .await?;
                 if members.iter().any(|member| {
-                    member.boot_id == boot_id && member.lifecycle == ClusterTaskLifecycle::Warming
+                    member.boot_id == boot_id && member.lifecycle == ClusterTaskLifecycle::Active
                 }) {
                     return Result::<()>::Ok(());
                 }
@@ -1445,11 +1445,11 @@ mod tests {
             }
         })
         .await
-        .context("WARMING membership was not published")??;
-        assert_eq!(state.load(Ordering::Acquire), STATE_WARMING);
+        .context("executor-eligible ACTIVE membership was not published")??;
+        assert_eq!(state.load(Ordering::Acquire), STATE_ACTIVE);
         assert!(
             !lifecycle.is_ready(),
-            "a successful WARMING heartbeat must not satisfy readiness"
+            "executor membership must not bypass gateway replica readiness"
         );
 
         lifecycle.mark_replicas_ready(true);
@@ -1574,25 +1574,18 @@ mod tests {
             .context("restored worker did not publish membership")?;
         assert_eq!(active.lifecycle, ClusterTaskLifecycle::Active);
 
-        // A local readiness predicate dropping must remove assignment
-        // eligibility even though Redis itself remains healthy.
+        // Losing gateway replica hydration withdraws public HTTP readiness, but
+        // must not remove executor placement: doing so would remove the owner
+        // that can answer the replica's recovery snapshot request.
         lifecycle.mark_replicas_ready(false);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let members = store
-                    .list_live(chrono::Utc::now().timestamp_millis())
-                    .await?;
-                if members.iter().any(|member| {
-                    member.boot_id == boot_id && member.lifecycle == ClusterTaskLifecycle::Warming
-                }) {
-                    return Result::<()>::Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .context("readiness drop did not demote membership")??;
-        assert_eq!(worker_state.load(Ordering::Acquire), STATE_WARMING);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let members = store
+            .list_live(chrono::Utc::now().timestamp_millis())
+            .await?;
+        assert!(members.iter().any(|member| {
+            member.boot_id == boot_id && member.lifecycle == ClusterTaskLifecycle::Active
+        }));
+        assert_eq!(worker_state.load(Ordering::Acquire), STATE_ACTIVE);
         assert!(!lifecycle.is_ready());
 
         lifecycle.mark_replicas_ready(true);

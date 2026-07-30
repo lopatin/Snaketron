@@ -16,7 +16,7 @@ use common::{
 };
 use server::cluster_membership::{BootIdentity, ClusterNamespace};
 use server::completion::{COMPLETION_SCHEMA_VERSION, CompletionEffect, CompletionRecordV1};
-use server::game_bus::GameBus;
+use server::game_bus::{GameBus, PartitionEvent};
 use server::game_executor::{PARTITION_COUNT, StreamEvent};
 use server::matchmaking_manager::{ActiveMatch, MatchStatus, QueuedPlayer};
 use server::partition_lease::PartitionLeaseStore;
@@ -1763,9 +1763,84 @@ async fn gateway_event_subscription_is_independent_of_command_backpressure() -> 
         let received = timeout(Duration::from_secs(1), events.event_receiver.recv())
             .await?
             .expect("gateway event reader stopped unexpectedly");
+        let PartitionEvent::Game(received) = received else {
+            panic!("ordinary event was decoded as a snapshot barrier");
+        };
         assert_eq!(received.game_id, partition);
         assert_eq!(received.stream_seq, 1);
 
+        token.cancel();
+        cleanup(partition).await;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn gateway_snapshot_barrier_is_ordered_after_preceding_game_events() -> Result<()> {
+    let _test_lock = STREAMS_TEST_LOCK.lock().await;
+    timeout(Duration::from_secs(10), async {
+        use redis::AsyncCommands;
+
+        let token = CancellationToken::new();
+        let bus = streams_bus(token.clone()).await?;
+        let partition = test_partition(12);
+        let namespace = unique_namespace("snapshot-barrier")?;
+        let boot_id = BootIdentity::new();
+        let client = redis::Client::open(REDIS_URL)?;
+        let mut redis = client.get_multiplexed_async_connection().await?;
+        let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(8);
+        let manager =
+            server::redis_utils::create_connection_manager(client.clone(), pubsub_tx).await?;
+        let mut owners = serde_json::Map::new();
+        owners.insert(
+            partition.to_string(),
+            serde_json::Value::String(boot_id.to_string()),
+        );
+        let _: () = redis
+            .set(
+                namespace.partition_assignment(partition),
+                serde_json::to_vec(&serde_json::json!({ "owners": owners }))?,
+            )
+            .await?;
+        let leases = PartitionLeaseStore::new(
+            manager,
+            namespace.clone(),
+            Duration::from_secs(10),
+            Duration::from_millis(750),
+        )?;
+        let guard = leases
+            .try_acquire(partition, &boot_id)
+            .await?
+            .expect("test partition lease acquired");
+        let mut events = bus.subscribe_to_partition_events(partition).await?;
+
+        bus.publish_event_fenced(&guard, &event(partition, 1))
+            .await?;
+        let completion_id = uuid::Uuid::new_v4().to_string();
+        bus.publish_snapshot_barrier_fenced(&guard, &completion_id)
+            .await?;
+
+        let first = timeout(Duration::from_secs(1), events.event_receiver.recv())
+            .await?
+            .expect("event reader stopped before game event");
+        assert!(matches!(
+            first,
+            PartitionEvent::Game(GameEventMessage { stream_seq: 1, .. })
+        ));
+        let second = timeout(Duration::from_secs(1), events.event_receiver.recv())
+            .await?
+            .expect("event reader stopped before snapshot barrier");
+        assert!(matches!(
+            second,
+            PartitionEvent::SnapshotBarrier {
+                completion_id: observed
+            } if observed == completion_id
+        ));
+
+        let _: () = redis
+            .del(&[namespace.partition_assignment(partition), guard.lease_key()])
+            .await?;
         token.cancel();
         cleanup(partition).await;
         Ok(())
@@ -1796,6 +1871,9 @@ async fn three_streams_route_to_their_channels_in_order() -> Result<()> {
             .await?;
         }
         bus.request_partition_snapshots(partition).await?;
+        let completion_id = uuid::Uuid::new_v4().to_string();
+        bus.request_partition_snapshots_with_barrier(partition, &completion_id)
+            .await?;
 
         for expected in 1..=5u64 {
             let msg = sub.recv_event().await.expect("event stream ended");
@@ -1816,6 +1894,16 @@ async fn three_streams_route_to_their_channels_in_order() -> Result<()> {
             .await
             .expect("request stream ended");
         assert_eq!(req.partition_id, partition);
+        assert_eq!(req.completion_id, None);
+        let barrier_req = sub
+            .recv_snapshot_request()
+            .await
+            .expect("barrier request stream ended");
+        assert_eq!(barrier_req.partition_id, partition);
+        assert_eq!(
+            barrier_req.completion_id.as_deref(),
+            Some(completion_id.as_str())
+        );
 
         token.cancel();
         cleanup(partition).await;

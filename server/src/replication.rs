@@ -1,4 +1,4 @@
-use crate::game_bus::{GameBus, PartitionEventSubscription};
+use crate::game_bus::{GameBus, PartitionEvent, PartitionEventSubscription};
 use crate::game_executor::PARTITION_COUNT;
 use anyhow::{Context, Result};
 use common::{GameEvent, GameEventMessage, GameState, GameStatus};
@@ -486,38 +486,88 @@ impl PartitionReplica {
             }
         };
 
-        // Keep the successfully anchored readers while retrying the initial
-        // snapshot request; this preserves the subscribe-before-request race
-        // guarantee without spawning duplicate reader tasks.
-        loop {
-            let result = tokio::select! {
-                biased;
-                _ = self.cancellation_token.cancelled() => return Ok(()),
-                result = self.bus.request_partition_snapshots(self.partition_id) => result,
-            };
-            match result {
-                Ok(()) => break,
-                Err(error) => warn!(
-                    partition = self.partition_id,
-                    %error,
-                    "Initial replication snapshot request unavailable; retrying locally"
-                ),
-            }
-            tokio::select! {
-                biased;
-                _ = self.cancellation_token.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-            }
-        }
-
         let PartitionEventSubscription {
             partition_id: _,
             mut event_receiver,
         } = subscription;
 
-        // Mark as ready immediately (initial state arrives via the snapshot
-        // request above; there is no historical catch-up phase)
+        // A gateway must not enter routing merely because its request was
+        // appended. Retry the boot-unique request until the executor publishes
+        // its completion marker after every active actor's requested snapshot.
+        // The marker shares this exact ordered stream, so observing it proves
+        // all preceding snapshots were applied; empty partitions work too.
+        let completion_id = uuid::Uuid::new_v4().to_string();
+        let mut request_retry = tokio::time::interval(std::time::Duration::from_secs(2));
+        request_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancellation_token.cancelled() => return Ok(()),
+                _ = request_retry.tick() => {
+                    let request = self.bus.request_partition_snapshots_with_barrier(
+                            self.partition_id,
+                            &completion_id,
+                        );
+                    let result = tokio::select! {
+                        biased;
+                        _ = self.cancellation_token.cancelled() => return Ok(()),
+                        result = request => result,
+                    };
+                    if let Err(error) = result {
+                        warn!(
+                            partition = self.partition_id,
+                            %error,
+                            "Initial replication snapshot request unavailable; retrying locally"
+                        );
+                    }
+                }
+                event = event_receiver.recv() => {
+                    match event {
+                        Some(PartitionEvent::Game(event)) => {
+                            self.process_received_event(event).await.with_context(|| {
+                                format!(
+                                    "partition {} failed to apply an event before its readiness barrier",
+                                    self.partition_id
+                                )
+                            })?;
+                        }
+                        Some(PartitionEvent::SnapshotBarrier {
+                            completion_id: observed,
+                        }) if observed == completion_id => {
+                            if self.cold_games.read().await.is_empty() {
+                                break;
+                            }
+                            warn!(
+                                partition = self.partition_id,
+                                %completion_id,
+                                "Ignoring readiness barrier while replicated games remain cold"
+                            );
+                        }
+                        Some(PartitionEvent::SnapshotBarrier { .. }) => {}
+                        Some(PartitionEvent::Discontinuity {
+                            resume_id,
+                            oldest_id,
+                        }) => anyhow::bail!(
+                            "partition {} event stream crossed its trim horizon before readiness (resume {}, oldest {})",
+                            self.partition_id,
+                            resume_id,
+                            oldest_id
+                        ),
+                        None => anyhow::bail!(
+                            "partition {} subscription closed before initial snapshot barrier",
+                            self.partition_id
+                        ),
+                    }
+                }
+            }
+        }
+
         self.status.write().await.is_ready = true;
+        info!(
+            partition = self.partition_id,
+            %completion_id,
+            "Initial replication snapshot barrier applied"
+        );
 
         // Main event processing loop
         loop {
@@ -532,15 +582,36 @@ impl PartitionReplica {
                 // Process events from partition subscription
                 event = event_receiver.recv() => {
                     match event {
-                        Some(event) => {
-                            if let Err(e) = self.process_received_event(event).await {
-                                error!("Failed to process event in partition {}: {}", self.partition_id, e);
+                        Some(PartitionEvent::Game(event)) => {
+                            if let Err(error) = self.process_received_event(event).await {
+                                self.status.write().await.is_ready = false;
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "partition {} failed to apply an event after readiness",
+                                        self.partition_id
+                                    )
+                                });
                             }
                         }
+                        Some(PartitionEvent::SnapshotBarrier { .. }) => {}
+                        Some(PartitionEvent::Discontinuity {
+                            resume_id,
+                            oldest_id,
+                        }) => {
+                            self.status.write().await.is_ready = false;
+                            anyhow::bail!(
+                                "partition {} event stream crossed its trim horizon after readiness (resume {}, oldest {})",
+                                self.partition_id,
+                                resume_id,
+                                oldest_id
+                            );
+                        }
                         None => {
-                            error!("Partition {} subscription closed unexpectedly, replication worker exiting",
-                                self.partition_id);
-                            break;
+                            self.status.write().await.is_ready = false;
+                            anyhow::bail!(
+                                "partition {} subscription closed unexpectedly after readiness",
+                                self.partition_id
+                            );
                         }
                     }
                 }
@@ -830,9 +901,12 @@ mod tests {
         ReplicaStore, ReplicatedGame, continuity_action, is_stateful_unknown_event,
         replica_snapshot,
     };
-    use crate::game_bus::GameBus;
+    use crate::game_bus::{GameBus, SnapshotRequest};
     use crate::game_executor::PARTITION_COUNT;
+    use crate::redis_keys::RedisKeys;
     use common::{GameEvent, GameEventMessage, GameState, GameStatus, GameType, QueueMode};
+    use redis::AsyncCommands;
+    use redis::streams::StreamRangeReply;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::{Barrier, RwLock, broadcast};
@@ -996,6 +1070,108 @@ mod tests {
         let (observed_state, observed_stream_seq) = reader.await.expect("reader task");
         assert_eq!(observed_state.start_ms, 11);
         assert_eq!(observed_stream_seq, 11);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_matching_barrier_after_applying_snapshot() -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let client = redis::Client::open("redis://127.0.0.1:6379/9?protocol=resp3")?;
+            let (push_tx, _push_rx) = broadcast::channel(8);
+            let manager =
+                crate::redis_utils::create_connection_manager(client.clone(), push_tx).await?;
+            let token = CancellationToken::new();
+            let bus = Arc::new(GameBus::new(
+                manager.clone(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                manager.clone(),
+                manager,
+                client.clone(),
+                token.clone(),
+            )?);
+            let partition = 1;
+            let event_stream = RedisKeys::stream_events(partition);
+            let request_stream = RedisKeys::stream_snapshot_requests(partition);
+            let mut redis = client.get_multiplexed_async_connection().await?;
+            let _: i64 = redis.del(&[&event_stream, &request_stream]).await?;
+
+            let replica_store: ReplicaStore = Arc::new(RwLock::new(HashMap::new()));
+            let replica = PartitionReplica::new(
+                partition,
+                bus,
+                replica_store.clone(),
+                Arc::new(RwLock::new(HashMap::new())),
+                token.clone(),
+            );
+            let status = replica.status();
+            let worker = tokio::spawn(replica.run());
+
+            let request = loop {
+                let entries: StreamRangeReply =
+                    redis.xrange_count(&request_stream, "-", "+", 1).await?;
+                if let Some(entry) = entries.ids.first()
+                    && let Some(payload) = entry.map.get("data")
+                {
+                    let bytes = redis::from_redis_value::<Vec<u8>>(payload)?;
+                    break serde_json::from_slice::<SnapshotRequest>(&bytes)?;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            let completion_id = request
+                .completion_id
+                .expect("readiness request includes a completion ID");
+            assert!(!status.read().await.is_ready);
+
+            let _: String = redis::cmd("XADD")
+                .arg(&event_stream)
+                .arg("*")
+                .arg("snapshot_barrier")
+                .arg(uuid::Uuid::new_v4().to_string())
+                .query_async(&mut redis)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert!(!status.read().await.is_ready);
+
+            let snapshot = snapshot(1, 1);
+            let _: String = redis::cmd("XADD")
+                .arg(&event_stream)
+                .arg("*")
+                .arg("data")
+                .arg(serde_json::to_vec(&snapshot)?)
+                .query_async(&mut redis)
+                .await?;
+            let _: String = redis::cmd("XADD")
+                .arg(&event_stream)
+                .arg("*")
+                .arg("snapshot_barrier")
+                .arg(&completion_id)
+                .query_async(&mut redis)
+                .await?;
+
+            loop {
+                if status.read().await.is_ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let replicated = replica_store
+                .read()
+                .await
+                .get(&snapshot.game_id)
+                .cloned()
+                .expect("snapshot was applied before readiness");
+            assert_eq!(replicated.stream_seq, snapshot.stream_seq);
+
+            token.cancel();
+            worker.await??;
+            let _: i64 = redis.del(&[&event_stream, &request_stream]).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
     }
 
     #[tokio::test]

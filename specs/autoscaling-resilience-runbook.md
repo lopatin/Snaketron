@@ -205,8 +205,11 @@ consumer-group cursors, or edit assignments by hand to force recovery.
    their stable identities. Do not force a reconnect or extend the deadline.
 2. Gateway replicas read only partition events. If event delivery stalls, check
    that the event-only reader is alive and inspect its last stream ID and any
-   trim-horizon warning. Executor command or snapshot-request channel depth is
-   not a gateway replica dependency.
+   trim-horizon error. A detected bounded-stream discontinuity is deliberately
+   task-fatal so no later readiness marker can bless missing snapshots; ECS
+   replaces the unready task and clients use ordinary reconnect. Executor
+   command or snapshot-request channel depth is not a gateway replica
+   dependency.
 3. Traefik keeps a sustained WebSocket-upgrade average of 50 per source IP and a
    burst of 512. A `429` is retryable inside the client's existing admission
    deadline. If the 512 burst is exceeded, inspect the source and cohort; do
@@ -1114,6 +1117,21 @@ completion record, final recovery envelope, stored snapshot, pending-effect
 index, and terminal publications before any reader could observe the snapshot;
 do not reintroduce a command-stream completion marker as an eviction
 dependency.
+
+Initial gateway readiness is stricter than merely anchoring those readers. Each
+partition replica publishes one boot-unique snapshot request and stays unready
+until it consumes the matching completion marker from the same ordered event
+stream. The owner appends that marker only after every active actor has
+published its requested snapshot at the next ordinary checkpoint; command
+dispatch continues while the completion waiters are pending. The replica
+retries the same request identity if no executor had subscribed yet. Empty
+partitions still receive a marker. Executor membership may become assignment
+eligible before this gateway-only proof, which prevents first-task bootstrap
+deadlock while Traefik continues to exclude the unready gateway.
+The readiness fan-out is bounded to three seconds and the replica retries the
+same durable request every two seconds. Timed-out actor waiters are pruned, so a
+terminal-materialization outage can keep a new gateway honestly unready without
+accumulating permanent workers or weakening existing gateways.
 
 The durable `GameCreated` scanner groups each validated scan page by partition
 and uses nonblocking sends to ten delivery workers, one per fixed partition.

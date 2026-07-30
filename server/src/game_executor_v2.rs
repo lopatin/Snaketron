@@ -378,6 +378,9 @@ enum GameActorMessage {
     Snapshot {
         reply: oneshot::Sender<Result<()>>,
     },
+    SnapshotAndWait {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Barrier {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -404,6 +407,12 @@ struct GameActorSlot {
     sender: mpsc::Sender<GameActorMessage>,
     terminally_completed: Arc<AtomicBool>,
     _task: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct SnapshotActorTarget {
+    sender: mpsc::Sender<GameActorMessage>,
+    terminally_completed: Arc<AtomicBool>,
 }
 
 struct PendingActorReply {
@@ -505,6 +514,7 @@ struct GameActor {
     planned_handoff_event_stream_watermark: Option<u64>,
     pending_stream_ids: Vec<String>,
     snapshot_requested: bool,
+    snapshot_waiters: Vec<oneshot::Sender<Result<()>>>,
     live: bool,
     start_event_pending: bool,
     completion_committed: bool,
@@ -624,6 +634,7 @@ impl GameActor {
             planned_handoff_event_stream_watermark: envelope.planned_handoff_event_stream_watermark,
             pending_stream_ids: Vec::new(),
             snapshot_requested: false,
+            snapshot_waiters: Vec::new(),
             live: false,
             start_event_pending,
             completion_committed: false,
@@ -719,6 +730,22 @@ impl GameActor {
                                 self.request_snapshot();
                             }
                             let _ = reply.send(Ok(()));
+                        }
+                        GameActorMessage::SnapshotAndWait { reply } => {
+                            // Readiness needs proof of publication, but the
+                            // actor must keep serving commands while waiting
+                            // for its next ordinary checkpoint. Queue the reply
+                            // and let one checkpoint satisfy every concurrent
+                            // gateway join without a scale-out write burst.
+                            if self.completion_cancel.is_cancelled() {
+                                handoff_requested = true;
+                                let _ = reply.send(Ok(()));
+                            } else {
+                                self.request_snapshot();
+                                self.snapshot_waiters
+                                    .retain(|waiter| !waiter.is_closed());
+                                self.snapshot_waiters.push(reply);
+                            }
                         }
                         GameActorMessage::Barrier { reply } => {
                             self.live = false;
@@ -1214,15 +1241,23 @@ impl GameActor {
         }
 
         // The completion transaction is the sole terminal publication path.
-        // A terminal actor will either commit that snapshot or stop; there is
-        // no ordinary snapshot for this request to publish.
-        if !self.engine.get_committed_state().is_complete() {
-            self.publish_event(GameEvent::Snapshot {
-                game_state: self.engine.get_committed_state().clone(),
-            })
-            .await?;
+        // Until it commits, keep readiness waiters pending: acknowledging the
+        // request after merely refreshing the last non-terminal checkpoint
+        // would let a gateway route without state for this game. On success
+        // the actor marks terminal completion before dropping these senders;
+        // on handoff their closure remains a retryable barrier failure.
+        if self.engine.get_committed_state().is_complete() {
+            self.snapshot_waiters.retain(|waiter| !waiter.is_closed());
+            return Ok(());
         }
+        self.publish_event(GameEvent::Snapshot {
+            game_state: self.engine.get_committed_state().clone(),
+        })
+        .await?;
         self.snapshot_requested = false;
+        for waiter in self.snapshot_waiters.drain(..) {
+            let _ = waiter.send(Ok(()));
+        }
         Ok(())
     }
 
@@ -1735,10 +1770,52 @@ async fn run_game_executor_v2(
                                 if request.partition_id != partition {
                                     return Err(anyhow::anyhow!("snapshot request was routed to the wrong partition"));
                                 }
-                                tokio::select! {
-                                    biased;
-                                    _ = handoff_cancel.cancelled() => {}
-                                    result = publish_snapshots(&actors) => result?,
+                                if let Some(completion_id) = request.completion_id {
+                                    let targets = snapshot_actor_targets(&actors);
+                                    let barrier_bus = bus.clone();
+                                    let barrier_guard = guard.clone();
+                                    let barrier_fatal = fatal.clone();
+                                    let barrier_handoff = handoff_cancel.clone();
+                                    let _barrier_worker = tokio::spawn(async move {
+                                        let result = tokio::select! {
+                                            biased;
+                                            _ = barrier_fatal.cancelled() => return,
+                                            _ = barrier_handoff.cancelled() => return,
+                                            result = await_published_snapshots(targets) => result,
+                                        };
+                                        if let Err(error) = result {
+                                            warn!(
+                                                partition,
+                                                %completion_id,
+                                                %error,
+                                                "readiness snapshot fan-out did not complete; requester will retry"
+                                            );
+                                            return;
+                                        }
+                                        let publication = tokio::select! {
+                                            biased;
+                                            _ = barrier_fatal.cancelled() => return,
+                                            _ = barrier_handoff.cancelled() => return,
+                                            result = barrier_bus.publish_snapshot_barrier_fenced(
+                                                &barrier_guard,
+                                                &completion_id,
+                                            ) => result,
+                                        };
+                                        if let Err(error) = publication {
+                                            warn!(
+                                                partition,
+                                                %completion_id,
+                                                %error,
+                                                "Readiness snapshot barrier was not published; requester will retry"
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    tokio::select! {
+                                        biased;
+                                        _ = handoff_cancel.cancelled() => {}
+                                        result = publish_snapshots(&actors) => result?,
+                                    }
                                 }
                             }
                             LiveExecutorWork::Deliveries(deliveries) => break deliveries?,
@@ -2492,6 +2569,40 @@ async fn publish_snapshots_unbounded(actors: &HashMap<u32, GameActorSlot>) -> Re
     await_actor_replies(replies, "game actor dropped snapshot reply").await
 }
 
+fn snapshot_actor_targets(actors: &HashMap<u32, GameActorSlot>) -> Vec<SnapshotActorTarget> {
+    actors
+        .values()
+        .map(|slot| SnapshotActorTarget {
+            sender: slot.sender.clone(),
+            terminally_completed: slot.terminally_completed.clone(),
+        })
+        .collect()
+}
+
+async fn await_published_snapshots(targets: Vec<SnapshotActorTarget>) -> Result<()> {
+    tokio::time::timeout(SNAPSHOT_FANOUT_TIMEOUT, async {
+        let mut replies = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (reply, receive) = oneshot::channel();
+            if target
+                .sender
+                .send(GameActorMessage::SnapshotAndWait { reply })
+                .await
+                .is_err()
+            {
+                if target.terminally_completed.load(Ordering::Acquire) {
+                    continue;
+                }
+                bail!("game actor stopped before readiness snapshot request");
+            }
+            replies.push((receive, target.terminally_completed));
+        }
+        await_actor_replies(replies, "game actor dropped readiness snapshot completion").await
+    })
+    .await
+    .context("partition readiness snapshot fan-out exceeded its deadline")?
+}
+
 async fn barrier_actors(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
     let mut replies = Vec::with_capacity(actors.len());
     for slot in actors.values() {
@@ -2637,6 +2748,7 @@ mod tests {
     use crate::db::models::{CustomLobby, Game, GamePlayer, HighScoreEntry, RankingEntry, User};
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::RedisConnection;
+    use crate::replication::{GameStateReader, ReplicationManager};
     use common::{CommandId, Direction, GameCommand, GameState, GameType, Position, QueueMode};
     use redis::AsyncCommands;
 
@@ -4214,6 +4326,10 @@ mod tests {
 
     impl CrashBoundaryHarness {
         async fn new(label: &str) -> Result<Self> {
+            Self::new_with_redis_url(label, "redis://127.0.0.1:6379/1?protocol=resp3").await
+        }
+
+        async fn new_with_redis_url(label: &str, redis_url: &str) -> Result<Self> {
             let test_lock = CRASH_BOUNDARY_TEST_LOCK.lock().await;
             let salt = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -4224,12 +4340,13 @@ mod tests {
                 + (partition + PARTITION_COUNT - base_game_id % PARTITION_COUNT) % PARTITION_COUNT;
             let namespace = ClusterNamespace::new(format!("boundary-{label}-{salt}"))?;
             let owner = BootIdentity::new();
-            let client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")?;
+            let client = redis::Client::open(redis_url)?;
             let mut raw = client.get_multiplexed_async_connection().await?;
             let _: () = raw
                 .del(&[
                     RedisKeys::stream_commands(partition),
                     RedisKeys::stream_events(partition),
+                    RedisKeys::stream_snapshot_requests(partition),
                 ])
                 .await?;
             let (pubsub_tx, _rx) = tokio::sync::broadcast::channel(8);
@@ -4459,6 +4576,7 @@ mod tests {
                     RedisKeys::game_snapshot(self.game_id),
                     RedisKeys::stream_commands(self.partition),
                     RedisKeys::stream_events(self.partition),
+                    RedisKeys::stream_snapshot_requests(self.partition),
                 ])
                 .await?;
             Ok(())
@@ -6206,6 +6324,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_snapshot_reply_waits_for_ordinary_checkpoint_publication() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("snapshot-readiness-barrier").await?;
+            harness.defer_game_start().await?;
+            let baseline = harness.recovery().await?;
+            let (sender, receiver) = mpsc::channel(4);
+            let fatal = harness.token.child_token();
+            let completion_cancel = fatal.child_token();
+            let mut actor = GameActor::from_envelope(
+                2,
+                baseline,
+                harness.bus.clone(),
+                harness.guard.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    checkpoint_interval: Duration::from_millis(100),
+                    ..RecoveryConfig::default()
+                },
+                receiver,
+                fatal.clone(),
+                completion_cancel,
+            );
+            actor.live = true;
+
+            let (checkpoint_entered, release_checkpoint) = harness.bus.gate_next_checkpoint();
+            let task = tokio::spawn(async move { actor.run().await });
+            let (reply, mut result) = oneshot::channel();
+            sender
+                .send(GameActorMessage::SnapshotAndWait { reply })
+                .await
+                .context("test actor stopped before readiness snapshot request")?;
+
+            tokio::time::timeout(Duration::from_secs(1), checkpoint_entered.notified())
+                .await
+                .context("ordinary checkpoint did not begin")?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut result)
+                    .await
+                    .is_err(),
+                "readiness snapshot completed before its checkpoint was durable"
+            );
+            release_checkpoint.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), result)
+                .await
+                .context("readiness snapshot did not complete after checkpoint release")???;
+
+            fatal.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .context("test actor did not stop after cancellation")?
+                .context("test actor task panicked")??;
+
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_snapshot_request_hydrates_replica_before_matching_readiness_barrier()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new_with_redis_url(
+                "snapshot-readiness-integration",
+                "redis://127.0.0.1:6379/2?protocol=resp3",
+            )
+            .await?;
+            harness.defer_game_start().await?;
+            let event_stream = RedisKeys::stream_events(harness.partition);
+            let replica_cancel = CancellationToken::new();
+            let replica_manager = ReplicationManager::new(
+                vec![harness.partition],
+                replica_cancel.clone(),
+                harness.bus.clone(),
+            )
+            .await?;
+            let request_stream = RedisKeys::stream_snapshot_requests(harness.partition);
+            let completion_id = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let entries: redis::streams::StreamRangeReply =
+                        harness.raw.xrange_all(&request_stream).await?;
+                    for entry in entries.ids {
+                        let Some(payload) = entry.map.get("data") else {
+                            continue;
+                        };
+                        let bytes = redis::from_redis_value::<Vec<u8>>(payload)?;
+                        let request = serde_json::from_slice::<SnapshotRequest>(&bytes)?;
+                        if let Some(completion_id) = request.completion_id {
+                            return Result::<String>::Ok(completion_id);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("replica did not publish its readiness snapshot request")??;
+
+            assert!(
+                replica_manager
+                    .get_game_state(harness.game_id)
+                    .await
+                    .is_none(),
+                "replica replayed the pre-subscription activation snapshot"
+            );
+            assert!(
+                !replica_manager.is_ready().await,
+                "replica became ready before the requested snapshot was published"
+            );
+
+            let executor_cancel = CancellationToken::new();
+            let (executor, executor_task) = spawn_game_executor_v2(
+                2,
+                harness.guard.clone(),
+                harness.leases.clone(),
+                harness.bus.clone(),
+                Arc::new(UnusedDatabase::default()),
+                RecoveryConfig {
+                    // Leave a deterministic window in which the executor's
+                    // activation snapshot has hydrated the replica, but the
+                    // readiness request still awaits an ordinary checkpoint.
+                    checkpoint_interval: Duration::from_secs(5),
+                    ..RecoveryConfig::default()
+                },
+                executor_cancel,
+            );
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while replica_manager
+                    .get_game_state(harness.game_id)
+                    .await
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("executor activation snapshot did not hydrate the real replica")?;
+            assert!(
+                !replica_manager.is_ready().await,
+                "activation snapshot bypassed the matching readiness barrier"
+            );
+
+            tokio::time::timeout(Duration::from_secs(6), async {
+                while !replica_manager.is_ready().await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("replica did not become ready after its matching snapshot barrier")?;
+            let replicated = replica_manager
+                .get_game_state(harness.game_id)
+                .await
+                .context("matching barrier arrived before the requested snapshot was applied")?;
+            assert!(matches!(replicated.status, GameStatus::Started { .. }));
+
+            let entries: redis::streams::StreamRangeReply =
+                harness.raw.xrange_all(&event_stream).await?;
+            let mut snapshot_indices = Vec::new();
+            let mut matching_barrier_index = None;
+            for (index, entry) in entries.ids.iter().enumerate() {
+                if let Some(payload) = entry.map.get("data") {
+                    let bytes = redis::from_redis_value::<Vec<u8>>(payload)?;
+                    let event = serde_json::from_slice::<GameEventMessage>(&bytes)?;
+                    if event.game_id == harness.game_id
+                        && matches!(event.event, GameEvent::Snapshot { .. })
+                    {
+                        snapshot_indices.push(index);
+                    }
+                }
+                if let Some(payload) = entry.map.get("snapshot_barrier") {
+                    let observed = redis::from_redis_value::<String>(payload)?;
+                    if observed == completion_id {
+                        matching_barrier_index.get_or_insert(index);
+                    }
+                }
+            }
+            let matching_barrier_index = matching_barrier_index
+                .context("executor did not publish the matching readiness barrier")?;
+            assert!(
+                snapshot_indices.len() >= 2,
+                "executor activation occurred, but the readiness request did not publish a second snapshot"
+            );
+            assert!(
+                snapshot_indices
+                    .last()
+                    .is_some_and(|index| *index < matching_barrier_index),
+                "matching readiness barrier preceded its requested snapshot"
+            );
+
+            replica_cancel.cancel();
+            replica_manager.wait().await?;
+            executor.handoff().await?;
+            executor_task
+                .await
+                .context("executor task panicked during test cleanup")??;
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn assignment_move_preempts_inflight_new_actor_activation() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut harness = CrashBoundaryHarness::new("new-actor-activation-handoff").await?;
@@ -6696,7 +7019,32 @@ mod tests {
             // the one-second materialization retry backoff was active.
             actor.checkpoint().await?;
             actor.publish_fresh_snapshot().await?;
-            actor.checkpoint().await?;
+            let (readiness_reply, mut readiness_completion) = oneshot::channel();
+            actor.request_snapshot();
+            actor.snapshot_waiters.push(readiness_reply);
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut readiness_completion)
+                    .await
+                    .is_err(),
+                "terminal-pending actor certified readiness before its terminal snapshot committed"
+            );
+            assert!(
+                actor.snapshot_requested,
+                "terminal-pending actor discarded its readiness snapshot request"
+            );
+            assert_eq!(
+                actor.snapshot_waiters.len(),
+                1,
+                "terminal-pending actor discarded its readiness waiter"
+            );
+            drop(readiness_completion);
+            actor.checkpoint_and_publish_requested_snapshot().await?;
+            assert!(
+                actor.snapshot_waiters.is_empty(),
+                "terminal-pending actor retained an abandoned readiness waiter"
+            );
+            assert!(actor.snapshot_requested);
 
             let persisted = harness.recovery().await?;
             assert!(

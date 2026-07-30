@@ -589,10 +589,19 @@ async fn read_output_status(
             let stream_unix_ms = stream_id.0;
             let stream_unix_ms =
                 i64::try_from(stream_unix_ms).context("event stream timestamp exceeds i64")?;
-            let payload = entry
-                .map
-                .get("data")
-                .context("authoritative event stream entry has no data field")?;
+            let data = entry.map.get("data");
+            let barrier = entry.map.get("snapshot_barrier");
+            let payload = match (data, barrier, entry.map.len()) {
+                (None, Some(barrier), 1) => {
+                    let completion_id = redis::from_redis_value::<String>(barrier)
+                        .context("authoritative snapshot barrier is not a string")?;
+                    Uuid::parse_str(&completion_id)
+                        .context("authoritative snapshot barrier ID is not a UUID")?;
+                    continue;
+                }
+                (Some(data), None, 1) => data,
+                _ => bail!("authoritative event stream entry has an unknown field shape"),
+            };
             let payload = redis::from_redis_value::<Vec<u8>>(payload)
                 .context("authoritative event stream data is not binary-safe")?;
             let event: GameEventMessage = serde_json::from_slice(&payload)
@@ -1155,6 +1164,14 @@ mod tests {
             ))?)
             .query_async(&mut redis)
             .await?;
+        let barrier_id = Uuid::new_v4().to_string();
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("snapshot_barrier")
+            .arg(&barrier_id)
+            .query_async(&mut redis)
+            .await?;
         for offset in 0..OUTPUT_SCAN_PAGE_SIZE {
             let stream_seq = u64::try_from(offset + 2)?;
             let _: String = redis::cmd("XADD")
@@ -1248,10 +1265,33 @@ mod tests {
             &mut redis,
             "output-proof".to_string(),
             partition,
-            scheduled_id,
+            scheduled_id.clone(),
         )
         .await?;
         assert!(empty.first_scheduled_output.is_none());
+
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("unknown")
+            .arg("shape")
+            .query_async(&mut redis)
+            .await?;
+        let malformed = match read_output_status(
+            &mut redis,
+            "output-proof".to_string(),
+            partition,
+            scheduled_id,
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown event-stream field shape was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            malformed.to_string().contains("unknown field shape"),
+            "unexpected malformed-entry error: {malformed:#}"
+        );
         let _: i64 = redis.del(&stream).await?;
         Ok(())
     }

@@ -192,8 +192,13 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - lifecycle state: `WARMING`, `ACTIVE`, or `DRAINING`;
    - an expiry refreshed on a short heartbeat.
 3. Membership heartbeat is one second and expiry is four seconds. Changes require staging evidence that the five-second crash-takeover objective still holds.
-4. A task may enter `ACTIVE` only after its local readiness conditions pass.
-5. Only `ACTIVE` tasks are eligible for new desired assignments.
+4. Executor membership may enter `ACTIVE` after the listener, assignment
+   watcher, and recent Valkey-operation predicates pass. It must not wait for
+   gateway replica hydration: a first or replacement task may need to own an
+   executor before it can answer the snapshot barrier that makes its gateway
+   routable.
+5. Only `ACTIVE` executor members are eligible for new desired assignments.
+   Public `/health/ready` remains a stricter, independent gateway predicate.
 6. On SIGTERM, executor membership must synchronously enter `DRAINING` before local readiness is demoted. The task retains its current executor work until the partition-local assignment views move, then performs bounded handoff; it never waits for a game to finish.
 7. SIGINT/Ctrl+C must use the same path for local development.
 8. Shutdown must have one global deadline. It must not apply a new timeout serially to every background handle.
@@ -369,11 +374,17 @@ The assignment coordinator is control plane only. Existing assignments and activ
 11. Checkpoint size and write volume must be measured under `1 -> 10 -> 1` load. Delta encoding is considered only if those measurements show a real capacity problem.
 12. A replica snapshot request must not perform an extra checkpoint inline or block
     the partition command reader behind a full-game fan-out. Each game actor
-    records an idempotent pending-snapshot flag, acknowledges the request
-    locally, and publishes at most one requested snapshot immediately after its
-    next existing periodic checkpoint. Concurrent gateway warm-up requests
-    therefore coalesce without weakening subscribe-before-request ordering.
-    Successor activation still publishes its immediate recovery re-anchor.
+    records an idempotent pending-snapshot flag and publishes at most one
+    requested snapshot immediately after its next existing periodic checkpoint.
+    Ordinary on-demand repair requests remain immediate hints. An initial
+    readiness request retains completion waiters in the actor while commands
+    continue, and a background executor worker appends a boot-unique completion
+    marker to the same ordered partition event stream only after every active
+    actor has published. Concurrent gateway warm-up requests coalesce at the
+    actor checkpoint. The gateway retries a missed request and becomes ready
+    only after consuming its exact marker, which also handles an empty
+    partition without a timer or synthetic game. Successor activation still
+    publishes its immediate recovery re-anchor.
 13. The authoritative executor partition reader must round-robin the complete
     projection for each addressable game, keep at most one unresolved delivery
     per game, and use a bounded fan-out. A later command, status, creation,
@@ -388,9 +399,14 @@ The assignment coordinator is control plane only. Existing assignments and activ
     must not read or drain the executor command stream or snapshot-request
     stream: pressure on either unrelated stream must not block authoritative
     game events from reaching connected sockets. The reader anchors before
-    subscription returns, reconnects from its last event-stream ID, and logs a
-    trim-horizon gap for diagnosis. Existing per-game sequence-gap and join-side
-    snapshot repair remain responsible for re-anchoring a stale replica.
+    subscription returns, reconnects from its last event-stream ID, and
+    verifies that a nonzero cursor has not crossed the bounded stream's trim
+    horizon on initial connection, reconnect, full backlog batches, and local
+    channel backpressure. A detected transport discontinuity fails the critical
+    replica worker and therefore the task; a surviving completion marker must
+    never certify snapshots that were trimmed before delivery. Existing
+    per-game sequence-gap and join-side snapshot repair remain responsible for
+    recoverable gaps beyond this bus.
 15. After broadcasting a full terminal snapshot, a gateway replica may evict
     that game immediately. The fenced completion script stores the immutable
     completion record, final recovery envelope, stored snapshot, pending-effect
@@ -496,14 +512,20 @@ The assignment coordinator is control plane only. Existing assignments and activ
 3. Readiness requires:
    - the HTTP/WebSocket listener is bound;
    - a recent bounded Valkey operation succeeded;
-   - all partition replica stream readers are subscribed and alive;
+   - all partition replica stream readers are subscribed and alive, and each
+     has consumed its boot-unique initial snapshot-completion marker after all
+     preceding active-game snapshots;
    - membership and assignment watchers are alive;
    - other critical local workers are alive;
    - the task is not draining.
 4. Readiness must not require owning any executor partition.
 5. A critical background worker exiting unexpectedly must fail the process so ECS restarts it. Do not add a general in-process supervisor.
 6. A transient regional Valkey failure makes tasks unready but must not make ECS liveness fail and create a replacement storm.
-7. A newly started task may be globally ready once its readers are alive. If a requested active game's replica is still cold, perform a bounded on-demand snapshot request/load and return a retryable warming response rather than delaying readiness for all users.
+7. Executor-placement eligibility and public gateway readiness are distinct.
+   A task may execute partitions while its gateway remains unready. After all
+   ten initial snapshot barriers pass, a later requested game that is still
+   cold uses the bounded on-demand snapshot request/load and returns a
+   retryable warming response rather than reporting a false missing game.
 8. Traefik backend health must use `/health/ready`; ECS container health must use `/health/live`.
 9. Keep `/api/health` as the lightweight client-side regional latency probe; it must not be the Traefik readiness signal.
 10. Remove the Traefik sticky-session cookie. Affinity is not required and can route reconnects back toward a draining backend.
@@ -642,11 +664,14 @@ The stored source token is diagnostic only. On recovery, the successor's newly a
 ### 11.1 Planned scale-up
 
 1. ECS starts a new task.
-2. It remains `WARMING` and unready until local readers and dependencies are ready.
-3. It becomes `ACTIVE`; Traefik and the assignment coordinator discover it automatically.
-4. The coordinator computes a minimally moved balanced desired map.
-5. Incumbents for moved partitions stop renewing, checkpoint, ACK covered commands, and compare-delete their leases.
-6. The new task acquires those leases, claims pending commands, restores checkpoints, catches up, and publishes fresh snapshots.
+2. After listener, assignment-watcher, and recent-Valkey checks pass, its
+   executor membership becomes `ACTIVE`; the assignment coordinator may use it
+   while its public gateway remains unready.
+3. The coordinator computes a minimally moved balanced desired map.
+4. Incumbents for moved partitions stop renewing, checkpoint, ACK covered commands, and compare-delete their leases.
+5. The new task acquires those leases, claims pending commands, restores checkpoints, catches up, and publishes fresh snapshots.
+6. Only after all gateway replicas consume their matching initial snapshot
+   barriers does `/health/ready` pass and Traefik route new connections to it.
 7. Existing WebSockets remain on their original tasks throughout.
 
 ### 11.2 Planned scale-down
@@ -796,6 +821,8 @@ rejections as healthy command throughput.
 | Fail checkpoint writes for nine seconds, then for eleven seconds, with the ten-second age budget | In the nine-second case commands remain pending and checkpointing recovers; in the eleven-second case the actor fails closed at the budget without falsely retiring work. |
 | Block one game actor while a later command targets another game in the same partition batch | The unrelated game receives its command before the blocked actor is released; each game retains one unresolved delivery at most, cursors never regress, and a handoff drains only the accepted prefix while leaving the untouched suffix recoverable in the PEL. |
 | Flood the executor command stream beyond the legacy gateway channel capacity while publishing a later authoritative event | The event-only gateway reader continues delivering the event promptly because it reads neither commands nor snapshot requests. |
+| Start a gateway while a partition is empty, active, or temporarily has no subscribed executor | Executor placement can converge before gateway routing; the gateway retries one boot-unique request, consumes every preceding requested snapshot and then its exact same-stream completion marker, and remains unready until that proof arrives. Snapshot publication waits on the existing actor checkpoint without blocking partition command dispatch. |
+| Remove a gateway event reader's nonzero cursor from the bounded stream before initial readiness or after routing | The reader emits a transport discontinuity, the critical replica worker exits, readiness is false, and no surviving old completion marker can make the task routable. |
 | Fail an owned partition executor closed, remove its final local handle, then begin task drain | The process-boot failure latch makes executor drain fail and no WebSocket `Drain` is announced; lease expiry plus ordinary reconnect remains authoritative. An empty handle map alone never passes. |
 | Inject failure at each WebSocket drain phase | Old socket remains usable until replacement auth, rejoin, snapshot, and switch complete; only one sends commands. |
 | Let the old socket advance beyond the frozen Pong frontier, promote the caught-up candidate, then deliver covered candidate snapshots both before and after the socket swap | Visible game state never rolls backward. Covered nonterminal stream-zero and sequenced frames remain suppressed until the promoted stream exceeds the old applied watermark; a terminal snapshot remains authoritative. |
@@ -929,6 +956,9 @@ criteria pass before the production ramp.
 - Planned task removal uses dual sockets; executor movement alone never moves sockets.
 - Matchmaking safety comes from atomic admission/cancellation and one matchmaking-slot commit, plus one narrow idempotent outbox bridge into the executor partition slot; it does not require a singleton or generic saga system.
 - Readiness and liveness are separate.
+- Executor-placement eligibility is also separate from gateway readiness so an
+  unready first/replacement gateway can own the executor that completes its
+  ordered initial-snapshot barrier.
 - CPU/memory autoscaling and `minTasks=1` remain.
 - Regional Serverless Valkey and single-ingress availability risks are accepted for this phase.
 - Serverless Valkey uses its fixed `volatile-lru` policy. CDK sets no data/ECPU usage maximum; any eviction or throttling fails certification and alarms in production.

@@ -58,6 +58,31 @@ use tracing::{debug, error, info, warn};
 pub struct SnapshotRequest {
     pub partition_id: u32,
     pub requester_id: Option<u64>, // Optional server ID of requester
+    /// Present only when gateway readiness must wait until every requested
+    /// snapshot has actually traversed the partition event stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
+}
+
+/// Internal messages delivered to a gateway replica from one ordered
+/// partition event stream. Game events retain their existing wire payload;
+/// completion markers use a separate Redis field and never reach clients.
+#[derive(Debug, Clone)]
+// Game events are the hot path; do not allocate every event merely to equalize
+// the rare readiness marker.
+#[allow(clippy::large_enum_variant)]
+pub enum PartitionEvent {
+    Game(GameEventMessage),
+    SnapshotBarrier {
+        completion_id: String,
+    },
+    /// The reader's last delivered cursor fell behind the bounded stream.
+    /// A gateway must not use a surviving barrier to certify snapshots that
+    /// may have been trimmed before delivery.
+    Discontinuity {
+        resume_id: String,
+        oldest_id: String,
+    },
 }
 
 /// A subscription to a partition's events, commands and requests
@@ -74,7 +99,7 @@ pub struct PartitionSubscription {
 /// unconsumed stream from applying backpressure to live game replication.
 pub struct PartitionEventSubscription {
     pub partition_id: u32,
-    pub event_receiver: mpsc::Receiver<GameEventMessage>,
+    pub event_receiver: mpsc::Receiver<PartitionEvent>,
 }
 
 pub struct SnapshotRequestSubscription {
@@ -385,9 +410,32 @@ impl GameBus {
         let request = SnapshotRequest {
             partition_id,
             requester_id: None,
+            completion_id: None,
         };
+        self.publish_snapshot_request(partition_id, &request).await
+    }
+
+    pub async fn request_partition_snapshots_with_barrier(
+        &self,
+        partition_id: u32,
+        completion_id: &str,
+    ) -> Result<()> {
+        uuid::Uuid::parse_str(completion_id).context("snapshot completion ID must be a UUID")?;
+        let request = SnapshotRequest {
+            partition_id,
+            requester_id: None,
+            completion_id: Some(completion_id.to_owned()),
+        };
+        self.publish_snapshot_request(partition_id, &request).await
+    }
+
+    async fn publish_snapshot_request(
+        &self,
+        partition_id: u32,
+        request: &SnapshotRequest,
+    ) -> Result<()> {
         let payload =
-            serde_json::to_vec(&request).context("Failed to serialize snapshot request")?;
+            serde_json::to_vec(request).context("Failed to serialize snapshot request")?;
         self.xadd(
             partition_id,
             &RedisKeys::stream_snapshot_requests(partition_id),
@@ -519,6 +567,47 @@ impl GameBus {
         if code != 1 {
             crate::resilience_metrics::record_fenced_write_rejection(1);
             anyhow::bail!("stale partition lease rejected event publication");
+        }
+        Ok(stream_id)
+    }
+
+    /// Publish an ordered completion marker only after every requested actor
+    /// snapshot has been written. Because this marker shares the event stream,
+    /// a replica that observes it has already processed all preceding
+    /// snapshots, including the empty-partition case.
+    pub async fn publish_snapshot_barrier_fenced(
+        &self,
+        guard: &PartitionLeaseGuard,
+        completion_id: &str,
+    ) -> Result<String> {
+        uuid::Uuid::parse_str(completion_id).context("snapshot completion ID must be a UUID")?;
+        let mut redis = self.partition_connection(guard.partition())?;
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {0, ''} end
+            local id = redis.call(
+                'XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*',
+                'snapshot_barrier', ARGV[3]
+            )
+            return {1, id}
+            "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(guard.lease_key())
+            .key(RedisKeys::stream_events(guard.partition()))
+            .arg(guard.encoded_token())
+            .arg(EVENTS_MAXLEN)
+            .arg(completion_id);
+        let operation = invocation.invoke_async(&mut redis);
+        let (code, stream_id): (i32, String) =
+            tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+                .await
+                .context("fenced snapshot barrier publication timed out")?
+                .context("failed to publish fenced snapshot barrier")?;
+        if code != 1 {
+            crate::resilience_metrics::record_fenced_write_rejection(1);
+            anyhow::bail!("stale partition lease rejected snapshot barrier");
         }
         Ok(stream_id)
     }
@@ -2174,11 +2263,13 @@ async fn partition_event_reader(
     client: RedisClient,
     partition_id: u32,
     mut last_id: String,
-    sender: mpsc::Sender<GameEventMessage>,
+    sender: mpsc::Sender<PartitionEvent>,
     cancellation: CancellationToken,
 ) {
     let key = RedisKeys::stream_events(partition_id);
     let mut first_connect = true;
+    // Close the anchor-to-dedicated-connection window on the first read too.
+    let mut verify_horizon = last_id != "0-0";
 
     'reconnect: loop {
         if cancellation.is_cancelled() || sender.is_closed() {
@@ -2197,37 +2288,52 @@ async fn partition_event_reader(
             }
         };
 
-        if !first_connect {
-            match connection
-                .xrange_count::<_, _, _, _, redis::streams::StreamRangeReply>(&key, "-", "+", 1)
-                .await
-            {
-                Ok(reply) => {
-                    if let Some(oldest) = reply
-                        .ids
-                        .first()
-                        .filter(|oldest| stream_id_less_than(&last_id, &oldest.id))
-                    {
-                        error!(
-                            partition = partition_id,
-                            stream = %key,
-                            resume = %last_id,
-                            oldest = %oldest.id,
-                            "Gateway event reader fell behind the trim horizon; downstream sequence-gap recovery will request snapshots"
-                        );
-                    }
-                }
-                Err(error) => warn!(
-                    %error,
-                    partition = partition_id,
-                    stream = %key,
-                    "Gateway event reader could not check the trim horizon"
-                ),
-            }
-        }
+        verify_horizon |= !first_connect;
         first_connect = false;
 
         loop {
+            if verify_horizon && last_id != "0-0" {
+                let horizon = connection
+                    .xrange_count::<_, _, _, _, redis::streams::StreamRangeReply>(&key, "-", "+", 1)
+                    .await;
+                let reply = match horizon {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            partition = partition_id,
+                            stream = %key,
+                            "Gateway event reader could not verify its trim horizon; reconnecting"
+                        );
+                        tokio::time::sleep(Duration::from_millis(READER_RECONNECT_BACKOFF_MS))
+                            .await;
+                        continue 'reconnect;
+                    }
+                };
+                let oldest_id = reply.ids.first().map(|oldest| oldest.id.clone());
+                if stream_cursor_fell_behind(&last_id, oldest_id.as_deref()) {
+                    let oldest_id = oldest_id.unwrap_or_else(|| "0-0".to_string());
+                    error!(
+                        partition = partition_id,
+                        stream = %key,
+                        resume = %last_id,
+                        oldest = %oldest_id,
+                        "Gateway event reader fell behind the trim horizon"
+                    );
+                    let discontinuity = PartitionEvent::Discontinuity {
+                        resume_id: last_id.clone(),
+                        oldest_id,
+                    };
+                    if !matches!(
+                        forward(&sender, discontinuity, &cancellation).await,
+                        Forward::Delivered
+                    ) {
+                        return;
+                    }
+                }
+                verify_horizon = false;
+            }
+
             let options = StreamReadOptions::default()
                 .count(XREAD_COUNT)
                 .block(XREAD_BLOCK_MS);
@@ -2253,21 +2359,49 @@ async fn partition_event_reader(
             };
 
             for stream in reply.keys {
+                if stream.ids.len() == XREAD_COUNT {
+                    // A full batch means the reader may be consuming a
+                    // backlog. Verify the cursor before asking for more.
+                    verify_horizon = true;
+                }
                 for entry in stream.ids {
                     let entry_id = entry.id.clone();
-                    let message = entry
-                        .map
-                        .get("data")
-                        .ok_or_else(|| anyhow::anyhow!("stream entry has no data field"))
-                        .and_then(|payload| {
-                            redis::from_redis_value::<Vec<u8>>(payload).map_err(anyhow::Error::from)
-                        })
-                        .and_then(|bytes| {
-                            serde_json::from_slice::<GameEventMessage>(&bytes)
+                    let message = match (entry.map.get("data"), entry.map.get("snapshot_barrier")) {
+                        (None, Some(payload)) if entry.map.len() == 1 => redis::from_redis_value::<
+                            String,
+                        >(
+                            payload
+                        )
+                        .map(|completion_id| PartitionEvent::SnapshotBarrier { completion_id })
+                        .map_err(anyhow::Error::from)
+                        .and_then(|message| {
+                            let PartitionEvent::SnapshotBarrier { completion_id } = &message else {
+                                unreachable!("constructed snapshot barrier")
+                            };
+                            uuid::Uuid::parse_str(completion_id)
+                                .context("snapshot barrier ID must be a UUID")?;
+                            Ok(message)
+                        }),
+                        (Some(payload), None) if entry.map.len() == 1 => {
+                            redis::from_redis_value::<Vec<u8>>(payload)
                                 .map_err(anyhow::Error::from)
-                        });
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<GameEventMessage>(&bytes)
+                                        .map(PartitionEvent::Game)
+                                        .map_err(anyhow::Error::from)
+                                })
+                        }
+                        _ => Err(anyhow::anyhow!("stream entry has an unknown field shape")),
+                    };
                     match message {
                         Ok(message) => {
+                            if sender.capacity() == 0 {
+                                // The stream can continue trimming while this
+                                // reader is held behind its local subscriber.
+                                // Verify the delivered cursor before the next
+                                // XREAD rather than silently jumping forward.
+                                verify_horizon = true;
+                            }
                             if !matches!(
                                 forward(&sender, message, &cancellation).await,
                                 Forward::Delivered
@@ -2275,12 +2409,15 @@ async fn partition_event_reader(
                                 return;
                             }
                         }
-                        Err(error) => warn!(
-                            %error,
-                            id = %entry_id,
-                            stream = %key,
-                            "Malformed gateway event; skipping"
-                        ),
+                        Err(error) => {
+                            error!(
+                                %error,
+                                id = %entry_id,
+                                stream = %key,
+                                "Malformed gateway partition event; failing closed"
+                            );
+                            return;
+                        }
                     }
                     last_id = entry_id;
                 }
@@ -2459,6 +2596,26 @@ async fn partition_reader(
                             }
                         }
                     }
+                    if stream.key == events_key
+                        && let Some(marker) = entry.map.get("snapshot_barrier")
+                    {
+                        // The combined subscription exposes only game events.
+                        // Replica readiness uses the dedicated event
+                        // subscription above, which retains this marker.
+                        let valid = entry.map.len() == 1
+                            && redis::from_redis_value::<String>(marker)
+                                .ok()
+                                .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok());
+                        if !valid {
+                            warn!(
+                                id = %entry.id,
+                                stream = %stream.key,
+                                "Malformed snapshot barrier on combined partition reader; skipping"
+                            );
+                        }
+                        last_ids[0] = entry.id.clone();
+                        continue;
+                    }
                     let Some(payload) = entry.map.get("data") else {
                         warn!(
                             "Stream entry {} on {} has no data field; skipping",
@@ -2563,6 +2720,10 @@ fn stream_id_less_than(a: &str, b: &str) -> bool {
     parse(a) < parse(b)
 }
 
+fn stream_cursor_fell_behind(cursor: &str, oldest: Option<&str>) -> bool {
+    cursor != "0-0" && oldest.is_none_or(|oldest| stream_id_less_than(cursor, oldest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2581,6 +2742,77 @@ mod tests {
         assert!(stream_id_less_than("9-0", "10-0"));
         assert!(!stream_id_less_than("10-0", "9-0"));
         assert!(!stream_id_less_than("5-2", "5-2"));
+    }
+
+    #[test]
+    fn bounded_stream_cursor_loss_is_conservative() {
+        assert!(!stream_cursor_fell_behind("0-0", None));
+        assert!(!stream_cursor_fell_behind("10-0", Some("9-0")));
+        assert!(!stream_cursor_fell_behind("10-0", Some("10-0")));
+        assert!(stream_cursor_fell_behind("10-0", Some("11-0")));
+        assert!(stream_cursor_fell_behind("10-0", None));
+    }
+
+    #[tokio::test]
+    async fn gateway_reader_emits_discontinuity_before_surviving_entries() -> Result<()> {
+        let url = "redis://127.0.0.1:6379/8?protocol=resp3";
+        let raw_client = redis::Client::open(url)?;
+        let mut redis = raw_client.get_multiplexed_async_connection().await?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let client = RedisClient::open(url, Some(push_tx))?;
+        let partition = PARTITION_COUNT - 1;
+        let stream = RedisKeys::stream_events(partition);
+        let _: i64 = redis.del(&stream).await?;
+        let old_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("1-0")
+            .arg("data")
+            .arg(serde_json::to_vec(&GameEventMessage {
+                game_id: partition,
+                tick: 0,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::StatusUpdated {
+                    status: common::GameStatus::Stopped,
+                },
+            })?)
+            .query_async(&mut redis)
+            .await?;
+        assert_eq!(old_id, "1-0");
+        let _: i64 = redis.del(&stream).await?;
+        let completion_id = uuid::Uuid::new_v4().to_string();
+        let surviving_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("2-0")
+            .arg("snapshot_barrier")
+            .arg(&completion_id)
+            .query_async(&mut redis)
+            .await?;
+        assert_eq!(surviving_id, "2-0");
+
+        let token = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let reader_token = token.clone();
+        let reader = tokio::spawn(async move {
+            partition_event_reader(client, partition, old_id, sender, reader_token).await;
+        });
+        let first = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .context("gateway reader did not report its lost cursor")?
+            .context("gateway reader closed before reporting its lost cursor")?;
+        assert!(matches!(
+            first,
+            PartitionEvent::Discontinuity {
+                resume_id,
+                oldest_id,
+            } if resume_id == "1-0" && oldest_id == "2-0"
+        ));
+
+        token.cancel();
+        reader.await?;
+        let _: i64 = redis.del(&stream).await?;
+        Ok(())
     }
 
     #[tokio::test]

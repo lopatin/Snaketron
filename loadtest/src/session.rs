@@ -2,8 +2,9 @@
 
 use crate::config::{CommandProfile, Population};
 use crate::report::{
-    HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord, SessionMetrics,
-    SessionOutcome, SessionPhase, SessionRecord, unix_time_ms,
+    CommandResolutionSource, HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord,
+    SessionMetrics, SessionOutcome, SessionPhase, SessionRecord, SlowCommandResolution,
+    retain_slow_resolution_coverage, unix_time_ms,
 };
 use crate::target::BackendHintRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -170,6 +171,16 @@ struct PendingCommand {
     sent_at_unix_ms: u64,
     sent_at: Instant,
 }
+
+struct PendingCommandResolution {
+    sent_second: u64,
+    sent_at_unix_ms: u64,
+    resolved_at_unix_ms: u64,
+    latency_ms: u64,
+}
+
+const SLOW_COMMAND_RESOLUTION_THRESHOLD_MS: u64 = 1_000;
+const MAX_SESSION_SLOW_COMMAND_RESOLUTIONS: usize = 32;
 
 struct LiveSession {
     record: SessionRecord,
@@ -1004,6 +1015,8 @@ enum PreGameHandoffAttemptError {
 async fn next_pre_game_candidate_message(
     session: &mut LiveSession,
     socket: &mut Socket,
+    task_boot_id: Option<&str>,
+    socket_generation: Option<u64>,
     deadline: tokio::time::Instant,
     cancellation: &CancellationToken,
 ) -> std::result::Result<WSMessage, PreGameHandoffAttemptError> {
@@ -1021,7 +1034,7 @@ async fn next_pre_game_candidate_message(
         }
     };
     session
-        .observe_received(&message)
+        .observe_received_from(&message, task_boot_id, socket_generation)
         .map_err(PreGameHandoffAttemptError::Fatal)?;
     Ok(message)
 }
@@ -1064,7 +1077,16 @@ async fn prepare_pre_game_candidate(
     .map_err(PreGameHandoffAttemptError::Candidate)?;
 
     let (task_boot_id, socket_generation, capabilities) = loop {
-        match next_pre_game_candidate_message(session, &mut socket, deadline, cancellation).await? {
+        match next_pre_game_candidate_message(
+            session,
+            &mut socket,
+            None,
+            None,
+            deadline,
+            cancellation,
+        )
+        .await?
+        {
             WSMessage::Authenticated {
                 task_boot_id,
                 protocol_version: _,
@@ -1120,8 +1142,15 @@ async fn prepare_pre_game_candidate(
         .await
         .map_err(PreGameHandoffAttemptError::Candidate)?;
         loop {
-            match next_pre_game_candidate_message(session, &mut socket, deadline, cancellation)
-                .await?
+            match next_pre_game_candidate_message(
+                session,
+                &mut socket,
+                Some(&task_boot_id),
+                Some(socket_generation),
+                deadline,
+                cancellation,
+            )
+            .await?
             {
                 WSMessage::LobbyUpdate {
                     lobby_code: updated,
@@ -1223,7 +1252,11 @@ async fn prepare_pre_game_candidate(
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PreGameHandoffAttemptError::Candidate)?;
                 session
-                    .observe_received(&message)
+                    .observe_received_from(
+                        &message,
+                        Some(&task_boot_id),
+                        Some(socket_generation),
+                    )
                     .map_err(PreGameHandoffAttemptError::Fatal)?;
                 match message {
                     WSMessage::Drain { .. } => {
@@ -1314,6 +1347,8 @@ async fn perform_pre_game_planned_handoff(
                 session.server_capabilities = candidate.capabilities;
                 session.last_lobby_members = candidate.lobby_members;
                 session.last_lobby_state = candidate.lobby_state;
+                session.current_task_boot_id = Some(candidate.task_boot_id.clone());
+                session.current_socket_generation = Some(candidate.socket_generation);
                 let ordinal = session.record.metrics.planned_handoff_successes + 1;
                 session.record.diagnostics.insert(
                     format!("planned_handoff_task_boot_id_{ordinal}"),
@@ -3389,7 +3424,11 @@ async fn prepare_planned_candidate(
             candidate = next_socket_message(&mut socket) => {
                 let message = candidate.map_err(PlannedHandoffAttemptError::Candidate)?;
                 session
-                    .observe_received(&message)
+                    .observe_received_from(
+                        &message,
+                        authenticated.then_some(task_boot_id.as_str()),
+                        authenticated.then_some(socket_generation),
+                    )
                     .map_err(PlannedHandoffAttemptError::Fatal)?;
                 match message {
                     WSMessage::Authenticated {
@@ -4142,9 +4181,11 @@ fn record_pending_command_resolution(
     pending_commands: &mut BTreeMap<u64, PendingCommand>,
     metrics: &mut SessionMetrics,
     sequence: u64,
-) -> Option<u64> {
+) -> Option<PendingCommandResolution> {
     let command = pending_commands.remove(&sequence)?;
     let sent_second = command.sent_at_unix_ms / 1_000;
+    let latency_ms = elapsed_ms(command.sent_at);
+    let resolved_at_unix_ms = unix_time_ms();
     let count = metrics
         .command_outcome_counts_by_sent_unix_second
         .entry(sent_second)
@@ -4154,35 +4195,38 @@ fn record_pending_command_resolution(
         .command_outcome_max_latency_ms_by_sent_unix_second
         .entry(sent_second)
         .or_default();
-    *maximum = (*maximum).max(elapsed_ms(command.sent_at));
-    Some(sent_second)
-}
-
-fn record_all_pending_command_resolutions(
-    pending_commands: &mut BTreeMap<u64, PendingCommand>,
-    metrics: &mut SessionMetrics,
-) {
-    let sequences: Vec<u64> = pending_commands.keys().copied().collect();
-    for sequence in sequences {
-        record_pending_command_resolution(pending_commands, metrics, sequence);
-    }
+    *maximum = (*maximum).max(latency_ms);
+    Some(PendingCommandResolution {
+        sent_second,
+        sent_at_unix_ms: command.sent_at_unix_ms,
+        resolved_at_unix_ms,
+        latency_ms,
+    })
 }
 
 fn record_scheduled_pending_command_resolution(
     pending_commands: &mut BTreeMap<u64, PendingCommand>,
     metrics: &mut SessionMetrics,
     sequence: u64,
-) -> bool {
-    let Some(sent_second) = record_pending_command_resolution(pending_commands, metrics, sequence)
-    else {
-        return false;
-    };
+) -> Option<PendingCommandResolution> {
+    let resolution = record_pending_command_resolution(pending_commands, metrics, sequence)?;
     let total = metrics
         .scheduled_command_counts_by_sent_unix_second
-        .entry(sent_second)
+        .entry(resolution.sent_second)
         .or_default();
     *total = total.saturating_add(1);
-    true
+    Some(resolution)
+}
+
+fn retain_slow_command_resolution(metrics: &mut SessionMetrics, resolution: SlowCommandResolution) {
+    if resolution.latency_ms <= SLOW_COMMAND_RESOLUTION_THRESHOLD_MS {
+        return;
+    }
+    metrics.slow_command_resolutions.push(resolution);
+    retain_slow_resolution_coverage(
+        &mut metrics.slow_command_resolutions,
+        MAX_SESSION_SLOW_COMMAND_RESOLUTIONS,
+    );
 }
 
 fn command_submission_is_backpressured(
@@ -4261,25 +4305,84 @@ fn rejection_fence_for_current_session(
     }
 }
 
-fn reconcile_command_outcomes(
-    pending_commands: &mut BTreeMap<u64, PendingCommand>,
-    metrics: &mut SessionMetrics,
-    contiguous_through: u64,
-    outcomes: &BTreeMap<u64, CommandOutcome>,
-) {
-    let resolved = pending_commands
-        .keys()
-        .copied()
-        .filter(|sequence| *sequence <= contiguous_through || outcomes.contains_key(sequence))
-        .collect::<Vec<_>>();
-    for sequence in resolved {
-        if matches!(
-            outcomes.get(&sequence),
-            Some(CommandOutcome::Scheduled { .. })
-        ) {
-            record_scheduled_pending_command_resolution(pending_commands, metrics, sequence);
+impl LiveSession {
+    fn record_command_resolution(
+        &mut self,
+        game_id: u32,
+        sequence: u64,
+        source: CommandResolutionSource,
+        scheduled: bool,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+    ) -> bool {
+        let resolution = if scheduled {
+            record_scheduled_pending_command_resolution(
+                &mut self.pending_commands,
+                &mut self.record.metrics,
+                sequence,
+            )
         } else {
-            record_pending_command_resolution(pending_commands, metrics, sequence);
+            record_pending_command_resolution(
+                &mut self.pending_commands,
+                &mut self.record.metrics,
+                sequence,
+            )
+        };
+        let Some(resolution) = resolution else {
+            return false;
+        };
+        retain_slow_command_resolution(
+            &mut self.record.metrics,
+            SlowCommandResolution {
+                session_id: self.record.session_id.clone(),
+                user_id: self.user_id,
+                game_id,
+                partition_id: game_id % 10,
+                client_game_session_id: self.client_game_session_id.clone(),
+                command_sequence: sequence,
+                sent_at_unix_ms: resolution.sent_at_unix_ms,
+                resolved_at_unix_ms: resolution.resolved_at_unix_ms,
+                latency_ms: resolution.latency_ms,
+                source,
+                gateway_task_boot_id: gateway_task_boot_id.map(str::to_owned),
+                socket_generation,
+            },
+        );
+        true
+    }
+
+    fn reconcile_command_outcomes(
+        &mut self,
+        game_id: u32,
+        contiguous_through: u64,
+        outcomes: &BTreeMap<u64, CommandOutcome>,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+    ) {
+        let resolved = self
+            .pending_commands
+            .keys()
+            .copied()
+            .filter(|sequence| *sequence <= contiguous_through || outcomes.contains_key(sequence))
+            .collect::<Vec<_>>();
+        for sequence in resolved {
+            let (source, scheduled) = match outcomes.get(&sequence) {
+                Some(CommandOutcome::Scheduled { .. }) => {
+                    (CommandResolutionSource::RecoveryScheduledOutcome, true)
+                }
+                Some(CommandOutcome::Rejected { .. }) => {
+                    (CommandResolutionSource::RecoveryRejectedOutcome, false)
+                }
+                None => (CommandResolutionSource::RecoveryContiguousOutcome, false),
+            };
+            self.record_command_resolution(
+                game_id,
+                sequence,
+                source,
+                scheduled,
+                gateway_task_boot_id,
+                socket_generation,
+            );
         }
     }
 }
@@ -4363,22 +4466,59 @@ impl LiveSession {
         self.remember(format!("sent:{kind}"));
     }
 
-    fn record_terminal_game_resolutions(&mut self) {
-        record_all_pending_command_resolutions(
-            &mut self.pending_commands,
-            &mut self.record.metrics,
-        );
+    fn record_terminal_game_resolutions(
+        &mut self,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+    ) {
+        let Some(game_id) = self.record.game_id else {
+            return;
+        };
+        let sequences = self.pending_commands.keys().copied().collect::<Vec<_>>();
+        for sequence in sequences {
+            self.record_command_resolution(
+                game_id,
+                sequence,
+                CommandResolutionSource::TerminalGameState,
+                false,
+                gateway_task_boot_id,
+                socket_generation,
+            );
+        }
     }
 
-    fn record_scheduled_command_resolution(&mut self, sequence: u64) -> bool {
-        record_scheduled_pending_command_resolution(
-            &mut self.pending_commands,
-            &mut self.record.metrics,
+    fn record_scheduled_command_resolution(
+        &mut self,
+        game_id: u32,
+        sequence: u64,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+    ) -> bool {
+        self.record_command_resolution(
+            game_id,
             sequence,
+            CommandResolutionSource::LiveScheduledEvent,
+            true,
+            gateway_task_boot_id,
+            socket_generation,
         )
     }
 
     fn observe_received(&mut self, message: &WSMessage) -> Result<()> {
+        let gateway_task_boot_id = self.current_task_boot_id.clone();
+        self.observe_received_from(
+            message,
+            gateway_task_boot_id.as_deref(),
+            self.current_socket_generation,
+        )
+    }
+
+    fn observe_received_from(
+        &mut self,
+        message: &WSMessage,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+    ) -> Result<()> {
         if let Some((source, from_sequence)) =
             rejection_fence_for_current_session(message, self.user_id, &self.client_game_session_id)
         {
@@ -4422,14 +4562,19 @@ impl LiveSession {
                     event.game_id,
                     &event.event,
                 ) {
-                    self.record_terminal_game_resolutions();
+                    self.record_terminal_game_resolutions(gateway_task_boot_id, socket_generation);
                 }
                 match &event.event {
                     GameEvent::CommandScheduledV2 { command_id, .. }
                         if command_id.user_id == self.user_id
                             && command_id.client_game_session_id == self.client_game_session_id =>
                     {
-                        if self.record_scheduled_command_resolution(command_id.sequence) {
+                        if self.record_scheduled_command_resolution(
+                            command_id.game_id,
+                            command_id.sequence,
+                            gateway_task_boot_id,
+                            socket_generation,
+                        ) {
                             let received_total = self
                                 .record
                                 .metrics
@@ -4443,27 +4588,31 @@ impl LiveSession {
                         if command_id.user_id == self.user_id
                             && command_id.client_game_session_id == self.client_game_session_id =>
                     {
-                        record_pending_command_resolution(
-                            &mut self.pending_commands,
-                            &mut self.record.metrics,
+                        self.record_command_resolution(
+                            command_id.game_id,
                             command_id.sequence,
+                            CommandResolutionSource::LiveRejectedEvent,
+                            false,
+                            gateway_task_boot_id,
+                            socket_generation,
                         );
                     }
                     _ => {}
                 }
             }
             WSMessage::CommandOutcomes {
-                game_id: _,
+                game_id,
                 client_game_session_id,
                 contiguous_through,
                 outcomes,
                 ..
             } if client_game_session_id == &self.client_game_session_id => {
-                reconcile_command_outcomes(
-                    &mut self.pending_commands,
-                    &mut self.record.metrics,
+                self.reconcile_command_outcomes(
+                    *game_id,
                     *contiguous_through,
                     outcomes,
+                    gateway_task_boot_id,
+                    socket_generation,
                 );
             }
             _ => {}
@@ -5173,16 +5322,14 @@ mod tests {
         ]);
         let mut metrics = SessionMetrics::default();
 
-        assert!(record_scheduled_pending_command_resolution(
-            &mut pending_commands,
-            &mut metrics,
-            1,
-        ));
-        assert!(!record_scheduled_pending_command_resolution(
-            &mut pending_commands,
-            &mut metrics,
-            1,
-        ));
+        assert!(
+            record_scheduled_pending_command_resolution(&mut pending_commands, &mut metrics, 1,)
+                .is_some()
+        );
+        assert!(
+            record_scheduled_pending_command_resolution(&mut pending_commands, &mut metrics, 1,)
+                .is_none()
+        );
         assert_eq!(
             metrics.command_outcome_counts_by_sent_unix_second,
             BTreeMap::from([(123, 1)])
@@ -5192,14 +5339,73 @@ mod tests {
             BTreeMap::from([(123, 1)])
         );
 
-        record_all_pending_command_resolutions(&mut pending_commands, &mut metrics);
-        record_all_pending_command_resolutions(&mut pending_commands, &mut metrics);
+        for sequence in [2, 3] {
+            record_pending_command_resolution(&mut pending_commands, &mut metrics, sequence);
+        }
+        for sequence in [2, 3] {
+            record_pending_command_resolution(&mut pending_commands, &mut metrics, sequence);
+        }
         assert!(pending_commands.is_empty());
         assert_eq!(
             metrics.command_outcome_counts_by_sent_unix_second,
             BTreeMap::from([(123, 3)])
         );
         assert!(metrics.command_outcome_max_latency_ms_by_sent_unix_second[&123] >= 5);
+    }
+
+    #[test]
+    fn slow_command_provenance_is_thresholded_sorted_and_bounded() {
+        let mut metrics = SessionMetrics::default();
+        let diagnostic = |sequence: u64, latency_ms: u64| SlowCommandResolution {
+            session_id: "session-1".to_owned(),
+            user_id: 7,
+            game_id: 42,
+            partition_id: 2,
+            client_game_session_id: "game-session-1".to_owned(),
+            command_sequence: sequence,
+            sent_at_unix_ms: 1_000 + sequence,
+            resolved_at_unix_ms: 1_000 + sequence + latency_ms,
+            latency_ms,
+            source: CommandResolutionSource::LiveScheduledEvent,
+            gateway_task_boot_id: Some("task-a".to_owned()),
+            socket_generation: Some(1),
+        };
+
+        retain_slow_command_resolution(&mut metrics, diagnostic(0, 1_000));
+        assert!(metrics.slow_command_resolutions.is_empty());
+
+        for sequence in 1..=40 {
+            retain_slow_command_resolution(&mut metrics, diagnostic(sequence, 1_000 + sequence));
+        }
+        assert_eq!(
+            metrics.slow_command_resolutions.len(),
+            MAX_SESSION_SLOW_COMMAND_RESOLUTIONS
+        );
+        assert_eq!(metrics.slow_command_resolutions[0].command_sequence, 40);
+        assert_eq!(
+            metrics
+                .slow_command_resolutions
+                .last()
+                .unwrap()
+                .command_sequence,
+            9
+        );
+
+        let mut another_second = diagnostic(100, 1_001);
+        another_second.sent_at_unix_ms = 2_000;
+        another_second.resolved_at_unix_ms = 3_001;
+        retain_slow_command_resolution(&mut metrics, another_second);
+        assert_eq!(
+            metrics.slow_command_resolutions.len(),
+            MAX_SESSION_SLOW_COMMAND_RESOLUTIONS
+        );
+        assert!(
+            metrics
+                .slow_command_resolutions
+                .iter()
+                .any(|resolution| resolution.sent_at_unix_ms / 1_000 == 2),
+            "a lower-latency violating second lost its only provenance record"
+        );
     }
 
     fn pending_command(sequence: u64) -> PendingCommand {
@@ -5746,8 +5952,8 @@ mod tests {
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,
-            current_task_boot_id: None,
-            current_socket_generation: None,
+            current_task_boot_id: Some("old-task".to_owned()),
+            current_socket_generation: Some(1),
             reconnects: 0,
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
@@ -6106,6 +6312,11 @@ mod tests {
         assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
         assert_eq!(session.record.metrics.disconnects, 0);
         assert_eq!(session.record.metrics.reconnects, 0);
+        assert_eq!(
+            session.current_task_boot_id.as_deref(),
+            Some("replacement-task")
+        );
+        assert_eq!(session.current_socket_generation, Some(2));
         session.socket.close(None).await.unwrap();
         server.await.unwrap();
     }
@@ -6845,8 +7056,8 @@ mod tests {
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,
-            current_task_boot_id: None,
-            current_socket_generation: None,
+            current_task_boot_id: Some("old-task".to_owned()),
+            current_socket_generation: Some(1),
             reconnects: 0,
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 2,
@@ -6854,8 +7065,10 @@ mod tests {
                 1,
                 PendingCommand {
                     message: pending,
-                    sent_at_unix_ms: unix_time_ms(),
-                    sent_at: Instant::now(),
+                    sent_at_unix_ms: unix_time_ms().saturating_sub(1_100),
+                    sent_at: Instant::now()
+                        .checked_sub(Duration::from_millis(1_100))
+                        .unwrap(),
                 },
             )]),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
@@ -6971,6 +7184,18 @@ mod tests {
             1
         );
         assert!(session.record.metrics.planned_handoff_active_overlap_ms[0] >= 40);
+        let candidate_resolution = session
+            .record
+            .metrics
+            .slow_command_resolutions
+            .iter()
+            .find(|resolution| resolution.command_sequence == 1)
+            .expect("candidate recovery outcome records slow-command provenance");
+        assert_eq!(
+            candidate_resolution.gateway_task_boot_id.as_deref(),
+            Some("candidate-task")
+        );
+        assert_eq!(candidate_resolution.socket_generation, Some(2));
         session.socket.close(None).await.unwrap();
         server.await.unwrap();
     }

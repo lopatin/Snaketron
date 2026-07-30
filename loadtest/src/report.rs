@@ -16,6 +16,58 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REPORT_SCHEMA_VERSION: u32 = 10;
+const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
+
+/// Keep the slowest evidence while reserving one representative for every
+/// violating original-send second that fits in the fixed report budget.
+/// This prevents one severe second from hiding the identity/source needed to
+/// diagnose a different failed second.
+pub(crate) fn retain_slow_resolution_coverage(
+    resolutions: &mut Vec<SlowCommandResolution>,
+    limit: usize,
+) {
+    resolutions.sort_by(|left, right| {
+        right
+            .latency_ms
+            .cmp(&left.latency_ms)
+            .then_with(|| left.sent_at_unix_ms.cmp(&right.sent_at_unix_ms))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.command_sequence.cmp(&right.command_sequence))
+    });
+    if resolutions.len() <= limit {
+        return;
+    }
+
+    let mut selected = vec![false; resolutions.len()];
+    let mut represented_seconds = std::collections::BTreeSet::new();
+    let mut selected_count = 0;
+    for (index, resolution) in resolutions.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        if represented_seconds.insert(resolution.sent_at_unix_ms / 1_000) {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+    if selected_count < limit {
+        for is_selected in &mut selected {
+            if selected_count == limit {
+                break;
+            }
+            if !*is_selected {
+                *is_selected = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut index = 0;
+    resolutions.retain(|_| {
+        let retain = selected[index];
+        index += 1;
+        retain
+    });
+}
 
 /// Milliseconds since the Unix epoch, suitable for report timestamps.
 pub fn unix_time_ms() -> u64 {
@@ -162,6 +214,42 @@ pub struct HardRecoveryObservation {
     pub pending_commands_after_outcome_barrier: u64,
 }
 
+/// How a pending command first became semantically final at the load
+/// generator. This diagnostic distinguishes a live authoritative event from
+/// an outcome replay or terminal-game cleanup without changing pass/fail
+/// semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResolutionSource {
+    LiveScheduledEvent,
+    LiveRejectedEvent,
+    RecoveryScheduledOutcome,
+    RecoveryRejectedOutcome,
+    RecoveryContiguousOutcome,
+    TerminalGameState,
+}
+
+/// Bounded provenance retained only for commands that violate the fixed
+/// one-second certification budget. Wall-clock timestamps locate the command
+/// in external logs; `latency_ms` is measured with the monotonic process clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowCommandResolution {
+    pub session_id: String,
+    pub user_id: u32,
+    pub game_id: u32,
+    pub partition_id: u32,
+    pub client_game_session_id: String,
+    pub command_sequence: u64,
+    pub sent_at_unix_ms: u64,
+    pub resolved_at_unix_ms: u64,
+    pub latency_ms: u64,
+    pub source: CommandResolutionSource,
+    /// WebSocket gateway identity at resolution time. Executor ownership is
+    /// correlated separately by partition and timestamp.
+    pub gateway_task_boot_id: Option<String>,
+    pub socket_generation: Option<u64>,
+}
+
 impl SessionFailureRecord {
     pub fn new(phase: SessionPhase, at_unix_ms: u64, message: impl Into<String>) -> Self {
         Self {
@@ -272,6 +360,11 @@ pub struct SessionMetrics {
     /// Resends retain the original timestamp.
     #[serde(default)]
     pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Bounded slow command outcomes with one representative retained for as
+    /// many distinct violating send seconds as fit before remaining slots go
+    /// to the slowest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_command_resolutions: Vec<SlowCommandResolution>,
     pub disconnects: u64,
     pub reconnects: u64,
 }
@@ -591,6 +684,11 @@ pub struct AggregateMetrics {
     /// second across every session.
     #[serde(default)]
     pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Bounded command outcomes above the fixed one-second gate. The cap first
+    /// reserves one record for as many distinct violating send seconds as fit,
+    /// then keeps the slowest remaining records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_command_resolutions: Vec<SlowCommandResolution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -735,6 +833,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut scheduled_command_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
     let mut command_outcome_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
     let mut command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut slow_command_resolutions = Vec::<SlowCommandResolution>::new();
 
     let sessions = run
         .sessions
@@ -847,6 +946,8 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
                     .or_default();
                 *maximum = (*maximum).max(*latency_ms);
             }
+            slow_command_resolutions
+                .extend(session.metrics.slow_command_resolutions.iter().cloned());
             traffic.disconnects = traffic
                 .disconnects
                 .saturating_add(session.metrics.disconnects);
@@ -941,6 +1042,11 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
         })
         .collect();
 
+    retain_slow_resolution_coverage(
+        &mut slow_command_resolutions,
+        MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS,
+    );
+
     let total = run.sessions.len();
     let denominator = total.max(1) as f64;
 
@@ -1008,6 +1114,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             scheduled_command_counts_by_sent_unix_second,
             command_outcome_counts_by_sent_unix_second,
             command_outcome_max_latency_ms_by_sent_unix_second,
+            slow_command_resolutions,
         },
         failures_by_phase,
         failures_by_message,
@@ -1648,6 +1755,39 @@ mod tests {
     }
 
     #[test]
+    fn slow_resolution_cap_preserves_each_violating_second() {
+        let resolution =
+            |sequence: u64, sent_at_unix_ms: u64, latency_ms: u64| SlowCommandResolution {
+                session_id: format!("session-{sequence}"),
+                user_id: 1,
+                game_id: 1,
+                partition_id: 1,
+                client_game_session_id: "game-session".to_owned(),
+                command_sequence: sequence,
+                sent_at_unix_ms,
+                resolved_at_unix_ms: sent_at_unix_ms + latency_ms,
+                latency_ms,
+                source: CommandResolutionSource::LiveScheduledEvent,
+                gateway_task_boot_id: Some("task".to_owned()),
+                socket_generation: Some(1),
+            };
+        let mut records = (0..10)
+            .map(|sequence| resolution(sequence, 1_000 + sequence, 10_000 - sequence))
+            .collect::<Vec<_>>();
+        records.push(resolution(99, 2_000, 1_001));
+
+        retain_slow_resolution_coverage(&mut records, 4);
+
+        assert_eq!(records.len(), 4);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.sent_at_unix_ms / 1_000 == 2),
+            "one severe second consumed the entire aggregate provenance cap"
+        );
+    }
+
+    #[test]
     fn aggregation_counts_outcomes_percentiles_traffic_and_concurrency() {
         let mut first = SessionRecord::new("s1", "user1", 0, "m1", 0);
         first.metrics.guest_auth_ms = Some(10);
@@ -1678,6 +1818,20 @@ mod tests {
             .metrics
             .command_outcome_max_latency_ms_by_sent_unix_second =
             BTreeMap::from([(10, 90), (11, 110)]);
+        first.metrics.slow_command_resolutions = vec![SlowCommandResolution {
+            session_id: "s1".to_owned(),
+            user_id: 1,
+            game_id: 21,
+            partition_id: 1,
+            client_game_session_id: "game-s1".to_owned(),
+            command_sequence: 3,
+            sent_at_unix_ms: 10_000,
+            resolved_at_unix_ms: 11_500,
+            latency_ms: 1_500,
+            source: CommandResolutionSource::LiveScheduledEvent,
+            gateway_task_boot_id: Some("boot-a".to_owned()),
+            socket_generation: Some(1),
+        }];
         first.game_id = Some(21);
         first.record_lifecycle(
             SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, 1)
@@ -1727,6 +1881,20 @@ mod tests {
         second
             .metrics
             .command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::from([(10, 120)]);
+        second.metrics.slow_command_resolutions = vec![SlowCommandResolution {
+            session_id: "s2".to_owned(),
+            user_id: 2,
+            game_id: 32,
+            partition_id: 2,
+            client_game_session_id: "game-s2".to_owned(),
+            command_sequence: 4,
+            sent_at_unix_ms: 10_001,
+            resolved_at_unix_ms: 12_001,
+            latency_ms: 2_000,
+            source: CommandResolutionSource::RecoveryScheduledOutcome,
+            gateway_task_boot_id: Some("boot-b".to_owned()),
+            socket_generation: Some(2),
+        }];
         second.game_id = Some(32);
         second.record_lifecycle(SessionLifecycleRecord::new(
             SessionPhase::WebSocketAuthentication,
@@ -1859,6 +2027,12 @@ mod tests {
                 .command_outcome_max_latency_ms_by_sent_unix_second,
             BTreeMap::from([(10, 120), (11, 110)])
         );
+        assert_eq!(report.metrics.slow_command_resolutions.len(), 2);
+        assert_eq!(report.metrics.slow_command_resolutions[0].session_id, "s2");
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].source,
+            CommandResolutionSource::RecoveryScheduledOutcome
+        );
         let report_json = serde_json::to_value(&report).expect("aggregate report serializes");
         assert_eq!(
             report_json.pointer("/metrics/command_counts_by_unix_second/10"),
@@ -1872,6 +2046,10 @@ mod tests {
         assert_eq!(
             report_json.pointer("/metrics/command_outcome_max_latency_ms_by_sent_unix_second/10"),
             Some(&serde_json::json!(120))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_command_resolutions/0/gateway_task_boot_id"),
+            Some(&serde_json::json!("boot-b"))
         );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);
