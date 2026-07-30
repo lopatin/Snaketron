@@ -1009,6 +1009,46 @@ VPC, and reusable Network/ECS/ECR/DynamoDB foundations were retained. No
 certificate was created. Fresh complete Gate A/B/C, automatic scale-in, and
 exit-137 evidence remain mandatory.
 
+Exact-source run
+[`30503270454`](https://github.com/lopatin/snaketron-io/actions/runs/30503270454)
+used outer commit `d31d64f93288aa246bb2038ec11b1adf401d05fc` and
+Snaketron commit `463a164bb66bb3e187c4681274bb6edb28ba6e88`. Gate A
+naturally scaled `1 -> 2` and passed every fixed check: all 1,664 sessions and
+1,477,620 commands completed exactly, with zero failed seconds across 374
+baseline, 44 movement, and 747 post-ready seconds. Gate B moved nine partitions
+in each direction; all 1,280 game sessions, 480 admissions, and 117 planned
+handoffs completed with no reconnect or usable-session gap. Gate C completed
+all 1,748 sessions and 874 games and held a final 403-second qualifying streak
+against the unchanged 300-second requirement. It retained three earlier
+nonqualifying seconds at 1,111 milliseconds, 1,006 milliseconds, and 127 fully
+joined duels rather than treating them as part of that continuous streak.
+
+The run is not complete certification. With load at zero, target tracking
+successfully stepped from ten tasks to two, approximately one task every two
+minutes. The local 20-minute ceiling expired while the last completed
+activity's 60-second cooldown still prevented the final action. During that
+AWS-only wait, both certification Valkey SSM tunnels reached their inactivity
+timeout. The crash suite consequently failed its initial read-only control
+snapshot and did not inject a crash.
+
+Automatic scale-in observation now has a 40-minute fail-only ceiling covering
+the low-alarm window, bucket alignment, eight subsequent
+cooldown/evaluation cycles, and final ECS convergence. It still returns
+immediately at desired/running/pending `1 / 1 / 0`, and this ceiling is not a
+product scale-in SLO. Once per minute the waiter performs a read-only
+executor-status query whose cluster bootstrap PINGs both advertised Serverless
+Valkey ports, after first checking both forwarding paths. This keeps the
+existing SSM sessions active and fails closed if the control path disappears;
+it does not change desired count, assignment, leases, autoscaling policy, or a
+user-visible acceptance budget.
+
+Cleanup for `30503270454` removed Server, Serverless Valkey, and Monitoring and
+stopped ingress. The same protected Network stack, instance, EIP, DNS record,
+certificate-bearing EBS volume, shared VPC, and ECS/ECR/DynamoDB foundations
+remained. No deployment-time Network update or certificate creation was
+observed. Fresh complete Gate A/B/C, automatic scale-in, and exit-137 evidence
+remain mandatory on one exact source.
+
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.
 
@@ -1195,6 +1235,14 @@ Scaling evidence has five deliberately distinct parts:
    require an AWS-observed automatic scale-in from ten to one plus a successful
    target-tracking activity. This observation is separate from the forced
    staircase.
+
+The automatic scale-in waiter returns immediately on success but permits up to
+40 minutes before failing. This is a conservative certification observation
+ceiling, not a service SLO: the managed low alarm may need fifteen one-minute
+datapoints, after which a ten-to-one contraction can require eight more
+cooldown/evaluation cycles and final ECS convergence. The zero-load waiter
+keeps both SSM Valkey tunnels active with a once-per-minute read-only cluster
+control probe; inability to read the control path fails certification.
 
 Report schema 10 records coordinator-observed, server-confirmed peak
 authentication concurrency, fully joined active-game concurrency, lifecycle

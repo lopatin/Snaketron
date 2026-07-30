@@ -1645,6 +1645,49 @@ Network/ECS/ECR/DynamoDB foundations. No certificate was issued or recreated.
 This remains diagnostic evidence; fresh complete Gate A/B/C, automatic
 scale-in, and exit-137 acceptance are required.
 
+Exact-source run
+([GitHub Actions 30503270454](https://github.com/lopatin/snaketron-io/actions/runs/30503270454),
+outer commit `d31d64f93288aa246bb2038ec11b1adf401d05fc`, Snaketron
+commit `463a164bb66bb3e187c4681274bb6edb28ba6e88`) proved the fixed
+30% CPU target and completed the three load gates. Gate A naturally scaled
+`1 -> 2`; all 1,664 sessions and 1,477,620 commands completed exactly, with no
+failed seconds across 374 baseline, 44 ownership-movement, and 747 post-ready
+seconds. Gate B moved nine partitions in each direction. All 1,280 game
+sessions and 480 open-loop admissions completed, and all 117 planned handoffs
+had zero usable-session gap and no reconnect. Gate C completed all 1,748
+sessions and 874 games and produced a final 403-second qualifying streak
+against the unchanged 300-second capacity requirement. Three earlier seconds
+were nonqualifying at 1,111 milliseconds, 1,006 milliseconds, and 127 fully
+joined duels; they were outside the final continuous qualifying streak and are
+retained rather than hidden.
+
+The run is not complete certification. After load reached zero, genuine target
+tracking successfully reduced the service from ten tasks to two in eight
+activities, approximately one task every two minutes. The harness's
+20-minute observation ceiling expired while the final successful activity's
+configured 60-second cooldown still prevented a `2 -> 1` action. Both
+certification-only Valkey SSM tunnels then reached their inactivity timeout,
+so the independent crash suite could not read its initial control-plane
+snapshot and performed no crash injection.
+
+The harness now allows up to 40 minutes for this AWS observation and returns
+immediately when desired, running, and pending counts reach `1 / 1 / 0`. That
+ceiling covers the managed low-alarm window, bucket alignment, eight subsequent
+cooldown/evaluation cycles, and final ECS convergence; it is not a product
+scale-in SLO. A read-only control-plane query once per minute, together with
+explicit connection checks and the cluster client's bootstrap and PING of both
+advertised Serverless Valkey ports, keeps the existing SSM sessions active and
+fails closed if the control path disappears. No production policy, authority
+path, lease, target, cooldown, command budget, or WebSocket requirement
+changed.
+
+Cleanup for `30503270454` again removed only Server, Serverless Valkey, and
+Monitoring and stopped ingress. It retained the same protected Network stack,
+instance, EIP, DNS record, certificate-bearing EBS volume, shared VPC, and
+ECS/ECR/DynamoDB foundations. No deployment-time Network update or certificate
+creation was observed. Fresh complete Gate A/B/C, automatic scale-in, and
+exit-137 acceptance remain required on one exact source.
+
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 
 ## 19. Definition of done

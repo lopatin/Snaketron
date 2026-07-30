@@ -2680,11 +2680,56 @@ wait_for_automatic_scale_in() {
   local report_dir="$1"
   local started_at_epoch="$2"
   # Application Auto Scaling's managed low alarms require fifteen one-minute
-  # datapoints. Leave time for bucket alignment, alarm/action propagation, and
-  # the final ECS task stop after that observation window.
-  local deadline=$((SECONDS + 1200))
+  # datapoints. A ten-to-one contraction can then require eight further
+  # cooldown/evaluation cycles plus the final ECS task stop. Forty minutes is
+  # an observation ceiling, not a product scale-in SLO; healthy runs return as
+  # soon as the service reaches one.
+  local deadline=$((SECONDS + 2400))
   local decrease_observed=false
+  local next_control_probe=0
   while (( SECONDS < deadline )); do
+    # The public workflow reaches Valkey through two SSM port-forwarding
+    # sessions. Keep both sessions active during this deliberately zero-load
+    # AWS observation, and retain a semantic control-plane read as evidence.
+    # Each fresh cluster client bootstraps and PINGs both advertised endpoints.
+    # This is certification plumbing only; it does not influence assignment,
+    # leases, desired count, or target tracking.
+    if (( SECONDS >= next_control_probe )); then
+      local port
+      for port in "$staging_valkey_port" "${VALKEY_READ_PORT:-6380}"; do
+        if ! retry_command 3 nc -z -w 3 "$staging_valkey_host" "$port"; then
+          echo "Valkey certification path on port $port became unavailable during automatic scale-in" >&2
+          return 1
+        fi
+      done
+
+      local control_candidate="$report_dir/automatic-scale-in-control.pending.json"
+      local control_probe_ok=false
+      local control_attempt
+      for control_attempt in 1 2 3; do
+        if SNAKETRON_REDIS_URL="$staging_redis_control_url" \
+          timeout --signal=TERM --kill-after=1s 10s \
+            "$resilience_admin" status \
+            --region-key "$SNAKETRON_REGION_CODE" \
+            >"$control_candidate" 2>/dev/null \
+          && jq -e '
+            type == "object"
+            and (.live_members | type == "array")
+            and (.runtime_partitions | type == "array")
+          ' "$control_candidate" >/dev/null; then
+          control_probe_ok=true
+          break
+        fi
+        sleep 2
+      done
+      if [[ "$control_probe_ok" != true ]]; then
+        echo "Valkey executor control path became unavailable during automatic scale-in" >&2
+        return 1
+      fi
+      mv "$control_candidate" "$report_dir/automatic-scale-in-control.json"
+      next_control_probe=$((SECONDS + 60))
+    fi
+
     local candidate="$report_dir/automatic-scale-in.pending.json"
     aws ecs describe-services \
       --region "$SNAKETRON_AWS_REGION" \
@@ -2707,7 +2752,7 @@ wait_for_automatic_scale_in() {
     fi
     sleep 5
   done
-  echo "After load removal, CPU/memory autoscaling did not reduce the ten-task service to one within twenty minutes" >&2
+  echo "After load removal, CPU/memory autoscaling did not reduce the ten-task service to one within forty minutes" >&2
   return 1
 }
 
@@ -4731,9 +4776,10 @@ run_staging_suite() {
   require_command dig
   require_command git
   require_command jq
+  require_command nc
+  require_command timeout
   if [[ "$crash_mode" == true ]]; then
     require_command session-manager-plugin
-    require_command timeout
   fi
   require_staging_environment
   configure_staging_control_urls
