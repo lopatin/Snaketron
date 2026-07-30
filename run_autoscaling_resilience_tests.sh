@@ -2644,9 +2644,10 @@ wait_for_automatic_scale_out() {
   local report_dir="$1"
   local started_at_epoch="$2"
   local observed_pid="${3:-}"
-  # Target tracking needs three one-minute alarm periods, may begin just after
-  # a bucket boundary, and is not useful until the added Fargate task is
-  # RUNNING. Eight minutes avoids racing that normal observation pipeline.
+  # Target tracking needs three one-minute alarm periods and may begin just
+  # after a bucket boundary. Bound the managed policy decision here; the
+  # caller separately waits for the added Fargate task and every readiness
+  # view, so cold task startup does not consume this fixed observation budget.
   local deadline=$((SECONDS + 480))
   while (( SECONDS < deadline )); do
     if [[ -n "$observed_pid" ]] && ! kill -0 "$observed_pid" 2>/dev/null; then
@@ -2661,10 +2662,8 @@ wait_for_automatic_scale_out() {
       --cluster "$SNAKETRON_ECS_CLUSTER" \
       --services "$SNAKETRON_ECS_SERVICE" >"$candidate"
     local desired
-    local running
     desired="$(jq -r '.services[0].desiredCount' "$candidate")"
-    running="$(jq -r '.services[0].runningCount' "$candidate")"
-    if (( desired > 1 && running > 1 )); then
+    if (( desired > 1 )); then
       mv "$candidate" "$report_dir/automatic-scale-out.json"
       wait_for_policy_activity "$started_at_epoch" \
         "$report_dir/automatic-scale-out-activities.json"
@@ -5552,6 +5551,13 @@ run_staging_suite() {
     "$report_dir" "$automatic_scale_out_label" "$automatic_scale_out_count"
   wait_for_traefik_task_readiness "$report_dir" "$automatic_scale_out_label"
   wait_for_control_plane "$automatic_scale_out_label" "$automatic_scale_out_count"
+  # Refresh the trigger snapshot after convergence so the final phase summary
+  # records the same fully ready count proven by the checks above.
+  aws ecs describe-services \
+    --region "$SNAKETRON_AWS_REGION" \
+    --cluster "$SNAKETRON_ECS_CLUSTER" \
+    --services "$SNAKETRON_ECS_SERVICE" \
+    >"$report_dir/automatic-scale-out.json"
   local automatic_scale_out_finished_ms
   automatic_scale_out_finished_ms="$(unix_time_ms)"
   jq -n \
