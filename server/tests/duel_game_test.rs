@@ -78,6 +78,8 @@ async fn test_duel_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Clients authenticated");
 
@@ -368,6 +370,8 @@ async fn test_turn_for_unowned_snake_is_ignored() -> Result<()> {
 
     attacker.authenticate(env.user_ids()[0]).await?;
     victim.authenticate(env.user_ids()[1]).await?;
+    attacker.create_lobby().await?;
+    victim.create_lobby().await?;
 
     attacker
         .send_message(WSMessage::QueueForMatch {

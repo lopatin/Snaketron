@@ -5,19 +5,23 @@ use common::{
     ClientCommandIdentityV2, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState,
     GameStatus, GameType, QueueMode, calculate_ai_move,
 };
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use server::ws_server::WSMessage;
 use std::pin::Pin;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, Sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WebSocketError, Message},
+};
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
 const GAME_OVER_TIMEOUT: Duration = Duration::from_secs(120);
+const MATCHMAKING_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -213,18 +217,26 @@ async fn play_single_game(
     let (ws_stream, _) = connect_async(ws_url.as_str())
         .await
         .with_context(|| format!("Bot {} failed to connect to websocket {}", idx + 1, ws_url))?;
-    let (mut ws_writer, mut ws_reader) = ws_stream.split();
+    let mut ws_stream = ws_stream;
 
-    send_ws(&mut ws_writer, WSMessage::Token(token.to_string())).await?;
+    send_status(
+        status_tx,
+        game_idx,
+        total_games,
+        "authenticating and creating lobby",
+    );
+    let lobby_code =
+        prepare_matchmaking_session(&mut ws_stream, token, game_type.clone(), queue_mode.clone())
+            .await?;
+    info!(
+        "Bot {} queued explicit lobby {} for game {}/{}",
+        idx + 1,
+        lobby_code,
+        game_idx,
+        total_games
+    );
     send_status(status_tx, game_idx, total_games, "queued");
-    send_ws(
-        &mut ws_writer,
-        WSMessage::QueueForMatch {
-            game_type: game_type.clone(),
-            queue_mode: queue_mode.clone(),
-        },
-    )
-    .await?;
+    let (mut ws_writer, mut ws_reader) = ws_stream.split();
 
     let mut engine: Option<GameEngine> = None;
     let mut snake_id: Option<u32> = None;
@@ -341,6 +353,121 @@ async fn play_single_game(
     }
 
     Ok(())
+}
+
+async fn prepare_matchmaking_session<S>(
+    socket: &mut S,
+    token: &str,
+    game_type: GameType,
+    queue_mode: QueueMode,
+) -> Result<String>
+where
+    S: Sink<Message, Error = WebSocketError>
+        + Stream<Item = std::result::Result<Message, WebSocketError>>
+        + Unpin,
+{
+    send_ws(socket, WSMessage::Token(token.to_owned())).await?;
+    wait_for_setup_response(
+        socket,
+        "WebSocket authentication",
+        "Authenticated",
+        |message| matches!(message, WSMessage::Authenticated { .. }).then_some(()),
+    )
+    .await?;
+
+    send_ws(socket, WSMessage::CreateLobby).await?;
+    let lobby_code = wait_for_setup_response(socket, "CreateLobby", "LobbyCreated", |message| {
+        if let WSMessage::LobbyCreated { lobby_code } = message {
+            Some(lobby_code.clone())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    send_ws(
+        socket,
+        WSMessage::QueueForMatch {
+            game_type,
+            queue_mode,
+        },
+    )
+    .await?;
+    Ok(lobby_code)
+}
+
+async fn wait_for_setup_response<S, T, F>(
+    socket: &mut S,
+    phase: &str,
+    expected: &str,
+    mut matcher: F,
+) -> Result<T>
+where
+    S: Stream<Item = std::result::Result<Message, WebSocketError>> + Unpin,
+    F: FnMut(&WSMessage) -> Option<T>,
+{
+    tokio::time::timeout(MATCHMAKING_SETUP_TIMEOUT, async {
+        loop {
+            let message = next_ws_message(socket, phase).await?;
+            if let Some(response) = matcher(&message) {
+                return Ok(response);
+            }
+            match &message {
+                WSMessage::AccessDenied { reason } => {
+                    return Err(anyhow!("{phase} was denied: {reason}"));
+                }
+                WSMessage::Drain {
+                    task_boot_id,
+                    deadline_unix_ms,
+                } => {
+                    return Err(anyhow!(
+                        "task {task_boot_id} requested drain during {phase} by {deadline_unix_ms}"
+                    ));
+                }
+                _ if is_benign_setup_message(&message) => {
+                    debug!("Ignored interleaved message during {phase}: {message:?}");
+                }
+                _ => {
+                    return Err(anyhow!("Expected {expected} response, got {message:?}"));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Timed out waiting for {expected}"))?
+}
+
+fn is_benign_setup_message(message: &WSMessage) -> bool {
+    matches!(
+        message,
+        WSMessage::UserCountUpdate { .. }
+            | WSMessage::LobbyUpdate { .. }
+            | WSMessage::LobbyChatHistory { .. }
+            | WSMessage::Pong { .. }
+    )
+}
+
+async fn next_ws_message<S>(socket: &mut S, phase: &str) -> Result<WSMessage>
+where
+    S: Stream<Item = std::result::Result<Message, WebSocketError>> + Unpin,
+{
+    loop {
+        let frame = socket
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("WebSocket ended during {phase}"))?
+            .with_context(|| format!("WebSocket failed during {phase}"))?;
+        match frame {
+            Message::Text(text) => {
+                return serde_json::from_str(&text)
+                    .with_context(|| format!("Invalid WebSocket message during {phase}"));
+            }
+            Message::Close(frame) => {
+                return Err(anyhow!("WebSocket closed during {phase}: {frame:?}"));
+            }
+            _ => {}
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -758,5 +885,163 @@ async fn log_progress(idx: usize, mut status_rx: watch::Receiver<String>) {
                 last = status_rx.borrow().clone();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn matchmaking_setup_waits_for_authentication_and_lobby_before_queueing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+
+            assert!(matches!(
+                next_ws_message(&mut socket, "test token").await.unwrap(),
+                WSMessage::Token(token) if token == "test-token"
+            ));
+            send_ws(
+                &mut socket,
+                WSMessage::UserCountUpdate {
+                    region_counts: HashMap::from([("test".to_owned(), 1)]),
+                },
+            )
+            .await
+            .unwrap();
+            send_ws(
+                &mut socket,
+                WSMessage::Authenticated {
+                    task_boot_id: "test-task".to_owned(),
+                    protocol_version: 2,
+                    capabilities: Vec::new(),
+                    socket_generation: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(
+                next_ws_message(&mut socket, "test lobby creation")
+                    .await
+                    .unwrap(),
+                WSMessage::CreateLobby
+            ));
+            send_ws(
+                &mut socket,
+                WSMessage::UserCountUpdate {
+                    region_counts: HashMap::from([("test".to_owned(), 1)]),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), socket.next())
+                    .await
+                    .is_err(),
+                "QueueForMatch arrived before LobbyCreated"
+            );
+            send_ws(
+                &mut socket,
+                WSMessage::LobbyCreated {
+                    lobby_code: "TEST-LOBBY".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(
+                next_ws_message(&mut socket, "test queue").await.unwrap(),
+                WSMessage::QueueForMatch {
+                    game_type: GameType::TeamMatch { per_team: 1 },
+                    queue_mode: QueueMode::Quickmatch,
+                }
+            ));
+        });
+
+        let ws_url = format!("ws://{address}/ws");
+        let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+        let lobby_code = prepare_matchmaking_session(
+            &mut socket,
+            "test-token",
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(lobby_code, "TEST-LOBBY");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn matchmaking_setup_surfaces_lobby_denial_without_queueing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+
+            assert!(matches!(
+                next_ws_message(&mut socket, "test token").await.unwrap(),
+                WSMessage::Token(_)
+            ));
+            send_ws(
+                &mut socket,
+                WSMessage::Authenticated {
+                    task_boot_id: "test-task".to_owned(),
+                    protocol_version: 2,
+                    capabilities: Vec::new(),
+                    socket_generation: 1,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                next_ws_message(&mut socket, "test lobby creation")
+                    .await
+                    .unwrap(),
+                WSMessage::CreateLobby
+            ));
+            send_ws(
+                &mut socket,
+                WSMessage::AccessDenied {
+                    reason: "lobby unavailable".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), socket.next())
+                    .await
+                    .is_err(),
+                "QueueForMatch was sent after CreateLobby was denied"
+            );
+        });
+
+        let ws_url = format!("ws://{address}/ws");
+        let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+        let error = prepare_matchmaking_session(
+            &mut socket,
+            "test-token",
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("CreateLobby was denied: lobby unavailable")
+        );
+        server.await.unwrap();
     }
 }

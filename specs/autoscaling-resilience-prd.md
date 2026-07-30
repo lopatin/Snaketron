@@ -26,12 +26,6 @@ The minimum correct design is:
 
 This PRD deliberately does not introduce a separate gateway service, a new consensus system, whole-partition snapshots, a generic WebSocket event log, a self-managed cache cluster, or custom autoscaling signals. ElastiCache Serverless itself is TLS-only and cluster-mode-only; the application must therefore be Redis-Cluster-aware. CDK pins Serverless Valkey major 8 for its faster managed burst expansion, without adding a paid ECPU minimum or a correctness-affecting maximum.
 
-The initial production conversion from the unused node-based cache is a
-deliberate destructive cutoff with downtime. It has no dual-running cache,
-legacy endpoint adapter, data migration, or rollback acceptance requirement.
-After that one-time conversion, all runtime and autoscaling requirements in
-this PRD apply to Serverless Valkey only.
-
 ## 2. Product problem
 
 The superseded executor path exposed the following failure modes.
@@ -148,8 +142,6 @@ For this PRD:
 - A matchmaking singleton as a correctness dependency.
 - Manual Traefik updates in response to node events.
 - DynamoDB capacity redesign in this phase.
-- A graceful or data-preserving migration from the unused node-based Valkey
-  deployment.
 - Continuous availability when the regional Serverless Valkey dependency or single ingress dependency is unavailable.
 
 ## 7. Core invariants
@@ -468,7 +460,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - creates one immutable queue identity for the lobby and one exact queued-lobby claim for each member;
    - rejects a conflicting lobby or user claim, so one user cannot be queued through two tabs or two lobbies;
    - inserts every queue and MMR-index member and sets the lobby state to `queued` in the same operation.
-   A retry of the same physical request is idempotent. A later request while the lobby is already queued preserves the first admitted preferences; changing them requires cancel and requeue.
+   A retry of the same physical request is idempotent. A later request while the lobby is already queued preserves the first admitted preferences; changing them requires cancel and requeue. `QueueForMatch` is rejected unless that socket has joined an explicit lobby; every browser entry point creates or restores that lobby before queueing, so there is no unaddressable server-generated lobby between the client and durable admission. A client retains at most one in-memory queue intent, scoped to the exact lobby and authenticated identity, until an authoritative `LobbyUpdate` reports `queued` or `matched`, or `JoinGame` reports the committed game. A successful WebSocket write is not admission acknowledgement. After reconnect it restores the lobby first and replays the same intent only if authoritative state is still `waiting`. Browser refresh, tab loss, and device transfer remain outside the persistence guarantee.
 3. Cancellation must compare and remove the exact admitted lobby identity, its queue/MMR members, and its per-user claims in one operation. It sets an existing lobby's state back to `waiting` only when no active-game mapping won the race. Repeated cancellation is idempotent.
 4. Commit a selected match through one atomic Valkey Lua operation in the matchmaking hash slot that:
    - verifies every selected lobby/queue entry is still eligible;
@@ -559,11 +551,14 @@ The assignment coordinator is control plane only. Existing assignments and activ
 ### R12 — Autoscaling behavior and capacity constraints
 
 1. Use the same target-tracking policies in development and production:
-   - CPU target: 30%;
+   - CPU target: 15%;
    - memory target: 80%;
    - 60-second scale-in and scale-out cooldowns.
-   The CPU target leaves measured headroom for command processing and partition
-   recovery while the managed alarm evaluates and a replacement task starts.
+   The CPU target remains above measured idle utilization while leaving margin
+   below the weakest loaded minute observed for the fixed Gate A work across
+   otherwise identical Fargate placements. This preserves headroom for command
+   processing and partition recovery while the managed alarm evaluates and a
+   replacement task starts.
 2. Retain `minTasks=1` and allow ten tasks in both development and production so the release-blocking `1 -> 10 -> 1` staircase can run outside production. The cap remains aligned with the ten executor partitions. The staircase uses the fixed 128-session / 64-duel one-task-capacity-valid transition cohort; the separate 128-session natural scale-out load and the complete capacity envelope must both be removed before a forced scale-in to one task. The minimum application task is two vCPU and four GiB, the smallest valid Fargate memory pairing for two vCPU; target tracking cannot protect a saturated one-task floor during the managed alarm's observation delay.
 3. The autoscaler must never select zero desired tasks.
 4. Validate forced `1 -> 10 -> 1` with 128 active game sessions / 64 duels
@@ -582,9 +577,9 @@ The assignment coordinator is control plane only. Existing assignments and activ
    proves that its context and transient admission sockets fit on the final
    one-task destination. The minimum application task is two vCPU and four GiB,
    the smallest valid Fargate memory pairing for two vCPU. Current exact-source
-   evidence measured about 0.71--0.85 vCPU at this cohort; one vCPU did not
-   preserve the one-second latency budget during the managed policy's
-   observation lag.
+   evidence measured about 0.36--0.72 vCPU at this cohort across otherwise
+   identical Fargate placements; one vCPU did not preserve the one-second
+   latency budget during the managed policy's observation lag.
 5. No custom game-specific autoscaling metric is added in this phase.
 6. Every task currently replicates every partition, so task-local replica memory may not fall on scale-out. Scaling tests must prove memory behavior is acceptable; otherwise the replication model or memory policy needs a separate decision.
 7. Existing WebSockets do not redistribute on scale-up, so service-average CPU can hide a hot gateway task. Record per-task CPU, memory, connections, and event-forwarding load during validation.
@@ -811,6 +806,8 @@ rejections as healthy command throughput.
 | Admit new sessions continuously while a backend performs the configured eight-second route-withdrawal wait | Existing sockets migrate; late new upgrade attempts may receive retryable `503`, and a same-IP certification burst may receive retryable `429`, but every new session retries through the ordinary reconnect path, reaches a ready backend within the unchanged ten-second deadline, and surfaces no terminal user error. The per-IP sustained average remains 50 upgrades per second, the burst is 512, and provider/health settings plus exact healthy-backend coverage corroborate capacity; no internal readiness-transition timestamp is required. |
 | Repeat and concurrently submit one lobby admission, then submit two lobbies containing the same user | One immutable lobby identity and one per-user claim win; every queue/MMR index has one exact member; conflicting admission is rejected; cancellation or match commit removes every winning claim so no stale lobby can rematch a user. |
 | Lose admission or cancellation responses, retry them, and interrupt the caller between durable queue mutation and presentation refresh | The atomic queue identity and lobby metadata state agree (`queued`, `waiting`, or `matched`); retries converge without a hidden queue member or stranded queued banner. |
+| Kill a gateway after it reads `QueueForMatch` but before the client observes durable admission | The client restores the exact lobby. `waiting` replays its one retained intent; `queued`, `matched`, or `JoinGame` clears it. Every member receives exactly one game assignment, and an assignment received during lobby restoration is not discarded. |
+| Send `QueueForMatch` before the socket has joined a lobby | The server rejects it without creating a hidden lobby or queue identity; normal browser entry points establish and retain the explicit lobby first. |
 | Concurrent matchmakers select the same lobbies | Exactly one atomic claim wins; no player or lobby belongs to two committed matches. |
 | Kill matchmaker before/after the matchmaking commit, destination outbox delivery, and source acknowledgement, including loss of each response | Before commit, entrants remain queued. After commit, match/mappings/outbox exist. Any task delivers exactly one partition `GameCreated`; retries repair either half, and the executor creates the checkpoint before ACK. Disconnected recipients recover from mappings. |
 | Commit immediately before a connected lobby listener subscribes, then drop or duplicate the Pub/Sub hint | Subscribe-then-read or the five-second reconciliation forwards the durable game ID once; duplicate hint/read overlap does not send a second `JoinGame`, and a later play-again game ID is still delivered. |
@@ -905,7 +902,7 @@ criteria pass before the production ramp.
 | `client/web/contexts/WebSocketContext.tsx` | Immediate/backoff reconnect, socket generations, dual-socket drain, explicit auth, one command owner. |
 | Client game integration | Stable session command IDs, external outbox, resolved watermark/sparse outcomes, terminal rejection. |
 | `cdk/lib/valkey-stack.ts` and `fargate-stack.ts` | Serverless Valkey, TLS cluster URL, Serverless metrics/alarms, liveness/readiness routing, sticky-cookie removal, health timing, and stop timeout. |
-| Production deployment workflow | Manual-only mutation, successful exact-commit staging-certification gate, destructive one-time legacy cutoff, and post-cutover verification. |
+| Production deployment workflow | Manual-only mutation, successful exact-commit staging-certification gate, immutable image deployment, and post-deploy verification. |
 | Development certification infrastructure | Fixed public `dev.snaketron.io` reuses but never owns or mutates the production VPC. Protected Network ingress/EIP/A-record/EBS/TLS state plus the ECS cluster, ECR repository, and DynamoDB tables remain reusable between runs; each run creates and deletes only its Serverless Valkey, Server, and Monitoring stacks and stops the persistent ingress after cleanup. |
 | Traefik configuration | Automatic health-based withdrawal/discovery and valid self-health endpoint. |
 | Test runners | Deterministic failure points, scaling/load scenarios, stale-owner and pending-entry tests. |
@@ -1687,6 +1684,50 @@ instance, EIP, DNS record, certificate-bearing EBS volume, shared VPC, and
 ECS/ECR/DynamoDB foundations. No deployment-time Network update or certificate
 creation was observed. Fresh complete Gate A/B/C, automatic scale-in, and
 exit-137 acceptance remain required on one exact source.
+
+Exact-source diagnostic run
+([GitHub Actions 30513482816](https://github.com/lopatin/snaketron-io/actions/runs/30513482816),
+outer commit `6d5e293afe9f42bb1530e5feb2a4bff1f9bae3b9`, Snaketron
+commit `554d4564efb1b9b946260a33b39e4e5f819aa340`) recorded the
+successful target-tracking action inside the fixed 480-second Gate A decision
+window, but the added Fargate task became ready 11 seconds after that window.
+The harness now separates the managed scaling decision from subsequent cold
+task readiness without changing either requirement. Its independent hard
+crash phase formally passed all 12 checks: 23 affected game clients recovered,
+the successor owner and first causal output appeared in 4.009 and 4.060
+seconds, and all 1,380 sessions, 690 games, and 1,235,425 command outcomes
+completed exactly.
+
+The next exact-source diagnostic
+([GitHub Actions 30516147896](https://github.com/lopatin/snaketron-io/actions/runs/30516147896),
+outer commit `35e88366fefa818c9dfcd44e34351d8ce294fb4c`, Snaketron
+commit `fb59d91654016fb3354fbbcc07b64bd65b467b52`) exercised that
+corrected decision/readiness split, but the unchanged fixed workload remained
+at 18.21--22.13% one-minute CPU instead of the prior identical image's
+approximately 28.5--35.2%. Command acknowledgement throughput differed by
+only 0.12%. A 30% target is therefore placement-sensitive; 15% remains above
+the approximately 2% idle level and below the weakest loaded minute with
+useful margin. The fixed workload, 480-second decision gate, memory target,
+cooldowns, task range, and one-second command gate remain unchanged.
+
+The same run's task exit-137 recovered all 23 affected active-game clients in
+2.542--2.738 seconds from client detection. The successor owner and first
+causal authoritative output appeared about 4.1 seconds after exact ECS stop,
+and all 1,232,737 submitted game commands had one terminal outcome with zero
+pending. It also exposed a separate admission-boundary defect: one two-player
+lobby sent `QueueForMatch` 162 milliseconds before the killed task stopped.
+The host restored the exact lobby, but a successful socket write had been
+mistaken for durable admission, so neither member was requeued and both timed
+out. Clients now retain one in-memory intent until authoritative
+`queued`/`matched` state or `JoinGame`, replaying it only after restored state
+is still `waiting`; existing atomic admission makes the replay idempotent.
+
+Cleanup for both diagnostics again deleted only the run-tagged Server,
+Serverless Valkey, and Monitoring stacks and stopped the same ingress. The
+VPC, Network/ECS/ECR/DynamoDB foundations, EIP, DNS, EBS volume, hostname, and
+TLS certificate serial/fingerprint were identical throughout; no network or
+certificate resource was recreated. Fresh complete Gate A/B/C, automatic
+scale-in, and hard-crash acceptance are still required on one exact source.
 
 Changing a timing value requires the same evidence again. It must not change a safety invariant or make graceful shutdown necessary for correctness.
 

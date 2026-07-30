@@ -160,7 +160,15 @@ async function establishActiveGame(page) {
   await expect.poll(() => page.evaluate(() => (
     window.__wsContext?.isConnected && window.__wsContext?.isSessionAuthenticated
   ))).toBe(true);
-  await expect.poll(() => socketMessages(page, oldSocketIndex, 'JoinLobby')).not.toHaveLength(0);
+  // Initial mount has both transport-context restoration and the persisted
+  // lobby state request. Complete the latter so later reconnects issue one
+  // transport restoration request instead of racing its five-second timeout.
+  await expect.poll(() => socketMessages(page, oldSocketIndex, 'JoinLobby')).toHaveLength(2);
+  await emitServerMessage(page, oldSocketIndex, {
+    JoinedLobby: { lobby_code: 'LOBBY1' },
+  });
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.currentLobby?.code))
+    .toBe('LOBBY1');
   await expect.poll(() => socketMessages(page, oldSocketIndex, 'JoinGame')).not.toHaveLength(0);
   // The JoinGame send and the GameArena message-handler effect are separate
   // React commits. Yield once so the initial snapshot cannot outrun the
@@ -180,6 +188,34 @@ async function establishActiveGame(page) {
     });
   });
   return oldSocketIndex;
+}
+
+async function establishAuthenticatedLobby(page) {
+  await page.goto('/');
+  await expect.poll(() => page.evaluate(() => (
+    window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
+  ))).toBeGreaterThanOrEqual(0);
+  const socketIndex = await page.evaluate(() => window.__mockSockets.indexOf(window.__wsInstance));
+  await expect.poll(() => socketMessages(page, socketIndex, 'Token')).toHaveLength(1);
+  await emitServerMessage(page, socketIndex, {
+    Authenticated: {
+      task_boot_id: 'lobby-task',
+      protocol_version: 2,
+      capabilities: REQUIRED_CAPABILITIES,
+      socket_generation: 1,
+    },
+  });
+  await expect.poll(() => socketMessages(page, socketIndex, 'JoinLobby')).toHaveLength(2);
+  await emitServerMessage(page, socketIndex, {
+    JoinedLobby: { lobby_code: 'LOBBY1' },
+  });
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.currentLobby?.code))
+    .toBe('LOBBY1');
+  await emitServerMessage(page, socketIndex, lobbyUpdate);
+  await expect.poll(() => page.evaluate(() => (
+    window.__wsContext?.isConnected && window.__wsContext?.isSessionAuthenticated
+  ))).toBe(true);
+  return socketIndex;
 }
 
 async function beginDrain(page, oldSocketIndex, { autoOpen = true, deadlineMs = 15_000 } = {}) {
@@ -688,6 +724,129 @@ test('a command with an ambiguous crash send is retried once with its stable ide
     .toHaveLength(1);
   expect(await page.evaluate(() => window.__terminalCommandOutcomes))
     .toEqual([firstSend.command_id]);
+});
+
+test('an unacknowledged matchmaking admission replays only while restored state is waiting', async ({ page }) => {
+  const oldSocketIndex = await establishAuthenticatedLobby(page);
+  await page.evaluate(() => {
+    window.__wsContext.sendMessage({
+      QueueForMatch: {
+        game_type: { FreeForAll: { max_players: 2 } },
+        queue_mode: 'Quickmatch',
+      },
+    });
+  });
+  await expect.poll(() => socketMessages(page, oldSocketIndex, 'QueueForMatch'))
+    .toHaveLength(1);
+  await emitServerMessage(page, oldSocketIndex, {
+    AccessDenied: {
+      reason: 'an unrelated request was rejected',
+    },
+  });
+
+  const socketCountBeforeCrash = await page.evaluate(() => window.__mockSockets.length);
+  await page.evaluate((index) => {
+    window.__mockSockets[index].serverClose(1012, 'gateway died before queue admission');
+  }, oldSocketIndex);
+  await expect.poll(() => page.evaluate(() => window.__mockSockets.length))
+    .toBeGreaterThan(socketCountBeforeCrash);
+  const replacementSocketIndex = socketCountBeforeCrash;
+  await expect.poll(() => socketMessages(page, replacementSocketIndex, 'Token')).toHaveLength(1);
+  await emitServerMessage(page, replacementSocketIndex, {
+    Authenticated: {
+      task_boot_id: 'replacement-lobby-task',
+      protocol_version: 2,
+      capabilities: REQUIRED_CAPABILITIES,
+      socket_generation: 2,
+    },
+  });
+  await expect.poll(() => socketMessages(page, replacementSocketIndex, 'JoinLobby'))
+    .toHaveLength(1);
+  expect(await socketMessages(page, replacementSocketIndex, 'QueueForMatch')).toEqual([]);
+
+  await emitServerMessage(page, replacementSocketIndex, {
+    LobbyUpdate: {
+      ...lobbyUpdate.LobbyUpdate,
+      lobby_code: 'OTHER-LOBBY',
+      state: 'queued',
+    },
+  });
+  expect(await socketMessages(page, replacementSocketIndex, 'QueueForMatch')).toEqual([]);
+
+  await emitServerMessage(page, replacementSocketIndex, lobbyUpdate);
+  await expect.poll(() => socketMessages(page, replacementSocketIndex, 'QueueForMatch'))
+    .toHaveLength(1);
+
+  await emitServerMessage(page, replacementSocketIndex, {
+    LobbyUpdate: {
+      ...lobbyUpdate.LobbyUpdate,
+      state: 'queued',
+    },
+  });
+  const socketCountBeforeAcknowledgedCrash = await page.evaluate(() => window.__mockSockets.length);
+  await page.evaluate((index) => {
+    window.__mockSockets[index].serverClose(1012, 'gateway died after queue admission');
+  }, replacementSocketIndex);
+  await expect.poll(() => page.evaluate(() => window.__mockSockets.length))
+    .toBeGreaterThan(socketCountBeforeAcknowledgedCrash);
+  const acknowledgedReplacementIndex = socketCountBeforeAcknowledgedCrash;
+  await expect.poll(() => socketMessages(page, acknowledgedReplacementIndex, 'Token'))
+    .toHaveLength(1);
+  await emitServerMessage(page, acknowledgedReplacementIndex, {
+    Authenticated: {
+      task_boot_id: 'acknowledged-replacement-task',
+      protocol_version: 2,
+      capabilities: REQUIRED_CAPABILITIES,
+      socket_generation: 3,
+    },
+  });
+  await expect.poll(() => socketMessages(page, acknowledgedReplacementIndex, 'JoinLobby'))
+    .not.toHaveLength(0);
+  await emitServerMessage(page, acknowledgedReplacementIndex, {
+    LobbyUpdate: {
+      ...lobbyUpdate.LobbyUpdate,
+      state: 'queued',
+    },
+  });
+  await page.waitForTimeout(250);
+  expect(await socketMessages(page, acknowledgedReplacementIndex, 'QueueForMatch')).toEqual([]);
+});
+
+test('planned lobby handoff replays only after the candidate restores authoritative waiting state', async ({ page }) => {
+  const oldSocketIndex = await establishAuthenticatedLobby(page);
+  await page.evaluate(() => {
+    window.__wsContext.sendMessage({
+      QueueForMatch: {
+        game_type: { FreeForAll: { max_players: 2 } },
+        queue_mode: 'Quickmatch',
+      },
+    });
+  });
+  await expect.poll(() => socketMessages(page, oldSocketIndex, 'QueueForMatch'))
+    .toHaveLength(1);
+
+  const candidateSocketIndex = await beginDrain(page, oldSocketIndex);
+  await emitServerMessage(page, candidateSocketIndex, {
+    Authenticated: {
+      task_boot_id: 'planned-lobby-replacement',
+      protocol_version: 2,
+      capabilities: REQUIRED_CAPABILITIES,
+      socket_generation: 2,
+    },
+  });
+  await expect.poll(() => socketMessages(page, candidateSocketIndex, 'JoinLobby'))
+    .toHaveLength(1);
+  expect(await socketMessages(page, candidateSocketIndex, 'QueueForMatch')).toEqual([]);
+
+  await emitServerMessage(page, candidateSocketIndex, lobbyUpdate);
+  expect(await socketMessages(page, candidateSocketIndex, 'QueueForMatch')).toEqual([]);
+  await confirmContinuityProbe(page, oldSocketIndex);
+
+  await expect.poll(() => page.evaluate((index) => (
+    window.__mockSockets.indexOf(window.__wsInstance) === index
+  ), candidateSocketIndex)).toBe(true);
+  await expect.poll(() => socketMessages(page, candidateSocketIndex, 'QueueForMatch'))
+    .toHaveLength(1);
 });
 
 for (const failurePhase of [

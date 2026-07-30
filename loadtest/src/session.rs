@@ -184,6 +184,10 @@ struct LiveSession {
     sticky_cookie: Option<String>,
     last_lobby_members: BTreeSet<u32>,
     last_lobby_state: Option<String>,
+    // A JoinGame/MatchFound frame can arrive while another recovery step is
+    // waiting for JoinedLobby or LobbyUpdate. Preserve that durable assignment
+    // instead of discarding it as an unrelated frame.
+    pending_match_game_id: Option<u32>,
     recent_events: VecDeque<String>,
     clock_offset_ms: i64,
     last_ping_client_time: Option<i64>,
@@ -345,6 +349,10 @@ enum SnapshotWaitError {
 
 enum PreGameWaitError {
     Recoverable(anyhow::Error),
+    PlannedDrain {
+        task_boot_id: String,
+        deadline_unix_ms: i64,
+    },
     Fatal(anyhow::Error),
 }
 
@@ -352,6 +360,10 @@ impl PreGameWaitError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Recoverable(error) | Self::Fatal(error) => error,
+            Self::PlannedDrain {
+                task_boot_id,
+                deadline_unix_ms,
+            } => anyhow!("task {task_boot_id} requested WebSocket drain by {deadline_unix_ms}"),
         }
     }
 }
@@ -839,6 +851,16 @@ async fn confirm_matchmaking_waiter(
     expected_user_ids: &BTreeSet<u32>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
+    if session.last_lobby_state.as_deref() == Some("queued")
+        && session.last_lobby_members == *expected_user_ids
+    {
+        session
+            .record
+            .diagnostics
+            .insert("queued_at_unix_ms".to_owned(), unix_time_ms().to_string());
+        return Ok(());
+    }
+
     loop {
         match session
             .wait_for_pre_game(
@@ -890,6 +912,28 @@ async fn confirm_matchmaking_waiter(
                     Some(expected_user_ids),
                     cancellation,
                     error,
+                )
+                .await?;
+                if session.last_lobby_state.as_deref() == Some("queued") {
+                    session
+                        .record
+                        .diagnostics
+                        .insert("queued_at_unix_ms".to_owned(), unix_time_ms().to_string());
+                    return Ok(());
+                }
+            }
+            Err(PreGameWaitError::PlannedDrain {
+                task_boot_id,
+                deadline_unix_ms,
+            }) => {
+                perform_pre_game_planned_handoff(
+                    session,
+                    settings,
+                    expected_user_ids,
+                    preferences,
+                    &task_boot_id,
+                    deadline_unix_ms,
+                    cancellation,
                 )
                 .await?;
                 if session.last_lobby_state.as_deref() == Some("queued") {
@@ -1098,12 +1142,20 @@ async fn prepare_pre_game_candidate(
                     lobby_rejoin_ms = Some(elapsed_ms(rejoin_started));
                     break;
                 }
-                WSMessage::MatchFound { game_id }
+                WSMessage::JoinGame(game_id) | WSMessage::MatchFound { game_id }
                     if settings.population == Population::Matchmaking =>
                 {
                     return Err(PreGameHandoffAttemptError::Fatal(anyhow!(
                         "matchmaking waiter unexpectedly entered game {game_id}"
                     )));
+                }
+                WSMessage::JoinGame(_) | WSMessage::MatchFound { .. }
+                    if settings.population == Population::Game =>
+                {
+                    lobby_members = expected_user_ids.clone();
+                    lobby_state = Some("matched".to_owned());
+                    lobby_rejoin_ms = Some(elapsed_ms(rejoin_started));
+                    break;
                 }
                 WSMessage::Drain { .. } => {
                     return Err(PreGameHandoffAttemptError::Candidate(anyhow!(
@@ -1153,7 +1205,7 @@ async fn prepare_pre_game_candidate(
                         break Instant::now();
                     }
                     WSMessage::Drain { .. } => {}
-                    WSMessage::MatchFound { game_id }
+                    WSMessage::JoinGame(game_id) | WSMessage::MatchFound { game_id }
                         if settings.population == Population::Matchmaking =>
                     {
                         return Err(PreGameHandoffAttemptError::Fatal(anyhow!(
@@ -1179,7 +1231,7 @@ async fn prepare_pre_game_candidate(
                             "ready replacement connection began draining"
                         )));
                     }
-                    WSMessage::MatchFound { game_id }
+                    WSMessage::JoinGame(game_id) | WSMessage::MatchFound { game_id }
                         if settings.population == Population::Matchmaking =>
                     {
                         return Err(PreGameHandoffAttemptError::Fatal(anyhow!(
@@ -1530,6 +1582,7 @@ async fn prepare_session(
         sticky_cookie,
         last_lobby_members: BTreeSet::new(),
         last_lobby_state: None,
+        pending_match_game_id: None,
         recent_events: VecDeque::new(),
         clock_offset_ms: 0,
         last_ping_client_time: None,
@@ -1928,6 +1981,10 @@ async fn restore_lobby_membership(
                     cause = error;
                     continue;
                 }
+                error @ PreGameWaitError::PlannedDrain { .. } => {
+                    cause = error.into_anyhow();
+                    continue;
+                }
                 PreGameWaitError::Fatal(error) => return Err(error),
             }
         }
@@ -1953,6 +2010,10 @@ async fn restore_lobby_membership(
                 Ok(()) => {}
                 Err(PreGameWaitError::Recoverable(error)) => {
                     cause = error;
+                    continue;
+                }
+                Err(error @ PreGameWaitError::PlannedDrain { .. }) => {
+                    cause = error.into_anyhow();
                     continue;
                 }
                 Err(PreGameWaitError::Fatal(error)) => return Err(error),
@@ -2059,7 +2120,11 @@ async fn queue_lobby_with_recovery(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     loop {
-        match session
+        if session.pending_match_game_id.is_some() {
+            return Ok(());
+        }
+
+        if let Err(error) = session
             .send_cancellable(
                 WSMessage::QueueForMatch {
                     game_type: settings.game_type.clone(),
@@ -2069,19 +2134,93 @@ async fn queue_lobby_with_recovery(
             )
             .await
         {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                restore_lobby_membership(
-                    session,
-                    settings,
-                    lobby_code,
-                    preferences,
-                    Some(expected_user_ids),
+            restore_lobby_membership(
+                session,
+                settings,
+                lobby_code,
+                preferences,
+                Some(expected_user_ids),
+                cancellation,
+                error.context("sending QueueForMatch before disconnect"),
+            )
+            .await?;
+        } else {
+            match session
+                .wait_for_pre_game(
+                    settings.queue_timeout,
                     cancellation,
-                    error.context("sending QueueForMatch before disconnect"),
+                    |message| match message {
+                        WSMessage::LobbyUpdate {
+                            lobby_code: updated,
+                            members,
+                            state,
+                            ..
+                        } if updated == lobby_code
+                            && state == "queued"
+                            && members
+                                .iter()
+                                .map(|member| member.user_id)
+                                .collect::<BTreeSet<_>>()
+                                == *expected_user_ids =>
+                        {
+                            Some(())
+                        }
+                        WSMessage::JoinGame(_) | WSMessage::MatchFound { .. } => Some(()),
+                        _ => None,
+                    },
                 )
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    session.record.record_lifecycle(
+                        SessionLifecycleRecord::new(SessionPhase::Matchmaking, unix_time_ms())
+                            .with_message("durable queue admission or match observed"),
+                    );
+                    return Ok(());
+                }
+                Err(PreGameWaitError::Recoverable(error)) => {
+                    restore_lobby_membership(
+                        session,
+                        settings,
+                        lobby_code,
+                        preferences,
+                        Some(expected_user_ids),
+                        cancellation,
+                        error.context(
+                            "connection failed before durable queue admission was observed",
+                        ),
+                    )
+                    .await?;
+                }
+                Err(PreGameWaitError::PlannedDrain {
+                    task_boot_id,
+                    deadline_unix_ms,
+                }) => {
+                    perform_pre_game_planned_handoff(
+                        session,
+                        settings,
+                        expected_user_ids,
+                        preferences,
+                        &task_boot_id,
+                        deadline_unix_ms,
+                        cancellation,
+                    )
+                    .await?;
+                }
+                Err(PreGameWaitError::Fatal(error)) => return Err(error),
             }
+        }
+
+        // `queued` is the durable acknowledgement for QueueForMatch. If the
+        // replacement sees `waiting`, the old gateway died before admission
+        // and the same idempotent intent must be replayed.
+        if session.pending_match_game_id.is_some()
+            || matches!(
+                session.last_lobby_state.as_deref(),
+                Some("queued" | "matched")
+            )
+        {
+            return Ok(());
         }
     }
 }
@@ -3813,6 +3952,9 @@ async fn wait_for_match_with_recovery(
     let mut group_game_updates = group_game_id.subscribe();
 
     loop {
+        if let Some(game_id) = session.pending_match_game_id.take() {
+            return share_group_game_id(group_game_id, game_id);
+        }
         if let Some(game_id) = *group_game_id.borrow() {
             return Ok(game_id);
         }
@@ -3848,6 +3990,28 @@ async fn wait_for_match_with_recovery(
             Ok(game_id) => return share_group_game_id(group_game_id, game_id),
             Err(PreGameWaitError::Fatal(error)) => {
                 return Err(error).context("waiting for matchmaking notification");
+            }
+            Err(PreGameWaitError::PlannedDrain {
+                task_boot_id,
+                deadline_unix_ms,
+            }) => {
+                let handoff = perform_pre_game_planned_handoff(
+                    session,
+                    settings,
+                    expected_user_ids,
+                    &preferences,
+                    &task_boot_id,
+                    deadline_unix_ms,
+                    cancellation,
+                );
+                match tokio::time::timeout_at(deadline, handoff).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "planned handoff while waiting for a match exceeded {timeout:?}"
+                        ));
+                    }
+                }
             }
             Err(PreGameWaitError::Recoverable(error)) => {
                 let restore = restore_lobby_membership(
@@ -4241,6 +4405,16 @@ impl LiveSession {
             self.last_lobby_members = members.iter().map(|member| member.user_id).collect();
             self.last_lobby_state = Some(state.clone());
         }
+        if let WSMessage::JoinGame(game_id) | WSMessage::MatchFound { game_id } = message {
+            if let Some(existing) = self.pending_match_game_id
+                && existing != *game_id
+            {
+                return Err(anyhow!(
+                    "received conflicting pre-game assignments {existing} and {game_id}"
+                ));
+            }
+            self.pending_match_game_id = Some(*game_id);
+        }
         match message {
             WSMessage::GameEvent(event) => {
                 if terminal_event_completes_current_game(
@@ -4363,9 +4537,10 @@ impl LiveSession {
                             )));
                         }
                         WSMessage::Drain { task_boot_id, deadline_unix_ms } => {
-                            return Err(PreGameWaitError::Recoverable(anyhow!(
-                                "task {task_boot_id} requested WebSocket drain by {deadline_unix_ms}"
-                            )));
+                            return Err(PreGameWaitError::PlannedDrain {
+                                task_boot_id: task_boot_id.clone(),
+                                deadline_unix_ms: *deadline_unix_ms,
+                            });
                         }
                         WSMessage::LobbyRegionMismatch {
                             target_region,
@@ -5268,6 +5443,7 @@ mod tests {
             sticky_cookie: None,
             last_lobby_members: BTreeSet::new(),
             last_lobby_state: None,
+            pending_match_game_id: None,
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,
@@ -5384,6 +5560,62 @@ mod tests {
         );
     }
 
+    fn planned_game_test_settings(websocket_url: Url) -> SessionSettings {
+        SessionSettings {
+            api_origin: Url::parse("http://127.0.0.1/").unwrap(),
+            websocket_url,
+            origin: "http://127.0.0.1".to_owned(),
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: QueueMode::Quickmatch,
+            selected_mode: "duel".to_owned(),
+            competitive: false,
+            population: Population::Game,
+            connect_timeout: Duration::from_secs(1),
+            lobby_timeout: Duration::from_secs(1),
+            queue_timeout: Duration::from_secs(2),
+            untimed_play_duration: Duration::from_secs(1),
+            command_profile: CommandProfile::Realistic,
+            backend_hints: BackendHintRegistry::default(),
+        }
+    }
+
+    fn planned_game_test_session(
+        socket: Socket,
+        settings: &SessionSettings,
+        lobby_state: &str,
+    ) -> LiveSession {
+        let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
+        let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
+        record.lobby_code = Some("TEST-LOBBY".to_owned());
+        LiveSession {
+            record,
+            user_id: 7,
+            token: "test-token".to_owned(),
+            socket,
+            websocket_url: settings.websocket_url.clone(),
+            origin: settings.origin.clone(),
+            backend_hints: settings.backend_hints.clone(),
+            sticky_cookie: Some("departing-backend".to_owned()),
+            last_lobby_members: BTreeSet::from([7]),
+            last_lobby_state: Some(lobby_state.to_owned()),
+            pending_match_game_id: None,
+            recent_events: VecDeque::new(),
+            clock_offset_ms: 0,
+            last_ping_client_time: None,
+            current_task_boot_id: Some("old-task".to_owned()),
+            current_socket_generation: Some(1),
+            reconnects: 0,
+            client_game_session_id: "test-session-7".to_owned(),
+            next_command_sequence: 1,
+            pending_commands: BTreeMap::new(),
+            server_capabilities: REQUIRED_SERVER_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            activity_lease: SessionActivityLease::new(7, activity_sender),
+        }
+    }
+
     #[tokio::test]
     async fn matchmaking_disconnect_reauthenticates_rejoins_and_preserves_roster() {
         use server::lobby_manager::LobbyMember;
@@ -5432,6 +5664,15 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            // Authentication recovery can emit the durable game mapping before
+            // lobby restoration starts. A waiter for JoinedLobby must not
+            // discard that assignment.
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::JoinGame(99)).unwrap(),
+                ))
+                .await
+                .unwrap();
             let join = socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(join.to_text().unwrap()).unwrap(),
@@ -5469,12 +5710,6 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            socket
-                .send(Message::Text(
-                    serde_json::to_string(&WSMessage::JoinGame(99)).unwrap(),
-                ))
-                .await
-                .unwrap();
         });
 
         let settings = SessionSettings {
@@ -5507,6 +5742,7 @@ mod tests {
             sticky_cookie: Some("opaque-backend-token".to_owned()),
             last_lobby_members: BTreeSet::new(),
             last_lobby_state: None,
+            pending_match_game_id: None,
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,
@@ -5541,6 +5777,450 @@ mod tests {
         assert_eq!(session.record.metrics.rejoin_lobby_ms.len(), 1);
         assert_eq!(session.record.metrics.usable_session_gap_ms.len(), 1);
         recovery_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_intent_replays_when_replacement_lobby_is_still_waiting() {
+        use server::lobby_manager::LobbyMember;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let preferences = LobbyPreferences {
+            selected_modes: vec!["duel".to_owned()],
+            competitive: false,
+        };
+        let server_preferences = preferences.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.unwrap();
+            let mut first_socket = accept_async(first_stream).await.unwrap();
+            let first_queue = first_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(first_queue.to_text().unwrap()).unwrap(),
+                WSMessage::QueueForMatch { .. }
+            ));
+            first_socket.close(None).await.unwrap();
+
+            let (replacement_stream, _) = listener.accept().await.unwrap();
+            let mut replacement = accept_async(replacement_stream).await.unwrap();
+            let token = replacement.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(value) if value == "test-token"
+            ));
+            replacement
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Authenticated {
+                        task_boot_id: "replacement-task".to_owned(),
+                        protocol_version: 2,
+                        capabilities: REQUIRED_SERVER_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_owned())
+                            .collect(),
+                        socket_generation: 2,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let join = replacement.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(join.to_text().unwrap()).unwrap(),
+                WSMessage::JoinLobby { lobby_code, .. } if lobby_code == "TEST-LOBBY"
+            ));
+            replacement
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::JoinedLobby {
+                        lobby_code: "TEST-LOBBY".to_owned(),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let update_preferences = replacement.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(update_preferences.to_text().unwrap()).unwrap(),
+                WSMessage::UpdateLobbyPreferences { .. }
+            ));
+            replacement
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::LobbyUpdate {
+                        lobby_code: "TEST-LOBBY".to_owned(),
+                        members: vec![LobbyMember {
+                            user_id: 7,
+                            username: "test-user".to_owned(),
+                            ts: 0.0,
+                        }],
+                        host_user_id: 7,
+                        state: "waiting".to_owned(),
+                        preferences: server_preferences.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let replay = replacement.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(replay.to_text().unwrap()).unwrap(),
+                WSMessage::QueueForMatch {
+                    game_type: GameType::FreeForAll { max_players: 2 },
+                    queue_mode: QueueMode::Quickmatch,
+                }
+            ));
+            replacement
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::LobbyUpdate {
+                        lobby_code: "TEST-LOBBY".to_owned(),
+                        members: vec![LobbyMember {
+                            user_id: 7,
+                            username: "test-user".to_owned(),
+                            ts: 0.0,
+                        }],
+                        host_user_id: 7,
+                        state: "queued".to_owned(),
+                        preferences: server_preferences,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = SessionSettings {
+            api_origin: Url::parse("http://127.0.0.1/").unwrap(),
+            websocket_url,
+            origin: "http://127.0.0.1".to_owned(),
+            game_type: GameType::FreeForAll { max_players: 2 },
+            queue_mode: QueueMode::Quickmatch,
+            selected_mode: "duel".to_owned(),
+            competitive: false,
+            population: Population::Game,
+            connect_timeout: Duration::from_secs(1),
+            lobby_timeout: Duration::from_secs(1),
+            queue_timeout: Duration::from_secs(2),
+            untimed_play_duration: Duration::from_secs(1),
+            command_profile: CommandProfile::Realistic,
+            backend_hints: BackendHintRegistry::default(),
+        };
+        let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
+        let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
+        record.lobby_code = Some("TEST-LOBBY".to_owned());
+        let mut session = LiveSession {
+            record,
+            user_id: 7,
+            token: "test-token".to_owned(),
+            socket,
+            websocket_url: settings.websocket_url.clone(),
+            origin: settings.origin.clone(),
+            backend_hints: settings.backend_hints.clone(),
+            sticky_cookie: None,
+            last_lobby_members: BTreeSet::from([7]),
+            last_lobby_state: Some("waiting".to_owned()),
+            pending_match_game_id: None,
+            recent_events: VecDeque::new(),
+            clock_offset_ms: 0,
+            last_ping_client_time: None,
+            current_task_boot_id: None,
+            current_socket_generation: None,
+            reconnects: 0,
+            client_game_session_id: "test-session-7".to_owned(),
+            next_command_sequence: 1,
+            pending_commands: BTreeMap::new(),
+            server_capabilities: BTreeSet::new(),
+            activity_lease: SessionActivityLease::new(7, activity_sender),
+        };
+
+        queue_lobby_with_recovery(
+            &mut session,
+            &settings,
+            "TEST-LOBBY",
+            &preferences,
+            &BTreeSet::from([7]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.last_lobby_state.as_deref(), Some("queued"));
+        assert_eq!(session.record.metrics.disconnects, 1);
+        assert_eq!(session.record.metrics.reconnects, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn planned_drain_replays_queue_when_candidate_lobby_is_still_waiting() {
+        use server::lobby_manager::LobbyMember;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let preferences = LobbyPreferences {
+            selected_modes: vec!["duel".to_owned()],
+            competitive: false,
+        };
+        let server_preferences = preferences.clone();
+        let server = tokio::spawn(async move {
+            let (old_stream, _) = listener.accept().await.unwrap();
+            let mut old_socket = accept_async(old_stream).await.unwrap();
+            let queue = old_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(queue.to_text().unwrap()).unwrap(),
+                WSMessage::QueueForMatch { .. }
+            ));
+            old_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Drain {
+                        task_boot_id: "old-task".to_owned(),
+                        deadline_unix_ms: Utc::now().timestamp_millis() + 5_000,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let (candidate_stream, _) = listener.accept().await.unwrap();
+            let mut candidate_socket = accept_async(candidate_stream).await.unwrap();
+            let token = candidate_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(value) if value == "test-token"
+            ));
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Authenticated {
+                        task_boot_id: "replacement-task".to_owned(),
+                        protocol_version: 2,
+                        capabilities: REQUIRED_SERVER_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_owned())
+                            .collect(),
+                        socket_generation: 2,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let join = candidate_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(join.to_text().unwrap()).unwrap(),
+                WSMessage::JoinLobby { lobby_code, .. } if lobby_code == "TEST-LOBBY"
+            ));
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::LobbyUpdate {
+                        lobby_code: "TEST-LOBBY".to_owned(),
+                        members: vec![LobbyMember {
+                            user_id: 7,
+                            username: "test-user".to_owned(),
+                            ts: 0.0,
+                        }],
+                        host_user_id: 7,
+                        state: "waiting".to_owned(),
+                        preferences: server_preferences.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let continuity = old_socket.next().await.unwrap().unwrap();
+            let WSMessage::Ping { client_time } =
+                serde_json::from_str::<WSMessage>(continuity.to_text().unwrap()).unwrap()
+            else {
+                panic!("old socket did not receive the continuity ping");
+            };
+            old_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time,
+                        server_time: Utc::now().timestamp_millis(),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                old_socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+
+            let replay = candidate_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(replay.to_text().unwrap()).unwrap(),
+                WSMessage::QueueForMatch {
+                    game_type: GameType::FreeForAll { max_players: 2 },
+                    queue_mode: QueueMode::Quickmatch,
+                }
+            ));
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::LobbyUpdate {
+                        lobby_code: "TEST-LOBBY".to_owned(),
+                        members: vec![LobbyMember {
+                            user_id: 7,
+                            username: "test-user".to_owned(),
+                            ts: 0.0,
+                        }],
+                        host_user_id: 7,
+                        state: "queued".to_owned(),
+                        preferences: server_preferences,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                candidate_socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = planned_game_test_settings(websocket_url);
+        let mut session = planned_game_test_session(socket, &settings, "waiting");
+
+        queue_lobby_with_recovery(
+            &mut session,
+            &settings,
+            "TEST-LOBBY",
+            &preferences,
+            &BTreeSet::from([7]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.last_lobby_state.as_deref(), Some("queued"));
+        assert_eq!(session.record.metrics.planned_handoff_attempts, 1);
+        assert_eq!(session.record.metrics.planned_handoff_successes, 1);
+        assert_eq!(session.record.metrics.planned_handoff_failures, 0);
+        assert_eq!(session.record.metrics.planned_handoff_continuity_proofs, 1);
+        assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
+        assert_eq!(session.record.metrics.disconnects, 0);
+        assert_eq!(session.record.metrics.reconnects, 0);
+        session.socket.close(None).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn planned_drain_preserves_early_candidate_game_assignment() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let server = tokio::spawn(async move {
+            let (old_stream, _) = listener.accept().await.unwrap();
+            let mut old_socket = accept_async(old_stream).await.unwrap();
+            old_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Drain {
+                        task_boot_id: "old-task".to_owned(),
+                        deadline_unix_ms: Utc::now().timestamp_millis() + 5_000,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let (candidate_stream, _) = listener.accept().await.unwrap();
+            let mut candidate_socket = accept_async(candidate_stream).await.unwrap();
+            let token = candidate_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(value) if value == "test-token"
+            ));
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Authenticated {
+                        task_boot_id: "replacement-task".to_owned(),
+                        protocol_version: 2,
+                        capabilities: REQUIRED_SERVER_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_owned())
+                            .collect(),
+                        socket_generation: 2,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let join = candidate_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(join.to_text().unwrap()).unwrap(),
+                WSMessage::JoinLobby { lobby_code, .. } if lobby_code == "TEST-LOBBY"
+            ));
+            candidate_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::MatchFound { game_id: 99 }).unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let continuity = old_socket.next().await.unwrap().unwrap();
+            let WSMessage::Ping { client_time } =
+                serde_json::from_str::<WSMessage>(continuity.to_text().unwrap()).unwrap()
+            else {
+                panic!("old socket did not receive the continuity ping");
+            };
+            old_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time,
+                        server_time: Utc::now().timestamp_millis(),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                old_socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+            assert!(matches!(
+                candidate_socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let (socket, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = planned_game_test_settings(websocket_url);
+        let mut session = planned_game_test_session(socket, &settings, "queued");
+        let (group_game_id, _) = watch::channel(None);
+
+        let game_id = wait_for_match_with_recovery(
+            &mut session,
+            &settings,
+            &BTreeSet::from([7]),
+            &group_game_id,
+            settings.queue_timeout,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(game_id, 99);
+        assert_eq!(*group_game_id.borrow(), Some(99));
+        assert_eq!(session.last_lobby_members, BTreeSet::from([7]));
+        assert_eq!(session.last_lobby_state.as_deref(), Some("matched"));
+        assert_eq!(session.record.metrics.planned_handoff_attempts, 1);
+        assert_eq!(session.record.metrics.planned_handoff_successes, 1);
+        assert_eq!(session.record.metrics.planned_handoff_failures, 0);
+        assert_eq!(session.record.metrics.planned_handoff_continuity_proofs, 1);
+        assert_eq!(session.record.metrics.usable_session_gap_ms, vec![0]);
+        assert_eq!(session.record.metrics.disconnects, 0);
+        assert_eq!(session.record.metrics.reconnects, 0);
+        session.socket.close(None).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -5666,6 +6346,7 @@ mod tests {
             sticky_cookie: Some("departing-backend".to_owned()),
             last_lobby_members: BTreeSet::from([7]),
             last_lobby_state: Some("queued".to_owned()),
+            pending_match_game_id: None,
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,
@@ -6160,6 +6841,7 @@ mod tests {
             sticky_cookie: None,
             last_lobby_members: BTreeSet::new(),
             last_lobby_state: None,
+            pending_match_game_id: None,
             recent_events: VecDeque::new(),
             clock_offset_ms: 0,
             last_ping_client_time: None,

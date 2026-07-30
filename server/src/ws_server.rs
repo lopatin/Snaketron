@@ -3085,154 +3085,17 @@ async fn process_ws_message(
                         });
                     }
 
-                    // Fetch user's MMR from database
-                    let user = db
-                        .get_user_by_id(metadata.user_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-                    let mmr = user.mmr;
-                    info!("User {} has MMR: {}", metadata.user_id, mmr);
-
-                    // Auto-create a single-member lobby for this solo player (just like guest lobby creation)
-                    info!("Creating auto-lobby for user {}", metadata.user_id);
-                    match lobby_manager.create_lobby(metadata.user_id, region).await {
-                        Ok(lobby) => {
-                            info!(
-                                "Auto-created lobby {} for user {}",
-                                lobby.lobby_code(),
-                                metadata.user_id
-                            );
-                            // Join the newly created lobby
-                            let lobby_handle = match lobby_manager
-                                .join_lobby(
-                                    Some(lobby.lobby_code()),
-                                    metadata.user_id,
-                                    metadata.username.clone(),
-                                    websocket_id.to_string(),
-                                    region.to_string(),
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    error!("Failed to join auto-created lobby: {}", e);
-                                    let response = WSMessage::AccessDenied {
-                                        reason: format!(
-                                            "Failed to create matchmaking lobby: {}",
-                                            e
-                                        ),
-                                    };
-                                    let json_msg = serde_json::to_string(&response)?;
-                                    ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: None,
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Fetch lobby members (should be just this user)
-                            let members = match lobby_manager
-                                .get_lobby_members(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                Ok(m) => {
-                                    info!(
-                                        lobby_id = lobby_handle.lobby_code,
-                                        member_count = m.len(),
-                                        "Fetched lobby members for auto-created lobby"
-                                    );
-                                    for (idx, (_user_id, member)) in m.iter().enumerate() {
-                                        info!(
-                                            idx = idx,
-                                            user_id = member.user_id,
-                                            username = %member.username,
-                                            "Lobby member"
-                                        );
-                                    }
-                                    m
-                                }
-                                Err(e) => {
-                                    error!("Failed to get lobby members: {}", e);
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: Some(lobby_handle),
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Add the auto-created lobby to matchmaking queue
-                            let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard
-                                .add_lobby_to_queue(
-                                    &lobby_handle.lobby_code,
-                                    members.into_values().collect(),
-                                    mmr,
-                                    vec![game_type.clone()],
-                                    queue_mode.clone(),
-                                    metadata.user_id as u32, // Solo player is the requesting user
-                                )
-                                .await
-                            {
-                                error!("Failed to add lobby to matchmaking queue: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-                            drop(mm_guard);
-
-                            if let Err(error) = lobby_manager
-                                .publish_lobby_update(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                warn!(
-                                    lobby_code = lobby_handle.lobby_code,
-                                    %error,
-                                    "Failed to publish queued lobby state"
-                                );
-                            }
-
-                            info!(
-                                "Auto-created lobby {} for solo player {} and added to matchmaking queue",
-                                lobby_handle.lobby_code, metadata.user_id
-                            );
-
-                            // Transition to InLobby state - lobby match notifications will be handled automatically
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: Some(lobby_handle),
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to create lobby: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
+                    let response = WSMessage::AccessDenied {
+                        reason: "Join a lobby before queueing for matchmaking".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
                 }
                 WSMessage::QueueForMatchMulti {
                     game_types,
@@ -3279,154 +3142,17 @@ async fn process_ws_message(
                         });
                     }
 
-                    // Fetch user's MMR from database
-                    let user = db
-                        .get_user_by_id(metadata.user_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-                    let mmr = user.mmr;
-                    info!("User {} has MMR: {}", metadata.user_id, mmr);
-
-                    // Auto-create a single-member lobby for this solo player
-                    info!("Creating auto-lobby for user {}", metadata.user_id);
-                    match lobby_manager.create_lobby(metadata.user_id, region).await {
-                        Ok(lobby) => {
-                            info!(
-                                "Auto-created lobby {} for user {}",
-                                lobby.lobby_code(),
-                                metadata.user_id
-                            );
-                            // Join the newly created lobby
-                            let lobby_handle = match lobby_manager
-                                .join_lobby(
-                                    Some(lobby.lobby_code()),
-                                    metadata.user_id,
-                                    metadata.username.clone(),
-                                    websocket_id.to_string(),
-                                    region.to_string(),
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    error!("Failed to join auto-created lobby: {}", e);
-                                    let response = WSMessage::AccessDenied {
-                                        reason: format!(
-                                            "Failed to create matchmaking lobby: {}",
-                                            e
-                                        ),
-                                    };
-                                    let json_msg = serde_json::to_string(&response)?;
-                                    ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: None,
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Fetch lobby members (should be just this user)
-                            let members = match lobby_manager
-                                .get_lobby_members(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                Ok(m) => {
-                                    info!(
-                                        lobby_id = lobby_handle.lobby_code,
-                                        member_count = m.len(),
-                                        "Fetched lobby members for auto-created lobby"
-                                    );
-                                    for (idx, (_user_id, member)) in m.iter().enumerate() {
-                                        info!(
-                                            idx = idx,
-                                            user_id = member.user_id,
-                                            username = %member.username,
-                                            "Lobby member"
-                                        );
-                                    }
-                                    m
-                                }
-                                Err(e) => {
-                                    error!("Failed to get lobby members: {}", e);
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: Some(lobby_handle),
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Add the auto-created lobby to matchmaking queue with multiple game types
-                            let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard
-                                .add_lobby_to_queue(
-                                    &lobby_handle.lobby_code,
-                                    members.into_values().collect(),
-                                    mmr,
-                                    game_types, // Use game_types directly instead of wrapping
-                                    queue_mode.clone(),
-                                    metadata.user_id as u32, // Solo player is the requesting user
-                                )
-                                .await
-                            {
-                                error!("Failed to add lobby to matchmaking queue: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-                            drop(mm_guard);
-
-                            if let Err(error) = lobby_manager
-                                .publish_lobby_update(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                warn!(
-                                    lobby_code = lobby_handle.lobby_code,
-                                    %error,
-                                    "Failed to publish queued lobby state"
-                                );
-                            }
-
-                            info!(
-                                "Auto-created lobby {} for solo player {} and added to matchmaking queue for multiple game types",
-                                lobby_handle.lobby_code, metadata.user_id
-                            );
-
-                            // Transition to InLobby state - lobby match notifications will be handled automatically
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: Some(lobby_handle),
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to create lobby: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
+                    let response = WSMessage::AccessDenied {
+                        reason: "Join a lobby before queueing for matchmaking".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
                 }
                 WSMessage::JoinGame(requested_game_id) => {
                     info!(

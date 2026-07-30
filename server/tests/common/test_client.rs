@@ -48,6 +48,35 @@ impl TestClient {
         }
     }
 
+    /// Create and join an explicit matchmaking lobby.
+    ///
+    /// `CreateLobby` auto-joins its creator on the server. Requiring the
+    /// `LobbyCreated` response keeps this helper from masking a failed join.
+    /// The periodic user-count broadcast is the only unrelated frame allowed
+    /// to overtake the response.
+    pub async fn create_lobby(&mut self) -> Result<String> {
+        self.send_message(WSMessage::CreateLobby).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.receive_message().await? {
+                    WSMessage::LobbyCreated { lobby_code } => return Ok(lobby_code),
+                    WSMessage::UserCountUpdate { .. } => {}
+                    WSMessage::AccessDenied { reason } => {
+                        return Err(anyhow::anyhow!("CreateLobby was denied: {reason}"));
+                    }
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "Expected LobbyCreated response, got {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for LobbyCreated"))?
+    }
+
     pub async fn send_ping(&mut self) -> Result<()> {
         let client_time = Utc::now().timestamp_millis();
         self.send_message(WSMessage::Ping { client_time }).await

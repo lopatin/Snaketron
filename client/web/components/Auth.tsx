@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import { useWebSocket } from '../contexts/WebSocketContext';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { api } from '../services/api';
@@ -10,6 +11,7 @@ function Auth() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { user, login, register } = useAuth();
+  const { currentLobby, createLobby } = useWebSocket();
   const { createSoloGame, currentGameId, createGame, isConnected } = useGameWebSocket();
   const [isProcessingAction, setIsProcessingAction] = useState(false);
   const [waitingForGameId, setWaitingForGameId] = useState(false);
@@ -161,6 +163,9 @@ function Auth() {
       switch (action) {
         case 'solo':
           // Create a solo game
+          if (!currentLobby) {
+            await createLobby();
+          }
           setWaitingForGameId(true);
           createSoloGame();
           break;

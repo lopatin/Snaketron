@@ -23,12 +23,7 @@ the autoscaling design in [autoscaling-resilience-prd.md](autoscaling-resilience
 - Recovery after checkpoint retention expires is explicitly unrecoverable; the
   server must not fabricate a replacement game.
 
-## One-time production Serverless Valkey cutover
-
-The first production deployment of this design is intentionally destructive.
-There are no users or cache state to migrate, so the production workflow does
-not dual-run the old node cache, preserve its plaintext endpoint, or attempt a
-zero-downtime compatibility transition.
+## Production release and cache lifecycle
 
 Production deployment is manual-only and restricted to the current `main`
 commit. Every dispatch, including a dry run with credentialed CDK planning,
@@ -38,24 +33,8 @@ must complete the planned suite, hard-crash suite, verified runtime-stack
 cleanup, and verified ingress stop; a run for another commit, branch,
 repository, or workflow is rejected before AWS credentials are used.
 
-For each production region, the workflow detects the old
-`AWS::ElastiCache::ReplicationGroup`, deletes and waits for the Monitoring and
-Server stacks that consume its generated endpoint exports, and removes the
-Server stack's retained `/ecs/snaketron/prod` log group. It leaves the Valkey
-stack itself in place so the ordinary dependency-ordered CDK deployment can
-replace its resource with Valkey 8 Serverless before recreating Server and
-Monitoring. The step is idempotent. While the legacy resource exists it performs
-the destructive cutoff; after Valkey is already Serverless, a rerun also removes
-failed, non-updatable Server or Monitoring stacks, cleans the retained Server
-log group when recreation is needed, and lets the ordinary deployment recreate
-missing consumers.
-
-Expect service downtime and loss of the old cache contents during this one-time
-cutover. Old task definitions are not a valid rollback because they contain the
-deleted plaintext endpoint; a failed cutover is recovered by rerunning or
-fixing the deployment forward. After deployment, the workflow requires one
-available Valkey 8 Serverless cache per region, no old Snaketron replication
-group, and an exact task URL of
+After deployment, the workflow requires one available Valkey 8 Serverless
+cache per region and an exact task URL of
 `rediss://HOST:6379/?protocol=resp3&cluster=true`.
 The production cache has CloudFormation deletion and replacement policies of
 `Retain`. The development Serverless cache is deliberately runtime-only and is
@@ -146,9 +125,19 @@ Development and production both allow a maximum of ten so the non-production
 service can run the release-blocking `1 -> 10 -> 1` certification staircase.
 Both retain a minimum of one. The application task uses two vCPU and four GiB
 so the one-task floor has takeover and burst headroom while target tracking is
-still observing load. CPU is targeted at 30%, memory at 80%, and both scale-in
+still observing load. CPU is targeted at 15%, memory at 80%, and both scale-in
 and scale-out cooldowns are 60 seconds. Development and production use the
 same policy.
+
+`QueueForMatch` uses the authoritative lobby state as its semantic
+acknowledgement. The browser and certification client retain only the single
+in-memory queue intent, scoped to the exact lobby and authentication identity,
+until `LobbyUpdate` reports `queued`/`matched` or `JoinGame` arrives. The server
+rejects queueing on a socket that has not joined an explicit lobby. After a
+transport replacement clients restore that lobby first; state `waiting` causes
+an idempotent replay, while any acknowledged state clears the intent. Do not
+treat a successful WebSocket write as durable admission, and do not add a
+separate acknowledgement protocol or persistence service for this.
 
 ## Routine deployments
 
@@ -945,8 +934,8 @@ successful ownership samples, so a longer regional scan cannot hide a lease
 outage. INFO volume was not correlated with the failed seconds; no speculative
 metrics concurrency or production log suppression is added.
 
-Development and production now use two-vCPU / four-GiB tasks, retain
-`minTasks=1`, and target CPU at 30%. Diagnostic run `30496453531` tested outer
+At that point, development and production used two-vCPU / four-GiB tasks, retained
+`minTasks=1`, and targeted CPU at 30%. Diagnostic run `30496453531` tested outer
 commit `9c729f8f075a556d3caee6e2a37302f8da0981e6` and nested commit
 `a424647639b156abfc8d0731b3fbf51ecbded634`. Its configured 35% managed 3/3
 CPU alarm never fired: Gate A timed out, so planned Gates B and C did not run.
@@ -1048,6 +1037,38 @@ certificate-bearing EBS volume, shared VPC, and ECS/ECR/DynamoDB foundations
 remained. No deployment-time Network update or certificate creation was
 observed. Fresh complete Gate A/B/C, automatic scale-in, and exit-137 evidence
 remain mandatory on one exact source.
+
+Run
+[`30513482816`](https://github.com/lopatin/snaketron-io/actions/runs/30513482816)
+confirmed that target tracking acted inside Gate A's fixed 480-second decision
+window even though the new Fargate task needed another 11 seconds to become
+ready. Decision evidence and cold-task readiness are now checked separately.
+Its independent exit-137 phase passed all 12 checks, with successor ownership
+and causal output in about four seconds and exact completion of 1,380
+sessions, 690 games, and 1,235,425 commands.
+
+Run
+[`30516147896`](https://github.com/lopatin/snaketron-io/actions/runs/30516147896)
+then found the unchanged fixed workload at 18.21--22.13% one-minute CPU rather
+than the prior identical image's approximately 28.5--35.2%, despite only a
+0.12% command-acknowledgement throughput difference. CPU target tracking is
+therefore 15%, above the approximately 2% idle level and below the weakest
+loaded minute with margin. No load, memory target, cooldown, task range,
+decision window, or command gate changed.
+
+That run's active-game crash recovery was clean: all 23 affected clients
+recovered in 2.542--2.738 seconds from detection, successor ownership and
+causal output resumed in about 4.1 seconds, and 1,232,737 commands resolved
+exactly. A lobby whose host sent `QueueForMatch` 162 milliseconds before the
+task stopped exposed a separate at-most-once client-boundary bug: the restored
+lobby remained `waiting`, so both members timed out. The client now retains
+one in-memory queue intent and replays it only when restored authoritative
+state remains `waiting`; `queued`, `matched`, or `JoinGame` clears it.
+
+Both runs deleted only their runtime Server, Serverless Valkey, and Monitoring
+stacks, stopped the same ingress, and retained identical foundation and TLS
+identities. Fresh complete Gate A/B/C, automatic scale-in, and hard-crash
+evidence remain mandatory on one exact source.
 
 The release is blocked if a non-production environment or credentials needed
 for these two external results are unavailable.

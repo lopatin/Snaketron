@@ -54,6 +54,8 @@ async fn test_simple_two_player_match() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Clients authenticated. User IDs: {:?}", env.user_ids());
 
@@ -136,6 +138,92 @@ async fn test_simple_two_player_match() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_queue_for_match_requires_an_explicit_lobby() -> Result<()> {
+    async fn expect_explicit_lobby_denial(client: &mut TestClient) -> Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match client.receive_message().await? {
+                    WSMessage::AccessDenied { reason } => {
+                        assert_eq!(reason, "Join a lobby before queueing for matchmaking");
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    WSMessage::UserCountUpdate { .. } => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "Expected no-lobby matchmaking denial, got {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+        })
+        .await?
+    }
+
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("test_queue_for_match_requires_an_explicit_lobby").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    let user_id = env.user_ids()[0];
+    let mut client = TestClient::connect(&server_addr).await?;
+    client.authenticate(user_id).await?;
+
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = ::common::QueueMode::Quickmatch;
+    client
+        .send_message(WSMessage::QueueForMatch {
+            game_type: game_type.clone(),
+            queue_mode: queue_mode.clone(),
+        })
+        .await?;
+    expect_explicit_lobby_denial(&mut client).await?;
+
+    client
+        .send_message(WSMessage::QueueForMatchMulti {
+            game_types: vec![game_type.clone()],
+            queue_mode: queue_mode.clone(),
+        })
+        .await?;
+    expect_explicit_lobby_denial(&mut client).await?;
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let lobby_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("lobby:*")
+        .query_async(&mut redis_conn)
+        .await?;
+    let lobby_queue_identity_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("matchmaking:*:lobby:*:queue-identity")
+        .query_async(&mut redis_conn)
+        .await?;
+    let user_queue_identity_exists: bool = redis_conn
+        .exists(RedisKeys::matchmaking_user_queue_identity(user_id as u32))
+        .await?;
+    let queue_len: usize = redis_conn
+        .zcard(RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode))
+        .await?;
+
+    assert!(
+        lobby_keys.is_empty(),
+        "QueueForMatch must not create any implicit lobby state"
+    );
+    assert!(
+        lobby_queue_identity_keys.is_empty(),
+        "QueueForMatch must not create a lobby queue identity"
+    );
+    assert!(
+        !user_queue_identity_exists,
+        "QueueForMatch must not reserve the user without a lobby"
+    );
+    assert_eq!(queue_len, 0, "QueueForMatch must not add a queue member");
+
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_basic_matchmaking() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
@@ -150,6 +238,8 @@ async fn test_basic_matchmaking() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Queue for match
     client1
@@ -192,6 +282,7 @@ async fn test_leave_queue() -> Result<()> {
 
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(env.user_ids()[0]).await?;
+    client.create_lobby().await?;
 
     // Queue and immediately leave
     client
@@ -233,6 +324,7 @@ async fn test_team_matchmaking() -> Result<()> {
     for i in 0..4 {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 
@@ -294,6 +386,7 @@ async fn test_concurrent_matchmaking() -> Result<()> {
         println!("Client {} connected", i);
 
         client.authenticate(user_id).await?;
+        client.create_lobby().await?;
         println!("Client {} authenticated", i);
 
         clients.push(client);
@@ -370,6 +463,8 @@ async fn test_disconnect_during_queue() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Both queue
     client1
@@ -433,6 +528,8 @@ async fn test_rejoin_active_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Get matched
     client1
@@ -596,6 +693,8 @@ async fn test_same_mmr_range_matches_instantly() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Two lobbies with MMR 550 and 570 (both silver)");
 
@@ -670,6 +769,8 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Gold (900) - 300 MMR difference");
 
@@ -748,6 +849,8 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Diamond (1500) - 900 MMR difference");
 
@@ -826,6 +929,8 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Bronze (300) vs Grandmaster (2000) - 1700 MMR difference");
 
@@ -913,6 +1018,7 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     for i in 0..6 {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 
@@ -1070,6 +1176,7 @@ async fn test_matchmaking_load() -> Result<()> {
     for i in 0..USER_COUNT {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 

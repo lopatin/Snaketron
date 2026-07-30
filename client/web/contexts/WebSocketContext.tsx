@@ -67,6 +67,7 @@ interface SocketSlot {
   gameComplete: boolean;
   gameStreamWatermark: number | null;
   commandOutcomesReady: boolean;
+  restoredLobbyState: string | null;
   drainDeadlineMs: number | null;
   candidateAttempt: number;
   authStartedAtMs: number | null;
@@ -96,6 +97,18 @@ const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
 const AUTHENTICATION_TIMEOUT_MS = 5_000;
+
+const isMatchmakingQueueIntent = (message: any): boolean =>
+  Boolean(
+    message &&
+    typeof message === 'object' &&
+    (message.QueueForMatch || message.QueueForMatchMulti),
+  );
+
+const authoritativeLobbyState = (rawMessage: any): string | null => {
+  const state = rawMessage?.LobbyUpdate?.state;
+  return typeof state === 'string' ? state.trim().toLowerCase() : null;
+};
 
 const clearAuthenticationTimeout = (slot: SocketSlot) => {
   if (slot.authTimeoutId !== null) {
@@ -198,6 +211,12 @@ interface StoredLobbyInfo {
   id?: number;
 }
 
+interface PendingMatchmakingIntent {
+  message: any;
+  lobbyCode: string;
+  authToken: string;
+}
+
 export const useWebSocket = (): WebSocketContextType => {
   const context = useContext(WebSocketContext);
   if (!context) {
@@ -242,6 +261,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
   const hasLoadedStoredLobbyRef = useRef(false);
   const restoreInProgressRef = useRef(false);
+  // QueueForMatch is safe to replay because Redis admission preserves the
+  // first physical queue identity. Keep only the one unacknowledged intent
+  // until authoritative lobby state or a durable game mapping confirms it.
+  const pendingMatchmakingIntentRef = useRef<PendingMatchmakingIntent | null>(null);
   const lobbyChatLobbyIdRef = useRef<number | null>(null);
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
@@ -400,6 +423,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, []);
 
   const resetLobbyState = useCallback(() => {
+    pendingMatchmakingIntentRef.current = null;
     setCurrentLobby(null);
     currentLobbyRef.current = null;
     setLobbyMembers([]);
@@ -663,7 +687,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
       dispatchRawMessage(candidate, message);
     });
-
+    const pendingMatchmakingIntent = pendingMatchmakingIntentRef.current;
+    if (
+      pendingMatchmakingIntent &&
+      candidate.restoredLobbyState === 'waiting' &&
+      candidate.expectedLobbyCode === pendingMatchmakingIntent.lobbyCode &&
+      candidate.authTokenSent === pendingMatchmakingIntent.authToken &&
+      candidate.socket.readyState === WebSocket.OPEN
+    ) {
+      candidate.socket.send(JSON.stringify(pendingMatchmakingIntent.message));
+    }
     if (previous && previous !== candidate) {
       previous.role = 'retired';
       inFlightRequestsByGenerationRef.current.delete(previous.generation);
@@ -700,6 +733,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     candidate.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
     candidate.expectedGameId = gameId;
     candidate.lobbyReady = candidate.expectedLobbyCode === null;
+    candidate.restoredLobbyState = null;
     candidate.gameReady = candidate.expectedGameId === null;
     candidate.gameComplete = false;
     candidate.gameStreamWatermark = null;
@@ -761,6 +795,44 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
     if (slot.role === 'retired') {
       return;
+    }
+
+    const pendingMatchmakingIntent = pendingMatchmakingIntentRef.current;
+    const lobbyState = authoritativeLobbyState(rawMessage);
+    const lobbyCode = typeof rawMessage?.LobbyUpdate?.lobby_code === 'string'
+      ? rawMessage.LobbyUpdate.lobby_code.trim().toUpperCase()
+      : null;
+    const messageMatchesPendingIdentity = Boolean(
+      pendingMatchmakingIntent &&
+      slot.authTokenSent === pendingMatchmakingIntent.authToken,
+    );
+    const updateMatchesPendingLobby = Boolean(
+      pendingMatchmakingIntent &&
+      messageMatchesPendingIdentity &&
+      lobbyCode === pendingMatchmakingIntent.lobbyCode,
+    );
+    if (
+      messageMatchesPendingIdentity && (
+        rawMessage?.JoinGame !== undefined ||
+        rawMessage?.MatchFound !== undefined ||
+        rawMessage === 'QueueLeft' ||
+        rawMessage?.QueueLeft !== undefined ||
+        (updateMatchesPendingLobby && (lobbyState === 'queued' || lobbyState === 'matched'))
+      )
+    ) {
+      pendingMatchmakingIntentRef.current = null;
+    } else if (
+      updateMatchesPendingLobby &&
+      lobbyState === 'waiting' &&
+      pendingMatchmakingIntent &&
+      slot.role === 'active' &&
+      activeSlotRef.current === slot &&
+      slot.authenticated &&
+      slot.socket.readyState === WebSocket.OPEN
+    ) {
+      // The replacement has restored the same lobby and Redis still says the
+      // admission never committed. Replay the one retained logical request.
+      slot.socket.send(JSON.stringify(pendingMatchmakingIntent.message));
     }
 
     if (
@@ -921,6 +993,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         (rawMessage?.JoinedLobby?.lobby_code?.toUpperCase() === slot.expectedLobbyCode ||
           rawMessage?.LobbyUpdate?.lobby_code?.toUpperCase() === slot.expectedLobbyCode)
       ) {
+        if (rawMessage?.LobbyUpdate) {
+          slot.restoredLobbyState = authoritativeLobbyState(rawMessage);
+        }
         if (!slot.lobbyReady && slot.contextRestoreStartedAtMs !== null) {
           const nowMs = Date.now();
           recordWsMetric('lobby_rejoin_latency_ms', {
@@ -1122,6 +1197,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       gameComplete: false,
       gameStreamWatermark: null,
       commandOutcomesReady: false,
+      restoredLobbyState: null,
       drainDeadlineMs: null,
       candidateAttempt: 0,
       authStartedAtMs: null,
@@ -1283,6 +1359,21 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [connect, disconnect]);
 
   const sendMessage = useCallback((message: any) => {
+    if (isMatchmakingQueueIntent(message)) {
+      const authToken = getToken();
+      const lobbyCode = (
+        currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? ''
+      ).trim().toUpperCase();
+      if (!lobbyCode) {
+        throw new Error('Cannot queue for matchmaking before a lobby exists');
+      }
+      if (!authToken) {
+        throw new Error('Cannot queue for matchmaking before authentication');
+      }
+      pendingMatchmakingIntentRef.current = { message, lobbyCode, authToken };
+    } else if (message === 'LeaveQueue' || message === 'LeaveLobby') {
+      pendingMatchmakingIntentRef.current = null;
+    }
     const target = activeSlotRef.current;
     const doSend = () => {
       if (
@@ -1305,7 +1396,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     } else {
       doSend();
     }
-  }, [latencySettings]);
+  }, [getToken, latencySettings]);
 
   const authenticateConnection = useCallback(() => {
     const slot = activeSlotRef.current;
@@ -1393,6 +1484,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   useEffect(() => {
     const previous = previousUserRef.current;
     const token = getToken();
+    if (
+      pendingMatchmakingIntentRef.current &&
+      pendingMatchmakingIntentRef.current.authToken !== token
+    ) {
+      pendingMatchmakingIntentRef.current = null;
+    }
     if (!token) {
       setAuthHandshakeState(false);
       lastAuthTokenRef.current = null;

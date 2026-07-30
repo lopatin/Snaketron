@@ -31,6 +31,7 @@ async fn test_solo_game() -> Result<()> {
     // Connect client
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(env.user_ids()[0]).await?;
+    client.create_lobby().await?;
 
     println!("Client authenticated");
 

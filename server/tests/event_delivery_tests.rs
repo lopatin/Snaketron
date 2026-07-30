@@ -27,6 +27,8 @@ async fn test_game_events_delivered() -> Result<()> {
     // Authenticate clients
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Create a game through matchmaking
     // Queue both clients for a match
@@ -190,6 +192,7 @@ async fn test_game_events_continue_after_reconnect() -> Result<()> {
     // Connect client
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(env.user_ids()[0]).await?;
+    client.create_lobby().await?;
 
     // Create a game through matchmaking
     client

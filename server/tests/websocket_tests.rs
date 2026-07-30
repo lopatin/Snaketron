@@ -92,6 +92,8 @@ async fn test_join_game_receives_snapshot() -> Result<()> {
         // Authenticate the clients
         client1.authenticate(env.user_ids()[0]).await?;
         client2.authenticate(env.user_ids()[1]).await?;
+        client1.create_lobby().await?;
+        client2.create_lobby().await?;
         info!("Clients authenticated");
 
         // Queue for match
