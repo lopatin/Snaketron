@@ -358,13 +358,24 @@ export class GameCommandOutbox {
     return true;
   }
 
-  completeTerminal(gameId: number, userId: number): TerminalOutboxCompletion {
+  completeTerminal(
+    gameId: number,
+    userId: number,
+    terminalRejectionReason?: string,
+  ): TerminalOutboxCompletion {
     const session = this.sessions.get(sessionKey(gameId, userId));
     if (!session?.terminalAwaitingOutcomeBarrier) {
       return 'not-terminal';
     }
     if (session.pending.size > 0) {
-      return 'pending';
+      if (!terminalRejectionReason?.trim()) {
+        return 'pending';
+      }
+      // The terminal barrier is an explicit disposition for identities that
+      // crossed completion while terminal delivery was already buffered.
+      // Exact scheduled/rejected outcomes were applied first; every identity
+      // left here is authoritatively rejected for this terminal reason.
+      session.pending.clear();
     }
     // Keep the tombstone after successful reconciliation. React can process
     // this barrier before the queued terminal event reaches the game engine;
@@ -428,8 +439,9 @@ export function markGameCommandOutboxTerminal(
 export function completeGameCommandOutboxTerminal(
   gameId: number,
   userId: number,
+  terminalRejectionReason?: string,
 ): TerminalOutboxCompletion {
-  return browserOutbox.completeTerminal(gameId, userId);
+  return browserOutbox.completeTerminal(gameId, userId, terminalRejectionReason);
 }
 
 export function clearGameCommandOutbox(gameId: number, userId: number): void {

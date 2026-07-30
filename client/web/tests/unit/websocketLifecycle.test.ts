@@ -28,11 +28,18 @@ test('the current websocket protocol fails closed when a capability is absent', 
     'command-delivery-v2',
     'command-outcomes-v1',
     'command-outcome-barrier-v1',
+    'terminal-command-cutoff-v1',
   ];
   assert.deepEqual(missingRequiredServerCapabilities(current), []);
   assert.deepEqual(
     missingRequiredServerCapabilities(current.filter((value) => value !== 'command-delivery-v2')),
     ['command-delivery-v2'],
+  );
+  assert.deepEqual(
+    missingRequiredServerCapabilities(
+      current.filter((value) => value !== 'terminal-command-cutoff-v1'),
+    ),
+    ['terminal-command-cutoff-v1'],
   );
 });
 

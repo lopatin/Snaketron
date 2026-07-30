@@ -62,9 +62,14 @@ pub enum WSMessage {
     /// Ordered barrier emitted only after every outcome batch for the
     /// immediately preceding snapshot has reached this socket's send queue.
     /// Planned handoff clients use it instead of guessing from timing or from
-    /// the absence of a per-session outcome batch.
+    /// the absence of a per-session outcome batch. A terminal barrier also
+    /// explicitly rejects every identity still unresolved at the client:
+    /// commands can cross the bidirectional WebSocket while completion is
+    /// already queued in the opposite direction.
     CommandOutcomesComplete {
         game_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_rejection_reason: Option<String>,
     },
     Chat(String),
     LobbyChatMessage {
@@ -1360,6 +1365,7 @@ const ACTIVE_GAME_MAPPING_TIMEOUT: Duration = Duration::from_secs(1);
 const COMMAND_OUTCOME_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
 const COMMAND_OUTCOME_READ_TIMEOUT: Duration = Duration::from_millis(750);
 const COMMAND_OUTCOME_RETRY_DELAY: Duration = Duration::from_millis(100);
+const TERMINAL_COMMAND_REJECTION_REASON: &str = "game completed";
 
 #[derive(Debug)]
 enum GameJoinAuthorizationError {
@@ -1439,9 +1445,8 @@ async fn has_durable_recovery_failure(
     }
 }
 
-/// A partition-wide snapshot request can be missed while no executor owns the
-/// partition. Keep requesting through the bounded takeover window, while the
-/// replication manager coalesces concurrent requests from reconnecting users.
+/// A targeted snapshot request can be missed while no executor owns the
+/// partition. Keep requesting this game through the bounded takeover window.
 async fn wait_for_live_game_after_snapshot_request(
     game_id: u32,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
@@ -1450,6 +1455,7 @@ async fn wait_for_live_game_after_snapshot_request(
 ) -> Option<GameState> {
     let partition_id = game_id % PARTITION_COUNT;
     let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+    let mut next_snapshot_request_at = tokio::time::Instant::now();
     let mut check_recovery = true;
 
     loop {
@@ -1460,13 +1466,14 @@ async fn wait_for_live_game_after_snapshot_request(
             return None;
         }
 
-        match replication_manager
-            .request_partition_snapshots(partition_id)
-            .await
-        {
-            Ok(published) => check_recovery |= published,
-            Err(error) => {
-                warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
+        let now = tokio::time::Instant::now();
+        if now >= next_snapshot_request_at {
+            next_snapshot_request_at = now + Duration::from_millis(500);
+            match replication_manager.request_game_snapshot(game_id).await {
+                Ok(()) => check_recovery = true,
+                Err(error) => {
+                    warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
+                }
             }
         }
 
@@ -1542,17 +1549,6 @@ async fn authorize_game_join_inner(
             game_id, user_id
         );
         return Err(game_join_denied("This game is unavailable"));
-    }
-
-    // Ask the current (or soon-to-be) owner to republish this partition. The
-    // startup request may have landed while no executor held the lease, so a
-    // cold join must be able to self-heal independently.
-    let partition_id = game_id % PARTITION_COUNT;
-    if let Err(error) = replication_manager
-        .request_partition_snapshots(partition_id)
-        .await
-    {
-        warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
     }
 
     if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
@@ -1959,12 +1955,10 @@ async fn subscribe_to_game_events(
     let mut initial_subscription = replication_manager.subscribe_to_game(game_id).await;
     if initial_subscription.is_err() {
         let partition_id = game_id % PARTITION_COUNT;
-        if let Err(error) = replication_manager
-            .request_partition_snapshots(partition_id)
-            .await
-        {
+        if let Err(error) = replication_manager.request_game_snapshot(game_id).await {
             warn!(game_id, partition_id, %error, "Failed to request subscription snapshots");
         }
+        let mut next_snapshot_request_at = tokio::time::Instant::now() + Duration::from_millis(500);
 
         let mut recovery_bridge_sent = send_recovery_bridge_if_available(
             game_id,
@@ -1978,28 +1972,26 @@ async fn subscribe_to_game_events(
         // Completed games intentionally leave replication memory. Avoid
         // spending the takeover wait on a game that already has its terminal
         // Redis snapshot.
-        if !recovery_bridge_sent {
-            match replication_manager.get_stored_snapshot(game_id).await {
-                Ok(Some(game_state))
-                    if matches!(game_state.status, GameStatus::Complete { .. })
-                        && game_state_records_user(&game_state, user_id) =>
-                {
-                    send_completed_game_snapshot(
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                        game_id,
-                        user_id,
-                        &game_state,
-                        "stored Redis snapshot",
-                    )
-                    .await;
-                    return;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
-                }
+        match replication_manager.get_stored_snapshot(game_id).await {
+            Ok(Some(game_state))
+                if matches!(game_state.status, GameStatus::Complete { .. })
+                    && game_state_records_user(&game_state, user_id) =>
+            {
+                send_completed_game_snapshot(
+                    &ws_tx,
+                    &game_bus,
+                    &cluster_namespace,
+                    game_id,
+                    user_id,
+                    &game_state,
+                    "stored Redis snapshot",
+                )
+                .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
             }
         }
 
@@ -2013,34 +2005,26 @@ async fn subscribe_to_game_events(
                 break;
             }
 
-            match replication_manager
-                .request_partition_snapshots(partition_id)
-                .await
-            {
-                Ok(published) if published && !recovery_bridge_sent => {
-                    recovery_bridge_sent = send_recovery_bridge_if_available(
-                        game_id,
-                        user_id,
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                    )
-                    .await;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(game_id, partition_id, %error, "Failed to retry subscription snapshots");
+            let now = tokio::time::Instant::now();
+            if now >= next_snapshot_request_at {
+                next_snapshot_request_at = now + Duration::from_millis(500);
+                match replication_manager.request_game_snapshot(game_id).await {
+                    Ok(()) if !recovery_bridge_sent => {
+                        recovery_bridge_sent = send_recovery_bridge_if_available(
+                            game_id,
+                            user_id,
+                            &ws_tx,
+                            &game_bus,
+                            &cluster_namespace,
+                        )
+                        .await;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        warn!(game_id, partition_id, %error, "Failed to retry subscription snapshots");
+                    }
                 }
             }
-        }
-        if initial_subscription.is_err() && recovery_bridge_sent {
-            warn!(
-                game_id,
-                user_id,
-                "Replica did not become subscribable after recovery snapshot; returning retryable warm-up"
-            );
-            send_game_warming(&ws_tx, game_id).await;
-            return;
         }
     }
 
@@ -2220,7 +2204,16 @@ async fn subscribe_to_game_events(
         }
     }
 
-    if !send_command_outcomes(&ws_tx, &game_bus, &cluster_namespace, game_id, user_id).await {
+    if !send_command_outcomes(
+        &ws_tx,
+        &game_bus,
+        &cluster_namespace,
+        game_id,
+        user_id,
+        None,
+    )
+    .await
+    {
         return;
     }
 
@@ -2261,6 +2254,7 @@ async fn subscribe_to_game_events(
                             &cluster_namespace,
                             game_id,
                             user_id,
+                            terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
                         )
                         .await
                         {
@@ -2291,6 +2285,7 @@ async fn subscribe_to_game_events(
                 // it can at least resync via RequestResync; either way, log
                 // loudly — a silent exit here is how ghost games are born.
                 if let Some(state) = replication_manager.get_game_state(game_id).await {
+                    let terminal = matches!(state.status, GameStatus::Complete { .. });
                     error!(
                         "Event broadcaster closed for live game {} (user {}); sending final snapshot",
                         game_id, user_id
@@ -2312,6 +2307,7 @@ async fn subscribe_to_game_events(
                         &cluster_namespace,
                         game_id,
                         user_id,
+                        terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
                     )
                     .await;
                 } else {
@@ -2367,7 +2363,15 @@ async fn subscribe_to_game_events(
             // were published by the old owner but never reached this socket.
             // Terminal state also requires the same durable replay before a
             // client may clear its command outbox or finish certification.
-            if !send_command_outcomes(&ws_tx, &game_bus, &cluster_namespace, game_id, user_id).await
+            if !send_command_outcomes(
+                &ws_tx,
+                &game_bus,
+                &cluster_namespace,
+                game_id,
+                user_id,
+                is_terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
             {
                 return;
             }
@@ -2386,13 +2390,21 @@ async fn send_command_outcomes(
     cluster_namespace: &ClusterNamespace,
     game_id: u32,
     user_id: u32,
+    terminal_rejection_reason: Option<&str>,
 ) -> bool {
     let Some(resolved) =
         load_command_outcomes(ws_tx, game_bus, cluster_namespace, game_id, user_id).await
     else {
         return false;
     };
-    send_command_outcomes_from_resolved(ws_tx, game_id, user_id, resolved).await
+    send_command_outcomes_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
 }
 
 async fn load_command_outcomes(
@@ -2447,19 +2459,19 @@ async fn load_completed_command_outcomes(
     cluster_namespace: &ClusterNamespace,
     game_id: u32,
     user_id: u32,
-) -> Option<ResolvedCommandState> {
+) -> Option<RecoveryEnvelopeV2> {
     match tokio::time::timeout(
         COMMAND_OUTCOME_READ_TIMEOUT,
         game_bus.get_recovery(cluster_namespace, game_id),
     )
     .await
     {
-        Ok(Ok(Some(envelope))) => Some(envelope.resolved_client_commands),
+        Ok(Ok(Some(envelope))) => Some(envelope),
         Ok(Ok(None)) => {
             warn!(
                 game_id,
                 user_id,
-                "Terminal recovery outcomes are no longer retained; sending an empty outcome barrier"
+                "Terminal recovery outcomes are no longer retained; terminal fallback will remain non-dispositive"
             );
             None
         }
@@ -2468,7 +2480,7 @@ async fn load_completed_command_outcomes(
                 game_id,
                 user_id,
                 %error,
-                "Failed to load terminal recovery outcomes; sending an empty outcome barrier"
+                "Failed to load terminal recovery outcomes; terminal fallback will remain non-dispositive"
             );
             None
         }
@@ -2476,7 +2488,7 @@ async fn load_completed_command_outcomes(
             warn!(
                 game_id,
                 user_id,
-                "Timed out loading terminal recovery outcomes; sending an empty outcome barrier"
+                "Timed out loading terminal recovery outcomes; terminal fallback will remain non-dispositive"
             );
             None
         }
@@ -2488,6 +2500,7 @@ async fn send_command_outcomes_from_resolved(
     game_id: u32,
     user_id: u32,
     resolved: ResolvedCommandState,
+    terminal_rejection_reason: Option<&str>,
 ) -> bool {
     for (client_game_session_id, session) in command_outcomes_for_user(resolved, user_id) {
         let response = WSMessage::CommandOutcomes {
@@ -2516,15 +2529,19 @@ async fn send_command_outcomes_from_resolved(
     // A user can legitimately have no recorded command session. The explicit
     // barrier distinguishes that case from a delayed/failed recovery read, so
     // make-before-break never promotes based on a timing assumption.
-    send_command_outcome_barrier(ws_tx, game_id, user_id).await
+    send_command_outcome_barrier(ws_tx, game_id, user_id, terminal_rejection_reason).await
 }
 
 async fn send_command_outcome_barrier(
     ws_tx: &mpsc::Sender<Message>,
     game_id: u32,
     user_id: u32,
+    terminal_rejection_reason: Option<&str>,
 ) -> bool {
-    let response = WSMessage::CommandOutcomesComplete { game_id };
+    let response = WSMessage::CommandOutcomesComplete {
+        game_id,
+        terminal_rejection_reason: terminal_rejection_reason.map(str::to_owned),
+    };
     let json = match serde_json::to_string(&response) {
         Ok(json) => json,
         Err(error) => {
@@ -2600,14 +2617,35 @@ async fn send_completed_game_snapshot(
         game_id, source, user_id
     );
     // The terminal snapshot remains useful after the short recovery envelope
-    // expires. An empty barrier fabricates no outcomes: clients with pending
-    // identities must retain them and fail closed, while clients with no
-    // pending commands can safely render the durable completed game.
-    let resolved = load_completed_command_outcomes(game_bus, cluster_namespace, game_id, user_id)
-        .await
-        .unwrap_or_default();
-    if !send_completed_game_snapshot_from_resolved(ws_tx, game_id, user_id, game_state, resolved)
-        .await
+    // expires. Only a real recovery envelope proves which exact identities
+    // were processed before immutable completion; without it, keep the
+    // barrier non-dispositive so an in-memory outbox fails closed.
+    let retained =
+        load_completed_command_outcomes(game_bus, cluster_namespace, game_id, user_id).await;
+    let (resolved, terminal_rejection_reason) = match retained {
+        Some(envelope) if matches!(envelope.game_state.status, GameStatus::Complete { .. }) => (
+            envelope.resolved_client_commands,
+            Some(TERMINAL_COMMAND_REJECTION_REASON),
+        ),
+        Some(_) => {
+            warn!(
+                game_id,
+                user_id,
+                "Ignoring nonterminal recovery outcomes beside a durable completed snapshot"
+            );
+            (ResolvedCommandState::default(), None)
+        }
+        None => (ResolvedCommandState::default(), None),
+    };
+    if !send_completed_game_snapshot_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        game_state,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
     {
         error!(
             "Failed to send {} and its terminal command outcomes for game {} to user {}",
@@ -2622,12 +2660,20 @@ async fn send_completed_game_snapshot_from_resolved(
     user_id: u32,
     game_state: &GameState,
     resolved: ResolvedCommandState,
+    terminal_rejection_reason: Option<&str>,
 ) -> bool {
     if let Err(error) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
         error!(game_id, user_id, %error, "Failed to send completed game snapshot");
         return false;
     }
-    send_command_outcomes_from_resolved(ws_tx, game_id, user_id, resolved).await
+    send_command_outcomes_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
 }
 
 async fn send_game_load_failed(
@@ -3807,8 +3853,25 @@ async fn process_ws_message(
                             command_id,
                             command,
                         };
-                        if let Err(error) = game_bus.publish_command(partition_id, &event).await {
-                            error!(game_id, user_id, %error, "Failed to publish v2 game command");
+                        match game_bus
+                            .publish_game_command_unless_completed(
+                                cluster_namespace,
+                                partition_id,
+                                game_id,
+                                &event,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(
+                                    game_id,
+                                    user_id, "Discarded command after immutable game completion"
+                                );
+                            }
+                            Err(error) => {
+                                error!(game_id, user_id, %error, "Failed to publish v2 game command");
+                            }
                         }
                         Ok(ConnectionState::Authenticated {
                             metadata,
@@ -4165,10 +4228,10 @@ async fn spectate_game(
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        GameJoinAuthorizationError, WSMessage, canonical_command_identity,
-        command_outcomes_for_user, game_join_denied, game_join_failure_message,
-        missing_game_join_failure, next_outbound_message, queue_planned_drain_notice,
-        recovery_bridge_snapshot, send_command_outcomes_from_resolved,
+        GameJoinAuthorizationError, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
+        canonical_command_identity, command_outcomes_for_user, game_join_denied,
+        game_join_failure_message, missing_game_join_failure, next_outbound_message,
+        queue_planned_drain_notice, recovery_bridge_snapshot, send_command_outcomes_from_resolved,
         send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
         snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
         take_lobby_update_receiver, unsent_lobby_match,
@@ -4526,9 +4589,17 @@ mod lifecycle_protocol_tests {
 
     #[test]
     fn command_outcome_barrier_has_an_explicit_game_scope() {
-        let value =
-            serde_json::to_value(WSMessage::CommandOutcomesComplete { game_id: 42 }).unwrap();
+        let value = serde_json::to_value(WSMessage::CommandOutcomesComplete {
+            game_id: 42,
+            terminal_rejection_reason: None,
+        })
+        .unwrap();
         assert_eq!(value["CommandOutcomesComplete"]["game_id"], 42);
+        assert!(
+            value["CommandOutcomesComplete"]
+                .get("terminal_rejection_reason")
+                .is_none()
+        );
     }
 
     fn decode_ws_message(message: Message) -> WSMessage {
@@ -4542,11 +4613,15 @@ mod lifecycle_protocol_tests {
     async fn empty_recovery_outcomes_still_emit_the_promotion_barrier() {
         let (tx, mut rx) = mpsc::channel(2);
         assert!(
-            send_command_outcomes_from_resolved(&tx, 42, 5, ResolvedCommandState::default(),).await
+            send_command_outcomes_from_resolved(&tx, 42, 5, ResolvedCommandState::default(), None,)
+                .await
         );
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
-            WSMessage::CommandOutcomesComplete { game_id: 42 }
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
         ));
     }
 
@@ -4567,7 +4642,7 @@ mod lifecycle_protocol_tests {
             )]),
         };
 
-        assert!(send_command_outcomes_from_resolved(&tx, 42, 5, resolved).await);
+        assert!(send_command_outcomes_from_resolved(&tx, 42, 5, resolved, None).await);
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
             WSMessage::CommandOutcomes {
@@ -4584,7 +4659,10 @@ mod lifecycle_protocol_tests {
         ));
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
-            WSMessage::CommandOutcomesComplete { game_id: 42 }
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
         ));
     }
 
@@ -4610,7 +4688,17 @@ mod lifecycle_protocol_tests {
             )]),
         };
 
-        assert!(send_completed_game_snapshot_from_resolved(&tx, 42, 5, &state, resolved).await);
+        assert!(
+            send_completed_game_snapshot_from_resolved(
+                &tx,
+                42,
+                5,
+                &state,
+                resolved,
+                Some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
+        );
 
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
@@ -4637,7 +4725,43 @@ mod lifecycle_protocol_tests {
         ));
         assert!(matches!(
             decode_ws_message(rx.recv().await.unwrap()),
-            WSMessage::CommandOutcomesComplete { game_id: 42 }
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: Some(reason),
+            } if reason == TERMINAL_COMMAND_REJECTION_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_without_retained_outcomes_has_no_default_disposition() {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.add_player(5, None).unwrap();
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(
+            send_completed_game_snapshot_from_resolved(
+                &tx,
+                42,
+                5,
+                &state,
+                ResolvedCommandState::default(),
+                None,
+            )
+            .await
+        );
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::GameEvent(_)
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
         ));
     }
 }

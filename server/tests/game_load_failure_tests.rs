@@ -124,11 +124,17 @@ async fn joining_an_unknown_game_returns_an_explicit_load_failure_and_can_retry(
         .await?;
     client.join_game(missing_game_id).await?;
 
-    let (retried_state, replayed_outcome_sessions) =
-        receive_terminal_snapshot_and_barrier(&mut client, missing_game_id).await?;
+    let (
+        retried_state,
+        replayed_outcome_sessions,
+        terminal_rejection_reason,
+        nonterminal_bridge_snapshots,
+    ) = receive_terminal_snapshot_and_barrier(&mut client, missing_game_id).await?;
     assert_eq!(retried_state.status, final_state.status);
     assert_eq!(retried_state.tick, final_state.tick);
     assert_eq!(replayed_outcome_sessions, 0);
+    assert_eq!(terminal_rejection_reason, None);
+    assert_eq!(nonterminal_bridge_snapshots, 0);
 
     client.disconnect().await?;
     env.shutdown().await?;
@@ -168,20 +174,48 @@ async fn joining_a_durably_saved_completed_game_returns_its_final_snapshot() -> 
             300,
         )
         .await?;
+    let stale_recovery = RecoveryEnvelopeV2::new(
+        game_id,
+        game_id % PARTITION_COUNT,
+        stale_state,
+        "0-0".to_owned(),
+        ResolvedCommandState::default(),
+        0,
+        0,
+        chrono::Utc::now().timestamp_millis(),
+        "stale-pre-completion-lease".to_owned(),
+    );
+    let namespace = ClusterNamespace::new("test-region")?;
+    let _: () = redis
+        .set_ex(
+            namespace.recovery(game_id),
+            serde_json::to_vec(&stale_recovery)?,
+            300,
+        )
+        .await?;
 
     let server_addr = env.ws_addr(0).expect("test server should be running");
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(user_id).await?;
     client.join_game(game_id).await?;
 
-    let (loaded_state, replayed_outcome_sessions) =
-        receive_terminal_snapshot_and_barrier(&mut client, game_id).await?;
+    let (
+        loaded_state,
+        replayed_outcome_sessions,
+        terminal_rejection_reason,
+        nonterminal_bridge_snapshots,
+    ) = receive_terminal_snapshot_and_barrier(&mut client, game_id).await?;
 
     assert_eq!(loaded_state.status, final_state.status);
     assert_eq!(loaded_state.tick, final_state.tick);
     assert_eq!(loaded_state.event_sequence, final_state.event_sequence);
     assert_eq!(loaded_state.scores, final_state.scores);
     assert_eq!(replayed_outcome_sessions, 0);
+    assert_eq!(terminal_rejection_reason, None);
+    assert!(
+        nonterminal_bridge_snapshots >= 1,
+        "the stale recovery envelope should be observed before the durable terminal fallback"
+    );
 
     client.disconnect().await?;
     env.shutdown().await?;
@@ -214,6 +248,25 @@ async fn completed_game_snapshots_are_denied_to_non_players_in_redis_and_dynamo(
     let _: () = redis
         .set_ex(&snapshot_key, serde_json::to_vec(&final_state)?, 300)
         .await?;
+    let terminal_recovery = RecoveryEnvelopeV2::new(
+        game_id,
+        game_id % PARTITION_COUNT,
+        final_state.clone(),
+        "0-0".to_owned(),
+        ResolvedCommandState::default(),
+        0,
+        0,
+        chrono::Utc::now().timestamp_millis(),
+        "terminal-completion-lease".to_owned(),
+    );
+    let namespace = ClusterNamespace::new("test-region")?;
+    let _: () = redis
+        .set_ex(
+            namespace.recovery(game_id),
+            serde_json::to_vec(&terminal_recovery)?,
+            300,
+        )
+        .await?;
     let chat_history_key = RedisKeys::game_chat_history_key(game_id);
     let seeded_chat = serde_json::json!({
         "game_id": game_id,
@@ -231,14 +284,20 @@ async fn completed_game_snapshots_are_denied_to_non_players_in_redis_and_dynamo(
     let mut spectator_client = TestClient::connect(&server_addr).await?;
     spectator_client.authenticate(spectator_user_id).await?;
     spectator_client.join_game(game_id).await?;
-    let (spectator_state, replayed_outcome_sessions) =
-        receive_terminal_snapshot_and_barrier(&mut spectator_client, game_id).await?;
+    let (
+        spectator_state,
+        replayed_outcome_sessions,
+        terminal_rejection_reason,
+        nonterminal_bridge_snapshots,
+    ) = receive_terminal_snapshot_and_barrier(&mut spectator_client, game_id).await?;
     assert!(
         spectator_state
             .spectators
             .contains(&(spectator_user_id as u32))
     );
     assert_eq!(replayed_outcome_sessions, 0);
+    assert_eq!(terminal_rejection_reason.as_deref(), Some("game completed"));
+    assert_eq!(nonterminal_bridge_snapshots, 0);
     spectator_client.disconnect().await?;
 
     let mut client = TestClient::connect(&server_addr).await?;
@@ -623,6 +682,7 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
             match client.receive_message().await? {
                 WSMessage::CommandOutcomesComplete {
                     game_id: barrier_game_id,
+                    ..
                 } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
                 WSMessage::GameLoadFailed {
                     game_id: failed_game_id,
@@ -862,18 +922,22 @@ async fn receive_snapshot(client: &mut TestClient) -> Result<GameState> {
 async fn receive_terminal_snapshot_and_barrier(
     client: &mut TestClient,
     expected_game_id: u32,
-) -> Result<(GameState, usize)> {
+) -> Result<(GameState, usize, Option<String>, usize)> {
     timeout(Duration::from_secs(10), async {
         let mut snapshot = None;
         let mut replayed_outcome_sessions = 0;
+        let mut nonterminal_bridge_snapshots = 0;
         loop {
             match client.receive_message().await? {
                 WSMessage::GameEvent(event) if event.game_id == expected_game_id => {
                     if let GameEvent::Snapshot { game_state } = event.event {
                         if !matches!(game_state.status, GameStatus::Complete { .. }) {
-                            return Err(anyhow::anyhow!(
-                                "expected terminal snapshot for game {expected_game_id}"
-                            ));
+                            // A short-lived recovery bridge may legitimately precede the
+                            // authoritative durable terminal fallback. It must not authorize
+                            // terminal command disposition, so keep waiting for the terminal
+                            // snapshot and its ordered barrier.
+                            nonterminal_bridge_snapshots += 1;
+                            continue;
                         }
                         snapshot = Some(game_state);
                     }
@@ -886,11 +950,19 @@ async fn receive_terminal_snapshot_and_barrier(
                     }
                     replayed_outcome_sessions += 1;
                 }
-                WSMessage::CommandOutcomesComplete { game_id } if game_id == expected_game_id => {
+                WSMessage::CommandOutcomesComplete {
+                    game_id,
+                    terminal_rejection_reason,
+                } if game_id == expected_game_id => {
                     let snapshot = snapshot.context(format!(
                         "terminal outcome barrier preceded game {expected_game_id} snapshot"
                     ))?;
-                    return Ok::<_, anyhow::Error>((snapshot, replayed_outcome_sessions));
+                    return Ok::<_, anyhow::Error>((
+                        snapshot,
+                        replayed_outcome_sessions,
+                        terminal_rejection_reason,
+                        nonterminal_bridge_snapshots,
+                    ));
                 }
                 WSMessage::GameWarming { game_id, .. } if game_id == expected_game_id => {
                     return Err(anyhow::anyhow!(

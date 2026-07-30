@@ -217,6 +217,7 @@ export interface CommandOutcomesPayload {
 export interface CommandOutcomesCompleteMessage {
   CommandOutcomesComplete: {
     game_id: number;
+    terminal_rejection_reason?: string;
   };
 }
 

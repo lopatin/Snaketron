@@ -349,6 +349,24 @@ test('terminal state before the first command keeps a tombstone through its barr
   assert.equal(next.command_id.sequence, 1);
 });
 
+test('terminal barrier explicitly rejects identities that crossed completion', () => {
+  const outbox = new GameCommandOutbox(() => 'session-terminal-cutoff');
+  outbox.enqueue(42, 7, command(1), 1_000);
+  outbox.enqueue(42, 7, command(2), 1_100);
+
+  outbox.markTerminal(42, 7);
+  assert.equal(outbox.completeTerminal(42, 7), 'pending');
+  assert.equal(
+    outbox.completeTerminal(42, 7, 'game completed'),
+    'cleared',
+  );
+  assert.deepEqual(outbox.pending(42, 7), []);
+  assert.throws(
+    () => outbox.enqueue(42, 7, command(3), 1_200),
+    /terminal game is awaiting command outcomes/,
+  );
+});
+
 test('terminal recovery fence remains parked until its completion barrier', () => {
   const sessionIds = ['session-terminal-fence', 'session-after-terminal'];
   const outbox = new GameCommandOutbox(() => sessionIds.shift()!);

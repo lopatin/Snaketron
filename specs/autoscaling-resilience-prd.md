@@ -314,7 +314,25 @@ The assignment coordinator is control plane only. Existing assignments and activ
 9. A rejected or never-received sequence must not be represented as accepted merely because a higher sequence resolved. The contiguous watermark never advances across an unresolved gap.
 10. Retain at most 128 exact outcomes per client game session and at most 64 client game sessions per game. Keep this bound equal to the browser outbox bound. The contiguous watermark remains in every recovery checkpoint for the checkpoint lifetime and permanently fences older resolved identities, so pruning an exact result does not permit its logical effect to run again.
 11. Recovery checkpoints must contain the resolved watermark and sparse command outcomes. After a recovery snapshot, the server sends that user's `CommandOutcomes` records followed by an explicit `CommandOutcomesComplete` barrier before the client may resend unresolved commands.
-12. A client may remove an outbox entry only after matching `CommandScheduledV2`, matching `CommandRejected`, matching `CommandOutcomes`, or a definitive `GameLoadFailed`. A terminal game event parks retries but does not resolve pending commands: the server must immediately follow it with the durable per-session outcomes (including any rejection fence) and `CommandOutcomesComplete`, and the client accepts terminal reconciliation only after processing that ordered barrier and proving that no command remains pending. The client retains an empty terminal tombstone until explicit leave/navigation so input cannot open a new command session either before or after the barrier while UI state catches up. If the short-lived recovery envelope has expired, an authorized completed-game reload may send the durable terminal snapshot followed by an empty barrier; this preserves read availability without fabricating an outcome, because any client that still has pending identities remains parked and fails closed.
+12. A client may remove an outbox entry only after matching
+    `CommandScheduledV2`, matching `CommandRejected`, matching
+    `CommandOutcomes`, an explicit terminal default disposition described
+    below, or a definitive `GameLoadFailed`. A terminal game event first parks
+    retries. The server then sends the durable exact per-session outcomes
+    (including any rejection fence) followed by
+    `CommandOutcomesComplete`. It may put a nonempty
+    `terminal_rejection_reason` on that barrier only after loading a current
+    recovery envelope whose game state is terminal. After the client has
+    already processed a terminal snapshot for that same game, it applies the
+    reason as a rejection to every still-pending identity for the game. Exact
+    outcomes take precedence. This closes commands that crossed buffered
+    terminal delivery without inventing a scheduled result. The client retains
+    an empty terminal tombstone until explicit leave/navigation so input cannot
+    open a new command session while UI state catches up. An authorized
+    completed-game reload with a missing, expired, malformed, or nonterminal
+    recovery envelope sends a reasonless barrier. It remains readable, but any
+    pending identity stays parked and fails closed rather than being
+    dispositioned from an unproven terminal frontier.
 13. Before publishing a client-visible `CommandScheduledV2` or `CommandRejected`
     that is not yet checkpointed, the executor must atomically and under its
     live fence write the exact outcome, authoritative schedule/counter, and
@@ -340,6 +358,15 @@ The assignment coordinator is control plane only. Existing assignments and activ
     only after those lower entries resolve. Do not add another Redis key,
     per-command checkpoint, or rejection persistence mechanism for this edge
     case.
+16. The gateway must test the partition completion key and append
+    `GameCommandSubmittedV2` in one same-slot Lua operation. Once completion
+    exists, a late command is not appended to the executor stream; the proven
+    terminal default disposition closes its client identity. The script must
+    reject a payload whose typed game/user identity does not match the
+    authenticated command envelope.
+17. `terminal-command-cutoff-v1` is a required lifecycle capability. A server
+    or client missing it is incompatible with this release; do not add a
+    fallback protocol.
 
 ### R6 — Per-game checkpoints and recovery
 
@@ -372,19 +399,24 @@ The assignment coordinator is control plane only. Existing assignments and activ
 9. Completed games must have explicit cleanup after their durable completion grace period.
 10. If replacement occurs after the documented recovery retention, the game must produce an explicit unrecoverable outcome. It must not silently fabricate or restart state.
 11. Checkpoint size and write volume must be measured under `1 -> 10 -> 1` load. Delta encoding is considered only if those measurements show a real capacity problem.
-12. A replica snapshot request must not perform an extra checkpoint inline or block
-    the partition command reader behind a full-game fan-out. Each game actor
-    records an idempotent pending-snapshot flag and publishes at most one
-    requested snapshot immediately after its next existing periodic checkpoint.
-    Ordinary on-demand repair requests remain immediate hints. An initial
-    readiness request retains completion waiters in the actor while commands
-    continue, and a background executor worker appends a boot-unique completion
-    marker to the same ordered partition event stream only after every active
-    actor has published. Concurrent gateway warm-up requests coalesce at the
-    actor checkpoint. The gateway retries a missed request and becomes ready
-    only after consuming its exact marker, which also handles an empty
-    partition without a timer or synthetic game. Successor activation still
-    publishes its immediate recovery re-anchor.
+12. A cold-join or ordinary on-demand repair request carries the exact game ID
+    and is only a best-effort hint to that actor. A gateway polls its local
+    replica every 100 milliseconds but publishes the targeted request at most
+    once per 500 milliseconds through the bounded warm-up window. The executor
+    uses a nonblocking actor mailbox send; a full mailbox, a request racing game
+    creation, or an ownership gap is benign because the gateway retries and a
+    successor publishes its recovery re-anchor. This path must not checkpoint
+    inline, wait for an actor reply, or fan out to unrelated games.
+
+    Partition startup/readiness and detected partition-gap repair remain
+    explicitly partition-scoped requests. An initial readiness request retains
+    completion waiters in every active actor while commands continue, and a
+    background executor worker appends a boot-unique completion marker to the
+    same ordered partition event stream only after every active actor has
+    published. The gateway retries a missed request and becomes ready only
+    after consuming its exact marker, which also handles an empty partition
+    without a timer or synthetic game. Targeted cold-join hints never satisfy
+    this readiness proof.
 13. The authoritative executor partition reader must round-robin the complete
     projection for each addressable game, keep at most one unresolved delivery
     per game, and use a bounded fan-out. A later command, status, creation,
@@ -438,7 +470,7 @@ The assignment coordinator is control plane only. Existing assignments and activ
    - short jittered exponential backoff after failure;
    - automatic reauthentication, lobby/game restoration, and fresh snapshot;
    - no page reload or user action.
-4. Use an explicit server `Authenticated` response containing task boot identity and the current required capabilities. The client must not mark a socket authenticated merely because it sent a token or a timeout elapsed. All advertised requirements are mandatory; there is no version negotiation or fallback mode.
+4. Use an explicit server `Authenticated` response containing task boot identity and the current required capabilities. The client must not mark a socket authenticated merely because it sent a token or a timeout elapsed. All advertised requirements are mandatory, including `command-outcome-barrier-v1` and `terminal-command-cutoff-v1`; there is no version negotiation or fallback mode.
 5. Every socket must have a monotonically changing local generation. Callbacks from an older generation must not close, reconnect, overwrite state, or clear readiness for a newer socket.
 6. Transport closure must be distinct from explicit `LeaveLobby`. Unexpected or planned transport loss stops that connection's heartbeat and lets its short presence lease expire; it must not immediately delete durable lobby or matchmaking state.
 7. Cleanup from an old socket must compare its session/generation and must not erase presence created by the replacement socket.
@@ -704,7 +736,17 @@ The stored source token is diagnostic only. On recovery, the successor's newly a
 1. The client places the stable command ID in its outbox before sending.
 2. The gateway appends it to the partition command stream.
 3. The executor processes it at least once and schedules it at most once.
-4. The client clears individual entries on `CommandScheduledV2`, `CommandRejected`, or matching `CommandOutcomes`. A terminal game event parks the outbox; it does not clear unresolved identities. After reconciling the terminal event's immediately following durable outcomes and rejection fence, `CommandOutcomesComplete` succeeds only when the pending set is empty; otherwise the client retains it and fails closed. Even on success, an empty terminal tombstone blocks new commands until explicit leave/navigation. A definitive `GameLoadFailed` may also clear it.
+4. The client clears individual entries on `CommandScheduledV2`,
+   `CommandRejected`, or matching `CommandOutcomes`. A terminal game event
+   parks the outbox. After exact durable outcomes, a
+   `CommandOutcomesComplete` carrying the proven terminal default rejects any
+   identities still pending for that game; a reasonless barrier leaves them
+   pending and fails closed. The barrier is invalid unless the client has
+   already observed an authoritative terminal snapshot for that same game.
+   Terminal state is irreversible, so reconnect does not discard this proof or
+   require generation-scoped terminal bookkeeping. Even after every entry
+   resolves, an empty terminal tombstone blocks new commands until explicit
+   leave/navigation. A definitive `GameLoadFailed` may also clear it.
 5. If the gateway/socket fails at any point, the client resends the same identity after recovery readiness.
 
 ## 12. Failure semantics
@@ -806,6 +848,12 @@ active socket reaches a capacity limit. Retiring a socket may discard its
 private unread queue; exact pending-command accounting and the durable outcome
 barrier must then recover every outcome or fail certification. The real-browser
 suite remains the authority for JavaScript rendering and stale-overlay behavior.
+For a pending command closed by a proven terminal-default barrier, the
+observation time is the later of that barrier's dedicated-reader receipt and
+the command's original send. This covers the legitimate cross-task ordering in
+which the reader has already received the terminal frontier while the driver is
+finishing a command send; it never produces a negative latency and does not
+permit a reasonless or pre-terminal barrier to resolve anything.
 Command-outcome certification accepts report schema 11 or newer only when
 `metadata.command_outcome_latency_basis` is exactly
 `original-send-to-dedicated-reader-frame-receipt`.
@@ -822,6 +870,9 @@ Command-outcome certification accepts report schema 11 or newer only when
 | Fill one client session's sparse exact-result window, then crash before the overflow rejection is checkpointed | The overflow command remains in the consumer-group pending list with its exact journaled decision; takeover installs the same rejection fence, emits no conflicting incremental outcome, and does not change engine state or the server command counter. |
 | Crash after checkpointing a sparse-window rejection fence but before its event reaches the client | Recovery outcomes expose the same fence; the client clears covered entries, keeps lower gaps pending, never resends a covered identity, and rotates only after every lower pending identity resolves. |
 | Reject sequence N, accept N+1, and lose both terminal events | Reconnect does not treat the higher sequence as proof that N was accepted; resolved watermark/sparse outcomes clear each entry according to its own result. |
+| Complete a game while one authenticated command crosses buffered terminal delivery | The completion commit and command append are atomically ordered. An append that wins receives its exact durable result; an append that loses is absent from the command stream and is rejected by the ordered terminal-default barrier. The client and certification driver first observe the terminal snapshot, finish with zero pending identities, and retain the empty terminal tombstone. |
+| Reload a durably completed game while recovery state is missing or still contains the preceding nonterminal checkpoint | The durable terminal snapshot remains readable, but `CommandOutcomesComplete` has no terminal default and cannot clear a pending identity. A preceding nonterminal recovery bridge does not authorize terminal disposition. |
+| Cold-join one game while its partition contains many unrelated actors and one actor mailbox is full | Requests name only the joined game and are published no faster than once per 500 milliseconds per joining socket. The executor does not await an actor reply or fan out to unrelated actors; a full or temporarily missing target is retried without blocking partition command delivery. Startup readiness and partition-gap requests remain full-partition proofs. |
 | Hold 128 client commands unresolved, then submit one more | The first 128 identities remain intact and resendable; the client does not allocate or send identity 129 until one entry resolves. |
 | Leave client sequence 1 unresolved while sequences 2 through 129 resolve, then submit sequence 130 | The client retains sequence 1, does not allocate sequence 130, and therefore cannot overflow the server's 128-entry sparse-result window. After sequence 1 resolves, the next allocated identity is exactly sequence 130. |
 | Pause owner A beyond its lease, let B acquire, then resume A | Every event, checkpoint, finalization, active-index mutation, and ACK from A is rejected. |

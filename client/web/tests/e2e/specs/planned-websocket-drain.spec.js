@@ -7,6 +7,7 @@ const REQUIRED_CAPABILITIES = [
   'command-delivery-v2',
   'command-outcomes-v1',
   'command-outcome-barrier-v1',
+  'terminal-command-cutoff-v1',
 ];
 
 const gameState = (tick = 5) => ({
@@ -724,6 +725,35 @@ test('a command with an ambiguous crash send is retried once with its stable ide
     .toHaveLength(1);
   expect(await page.evaluate(() => window.__terminalCommandOutcomes))
     .toEqual([firstSend.command_id]);
+});
+
+test('terminal cutoff rejects a command crossed by buffered completion', async ({ page }) => {
+  const socketIndex = await establishActiveGame(page);
+  await page.keyboard.press('ArrowUp');
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2'))
+    .toHaveLength(1);
+
+  const terminalSnapshot = snapshot(11, 6);
+  terminalSnapshot.GameEvent.event.Snapshot.game_state.status = {
+    Complete: { winning_snake_id: null },
+  };
+  await emitServerMessage(page, socketIndex, terminalSnapshot);
+  await emitServerMessage(page, socketIndex, {
+    CommandOutcomesComplete: {
+      game_id: 42,
+      terminal_rejection_reason: 'game completed',
+    },
+  });
+
+  await expect(page.getByText(
+    'Game completion did not reconcile every pending command. Your command outbox was retained safely.',
+  )).toHaveCount(0);
+  await page.waitForTimeout(1_500);
+  expect(await socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(1);
+
+  await page.keyboard.press('ArrowLeft');
+  await page.waitForTimeout(100);
+  expect(await socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(1);
 });
 
 test('an unacknowledged matchmaking admission replays only while restored state is waiting', async ({ page }) => {

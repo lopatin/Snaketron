@@ -49,13 +49,14 @@ const POPULATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 // backpressure here, but a fixed certification cohort must fail instead of
 // silently reducing its submitted workload.
 const MAX_PENDING_COMMANDS_PER_GAME_SESSION: usize = 128;
-const REQUIRED_SERVER_CAPABILITIES: [&str; 6] = [
+const REQUIRED_SERVER_CAPABILITIES: [&str; 7] = [
     "explicit-auth-v1",
     "planned-drain-v1",
     "socket-generation-v1",
     "command-delivery-v2",
     "command-outcomes-v1",
     "command-outcome-barrier-v1",
+    "terminal-command-cutoff-v1",
 ];
 
 fn validate_required_server_capabilities(capabilities: &BTreeSet<String>) -> Result<()> {
@@ -313,6 +314,7 @@ struct LiveSession {
     client_game_session_id: String,
     next_command_sequence: u64,
     pending_commands: BTreeMap<u64, PendingCommand>,
+    terminal_games_observed: BTreeSet<u32>,
     server_capabilities: BTreeSet<String>,
     activity_lease: SessionActivityLease,
 }
@@ -1745,6 +1747,7 @@ async fn prepare_session(
         client_game_session_id: format!("loadtest-{run_id}-{session_index}"),
         next_command_sequence: 1,
         pending_commands: BTreeMap::new(),
+        terminal_games_observed: BTreeSet::new(),
         server_capabilities: BTreeSet::new(),
         activity_lease,
     };
@@ -2734,7 +2737,10 @@ async fn play_session_inner(
                             _ => runtime.engine.process_server_event(&event)?,
                         }
                     }
-                    WSMessage::CommandOutcomesComplete { game_id: completed }
+                    WSMessage::CommandOutcomesComplete {
+                        game_id: completed,
+                        ..
+                    }
                         if completed == game_id =>
                     {
                         if terminal_state_observed {
@@ -3032,7 +3038,9 @@ async fn wait_for_command_outcome_barrier(
             }
         };
         match message {
-            WSMessage::CommandOutcomesComplete { game_id: completed } if completed == game_id => {
+            WSMessage::CommandOutcomesComplete {
+                game_id: completed, ..
+            } if completed == game_id => {
                 return Ok(());
             }
             WSMessage::GameEvent(event) if event.game_id == game_id => {
@@ -3360,7 +3368,9 @@ fn process_active_handoff_message(
                 _ => runtime.engine.process_server_event(&event)?,
             }
         }
-        WSMessage::CommandOutcomesComplete { game_id: completed } if completed == game_id => {
+        WSMessage::CommandOutcomesComplete {
+            game_id: completed, ..
+        } if completed == game_id => {
             return Ok(ActiveHandoffObservation::OutcomeBarrier);
         }
         WSMessage::GameLoadFailed {
@@ -3779,7 +3789,10 @@ async fn prepare_planned_candidate(
                             }
                         }
                     }
-                    WSMessage::CommandOutcomesComplete { game_id: completed }
+                    WSMessage::CommandOutcomesComplete {
+                        game_id: completed,
+                        ..
+                    }
                         if completed == game_id =>
                     {
                         outcomes_ready = true;
@@ -4674,6 +4687,36 @@ impl LiveSession {
             );
         }
     }
+
+    fn reconcile_terminal_barrier_rejections(
+        &mut self,
+        game_id: u32,
+        gateway_task_boot_id: Option<&str>,
+        socket_generation: Option<u64>,
+        observation: FrameObservation,
+    ) {
+        let unresolved = self.pending_commands.keys().copied().collect::<Vec<_>>();
+        for sequence in unresolved {
+            let effective_observation = self
+                .pending_commands
+                .get(&sequence)
+                .map(|pending| FrameObservation {
+                    received_at: observation.received_at.max(pending.sent_at),
+                    received_at_unix_ms: observation
+                        .received_at_unix_ms
+                        .max(pending.sent_at_unix_ms),
+                })
+                .unwrap_or(observation);
+            self.record_command_resolution(
+                game_id,
+                sequence,
+                CommandResolutionSource::TerminalBarrierRejectedOutcome,
+                gateway_task_boot_id,
+                socket_generation,
+                effective_observation,
+            );
+        }
+    }
 }
 
 impl LiveSession {
@@ -4822,6 +4865,44 @@ impl LiveSession {
                 .diagnostics
                 .entry("first_game_event_at_unix_ms".to_owned())
                 .or_insert_with(|| observation.received_at_unix_ms.to_string());
+        }
+        if let WSMessage::GameEvent(event) = message
+            && (matches!(
+                &event.event,
+                GameEvent::StatusUpdated {
+                    status: GameStatus::Complete { .. },
+                }
+            ) || matches!(
+                &event.event,
+                GameEvent::Snapshot { game_state }
+                    if matches!(game_state.status, GameStatus::Complete { .. })
+            ))
+        {
+            self.terminal_games_observed.insert(event.game_id);
+        }
+        if let WSMessage::CommandOutcomesComplete {
+            game_id,
+            terminal_rejection_reason: Some(reason),
+        } = message
+        {
+            if reason.trim().is_empty() {
+                return Err(anyhow!(
+                    "terminal command outcome barrier for game {game_id} has an empty rejection reason"
+                ));
+            }
+            if !self.terminal_games_observed.contains(game_id) {
+                return Err(anyhow!(
+                    "terminal command outcome barrier for game {game_id} preceded terminal state"
+                ));
+            }
+            if self.record.game_id == Some(*game_id) {
+                self.reconcile_terminal_barrier_rejections(
+                    *game_id,
+                    gateway_task_boot_id,
+                    socket_generation,
+                    observation,
+                );
+            }
         }
         if matches!(message, WSMessage::CommandOutcomesComplete { .. }) {
             self.record.metrics.command_outcome_barriers_received = self
@@ -6235,6 +6316,7 @@ mod tests {
             client_game_session_id: "test-session-1".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(1, activity_sender),
         };
@@ -6390,6 +6472,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_owned())
@@ -6424,6 +6507,24 @@ mod tests {
         command.sent_at = sent_at;
         command.sent_at_unix_ms = 123_456;
         session.pending_commands.insert(1, command);
+        let early_barrier_error = session
+            .observe_received(
+                &WSMessage::CommandOutcomesComplete {
+                    game_id: 42,
+                    terminal_rejection_reason: Some("game completed".to_owned()),
+                },
+                FrameObservation {
+                    received_at_unix_ms: 124_455,
+                    received_at: sent_at + Duration::from_millis(999),
+                },
+            )
+            .expect_err("a terminal default cannot precede terminal state");
+        assert!(
+            early_barrier_error
+                .to_string()
+                .contains("preceded terminal state")
+        );
+        assert!(session.pending_commands.contains_key(&1));
         let mut completed = duel_snapshot(&[7, 8]);
         completed.status = GameStatus::Complete {
             winning_snake_id: None,
@@ -6474,9 +6575,22 @@ mod tests {
                 },
             )
             .unwrap();
+        let mut crossed_completion = pending_command(2);
+        crossed_completion.sent_at = sent_at + Duration::from_millis(100);
+        crossed_completion.sent_at_unix_ms = 123_556;
+        session.pending_commands.insert(2, crossed_completion);
+        let mut sent_after_reader_receipt = pending_command(3);
+        sent_after_reader_receipt.sent_at = sent_at + Duration::from_millis(1_600);
+        sent_after_reader_receipt.sent_at_unix_ms = 125_056;
+        session
+            .pending_commands
+            .insert(3, sent_after_reader_receipt);
         session
             .observe_received(
-                &WSMessage::CommandOutcomesComplete { game_id: 42 },
+                &WSMessage::CommandOutcomesComplete {
+                    game_id: 42,
+                    terminal_rejection_reason: Some("game completed".to_owned()),
+                },
                 FrameObservation {
                     received_at_unix_ms: 124_957,
                     received_at: sent_at + Duration::from_millis(1_501),
@@ -6491,11 +6605,23 @@ mod tests {
                 .record
                 .metrics
                 .command_outcome_counts_by_sent_unix_second,
-            BTreeMap::from([(123, 1)])
+            BTreeMap::from([(123, 2), (125, 1)])
         );
         assert_eq!(
             session.record.metrics.slow_command_resolutions[0].source,
             CommandResolutionSource::RecoveryContiguousOutcome
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[1].source,
+            CommandResolutionSource::TerminalBarrierRejectedOutcome
+        );
+        assert_eq!(
+            session
+                .record
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second[&125],
+            0,
+            "a command created after reader receipt is terminal at its own send frontier"
         );
         assert_eq!(session.record.metrics.command_outcome_barriers_received, 1);
         session.socket.close().await.unwrap();
@@ -6684,6 +6810,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
@@ -6865,6 +6992,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
@@ -7297,6 +7425,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_owned())
@@ -7485,8 +7614,11 @@ mod tests {
             );
             candidate_socket
                 .send(Message::Text(
-                    serde_json::to_string(&WSMessage::CommandOutcomesComplete { game_id: 42 })
-                        .unwrap(),
+                    serde_json::to_string(&WSMessage::CommandOutcomesComplete {
+                        game_id: 42,
+                        terminal_rejection_reason: None,
+                    })
+                    .unwrap(),
                 ))
                 .await
                 .unwrap();
@@ -7634,8 +7766,11 @@ mod tests {
             }
             candidate_socket
                 .send(Message::Text(
-                    serde_json::to_string(&WSMessage::CommandOutcomesComplete { game_id: 42 })
-                        .unwrap(),
+                    serde_json::to_string(&WSMessage::CommandOutcomesComplete {
+                        game_id: 42,
+                        terminal_rejection_reason: None,
+                    })
+                    .unwrap(),
                 ))
                 .await
                 .unwrap();
@@ -7802,6 +7937,7 @@ mod tests {
                         .unwrap(),
                 },
             )]),
+            terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_owned())

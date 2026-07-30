@@ -20,6 +20,7 @@ pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "command-delivery-v2",
     "command-outcomes-v1",
     "command-outcome-barrier-v1",
+    "terminal-command-cutoff-v1",
 ];
 
 /// A planned task-removal notification. The absolute deadline avoids clients
@@ -358,6 +359,12 @@ mod tests {
                 .protocol_capabilities()
                 .iter()
                 .any(|value| value == "command-outcome-barrier-v1")
+        );
+        assert!(
+            lifecycle
+                .protocol_capabilities()
+                .iter()
+                .any(|value| value == "terminal-command-cutoff-v1")
         );
     }
 }

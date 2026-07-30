@@ -226,6 +226,7 @@ pub enum CommandResolutionSource {
     RecoveryScheduledOutcome,
     RecoveryRejectedOutcome,
     RecoveryContiguousOutcome,
+    TerminalBarrierRejectedOutcome,
 }
 
 /// Bounded provenance retained only for commands that violate the fixed

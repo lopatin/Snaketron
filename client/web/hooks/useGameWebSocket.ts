@@ -420,7 +420,13 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
         const terminalCompletion = user
-          ? completeGameCommandOutboxTerminal(gameId, user.id)
+          ? completeGameCommandOutboxTerminal(
+              gameId,
+              user.id,
+              typeof payload?.terminal_rejection_reason === 'string'
+                ? payload.terminal_rejection_reason
+                : undefined,
+            )
           : 'not-terminal';
         if (terminalCompletion === 'pending') {
           completedOutcomeBarriersRef.current.delete(gameId);

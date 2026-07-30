@@ -1139,6 +1139,13 @@ same durable request every two seconds. Timed-out actor waiters are pruned, so a
 terminal-materialization outage can keep a new gateway honestly unready without
 accumulating permanent workers or weakening existing gateways.
 
+Ordinary cold joins do not repeat that partition-wide fan-out. Their request
+names one game, is published at most once per 500 milliseconds while the
+gateway polls its replica every 100 milliseconds, and is delivered to the actor
+with a nonblocking mailbox send. A full or temporarily absent actor is retried;
+it cannot hold the partition command reader or amplify one join across every
+game. Partition startup and detected stream-gap repair remain partition-scoped.
+
 The durable `GameCreated` scanner groups each validated scan page by partition
 and uses nonblocking sends to ten delivery workers, one per fixed partition.
 Each lane holds one active and at most one queued batch. Its worker preserves
@@ -1251,7 +1258,7 @@ produce more than one intermediate version. A fresh ten-task
 membership/ECS-health pair is captured immediately before scale-in. These
 snapshots complement continuous unowned-duration and fencing metrics. It also
 records the automatic, reset, forced scale-out, and forced scale-in windows;
-report schema 10 includes each session's launch
+report schema 11 includes each session's launch
 wave, start time, and bounded initial admission-ready duration so the admission
 assertion is phase-specific.
 
@@ -1289,7 +1296,7 @@ cooldown/evaluation cycles and final ECS convergence. The zero-load waiter
 keeps both SSM Valkey tunnels active with a once-per-minute read-only cluster
 control probe; inability to read the control path fails certification.
 
-Report schema 10 records coordinator-observed, server-confirmed peak
+Report schema 11 records coordinator-observed, server-confirmed peak
 authentication concurrency, fully joined active-game concurrency, lifecycle
 timestamps, exact initial task boot identity, planned-handoff evidence, and a
 per-second aggregate of logical command submissions, receipt-time scheduled
@@ -1310,6 +1317,16 @@ physical resend. A sparse-window rejection fence is protective behavior for an
 invalid or pathological command session, not healthy load-test throughput; any
 such fence in Gate A, B, or C fails that certification session immediately
 before covered commands can be counted as successful outcomes.
+After an authoritative terminal snapshot, a
+`CommandOutcomesComplete.terminal_rejection_reason` from a current terminal
+recovery envelope rejects any same-game identities that remain pending after
+exact outcomes. The report records these as
+`TerminalBarrierRejectedOutcome`; their latency ends at the later of the
+barrier's dedicated-reader receipt and the original command send. A reasonless
+barrier—used when recovery state is absent, expired, malformed, or
+nonterminal—never clears pending identities and therefore fails closed. Treat
+any terminal default observed before the terminal snapshot as a protocol
+failure.
 While a session is already playing, `GameWarming` pauses its command generator
 and schedules same-socket `JoinGame` retries from the server hint. Only a fresh
 snapshot plus `CommandOutcomesComplete` resumes commands and triggers stable-ID

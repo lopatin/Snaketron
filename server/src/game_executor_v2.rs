@@ -1770,6 +1770,11 @@ async fn run_game_executor_v2(
                                 if request.partition_id != partition {
                                     return Err(anyhow::anyhow!("snapshot request was routed to the wrong partition"));
                                 }
+                                if request.completion_id.is_some() && request.game_id.is_some() {
+                                    return Err(anyhow::anyhow!(
+                                        "snapshot readiness barrier cannot target one game"
+                                    ));
+                                }
                                 if let Some(completion_id) = request.completion_id {
                                     let targets = snapshot_actor_targets(&actors);
                                     let barrier_bus = bus.clone();
@@ -1810,6 +1815,17 @@ async fn run_game_executor_v2(
                                             );
                                         }
                                     });
+                                } else if let Some(game_id) = request.game_id {
+                                    if game_id % PARTITION_COUNT != partition {
+                                        return Err(anyhow::anyhow!(
+                                            "targeted snapshot request was routed to the wrong partition"
+                                        ));
+                                    }
+                                    tokio::select! {
+                                        biased;
+                                        _ = handoff_cancel.cancelled() => {}
+                                        result = publish_game_snapshot(&actors, game_id) => result?,
+                                    }
                                 } else {
                                     tokio::select! {
                                         biased;
@@ -2532,6 +2548,34 @@ async fn await_actor_replies(
 
 async fn publish_snapshots(actors: &HashMap<u32, GameActorSlot>) -> Result<()> {
     publish_snapshots_with_timeout(actors, SNAPSHOT_FANOUT_TIMEOUT).await
+}
+
+async fn publish_game_snapshot(actors: &HashMap<u32, GameActorSlot>, game_id: u32) -> Result<()> {
+    let Some(slot) = actors.get(&game_id) else {
+        // The request may win the race with GameCreated or arrive in an
+        // ownership gap. Cold joins retry until the bounded warm-up deadline.
+        return Ok(());
+    };
+    if slot._task.is_finished() {
+        if slot.has_terminal_completion() {
+            return Ok(());
+        }
+        bail!("game actor stopped before targeted snapshot request");
+    }
+    let (reply, _receive) = oneshot::channel();
+    match slot.sender.try_send(GameActorMessage::Snapshot { reply }) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // This is a best-effort cold-join hint, never a partition
+            // readiness barrier. Do not let one busy actor stall command
+            // dispatch for every unrelated game; the gateway retries.
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) if slot.has_terminal_completion() => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            bail!("game actor stopped before targeted snapshot request")
+        }
+    }
 }
 
 async fn publish_snapshots_with_timeout(
@@ -3919,6 +3963,83 @@ mod tests {
         publish_snapshots(&actors).await?;
 
         actors.remove(&17).expect("test actor exists")._task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn targeted_snapshot_reaches_only_the_requested_game_actor() -> Result<()> {
+        fn counting_slot(counter: Arc<std::sync::atomic::AtomicUsize>) -> GameActorSlot {
+            let (sender, mut receiver) = mpsc::channel(1);
+            let terminally_completed = Arc::new(AtomicBool::new(false));
+            let task = tokio::spawn(async move {
+                if let Some(GameActorMessage::Snapshot { reply }) = receiver.recv().await {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(Ok(()));
+                }
+                std::future::pending::<()>().await;
+            });
+            GameActorSlot {
+                sender,
+                terminally_completed,
+                _task: task,
+            }
+        }
+
+        let requested_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unrelated_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut actors = HashMap::from([
+            (17, counting_slot(requested_count.clone())),
+            (27, counting_slot(unrelated_count.clone())),
+        ]);
+
+        publish_game_snapshot(&actors, 17).await?;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requested_count.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("requested actor did not receive its targeted snapshot hint")?;
+        assert_eq!(requested_count.load(Ordering::Relaxed), 1);
+        assert_eq!(unrelated_count.load(Ordering::Relaxed), 0);
+        for (_, slot) in actors.drain() {
+            abort_test_slot(slot).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn targeted_snapshot_hint_never_waits_for_a_full_actor_mailbox() -> Result<()> {
+        let (sender, receiver) = mpsc::channel(1);
+        let (occupied_reply, _occupied_receive) = oneshot::channel();
+        sender
+            .try_send(GameActorMessage::Snapshot {
+                reply: occupied_reply,
+            })
+            .expect("test mailbox should accept its occupying message");
+        let task = tokio::spawn(async move {
+            let _receiver = receiver;
+            std::future::pending::<()>().await;
+        });
+        let mut actors = HashMap::from([(
+            17,
+            GameActorSlot {
+                sender,
+                terminally_completed: Arc::new(AtomicBool::new(false)),
+                _task: task,
+            },
+        )]);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            publish_game_snapshot(&actors, 17),
+        )
+        .await
+        .context("targeted snapshot hint blocked on a full actor mailbox")??;
+        publish_game_snapshot(&HashMap::new(), 17).await?;
+
+        abort_test_slot(actors.remove(&17).expect("test actor exists")).await;
         Ok(())
     }
 

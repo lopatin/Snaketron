@@ -9,6 +9,7 @@ export const REQUIRED_SERVER_CAPABILITIES = [
   'command-delivery-v2',
   'command-outcomes-v1',
   'command-outcome-barrier-v1',
+  'terminal-command-cutoff-v1',
 ] as const;
 
 export type ReplacementFailureAction = 'retry-candidate' | 'reconnect-active' | 'none';

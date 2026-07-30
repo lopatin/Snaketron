@@ -701,6 +701,14 @@ impl ReplicationManager {
         Ok(true)
     }
 
+    /// Ask the executor to refresh one game for a cold JoinGame. Actor-side
+    /// checkpoint coalescing absorbs duplicate requests from the two players;
+    /// unlike a partition request, this cannot republish every unrelated game
+    /// and multiply recovery payloads across all connected sockets.
+    pub async fn request_game_snapshot(&self, game_id: u32) -> Result<()> {
+        self.bus.request_game_snapshot(game_id).await
+    }
+
     /// Load the most recently published game snapshot from Redis.
     ///
     /// Durably completed games are deliberately evicted from the in-memory replication cache,
@@ -1121,6 +1129,10 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             };
+            assert_eq!(
+                request.game_id, None,
+                "partition readiness must request every active game"
+            );
             let completion_id = request
                 .completion_id
                 .expect("readiness request includes a completion ID");

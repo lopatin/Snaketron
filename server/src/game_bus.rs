@@ -58,6 +58,10 @@ use tracing::{debug, error, info, warn};
 pub struct SnapshotRequest {
     pub partition_id: u32,
     pub requester_id: Option<u64>, // Optional server ID of requester
+    /// A cold JoinGame needs only this actor. Partition readiness and
+    /// replica-gap recovery leave it absent because they require every game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<u32>,
     /// Present only when gateway readiness must wait until every requested
     /// snapshot has actually traversed the partition event stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +363,59 @@ impl GameBus {
         .map(|_| ())
     }
 
+    /// Publishes a client game command only while the game has no immutable
+    /// completion record. The completion key and command stream share the
+    /// partition hash slot, so completion and ingress are ordered by one
+    /// atomic Valkey transaction even when different ECS tasks host the
+    /// WebSocket and executor.
+    pub async fn publish_game_command_unless_completed(
+        &self,
+        namespace: &ClusterNamespace,
+        partition_id: u32,
+        game_id: u32,
+        command: &StreamEvent,
+    ) -> Result<bool> {
+        if game_id % PARTITION_COUNT != partition_id {
+            anyhow::bail!("game command does not belong to its target partition");
+        }
+        let StreamEvent::GameCommandSubmittedV2 {
+            game_id: payload_game_id,
+            user_id,
+            command_id,
+            ..
+        } = command
+        else {
+            anyhow::bail!("completed-game command gate accepts only v2 game commands");
+        };
+        if *payload_game_id != game_id
+            || command_id.game_id != game_id
+            || command_id.user_id != *user_id
+        {
+            anyhow::bail!("completed-game command gate identity mismatch");
+        }
+        let payload = serde_json::to_vec(command).context("Failed to serialize game command")?;
+        let mut redis = self.partition_connection(partition_id)?;
+        let script = redis::Script::new(
+            r#"
+            if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+            redis.call('XADD', KEYS[2], '*', 'data', ARGV[1])
+            return 1
+            "#,
+        );
+        let result: i32 = script
+            .key(namespace.completion(game_id))
+            .key(RedisKeys::stream_commands(partition_id))
+            .arg(payload)
+            .invoke_async(&mut redis)
+            .await
+            .context("Failed to atomically gate completed game command publication")?;
+        match result {
+            1 => Ok(true),
+            0 => Ok(false),
+            other => anyhow::bail!("unknown completed game command publication result {other}"),
+        }
+    }
+
     /// Cross-slot destination half of matchmaking's durable outbox. The
     /// marker and command stream share the partition slot, so a retry after an
     /// ambiguous response returns the original stream ID without a second
@@ -410,6 +467,18 @@ impl GameBus {
         let request = SnapshotRequest {
             partition_id,
             requester_id: None,
+            game_id: None,
+            completion_id: None,
+        };
+        self.publish_snapshot_request(partition_id, &request).await
+    }
+
+    pub async fn request_game_snapshot(&self, game_id: u32) -> Result<()> {
+        let partition_id = game_id % PARTITION_COUNT;
+        let request = SnapshotRequest {
+            partition_id,
+            requester_id: None,
+            game_id: Some(game_id),
             completion_id: None,
         };
         self.publish_snapshot_request(partition_id, &request).await
@@ -424,6 +493,7 @@ impl GameBus {
         let request = SnapshotRequest {
             partition_id,
             requester_id: None,
+            game_id: None,
             completion_id: Some(completion_id.to_owned()),
         };
         self.publish_snapshot_request(partition_id, &request).await
@@ -2731,6 +2801,7 @@ mod tests {
     use crate::partition_lease::PartitionLeaseStore;
     use crate::redis_utils::{RedisClient, create_connection_manager};
     use anyhow::Context;
+    use common::{ClientCommandIdentityV2, CommandId, Direction, GameCommand, GameCommandMessage};
     use redis::AsyncCommands;
 
     #[test]
@@ -2751,6 +2822,112 @@ mod tests {
         assert!(!stream_cursor_fell_behind("10-0", Some("10-0")));
         assert!(stream_cursor_fell_behind("10-0", Some("11-0")));
         assert!(stream_cursor_fell_behind("10-0", None));
+    }
+
+    #[test]
+    fn partition_snapshot_request_decodes_without_a_game_target() {
+        let partition_scoped: SnapshotRequest = serde_json::from_value(serde_json::json!({
+            "partition_id": 2,
+            "requester_id": null,
+            "completion_id": null
+        }))
+        .unwrap();
+        assert_eq!(partition_scoped.game_id, None);
+
+        let targeted = SnapshotRequest {
+            partition_id: 2,
+            requester_id: None,
+            game_id: Some(42),
+            completion_id: None,
+        };
+        let value = serde_json::to_value(targeted).unwrap();
+        assert_eq!(value["game_id"], 42);
+    }
+
+    #[tokio::test]
+    async fn completed_game_gate_is_atomic_with_command_publication() -> Result<()> {
+        let url = "redis://127.0.0.1:6379/14?protocol=resp3";
+        let client = redis::Client::open(url)?;
+        let (push_tx, _push_rx) = tokio::sync::broadcast::channel(8);
+        let connection = create_connection_manager(client.clone(), push_tx).await?;
+        let bus = GameBus::new(
+            connection.clone(),
+            (0..PARTITION_COUNT)
+                .map(|_| connection.clone().into())
+                .collect(),
+            (0..PARTITION_COUNT)
+                .map(|_| connection.clone().into())
+                .collect(),
+            connection.clone(),
+            connection.clone(),
+            client.clone(),
+            CancellationToken::new(),
+        )?;
+        let game_id = 1_234_567;
+        let partition = game_id % PARTITION_COUNT;
+        let namespace = ClusterNamespace::new("completion-command-gate-test")?;
+        let completion_key = namespace.completion(game_id);
+        let command_stream = RedisKeys::stream_commands(partition);
+        let mut inspector = client.get_multiplexed_async_connection().await?;
+        let _: () = inspector.del(&[&completion_key, &command_stream]).await?;
+        let command_id = ClientCommandIdentityV2 {
+            game_id,
+            user_id: 7,
+            client_game_session_id: "completion-gate".to_owned(),
+            sequence: 1,
+        };
+        let command = StreamEvent::GameCommandSubmittedV2 {
+            game_id,
+            user_id: 7,
+            command_id: command_id.clone(),
+            command: GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 1,
+                    user_id: 7,
+                    sequence_number: 1,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: 1,
+                    direction: Direction::Up,
+                },
+            },
+        };
+
+        assert!(
+            bus.publish_game_command_unless_completed(&namespace, partition, game_id, &command,)
+                .await?
+        );
+        assert_eq!(inspector.xlen::<_, usize>(&command_stream).await?, 1);
+
+        let mismatched = StreamEvent::GameCommandSubmittedV2 {
+            game_id: game_id + PARTITION_COUNT,
+            user_id: 7,
+            command_id: ClientCommandIdentityV2 {
+                game_id: game_id + PARTITION_COUNT,
+                ..command_id
+            },
+            command: match command.clone() {
+                StreamEvent::GameCommandSubmittedV2 { command, .. } => command,
+                _ => unreachable!(),
+            },
+        };
+        assert!(
+            bus.publish_game_command_unless_completed(&namespace, partition, game_id, &mismatched,)
+                .await
+                .is_err()
+        );
+        assert_eq!(inspector.xlen::<_, usize>(&command_stream).await?, 1);
+
+        let _: () = inspector.set(&completion_key, "complete").await?;
+        assert!(
+            !bus.publish_game_command_unless_completed(&namespace, partition, game_id, &command,)
+                .await?
+        );
+        assert_eq!(inspector.xlen::<_, usize>(&command_stream).await?, 1);
+
+        let _: () = inspector.del(&[&completion_key, &command_stream]).await?;
+        Ok(())
     }
 
     #[tokio::test]
