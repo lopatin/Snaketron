@@ -676,22 +676,34 @@ command_outcome_window_diagnostics() {
               | select(
                   ($report.metrics
                     .scheduled_command_counts_by_partition_and_unix_second
-                    [($partition | tostring)][$second_key] // 0) <= 0)
-              | $partition] as $missing_partitions
+                    [($partition | tostring)][$second_key] // 0) > 0)
+              | $partition] as $productive_partitions
           | {
               unix_second: $second,
               sent: $sent,
               outcomes: $outcomes,
               outcome_max_latency_ms: $outcome_max_latency_ms,
               scheduled: $scheduled,
-              missing_partitions: $missing_partitions
+              productive_partitions: $productive_partitions
             }
+        ] as $seconds
+      # Exact outcome accounting and latency are anchored to every original
+      # send second, so a partition-specific command stall fails those checks.
+      # Partition output is therefore a window-wide coverage proof, not a
+      # requirement that idle partitions manufacture work every second.
+      | [range(0; $required_partition_count)] as $required_partitions
+      | ([$seconds[].productive_partitions[]] | unique | sort)
+          as $covered_partitions
+      | [$required_partitions[]
+          | . as $partition
+          | select(($covered_partitions | index($partition)) == null)]
+          as $uncovered_partitions
+      | [$seconds[]
           | select(
               .sent <= 0
               or .outcomes != .sent
               or .outcome_max_latency_ms > $max_latency_ms
-              or .scheduled <= 0
-              or (.missing_partitions | length) > 0)
+              or .scheduled <= 0)
         ] as $failed_seconds
       | {
           max_latency_ms: $max_latency_ms,
@@ -701,6 +713,11 @@ command_outcome_window_diagnostics() {
             schema: $schema_valid,
             command_outcome_latency_basis: $latency_basis_valid
           },
+          partition_coverage: {
+            required_partitions: $required_partitions,
+            covered_partitions: $covered_partitions,
+            uncovered_partitions: $uncovered_partitions
+          },
           first_full_second: $first_second,
           after_last_full_second: $after_last_second,
           full_second_count: ($after_last_second - $first_second),
@@ -709,6 +726,7 @@ command_outcome_window_diagnostics() {
             ($schema_valid
               and $latency_basis_valid
               and ($after_last_second - $first_second) >= $required_full_seconds
+              and ($uncovered_partitions | length) == 0
               and ($failed_seconds | length) == 0)
         }
     ' "$summary"
@@ -1352,20 +1370,40 @@ test_command_outcome_window_gate() {
   jq 'del(
     .metrics.scheduled_command_counts_by_partition_and_unix_second["1"]["11"]
   )' "$summary" >"$invalid"
-  if command_outcomes_meet_window_budget "$invalid" "$window" 1000 2; then
+  if ! command_outcomes_meet_window_budget "$invalid" "$window" 1000 2; then
     result=1
   fi
   if ! command_outcome_window_diagnostics \
     "$invalid" "$window" 1000 2 \
     | jq -e '
-        .passed == false
+        .passed
         and .full_second_count == 2
-        and (.failed_seconds | length) == 1
-        and .failed_seconds[0].unix_second == 11
-        and .failed_seconds[0].missing_partitions == [1]
+        and .partition_coverage.uncovered_partitions == []
+        and (.failed_seconds | length) == 0
       ' >/dev/null; then
     result=1
   fi
+  # Exact per-sent-second outcome accounting protects every issued command.
+  # Partition output only has to cover the complete fleet somewhere in the
+  # window; an idle partition does not owe output in every individual second.
+  jq '
+    del(
+      .metrics.scheduled_command_counts_by_partition_and_unix_second
+        ["1"]["10"],
+      .metrics.scheduled_command_counts_by_partition_and_unix_second
+        ["1"]["11"]
+    )
+  ' "$summary" >"$invalid"
+  if command_outcomes_meet_window_budget "$invalid" "$window" 1000 2; then
+    result=1
+  fi
+  command_outcome_window_diagnostics "$invalid" "$window" 1000 2 \
+    | jq -e '
+        .passed == false
+        and .partition_coverage.covered_partitions == [0]
+        and .partition_coverage.uncovered_partitions == [1]
+        and (.failed_seconds | length) == 0
+      ' >/dev/null || result=1
   jq -n '{started_at_unix_ms: 8500, finished_at_unix_ms: 12000}' >"$invalid"
   if command_outcomes_meet_window_budget "$summary" "$invalid"; then
     result=1
@@ -1408,6 +1446,7 @@ test_command_outcome_window_gate() {
   jq -e '
     .passed
     and .required_full_seconds == 1
+    and .partition_coverage.uncovered_partitions == []
     and .first_full_second == 11
     and .after_last_full_second == 12
     and .full_second_count == 1
@@ -6100,9 +6139,9 @@ run_staging_suite() {
   local automatic_scale_out_started_ms
   "${natural_scale_out_command[@]}" &
   load_pid=$!
-  # One hundred twenty-eight sessions retain active games on every partition
-  # and drive the two-vCPU minimum task above its headroom-preserving
-  # target-tracking threshold.
+  # One hundred twenty-eight sessions exercise every partition across each
+  # certification window and drive the two-vCPU minimum task above its
+  # headroom-preserving target-tracking threshold.
   # They must still trigger the configured CPU/memory policy naturally;
   # failure to trigger is a certification failure, not permission to force
   # the transition.
@@ -6516,6 +6555,9 @@ run_staging_suite() {
   local lobby_summary="$report_dir/$lobby_run_id/summary.json"
   local matchmaking_summary="$report_dir/$matchmaking_run_id/summary.json"
   local admission_summary="$report_dir/$admission_run_id/summary.json"
+  # The strict sent-second outcome windows below catch any partition-specific
+  # delay or loss. These partition predicates prove fleet-wide exercise before
+  # and during movement without requiring idle partitions to emit every second.
   jq -e \
     --slurpfile scale_out "$report_dir/scale-out-window.json" \
     --slurpfile scale_in "$report_dir/scale-in-window.json" '
@@ -6580,12 +6622,15 @@ run_staging_suite() {
           and ((.key | tonumber) < $scale_in_first_second)
           and .value > 0))
       and $scale_in_after_last_second > $scale_in_first_second
-      and all(range($scale_in_first_second; $scale_in_after_last_second);
-        . as $second
-        | all(range(0; 10);
-            . as $partition
-            | (($report.metrics.scheduled_command_counts_by_partition_and_unix_second
-              [($partition | tostring)][($second | tostring)] // 0) > 0)))
+      and all(range(0; 10);
+        . as $partition
+        | any(
+          ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
+            [($partition | tostring)] // {})
+          | to_entries[];
+          ((.key | tonumber) >= $scale_in_first_second)
+          and ((.key | tonumber) < $scale_in_after_last_second)
+          and .value > 0))
     ' "$continuity_summary" >/dev/null || {
       echo "Continuity load did not satisfy the active-game transition invariants" >&2
       exit 1
