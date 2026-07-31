@@ -39,6 +39,7 @@ hard_crash_envelope_jq='
   def hard_crash_required_online_samples:
     hard_crash_required_report_seconds + 1;
   def hard_crash_max_online_sample_gap_ms: 10000;
+  def hard_crash_max_reconnect_attempts_per_affected_session: 2;
   def longest_qualifying_streak($samples):
     reduce $samples[] as $sample (
       {
@@ -104,6 +105,26 @@ hard_crash_envelope_jq='
         | .qualifying = hard_crash_report_second_qualifies];
   def nonnegative_integer:
     type == "number" and . >= 0 and . == floor;
+  def hard_crash_reconnect_accounting_passes(
+    $affected_sessions;
+    $completed_recoveries;
+    $disconnects;
+    $reconnect_attempts
+  ):
+    ($affected_sessions | nonnegative_integer)
+    and $affected_sessions > 0
+    and ($completed_recoveries | nonnegative_integer)
+    and $completed_recoveries == $affected_sessions
+    # Each completed affected session accounts for exactly the socket lost
+    # with the crashed task. A connect attempt can fail before it creates
+    # another socket, so attempts need not equal disconnects.
+    and ($disconnects | nonnegative_integer)
+    and $disconnects == $affected_sessions
+    and ($reconnect_attempts | nonnegative_integer)
+    and $reconnect_attempts >= $affected_sessions
+    and $reconnect_attempts
+      <= ($affected_sessions
+        * hard_crash_max_reconnect_attempts_per_affected_session);
   def bounded_sample_cadence($samples):
     all(
       range(1; ($samples | length));
@@ -1829,6 +1850,35 @@ test_hard_crash_envelope_contract() {
   }
 }
 
+test_hard_crash_reconnect_accounting_contract() {
+  jq -en "$hard_crash_envelope_jq"'
+    def passes($affected; $recoveries; $disconnects; $attempts):
+      hard_crash_reconnect_accounting_passes(
+        $affected;
+        $recoveries;
+        $disconnects;
+        $attempts
+      );
+    [
+      passes(26; 26; 26; 26),
+      # One failed connect followed by a completed recovery is still one
+      # crashed socket and two bounded attempts for that affected session.
+      passes(26; 26; 26; 27),
+      (passes(26; 26; 27; 27) | not),
+      (passes(26; 26; 26; 53) | not),
+      (passes(26; 25; 26; 27) | not),
+      (passes(26; 26; 26; 25) | not),
+      (passes(0; 0; 0; 0) | not),
+      passes(1; 1; 1; 2),
+      (passes(1; 1; 1; 3) | not)
+    ]
+    | all
+  ' >/dev/null || {
+    echo "Hard-crash reconnect accounting accepted unrelated disconnects or excessive attempts" >&2
+    return 1
+  }
+}
+
 test_hard_crash_evidence_selectors() {
   local result=0
   local fixture_dir
@@ -2488,6 +2538,7 @@ test_evidence_safety_helpers() {
   test_staging_entry_state_contract
   test_capacity_continuous_window_contract
   test_hard_crash_envelope_contract
+  test_hard_crash_reconnect_accounting_contract
   test_hard_crash_evidence_selectors
   test_unexpected_crash_stop_selector
   test_observer_pid_supervision_contract
@@ -5086,16 +5137,12 @@ assert_hard_crash_report() {
               $m.ecs_exec_invoked_at_unix_ms
             ),
             affected_reconnects: (
-              ($affected | length) > 0
-              and ($all_recoveries | length) == ($affected | length)
-              # Traffic counters count connection attempts, including a
-              # retryable reconnect whose first replacement socket does not
-              # reach a fresh snapshot. Hard recoveries count completed
-              # game-ready outcomes, so require every attempt to be balanced
-              # without incorrectly requiring the populations to be equal.
-              and $r.metrics.traffic.disconnects >= ($affected | length)
-              and $r.metrics.traffic.reconnects
-                == $r.metrics.traffic.disconnects),
+              hard_crash_reconnect_accounting_passes(
+                ($affected | length);
+                ($all_recoveries | length);
+                $r.metrics.traffic.disconnects;
+                $r.metrics.traffic.reconnects
+              )),
             pending_backlog: (
               $m.pending_after_kill.partition == $partition
               and $m.pending_after_kill.killed_lease_token
