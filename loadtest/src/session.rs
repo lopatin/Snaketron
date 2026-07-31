@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, interval_at};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, Request, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -38,12 +39,12 @@ type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SocketSink = SplitSink<RawSocket, Message>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+const READER_WAKE_SENTINEL_INTERVAL: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MAX_RECONNECTS: u32 = 2;
 const RECENT_EVENT_LIMIT: usize = 32;
 const GAME_TIMEOUT_MARGIN: Duration = Duration::from_secs(45);
 const PLANNED_HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
-const ADMISSION_RETRY_DELAY: Duration = Duration::from_secs(1);
 const ADMISSION_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const POPULATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 // Shared with the executor's bounded exact-outcome window. Browser clients
@@ -198,14 +199,18 @@ struct FrameObservation {
     received_at_unix_ms: u64,
     received_at: Instant,
     reader_receipt_to_driver_lag_ms: u64,
+    reader_task_latest_wake_lag_ms: u64,
+    reader_task_max_wake_lag_ms: u64,
 }
 
 impl FrameObservation {
-    fn now() -> Self {
+    fn now(reader_task_latest_wake_lag_ms: u64, reader_task_max_wake_lag_ms: u64) -> Self {
         Self {
             received_at_unix_ms: unix_time_ms(),
             received_at: Instant::now(),
             reader_receipt_to_driver_lag_ms: 0,
+            reader_task_latest_wake_lag_ms,
+            reader_task_max_wake_lag_ms,
         }
     }
 }
@@ -229,20 +234,51 @@ struct Socket {
 
 impl Socket {
     fn new(raw: RawSocket) -> Self {
+        Self::new_with_reader_wake_sentinel_interval(raw, READER_WAKE_SENTINEL_INTERVAL)
+    }
+
+    fn new_with_reader_wake_sentinel_interval(
+        raw: RawSocket,
+        reader_wake_sentinel_interval: Duration,
+    ) -> Self {
         let (sink, mut stream) = raw.split();
         let (sender, inbound) = mpsc::unbounded_channel();
         let reader = tokio::spawn(async move {
-            while let Some(frame) = stream.next().await {
-                let observed = ObservedFrame {
-                    observation: FrameObservation::now(),
-                    frame,
-                };
-                if sender.send(observed).is_err() {
-                    break;
+            let mut wake_sentinel = interval(reader_wake_sentinel_interval);
+            wake_sentinel.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut latest_wake_lag_ms = 0;
+            let mut max_wake_lag_ms = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    scheduled_at = wake_sentinel.tick() => {
+                        latest_wake_lag_ms = tokio::time::Instant::now()
+                            .saturating_duration_since(scheduled_at)
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        max_wake_lag_ms = max_wake_lag_ms.max(latest_wake_lag_ms);
+                    }
+                    frame = stream.next() => {
+                        let Some(frame) = frame else {
+                            break;
+                        };
+                        let observed = ObservedFrame {
+                            observation: FrameObservation::now(
+                                latest_wake_lag_ms,
+                                max_wake_lag_ms,
+                            ),
+                            frame,
+                        };
+                        if sender.send(observed).is_err() {
+                            break;
+                        }
+                        // Poll again immediately. Tungstenite queues automatic
+                        // Ping and Close replies while reading and flushes them
+                        // on the next read, so control-frame progress does not
+                        // wait for the game driver.
+                    }
                 }
-                // Poll again immediately. Tungstenite queues automatic Ping and
-                // Close replies while reading and flushes them on the next read,
-                // so control-frame progress does not wait for the game driver.
             }
         });
         Self {
@@ -299,6 +335,32 @@ impl std::fmt::Display for WebSocketConnectTimeout {
 
 impl std::error::Error for WebSocketConnectTimeout {}
 
+#[derive(Debug)]
+struct WebSocketTransportEnded {
+    detail: String,
+}
+
+impl std::fmt::Display for WebSocketTransportEnded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "websocket transport ended: {}", self.detail)
+    }
+}
+
+impl std::error::Error for WebSocketTransportEnded {}
+
+#[derive(Debug)]
+struct WebSocketAdmissionRetry {
+    detail: String,
+}
+
+impl std::fmt::Display for WebSocketAdmissionRetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "WebSocket admission must retry: {}", self.detail)
+    }
+}
+
+impl std::error::Error for WebSocketAdmissionRetry {}
+
 const SLOW_COMMAND_RESOLUTION_THRESHOLD_MS: u64 = 1_000;
 const MAX_SESSION_SLOW_COMMAND_RESOLUTIONS: usize = 32;
 const SLOW_APPLICATION_PING_THRESHOLD_MS: u64 = 1_000;
@@ -310,6 +372,31 @@ const fn reconnect_delay_for_attempt(attempt: u32) -> Duration {
         Duration::ZERO
     } else {
         RECONNECT_DELAY
+    }
+}
+
+fn initial_admission_retry_delay(completed_attempts: u32) -> Option<Duration> {
+    let retry_attempt = completed_attempts.checked_sub(1)?;
+    (retry_attempt < MAX_RECONNECTS).then(|| reconnect_delay_for_attempt(retry_attempt))
+}
+
+async fn wait_for_initial_admission_retry(
+    completed_attempts: u32,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    let Some(delay) = initial_admission_retry_delay(completed_attempts) else {
+        return Ok(false);
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() || (!delay.is_zero() && delay >= remaining) {
+        return Ok(false);
+    }
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(anyhow!("operation cancelled")),
+        _ = tokio::time::sleep(delay) => Ok(
+            tokio::time::Instant::now() < deadline
+        ),
     }
 }
 
@@ -1585,6 +1672,114 @@ async fn perform_pre_game_planned_handoff(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn connect_initial_admission_socket(
+    websocket_url: &Url,
+    origin: &str,
+    backend_hints: &BackendHintRegistry,
+    sticky_cookie: Option<&str>,
+    admission_attempts: &mut u32,
+    admission_deadline: tokio::time::Instant,
+    record: &mut SessionRecord,
+    cancellation: &CancellationToken,
+) -> Result<(Socket, Option<String>, Option<String>)> {
+    loop {
+        let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "WebSocket admission exhausted its bounded connection-to-pong budget"
+            ));
+        }
+        *admission_attempts = admission_attempts.saturating_add(1);
+        record.diagnostics.insert(
+            "initial_admission_attempts".to_owned(),
+            admission_attempts.to_string(),
+        );
+        let attempt_timeout = remaining.min(ADMISSION_CONNECT_ATTEMPT_TIMEOUT);
+        let connect_result = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(anyhow!("operation cancelled during WebSocket admission"));
+            }
+            result = connect_socket(
+                websocket_url,
+                origin,
+                attempt_timeout,
+                backend_hints,
+                sticky_cookie,
+            ) => result,
+        };
+        match connect_result {
+            Ok(connection) => return Ok(connection),
+            Err(error) if is_retryable_websocket_admission(&error) => {
+                record.record_lifecycle(
+                    SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
+                        .with_message(
+                            "transient WebSocket admission failure; retrying the same guest token",
+                        ),
+                );
+                match wait_for_initial_admission_retry(
+                    *admission_attempts,
+                    admission_deadline,
+                    cancellation,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(error.context(
+                            "transient WebSocket admission retries exhausted the bounded budget",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn authenticate_initial_admission_attempt(
+    session: &mut LiveSession,
+    admission_deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let websocket_auth_started = Instant::now();
+    let token = session.token.clone();
+    tokio::time::timeout_at(
+        admission_deadline,
+        session.send_cancellable(WSMessage::Token(token), cancellation),
+    )
+    .await
+    .map_err(|_| anyhow!("bounded admission deadline expired while sending the token"))?
+    .context("failed to send authentication token")?;
+
+    // The token has crossed the initial socket, which is the report's logical
+    // concurrency boundary. The ordered ping below then confirms processing
+    // and establishes the server clock offset before any game timing occurs.
+    session.record.record_lifecycle(
+        SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, unix_time_ms())
+            .with_message("token sent; awaiting explicit authentication"),
+    );
+    let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
+    session
+        .wait_for_authenticated(remaining, cancellation)
+        .await
+        .context("authentication acknowledgement failed")?;
+    let websocket_auth_ms = elapsed_ms(websocket_auth_started);
+    session
+        .record
+        .metrics
+        .websocket_auth_ms
+        .push(websocket_auth_ms);
+    session.activity_lease.mark_connected();
+
+    let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
+    send_tagged_ping_and_wait(session, None, remaining, cancellation)
+        .await
+        .context("authentication clock-sync ping failed")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_session(
     run_id: &str,
     wave_index: u32,
@@ -1672,86 +1867,37 @@ async fn prepare_session(
     let admission_started = Instant::now();
     let admission_deadline = tokio::time::Instant::now() + settings.connect_timeout;
     let mut admission_attempts = 0u32;
-    let (socket, backend, sticky_cookie) = loop {
-        admission_attempts = admission_attempts.saturating_add(1);
-        let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            fail_record(
-                &mut record,
-                SessionPhase::WebSocketConnect,
-                "WebSocket admission exhausted its bounded connection-to-pong budget",
+    let initial_connection = connect_initial_admission_socket(
+        &settings.websocket_url,
+        &settings.origin,
+        &settings.backend_hints,
+        None,
+        &mut admission_attempts,
+        admission_deadline,
+        &mut record,
+        cancellation,
+    )
+    .await;
+    let (socket, backend, sticky_cookie) = match initial_connection {
+        Ok(connection) => connection,
+        Err(_) if cancellation.is_cancelled() => {
+            record.cancel(
+                unix_time_ms(),
+                "load-test cancellation interrupted WebSocket admission",
             );
             return Err(record);
         }
-        let attempt_timeout = remaining.min(ADMISSION_CONNECT_ATTEMPT_TIMEOUT);
-        let connect_result = tokio::select! {
-            _ = cancellation.cancelled() => {
-                record.cancel(
-                    unix_time_ms(),
-                    "load-test cancellation interrupted WebSocket connection",
-                );
-                return Err(record);
-            }
-            result = connect_socket(
-                &settings.websocket_url,
-                &settings.origin,
-                attempt_timeout,
-                &settings.backend_hints,
-                None,
-            ) => result,
-        };
-        match connect_result {
-            Ok(value) => break value,
-            Err(error) if is_retryable_websocket_admission(&error) => {
-                record.record_lifecycle(
-                    SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
-                        .with_message(
-                            "transient WebSocket admission failure; retrying the same guest token",
-                        ),
-                );
-                let remaining =
-                    admission_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    fail_record(
-                        &mut record,
-                        SessionPhase::WebSocketConnect,
-                        format!(
-                            "transient WebSocket admission retries exhausted the bounded budget: {error:#}"
-                        ),
-                    );
-                    return Err(record);
-                }
-                tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        record.cancel(
-                            unix_time_ms(),
-                            "load-test cancellation interrupted WebSocket admission retry",
-                        );
-                        return Err(record);
-                    }
-                    _ = tokio::time::sleep(ADMISSION_RETRY_DELAY.min(remaining)) => {}
-                }
-            }
-            Err(error) => {
-                fail_record(
-                    &mut record,
-                    SessionPhase::WebSocketConnect,
-                    format!("{error:#}"),
-                );
-                return Err(record);
-            }
+        Err(error) => {
+            fail_record(
+                &mut record,
+                SessionPhase::WebSocketConnect,
+                format!("{error:#}"),
+            );
+            return Err(record);
         }
     };
     record.metrics.websocket_connect_ms = Some(elapsed_ms(admission_started));
-    record.diagnostics.insert(
-        "initial_admission_attempts".to_owned(),
-        admission_attempts.to_string(),
-    );
-    if let Some(backend) = backend {
-        record
-            .diagnostics
-            .insert("websocket_backend".to_owned(), backend);
-    }
+    let mut admitted_backend = backend;
 
     let mut session = LiveSession {
         record,
@@ -1780,76 +1926,126 @@ async fn prepare_session(
         activity_lease,
     };
 
-    let websocket_auth_started = Instant::now();
-    let token = session.token.clone();
-    let token_result = tokio::time::timeout_at(
-        admission_deadline,
-        session.send_cancellable(WSMessage::Token(token), cancellation),
-    )
-    .await;
-    if let Err(error) = token_result
-        .map_err(|_| anyhow!("bounded admission deadline expired while sending the token"))
-        .and_then(|result| result)
-    {
-        if cancellation.is_cancelled() {
-            session.record.cancel(
-                unix_time_ms(),
-                "load-test cancellation interrupted WebSocket authentication",
-            );
-            return Err(session.into_record());
-        }
-        session.fail(
-            SessionPhase::WebSocketAuthentication,
-            format!("failed to send authentication token: {error:#}"),
-        );
-        return Err(session.into_record());
-    }
-    // The token has crossed the initial socket, which is the report's logical
-    // concurrency boundary. The ordered ping below then confirms processing
-    // and establishes the server clock offset before any game timing occurs.
-    session.record.record_lifecycle(
-        SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, unix_time_ms())
-            .with_message("token sent; awaiting explicit authentication"),
-    );
-    let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
-    if let Err(error) = session
-        .wait_for_authenticated(remaining, cancellation)
+    loop {
+        let authentication = tokio::time::timeout_at(
+            admission_deadline,
+            authenticate_initial_admission_attempt(&mut session, admission_deadline, cancellation),
+        )
         .await
-    {
-        session.fail(
-            SessionPhase::WebSocketAuthentication,
-            format!("authentication acknowledgement failed: {error:#}"),
-        );
-        return Err(session.into_record());
-    }
-    session
-        .record
-        .metrics
-        .websocket_auth_ms
-        .push(elapsed_ms(websocket_auth_started));
-    session.activity_lease.mark_connected();
-    let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
-    if let Err(error) = send_tagged_ping_and_wait(&mut session, None, remaining, cancellation).await
-    {
-        if cancellation.is_cancelled() {
-            session.record.cancel(
-                unix_time_ms(),
-                "load-test cancellation interrupted WebSocket authentication",
-            );
-            return Err(session.into_record());
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "WebSocket admission exhausted its bounded connection-to-pong budget"
+            ))
+        });
+        match authentication {
+            Ok(()) => {
+                if let Some(backend) = admitted_backend {
+                    session
+                        .record
+                        .diagnostics
+                        .insert("websocket_backend".to_owned(), backend);
+                } else {
+                    session.record.diagnostics.remove("websocket_backend");
+                }
+                session.record.metrics.initial_admission_ready_ms =
+                    Some(elapsed_ms(admission_started));
+                session.record.record_lifecycle(
+                    SessionLifecycleRecord::new(
+                        SessionPhase::WebSocketAuthentication,
+                        unix_time_ms(),
+                    )
+                    .with_message("token processed; server clock synchronized"),
+                );
+                return Ok(session);
+            }
+            Err(_) if cancellation.is_cancelled() => {
+                session.record.cancel(
+                    unix_time_ms(),
+                    "load-test cancellation interrupted WebSocket authentication",
+                );
+                return Err(session.into_record());
+            }
+            Err(error) if is_retryable_websocket_admission(&error) => {
+                session.record.record_lifecycle(
+                    SessionLifecycleRecord::new(
+                        SessionPhase::WebSocketAuthentication,
+                        unix_time_ms(),
+                    )
+                    .with_message(
+                        "transient initial authentication transport failure; reconnecting the same logical session",
+                    ),
+                );
+                match wait_for_initial_admission_retry(
+                    admission_attempts,
+                    admission_deadline,
+                    cancellation,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        session.fail(
+                            SessionPhase::WebSocketAuthentication,
+                            format!(
+                                "transient WebSocket authentication retries exhausted the bounded admission budget: {error:#}"
+                            ),
+                        );
+                        return Err(session.into_record());
+                    }
+                    Err(_) => {
+                        session.record.cancel(
+                            unix_time_ms(),
+                            "load-test cancellation interrupted WebSocket authentication retry",
+                        );
+                        return Err(session.into_record());
+                    }
+                }
+
+                let websocket_url = session.websocket_url.clone();
+                let origin = session.origin.clone();
+                let backend_hints = session.backend_hints.clone();
+                let sticky_cookie = session.sticky_cookie.clone();
+                let replacement = connect_initial_admission_socket(
+                    &websocket_url,
+                    &origin,
+                    &backend_hints,
+                    sticky_cookie.as_deref(),
+                    &mut admission_attempts,
+                    admission_deadline,
+                    &mut session.record,
+                    cancellation,
+                )
+                .await;
+                let (socket, backend, sticky_cookie) = match replacement {
+                    Ok(connection) => connection,
+                    Err(_) if cancellation.is_cancelled() => {
+                        session.record.cancel(
+                            unix_time_ms(),
+                            "load-test cancellation interrupted WebSocket admission retry",
+                        );
+                        return Err(session.into_record());
+                    }
+                    Err(error) => {
+                        session.fail(SessionPhase::WebSocketConnect, format!("{error:#}"));
+                        return Err(session.into_record());
+                    }
+                };
+                session.socket = socket;
+                session.pending_application_pings.clear();
+                session.current_task_boot_id = None;
+                session.current_socket_generation = None;
+                session.server_capabilities.clear();
+                if sticky_cookie.is_some() {
+                    session.sticky_cookie = sticky_cookie;
+                }
+                admitted_backend = backend;
+            }
+            Err(error) => {
+                session.fail(SessionPhase::WebSocketAuthentication, format!("{error:#}"));
+                return Err(session.into_record());
+            }
         }
-        session.fail(
-            SessionPhase::WebSocketAuthentication,
-            format!("authentication clock-sync ping failed: {error:#}"),
-        );
-        return Err(session.into_record());
     }
-    session.record.metrics.initial_admission_ready_ms = Some(elapsed_ms(admission_started));
-    session.record.record_lifecycle(
-        SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, unix_time_ms())
-            .with_message("token processed; server clock synchronized"),
-    );
-    Ok(session)
 }
 
 async fn prepare_lobby(
@@ -2951,8 +3147,15 @@ async fn send_tagged_ping_and_wait(
             WSMessage::AccessDenied { reason } => {
                 return Err(anyhow!("server denied the session: {reason}"));
             }
-            WSMessage::Drain { .. } => {
-                return Err(anyhow!("server closed the connection before the pong"));
+            WSMessage::Drain {
+                task_boot_id,
+                deadline_unix_ms,
+            } => {
+                return Err(anyhow::Error::new(WebSocketAdmissionRetry {
+                    detail: format!(
+                        "task {task_boot_id} began draining before the admission pong (deadline {deadline_unix_ms})"
+                    ),
+                }));
             }
             _ => {}
         }
@@ -4706,6 +4909,8 @@ impl LiveSession {
                     .first_websocket_write_completed_at_unix_ms,
                 first_websocket_write_wait_ms: resolution.first_websocket_write_wait_ms,
                 reader_receipt_to_driver_lag_ms: observation.reader_receipt_to_driver_lag_ms,
+                reader_task_latest_wake_lag_ms: observation.reader_task_latest_wake_lag_ms,
+                reader_task_max_wake_lag_ms: observation.reader_task_max_wake_lag_ms,
             },
         );
         true
@@ -4765,6 +4970,8 @@ impl LiveSession {
                         .received_at_unix_ms
                         .max(pending.sent_at_unix_ms),
                     reader_receipt_to_driver_lag_ms: observation.reader_receipt_to_driver_lag_ms,
+                    reader_task_latest_wake_lag_ms: observation.reader_task_latest_wake_lag_ms,
+                    reader_task_max_wake_lag_ms: observation.reader_task_max_wake_lag_ms,
                 })
                 .unwrap_or(observation);
             self.record_command_resolution(
@@ -4939,7 +5146,10 @@ impl LiveSession {
             .metrics
             .websocket_dispatch_lag
             .observe(observation.reader_receipt_to_driver_lag_ms);
-        if let WSMessage::Pong { client_time, .. } = message
+        if let WSMessage::Pong {
+            client_time,
+            server_time,
+        } = message
             && let Some(ping) = self.pending_application_pings.remove(client_time)
             && observation.received_at >= ping.sent_at
         {
@@ -4951,8 +5161,12 @@ impl LiveSession {
                     sent_at_unix_ms: ping.sent_at_unix_ms,
                     received_at_unix_ms: observation.received_at_unix_ms,
                     rtt_ms: duration_between_ms(observation.received_at, ping.sent_at),
+                    server_time: Some(*server_time),
+                    pre_update_clock_offset_ms: Some(self.clock_offset_ms),
                     gateway_task_boot_id: gateway_task_boot_id.map(str::to_owned),
                     socket_generation,
+                    reader_task_latest_wake_lag_ms: observation.reader_task_latest_wake_lag_ms,
+                    reader_task_max_wake_lag_ms: observation.reader_task_max_wake_lag_ms,
                 },
             );
         }
@@ -5101,11 +5315,11 @@ impl LiveSession {
 
     async fn next_message(&mut self) -> Result<WSMessage> {
         loop {
-            let next = self
-                .socket
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("websocket stream ended"))??;
+            let next = self.socket.next().await.ok_or_else(|| {
+                anyhow::Error::new(WebSocketTransportEnded {
+                    detail: "stream ended without a Close frame".to_owned(),
+                })
+            })??;
             match next {
                 Message::Text(text) => {
                     let message: WSMessage = serde_json::from_str(&text).with_context(|| {
@@ -5120,7 +5334,9 @@ impl LiveSession {
                 }
                 Message::Ping(payload) => self.socket.send(Message::Pong(payload)).await?,
                 Message::Close(frame) => {
-                    return Err(anyhow!("websocket closed: {frame:?}"));
+                    return Err(anyhow::Error::new(WebSocketTransportEnded {
+                        detail: format!("peer sent Close frame {frame:?}"),
+                    }));
                 }
                 _ => {}
             }
@@ -5266,10 +5482,15 @@ impl LiveSession {
                 WSMessage::AccessDenied { reason } => {
                     return Err(anyhow!("server denied authentication: {reason}"));
                 }
-                WSMessage::Drain { .. } => {
-                    return Err(anyhow!(
-                        "task began draining before authentication completed"
-                    ));
+                WSMessage::Drain {
+                    task_boot_id,
+                    deadline_unix_ms,
+                } => {
+                    return Err(anyhow::Error::new(WebSocketAdmissionRetry {
+                        detail: format!(
+                            "task {task_boot_id} began draining before authentication completed (deadline {deadline_unix_ms})"
+                        ),
+                    }));
                 }
                 _ => {}
             }
@@ -5380,15 +5601,23 @@ async fn connect_socket(
 fn is_retryable_websocket_admission(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<WebSocketConnectTimeout>()
+            || cause.is::<WebSocketTransportEnded>()
+            || cause.is::<WebSocketAdmissionRetry>()
             || cause.downcast_ref::<WebSocketError>().is_some_and(|error| {
-                matches!(error, WebSocketError::Io(_))
-                    || matches!(error, WebSocketError::Http(response)
-                    if matches!(
-                        response.status(),
-                        StatusCode::TOO_MANY_REQUESTS
-                            | StatusCode::BAD_GATEWAY
-                            | StatusCode::SERVICE_UNAVAILABLE
-                    ))
+                matches!(
+                    error,
+                    WebSocketError::ConnectionClosed
+                        | WebSocketError::AlreadyClosed
+                        | WebSocketError::Io(_)
+                        | WebSocketError::Protocol(ProtocolError::SendAfterClosing)
+                        | WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+                ) || matches!(error, WebSocketError::Http(response)
+                if matches!(
+                    response.status(),
+                    StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::BAD_GATEWAY
+                        | StatusCode::SERVICE_UNAVAILABLE
+                ))
             })
     })
 }
@@ -5636,6 +5865,26 @@ mod tests {
     }
 
     #[test]
+    fn initial_admission_uses_the_bounded_reconnect_policy() {
+        assert_eq!(initial_admission_retry_delay(0), None);
+        assert_eq!(
+            initial_admission_retry_delay(1),
+            Some(Duration::ZERO),
+            "the first retry must be immediate"
+        );
+        assert_eq!(
+            initial_admission_retry_delay(2),
+            Some(RECONNECT_DELAY),
+            "the second retry uses the established reconnect bound"
+        );
+        assert_eq!(
+            initial_admission_retry_delay(3),
+            None,
+            "initial admission must not exceed MAX_RECONNECTS"
+        );
+    }
+
+    #[test]
     fn only_transient_websocket_failures_are_retryable_admission() {
         let timeout = anyhow::Error::new(WebSocketConnectTimeout {
             timeout: ADMISSION_CONNECT_ATTEMPT_TIMEOUT,
@@ -5647,6 +5896,28 @@ mod tests {
             "connection reset",
         )));
         assert!(is_retryable_websocket_admission(&io));
+        assert!(is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketTransportEnded {
+                detail: "peer sent Close frame".to_owned(),
+            }
+        )));
+        assert!(is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketError::ConnectionClosed
+        )));
+        assert!(is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+        )));
+        assert!(is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketError::Protocol(ProtocolError::SendAfterClosing)
+        )));
+        assert!(is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketAdmissionRetry {
+                detail: "task began draining before authentication".to_owned(),
+            }
+        )));
+        assert!(!is_retryable_websocket_admission(&anyhow::Error::new(
+            WebSocketError::Protocol(ProtocolError::MaskedFrameFromServer)
+        )));
 
         let unavailable = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -5675,6 +5946,12 @@ mod tests {
             .unwrap();
         let forbidden = anyhow::Error::new(WebSocketError::Http(forbidden));
         assert!(!is_retryable_websocket_admission(&forbidden));
+        assert!(!is_retryable_websocket_admission(&anyhow!(
+            "server denied authentication: invalid token"
+        )));
+        assert!(!is_retryable_websocket_admission(&anyhow!(
+            "authenticated server is incompatible"
+        )));
         assert!(!is_retryable_websocket_admission(&anyhow!(
             "transport failed"
         )));
@@ -5767,6 +6044,8 @@ mod tests {
             received_at_unix_ms: 123_461,
             received_at: sent_at + Duration::from_millis(5),
             reader_receipt_to_driver_lag_ms: 7,
+            reader_task_latest_wake_lag_ms: 8,
+            reader_task_max_wake_lag_ms: 9,
         };
 
         let scheduled = record_scheduled_pending_command_resolution(
@@ -5845,6 +6124,8 @@ mod tests {
             first_websocket_write_completed_at_unix_ms: Some(1_002 + sequence),
             first_websocket_write_wait_ms: Some(2),
             reader_receipt_to_driver_lag_ms: 3,
+            reader_task_latest_wake_lag_ms: 4,
+            reader_task_max_wake_lag_ms: 5,
         };
 
         retain_slow_command_resolution(&mut metrics, diagnostic(0, 1_000));
@@ -5895,8 +6176,12 @@ mod tests {
                     sent_at_unix_ms,
                     received_at_unix_ms: sent_at_unix_ms + rtt_ms,
                     rtt_ms,
+                    server_time: Some(sent_at_unix_ms as i64 + 10),
+                    pre_update_clock_offset_ms: Some(5),
                     gateway_task_boot_id: Some(gateway.to_owned()),
                     socket_generation: Some(generation),
+                    reader_task_latest_wake_lag_ms: 6,
+                    reader_task_max_wake_lag_ms: 7,
                 }
             };
 
@@ -5969,6 +6254,8 @@ mod tests {
             received_at_unix_ms: 10_125,
             received_at: sent_at + Duration::from_millis(125),
             reader_receipt_to_driver_lag_ms: 1_875,
+            reader_task_latest_wake_lag_ms: 250,
+            reader_task_max_wake_lag_ms: 500,
         };
 
         let resolution =
@@ -5998,6 +6285,8 @@ mod tests {
             received_at_unix_ms: 123_455,
             received_at: sent_at.checked_sub(Duration::from_millis(1)).unwrap(),
             reader_receipt_to_driver_lag_ms: 0,
+            reader_task_latest_wake_lag_ms: 0,
+            reader_task_max_wake_lag_ms: 0,
         };
 
         assert!(
@@ -6316,6 +6605,82 @@ mod tests {
         assert!(
             observation.reader_receipt_to_driver_lag_ms >= 40,
             "reader-to-driver lag was not frozen when the driver received the frame"
+        );
+        socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_reader_attaches_its_own_wake_lag_to_the_next_frame() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send_frame, receive_send_frame) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time: 6,
+                        server_time: 8,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            receive_send_frame.await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time: 7,
+                        server_time: 9,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let url = format!("ws://{address}/ws");
+        let (raw, _) = connect_async(url).await.unwrap();
+        let mut socket =
+            Socket::new_with_reader_wake_sentinel_interval(raw, Duration::from_millis(10));
+        assert!(matches!(
+            next_socket_message(&mut socket).await.unwrap(),
+            WSMessage::Pong {
+                client_time: 6,
+                server_time: 8
+            }
+        ));
+        std::thread::sleep(Duration::from_millis(50));
+        send_frame.send(()).unwrap();
+
+        let message = next_socket_message(&mut socket).await.unwrap();
+        let observation = socket
+            .last_observation()
+            .expect("reader did not attach a receipt timestamp");
+
+        assert!(matches!(
+            message,
+            WSMessage::Pong {
+                client_time: 7,
+                server_time: 9
+            }
+        ));
+        assert!(
+            observation.reader_task_latest_wake_lag_ms >= 20,
+            "reader sentinel did not retain the delayed wake immediately preceding the frame"
+        );
+        assert_eq!(
+            observation.reader_task_max_wake_lag_ms,
+            observation.reader_task_latest_wake_lag_ms
         );
         socket.close().await.unwrap();
         server.await.unwrap();
@@ -6673,6 +7038,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_ping_records_gateway_clock_and_reader_wake_provenance() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_url = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (raw, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let settings = planned_game_test_settings(websocket_url);
+        let mut session = planned_game_test_session(Socket::new(raw), &settings, "playing");
+        session.clock_offset_ms = -37;
+        let sent_at = Instant::now()
+            .checked_sub(Duration::from_millis(1_500))
+            .unwrap();
+        session.pending_application_pings.insert(
+            77,
+            ApplicationPingSend {
+                sent_at_unix_ms: 10_000,
+                sent_at,
+            },
+        );
+
+        session
+            .observe_received(
+                &WSMessage::Pong {
+                    client_time: 77,
+                    server_time: 10_125,
+                },
+                FrameObservation {
+                    received_at_unix_ms: 11_500,
+                    received_at: sent_at + Duration::from_millis(1_500),
+                    reader_receipt_to_driver_lag_ms: 0,
+                    reader_task_latest_wake_lag_ms: 1_234,
+                    reader_task_max_wake_lag_ms: 2_345,
+                },
+            )
+            .unwrap();
+
+        let observation = session
+            .record
+            .metrics
+            .slow_application_ping_observations
+            .first()
+            .expect("slow Pong provenance was not retained");
+        assert_eq!(observation.server_time, Some(10_125));
+        assert_eq!(observation.pre_update_clock_offset_ms, Some(-37));
+        assert_eq!(observation.reader_task_latest_wake_lag_ms, 1_234);
+        assert_eq!(observation.reader_task_max_wake_lag_ms, 2_345);
+        assert_eq!(
+            observation.gateway_task_boot_id.as_deref(),
+            Some("old-task")
+        );
+        assert_eq!(observation.socket_generation, Some(1));
+        session.socket.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_state_waits_for_durable_pending_outcome_and_barrier() {
         use tokio::net::TcpListener;
         use tokio_tungstenite::accept_async;
@@ -6708,6 +7139,8 @@ mod tests {
                     received_at_unix_ms: 124_455,
                     received_at: sent_at + Duration::from_millis(999),
                     reader_receipt_to_driver_lag_ms: 0,
+                    reader_task_latest_wake_lag_ms: 0,
+                    reader_task_max_wake_lag_ms: 0,
                 },
             )
             .expect_err("a terminal default cannot precede terminal state");
@@ -6738,6 +7171,8 @@ mod tests {
                     received_at_unix_ms: 124_456,
                     received_at: sent_at + Duration::from_millis(1_000),
                     reader_receipt_to_driver_lag_ms: 0,
+                    reader_task_latest_wake_lag_ms: 0,
+                    reader_task_max_wake_lag_ms: 0,
                 },
             )
             .unwrap();
@@ -6766,6 +7201,8 @@ mod tests {
                     received_at_unix_ms: 124_956,
                     received_at: sent_at + Duration::from_millis(1_500),
                     reader_receipt_to_driver_lag_ms: 11,
+                    reader_task_latest_wake_lag_ms: 21,
+                    reader_task_max_wake_lag_ms: 31,
                 },
             )
             .unwrap();
@@ -6789,6 +7226,8 @@ mod tests {
                     received_at_unix_ms: 124_957,
                     received_at: sent_at + Duration::from_millis(1_501),
                     reader_receipt_to_driver_lag_ms: 12,
+                    reader_task_latest_wake_lag_ms: 22,
+                    reader_task_max_wake_lag_ms: 32,
                 },
             )
             .unwrap();
@@ -6820,12 +7259,28 @@ mod tests {
             11
         );
         assert_eq!(
+            session.record.metrics.slow_command_resolutions[0].reader_task_latest_wake_lag_ms,
+            21
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[0].reader_task_max_wake_lag_ms,
+            31
+        );
+        assert_eq!(
             session.record.metrics.slow_command_resolutions[1].source,
             CommandResolutionSource::TerminalBarrierRejectedOutcome
         );
         assert_eq!(
             session.record.metrics.slow_command_resolutions[1].reader_receipt_to_driver_lag_ms,
             12
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[1].reader_task_latest_wake_lag_ms,
+            22
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[1].reader_task_max_wake_lag_ms,
+            32
         );
         assert_eq!(
             session
@@ -6874,7 +7329,7 @@ mod tests {
                         reason: server::recovery::SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
                     }),
                 },
-                FrameObservation::now(),
+                FrameObservation::now(0, 0),
             )
             .unwrap_err();
 
@@ -8331,5 +8786,201 @@ mod tests {
 
         assert!(result.pairing_violation.is_some());
         assert!(result.sessions.iter().all(SessionRecord::is_failed));
+    }
+
+    #[tokio::test]
+    async fn initial_auth_transport_drop_and_drain_retry_with_the_same_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_address = api_listener.local_addr().unwrap();
+        let api_server = tokio::spawn(async move {
+            let (mut stream, _) = api_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1_024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"token":"stable-token","user":{"id":7,"username":"stable-user"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_address = websocket_listener.local_addr().unwrap();
+        let websocket_server = tokio::spawn(async move {
+            let (first_stream, _) = websocket_listener.accept().await.unwrap();
+            let mut first_socket = accept_async(first_stream).await.unwrap();
+            let first_token = first_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(first_token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(token) if token == "stable-token"
+            ));
+            drop(first_socket);
+
+            let (draining_stream, _) = websocket_listener.accept().await.unwrap();
+            let mut draining_socket = accept_async(draining_stream).await.unwrap();
+            let draining_token = draining_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(draining_token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(token) if token == "stable-token"
+            ));
+            draining_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Authenticated {
+                        task_boot_id: "draining-task".to_owned(),
+                        protocol_version: 2,
+                        capabilities: REQUIRED_SERVER_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_owned())
+                            .collect(),
+                        socket_generation: 1,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(
+                    draining_socket
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .to_text()
+                        .unwrap()
+                )
+                .unwrap(),
+                WSMessage::Ping { .. }
+            ));
+            draining_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Drain {
+                        task_boot_id: "draining-task".to_owned(),
+                        deadline_unix_ms: Utc::now().timestamp_millis() + 10_000,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+
+            let (replacement_stream, _) = websocket_listener.accept().await.unwrap();
+            let mut replacement_socket = accept_async(replacement_stream).await.unwrap();
+            let replacement_token = replacement_socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WSMessage>(replacement_token.to_text().unwrap()).unwrap(),
+                WSMessage::Token(token) if token == "stable-token"
+            ));
+            replacement_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Authenticated {
+                        task_boot_id: "replacement-task".to_owned(),
+                        protocol_version: 2,
+                        capabilities: REQUIRED_SERVER_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_owned())
+                            .collect(),
+                        socket_generation: 1,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let ping = replacement_socket.next().await.unwrap().unwrap();
+            let client_time =
+                match serde_json::from_str::<WSMessage>(ping.to_text().unwrap()).unwrap() {
+                    WSMessage::Ping { client_time } => client_time,
+                    other => panic!("expected initial clock-sync Ping, received {other:?}"),
+                };
+            replacement_socket
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::Pong {
+                        client_time,
+                        server_time: client_time,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                replacement_socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+
+        let settings = SessionSettings {
+            api_origin: Url::parse(&format!("http://{api_address}/")).unwrap(),
+            websocket_url: Url::parse(&format!("ws://{websocket_address}/ws")).unwrap(),
+            origin: format!("http://{api_address}"),
+            game_type: GameType::Solo,
+            queue_mode: QueueMode::Quickmatch,
+            selected_mode: "solo".to_owned(),
+            competitive: false,
+            population: Population::Idle,
+            connect_timeout: Duration::from_secs(5),
+            lobby_timeout: Duration::from_secs(1),
+            queue_timeout: Duration::from_secs(1),
+            untimed_play_duration: Duration::from_secs(1),
+            command_profile: CommandProfile::Realistic,
+            backend_hints: BackendHintRegistry::default(),
+        };
+        let (activity_sender, mut activity_receiver) = mpsc::unbounded_channel();
+        let mut session = prepare_session(
+            "test-run",
+            0,
+            "test-group",
+            7,
+            &settings,
+            &Client::new(),
+            activity_sender,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("transient initial authentication close should recover");
+
+        assert_eq!(session.user_id, 7);
+        assert_eq!(session.token, "stable-token");
+        assert_eq!(session.client_game_session_id, "loadtest-test-run-7");
+        assert_eq!(
+            session
+                .record
+                .diagnostics
+                .get("initial_admission_attempts")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            session
+                .record
+                .diagnostics
+                .get("task_boot_id_0")
+                .map(String::as_str),
+            Some("replacement-task")
+        );
+        assert_eq!(session.record.metrics.websocket_auth_ms.len(), 2);
+        assert!(session.record.metrics.websocket_connect_ms.is_some());
+        assert!(session.record.metrics.initial_admission_ready_ms.is_some());
+        assert_eq!(session.record.metrics.disconnects, 0);
+        assert_eq!(session.record.metrics.reconnects, 0);
+        assert!(matches!(
+            activity_receiver.try_recv().unwrap(),
+            SessionActivityEvent::Connected { session_index: 7 }
+        ));
+
+        session.socket.close().await.unwrap();
+        websocket_server.await.unwrap();
+        api_server.await.unwrap();
     }
 }

@@ -23,8 +23,8 @@ admission_population_pid=""
 idle_population_pid=""
 lobby_population_pid=""
 matchmaking_population_pid=""
-traefik_monitor_pid=""
-traefik_monitor_dir=""
+public_availability_monitor_pid=""
+public_availability_monitor_dir=""
 ecs_runtime_monitor_pid=""
 ecs_runtime_monitor_dir=""
 hard_crash_control_observer_pid=""
@@ -589,18 +589,6 @@ write_capacity_acceptance_report() {
     ' >"$output"
 }
 
-traefik_sample_has_healthy_backend() {
-  local sample="$1"
-  awk '
-    /^traefik_service_server_up{/ {
-      if ($0 ~ /url="http:\/\/[^\"]+:8080"/ && ($NF + 0) > 0) {
-        found = 1
-      }
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$sample"
-}
-
 traefik_sample_has_healthy_task() {
   local sample="$1"
   local private_ipv4="$2"
@@ -617,6 +605,8 @@ traefik_sample_has_healthy_task() {
 traefik_sample_has_healthy_fleet() {
   local sample="$1"
   local healthy_observation="$2"
+  # Removed-task label series can remain in Traefik's Prometheus registry.
+  # This proves inclusion of every current healthy ECS IP, not exact equality.
   local expected_count
   expected_count="$(jq -er '.tasks | length | select(. > 0)' "$healthy_observation")" \
     || return 1
@@ -1134,16 +1124,19 @@ test_traefik_server_up_parser() {
     '# TYPE traefik_service_server_up gauge' \
     'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 1' \
     'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 0' \
+    'traefik_service_server_up{service="removed-task",url="http://10.0.9.90:8080"} 1' \
     >"$fixture"
   printf '%s\n' \
     '# TYPE traefik_service_server_up gauge' \
     'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 0' \
     'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 1' \
+    'traefik_service_server_up{service="removed-task",url="http://10.0.9.90:8080"} 1' \
     >"$partial_b"
   printf '%s\n' \
     '# TYPE traefik_service_server_up gauge' \
     'traefik_service_server_up{service="opaque-task-a",url="http://10.0.1.10:8080"} 1' \
     'traefik_service_server_up{service="opaque-task-b",url="http://10.0.2.20:8080"} 1' \
+    'traefik_service_server_up{service="removed-task",url="http://10.0.9.90:8080"} 1' \
     >"$complete"
   jq -n '{
     tasks: [
@@ -1153,7 +1146,6 @@ test_traefik_server_up_parser() {
   }' >"$healthy"
 
   local result=0
-  traefik_sample_has_healthy_backend "$fixture" || result=1
   traefik_sample_has_healthy_task "$fixture" 10.0.1.10 || result=1
   if traefik_sample_has_healthy_task "$fixture" 10.0.2.20; then
     result=1
@@ -1171,7 +1163,85 @@ test_traefik_server_up_parser() {
   rm -rf "$fixture_dir"
 
   if (( result != 0 )); then
-    echo "Traefik server-up parser accepted partial fleet coverage or rejected a healthy opaque service" >&2
+    echo "Traefik server-up parser did not restrict readiness to current healthy task IPs" >&2
+    return 1
+  fi
+}
+
+test_public_availability_summary_gate() {
+  local fixture_dir
+  fixture_dir="$(mktemp -d)"
+  local observations="$fixture_dir/observations.jsonl"
+  local good_observations="$fixture_dir/good-observations.jsonl"
+  local summary="$fixture_dir/summary.json"
+  jq -cn '{kind: "start", endpoint: "https://dev.example/api/health", at_unix_ms: 900}' \
+    >"$good_observations"
+  local sequence
+  for sequence in {1..10}; do
+    jq -cn \
+      --argjson sequence "$sequence" \
+      --argjson started "$((sequence * 1000))" '
+        {
+          kind: "sample",
+          sequence: $sequence,
+          started_at_unix_ms: $started,
+          finished_at_unix_ms: ($started + 10),
+          curl_exit_code: 0,
+          http_status: "200",
+          response_body: "{\"status\":\"ok\"}",
+          curl_stderr: ""
+        }
+      ' >>"$good_observations"
+  done
+  jq -cn \
+    '{kind: "stop", at_unix_ms: 10500, was_running_at_stop: true, exit_status: 0}' \
+    >>"$good_observations"
+  cp "$good_observations" "$observations"
+
+  local result=0
+  summarize_public_availability_observations \
+    "$fixture_dir" "$summary" "https://dev.example/api/health" || result=1
+  jq -e '
+    .passed
+    and .sample_count == 10
+    and .failed_samples == 0
+    and .maximum_start_gap_ms == 3000
+    and .maximum_observed_start_gap_ms == 1000
+  ' "$summary" >/dev/null || result=1
+
+  local mutation
+  local mutations=(
+    'if .kind == "sample" and .sequence == 2 then .curl_exit_code = 7 else . end'
+    'if .kind == "sample" and .sequence == 3 then .http_status = "503" else . end'
+    'if .kind == "sample" and .sequence == 4 then .response_body = "{\"status\":\"degraded\"}" else . end'
+    'if .kind == "sample" and .sequence >= 6 then .started_at_unix_ms += 3000 | .finished_at_unix_ms += 3000 elif .kind == "stop" then .at_unix_ms += 3000 else . end'
+    'if .kind == "sample" and .sequence == 2 then .finished_at_unix_ms = (.started_at_unix_ms - 1) else . end'
+    'if .kind == "sample" and .sequence == 5 then .started_at_unix_ms = 3500 else . end'
+    'if .kind == "stop" then .was_running_at_stop = false else . end'
+    'if .kind == "start" then .endpoint = "https://wrong.example/api/health" else . end'
+  )
+  for mutation in "${mutations[@]}"; do
+    jq -c "$mutation" "$good_observations" >"$observations"
+    summarize_public_availability_observations \
+      "$fixture_dir" "$summary" "https://dev.example/api/health" || result=1
+    jq -e '.passed == false' "$summary" >/dev/null || result=1
+  done
+  cp "$good_observations" "$observations"
+  printf '%s\n' '{"kind":"unknown"}' >>"$observations"
+  summarize_public_availability_observations \
+    "$fixture_dir" "$summary" "https://dev.example/api/health" || result=1
+  jq -e '.passed == false and .unrecognized_observations == 1' \
+    "$summary" >/dev/null || result=1
+  cp "$good_observations" "$observations"
+  printf '%s\n' '{not-json' >>"$fixture_dir/observations.jsonl"
+  summarize_public_availability_observations \
+    "$fixture_dir" "$summary" "https://dev.example/api/health" || result=1
+  jq -e '.passed == false and .malformed_observations' \
+    "$summary" >/dev/null || result=1
+  rm -rf "$fixture_dir"
+
+  if (( result != 0 )); then
+    echo "Public availability summary did not fail closed for probe, cadence, or supervision evidence" >&2
     return 1
   fi
 }
@@ -2377,6 +2447,7 @@ test_evidence_safety_helpers() {
   test_live_task_definition_gate
   test_exact_tag_image_digest_gate
   test_traefik_server_up_parser
+  test_public_availability_summary_gate
   test_command_outcome_window_gate
   test_staging_entry_state_contract
   test_capacity_continuous_window_contract
@@ -3247,75 +3318,181 @@ collect_observed_stopped_tasks() {
   ' "$ecs_runtime_monitor_dir"/*.json >"$output"
 }
 
-start_traefik_monitor() {
-  traefik_monitor_dir="$1/traefik"
-  mkdir -p "$traefik_monitor_dir"
+start_public_availability_monitor() {
+  public_availability_monitor_dir="$1/public-availability"
+  mkdir -p "$public_availability_monitor_dir"
+  local endpoint="${SNAKETRON_STAGING_TARGET%/}/api/health"
+  local observations="$public_availability_monitor_dir/observations.jsonl"
+  rm -f -- "$public_availability_monitor_dir/.stop"
+  jq -cn --arg endpoint "$endpoint" --argjson at "$(unix_time_ms)" \
+    '{kind: "start", endpoint: $endpoint, at_unix_ms: $at}' >"$observations"
+
   (
-    local sequence=0
-    while true; do
+    local sequence=0 body="$public_availability_monitor_dir/.body"
+    local error="$public_availability_monitor_dir/.error"
+    trap 'rm -f -- "$body" "$error"' EXIT
+    while [[ ! -e "$public_availability_monitor_dir/.stop" ]]; do
       sequence=$((sequence + 1))
-      local sample
-      printf -v sample '%s/%06d.prom' "$traefik_monitor_dir" "$sequence"
-      # The SSM tunnel can need more than three seconds to carry the complete
-      # metrics body even while Traefik is healthy. A partial body is still a
-      # failed sample, and any failed sample still fails certification; the
-      # wider transfer bound only avoids aborting a healthy in-progress body.
-      if ! curl -fsS --connect-timeout 1 --max-time 5 \
-        "$staging_traefik_metrics_control_url" >"$sample"; then
-        mv "$sample" "$sample.error"
+      local started finished curl_exit_code=0 http_status=""
+      started="$(unix_time_ms)"
+      : >"$body"
+      : >"$error"
+      if http_status="$(curl \
+        --silent \
+        --show-error \
+        --connect-timeout 1 \
+        --max-time 2 \
+        --max-filesize 4096 \
+        --header 'Accept: application/json' \
+        --output "$body" \
+        --write-out '%{http_code}' \
+        "$endpoint" \
+        2>"$error")"; then
+        :
+      else
+        curl_exit_code=$?
       fi
-      sleep 2
+      finished="$(unix_time_ms)"
+      jq -cn --argjson sequence "$sequence" \
+        --argjson started "$started" \
+        --argjson finished "$finished" \
+        --argjson curl_exit "$curl_exit_code" \
+        --arg http_status "$http_status" \
+        --rawfile response_body "$body" \
+        --rawfile curl_stderr "$error" '
+          {kind: "sample", sequence: $sequence,
+           started_at_unix_ms: $started, finished_at_unix_ms: $finished,
+           curl_exit_code: $curl_exit, http_status: $http_status,
+           response_body: $response_body, curl_stderr: $curl_stderr}
+        ' >>"$observations"
+
+      local delay_ms delay_seconds
+      delay_ms=$((started + 1000 - $(unix_time_ms)))
+      if (( delay_ms > 0 )); then
+        printf -v delay_seconds '%d.%03d' \
+          "$((delay_ms / 1000))" "$((delay_ms % 1000))"
+        sleep "$delay_seconds"
+      fi
     done
   ) &
-  traefik_monitor_pid=$!
+  public_availability_monitor_pid=$!
 }
 
-stop_traefik_monitor() {
-  local monitor_pid="${traefik_monitor_pid:-}"
-  if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
-    kill -TERM "$monitor_pid" 2>/dev/null || true
-    wait "$monitor_pid" 2>/dev/null || true
+stop_public_availability_monitor() {
+  local monitor_pid="${public_availability_monitor_pid:-}"
+  [[ -n "$monitor_pid" ]] || return 0
+
+  local was_running=false
+  local monitor_status=0
+  if kill -0 "$monitor_pid" 2>/dev/null; then
+    was_running=true
+    : >"$public_availability_monitor_dir/.stop"
+    wait "$monitor_pid" || monitor_status=$?
+  else
+    wait "$monitor_pid" || monitor_status=$?
   fi
-  traefik_monitor_pid=""
+  jq -cn --argjson at "$(unix_time_ms)" \
+    --argjson was_running "$was_running" \
+    --argjson exit_status "$monitor_status" '
+      {kind: "stop", at_unix_ms: $at,
+       was_running_at_stop: $was_running, exit_status: $exit_status}
+    ' >>"$public_availability_monitor_dir/observations.jsonl"
+  public_availability_monitor_pid=""
+  rm -f -- "$public_availability_monitor_dir/.stop"
+  return 0
 }
 
-assert_traefik_monitor() {
+summarize_public_availability_observations() {
+  local evidence_dir="$1"
+  local output="$2"
+  local expected_endpoint="$3"
+  local pending="${output}.pending"
+  rm -f -- "$pending"
+
+  if ! jq -s --arg expected_endpoint "$expected_endpoint" '
+      def response_ok:
+        (try (.response_body | fromjson).status catch null) == "ok";
+      def sample_timing_ok:
+        (.started_at_unix_ms | type) == "number"
+        and (.finished_at_unix_ms | type) == "number"
+        and .finished_at_unix_ms >= .started_at_unix_ms;
+      def sample_ok:
+        .curl_exit_code == 0 and .http_status == "200" and response_ok
+        and sample_timing_ok
+        and ((.response_body // "") | utf8bytelength) <= 4096;
+      [ .[] | select(.kind == "start") ] as $starts
+      | [ .[] | select(.kind == "stop") ] as $stops
+      | [ .[] | select(.kind == "sample") ] as $samples
+      | [ .[] | select(
+          .kind != "start" and .kind != "stop" and .kind != "sample")
+        ] as $unrecognized
+      | [range(1; ($samples | length)) as $i
+          | $samples[$i].started_at_unix_ms
+            - $samples[$i - 1].started_at_unix_ms] as $gaps
+      | {endpoint: ($starts[0].endpoint // null),
+          acceptance_scope:
+            "hard gate for planned scaling; diagnostic during abrupt crash",
+          required_curl_exit_code: 0, required_http_status: 200,
+          required_json_status: "ok", target_cadence_ms: 1000,
+          maximum_start_gap_ms: 3000, maximum_response_bytes: 4096,
+          minimum_samples: 10,
+          monitor_start: ($starts[0] // null),
+          monitor_stop: ($stops[0] // null),
+          expected_endpoint: $expected_endpoint,
+          unrecognized_observations: ($unrecognized | length),
+          sample_count: ($samples | length),
+          failed_samples: ([$samples[] | select((sample_ok | not))] | length),
+          maximum_observed_start_gap_ms: ($gaps | max // 0),
+          negative_start_gaps: ([$gaps[] | select(. < 0)] | length),
+          sequence_gaps: ([range(0; ($samples | length)) as $i
+            | select($samples[$i].sequence != ($i + 1))] | length),
+          start_coverage_delay_ms: (
+            if ($samples | length) == 0 then null
+            else $samples[0].started_at_unix_ms
+              - ($starts[0].at_unix_ms // 0)
+            end),
+          stop_coverage_delay_ms: (
+            if ($samples | length) == 0 then null
+            else ($stops[0].at_unix_ms // 0)
+              - $samples[-1].finished_at_unix_ms
+            end)
+        }
+      | .passed = (
+          ($starts | length) == 1
+          and ($stops | length) == 1
+          and .monitor_start.endpoint == .expected_endpoint
+          and .unrecognized_observations == 0
+          and .monitor_stop.was_running_at_stop == true
+          and .monitor_stop.exit_status == 0
+          and .sample_count >= .minimum_samples
+          and .failed_samples == 0
+          and .negative_start_gaps == 0
+          and .sequence_gaps == 0
+          and (.start_coverage_delay_ms >= 0
+            and .start_coverage_delay_ms <= .maximum_start_gap_ms)
+          and (.stop_coverage_delay_ms >= 0
+            and .stop_coverage_delay_ms <= .maximum_start_gap_ms)
+          and .maximum_observed_start_gap_ms <= .maximum_start_gap_ms)
+    ' "$evidence_dir/observations.jsonl" >"$pending" 2>/dev/null; then
+    rm -f -- "$pending"
+    jq -n --arg observations "$evidence_dir/observations.jsonl" \
+      '{observations: $observations, malformed_observations: true,
+        passed: false}' >"$output"
+    return 0
+  fi
+  mv "$pending" "$output"
+}
+
+assert_public_availability_monitor() {
   local report_dir="$1"
-  local sample_count=0
-  local zero_ready_count=0
-  local error_count=0
-  local sample
-  for sample in "$traefik_monitor_dir"/*.prom.error; do
-    [[ -e "$sample" ]] || continue
-    error_count=$((error_count + 1))
-  done
-  for sample in "$traefik_monitor_dir"/*.prom; do
-    [[ -e "$sample" ]] || continue
-    sample_count=$((sample_count + 1))
-    # Traefik's per-server metric uses an opaque service id even though its
-    # router metrics use the configured service name. This dedicated proxy has
-    # only the Snaketron ECS provider, so any healthy :8080 backend proves that
-    # public routing retained an available server.
-    if ! traefik_sample_has_healthy_backend "$sample"; then
-      zero_ready_count=$((zero_ready_count + 1))
-    fi
-  done
-  if ! jq -n \
-    --argjson samples "$sample_count" \
-    --argjson scrape_errors "$error_count" \
-    --argjson zero_healthy_backend_samples "$zero_ready_count" \
-    '{
-      samples: $samples,
-      scrape_errors: $scrape_errors,
-      zero_healthy_backend_samples: $zero_healthy_backend_samples
-    }' >"$report_dir/traefik-summary.json"; then
-    echo "Could not write Traefik routing evidence" >&2
+  local summary="$report_dir/public-availability-summary.json"
+  summarize_public_availability_observations \
+    "$public_availability_monitor_dir" "$summary" \
+    "${SNAKETRON_STAGING_TARGET%/}/api/health"
+  jq -e '.passed == true' "$summary" >/dev/null || {
+    echo "Public /api/health availability evidence failed; see public-availability-summary.json" >&2
     return 1
-  fi
-  if (( sample_count < 10 || error_count > 0 || zero_ready_count > 0 )); then
-    echo "Traefik evidence was incomplete or observed a zero-healthy-backend sample; see traefik-summary.json" >&2
-    return 1
-  fi
+  }
 }
 
 capture_ecs_health() {
@@ -4692,6 +4869,8 @@ collect_crash_ecs_runtime_evidence() {
 assert_hard_crash_report() {
   local report_dir="$1"
   local summary="$2"
+  local acceptance="$report_dir/hard-crash-acceptance.json"
+  local pending="${acceptance}.pending"
   if ! jq -n \
     --slurpfile report "$summary" \
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
@@ -5041,11 +5220,21 @@ assert_hard_crash_report() {
           }
         }
       | .passed = ([.checks[]] | all)
-    ' >"$report_dir/hard-crash-acceptance.json"; then
+    ' >"$pending"; then
+    rm -f -- "$pending"
+    jq -n \
+      --arg summary "$summary" '
+        {
+          passed: false,
+          evidence_materialization_error: true,
+          load_summary: $summary
+        }
+      ' >"$acceptance"
     echo "Could not write hard-crash acceptance evidence" >&2
     return 1
   fi
-  jq -e '.passed' "$report_dir/hard-crash-acceptance.json" >/dev/null || {
+  mv "$pending" "$acceptance"
+  jq -e '.passed' "$acceptance" >/dev/null || {
     echo "Hard-crash recovery failed its session, command, ownership, or five-second output gates" >&2
     return 1
   }
@@ -5132,8 +5321,8 @@ run_staging_suite() {
   idle_population_pid=""
   lobby_population_pid=""
   matchmaking_population_pid=""
-  traefik_monitor_pid=""
-  traefik_monitor_dir=""
+  public_availability_monitor_pid=""
+  public_availability_monitor_dir=""
   ecs_runtime_monitor_pid=""
   ecs_runtime_monitor_dir=""
   hard_crash_control_observer_pid=""
@@ -5159,7 +5348,7 @@ run_staging_suite() {
     trap - EXIT
     set +e
     local cleanup_ok=true
-    stop_traefik_monitor
+    stop_public_availability_monitor
     stop_ecs_runtime_monitor
     stop_hard_crash_control_observer
     local population_pid
@@ -5432,7 +5621,7 @@ run_staging_suite() {
   local evidence_started_epoch
   evidence_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   evidence_started_epoch="$(date -u +%s)"
-  start_traefik_monitor "$report_dir"
+  start_public_availability_monitor "$report_dir"
   start_ecs_runtime_monitor "$report_dir"
   # Keep the one-task continuity/staircase load separate from the supported
   # 272-session capacity load. Target-tracking latency must never leave the
@@ -5720,7 +5909,8 @@ run_staging_suite() {
     wait_for_traefik_task_readiness "$report_dir" hard-crash-replacement-10
     wait_for_control_plane hard-crash-replacement-10 10
     require_load_running
-    wait "$load_pid"
+    local load_exit_status=0
+    wait "$load_pid" || load_exit_status=$?
     load_pid=""
 
     wait_for_executor_drain hard-crash-final-10 10
@@ -5730,18 +5920,34 @@ run_staging_suite() {
     evidence_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     stop_ecs_runtime_monitor
     collect_crash_ecs_runtime_evidence "$report_dir"
-    stop_traefik_monitor
-    # These are independent proofs. Always materialize both acceptance files
-    # so a tunnel scrape failure cannot hide an otherwise complete product
-    # recovery result (or vice versa), while failing closed if either check
-    # fails.
+    stop_public_availability_monitor
+    # Materialize each independent result even when the load report fails.
+    # Load and recovery fail closed. Raw HTTP samples remain diagnostic here
+    # because abrupt-crash acceptance permits a retryable attempt and is
+    # enforced by the WebSocket recovery checks instead.
     local hard_crash_status=0
-    local traefik_status=0
     assert_hard_crash_report "$report_dir" "$load_summary" \
       || hard_crash_status=$?
-    assert_traefik_monitor "$report_dir" || traefik_status=$?
-    if (( hard_crash_status != 0 || traefik_status != 0 )); then
-      echo "Hard-crash certification failed: recovery=$hard_crash_status routing=$traefik_status" >&2
+    summarize_public_availability_observations \
+      "$public_availability_monitor_dir" \
+      "$report_dir/public-availability-summary.json" \
+      "${SNAKETRON_STAGING_TARGET%/}/api/health"
+    jq -n \
+      --argjson load_exit_status "$load_exit_status" \
+      --argjson recovery_status "$hard_crash_status" '
+        {
+          load_exit_status: $load_exit_status,
+          recovery_status: $recovery_status,
+          public_availability_evidence:
+            "diagnostic only; abrupt-crash acceptance is the WebSocket reconnect and fresh-snapshot recovery gate",
+          passed: (
+            $load_exit_status == 0
+            and $recovery_status == 0)
+        }
+      ' >"$report_dir/hard-crash-proof-status.json"
+    if (( load_exit_status != 0 \
+      || hard_crash_status != 0 )); then
+      echo "Hard-crash certification failed: load=$load_exit_status recovery=$hard_crash_status" >&2
       return 1
     fi
     echo "Hard-crash staging evidence written to $report_dir"
@@ -6685,8 +6891,8 @@ run_staging_suite() {
 
   local evidence_finished_at
   evidence_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  stop_traefik_monitor
-  assert_traefik_monitor "$report_dir"
+  stop_public_availability_monitor
+  assert_public_availability_monitor "$report_dir"
   # CloudWatch datapoints commonly arrive after their measurement timestamp.
   # Waiting changes no cloud state and prevents a false pass on partial data.
   sleep 120

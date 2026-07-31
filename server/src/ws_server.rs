@@ -226,6 +226,14 @@ const CHAT_HISTORY_LIMIT: usize = 200;
 const LOBBY_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
 const LOBBY_MATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SLOW_COMMAND_PUBLISH_THRESHOLD: Duration = Duration::from_secs(1);
+
+fn slow_command_publish_wait_ms(publish_wait: Duration) -> Option<u64> {
+    if publish_wait <= SLOW_COMMAND_PUBLISH_THRESHOLD {
+        return None;
+    }
+    Some(u64::try_from(publish_wait.as_millis()).unwrap_or(u64::MAX))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LobbyChatBroadcast {
@@ -3955,21 +3963,37 @@ async fn process_ws_message(
                             });
                         }
                         let partition_id = game_id % PARTITION_COUNT;
+                        let command_sequence = command_id.sequence;
                         let event = StreamEvent::GameCommandSubmittedV2 {
                             game_id,
                             user_id,
                             command_id,
                             command,
                         };
-                        match game_bus
+                        let publish_started = tokio::time::Instant::now();
+                        let publish_result = game_bus
                             .publish_game_command_unless_completed(
                                 cluster_namespace,
                                 partition_id,
                                 game_id,
                                 &event,
                             )
-                            .await
-                        {
+                            .await;
+                        let publish_wait = publish_started.elapsed();
+                        if let Some(publish_wait_ms) = slow_command_publish_wait_ms(publish_wait) {
+                            warn!(
+                                game_id,
+                                user_id,
+                                partition_id,
+                                command_sequence,
+                                gateway_task_boot_id = lifecycle.task_boot_id(),
+                                socket_generation,
+                                publish_wait_ms,
+                                publish_succeeded = publish_result.is_ok(),
+                                "Slow v2 game command publication"
+                            );
+                        }
+                        match publish_result {
                             Ok(true) => {}
                             Ok(false) => {
                                 debug!(
@@ -4342,8 +4366,9 @@ mod lifecycle_protocol_tests {
         game_join_failure_message, missing_game_join_failure, next_game_subscription_input,
         next_outbound_message, queue_planned_drain_notice, recovery_bridge_snapshot,
         send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
-        send_recovery_bridge_snapshot, snapshot_requires_command_outcomes,
-        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
+        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
+        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
+        take_lobby_update_receiver, unsent_lobby_match,
     };
     use crate::lifecycle::DrainNotice;
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -4365,6 +4390,19 @@ mod lifecycle_protocol_tests {
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn slow_command_publish_logging_uses_a_strict_one_second_threshold() {
+        assert_eq!(
+            slow_command_publish_wait_ms(Duration::from_millis(999)),
+            None
+        );
+        assert_eq!(slow_command_publish_wait_ms(Duration::from_secs(1)), None);
+        assert_eq!(
+            slow_command_publish_wait_ms(Duration::from_millis(1_001)),
+            Some(1_001)
+        );
+    }
 
     #[test]
     fn gateway_canonicalizes_untrusted_command_scope() {

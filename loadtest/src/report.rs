@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 12;
+pub const REPORT_SCHEMA_VERSION: u32 = 13;
 const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
 const MAX_AGGREGATE_SLOW_APPLICATION_PINGS: usize = 256;
 
@@ -330,6 +330,14 @@ pub struct SlowCommandResolution {
     /// the virtual-user driver processed it.
     #[serde(default)]
     pub reader_receipt_to_driver_lag_ms: u64,
+    /// Scheduling delay observed by the reader task's most recent sentinel
+    /// tick before it stamped the resolving frame.
+    #[serde(default)]
+    pub reader_task_latest_wake_lag_ms: u64,
+    /// Worst scheduling delay observed by this socket reader before it stamped
+    /// the resolving frame.
+    #[serde(default)]
+    pub reader_task_max_wake_lag_ms: u64,
 }
 
 /// Bounded application-level Ping/Pong evidence whose RTT exceeded the fixed
@@ -342,8 +350,25 @@ pub struct SlowApplicationPingObservation {
     pub sent_at_unix_ms: u64,
     pub received_at_unix_ms: u64,
     pub rtt_ms: u64,
+    /// Gateway wall clock captured when it handled the Ping. This value is
+    /// already present on the Pong wire message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_time: Option<i64>,
+    /// Last clock-offset estimate before this Pong could update it. Together
+    /// with `server_time`, this locates the delay before versus after gateway
+    /// handling without trusting a newly delayed sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_update_clock_offset_ms: Option<i64>,
     pub gateway_task_boot_id: Option<String>,
     pub socket_generation: Option<u64>,
+    /// Scheduling delay observed by the reader task's most recent sentinel
+    /// tick before it stamped this Pong.
+    #[serde(default)]
+    pub reader_task_latest_wake_lag_ms: u64,
+    /// Worst scheduling delay observed by this socket reader before it stamped
+    /// this Pong.
+    #[serde(default)]
+    pub reader_task_max_wake_lag_ms: u64,
 }
 
 /// Constant-space evidence of delay after the dedicated socket reader has
@@ -400,7 +425,7 @@ pub struct SessionMetrics {
     pub guest_auth_ms: Option<u64>,
     pub websocket_connect_ms: Option<u64>,
     /// First WebSocket connection attempt through the ordered application pong
-    /// that proves authentication is usable. This includes any bounded HTTP 503
+    /// that proves authentication is usable. This includes bounded transient
     /// admission retries made with the same guest token.
     pub initial_admission_ready_ms: Option<u64>,
     /// Initial and reconnect token-to-Authenticated handshakes. Bounded by the
@@ -872,7 +897,7 @@ pub struct SessionSummary {
     /// Later reconnect/handoff samples remain in the aggregate distribution.
     pub initial_websocket_auth_ms: Option<u64>,
     /// First WebSocket connection attempt through the authenticated ordered
-    /// application pong, including same-identity HTTP 503 retries.
+    /// application pong, including same-identity transient admission retries.
     pub initial_admission_ready_ms: Option<u64>,
     /// Exact `<database server id>:<executor boot UUID>` identity returned by
     /// the initial `Authenticated` frame and compared with the ten-member
@@ -1938,6 +1963,8 @@ mod tests {
                 first_websocket_write_completed_at_unix_ms: Some(sent_at_unix_ms + 2),
                 first_websocket_write_wait_ms: Some(2),
                 reader_receipt_to_driver_lag_ms: 3,
+                reader_task_latest_wake_lag_ms: 4,
+                reader_task_max_wake_lag_ms: 5,
             };
         let mut records = (0..10)
             .map(|sequence| resolution(sequence, 1_000 + sequence, 10_000 - sequence))
@@ -1967,8 +1994,12 @@ mod tests {
             sent_at_unix_ms,
             received_at_unix_ms: sent_at_unix_ms + rtt_ms,
             rtt_ms,
+            server_time: Some(sent_at_unix_ms as i64 + 10),
+            pre_update_clock_offset_ms: Some(5),
             gateway_task_boot_id: Some(gateway.to_owned()),
             socket_generation: Some(generation),
+            reader_task_latest_wake_lag_ms: 6,
+            reader_task_max_wake_lag_ms: 7,
         };
         let mut observations = vec![
             ping("session-a", 1_000, 4_000, "gateway-a", 1),
@@ -2046,6 +2077,8 @@ mod tests {
             first_websocket_write_completed_at_unix_ms: Some(10_002),
             first_websocket_write_wait_ms: Some(2),
             reader_receipt_to_driver_lag_ms: 3,
+            reader_task_latest_wake_lag_ms: 4,
+            reader_task_max_wake_lag_ms: 5,
         }];
         first.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
             session_id: "s1".to_owned(),
@@ -2053,8 +2086,12 @@ mod tests {
             sent_at_unix_ms: 10_000,
             received_at_unix_ms: 11_100,
             rtt_ms: 1_100,
+            server_time: Some(10_010),
+            pre_update_clock_offset_ms: Some(1),
             gateway_task_boot_id: Some("boot-a".to_owned()),
             socket_generation: Some(1),
+            reader_task_latest_wake_lag_ms: 6,
+            reader_task_max_wake_lag_ms: 7,
         }];
         first.game_id = Some(21);
         first.record_lifecycle(
@@ -2126,6 +2163,8 @@ mod tests {
             first_websocket_write_completed_at_unix_ms: Some(10_004),
             first_websocket_write_wait_ms: Some(3),
             reader_receipt_to_driver_lag_ms: 4,
+            reader_task_latest_wake_lag_ms: 5,
+            reader_task_max_wake_lag_ms: 6,
         }];
         second.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
             session_id: "s2".to_owned(),
@@ -2133,8 +2172,12 @@ mod tests {
             sent_at_unix_ms: 10_001,
             received_at_unix_ms: 12_001,
             rtt_ms: 2_000,
+            server_time: Some(10_011),
+            pre_update_clock_offset_ms: Some(2),
             gateway_task_boot_id: Some("boot-b".to_owned()),
             socket_generation: Some(2),
+            reader_task_latest_wake_lag_ms: 7,
+            reader_task_max_wake_lag_ms: 8,
         }];
         second.game_id = Some(32);
         second.record_lifecycle(SessionLifecycleRecord::new(
@@ -2179,7 +2222,7 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
-        assert_eq!(report.schema_version, 12);
+        assert_eq!(report.schema_version, 13);
         assert_eq!(report.sessions[0].started_at_unix_ms, 0);
         assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
         assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
@@ -2291,6 +2334,14 @@ mod tests {
             4
         );
         assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_task_latest_wake_lag_ms,
+            5
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_task_max_wake_lag_ms,
+            6
+        );
+        assert_eq!(
             report.metrics.slow_application_ping_observations,
             vec![
                 SlowApplicationPingObservation {
@@ -2299,8 +2350,12 @@ mod tests {
                     sent_at_unix_ms: 10_001,
                     received_at_unix_ms: 12_001,
                     rtt_ms: 2_000,
+                    server_time: Some(10_011),
+                    pre_update_clock_offset_ms: Some(2),
                     gateway_task_boot_id: Some("boot-b".to_owned()),
                     socket_generation: Some(2),
+                    reader_task_latest_wake_lag_ms: 7,
+                    reader_task_max_wake_lag_ms: 8,
                 },
                 SlowApplicationPingObservation {
                     session_id: "s1".to_owned(),
@@ -2308,8 +2363,12 @@ mod tests {
                     sent_at_unix_ms: 10_000,
                     received_at_unix_ms: 11_100,
                     rtt_ms: 1_100,
+                    server_time: Some(10_010),
+                    pre_update_clock_offset_ms: Some(1),
                     gateway_task_boot_id: Some("boot-a".to_owned()),
                     socket_generation: Some(1),
+                    reader_task_latest_wake_lag_ms: 6,
+                    reader_task_max_wake_lag_ms: 7,
                 },
             ]
         );
@@ -2338,6 +2397,16 @@ mod tests {
         assert_eq!(
             report_json.pointer("/metrics/slow_application_ping_observations/0/socket_generation"),
             Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_application_ping_observations/0/server_time"),
+            Some(&serde_json::json!(10_011))
+        );
+        assert_eq!(
+            report_json.pointer(
+                "/metrics/slow_application_ping_observations/0/reader_task_max_wake_lag_ms"
+            ),
+            Some(&serde_json::json!(8))
         );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);

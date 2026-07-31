@@ -1258,7 +1258,7 @@ produce more than one intermediate version. A fresh ten-task
 membership/ECS-health pair is captured immediately before scale-in. These
 snapshots complement continuous unowned-duration and fencing metrics. It also
 records the automatic, reset, forced scale-out, and forced scale-in windows;
-report schema 11 includes each session's launch
+report schema 13 includes each session's launch
 wave, start time, and bounded initial admission-ready duration so the admission
 assertion is phase-specific.
 
@@ -1296,7 +1296,7 @@ cooldown/evaluation cycles and final ECS convergence. The zero-load waiter
 keeps both SSM Valkey tunnels active with a once-per-minute read-only cluster
 control probe; inability to read the control path fails certification.
 
-Report schema 11 records coordinator-observed, server-confirmed peak
+Report schema 13 records coordinator-observed, server-confirmed peak
 authentication concurrency, fully joined active-game concurrency, lifecycle
 timestamps, exact initial task boot identity, planned-handoff evidence, and a
 per-second aggregate of logical command submissions, receipt-time scheduled
@@ -1343,11 +1343,17 @@ post-ready hold, no more than 64 sessions in flight, and ten-second p99
 readiness throughout the scale-in window. Exact task identities must cover the
 settled ten-task membership in both the transition and capacity phases.
 
-The runner continuously scrapes Traefik's service-server-up gauge, accepts its
-opaque per-task service IDs, and matches settled tasks by exact private-IP
-`:8080` URL. It fails on any scrape error or zero-healthy-backend sample.
-Settled ECS phase snapshots
-require every running task to be healthy. After CloudWatch ingestion settles,
+The runner checks Traefik's service-server-up gauge at each settled readiness
+boundary by matching every current healthy ECS task's exact private-IP
+`:8080` URL. It does not treat stale historical metric series as availability
+proof. A separately supervised one-hertz request to the public `/api/health`
+endpoint is the planned-path availability gate: every sample must complete,
+return HTTP 200 with `status: "ok"`, preserve sequence, and remain inside its
+bounded coverage cadence. The same public evidence is retained as diagnostic
+during abrupt crash because that boundary explicitly permits a retryable
+transport interruption and is instead gated by WebSocket recovery. Settled ECS
+phase snapshots require every running task to be healthy. After CloudWatch
+ingestion settles,
 the runner requires complete time-bucket coverage for ECS CPU/memory, Serverless
 Valkey bytes/ECPU/read-write latency/connections/network/evictions/throttling,
 Traefik-host CPU/network, and resilience
