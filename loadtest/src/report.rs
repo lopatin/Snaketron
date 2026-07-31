@@ -15,8 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 11;
+pub const REPORT_SCHEMA_VERSION: u32 = 12;
 const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
+const MAX_AGGREGATE_SLOW_APPLICATION_PINGS: usize = 256;
 
 /// Keep the slowest evidence while reserving one representative for every
 /// violating original-send second that fits in the fixed report budget.
@@ -63,6 +64,74 @@ pub(crate) fn retain_slow_resolution_coverage(
     }
     let mut index = 0;
     resolutions.retain(|_| {
+        let retain = selected[index];
+        index += 1;
+        retain
+    });
+}
+
+/// Bound slow Ping/Pong provenance without allowing one busy session or one
+/// delayed second to consume the aggregate evidence budget. Records are
+/// retained in descending RTT order while first reserving time coverage and
+/// then connection-identity coverage.
+pub(crate) fn retain_slow_ping_coverage(
+    observations: &mut Vec<SlowApplicationPingObservation>,
+    limit: usize,
+) {
+    observations.sort_by(|left, right| {
+        right
+            .rtt_ms
+            .cmp(&left.rtt_ms)
+            .then_with(|| left.sent_at_unix_ms.cmp(&right.sent_at_unix_ms))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.client_time.cmp(&right.client_time))
+    });
+    if observations.len() <= limit {
+        return;
+    }
+
+    let mut selected = vec![false; observations.len()];
+    let mut represented_seconds = std::collections::BTreeSet::new();
+    let mut selected_count = 0;
+    for (index, observation) in observations.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        if represented_seconds.insert(observation.sent_at_unix_ms / 1_000) {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+
+    let mut represented_connections = std::collections::BTreeSet::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        let identity = (
+            observation.session_id.as_str(),
+            observation.gateway_task_boot_id.as_deref(),
+            observation.socket_generation,
+        );
+        if represented_connections.insert(identity) && !selected[index] {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+
+    if selected_count < limit {
+        for is_selected in &mut selected {
+            if selected_count == limit {
+                break;
+            }
+            if !*is_selected {
+                *is_selected = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut index = 0;
+    observations.retain(|_| {
         let retain = selected[index];
         index += 1;
         retain
@@ -248,6 +317,33 @@ pub struct SlowCommandResolution {
     /// correlated separately by partition and timestamp.
     pub gateway_task_boot_id: Option<String>,
     pub socket_generation: Option<u64>,
+    /// Wall-clock completion of the command's original WebSocket write. This
+    /// remains absent only when that first write never returned before the
+    /// command was otherwise resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_websocket_write_completed_at_unix_ms: Option<u64>,
+    /// Monotonic wait from the original `sent_at` gate anchor through completion
+    /// of its first WebSocket write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_websocket_write_wait_ms: Option<u64>,
+    /// Delay after the dedicated reader stamped the resolving frame and before
+    /// the virtual-user driver processed it.
+    #[serde(default)]
+    pub reader_receipt_to_driver_lag_ms: u64,
+}
+
+/// Bounded application-level Ping/Pong evidence whose RTT exceeded the fixed
+/// one-second diagnostic threshold. Receipt is stamped by the dedicated socket
+/// reader, independently of virtual-user driver scheduling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowApplicationPingObservation {
+    pub session_id: String,
+    pub client_time: i64,
+    pub sent_at_unix_ms: u64,
+    pub received_at_unix_ms: u64,
+    pub rtt_ms: u64,
+    pub gateway_task_boot_id: Option<String>,
+    pub socket_generation: Option<u64>,
 }
 
 /// Constant-space evidence of delay after the dedicated socket reader has
@@ -397,6 +493,10 @@ pub struct SessionMetrics {
     /// to the slowest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slow_command_resolutions: Vec<SlowCommandResolution>,
+    /// Bounded slow application Ping/Pong observations, measured to the
+    /// dedicated reader rather than driver processing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_application_ping_observations: Vec<SlowApplicationPingObservation>,
     pub disconnects: u64,
     pub reconnects: u64,
 }
@@ -726,6 +826,11 @@ pub struct AggregateMetrics {
     /// then keeps the slowest remaining records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slow_command_resolutions: Vec<SlowCommandResolution>,
+    /// Bounded Ping/Pong RTTs above one second. The cap preserves distinct send
+    /// seconds and session/gateway/socket identities before filling remaining
+    /// slots with the slowest observations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_application_ping_observations: Vec<SlowApplicationPingObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -872,6 +977,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut command_outcome_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
     let mut command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::<u64, u64>::new();
     let mut slow_command_resolutions = Vec::<SlowCommandResolution>::new();
+    let mut slow_application_ping_observations = Vec::<SlowApplicationPingObservation>::new();
 
     let sessions = run
         .sessions
@@ -987,6 +1093,13 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             }
             slow_command_resolutions
                 .extend(session.metrics.slow_command_resolutions.iter().cloned());
+            slow_application_ping_observations.extend(
+                session
+                    .metrics
+                    .slow_application_ping_observations
+                    .iter()
+                    .cloned(),
+            );
             traffic.disconnects = traffic
                 .disconnects
                 .saturating_add(session.metrics.disconnects);
@@ -1085,6 +1198,10 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
         &mut slow_command_resolutions,
         MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS,
     );
+    retain_slow_ping_coverage(
+        &mut slow_application_ping_observations,
+        MAX_AGGREGATE_SLOW_APPLICATION_PINGS,
+    );
 
     let total = run.sessions.len();
     let denominator = total.max(1) as f64;
@@ -1155,6 +1272,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             command_outcome_counts_by_sent_unix_second,
             command_outcome_max_latency_ms_by_sent_unix_second,
             slow_command_resolutions,
+            slow_application_ping_observations,
         },
         failures_by_phase,
         failures_by_message,
@@ -1817,6 +1935,9 @@ mod tests {
                 source: CommandResolutionSource::LiveScheduledEvent,
                 gateway_task_boot_id: Some("task".to_owned()),
                 socket_generation: Some(1),
+                first_websocket_write_completed_at_unix_ms: Some(sent_at_unix_ms + 2),
+                first_websocket_write_wait_ms: Some(2),
+                reader_receipt_to_driver_lag_ms: 3,
             };
         let mut records = (0..10)
             .map(|sequence| resolution(sequence, 1_000 + sequence, 10_000 - sequence))
@@ -1831,6 +1952,45 @@ mod tests {
                 .iter()
                 .any(|record| record.sent_at_unix_ms / 1_000 == 2),
             "one severe second consumed the entire aggregate provenance cap"
+        );
+    }
+
+    #[test]
+    fn slow_ping_cap_preserves_time_and_connection_coverage() {
+        let ping = |session_id: &str,
+                    sent_at_unix_ms: u64,
+                    rtt_ms: u64,
+                    gateway: &str,
+                    generation: u64| SlowApplicationPingObservation {
+            session_id: session_id.to_owned(),
+            client_time: sent_at_unix_ms as i64,
+            sent_at_unix_ms,
+            received_at_unix_ms: sent_at_unix_ms + rtt_ms,
+            rtt_ms,
+            gateway_task_boot_id: Some(gateway.to_owned()),
+            socket_generation: Some(generation),
+        };
+        let mut observations = vec![
+            ping("session-a", 1_000, 4_000, "gateway-a", 1),
+            ping("session-a", 1_001, 3_000, "gateway-a", 1),
+            ping("session-a", 2_000, 1_001, "gateway-a", 1),
+            ping("session-b", 1_002, 1_002, "gateway-b", 2),
+        ];
+
+        retain_slow_ping_coverage(&mut observations, 3);
+
+        assert_eq!(observations.len(), 3);
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.sent_at_unix_ms / 1_000 == 2),
+            "one delayed second consumed the entire ping evidence cap"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.session_id == "session-b"),
+            "one connection consumed the entire ping evidence cap"
         );
     }
 
@@ -1881,6 +2041,18 @@ mod tests {
             resolved_at_unix_ms: 11_500,
             latency_ms: 1_500,
             source: CommandResolutionSource::LiveScheduledEvent,
+            gateway_task_boot_id: Some("boot-a".to_owned()),
+            socket_generation: Some(1),
+            first_websocket_write_completed_at_unix_ms: Some(10_002),
+            first_websocket_write_wait_ms: Some(2),
+            reader_receipt_to_driver_lag_ms: 3,
+        }];
+        first.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
+            session_id: "s1".to_owned(),
+            client_time: 10_000,
+            sent_at_unix_ms: 10_000,
+            received_at_unix_ms: 11_100,
+            rtt_ms: 1_100,
             gateway_task_boot_id: Some("boot-a".to_owned()),
             socket_generation: Some(1),
         }];
@@ -1951,6 +2123,18 @@ mod tests {
             source: CommandResolutionSource::RecoveryScheduledOutcome,
             gateway_task_boot_id: Some("boot-b".to_owned()),
             socket_generation: Some(2),
+            first_websocket_write_completed_at_unix_ms: Some(10_004),
+            first_websocket_write_wait_ms: Some(3),
+            reader_receipt_to_driver_lag_ms: 4,
+        }];
+        second.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
+            session_id: "s2".to_owned(),
+            client_time: 10_001,
+            sent_at_unix_ms: 10_001,
+            received_at_unix_ms: 12_001,
+            rtt_ms: 2_000,
+            gateway_task_boot_id: Some("boot-b".to_owned()),
+            socket_generation: Some(2),
         }];
         second.game_id = Some(32);
         second.record_lifecycle(SessionLifecycleRecord::new(
@@ -1995,7 +2179,7 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
-        assert_eq!(report.schema_version, 11);
+        assert_eq!(report.schema_version, 12);
         assert_eq!(report.sessions[0].started_at_unix_ms, 0);
         assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
         assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
@@ -2098,6 +2282,37 @@ mod tests {
             report.metrics.slow_command_resolutions[0].source,
             CommandResolutionSource::RecoveryScheduledOutcome
         );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].first_websocket_write_wait_ms,
+            Some(3)
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_receipt_to_driver_lag_ms,
+            4
+        );
+        assert_eq!(
+            report.metrics.slow_application_ping_observations,
+            vec![
+                SlowApplicationPingObservation {
+                    session_id: "s2".to_owned(),
+                    client_time: 10_001,
+                    sent_at_unix_ms: 10_001,
+                    received_at_unix_ms: 12_001,
+                    rtt_ms: 2_000,
+                    gateway_task_boot_id: Some("boot-b".to_owned()),
+                    socket_generation: Some(2),
+                },
+                SlowApplicationPingObservation {
+                    session_id: "s1".to_owned(),
+                    client_time: 10_000,
+                    sent_at_unix_ms: 10_000,
+                    received_at_unix_ms: 11_100,
+                    rtt_ms: 1_100,
+                    gateway_task_boot_id: Some("boot-a".to_owned()),
+                    socket_generation: Some(1),
+                },
+            ]
+        );
         let report_json = serde_json::to_value(&report).expect("aggregate report serializes");
         assert_eq!(
             report_json.pointer("/metrics/command_counts_by_unix_second/10"),
@@ -2119,6 +2334,10 @@ mod tests {
         assert_eq!(
             report_json.pointer("/metrics/websocket_dispatch_lag/maximum_ms"),
             Some(&serde_json::json!(1_500))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_application_ping_observations/0/socket_generation"),
+            Some(&serde_json::json!(2))
         );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);

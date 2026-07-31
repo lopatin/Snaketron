@@ -3256,7 +3256,12 @@ start_traefik_monitor() {
       sequence=$((sequence + 1))
       local sample
       printf -v sample '%s/%06d.prom' "$traefik_monitor_dir" "$sequence"
-      if ! curl -fsS --max-time 3 "$staging_traefik_metrics_control_url" >"$sample"; then
+      # The SSM tunnel can need more than three seconds to carry the complete
+      # metrics body even while Traefik is healthy. A partial body is still a
+      # failed sample, and any failed sample still fails certification; the
+      # wider transfer bound only avoids aborting a healthy in-progress body.
+      if ! curl -fsS --connect-timeout 1 --max-time 5 \
+        "$staging_traefik_metrics_control_url" >"$sample"; then
         mv "$sample" "$sample.error"
       fi
       sleep 2
@@ -3295,7 +3300,7 @@ assert_traefik_monitor() {
       zero_ready_count=$((zero_ready_count + 1))
     fi
   done
-  jq -n \
+  if ! jq -n \
     --argjson samples "$sample_count" \
     --argjson scrape_errors "$error_count" \
     --argjson zero_healthy_backend_samples "$zero_ready_count" \
@@ -3303,7 +3308,10 @@ assert_traefik_monitor() {
       samples: $samples,
       scrape_errors: $scrape_errors,
       zero_healthy_backend_samples: $zero_healthy_backend_samples
-    }' >"$report_dir/traefik-summary.json"
+    }' >"$report_dir/traefik-summary.json"; then
+    echo "Could not write Traefik routing evidence" >&2
+    return 1
+  fi
   if (( sample_count < 10 || error_count > 0 || zero_ready_count > 0 )); then
     echo "Traefik evidence was incomplete or observed a zero-healthy-backend sample; see traefik-summary.json" >&2
     return 1
@@ -4684,7 +4692,7 @@ collect_crash_ecs_runtime_evidence() {
 assert_hard_crash_report() {
   local report_dir="$1"
   local summary="$2"
-  jq -n \
+  if ! jq -n \
     --slurpfile report "$summary" \
     --slurpfile manifest "$report_dir/hard-crash-manifest.json" \
     --slurpfile pre "$report_dir/control-plane-pre-crash-10.json" \
@@ -5033,7 +5041,10 @@ assert_hard_crash_report() {
           }
         }
       | .passed = ([.checks[]] | all)
-    ' >"$report_dir/hard-crash-acceptance.json"
+    ' >"$report_dir/hard-crash-acceptance.json"; then
+    echo "Could not write hard-crash acceptance evidence" >&2
+    return 1
+  fi
   jq -e '.passed' "$report_dir/hard-crash-acceptance.json" >/dev/null || {
     echo "Hard-crash recovery failed its session, command, ownership, or five-second output gates" >&2
     return 1
@@ -5720,8 +5731,19 @@ run_staging_suite() {
     stop_ecs_runtime_monitor
     collect_crash_ecs_runtime_evidence "$report_dir"
     stop_traefik_monitor
-    assert_traefik_monitor "$report_dir"
-    assert_hard_crash_report "$report_dir" "$load_summary"
+    # These are independent proofs. Always materialize both acceptance files
+    # so a tunnel scrape failure cannot hide an otherwise complete product
+    # recovery result (or vice versa), while failing closed if either check
+    # fails.
+    local hard_crash_status=0
+    local traefik_status=0
+    assert_hard_crash_report "$report_dir" "$load_summary" \
+      || hard_crash_status=$?
+    assert_traefik_monitor "$report_dir" || traefik_status=$?
+    if (( hard_crash_status != 0 || traefik_status != 0 )); then
+      echo "Hard-crash certification failed: recovery=$hard_crash_status routing=$traefik_status" >&2
+      return 1
+    fi
     echo "Hard-crash staging evidence written to $report_dir"
     return 0
   fi

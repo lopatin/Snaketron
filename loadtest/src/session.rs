@@ -3,8 +3,9 @@
 use crate::config::{CommandProfile, Population};
 use crate::report::{
     CommandResolutionSource, HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord,
-    SessionMetrics, SessionOutcome, SessionPhase, SessionRecord, SlowCommandResolution,
-    retain_slow_resolution_coverage, unix_time_ms,
+    SessionMetrics, SessionOutcome, SessionPhase, SessionRecord, SlowApplicationPingObservation,
+    SlowCommandResolution, retain_slow_ping_coverage, retain_slow_resolution_coverage,
+    unix_time_ms,
 };
 use crate::target::BackendHintRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -174,6 +175,8 @@ struct PendingCommand {
     message: GameCommandMessage,
     sent_at_unix_ms: u64,
     sent_at: Instant,
+    first_websocket_write_completed_at_unix_ms: Option<u64>,
+    first_websocket_write_wait_ms: Option<u64>,
 }
 
 struct PendingCommandResolution {
@@ -181,12 +184,20 @@ struct PendingCommandResolution {
     sent_at_unix_ms: u64,
     resolved_at_unix_ms: u64,
     latency_ms: u64,
+    first_websocket_write_completed_at_unix_ms: Option<u64>,
+    first_websocket_write_wait_ms: Option<u64>,
+}
+
+struct ApplicationPingSend {
+    sent_at_unix_ms: u64,
+    sent_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct FrameObservation {
     received_at_unix_ms: u64,
     received_at: Instant,
+    reader_receipt_to_driver_lag_ms: u64,
 }
 
 impl FrameObservation {
@@ -194,6 +205,7 @@ impl FrameObservation {
         Self {
             received_at_unix_ms: unix_time_ms(),
             received_at: Instant::now(),
+            reader_receipt_to_driver_lag_ms: 0,
         }
     }
 }
@@ -246,7 +258,9 @@ impl Socket {
     }
 
     async fn next(&mut self) -> Option<std::result::Result<Message, WebSocketError>> {
-        let observed = self.inbound.recv().await?;
+        let mut observed = self.inbound.recv().await?;
+        observed.observation.reader_receipt_to_driver_lag_ms =
+            duration_between_ms(Instant::now(), observed.observation.received_at);
         self.last_observation = Some(observed.observation);
         Some(observed.frame)
     }
@@ -287,6 +301,17 @@ impl std::error::Error for WebSocketConnectTimeout {}
 
 const SLOW_COMMAND_RESOLUTION_THRESHOLD_MS: u64 = 1_000;
 const MAX_SESSION_SLOW_COMMAND_RESOLUTIONS: usize = 32;
+const SLOW_APPLICATION_PING_THRESHOLD_MS: u64 = 1_000;
+const MAX_SESSION_SLOW_APPLICATION_PINGS: usize = 32;
+const MAX_OUTSTANDING_APPLICATION_PINGS: usize = 32;
+
+const fn reconnect_delay_for_attempt(attempt: u32) -> Duration {
+    if attempt == 0 {
+        Duration::ZERO
+    } else {
+        RECONNECT_DELAY
+    }
+}
 
 struct LiveSession {
     record: SessionRecord,
@@ -314,6 +339,7 @@ struct LiveSession {
     client_game_session_id: String,
     next_command_sequence: u64,
     pending_commands: BTreeMap<u64, PendingCommand>,
+    pending_application_pings: BTreeMap<i64, ApplicationPingSend>,
     terminal_games_observed: BTreeSet<u32>,
     server_capabilities: BTreeSet<String>,
     activity_lease: SessionActivityLease,
@@ -1459,6 +1485,7 @@ async fn perform_pre_game_planned_handoff(
         {
             Ok(mut candidate) => {
                 let mut old_socket = std::mem::replace(&mut session.socket, candidate.socket);
+                session.pending_application_pings.clear();
                 if candidate.sticky_cookie.is_some() {
                     session.sticky_cookie = candidate.sticky_cookie.take();
                 }
@@ -1747,6 +1774,7 @@ async fn prepare_session(
         client_game_session_id: format!("loadtest-{run_id}-{session_index}"),
         next_command_sequence: 1,
         pending_commands: BTreeMap::new(),
+        pending_application_pings: BTreeMap::new(),
         terminal_games_observed: BTreeSet::new(),
         server_capabilities: BTreeSet::new(),
         activity_lease,
@@ -2204,6 +2232,7 @@ async fn recover_pre_game_socket(
     session.record.metrics.disconnects = session.record.metrics.disconnects.saturating_add(1);
     let recovery_started = Instant::now();
     let mut last_error = cause;
+    let mut recovery_attempt = 0;
     loop {
         if cancellation.is_cancelled() {
             return Err(anyhow!(
@@ -2216,18 +2245,22 @@ async fn recover_pre_game_socket(
             ));
         }
 
+        let reconnect_delay = reconnect_delay_for_attempt(recovery_attempt);
+        if !reconnect_delay.is_zero() {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("operation cancelled while restoring pre-game session"));
+                }
+                _ = tokio::time::sleep(reconnect_delay) => {}
+            }
+        }
+        recovery_attempt = recovery_attempt.saturating_add(1);
         session.reconnects += 1;
         session.record.metrics.reconnects = session.record.metrics.reconnects.saturating_add(1);
         session
             .record
             .diagnostics
             .insert("reconnects".to_owned(), session.reconnects.to_string());
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(anyhow!("operation cancelled while restoring pre-game session"));
-            }
-            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
-        }
 
         session.record.record_lifecycle(
             SessionLifecycleRecord::new(SessionPhase::WebSocketConnect, unix_time_ms())
@@ -3122,6 +3155,7 @@ async fn recover_game_snapshot(
         u64::try_from(session.pending_commands.len()).unwrap_or(u64::MAX);
     let recovery_started = Instant::now();
     let mut last_error = cause;
+    let mut recovery_attempt = 0;
 
     loop {
         if cancellation.is_cancelled() {
@@ -3135,19 +3169,22 @@ async fn recover_game_snapshot(
             ));
         }
 
+        let reconnect_delay = reconnect_delay_for_attempt(recovery_attempt);
+        if !reconnect_delay.is_zero() {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("operation cancelled while reconnecting to game {game_id}"));
+                }
+                _ = tokio::time::sleep(reconnect_delay) => {}
+            }
+        }
+        recovery_attempt = recovery_attempt.saturating_add(1);
         session.reconnects += 1;
         session.record.metrics.reconnects = session.record.metrics.reconnects.saturating_add(1);
         session
             .record
             .diagnostics
             .insert("reconnects".to_owned(), session.reconnects.to_string());
-
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(anyhow!("operation cancelled while reconnecting to game {game_id}"));
-            }
-            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
-        }
 
         if let Err(error) = session
             .reconnect(settings.connect_timeout, cancellation)
@@ -3988,6 +4025,7 @@ async fn perform_planned_handoff(
                     );
 
                 let mut old_socket = std::mem::replace(&mut session.socket, candidate.socket);
+                session.pending_application_pings.clear();
                 if candidate.sticky_cookie.is_some() {
                     session.sticky_cookie = candidate.sticky_cookie.take();
                 }
@@ -4493,6 +4531,9 @@ fn record_pending_command_resolution(
         sent_at_unix_ms: command.sent_at_unix_ms,
         resolved_at_unix_ms,
         latency_ms,
+        first_websocket_write_completed_at_unix_ms: command
+            .first_websocket_write_completed_at_unix_ms,
+        first_websocket_write_wait_ms: command.first_websocket_write_wait_ms,
     })
 }
 
@@ -4520,6 +4561,20 @@ fn retain_slow_command_resolution(metrics: &mut SessionMetrics, resolution: Slow
     retain_slow_resolution_coverage(
         &mut metrics.slow_command_resolutions,
         MAX_SESSION_SLOW_COMMAND_RESOLUTIONS,
+    );
+}
+
+fn retain_slow_application_ping(
+    metrics: &mut SessionMetrics,
+    observation: SlowApplicationPingObservation,
+) {
+    if observation.rtt_ms <= SLOW_APPLICATION_PING_THRESHOLD_MS {
+        return;
+    }
+    metrics.slow_application_ping_observations.push(observation);
+    retain_slow_ping_coverage(
+        &mut metrics.slow_application_ping_observations,
+        MAX_SESSION_SLOW_APPLICATION_PINGS,
     );
 }
 
@@ -4647,6 +4702,10 @@ impl LiveSession {
                 source,
                 gateway_task_boot_id: gateway_task_boot_id.map(str::to_owned),
                 socket_generation,
+                first_websocket_write_completed_at_unix_ms: resolution
+                    .first_websocket_write_completed_at_unix_ms,
+                first_websocket_write_wait_ms: resolution.first_websocket_write_wait_ms,
+                reader_receipt_to_driver_lag_ms: observation.reader_receipt_to_driver_lag_ms,
             },
         );
         true
@@ -4705,6 +4764,7 @@ impl LiveSession {
                     received_at_unix_ms: observation
                         .received_at_unix_ms
                         .max(pending.sent_at_unix_ms),
+                    reader_receipt_to_driver_lag_ms: observation.reader_receipt_to_driver_lag_ms,
                 })
                 .unwrap_or(observation);
             self.record_command_resolution(
@@ -4744,6 +4804,8 @@ impl LiveSession {
                 message: command.clone(),
                 sent_at_unix_ms,
                 sent_at: Instant::now(),
+                first_websocket_write_completed_at_unix_ms: None,
+                first_websocket_write_wait_ms: None,
             },
         );
         // This is one logical client submission even when the socket write is
@@ -4757,11 +4819,17 @@ impl LiveSession {
             .entry(sent_at_unix_ms / 1_000)
             .or_default();
         *commands_in_second = commands_in_second.saturating_add(1);
-        self.send(WSMessage::GameCommandV2 {
-            command_id,
-            command,
-        })
-        .await
+        let result = self
+            .send(WSMessage::GameCommandV2 {
+                command_id,
+                command,
+            })
+            .await;
+        if let Some(pending) = self.pending_commands.get_mut(&sequence) {
+            pending.first_websocket_write_completed_at_unix_ms = Some(unix_time_ms());
+            pending.first_websocket_write_wait_ms = Some(elapsed_ms(pending.sent_at));
+        }
+        result
     }
 
     async fn resend_pending_commands(&mut self, game_id: u32) -> Result<()> {
@@ -4797,8 +4865,28 @@ impl LiveSession {
 
     async fn send(&mut self, message: WSMessage) -> Result<()> {
         let kind = message_kind(&message);
+        let application_ping = match &message {
+            WSMessage::Ping { client_time } => Some((
+                *client_time,
+                ApplicationPingSend {
+                    sent_at_unix_ms: unix_time_ms(),
+                    sent_at: Instant::now(),
+                },
+            )),
+            _ => None,
+        };
         let payload = serde_json::to_string(&message)?;
         self.socket.send(Message::Text(payload)).await?;
+        if let Some((client_time, application_ping)) = application_ping {
+            if self.pending_application_pings.len() >= MAX_OUTSTANDING_APPLICATION_PINGS
+                && let Some(oldest) = self.pending_application_pings.first_key_value()
+            {
+                let oldest = *oldest.0;
+                self.pending_application_pings.remove(&oldest);
+            }
+            self.pending_application_pings
+                .insert(client_time, application_ping);
+        }
         self.observe_sent(kind);
         Ok(())
     }
@@ -4850,7 +4938,24 @@ impl LiveSession {
         self.record
             .metrics
             .websocket_dispatch_lag
-            .observe(duration_between_ms(Instant::now(), observation.received_at));
+            .observe(observation.reader_receipt_to_driver_lag_ms);
+        if let WSMessage::Pong { client_time, .. } = message
+            && let Some(ping) = self.pending_application_pings.remove(client_time)
+            && observation.received_at >= ping.sent_at
+        {
+            retain_slow_application_ping(
+                &mut self.record.metrics,
+                SlowApplicationPingObservation {
+                    session_id: self.record.session_id.clone(),
+                    client_time: *client_time,
+                    sent_at_unix_ms: ping.sent_at_unix_ms,
+                    received_at_unix_ms: observation.received_at_unix_ms,
+                    rtt_ms: duration_between_ms(observation.received_at, ping.sent_at),
+                    gateway_task_boot_id: gateway_task_boot_id.map(str::to_owned),
+                    socket_generation,
+                },
+            );
+        }
         if let Some((source, from_sequence)) =
             rejection_fence_for_current_session(message, self.user_id, &self.client_game_session_id)
         {
@@ -5092,6 +5197,7 @@ impl LiveSession {
         };
         let (socket, backend, sticky_cookie) = connect_result?;
         self.socket = socket;
+        self.pending_application_pings.clear();
         if sticky_cookie.is_some() {
             self.sticky_cookie = sticky_cookie;
         }
@@ -5523,6 +5629,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crash_reconnect_is_immediate_then_bounded() {
+        assert_eq!(reconnect_delay_for_attempt(0), Duration::ZERO);
+        assert_eq!(reconnect_delay_for_attempt(1), RECONNECT_DELAY);
+        assert_eq!(reconnect_delay_for_attempt(u32::MAX), RECONNECT_DELAY);
+    }
+
+    #[test]
     fn only_transient_websocket_failures_are_retryable_admission() {
         let timeout = anyhow::Error::new(WebSocketConnectTimeout {
             timeout: ADMISSION_CONNECT_ATTEMPT_TIMEOUT,
@@ -5624,6 +5737,8 @@ mod tests {
                     message: message.clone(),
                     sent_at_unix_ms: 123_456,
                     sent_at,
+                    first_websocket_write_completed_at_unix_ms: Some(123_457),
+                    first_websocket_write_wait_ms: Some(1),
                 },
             ),
             (
@@ -5632,6 +5747,8 @@ mod tests {
                     message: message.clone(),
                     sent_at_unix_ms: 123_456,
                     sent_at,
+                    first_websocket_write_completed_at_unix_ms: Some(123_457),
+                    first_websocket_write_wait_ms: Some(1),
                 },
             ),
             (
@@ -5640,6 +5757,8 @@ mod tests {
                     message,
                     sent_at_unix_ms: 123_456,
                     sent_at,
+                    first_websocket_write_completed_at_unix_ms: Some(123_457),
+                    first_websocket_write_wait_ms: Some(1),
                 },
             ),
         ]);
@@ -5647,17 +5766,21 @@ mod tests {
         let observation = FrameObservation {
             received_at_unix_ms: 123_461,
             received_at: sent_at + Duration::from_millis(5),
+            reader_receipt_to_driver_lag_ms: 7,
         };
 
-        assert!(
-            record_scheduled_pending_command_resolution(
-                &mut pending_commands,
-                &mut metrics,
-                1,
-                observation,
-            )
-            .is_some()
+        let scheduled = record_scheduled_pending_command_resolution(
+            &mut pending_commands,
+            &mut metrics,
+            1,
+            observation,
+        )
+        .expect("scheduled command should resolve exactly once");
+        assert_eq!(
+            scheduled.first_websocket_write_completed_at_unix_ms,
+            Some(123_457)
         );
+        assert_eq!(scheduled.first_websocket_write_wait_ms, Some(1));
         assert!(
             record_scheduled_pending_command_resolution(
                 &mut pending_commands,
@@ -5719,6 +5842,9 @@ mod tests {
             source: CommandResolutionSource::LiveScheduledEvent,
             gateway_task_boot_id: Some("task-a".to_owned()),
             socket_generation: Some(1),
+            first_websocket_write_completed_at_unix_ms: Some(1_002 + sequence),
+            first_websocket_write_wait_ms: Some(2),
+            reader_receipt_to_driver_lag_ms: 3,
         };
 
         retain_slow_command_resolution(&mut metrics, diagnostic(0, 1_000));
@@ -5758,6 +5884,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slow_application_ping_provenance_is_thresholded_and_bounded() {
+        let mut metrics = SessionMetrics::default();
+        let diagnostic =
+            |sequence: u64, sent_at_unix_ms: u64, rtt_ms: u64, gateway: &str, generation: u64| {
+                SlowApplicationPingObservation {
+                    session_id: format!("session-{sequence}"),
+                    client_time: sent_at_unix_ms as i64,
+                    sent_at_unix_ms,
+                    received_at_unix_ms: sent_at_unix_ms + rtt_ms,
+                    rtt_ms,
+                    gateway_task_boot_id: Some(gateway.to_owned()),
+                    socket_generation: Some(generation),
+                }
+            };
+
+        retain_slow_application_ping(
+            &mut metrics,
+            diagnostic(0, 1_000, SLOW_APPLICATION_PING_THRESHOLD_MS, "task-a", 1),
+        );
+        assert!(metrics.slow_application_ping_observations.is_empty());
+
+        for sequence in 1..=40 {
+            retain_slow_application_ping(
+                &mut metrics,
+                diagnostic(
+                    sequence,
+                    1_000 + sequence,
+                    SLOW_APPLICATION_PING_THRESHOLD_MS + sequence,
+                    "task-a",
+                    1,
+                ),
+            );
+        }
+        let second_connection = diagnostic(100, 2_000, 1_001, "task-b", 2);
+        retain_slow_application_ping(&mut metrics, second_connection);
+
+        assert_eq!(
+            metrics.slow_application_ping_observations.len(),
+            MAX_SESSION_SLOW_APPLICATION_PINGS
+        );
+        assert!(
+            metrics
+                .slow_application_ping_observations
+                .iter()
+                .any(|observation| observation.gateway_task_boot_id.as_deref() == Some("task-b")),
+            "one socket consumed the entire session ping evidence cap"
+        );
+    }
+
     fn pending_command(sequence: u64) -> PendingCommand {
         use common::CommandId;
 
@@ -5776,6 +5952,8 @@ mod tests {
             },
             sent_at_unix_ms: 123_456,
             sent_at: Instant::now(),
+            first_websocket_write_completed_at_unix_ms: Some(123_457),
+            first_websocket_write_wait_ms: Some(1),
         }
     }
 
@@ -5790,6 +5968,7 @@ mod tests {
         let observation = FrameObservation {
             received_at_unix_ms: 10_125,
             received_at: sent_at + Duration::from_millis(125),
+            reader_receipt_to_driver_lag_ms: 1_875,
         };
 
         let resolution =
@@ -5797,6 +5976,11 @@ mod tests {
 
         assert_eq!(resolution.latency_ms, 125);
         assert_eq!(resolution.resolved_at_unix_ms, 10_125);
+        assert_eq!(
+            resolution.first_websocket_write_completed_at_unix_ms,
+            Some(123_457)
+        );
+        assert_eq!(resolution.first_websocket_write_wait_ms, Some(1));
         assert!(
             elapsed_ms(sent_at) >= 2_000,
             "the test must exercise a driver that observes the outcome much later"
@@ -5813,6 +5997,7 @@ mod tests {
         let stale_observation = FrameObservation {
             received_at_unix_ms: 123_455,
             received_at: sent_at.checked_sub(Duration::from_millis(1)).unwrap(),
+            reader_receipt_to_driver_lag_ms: 0,
         };
 
         assert!(
@@ -6128,6 +6313,10 @@ mod tests {
             duration_between_ms(Instant::now(), observation.received_at) >= 40,
             "receipt timestamp was taken when the driver polled, not by the reader"
         );
+        assert!(
+            observation.reader_receipt_to_driver_lag_ms >= 40,
+            "reader-to-driver lag was not frozen when the driver received the frame"
+        );
         socket.close().await.unwrap();
         server.await.unwrap();
     }
@@ -6316,6 +6505,7 @@ mod tests {
             client_game_session_id: "test-session-1".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(1, activity_sender),
@@ -6472,6 +6662,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
@@ -6516,6 +6707,7 @@ mod tests {
                 FrameObservation {
                     received_at_unix_ms: 124_455,
                     received_at: sent_at + Duration::from_millis(999),
+                    reader_receipt_to_driver_lag_ms: 0,
                 },
             )
             .expect_err("a terminal default cannot precede terminal state");
@@ -6545,6 +6737,7 @@ mod tests {
                 FrameObservation {
                     received_at_unix_ms: 124_456,
                     received_at: sent_at + Duration::from_millis(1_000),
+                    reader_receipt_to_driver_lag_ms: 0,
                 },
             )
             .unwrap();
@@ -6572,6 +6765,7 @@ mod tests {
                 FrameObservation {
                     received_at_unix_ms: 124_956,
                     received_at: sent_at + Duration::from_millis(1_500),
+                    reader_receipt_to_driver_lag_ms: 11,
                 },
             )
             .unwrap();
@@ -6594,6 +6788,7 @@ mod tests {
                 FrameObservation {
                     received_at_unix_ms: 124_957,
                     received_at: sent_at + Duration::from_millis(1_501),
+                    reader_receipt_to_driver_lag_ms: 12,
                 },
             )
             .unwrap();
@@ -6612,8 +6807,25 @@ mod tests {
             CommandResolutionSource::RecoveryContiguousOutcome
         );
         assert_eq!(
+            session.record.metrics.slow_command_resolutions[0]
+                .first_websocket_write_completed_at_unix_ms,
+            Some(123_457)
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[0].first_websocket_write_wait_ms,
+            Some(1)
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[0].reader_receipt_to_driver_lag_ms,
+            11
+        );
+        assert_eq!(
             session.record.metrics.slow_command_resolutions[1].source,
             CommandResolutionSource::TerminalBarrierRejectedOutcome
+        );
+        assert_eq!(
+            session.record.metrics.slow_command_resolutions[1].reader_receipt_to_driver_lag_ms,
+            12
         );
         assert_eq!(
             session
@@ -6810,6 +7022,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(7, activity_sender),
@@ -6992,6 +7205,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
             activity_lease: SessionActivityLease::new(7, activity_sender),
@@ -7425,6 +7639,7 @@ mod tests {
             client_game_session_id: "test-session-7".to_owned(),
             next_command_sequence: 1,
             pending_commands: BTreeMap::new(),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
@@ -7935,8 +8150,13 @@ mod tests {
                     sent_at: Instant::now()
                         .checked_sub(Duration::from_millis(1_100))
                         .unwrap(),
+                    first_websocket_write_completed_at_unix_ms: Some(
+                        unix_time_ms().saturating_sub(1_099),
+                    ),
+                    first_websocket_write_wait_ms: Some(1),
                 },
             )]),
+            pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: REQUIRED_SERVER_CAPABILITIES
                 .iter()
