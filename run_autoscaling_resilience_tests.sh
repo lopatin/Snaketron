@@ -105,6 +105,18 @@ hard_crash_envelope_jq='
         | .qualifying = hard_crash_report_second_qualifies];
   def nonnegative_integer:
     type == "number" and . >= 0 and . == floor;
+  def hard_crash_recovery_is_affected(
+    $task_boot_id;
+    $ecs_exec_invoked_at_unix_ms;
+    $execution_stopped_at_unix_ms
+  ):
+    .from_task_boot_id == $task_boot_id
+    # The socket can report EOF just before ECS publishes executionStoppedAt.
+    # Attribute from the fault invocation, but require recovery to finish
+    # after the authoritative container-stop timestamp.
+    and .detected_at_unix_ms >= $ecs_exec_invoked_at_unix_ms
+    and .ready_at_unix_ms >= $execution_stopped_at_unix_ms
+    and .ready_at_unix_ms >= .detected_at_unix_ms;
   def hard_crash_reconnect_accounting_passes(
     $affected_sessions;
     $completed_recoveries;
@@ -1918,6 +1930,32 @@ test_hard_crash_reconnect_accounting_contract() {
   }
 }
 
+test_hard_crash_recovery_attribution_contract() {
+  jq -en "$hard_crash_envelope_jq"'
+    def recovery($task; $detected; $ready):
+      {
+        from_task_boot_id: $task,
+        detected_at_unix_ms: $detected,
+        ready_at_unix_ms: $ready
+      };
+    def affected:
+      hard_crash_recovery_is_affected("killed"; 1000; 2000);
+    [
+      # ECS publishes executionStoppedAt after the process has closed sockets.
+      (recovery("killed"; 1900; 2100) | affected),
+      (recovery("killed"; 2000; 2100) | affected),
+      (recovery("other"; 1900; 2100) | affected | not),
+      (recovery("killed"; 999; 2100) | affected | not),
+      (recovery("killed"; 1900; 1999) | affected | not),
+      (recovery("killed"; 2200; 2100) | affected | not)
+    ]
+    | all
+  ' >/dev/null || {
+    echo "Hard-crash recovery attribution rejected valid control-plane lag or accepted an unrelated recovery" >&2
+    return 1
+  }
+}
+
 test_hard_crash_evidence_selectors() {
   local result=0
   local fixture_dir
@@ -2578,6 +2616,7 @@ test_evidence_safety_helpers() {
   test_capacity_continuous_window_contract
   test_hard_crash_envelope_contract
   test_hard_crash_reconnect_accounting_contract
+  test_hard_crash_recovery_attribution_contract
   test_hard_crash_evidence_selectors
   test_unexpected_crash_stop_selector
   test_observer_pid_supervision_contract
@@ -5055,12 +5094,11 @@ assert_hard_crash_report() {
           as $online_envelope_tail
       | [$r.sessions[].hard_recoveries[]?] as $all_recoveries
       | [$all_recoveries[]
-          | select(
-              .from_task_boot_id == $m.task_boot_id
-              and .detected_at_unix_ms >= $timing_origin
-              and .detected_at_unix_ms >= $m.ecs_exec_invoked_at_unix_ms
-              and .ready_at_unix_ms >= $exact_stop
-              and .ready_at_unix_ms >= .detected_at_unix_ms)] as $affected
+          | select(hard_crash_recovery_is_affected(
+              $m.task_boot_id;
+              $m.ecs_exec_invoked_at_unix_ms;
+              $exact_stop
+            ))] as $affected
       | ([$affected[].ready_at_unix_ms - $timing_origin] | p99)
           as $crash_to_ready_p99_upper_bound_ms
       | {
