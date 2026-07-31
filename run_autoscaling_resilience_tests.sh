@@ -125,7 +125,7 @@ hard_crash_envelope_jq='
       end) as $online_tail
     | longest_qualifying_streak($pre_crash_seconds) as $report_streak
     | ($pre_crash_seconds | last) as $final_report_second
-    | $report_streak.longest_seconds
+    | $report_streak.current_seconds
         >= hard_crash_required_report_seconds
       and $final_report_second.qualifying
       and $envelope.required_stable_seconds
@@ -1678,20 +1678,32 @@ test_hard_crash_envelope_contract() {
       | .metrics.command_counts_by_unix_second[
           ($gap_second | tostring)
         ] = 0) as $report
-    | hard_crash_pre_crash_seconds($report; $timing_origin)
-        as $positive_seconds
     | ($report
         | .metrics.command_counts_by_unix_second[
-            (($gap_second - 1) | tostring)
+            ($gap_second | tostring)
+          ] = $required_commands
+        | .metrics.command_counts_by_unix_second[
+            ($first_second | tostring)
+          ] = 0
+        | .metrics.command_counts_by_unix_second[
+            (($first_second + 1) | tostring)
+          ] = 0) as $positive_report
+    | hard_crash_pre_crash_seconds($positive_report; $timing_origin)
+        as $positive_seconds
+    | ($positive_report
+        | .metrics.command_counts_by_unix_second[
+            (($first_second + 2) | tostring)
           ] = 0
         | hard_crash_pre_crash_seconds(.; $timing_origin))
         as $short_streak_seconds
-    | ($report
+    | ($positive_report
         | .metrics.command_counts_by_unix_second[
             ($final_second | tostring)
           ] = 0
         | hard_crash_pre_crash_seconds(.; $timing_origin))
         as $bad_final_seconds
+    | hard_crash_pre_crash_seconds($report; $timing_origin)
+        as $old_streak_only_seconds
     | {
         required_stable_seconds: $required_seconds,
         required_qualifying_samples: $required_samples,
@@ -1740,6 +1752,11 @@ test_hard_crash_envelope_contract() {
           $exec_invoked_at
         ) | not),
         (passes(
+          $old_streak_only_seconds;
+          $online;
+          $exec_invoked_at
+        ) | not),
+        (passes(
           $positive_seconds;
           ($online | .samples = .samples[:-1]);
           $exec_invoked_at
@@ -1763,21 +1780,40 @@ test_hard_crash_envelope_contract() {
         (passes(
           $positive_seconds;
           ($online
-            | .samples[1].observed_at_unix_ms =
-                .samples[0].observed_at_unix_ms);
+            | .samples[3].observed_at_unix_ms =
+                .samples[2].observed_at_unix_ms);
           $exec_invoked_at
         ) | not),
+        passes(
+          $positive_seconds;
+          ($online
+            | .samples = ([
+                {
+                  observed_at_unix_ms: 95000,
+                  raw_websockets: ($required_sessions - 1),
+                  active_games: $required_duels
+                }
+              ] + .samples));
+          $exec_invoked_at
+        ),
         (passes(
           $positive_seconds;
           ($online
             | .samples |= (
                 to_entries
                 | map(
-                    .value.observed_at_unix_ms +=
-                      (.key * (hard_crash_max_online_sample_gap_ms - 4999))
-                  )
+                    if .key >= 3 then
+                      .value.observed_at_unix_ms +=
+                        (hard_crash_max_online_sample_gap_ms - 4999)
+                    else .
+                    end)
                 | map(.value)
               ));
+          $exec_invoked_at
+        ) | not),
+        (passes(
+          $positive_seconds;
+          ($online | .required_qualifying_samples += 1);
           $exec_invoked_at
         ) | not),
         (passes(
@@ -2948,8 +2984,13 @@ verify_staging_identity() {
       echo "The configured Traefik metrics control URL must be reachable from the staging runner" >&2
       return 1
     }
-  grep -F "service=\"$staging_traefik_service_label\"" "$identity_dir/traefik-metrics.prom" \
-    | grep -q '^traefik_' || {
+  awk -v needle="service=\"$staging_traefik_service_label\"" '
+    index($0, "traefik_") == 1 && index($0, needle) {
+      found = 1
+      exit
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$identity_dir/traefik-metrics.prom" || {
       echo "Traefik metrics lack derived service label $staging_traefik_service_label" >&2
       return 1
     }
@@ -5788,13 +5829,19 @@ run_staging_suite() {
     local samples="$evidence_dir/samples.jsonl"
     local control_candidate="$evidence_dir/control.pending.json"
     local deadline=$((SECONDS + 600))
-    local consecutive=0
-    # N qualifying samples contain only N-1 inter-sample intervals. Requiring
-    # one extra sample makes the label a real minimum duration, not a count.
+    local max_sample_gap_ms=10000
+    # N observations contain N-1 intervals. Preserve both the 31-observation
+    # density and the independent thirty-second elapsed-time proof.
     local required_samples=$((stable_seconds + 1))
+    local previous_qualifying_at_ms=0
+    local consecutive=0
+    local qualifying_duration_ms=0
+    local -a qualifying_timestamps=()
     mkdir -p "$evidence_dir"
     : >"$samples"
     while (( SECONDS < deadline )); do
+      local iteration_started_at_ms
+      iteration_started_at_ms="$(unix_time_ms)"
       require_runner_running "$label load runner" "$observed_pid"
       local users=0
       local games=0
@@ -5821,8 +5868,10 @@ run_staging_suite() {
           return 1
         fi
       fi
+      local observed_at_unix_ms
+      observed_at_unix_ms="$(unix_time_ms)"
       jq -cn \
-        --argjson observed_at_unix_ms "$(unix_time_ms)" \
+        --argjson observed_at_unix_ms "$observed_at_unix_ms" \
         --argjson raw_websockets "$users" \
         --argjson active_games "$games" \
         '{
@@ -5831,11 +5880,27 @@ run_staging_suite() {
           active_games: $active_games
         }' >>"$samples"
       if (( users >= 256 && games >= 128 )); then
-        consecutive=$((consecutive + 1))
+        if (( consecutive == 0 \
+          || observed_at_unix_ms <= previous_qualifying_at_ms \
+          || observed_at_unix_ms - previous_qualifying_at_ms > max_sample_gap_ms )); then
+          qualifying_timestamps=("$observed_at_unix_ms")
+        else
+          qualifying_timestamps+=("$observed_at_unix_ms")
+          if (( ${#qualifying_timestamps[@]} > required_samples )); then
+            qualifying_timestamps=("${qualifying_timestamps[@]:1}")
+          fi
+        fi
+        consecutive="${#qualifying_timestamps[@]}"
+        previous_qualifying_at_ms="$observed_at_unix_ms"
+        qualifying_duration_ms=$((observed_at_unix_ms - qualifying_timestamps[0]))
       else
+        previous_qualifying_at_ms=0
         consecutive=0
+        qualifying_duration_ms=0
+        qualifying_timestamps=()
       fi
-      if (( consecutive >= required_samples )); then
+      if (( consecutive >= required_samples \
+        && qualifying_duration_ms >= stable_seconds * 1000 )); then
         mv "$control_candidate" "$evidence_dir/control.json"
         jq -s \
           --argjson required_stable_seconds "$stable_seconds" \
@@ -5848,7 +5913,16 @@ run_staging_suite() {
           "$samples" >"$evidence_dir/summary.json"
         return 0
       fi
-      sleep 1
+      local iteration_finished_at_ms
+      iteration_finished_at_ms="$(unix_time_ms)"
+      local remaining_delay_ms=$((iteration_started_at_ms + 1000 - iteration_finished_at_ms))
+      if (( remaining_delay_ms > 0 )); then
+        local remaining_delay_seconds
+        printf -v remaining_delay_seconds '%d.%03d' \
+          $((remaining_delay_ms / 1000)) $((remaining_delay_ms % 1000))
+        # Probe time counts toward the fixed one-second sampling period.
+        sleep "$remaining_delay_seconds"
+      fi
     done
     jq -s \
       --argjson required_stable_seconds "$stable_seconds" \
