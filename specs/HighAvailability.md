@@ -1,5 +1,7 @@
 # High Availability
 
+> **Status: Superseded.** This document describes an abandoned Raft-based design and does not match the current Redis/Valkey implementation. See [PRD: Seamless ECS Autoscaling and Crash Recovery](autoscaling-resilience-prd.md) for the current requirements and rollout plan.
+
 The Snaketron server is designed for high availability. When one server is terminated, another server automatically takes over the game state, and websockets reconnect to a new server as well.
 
 ## Design
@@ -14,7 +16,7 @@ Each server is a single Rust process on its own host in the same network. The Ru
 - **Raft**: Implements the Raft consensus algorithm for leader election and state replication across servers.
 
 ## Data Flow
-The WebSocket connection sends game commands to the GameManager, if the game is running on this server. 
+The WebSocket connection sends game commands to the GameManager, if the game is running on this server.
 If the game is not running on this server, the command is sent to the gRPC client, which forwards it to the appropriate server.
 The GameManager runs the game loop for a single GameState by applying game commands (including system commands like Tick).
 Each tick in the loop emits events, which are replicated to the other servers via Raft.

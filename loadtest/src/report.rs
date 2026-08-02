@@ -15,7 +15,128 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 13;
+const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
+const MAX_AGGREGATE_SLOW_APPLICATION_PINGS: usize = 256;
+
+/// Keep the slowest evidence while reserving one representative for every
+/// violating original-send second that fits in the fixed report budget.
+/// This prevents one severe second from hiding the identity/source needed to
+/// diagnose a different failed second.
+pub(crate) fn retain_slow_resolution_coverage(
+    resolutions: &mut Vec<SlowCommandResolution>,
+    limit: usize,
+) {
+    resolutions.sort_by(|left, right| {
+        right
+            .latency_ms
+            .cmp(&left.latency_ms)
+            .then_with(|| left.sent_at_unix_ms.cmp(&right.sent_at_unix_ms))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.command_sequence.cmp(&right.command_sequence))
+    });
+    if resolutions.len() <= limit {
+        return;
+    }
+
+    let mut selected = vec![false; resolutions.len()];
+    let mut represented_seconds = std::collections::BTreeSet::new();
+    let mut selected_count = 0;
+    for (index, resolution) in resolutions.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        if represented_seconds.insert(resolution.sent_at_unix_ms / 1_000) {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+    if selected_count < limit {
+        for is_selected in &mut selected {
+            if selected_count == limit {
+                break;
+            }
+            if !*is_selected {
+                *is_selected = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut index = 0;
+    resolutions.retain(|_| {
+        let retain = selected[index];
+        index += 1;
+        retain
+    });
+}
+
+/// Bound slow Ping/Pong provenance without allowing one busy session or one
+/// delayed second to consume the aggregate evidence budget. Records are
+/// retained in descending RTT order while first reserving time coverage and
+/// then connection-identity coverage.
+pub(crate) fn retain_slow_ping_coverage(
+    observations: &mut Vec<SlowApplicationPingObservation>,
+    limit: usize,
+) {
+    observations.sort_by(|left, right| {
+        right
+            .rtt_ms
+            .cmp(&left.rtt_ms)
+            .then_with(|| left.sent_at_unix_ms.cmp(&right.sent_at_unix_ms))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.client_time.cmp(&right.client_time))
+    });
+    if observations.len() <= limit {
+        return;
+    }
+
+    let mut selected = vec![false; observations.len()];
+    let mut represented_seconds = std::collections::BTreeSet::new();
+    let mut selected_count = 0;
+    for (index, observation) in observations.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        if represented_seconds.insert(observation.sent_at_unix_ms / 1_000) {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+
+    let mut represented_connections = std::collections::BTreeSet::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if selected_count == limit {
+            break;
+        }
+        let identity = (
+            observation.session_id.as_str(),
+            observation.gateway_task_boot_id.as_deref(),
+            observation.socket_generation,
+        );
+        if represented_connections.insert(identity) && !selected[index] {
+            selected[index] = true;
+            selected_count += 1;
+        }
+    }
+
+    if selected_count < limit {
+        for is_selected in &mut selected {
+            if selected_count == limit {
+                break;
+            }
+            if !*is_selected {
+                *is_selected = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut index = 0;
+    observations.retain(|_| {
+        let retain = selected[index];
+        index += 1;
+        retain
+    });
+}
 
 /// Milliseconds since the Unix epoch, suitable for report timestamps.
 pub fn unix_time_ms() -> u64 {
@@ -142,6 +263,140 @@ pub struct SessionFailureRecord {
     pub context: BTreeMap<String, String>,
 }
 
+/// One completed hard-crash recovery, with enough identity and command-state
+/// detail for staging certification to attribute recovery to the killed task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardRecoveryObservation {
+    pub detected_at_unix_ms: u64,
+    pub ready_at_unix_ms: u64,
+    pub from_task_boot_id: String,
+    pub to_task_boot_id: String,
+    pub from_socket_generation: u64,
+    pub to_socket_generation: u64,
+    pub game_id: u32,
+    pub fresh_snapshot_received: bool,
+    pub pending_commands_at_detection: u64,
+    /// Diagnostic count after the first recovery outcome barrier. Commands
+    /// absent from that barrier are intentionally resent with their stable IDs,
+    /// so this may be nonzero even when recovery is correct. Final drain is the
+    /// eventual-delivery gate.
+    pub pending_commands_after_outcome_barrier: u64,
+}
+
+/// How a pending command first became semantically final at the load
+/// generator. This diagnostic distinguishes a live authoritative event from
+/// an outcome replay without changing pass/fail semantics. Terminal game state
+/// alone is deliberately not a command outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResolutionSource {
+    LiveScheduledEvent,
+    LiveRejectedEvent,
+    RecoveryScheduledOutcome,
+    RecoveryRejectedOutcome,
+    RecoveryContiguousOutcome,
+    TerminalBarrierRejectedOutcome,
+}
+
+/// Bounded provenance retained only for commands that violate the fixed
+/// one-second certification budget. Wall-clock timestamps locate the command
+/// in external logs; `latency_ms` is measured with the monotonic process clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowCommandResolution {
+    pub session_id: String,
+    pub user_id: u32,
+    pub game_id: u32,
+    pub partition_id: u32,
+    pub client_game_session_id: String,
+    pub command_sequence: u64,
+    pub sent_at_unix_ms: u64,
+    pub resolved_at_unix_ms: u64,
+    pub latency_ms: u64,
+    pub source: CommandResolutionSource,
+    /// WebSocket gateway identity at resolution time. Executor ownership is
+    /// correlated separately by partition and timestamp.
+    pub gateway_task_boot_id: Option<String>,
+    pub socket_generation: Option<u64>,
+    /// Wall-clock completion of the command's original WebSocket write. This
+    /// remains absent only when that first write never returned before the
+    /// command was otherwise resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_websocket_write_completed_at_unix_ms: Option<u64>,
+    /// Monotonic wait from the original `sent_at` gate anchor through completion
+    /// of its first WebSocket write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_websocket_write_wait_ms: Option<u64>,
+    /// Delay after the dedicated reader stamped the resolving frame and before
+    /// the virtual-user driver processed it.
+    #[serde(default)]
+    pub reader_receipt_to_driver_lag_ms: u64,
+    /// Scheduling delay observed by the reader task's most recent sentinel
+    /// tick before it stamped the resolving frame.
+    #[serde(default)]
+    pub reader_task_latest_wake_lag_ms: u64,
+    /// Worst scheduling delay observed by this socket reader before it stamped
+    /// the resolving frame.
+    #[serde(default)]
+    pub reader_task_max_wake_lag_ms: u64,
+}
+
+/// Bounded application-level Ping/Pong evidence whose RTT exceeded the fixed
+/// one-second diagnostic threshold. Receipt is stamped by the dedicated socket
+/// reader, independently of virtual-user driver scheduling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowApplicationPingObservation {
+    pub session_id: String,
+    pub client_time: i64,
+    pub sent_at_unix_ms: u64,
+    pub received_at_unix_ms: u64,
+    pub rtt_ms: u64,
+    /// Gateway wall clock captured when it handled the Ping. This value is
+    /// already present on the Pong wire message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_time: Option<i64>,
+    /// Last clock-offset estimate before this Pong could update it. Together
+    /// with `server_time`, this locates the delay before versus after gateway
+    /// handling without trusting a newly delayed sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_update_clock_offset_ms: Option<i64>,
+    pub gateway_task_boot_id: Option<String>,
+    pub socket_generation: Option<u64>,
+    /// Scheduling delay observed by the reader task's most recent sentinel
+    /// tick before it stamped this Pong.
+    #[serde(default)]
+    pub reader_task_latest_wake_lag_ms: u64,
+    /// Worst scheduling delay observed by this socket reader before it stamped
+    /// this Pong.
+    #[serde(default)]
+    pub reader_task_max_wake_lag_ms: u64,
+}
+
+/// Constant-space evidence of delay after the dedicated socket reader has
+/// received a frame but before the virtual user's driver processes it. This is
+/// load-generator health telemetry, not part of the service latency gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketDispatchLagSummary {
+    pub observations: u64,
+    pub maximum_ms: u64,
+    pub over_one_second: u64,
+}
+
+impl WebSocketDispatchLagSummary {
+    pub fn observe(&mut self, milliseconds: u64) {
+        self.observations = self.observations.saturating_add(1);
+        self.maximum_ms = self.maximum_ms.max(milliseconds);
+        if milliseconds > 1_000 {
+            self.over_one_second = self.over_one_second.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.observations = self.observations.saturating_add(other.observations);
+        self.maximum_ms = self.maximum_ms.max(other.maximum_ms);
+        self.over_one_second = self.over_one_second.saturating_add(other.over_one_second);
+    }
+}
+
 impl SessionFailureRecord {
     pub fn new(phase: SessionPhase, at_unix_ms: u64, message: impl Into<String>) -> Self {
         Self {
@@ -169,16 +424,104 @@ impl SessionFailureRecord {
 pub struct SessionMetrics {
     pub guest_auth_ms: Option<u64>,
     pub websocket_connect_ms: Option<u64>,
+    /// First WebSocket connection attempt through the ordered application pong
+    /// that proves authentication is usable. This includes bounded transient
+    /// admission retries made with the same guest token.
+    pub initial_admission_ready_ms: Option<u64>,
+    /// Initial and reconnect token-to-Authenticated handshakes. Bounded by the
+    /// per-session reconnect budget.
+    #[serde(default)]
+    pub websocket_auth_ms: Vec<u64>,
     pub lobby_ready_ms: Option<u64>,
     pub matchmaking_wait_ms: Option<u64>,
     pub game_join_ms: Option<u64>,
     pub game_duration_ms: Option<u64>,
     #[serde(default)]
     pub websocket_rtt_ms: Vec<u64>,
+    /// Delay between the continuously polled socket reader receiving a parsed
+    /// frame and the virtual-user driver observing it.
+    #[serde(default)]
+    pub websocket_dispatch_lag: WebSocketDispatchLagSummary,
+    /// Transport loss/drain detection through a usable replacement.
+    #[serde(default)]
+    pub reconnect_duration_ms: Vec<u64>,
+    /// Recovery detection through restored lobby membership.
+    #[serde(default)]
+    pub rejoin_lobby_ms: Vec<u64>,
+    /// Replacement JoinGame send through a fresh authoritative snapshot.
+    #[serde(default)]
+    pub rejoin_snapshot_ms: Vec<u64>,
+    /// Interval without an authenticated, game-ready session. Crash recovery
+    /// records the full recovery interval. Planned handoff records the interval
+    /// gap derived from the candidate-ready and old-socket probe timestamps.
+    #[serde(default)]
+    pub usable_session_gap_ms: Vec<u64>,
+    #[serde(default)]
+    pub planned_handoff_duration_ms: Vec<u64>,
+    /// Observed interval in which the candidate was game-ready before the old
+    /// socket acknowledged an ordered application ping.
+    #[serde(default)]
+    pub planned_handoff_active_overlap_ms: Vec<u64>,
+    #[serde(default)]
+    pub planned_handoff_attempts: u64,
+    #[serde(default)]
+    pub planned_handoff_successes: u64,
+    #[serde(default)]
+    pub planned_handoff_failures: u64,
+    #[serde(default)]
+    pub planned_handoff_outcome_barriers: u64,
+    #[serde(default)]
+    pub planned_handoff_terminal_completions: u64,
+    /// One per successful handoff. Candidate promotion requires an old-socket
+    /// ping response after candidate readiness; terminal completion requires a
+    /// terminal event on the old socket.
+    #[serde(default)]
+    pub planned_handoff_continuity_proofs: u64,
+    /// Logical AI game-command submissions made while planned candidates were
+    /// being prepared.
+    #[serde(default)]
+    pub planned_handoff_commands_sent: u64,
+    #[serde(default)]
+    pub command_outcome_barriers_received: u64,
+    #[serde(default)]
+    pub pending_commands_at_finish: u64,
     pub messages_sent: u64,
     pub messages_received: u64,
     pub game_events_received: u64,
     pub commands_sent: u64,
+    /// Logical command submissions grouped by their original wall-clock send
+    /// second. Ambiguous first writes retain this bucket across stable-identity
+    /// resends.
+    #[serde(default)]
+    pub command_counts_by_unix_second: BTreeMap<u64, u64>,
+    /// First-seen authoritative scheduled outcomes grouped by the load
+    /// generator's receipt second.
+    #[serde(default)]
+    pub scheduled_command_counts_by_unix_second: BTreeMap<u64, u64>,
+    /// First-seen accepted/scheduled outcomes grouped by the command's
+    /// original send second, including exact outcomes replayed after recovery.
+    #[serde(default)]
+    pub scheduled_command_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Every first terminal executor outcome, grouped by the command's
+    /// original send second. This includes scheduled, rejected, and commands
+    /// resolved by executor-authored live or recovered outcomes.
+    #[serde(default)]
+    pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Worst original-send-to-terminal-outcome transport receipt latency for
+    /// each send second. The dedicated socket reader timestamps the frame
+    /// before lossless handoff to the virtual-user driver. Resends retain the
+    /// original timestamp.
+    #[serde(default)]
+    pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Bounded slow command outcomes with one representative retained for as
+    /// many distinct violating send seconds as fit before remaining slots go
+    /// to the slowest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_command_resolutions: Vec<SlowCommandResolution>,
+    /// Bounded slow application Ping/Pong observations, measured to the
+    /// dedicated reader rather than driver processing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_application_ping_observations: Vec<SlowApplicationPingObservation>,
     pub disconnects: u64,
     pub reconnects: u64,
 }
@@ -193,9 +536,8 @@ pub struct RampStageRecord {
     pub sessions_launched: usize,
     pub active_sessions_at_start: usize,
     pub active_sessions_at_end: usize,
-    /// Whether the coordinator ever observed the requested number of logical
-    /// sessions whose initial WebSocket had sent an authentication token during
-    /// this bounded ramp-and-hold window.
+    /// Whether the coordinator ever observed the requested number of sessions
+    /// whose server returned an authentication acknowledgement in this window.
     pub target_reached: bool,
     pub target_reached_at_unix_ms: Option<u64>,
 }
@@ -241,6 +583,10 @@ pub struct SessionRecord {
     pub failure: Option<SessionFailureRecord>,
     #[serde(default)]
     pub metrics: SessionMetrics,
+    /// Successful recoveries from an abruptly lost game socket. Failed or
+    /// incomplete attempts remain represented by the session failure record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hard_recoveries: Vec<HardRecoveryObservation>,
     /// Additional session-level diagnostics retained in failure JSON.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub diagnostics: BTreeMap<String, String>,
@@ -270,6 +616,7 @@ impl SessionRecord {
             )],
             failure: None,
             metrics: SessionMetrics::default(),
+            hard_recoveries: Vec::new(),
             diagnostics: BTreeMap::new(),
         }
     }
@@ -328,6 +675,10 @@ pub struct LoadTestRun {
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: u64,
     pub configured_max_concurrency: usize,
+    /// Filled from the coordinator's server-acknowledged activity tracker just
+    /// before report generation.
+    #[serde(default)]
+    pub peak_authenticated_concurrency: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
@@ -354,6 +705,7 @@ impl LoadTestRun {
             started_at_unix_ms,
             finished_at_unix_ms: started_at_unix_ms,
             configured_max_concurrency,
+            peak_authenticated_concurrency: 0,
             metadata: BTreeMap::new(),
             ramp_stages: Vec::new(),
             infrastructure_samples: Vec::new(),
@@ -432,17 +784,78 @@ pub struct TrafficTotals {
     pub reconnects: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedHandoffTotals {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub outcome_barriers: u64,
+    pub terminal_completions: u64,
+    #[serde(default)]
+    pub continuity_proofs: u64,
+    #[serde(default)]
+    pub commands_sent: u64,
+    pub pending_commands_at_finish: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AggregateMetrics {
     pub session_duration_ms: DistributionSummary,
     pub guest_auth_ms: DistributionSummary,
     pub websocket_connect_ms: DistributionSummary,
+    pub initial_admission_ready_ms: DistributionSummary,
+    pub websocket_auth_ms: DistributionSummary,
     pub lobby_ready_ms: DistributionSummary,
     pub matchmaking_wait_ms: DistributionSummary,
     pub game_join_ms: DistributionSummary,
     pub game_duration_ms: DistributionSummary,
     pub websocket_rtt_ms: DistributionSummary,
+    /// Constant-space aggregate of reader-receipt-to-driver delay. It diagnoses
+    /// an overloaded synthetic client independently from the service latency
+    /// gate.
+    #[serde(default)]
+    pub websocket_dispatch_lag: WebSocketDispatchLagSummary,
+    pub reconnect_duration_ms: DistributionSummary,
+    pub rejoin_lobby_ms: DistributionSummary,
+    pub rejoin_snapshot_ms: DistributionSummary,
+    pub usable_session_gap_ms: DistributionSummary,
+    pub planned_handoff_duration_ms: DistributionSummary,
+    #[serde(default)]
+    pub planned_handoff_active_overlap_ms: DistributionSummary,
+    pub planned_handoffs: PlannedHandoffTotals,
     pub traffic: TrafficTotals,
+    /// Sum of all session command histograms, keyed by Unix second.
+    #[serde(default)]
+    pub command_counts_by_unix_second: BTreeMap<u64, u64>,
+    /// First-seen authoritative command schedules grouped by executor partition
+    /// and the load generator's receipt second.
+    /// Game IDs map to partitions with `game_id % 10`.
+    #[serde(default)]
+    pub scheduled_command_counts_by_partition_and_unix_second: BTreeMap<u32, BTreeMap<u64, u64>>,
+    /// Sum of first-seen accepted/scheduled outcomes keyed by original send
+    /// second. This is the causal liveness companion to the terminal-outcome
+    /// count and latency maps.
+    #[serde(default)]
+    pub scheduled_command_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Sum of all first terminal command outcomes, keyed by original send
+    /// second. Together with the send histogram this proves eventual semantic
+    /// resolution without confusing receipt-time bucket boundaries.
+    #[serde(default)]
+    pub command_outcome_counts_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Maximum first-send-to-terminal-outcome transport receipt latency in
+    /// each send second across every session.
+    #[serde(default)]
+    pub command_outcome_max_latency_ms_by_sent_unix_second: BTreeMap<u64, u64>,
+    /// Bounded command outcomes above the fixed one-second gate. The cap first
+    /// reserves one record for as many distinct violating send seconds as fit,
+    /// then keeps the slowest remaining records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_command_resolutions: Vec<SlowCommandResolution>,
+    /// Bounded Ping/Pong RTTs above one second. The cap preserves distinct send
+    /// seconds and session/gateway/socket identities before filling remaining
+    /// slots with the slowest observations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slow_application_ping_observations: Vec<SlowApplicationPingObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -459,6 +872,15 @@ pub struct SessionCounts {
     /// short reconnect gaps; this does not claim server-side authentication was
     /// confirmed or that one transport socket stayed continuously open.
     pub peak_token_sent_concurrency: usize,
+    /// Peak sessions whose server returned `Authenticated`. This is maintained
+    /// by the coordinator's activity tracker and is the certification measure;
+    /// unlike `peak_token_sent_concurrency`, it cannot count a half-open auth.
+    #[serde(default)]
+    pub peak_authenticated_concurrency: usize,
+    /// Peak games for which every participant had entered active play and had
+    /// not yet completed its measured game window. Partial joins do not count.
+    #[serde(default)]
+    pub peak_active_game_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,8 +889,45 @@ pub struct SessionSummary {
     pub username: String,
     pub wave_index: u32,
     pub match_group: String,
+    /// Used by staging certification to prove that new users were admitted
+    /// while a specific control-plane transition was in progress.
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: Option<u64>,
+    /// First token-to-`Authenticated` handshake for this logical session.
+    /// Later reconnect/handoff samples remain in the aggregate distribution.
+    pub initial_websocket_auth_ms: Option<u64>,
+    /// First WebSocket connection attempt through the authenticated ordered
+    /// application pong, including same-identity transient admission retries.
+    pub initial_admission_ready_ms: Option<u64>,
+    /// Exact `<database server id>:<executor boot UUID>` identity returned by
+    /// the initial `Authenticated` frame and compared with the ten-member
+    /// control-plane snapshot during staging.
+    pub initial_task_boot_id: Option<String>,
+    /// Harmless run-local backend alias, when ingress supplied one.
+    pub initial_backend_hint: Option<String>,
+    pub authenticated_at_unix_ms: Option<u64>,
+    pub lobby_ready_at_unix_ms: Option<u64>,
+    pub matchmaking_at_unix_ms: Option<u64>,
+    pub queued_at_unix_ms: Option<u64>,
+    pub playing_at_unix_ms: Option<u64>,
+    /// First game event observed on the initial logical session. Staging uses
+    /// this timestamp with TaskBootId to prove forwarding before scale-in.
+    pub first_game_event_at_unix_ms: Option<u64>,
+    pub game_finished_at_unix_ms: Option<u64>,
+    /// Successful nonterminal game-socket promotions. These timestamps let the
+    /// staging gate attribute a command-bearing handoff to its exact scale-in
+    /// window instead of accepting an earlier drain from the same long run.
+    #[serde(default)]
+    pub planned_game_handoff_at_unix_ms: Vec<u64>,
+    /// Successful hard-crash recoveries retained in the compact aggregate so
+    /// certification does not need to infer recovery from aggregate percentiles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hard_recoveries: Vec<HardRecoveryObservation>,
     pub lobby_code: Option<String>,
     pub game_id: Option<u32>,
+    /// Retained so staging can attribute proven event forwarding to the exact
+    /// TaskBootId that authenticated the socket.
+    pub game_events_received: u64,
     pub outcome: SessionOutcome,
     /// `timeboxed` when a healthy untimed game reached its configured play window.
     pub completion_kind: Option<String>,
@@ -520,12 +979,30 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut session_durations = Vec::new();
     let mut guest_auth = Vec::new();
     let mut websocket_connect = Vec::new();
+    let mut initial_admission_ready = Vec::new();
+    let mut websocket_auth = Vec::new();
     let mut lobby_ready = Vec::new();
     let mut matchmaking_wait = Vec::new();
     let mut game_join = Vec::new();
     let mut game_duration = Vec::new();
     let mut websocket_rtt = Vec::new();
+    let mut websocket_dispatch_lag = WebSocketDispatchLagSummary::default();
+    let mut reconnect_duration = Vec::new();
+    let mut rejoin_lobby = Vec::new();
+    let mut rejoin_snapshot = Vec::new();
+    let mut usable_session_gap = Vec::new();
+    let mut planned_handoff_duration = Vec::new();
+    let mut planned_handoff_active_overlap = Vec::new();
+    let mut planned_handoffs = PlannedHandoffTotals::default();
     let mut traffic = TrafficTotals::default();
+    let mut command_counts_by_unix_second = BTreeMap::<u64, u64>::new();
+    let mut scheduled_command_counts_by_partition_and_unix_second =
+        BTreeMap::<u32, BTreeMap<u64, u64>>::new();
+    let mut scheduled_command_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut command_outcome_counts_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::<u64, u64>::new();
+    let mut slow_command_resolutions = Vec::<SlowCommandResolution>::new();
+    let mut slow_application_ping_observations = Vec::<SlowApplicationPingObservation>::new();
 
     let sessions = run
         .sessions
@@ -543,11 +1020,54 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             }
             push_option(&mut guest_auth, session.metrics.guest_auth_ms);
             push_option(&mut websocket_connect, session.metrics.websocket_connect_ms);
+            push_option(
+                &mut initial_admission_ready,
+                session.metrics.initial_admission_ready_ms,
+            );
+            websocket_auth.extend(session.metrics.websocket_auth_ms.iter().copied());
             push_option(&mut lobby_ready, session.metrics.lobby_ready_ms);
             push_option(&mut matchmaking_wait, session.metrics.matchmaking_wait_ms);
             push_option(&mut game_join, session.metrics.game_join_ms);
             push_option(&mut game_duration, session.metrics.game_duration_ms);
             websocket_rtt.extend(session.metrics.websocket_rtt_ms.iter().copied());
+            websocket_dispatch_lag.merge(session.metrics.websocket_dispatch_lag);
+            reconnect_duration.extend(session.metrics.reconnect_duration_ms.iter().copied());
+            rejoin_lobby.extend(session.metrics.rejoin_lobby_ms.iter().copied());
+            rejoin_snapshot.extend(session.metrics.rejoin_snapshot_ms.iter().copied());
+            usable_session_gap.extend(session.metrics.usable_session_gap_ms.iter().copied());
+            planned_handoff_duration
+                .extend(session.metrics.planned_handoff_duration_ms.iter().copied());
+            planned_handoff_active_overlap.extend(
+                session
+                    .metrics
+                    .planned_handoff_active_overlap_ms
+                    .iter()
+                    .copied(),
+            );
+            planned_handoffs.attempts = planned_handoffs
+                .attempts
+                .saturating_add(session.metrics.planned_handoff_attempts);
+            planned_handoffs.successes = planned_handoffs
+                .successes
+                .saturating_add(session.metrics.planned_handoff_successes);
+            planned_handoffs.failures = planned_handoffs
+                .failures
+                .saturating_add(session.metrics.planned_handoff_failures);
+            planned_handoffs.outcome_barriers = planned_handoffs
+                .outcome_barriers
+                .saturating_add(session.metrics.planned_handoff_outcome_barriers);
+            planned_handoffs.terminal_completions = planned_handoffs
+                .terminal_completions
+                .saturating_add(session.metrics.planned_handoff_terminal_completions);
+            planned_handoffs.continuity_proofs = planned_handoffs
+                .continuity_proofs
+                .saturating_add(session.metrics.planned_handoff_continuity_proofs);
+            planned_handoffs.commands_sent = planned_handoffs
+                .commands_sent
+                .saturating_add(session.metrics.planned_handoff_commands_sent);
+            planned_handoffs.pending_commands_at_finish = planned_handoffs
+                .pending_commands_at_finish
+                .saturating_add(session.metrics.pending_commands_at_finish);
 
             traffic.messages_sent = traffic
                 .messages_sent
@@ -561,6 +1081,50 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             traffic.commands_sent = traffic
                 .commands_sent
                 .saturating_add(session.metrics.commands_sent);
+            for (second, count) in &session.metrics.command_counts_by_unix_second {
+                let total = command_counts_by_unix_second.entry(*second).or_default();
+                *total = total.saturating_add(*count);
+            }
+            for (second, count) in &session.metrics.scheduled_command_counts_by_unix_second {
+                if let Some(game_id) = session.game_id {
+                    let partition_total = scheduled_command_counts_by_partition_and_unix_second
+                        .entry(game_id % 10)
+                        .or_default()
+                        .entry(*second)
+                        .or_default();
+                    *partition_total = partition_total.saturating_add(*count);
+                }
+            }
+            for (second, count) in &session.metrics.scheduled_command_counts_by_sent_unix_second {
+                let total = scheduled_command_counts_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *total = total.saturating_add(*count);
+            }
+            for (second, count) in &session.metrics.command_outcome_counts_by_sent_unix_second {
+                let total = command_outcome_counts_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *total = total.saturating_add(*count);
+            }
+            for (second, latency_ms) in &session
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second
+            {
+                let maximum = command_outcome_max_latency_ms_by_sent_unix_second
+                    .entry(*second)
+                    .or_default();
+                *maximum = (*maximum).max(*latency_ms);
+            }
+            slow_command_resolutions
+                .extend(session.metrics.slow_command_resolutions.iter().cloned());
+            slow_application_ping_observations.extend(
+                session
+                    .metrics
+                    .slow_application_ping_observations
+                    .iter()
+                    .cloned(),
+            );
             traffic.disconnects = traffic
                 .disconnects
                 .saturating_add(session.metrics.disconnects);
@@ -589,8 +1153,62 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
                 username: session.username.clone(),
                 wave_index: session.wave_index,
                 match_group: session.match_group.clone(),
+                started_at_unix_ms: session.started_at_unix_ms,
+                finished_at_unix_ms: session.finished_at_unix_ms,
+                initial_websocket_auth_ms: session.metrics.websocket_auth_ms.first().copied(),
+                initial_admission_ready_ms: session.metrics.initial_admission_ready_ms,
+                initial_task_boot_id: session.diagnostics.get("task_boot_id_0").cloned(),
+                initial_backend_hint: session.diagnostics.get("websocket_backend").cloned(),
+                authenticated_at_unix_ms: session.lifecycle.iter().find_map(|event| {
+                    (event.phase == SessionPhase::WebSocketAuthentication
+                        && event.message.as_deref()
+                            == Some("token processed; server clock synchronized"))
+                    .then_some(event.at_unix_ms)
+                }),
+                lobby_ready_at_unix_ms: session
+                    .lifecycle
+                    .iter()
+                    .find(|event| event.phase == SessionPhase::LobbyReady)
+                    .map(|event| event.at_unix_ms),
+                matchmaking_at_unix_ms: session
+                    .lifecycle
+                    .iter()
+                    .find(|event| event.phase == SessionPhase::Matchmaking)
+                    .map(|event| event.at_unix_ms),
+                queued_at_unix_ms: session
+                    .diagnostics
+                    .get("queued_at_unix_ms")
+                    .and_then(|value| value.parse().ok()),
+                playing_at_unix_ms: session
+                    .lifecycle
+                    .iter()
+                    .find(|event| event.phase == SessionPhase::Playing)
+                    .map(|event| event.at_unix_ms),
+                first_game_event_at_unix_ms: session
+                    .diagnostics
+                    .get("first_game_event_at_unix_ms")
+                    .and_then(|value| value.parse().ok()),
+                game_finished_at_unix_ms: session
+                    .lifecycle
+                    .iter()
+                    .find(|event| event.phase == SessionPhase::Playing)
+                    .map(|event| event.at_unix_ms)
+                    .zip(session.metrics.game_duration_ms)
+                    .map(|(started, duration)| started.saturating_add(duration)),
+                planned_game_handoff_at_unix_ms: session
+                    .lifecycle
+                    .iter()
+                    .filter(|event| {
+                        event.phase == SessionPhase::GameSnapshot
+                            && event.message.as_deref()
+                                == Some("planned handoff promoted a fully synchronized candidate")
+                    })
+                    .map(|event| event.at_unix_ms)
+                    .collect(),
+                hard_recoveries: session.hard_recoveries.clone(),
                 lobby_code: session.lobby_code.clone(),
                 game_id: session.game_id,
+                game_events_received: session.metrics.game_events_received,
                 outcome: session.outcome,
                 completion_kind: session.diagnostics.get("completion_kind").cloned(),
                 duration_ms: session.duration_ms(),
@@ -600,6 +1218,15 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             }
         })
         .collect();
+
+    retain_slow_resolution_coverage(
+        &mut slow_command_resolutions,
+        MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS,
+    );
+    retain_slow_ping_coverage(
+        &mut slow_application_ping_observations,
+        MAX_AGGREGATE_SLOW_APPLICATION_PINGS,
+    );
 
     let total = run.sessions.len();
     let denominator = total.max(1) as f64;
@@ -637,17 +1264,40 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
                 failed as f64 * 100.0 / denominator
             },
             peak_token_sent_concurrency: peak_token_sent_concurrency(run),
+            peak_authenticated_concurrency: run.peak_authenticated_concurrency,
+            peak_active_game_concurrency: peak_active_game_concurrency(run),
         },
         metrics: AggregateMetrics {
             session_duration_ms: DistributionSummary::from_samples(&session_durations),
             guest_auth_ms: DistributionSummary::from_samples(&guest_auth),
             websocket_connect_ms: DistributionSummary::from_samples(&websocket_connect),
+            initial_admission_ready_ms: DistributionSummary::from_samples(&initial_admission_ready),
+            websocket_auth_ms: DistributionSummary::from_samples(&websocket_auth),
             lobby_ready_ms: DistributionSummary::from_samples(&lobby_ready),
             matchmaking_wait_ms: DistributionSummary::from_samples(&matchmaking_wait),
             game_join_ms: DistributionSummary::from_samples(&game_join),
             game_duration_ms: DistributionSummary::from_samples(&game_duration),
             websocket_rtt_ms: DistributionSummary::from_samples(&websocket_rtt),
+            websocket_dispatch_lag,
+            reconnect_duration_ms: DistributionSummary::from_samples(&reconnect_duration),
+            rejoin_lobby_ms: DistributionSummary::from_samples(&rejoin_lobby),
+            rejoin_snapshot_ms: DistributionSummary::from_samples(&rejoin_snapshot),
+            usable_session_gap_ms: DistributionSummary::from_samples(&usable_session_gap),
+            planned_handoff_duration_ms: DistributionSummary::from_samples(
+                &planned_handoff_duration,
+            ),
+            planned_handoff_active_overlap_ms: DistributionSummary::from_samples(
+                &planned_handoff_active_overlap,
+            ),
+            planned_handoffs,
             traffic,
+            command_counts_by_unix_second,
+            scheduled_command_counts_by_partition_and_unix_second,
+            scheduled_command_counts_by_sent_unix_second,
+            command_outcome_counts_by_sent_unix_second,
+            command_outcome_max_latency_ms_by_sent_unix_second,
+            slow_command_resolutions,
+            slow_application_ping_observations,
         },
         failures_by_phase,
         failures_by_message,
@@ -697,6 +1347,78 @@ fn peak_token_sent_concurrency(run: &LoadTestRun) -> usize {
         } else {
             current = current.saturating_add(1);
             peak = peak.max(current);
+        }
+    }
+    peak
+}
+
+fn peak_active_game_concurrency(run: &LoadTestRun) -> usize {
+    #[derive(Debug, Default)]
+    struct GameWindow {
+        participant_starts: Vec<u64>,
+        participant_finishes: Vec<u64>,
+    }
+
+    let expected_players = match run.metadata.get("mode").map(String::as_str) {
+        Some("solo") => 1,
+        Some("duel") => 2,
+        Some("2v2" | "ffa") => 4,
+        _ => return 0,
+    };
+    let mut windows = BTreeMap::<u32, GameWindow>::new();
+    for session in &run.sessions {
+        let Some(game_id) = session.game_id else {
+            continue;
+        };
+        let Some(playing_at) = session
+            .lifecycle
+            .iter()
+            .find(|event| event.phase == SessionPhase::Playing)
+            .map(|event| event.at_unix_ms)
+        else {
+            continue;
+        };
+        let Some(game_duration_ms) = session.metrics.game_duration_ms else {
+            continue;
+        };
+        let window = windows.entry(game_id).or_default();
+        window.participant_starts.push(playing_at);
+        window
+            .participant_finishes
+            .push(playing_at.saturating_add(game_duration_ms));
+    }
+
+    // A game is fully active only from its last participant entering play
+    // through its first participant ending play. End events sort first at equal
+    // timestamps.
+    let mut events = Vec::with_capacity(windows.len() * 2);
+    for window in windows.into_values() {
+        if window.participant_starts.len() != expected_players
+            || window.participant_finishes.len() != expected_players
+        {
+            continue;
+        }
+        let Some(start) = window.participant_starts.into_iter().max() else {
+            continue;
+        };
+        let Some(finish) = window.participant_finishes.into_iter().min() else {
+            continue;
+        };
+        if finish > start {
+            events.push((start, 1i8));
+            events.push((finish, -1i8));
+        }
+    }
+    events.sort_unstable_by_key(|(at, delta)| (*at, *delta));
+
+    let mut active = 0usize;
+    let mut peak = 0usize;
+    for (_, delta) in events {
+        if delta < 0 {
+            active = active.saturating_sub(1);
+        } else {
+            active = active.saturating_add(1);
+            peak = peak.max(active);
         }
     }
     peak
@@ -884,6 +1606,8 @@ fn render_html(report: &AggregateReport) -> String {
          <div class=\"card\"><span class=\"label\">Failed</span><b class=\"failed\">{}</b></div>\
          <div class=\"card\"><span class=\"label\">Success rate</span><b>{:.1}%</b></div>\
          <div class=\"card\"><span class=\"label\">Peak token-sent sessions</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Peak authenticated sessions</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Peak active games</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Configured max</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Games observed</span><b>{}/{}</b></div>\
          <div class=\"card\"><span class=\"label\">Authoritative games</span><b>{}</b></div>\
@@ -895,6 +1619,8 @@ fn render_html(report: &AggregateReport) -> String {
         counts.failed,
         counts.success_rate_percent,
         counts.peak_token_sent_concurrency,
+        counts.peak_authenticated_concurrency,
+        counts.peak_active_game_concurrency,
         report.configured_max_concurrency,
         report.games.observed,
         report.games.expected,
@@ -948,6 +1674,16 @@ fn render_html(report: &AggregateReport) -> String {
         "WebSocket connect",
         &report.metrics.websocket_connect_ms,
     );
+    append_distribution_row(
+        &mut html,
+        "Initial admission ready",
+        &report.metrics.initial_admission_ready_ms,
+    );
+    append_distribution_row(
+        &mut html,
+        "WebSocket authentication",
+        &report.metrics.websocket_auth_ms,
+    );
     append_distribution_row(&mut html, "Lobby ready", &report.metrics.lobby_ready_ms);
     append_distribution_row(
         &mut html,
@@ -957,9 +1693,58 @@ fn render_html(report: &AggregateReport) -> String {
     append_distribution_row(&mut html, "Game join", &report.metrics.game_join_ms);
     append_distribution_row(&mut html, "Game duration", &report.metrics.game_duration_ms);
     append_distribution_row(&mut html, "WebSocket RTT", &report.metrics.websocket_rtt_ms);
+    append_distribution_row(
+        &mut html,
+        "Reconnect duration",
+        &report.metrics.reconnect_duration_ms,
+    );
+    append_distribution_row(&mut html, "Lobby rejoin", &report.metrics.rejoin_lobby_ms);
+    append_distribution_row(
+        &mut html,
+        "Game snapshot rejoin",
+        &report.metrics.rejoin_snapshot_ms,
+    );
+    append_distribution_row(
+        &mut html,
+        "Usable-session gap",
+        &report.metrics.usable_session_gap_ms,
+    );
+    append_distribution_row(
+        &mut html,
+        "Planned handoff duration",
+        &report.metrics.planned_handoff_duration_ms,
+    );
+    append_distribution_row(
+        &mut html,
+        "Planned handoff active overlap",
+        &report.metrics.planned_handoff_active_overlap_ms,
+    );
     html.push_str("</tbody></table></div>");
 
+    let handoffs = &report.metrics.planned_handoffs;
+    let _ = write!(
+        html,
+        "<h2>Planned handoffs</h2><div class=\"cards\">\
+         <div class=\"card\"><span class=\"label\">Attempts</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Successes</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Failures</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Outcome barriers</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Completed during handoff</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Continuity proofs</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Commands during handoff</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Pending commands at finish</span><b>{}</b></div></div>",
+        handoffs.attempts,
+        handoffs.successes,
+        handoffs.failures,
+        handoffs.outcome_barriers,
+        handoffs.terminal_completions,
+        handoffs.continuity_proofs,
+        handoffs.commands_sent,
+        handoffs.pending_commands_at_finish,
+    );
+
     let traffic = &report.metrics.traffic;
+    let dispatch_lag = &report.metrics.websocket_dispatch_lag;
     let _ = write!(
         html,
         "<h2>Traffic</h2><div class=\"cards\">\
@@ -968,19 +1753,25 @@ fn render_html(report: &AggregateReport) -> String {
          <div class=\"card\"><span class=\"label\">Game events</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Commands sent</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Disconnects</span><b>{}</b></div>\
-         <div class=\"card\"><span class=\"label\">Reconnects</span><b>{}</b></div></div>",
+         <div class=\"card\"><span class=\"label\">Reconnects</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Reader dispatch observations</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Maximum reader dispatch lag</span><b>{} ms</b></div>\
+         <div class=\"card\"><span class=\"label\">Reader dispatch lag &gt; 1 s</span><b>{}</b></div></div>",
         traffic.messages_sent,
         traffic.messages_received,
         traffic.game_events_received,
         traffic.commands_sent,
         traffic.disconnects,
         traffic.reconnects,
+        dispatch_lag.observations,
+        dispatch_lag.maximum_ms,
+        dispatch_lag.over_one_second,
     );
 
     if !report.ramp_stages.is_empty() {
         html.push_str(
             "<h2>Ramp stages</h2><div class=\"scroll\"><table><thead><tr>\
-             <th>Stage</th><th>Token-sent target</th><th>Reached</th><th>Launched</th><th>Token-sent start</th><th>Token-sent end</th>\
+             <th>Stage</th><th>Authenticated target</th><th>Reached</th><th>Launched</th><th>Authenticated start</th><th>Authenticated end</th>\
              <th>Duration</th></tr></thead><tbody>",
         );
         for stage in &report.ramp_stages {
@@ -1154,26 +1945,241 @@ mod tests {
     }
 
     #[test]
+    fn slow_resolution_cap_preserves_each_violating_second() {
+        let resolution =
+            |sequence: u64, sent_at_unix_ms: u64, latency_ms: u64| SlowCommandResolution {
+                session_id: format!("session-{sequence}"),
+                user_id: 1,
+                game_id: 1,
+                partition_id: 1,
+                client_game_session_id: "game-session".to_owned(),
+                command_sequence: sequence,
+                sent_at_unix_ms,
+                resolved_at_unix_ms: sent_at_unix_ms + latency_ms,
+                latency_ms,
+                source: CommandResolutionSource::LiveScheduledEvent,
+                gateway_task_boot_id: Some("task".to_owned()),
+                socket_generation: Some(1),
+                first_websocket_write_completed_at_unix_ms: Some(sent_at_unix_ms + 2),
+                first_websocket_write_wait_ms: Some(2),
+                reader_receipt_to_driver_lag_ms: 3,
+                reader_task_latest_wake_lag_ms: 4,
+                reader_task_max_wake_lag_ms: 5,
+            };
+        let mut records = (0..10)
+            .map(|sequence| resolution(sequence, 1_000 + sequence, 10_000 - sequence))
+            .collect::<Vec<_>>();
+        records.push(resolution(99, 2_000, 1_001));
+
+        retain_slow_resolution_coverage(&mut records, 4);
+
+        assert_eq!(records.len(), 4);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.sent_at_unix_ms / 1_000 == 2),
+            "one severe second consumed the entire aggregate provenance cap"
+        );
+    }
+
+    #[test]
+    fn slow_ping_cap_preserves_time_and_connection_coverage() {
+        let ping = |session_id: &str,
+                    sent_at_unix_ms: u64,
+                    rtt_ms: u64,
+                    gateway: &str,
+                    generation: u64| SlowApplicationPingObservation {
+            session_id: session_id.to_owned(),
+            client_time: sent_at_unix_ms as i64,
+            sent_at_unix_ms,
+            received_at_unix_ms: sent_at_unix_ms + rtt_ms,
+            rtt_ms,
+            server_time: Some(sent_at_unix_ms as i64 + 10),
+            pre_update_clock_offset_ms: Some(5),
+            gateway_task_boot_id: Some(gateway.to_owned()),
+            socket_generation: Some(generation),
+            reader_task_latest_wake_lag_ms: 6,
+            reader_task_max_wake_lag_ms: 7,
+        };
+        let mut observations = vec![
+            ping("session-a", 1_000, 4_000, "gateway-a", 1),
+            ping("session-a", 1_001, 3_000, "gateway-a", 1),
+            ping("session-a", 2_000, 1_001, "gateway-a", 1),
+            ping("session-b", 1_002, 1_002, "gateway-b", 2),
+        ];
+
+        retain_slow_ping_coverage(&mut observations, 3);
+
+        assert_eq!(observations.len(), 3);
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.sent_at_unix_ms / 1_000 == 2),
+            "one delayed second consumed the entire ping evidence cap"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.session_id == "session-b"),
+            "one connection consumed the entire ping evidence cap"
+        );
+    }
+
+    #[test]
     fn aggregation_counts_outcomes_percentiles_traffic_and_concurrency() {
         let mut first = SessionRecord::new("s1", "user1", 0, "m1", 0);
         first.metrics.guest_auth_ms = Some(10);
         first.metrics.matchmaking_wait_ms = Some(20);
         first.metrics.websocket_rtt_ms = vec![5, 15];
+        first.metrics.websocket_dispatch_lag = WebSocketDispatchLagSummary {
+            observations: 3,
+            maximum_ms: 1_500,
+            over_one_second: 1,
+        };
+        first.metrics.websocket_auth_ms = vec![7, 9];
+        first.metrics.initial_admission_ready_ms = Some(12);
+        first.metrics.reconnect_duration_ms = vec![30];
+        first.metrics.rejoin_lobby_ms = vec![31];
+        first.metrics.rejoin_snapshot_ms = vec![32];
+        first.metrics.usable_session_gap_ms = vec![33];
+        first.metrics.planned_handoff_duration_ms = vec![34];
+        first.metrics.planned_handoff_active_overlap_ms = vec![35];
+        first.metrics.planned_handoff_attempts = 1;
+        first.metrics.planned_handoff_successes = 1;
+        first.metrics.planned_handoff_outcome_barriers = 1;
+        first.metrics.planned_handoff_continuity_proofs = 1;
+        first.metrics.planned_handoff_commands_sent = 2;
         first.metrics.messages_sent = 7;
-        first.record_lifecycle(SessionLifecycleRecord::new(
-            SessionPhase::WebSocketAuthentication,
-            1,
-        ));
+        first.metrics.game_events_received = 8;
+        first.metrics.command_counts_by_unix_second = BTreeMap::from([(10, 4), (11, 3)]);
+        first.metrics.scheduled_command_counts_by_unix_second = BTreeMap::from([(10, 3), (11, 3)]);
+        first.metrics.scheduled_command_counts_by_sent_unix_second =
+            BTreeMap::from([(10, 2), (11, 3)]);
+        first.metrics.command_outcome_counts_by_sent_unix_second =
+            BTreeMap::from([(10, 4), (11, 2)]);
+        first
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second =
+            BTreeMap::from([(10, 90), (11, 110)]);
+        first.metrics.slow_command_resolutions = vec![SlowCommandResolution {
+            session_id: "s1".to_owned(),
+            user_id: 1,
+            game_id: 21,
+            partition_id: 1,
+            client_game_session_id: "game-s1".to_owned(),
+            command_sequence: 3,
+            sent_at_unix_ms: 10_000,
+            resolved_at_unix_ms: 11_500,
+            latency_ms: 1_500,
+            source: CommandResolutionSource::LiveScheduledEvent,
+            gateway_task_boot_id: Some("boot-a".to_owned()),
+            socket_generation: Some(1),
+            first_websocket_write_completed_at_unix_ms: Some(10_002),
+            first_websocket_write_wait_ms: Some(2),
+            reader_receipt_to_driver_lag_ms: 3,
+            reader_task_latest_wake_lag_ms: 4,
+            reader_task_max_wake_lag_ms: 5,
+        }];
+        first.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
+            session_id: "s1".to_owned(),
+            client_time: 10_000,
+            sent_at_unix_ms: 10_000,
+            received_at_unix_ms: 11_100,
+            rtt_ms: 1_100,
+            server_time: Some(10_010),
+            pre_update_clock_offset_ms: Some(1),
+            gateway_task_boot_id: Some("boot-a".to_owned()),
+            socket_generation: Some(1),
+            reader_task_latest_wake_lag_ms: 6,
+            reader_task_max_wake_lag_ms: 7,
+        }];
+        first.game_id = Some(21);
+        first.record_lifecycle(
+            SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, 1)
+                .with_message("token processed; server clock synchronized"),
+        );
+        first.record_lifecycle(SessionLifecycleRecord::new(SessionPhase::Playing, 10));
+        first.record_lifecycle(
+            SessionLifecycleRecord::new(SessionPhase::GameSnapshot, 20)
+                .with_message("planned handoff promoted a fully synchronized candidate"),
+        );
+        first.metrics.game_duration_ms = Some(50);
         first
             .diagnostics
             .insert("completion_kind".to_owned(), "timeboxed".to_owned());
+        first
+            .diagnostics
+            .insert("task_boot_id_0".to_owned(), "boot-a".to_owned());
+        first
+            .diagnostics
+            .insert("websocket_backend".to_owned(), "backend-1".to_owned());
+        first
+            .diagnostics
+            .insert("first_game_event_at_unix_ms".to_owned(), "11".to_owned());
+        first.hard_recoveries.push(HardRecoveryObservation {
+            detected_at_unix_ms: 40,
+            ready_at_unix_ms: 45,
+            from_task_boot_id: "task-a:boot-a".to_owned(),
+            to_task_boot_id: "task-b:boot-b".to_owned(),
+            from_socket_generation: 1,
+            to_socket_generation: 2,
+            game_id: 21,
+            fresh_snapshot_received: true,
+            pending_commands_at_detection: 1,
+            pending_commands_after_outcome_barrier: 1,
+        });
         first.complete(100);
 
         let mut second = SessionRecord::new("s2", "user2", 0, "m1", 50);
         second.metrics.guest_auth_ms = Some(20);
         second.metrics.matchmaking_wait_ms = Some(100);
         second.metrics.websocket_rtt_ms = vec![25];
+        second.metrics.websocket_dispatch_lag = WebSocketDispatchLagSummary {
+            observations: 2,
+            maximum_ms: 50,
+            over_one_second: 0,
+        };
         second.metrics.messages_sent = 11;
+        second.metrics.command_counts_by_unix_second = BTreeMap::from([(10, 2)]);
+        second.metrics.scheduled_command_counts_by_unix_second = BTreeMap::from([(10, 1)]);
+        second.metrics.scheduled_command_counts_by_sent_unix_second = BTreeMap::from([(10, 1)]);
+        second.metrics.command_outcome_counts_by_sent_unix_second = BTreeMap::from([(10, 2)]);
+        second
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second = BTreeMap::from([(10, 120)]);
+        second.metrics.slow_command_resolutions = vec![SlowCommandResolution {
+            session_id: "s2".to_owned(),
+            user_id: 2,
+            game_id: 32,
+            partition_id: 2,
+            client_game_session_id: "game-s2".to_owned(),
+            command_sequence: 4,
+            sent_at_unix_ms: 10_001,
+            resolved_at_unix_ms: 12_001,
+            latency_ms: 2_000,
+            source: CommandResolutionSource::RecoveryScheduledOutcome,
+            gateway_task_boot_id: Some("boot-b".to_owned()),
+            socket_generation: Some(2),
+            first_websocket_write_completed_at_unix_ms: Some(10_004),
+            first_websocket_write_wait_ms: Some(3),
+            reader_receipt_to_driver_lag_ms: 4,
+            reader_task_latest_wake_lag_ms: 5,
+            reader_task_max_wake_lag_ms: 6,
+        }];
+        second.metrics.slow_application_ping_observations = vec![SlowApplicationPingObservation {
+            session_id: "s2".to_owned(),
+            client_time: 10_001,
+            sent_at_unix_ms: 10_001,
+            received_at_unix_ms: 12_001,
+            rtt_ms: 2_000,
+            server_time: Some(10_011),
+            pre_update_clock_offset_ms: Some(2),
+            gateway_task_boot_id: Some("boot-b".to_owned()),
+            socket_generation: Some(2),
+            reader_task_latest_wake_lag_ms: 7,
+            reader_task_max_wake_lag_ms: 8,
+        }];
+        second.game_id = Some(32);
         second.record_lifecycle(SessionLifecycleRecord::new(
             SessionPhase::WebSocketAuthentication,
             51,
@@ -1200,6 +2206,7 @@ mod tests {
             started_at_unix_ms: 0,
             finished_at_unix_ms: 400,
             configured_max_concurrency: 4,
+            peak_authenticated_concurrency: 3,
             metadata: BTreeMap::new(),
             ramp_stages: Vec::new(),
             infrastructure_samples: Vec::new(),
@@ -1215,16 +2222,192 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
+        assert_eq!(report.schema_version, 13);
+        assert_eq!(report.sessions[0].started_at_unix_ms, 0);
+        assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
+        assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
+        assert_eq!(report.sessions[0].initial_admission_ready_ms, Some(12));
+        assert_eq!(report.sessions[0].game_events_received, 8);
+        assert_eq!(
+            report.sessions[0].initial_task_boot_id.as_deref(),
+            Some("boot-a")
+        );
+        assert_eq!(
+            report.sessions[0].initial_backend_hint.as_deref(),
+            Some("backend-1")
+        );
+        assert_eq!(report.sessions[0].authenticated_at_unix_ms, Some(1));
+        assert_eq!(report.sessions[0].playing_at_unix_ms, Some(10));
+        assert_eq!(report.sessions[0].first_game_event_at_unix_ms, Some(11));
+        assert_eq!(report.sessions[0].game_finished_at_unix_ms, Some(60));
+        assert_eq!(report.sessions[0].planned_game_handoff_at_unix_ms, vec![20]);
+        assert_eq!(report.sessions[0].hard_recoveries.len(), 1);
+        assert_eq!(
+            report.sessions[0].hard_recoveries[0].to_task_boot_id,
+            "task-b:boot-b"
+        );
+        assert_eq!(
+            report.sessions[0].hard_recoveries[0].pending_commands_after_outcome_barrier,
+            1
+        );
+        assert_eq!(report.sessions[1].initial_websocket_auth_ms, None);
         assert_eq!(report.session_counts.total, 3);
         assert_eq!(report.session_counts.completed, 2);
         assert_eq!(report.session_counts.failed, 1);
         assert_eq!(report.session_counts.peak_token_sent_concurrency, 2);
+        assert_eq!(report.session_counts.peak_authenticated_concurrency, 3);
         assert!((report.session_counts.success_rate_percent - 66.666_666).abs() < 0.001);
         assert_eq!(report.metrics.guest_auth_ms.p50_ms, Some(20));
         assert_eq!(report.metrics.guest_auth_ms.p95_ms, Some(30));
         assert_eq!(report.metrics.matchmaking_wait_ms.p50_ms, Some(60));
         assert_eq!(report.metrics.websocket_rtt_ms.p95_ms, Some(25));
+        assert_eq!(
+            report.metrics.websocket_dispatch_lag,
+            WebSocketDispatchLagSummary {
+                observations: 5,
+                maximum_ms: 1_500,
+                over_one_second: 1,
+            }
+        );
+        assert_eq!(report.metrics.websocket_auth_ms.p95_ms, Some(9));
+        assert_eq!(report.metrics.initial_admission_ready_ms.p95_ms, Some(12));
+        assert_eq!(report.metrics.reconnect_duration_ms.p95_ms, Some(30));
+        assert_eq!(report.metrics.rejoin_lobby_ms.p95_ms, Some(31));
+        assert_eq!(report.metrics.rejoin_snapshot_ms.p95_ms, Some(32));
+        assert_eq!(report.metrics.usable_session_gap_ms.p95_ms, Some(33));
+        assert_eq!(report.metrics.planned_handoff_duration_ms.p95_ms, Some(34));
+        assert_eq!(
+            report.metrics.planned_handoff_active_overlap_ms.p95_ms,
+            Some(35)
+        );
+        assert_eq!(report.metrics.planned_handoffs.attempts, 1);
+        assert_eq!(report.metrics.planned_handoffs.successes, 1);
+        assert_eq!(report.metrics.planned_handoffs.failures, 0);
+        assert_eq!(report.metrics.planned_handoffs.outcome_barriers, 1);
+        assert_eq!(report.metrics.planned_handoffs.terminal_completions, 0);
+        assert_eq!(report.metrics.planned_handoffs.continuity_proofs, 1);
+        assert_eq!(report.metrics.planned_handoffs.commands_sent, 2);
+        assert_eq!(
+            report.metrics.planned_handoffs.pending_commands_at_finish,
+            0
+        );
         assert_eq!(report.metrics.traffic.messages_sent, 31);
+        assert_eq!(
+            report.metrics.command_counts_by_unix_second,
+            BTreeMap::from([(10, 6), (11, 3)])
+        );
+        assert_eq!(
+            report
+                .metrics
+                .scheduled_command_counts_by_partition_and_unix_second,
+            BTreeMap::from([
+                (1, BTreeMap::from([(10, 3), (11, 3)])),
+                (2, BTreeMap::from([(10, 1)])),
+            ])
+        );
+        assert_eq!(
+            report.metrics.scheduled_command_counts_by_sent_unix_second,
+            BTreeMap::from([(10, 3), (11, 3)])
+        );
+        assert_eq!(
+            report.metrics.command_outcome_counts_by_sent_unix_second,
+            BTreeMap::from([(10, 6), (11, 2)])
+        );
+        assert_eq!(
+            report
+                .metrics
+                .command_outcome_max_latency_ms_by_sent_unix_second,
+            BTreeMap::from([(10, 120), (11, 110)])
+        );
+        assert_eq!(report.metrics.slow_command_resolutions.len(), 2);
+        assert_eq!(report.metrics.slow_command_resolutions[0].session_id, "s2");
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].source,
+            CommandResolutionSource::RecoveryScheduledOutcome
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].first_websocket_write_wait_ms,
+            Some(3)
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_receipt_to_driver_lag_ms,
+            4
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_task_latest_wake_lag_ms,
+            5
+        );
+        assert_eq!(
+            report.metrics.slow_command_resolutions[0].reader_task_max_wake_lag_ms,
+            6
+        );
+        assert_eq!(
+            report.metrics.slow_application_ping_observations,
+            vec![
+                SlowApplicationPingObservation {
+                    session_id: "s2".to_owned(),
+                    client_time: 10_001,
+                    sent_at_unix_ms: 10_001,
+                    received_at_unix_ms: 12_001,
+                    rtt_ms: 2_000,
+                    server_time: Some(10_011),
+                    pre_update_clock_offset_ms: Some(2),
+                    gateway_task_boot_id: Some("boot-b".to_owned()),
+                    socket_generation: Some(2),
+                    reader_task_latest_wake_lag_ms: 7,
+                    reader_task_max_wake_lag_ms: 8,
+                },
+                SlowApplicationPingObservation {
+                    session_id: "s1".to_owned(),
+                    client_time: 10_000,
+                    sent_at_unix_ms: 10_000,
+                    received_at_unix_ms: 11_100,
+                    rtt_ms: 1_100,
+                    server_time: Some(10_010),
+                    pre_update_clock_offset_ms: Some(1),
+                    gateway_task_boot_id: Some("boot-a".to_owned()),
+                    socket_generation: Some(1),
+                    reader_task_latest_wake_lag_ms: 6,
+                    reader_task_max_wake_lag_ms: 7,
+                },
+            ]
+        );
+        let report_json = serde_json::to_value(&report).expect("aggregate report serializes");
+        assert_eq!(
+            report_json.pointer("/metrics/command_counts_by_unix_second/10"),
+            Some(&serde_json::json!(6))
+        );
+        assert_eq!(
+            report_json
+                .pointer("/metrics/scheduled_command_counts_by_partition_and_unix_second/1/11"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/command_outcome_max_latency_ms_by_sent_unix_second/10"),
+            Some(&serde_json::json!(120))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_command_resolutions/0/gateway_task_boot_id"),
+            Some(&serde_json::json!("boot-b"))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/websocket_dispatch_lag/maximum_ms"),
+            Some(&serde_json::json!(1_500))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_application_ping_observations/0/socket_generation"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            report_json.pointer("/metrics/slow_application_ping_observations/0/server_time"),
+            Some(&serde_json::json!(10_011))
+        );
+        assert_eq!(
+            report_json.pointer(
+                "/metrics/slow_application_ping_observations/0/reader_task_max_wake_lag_ms"
+            ),
+            Some(&serde_json::json!(8))
+        );
         assert_eq!(report.games.completed, 1);
         assert_eq!(report.games.timeboxed, 1);
         assert_eq!(
@@ -1243,6 +2426,39 @@ mod tests {
             report.sessions[1].detail_file.as_deref(),
             Some("failures/00001-s2.json")
         );
+    }
+
+    #[test]
+    fn active_game_peak_requires_every_participant_and_uses_intersected_lifetimes() {
+        fn participant(
+            session_id: &str,
+            game_id: u32,
+            snapshot_at: u64,
+            finish_at: u64,
+        ) -> SessionRecord {
+            let mut session = SessionRecord::new(session_id, session_id, 0, session_id, 0);
+            session.game_id = Some(game_id);
+            session.record_lifecycle(SessionLifecycleRecord::new(
+                SessionPhase::Playing,
+                snapshot_at,
+            ));
+            session.metrics.game_duration_ms = Some(finish_at - snapshot_at);
+            session.complete(finish_at.saturating_add(10));
+            session
+        }
+
+        let mut run = LoadTestRun::new("run", "https://example.test", 0, 6);
+        run.metadata.insert("mode".to_owned(), "duel".to_owned());
+        run.sessions = vec![
+            participant("a", 41, 10, 100),
+            participant("b", 41, 20, 90),
+            participant("c", 42, 30, 80),
+            participant("d", 42, 40, 120),
+            // A partially joined duel must not inflate the peak.
+            participant("e", 43, 15, 110),
+        ];
+
+        assert_eq!(peak_active_game_concurrency(&run), 2);
     }
 
     #[test]
@@ -1267,6 +2483,7 @@ mod tests {
             started_at_unix_ms: 0,
             finished_at_unix_ms: 10,
             configured_max_concurrency: 1,
+            peak_authenticated_concurrency: 0,
             metadata: BTreeMap::new(),
             ramp_stages: Vec::new(),
             infrastructure_samples: Vec::new(),

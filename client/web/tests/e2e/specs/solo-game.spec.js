@@ -64,11 +64,11 @@ test.describe('Solo Game', () => {
     await gameArenaPage.pressKey('ArrowUp');
     
     // Wait for game command to be sent
-    const gameCommandPromise = wsMonitor.waitForMessage('GameCommand');
+    const gameCommandPromise = wsMonitor.waitForMessage('GameCommandV2');
     const gameCommand = await gameCommandPromise;
     
-    expect(gameCommand).toHaveProperty('GameCommand');
-    expect(gameCommand.GameCommand.command).toEqual({ Direction: 'Up' });
+    expect(gameCommand).toHaveProperty('GameCommandV2');
+    expect(gameCommand.GameCommandV2.command.command).toEqual({ Direction: 'Up' });
 
     // Step 9: Wait for game state update
     const gameEventPromise = wsMonitor.waitForMessage('GameEvent');

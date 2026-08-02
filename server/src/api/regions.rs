@@ -1,11 +1,12 @@
+use anyhow::Context;
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::{error, warn};
 
 use crate::http_server::HttpServerState;
-
-const ACTIVE_SERVER_USER_COUNT_PATTERN: &str = "server:*:user_count";
+use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 
 /// Region metadata returned by /api/regions endpoint
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -22,6 +23,12 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveServerMetric {
+    pub(crate) region: String,
+    pub(crate) user_count: u32,
+}
+
 /// List all available regions with connection metadata
 /// Regions are dynamically discovered from DynamoDB by scanning for active servers
 pub async fn list_regions(State(state): State<HttpServerState>) -> Json<Vec<RegionMetadata>> {
@@ -31,77 +38,24 @@ pub async fn list_regions(State(state): State<HttpServerState>) -> Json<Vec<Regi
 
 /// Get aggregated user counts per region from Redis
 ///
-/// Queries Redis for all server user counts and aggregates them by region.
-/// Redis schema:
-/// - Key: server:{server_id}:user_count -> Value: <count>
-/// - Key: server:{server_id}:region -> Value: <region_id>
+/// Loads the single-slot active-server registry and aggregates it by region.
 pub async fn get_user_counts(
     State(state): State<HttpServerState>,
 ) -> Result<Json<HashMap<String, u32>>, StatusCode> {
-    let redis_client = match redis::Client::open(state.redis_url.as_str()) {
-        Ok(client) => client,
-        Err(e) => {
-            error!("Failed to open Redis client: {}", e);
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
+    let mut conn = state.redis.clone();
 
-    let mut conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
+    let metrics = match load_active_server_metrics(&mut conn).await {
+        Ok(metrics) => metrics,
         Err(e) => {
-            error!("Failed to get Redis connection: {}", e);
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
-
-    let server_keys = match scan_active_server_keys(&mut conn).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            error!("Failed to query active server metric keys: {}", e);
+            error!("Failed to query active server metrics: {}", e);
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
     let mut region_counts: HashMap<String, u32> = HashMap::new();
-
-    for key in server_keys {
-        // Get user count for this server
-        let count: Option<u32> = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
-            Ok(count) => count,
-            Err(e) => {
-                error!("Failed to read an active server's user count: {}", e);
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-        };
-        let Some(count) = count else {
-            // The TTL-backed key can legitimately expire after SCAN.
-            continue;
-        };
-
-        let Some(region_key) = region_key_for_active_server(&key) else {
-            error!("Redis returned a malformed active server metric key");
-            continue;
-        };
-
-        let region: Option<String> = match redis::cmd("GET")
-            .arg(&region_key)
-            .query_async(&mut conn)
-            .await
-        {
-            Ok(region) => region,
-            Err(e) => {
-                error!("Failed to resolve an active server's region: {}", e);
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-        };
-        let Some(region) = region.filter(|region| !region.trim().is_empty()) else {
-            warn!("Ignoring an active server metric without region metadata");
-            continue;
-        };
-
-        // Aggregate counts by region
-        let regional_count = region_counts.entry(region).or_insert(0_u32);
-        *regional_count = regional_count.saturating_add(count);
+    for metric in metrics {
+        let regional_count = region_counts.entry(metric.region).or_insert(0_u32);
+        *regional_count = regional_count.saturating_add(metric.user_count);
     }
 
     Ok(Json(region_counts))
@@ -109,103 +63,80 @@ pub async fn get_user_counts(
 
 /// Get active server-instance counts per region from Redis.
 ///
-/// A server is considered active while its TTL-backed
-/// `server:{server_id}:user_count` key exists. Persistent region metadata is
-/// consulted only for those active keys, and server identifiers are never
-/// included in the response.
+/// A server is considered active while its expiry-index entry is newer than
+/// Valkey's server clock. Server identifiers are never included in the response.
 pub async fn get_server_counts(
     State(state): State<HttpServerState>,
 ) -> Result<Json<HashMap<String, u32>>, StatusCode> {
-    let redis_client = match redis::Client::open(state.redis_url.as_str()) {
-        Ok(client) => client,
-        Err(e) => {
-            error!("Failed to open Redis client: {}", e);
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
+    let mut conn = state.redis.clone();
 
-    let mut conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(conn) => conn,
+    let metrics = match load_active_server_metrics(&mut conn).await {
+        Ok(metrics) => metrics,
         Err(e) => {
-            error!("Failed to get Redis connection: {}", e);
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
-
-    let active_server_keys = match scan_active_server_keys(&mut conn).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            error!("Failed to query active server metric keys: {}", e);
+            error!("Failed to query active server metrics: {}", e);
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
     let mut region_counts = HashMap::new();
-    for active_server_key in active_server_keys {
-        let Some(region_key) = region_key_for_active_server(&active_server_key) else {
-            error!("Redis returned a malformed active server metric key");
-            continue;
-        };
-        let region: Option<String> = match redis::cmd("GET")
-            .arg(region_key)
-            .query_async(&mut conn)
-            .await
-        {
-            Ok(region) => region,
-            Err(e) => {
-                error!("Failed to resolve an active server's region: {}", e);
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-        };
-        let Some(region) = region.filter(|region| !region.trim().is_empty()) else {
-            warn!("Ignoring an active server metric without region metadata");
-            continue;
-        };
-
-        record_active_server(&mut region_counts, region);
+    for metric in metrics {
+        record_active_server(&mut region_counts, metric.region);
     }
 
     Ok(Json(region_counts))
 }
 
-async fn scan_active_server_keys(
-    conn: &mut redis::aio::MultiplexedConnection,
-) -> redis::RedisResult<Vec<String>> {
-    let mut cursor = 0_u64;
-    let mut keys = HashSet::new();
+/// Load the complete active registry from one hash slot. SCAN is deliberately
+/// avoided: redis-rs routes a cluster SCAN to one node, which can silently
+/// omit tasks stored on other Serverless shards.
+pub(crate) async fn load_active_server_metrics(
+    conn: &mut RedisConnection,
+) -> anyhow::Result<Vec<ActiveServerMetric>> {
+    let entries: HashMap<String, String> = redis::Script::new(
+        r#"
+        local function key_type(key)
+            local response = redis.call('TYPE', key)
+            if type(response) == 'table' then return response['ok'] end
+            return response
+        end
+        local metrics_type = key_type(KEYS[1])
+        local expiry_type = key_type(KEYS[2])
+        if metrics_type ~= 'none' and metrics_type ~= 'hash' then
+            return redis.error_reply('active server metrics key has wrong type')
+        end
+        if expiry_type ~= 'none' and expiry_type ~= 'zset' then
+            return redis.error_reply('active server expiry key has wrong type')
+        end
+        local now = redis.call('TIME')
+        local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+        local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now_ms)
+        if #expired > 0 then
+            redis.call('HDEL', KEYS[1], unpack(expired))
+            redis.call('ZREM', KEYS[2], unpack(expired))
+        end
+        return redis.call('HGETALL', KEYS[1])
+        "#,
+    )
+    .key(RedisKeys::active_server_metrics())
+    .key(RedisKeys::active_server_metrics_expiry())
+    .invoke_async(conn)
+    .await
+    .context("failed to load and prune active server metrics")?;
 
-    loop {
-        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(ACTIVE_SERVER_USER_COUNT_PATTERN)
-            .arg("COUNT")
-            .arg(100_u32)
-            .query_async(conn)
-            .await?;
-        keys.extend(batch);
-        cursor = next_cursor;
-        if cursor == 0 {
-            break;
+    let mut metrics = Vec::with_capacity(entries.len());
+    for (server_id, payload) in entries {
+        match serde_json::from_str::<ActiveServerMetric>(&payload) {
+            Ok(metric) if !metric.region.trim().is_empty() => metrics.push(metric),
+            Ok(_) => warn!(server_id, "Ignoring active server metric with empty region"),
+            Err(error) => warn!(server_id, %error, "Ignoring malformed active server metric"),
         }
     }
-
-    Ok(keys.into_iter().collect())
+    Ok(metrics)
 }
 
 fn record_active_server(region_counts: &mut HashMap<String, u32>, region: String) {
     let count = region_counts.entry(region).or_insert(0);
     *count = count.saturating_add(1);
-}
-
-fn region_key_for_active_server(user_count_key: &str) -> Option<String> {
-    let mut parts = user_count_key.split(':');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("server"), Some(server_id), Some("user_count"), None) if !server_id.is_empty() => {
-            Some(format!("server:{server_id}:region"))
-        }
-        _ => None,
-    }
 }
 
 /// Simple health check endpoint for client-side ping measurement
@@ -218,7 +149,7 @@ pub async fn health_check_json() -> Json<HealthResponse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_active_server, region_key_for_active_server};
+    use super::record_active_server;
     use std::collections::HashMap;
 
     #[test]
@@ -231,26 +162,5 @@ mod tests {
         assert_eq!(counts.get("use1"), Some(&2));
         assert_eq!(counts.get("euw1"), Some(&1));
         assert_eq!(counts.len(), 2);
-    }
-
-    #[test]
-    fn derives_region_key_from_an_active_server_metric() {
-        assert_eq!(
-            region_key_for_active_server("server:instance-123:user_count").as_deref(),
-            Some("server:instance-123:region")
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_active_server_metrics() {
-        for key in [
-            "",
-            "server::user_count",
-            "server:instance-123",
-            "server:instance-123:connections",
-            "server:instance-123:user_count:extra",
-        ] {
-            assert_eq!(region_key_for_active_server(key), None, "accepted {key}");
-        }
     }
 }

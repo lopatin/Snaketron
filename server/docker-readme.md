@@ -52,7 +52,7 @@ Required environment variables:
 - `SNAKETRON_DB_PASS`: Database password
 - `SNAKETRON_DB_NAME`: Database name
 - `SNAKETRON_REGION`: AWS region
-- `SNAKETRON_WS_PORT`: WebSocket port (8080)
+- `SNAKETRON_HTTP_PORT`: HTTP/WebSocket port (8080)
 - `SNAKETRON_GRPC_PORT`: gRPC port (50051)
 
 ### Task Definition Configuration

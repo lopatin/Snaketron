@@ -140,6 +140,16 @@ impl GameEngine {
     }
 
     pub fn new_from_state(game_id: u32, game_state: GameState) -> Self {
+        Self::new_from_state_with_command_counter(game_id, game_state, 0)
+    }
+
+    /// Restore an authoritative engine without reusing server command IDs.
+    /// `next_command_sequence` is part of the v2 recovery envelope.
+    pub fn new_from_state_with_command_counter(
+        game_id: u32,
+        game_state: GameState,
+        next_command_sequence: u32,
+    ) -> Self {
         let mut predicted_state = game_state.clone();
         predicted_state.rng = None; // Remove RNG so client doesn't generate food
 
@@ -150,10 +160,14 @@ impl GameEngine {
             event_log: Vec::new(),
             committed_state_lag_ms: 500,
             local_player_id: None,
-            command_counter: 0,
+            command_counter: next_command_sequence,
             local_command_seq: 0,
             sync_status: SyncStatus::default(),
         }
+    }
+
+    pub fn next_server_command_sequence(&self) -> u32 {
+        self.command_counter
     }
 
     pub fn set_local_player_id(&mut self, player_id: u32) {
@@ -431,6 +445,46 @@ impl GameEngine {
         }
 
         Ok(cmd)
+    }
+
+    /// Replays an already-decided authoritative command after crash recovery.
+    /// The server ID and scheduled tick are preserved exactly; recomputing them
+    /// from the successor's older checkpoint would make the same client command
+    /// resolve differently after failover.
+    pub fn replay_scheduled_command(&mut self, command_message: GameCommandMessage) -> Result<()> {
+        let server_id = command_message
+            .command_id_server
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("replayed server command has no server ID"))?;
+        if server_id.sequence_number != self.command_counter {
+            return Err(anyhow::anyhow!(
+                "replayed server command sequence {} does not match next sequence {}",
+                server_id.sequence_number,
+                self.command_counter
+            ));
+        }
+        if server_id.user_id != command_message.command_id_client.user_id {
+            return Err(anyhow::anyhow!(
+                "replayed server command user identity does not match"
+            ));
+        }
+        if server_id.tick < self.committed_state.current_tick() {
+            return Err(anyhow::anyhow!(
+                "replayed server command tick {} predates checkpoint tick {}",
+                server_id.tick,
+                self.committed_state.current_tick()
+            ));
+        }
+
+        self.command_counter = self
+            .command_counter
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("server command sequence overflow"))?;
+        self.committed_state.schedule_command(&command_message);
+        if let Some(predicted_state) = &mut self.predicted_state {
+            predicted_state.schedule_command(&command_message);
+        }
+        Ok(())
     }
 
     // --- JSON Getters for WASM ---

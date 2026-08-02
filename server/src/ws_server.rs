@@ -1,24 +1,33 @@
 use crate::api::auth::validate_username;
+use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
+use crate::lifecycle::{DrainNotice, TaskLifecycle, WS_PROTOCOL_VERSION};
 use crate::lobby_manager;
 use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
 use crate::matchmaking_manager::MatchmakingManager;
 use crate::pubsub_manager::PubSubManager;
+use crate::recovery::{
+    CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
+    SessionCommandRejectionFence, validate_client_command_identity,
+};
 use crate::redis_keys::RedisKeys;
+use crate::redis_utils::RedisConnection;
 use crate::replication::GameStateReader;
 use crate::user_cache::UserCache;
-use crate::ws_matchmaking::remove_from_matchmaking_queue;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use common::{GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus};
+use common::{
+    ClientCommandIdentityV2, GameCommandMessage, GameEvent, GameEventMessage, GameState, GameStatus,
+};
 use futures_util::SinkExt;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::{Future, pending};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -27,7 +36,6 @@ use tokio_stream::StreamExt;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use tungstenite::Utf8Bytes;
 
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
@@ -36,8 +44,35 @@ pub enum WSMessage {
     Token(String),
     JoinGame(u32),
     LeaveGame,
-    GameCommand(GameCommandMessage),
+    /// At-least-once client command. The gateway canonicalizes `game_id` and
+    /// `user_id` from the authenticated connection before publishing it.
+    GameCommandV2 {
+        command_id: ClientCommandIdentityV2,
+        command: GameCommandMessage,
+    },
     GameEvent(GameEventMessage),
+    /// Executor-authored terminal command outcomes adjacent to a fresh
+    /// snapshot. This is user/session filtered and never part of shared state.
+    CommandOutcomes {
+        game_id: u32,
+        client_game_session_id: String,
+        contiguous_through: u64,
+        outcomes: BTreeMap<u64, CommandOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rejection_fence: Option<SessionCommandRejectionFence>,
+    },
+    /// Ordered barrier emitted only after every outcome batch for the
+    /// immediately preceding snapshot has reached this socket's send queue.
+    /// Planned handoff clients use it instead of guessing from timing or from
+    /// the absence of a per-session outcome batch. A terminal barrier also
+    /// explicitly rejects every identity still unresolved at the client:
+    /// commands can cross the bidirectional WebSocket while completion is
+    /// already queued in the opposite direction.
+    CommandOutcomesComplete {
+        game_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_rejection_reason: Option<String>,
+    },
     Chat(String),
     LobbyChatMessage {
         lobby_code: String,
@@ -63,7 +98,14 @@ pub enum WSMessage {
         game_id: u32,
         messages: Vec<GameChatBroadcast>,
     },
-    Shutdown,
+    /// Server -> client acknowledgement sent only after token verification and
+    /// user loading have completed.
+    Authenticated {
+        task_boot_id: String,
+        protocol_version: u16,
+        capabilities: Vec<String>,
+        socket_generation: u64,
+    },
     /// Client -> server: the client detected message loss or state divergence
     /// (stream_seq gap, repeated TickHash mismatch, or a silent feed) and
     /// needs its event subscription restarted with a fresh snapshot.
@@ -107,18 +149,22 @@ pub enum WSMessage {
         game_id: u32,
         reason: String,
     },
+    /// The game is known, but this ready gateway's local replica is still
+    /// warming through an executor ownership gap. Clients retry the same join
+    /// without surfacing a terminal error.
+    GameWarming {
+        game_id: u32,
+        retry_after_ms: u64,
+    },
     // Solo game responses
     SoloGameCreated {
         game_id: u32,
     },
-    // High availability messages
-    ServerShutdown {
-        reason: String,
-        grace_period_seconds: u32,
-    },
-    AuthorityTransfer {
-        game_id: u32,
-        new_server_url: String,
+    // Planned gateway handoff. Executor ownership is intentionally absent:
+    // the replacement connection uses the same regional URL.
+    Drain {
+        task_boot_id: String,
+        deadline_unix_ms: i64,
     },
     // Region user count updates
     UserCountUpdate {
@@ -177,6 +223,17 @@ pub struct PlayerMetadata {
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
 const CHAT_HISTORY_LIMIT: usize = 200;
+const LOBBY_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
+const LOBBY_MATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+const LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SLOW_COMMAND_PUBLISH_THRESHOLD: Duration = Duration::from_secs(1);
+
+fn slow_command_publish_wait_ms(publish_wait: Duration) -> Option<u64> {
+    if publish_wait <= SLOW_COMMAND_PUBLISH_THRESHOLD {
+        return None;
+    }
+    Some(u64::try_from(publish_wait.as_millis()).unwrap_or(u64::MAX))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LobbyChatBroadcast {
@@ -196,6 +253,16 @@ pub struct GameChatBroadcast {
     username: String,
     message: String,
     timestamp_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum LobbyMatchHint {
+    MatchFound {
+        game_id: u32,
+        #[serde(default)]
+        partition_id: Option<u32>,
+    },
 }
 
 async fn handle_guest_nickname_update(
@@ -311,6 +378,119 @@ enum ConnectionState {
     },
 }
 
+fn queue_planned_drain_notice(
+    drain_tx: &mpsc::Sender<Message>,
+    notice: &DrainNotice,
+) -> Result<()> {
+    let message = WSMessage::Drain {
+        task_boot_id: notice.task_boot_id.clone(),
+        deadline_unix_ms: notice.deadline_unix_ms,
+    };
+    drain_tx
+        .try_send(Message::Text(serde_json::to_string(&message)?.into()))
+        .context("WebSocket drain control channel unavailable")
+}
+
+/// Receive control traffic ahead of the bounded gameplay queue. The sink
+/// remains owned by one task, so this changes only queueing priority: at most
+/// the single frame already being written can precede a drain notice.
+async fn next_outbound_message(
+    drain_rx: &mut mpsc::Receiver<Message>,
+    ws_rx: &mut mpsc::Receiver<Message>,
+    drain_open: &mut bool,
+    ws_open: &mut bool,
+) -> Option<Message> {
+    loop {
+        if !*drain_open && !*ws_open {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            message = drain_rx.recv(), if *drain_open => {
+                match message {
+                    Some(message) => return Some(message),
+                    None => *drain_open = false,
+                }
+            }
+            message = ws_rx.recv(), if *ws_open => {
+                match message {
+                    Some(message) => return Some(message),
+                    None => *ws_open = false,
+                }
+            }
+        }
+    }
+}
+
+/// Move the receiver created before `join_lobby` publishes its initial
+/// snapshot into the WebSocket forwarder. `Receiver::resubscribe()` starts at
+/// the current tail, so using only that new receiver would discard an initial
+/// update that reached this task while the join response was being assembled.
+fn take_lobby_update_receiver(
+    receiver: &mut broadcast::Receiver<lobby_manager::Lobby>,
+) -> broadcast::Receiver<lobby_manager::Lobby> {
+    let replacement = receiver.resubscribe();
+    std::mem::replace(receiver, replacement)
+}
+
+#[derive(PartialEq, Eq)]
+struct LobbyUpdateFingerprint {
+    lobby_code: String,
+    members: Vec<(u32, String)>,
+    host_user_id: i32,
+    state: String,
+    preferences: lobby_manager::LobbyPreferences,
+}
+
+/// Publish the durable lobby snapshot, rather than trusting the at-most-once
+/// Pub/Sub payload as authoritative state. A missing lobby is represented by
+/// the same terminal update used by the lobby manager's deletion forwarder.
+async fn send_authoritative_lobby_update(
+    lobby_manager: &Arc<lobby_manager::LobbyManager>,
+    lobby_code: &str,
+    ws_tx: &mpsc::Sender<Message>,
+    last_sent_update: &mut Option<LobbyUpdateFingerprint>,
+) -> Result<bool> {
+    let lobby = lobby_manager
+        .get_lobby_opt(lobby_code)
+        .await?
+        .unwrap_or_else(|| lobby_manager::Lobby {
+            lobby_code: lobby_code.to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 0,
+            state: "deleted".to_owned(),
+            preferences: lobby_manager::LobbyPreferences::default(),
+        });
+    let fingerprint = LobbyUpdateFingerprint {
+        lobby_code: lobby.lobby_code.clone(),
+        members: lobby
+            .members
+            .values()
+            .map(|member| (member.user_id, member.username.clone()))
+            .collect(),
+        host_user_id: lobby.host_user_id,
+        state: lobby.state.clone(),
+        preferences: lobby.preferences.clone(),
+    };
+    if last_sent_update.as_ref() == Some(&fingerprint) {
+        return Ok(true);
+    }
+    let ws_message = WSMessage::LobbyUpdate {
+        lobby_code: lobby.lobby_code,
+        members: lobby.members.into_values().collect(),
+        host_user_id: lobby.host_user_id,
+        state: lobby.state,
+        preferences: lobby.preferences,
+    };
+    let json_msg = serde_json::to_string(&ws_message)?;
+    if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
+        return Ok(false);
+    }
+    *last_sent_update = Some(fingerprint);
+    Ok(true)
+}
+
 /// Handle WebSocket connection from Axum
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_websocket(
@@ -318,7 +498,7 @@ pub async fn handle_websocket(
     db: Arc<dyn Database>,
     user_cache: UserCache,
     jwt_verifier: Arc<dyn JwtVerifier>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     pubsub_manager: Arc<PubSubManager>,
     game_bus: Arc<GameBus>,
@@ -327,6 +507,8 @@ pub async fn handle_websocket(
     cancellation_token: CancellationToken,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
+    lifecycle: TaskLifecycle,
+    cluster_namespace: ClusterNamespace,
 ) {
     info!("New WebSocket connection established");
 
@@ -345,10 +527,22 @@ pub async fn handle_websocket(
         redis_url,
         lobby_manager,
         region,
+        lifecycle,
+        cluster_namespace,
     )
     .await
     {
         error!("WebSocket connection error: {}", e);
+    }
+}
+
+async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = handle.take() {
+        handle.abort();
+        // CommandOutcomesComplete is intentionally compact and has no wire
+        // generation. Joining guarantees the old forwarder cannot enqueue its
+        // barrier after a replacement forwarder enqueues a newer snapshot.
+        let _ = handle.await;
     }
 }
 
@@ -364,19 +558,27 @@ async fn handle_websocket_connection(
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
     replication_manager: Arc<crate::replication::ReplicationManager>,
-    redis: ConnectionManager,
+    redis: RedisConnection,
     redis_url: String,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
+    lifecycle: TaskLifecycle,
+    cluster_namespace: ClusterNamespace,
 ) -> Result<()> {
     // Split the WebSocket into send and receive parts using futures_util
     let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
 
-    // Create a channel for sending messages to the WebSocket
+    // Gameplay and ordinary protocol traffic retain the existing bounded
+    // backpressure queue. Drain has a one-slot priority path so a saturated
+    // gameplay queue cannot consume the handoff window before the client sees
+    // the notice.
     let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
+    let (drain_tx, mut priority_drain_rx) = mpsc::channel::<Message>(1);
 
     // Generate a unique websocket ID for this connection
     let websocket_id = uuid::Uuid::new_v4().to_string();
+    let socket_generation = lifecycle.next_socket_generation();
+    let mut drain_rx = lifecycle.subscribe_to_drain();
 
     // Start in unauthenticated state
     let mut state = ConnectionState::Unauthenticated;
@@ -404,9 +606,17 @@ async fn handle_websocket_connection(
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
     // Spawn task to forward messages from channel to WebSocket
-    let _ws_tx_clone = ws_tx.clone();
     let forward_task = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.recv().await {
+        let mut drain_open = true;
+        let mut ws_open = true;
+        while let Some(msg) = next_outbound_message(
+            &mut priority_drain_rx,
+            &mut ws_rx,
+            &mut drain_open,
+            &mut ws_open,
+        )
+        .await
+        {
             // Convert to Axum WebSocket message
             let axum_msg = match msg {
                 Message::Text(text) => axum::extract::ws::Message::Text(text.to_string()),
@@ -441,6 +651,22 @@ async fn handle_websocket_connection(
         }
     });
 
+    // A WebSocket can pass the readiness check immediately before the task
+    // flips to draining and finish upgrading after the broadcast. Replay the
+    // process-local notice so that narrow race cannot leave a late socket on
+    // the departing task until forced termination.
+    if let Some(notice) = lifecycle.current_drain_notice() {
+        let remaining_ms = notice
+            .deadline_unix_ms
+            .saturating_sub(Utc::now().timestamp_millis())
+            .max(1) as u64;
+        shutdown_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_millis(remaining_ms));
+        shutdown_started = true;
+        queue_planned_drain_notice(&drain_tx, &notice)?;
+    }
+
     loop {
         // let state_name = match &state {
         //     ConnectionState::Unauthenticated => "Unauthenticated".to_string(),
@@ -463,20 +689,30 @@ async fn handle_websocket_connection(
                 warn!("Shutdown timeout reached, closing connection");
                 break;
             }
-            // Handle cancellation token
-            _ = cancellation_token.cancelled(), if !shutdown_started => {
-                // Send a Shutdown message to the client
-                info!("Sending shutdown message to client");
-                let json_msg = serde_json::json!(WSMessage::Shutdown);
-                let shutdown_msg = Message::Text(Utf8Bytes::from(json_msg.to_string()));
-                if let Err(e) = ws_tx.send(shutdown_msg).await {
-                    error!("Failed to send shutdown message: {}", e);
-                }
-                // Start shutdown timeout
-                shutdown_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
+            // A planned drain is independent from final process cancellation:
+            // the old socket remains usable until the replacement is ready.
+            notice = drain_rx.recv(), if !shutdown_started => {
+                let notice = match notice {
+                    Ok(notice) => notice,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                info!("Sending planned drain message to client");
+                let remaining_ms = notice.deadline_unix_ms
+                    .saturating_sub(Utc::now().timestamp_millis())
+                    .max(1) as u64;
+                shutdown_timeout.as_mut().reset(
+                    tokio::time::Instant::now() + Duration::from_millis(remaining_ms),
+                );
                 shutdown_started = true;
-
-                // No need for ShuttingDown state anymore, shutdown_started flag is sufficient
+                if let Err(e) = queue_planned_drain_notice(&drain_tx, &notice) {
+                    error!("Failed to queue planned drain message: {}", e);
+                }
+            }
+            // Final cancellation is a fallback for crashes during a planned
+            // drain setup. Normal SIGTERM announces through drain_rx first.
+            _ = cancellation_token.cancelled(), if !shutdown_started => {
+                break;
             }
             // Handle incoming WebSocket messages
             Some(result) = ws_stream.next() => {
@@ -516,17 +752,20 @@ async fn handle_websocket_connection(
                                     if in_this_game && allowed {
                                         last_resync_at = Some(now);
                                         if let ConnectionState::Authenticated { metadata, .. } = &state {
+                                            let user_id = metadata.user_id as u32;
                                             info!(
                                                 "Resync requested by user {} for game {}; restarting event subscription",
                                                 metadata.user_id, resync_game_id
                                             );
-                                            if let Some(handle) = game_event_handle.take() {
-                                                handle.abort();
-                                            }
-                                            let user_id = metadata.user_id as u32;
+                                            abort_and_join_game_event_forwarder(
+                                                &mut game_event_handle,
+                                            )
+                                            .await;
                                             let ws_tx_clone = ws_tx.clone();
                                             let replication_manager_clone = replication_manager.clone();
                                             let db_clone = db.clone();
+                                            let game_bus_clone = game_bus.clone();
+                                            let cluster_namespace_clone = cluster_namespace.clone();
                                             game_event_handle = Some(tokio::spawn(async move {
                                                 subscribe_to_game_events(
                                                     resync_game_id,
@@ -534,6 +773,8 @@ async fn handle_websocket_connection(
                                                     ws_tx_clone,
                                                     replication_manager_clone,
                                                     db_clone,
+                                                    game_bus_clone,
+                                                    cluster_namespace_clone,
                                                 ).await;
                                             }));
                                         }
@@ -548,6 +789,26 @@ async fn handle_websocket_connection(
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                     let was_in_lobby = matches!(&state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
+                                    if was_in_lobby
+                                        && matches!(
+                                            &ws_message,
+                                            WSMessage::CreateLobby | WSMessage::JoinLobby { .. }
+                                        )
+                                    {
+                                        let denial = WSMessage::AccessDenied {
+                                            reason: "Leave your current lobby before creating or joining another lobby".to_owned(),
+                                        };
+                                        if ws_tx
+                                            .send(Message::Text(
+                                                serde_json::to_string(&denial)?.into(),
+                                            ))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     // Keep the requested id so a denied switch does not look like a
                                     // successful re-entry into the connection's previously authorized
                                     // game. Successful JoinGame retries still restart subscriptions.
@@ -571,8 +832,11 @@ async fn handle_websocket_connection(
                                         &lobby_manager,
                                         &websocket_id,
                                         &region,
+                                        &lifecycle,
+                                        socket_generation,
+                                        &cluster_namespace,
                                     ).await {
-                                        Ok(new_state) => {
+                                        Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
                                             let entered_game_id = match &new_state {
                                                 ConnectionState::Authenticated { game_id, .. } => *game_id,
@@ -593,19 +857,22 @@ async fn handle_websocket_connection(
                                             // Handle state transitions
                                             if entering_game
                                                 && let ConnectionState::Authenticated { game_id: Some(game_id), metadata, .. } = &new_state {
+                                                    let game_id = *game_id;
+                                                    let user_id = metadata.user_id as u32;
                                                     // Subscribe to game events if entering a game
-                                                    if let Some(handle) = game_event_handle.take() {
-                                                        handle.abort();
-                                                    }
+                                                    abort_and_join_game_event_forwarder(
+                                                        &mut game_event_handle,
+                                                    )
+                                                    .await;
                                                     if let Some(handle) = game_chat_handle.take() {
                                                         handle.abort();
                                                     }
 
-                                                    let game_id = *game_id;
-                                                    let user_id = metadata.user_id as u32;
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let replication_manager_clone = replication_manager.clone();
                                                     let db_clone = db.clone();
+                                                    let game_bus_clone = game_bus.clone();
+                                                    let cluster_namespace_clone = cluster_namespace.clone();
 
                                                     game_event_handle = Some(tokio::spawn(async move {
                                                         subscribe_to_game_events(
@@ -614,6 +881,8 @@ async fn handle_websocket_connection(
                                                             ws_tx_clone,
                                                             replication_manager_clone,
                                                             db_clone,
+                                                            game_bus_clone,
+                                                            cluster_namespace_clone,
                                                         ).await;
                                                     }));
 
@@ -670,50 +939,54 @@ async fn handle_websocket_connection(
 
                                             // Handle lobby state transitions
                                             if entering_lobby
-                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &new_state {
-                                                    if let Some(handle) = lobby_update_handle.take() {
-                                                        handle.abort();
-                                                    }
-                                                    if let Some(handle) = lobby_chat_handle.take() {
-                                                        handle.abort();
-                                                    }
+                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &mut new_state {
+                                                if let Some(handle) = lobby_update_handle.take() {
+                                                    handle.abort();
+                                                }
+                                                if let Some(handle) = lobby_chat_handle.take() {
+                                                    handle.abort();
+                                                }
 
-                                                    let mut lobby_rx = lobby_handle.rx.resubscribe();
+                                                    let mut lobby_rx = take_lobby_update_receiver(&mut lobby_handle.rx);
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let cancellation_token_clone = cancellation_token.clone();
+                                                    let lobby_manager_clone = lobby_manager.clone();
 
                                                     lobby_update_handle = Some(tokio::spawn(async move {
+                                                        let mut last_sent_update = None;
+                                                        let mut reconciliation = tokio::time::interval(
+                                                            LOBBY_STATE_RECONCILIATION_INTERVAL,
+                                                        );
+                                                        reconciliation.set_missed_tick_behavior(
+                                                            tokio::time::MissedTickBehavior::Skip,
+                                                        );
                                                         loop {
                                                             tokio::select! {
+                                                                biased;
                                                                 _ = cancellation_token_clone.cancelled() => {
                                                                     debug!("Lobby update task cancelled for lobby {}", lobby_code_for_updates);
                                                                     break;
                                                                 }
                                                                 update = lobby_rx.recv() => {
                                                                     match update {
-                                                                        Ok(lobby) => {
-                                                                            debug!("Received lobby update for lobby {}", lobby.lobby_code);
-                                                                            let ws_message = WSMessage::LobbyUpdate {
-                                                                                lobby_code: lobby.lobby_code,
-                                                                                members: lobby.members.into_values().collect(),
-                                                                                host_user_id: lobby.host_user_id,
-                                                                                state: lobby.state,
-                                                                                preferences: lobby.preferences,
-                                                                            };
-
-                                                                            let json_msg = match serde_json::to_string(&ws_message) {
-                                                                                Ok(json) => json,
-                                                                                Err(e) => {
-                                                                                    error!("Failed to serialize lobby update: {}", e);
-                                                                                    continue;
+                                                                        Ok(_) => {
+                                                                            debug!("Received lobby update hint for lobby {}", lobby_code_for_updates);
+                                                                            match send_authoritative_lobby_update(
+                                                                                &lobby_manager_clone,
+                                                                                &lobby_code_for_updates,
+                                                                                &ws_tx_clone,
+                                                                                &mut last_sent_update,
+                                                                            ).await {
+                                                                                Ok(true) => {}
+                                                                                Ok(false) => {
+                                                                                    debug!("WebSocket channel closed while sending lobby update for {}", lobby_code_for_updates);
+                                                                                    break;
                                                                                 }
-                                                                            };
-
-                                                                            if ws_tx_clone.send(Message::Text(json_msg.into())).await.is_err() {
-                                                                                debug!("WebSocket channel closed while sending lobby update for {}", lobby_code_for_updates);
-                                                                                break;
+                                                                                Err(error) => {
+                                                                                    warn!("Failed to reconcile lobby {} after update hint: {}", lobby_code_for_updates, error);
+                                                                                }
                                                                             }
                                                                         }
                                                                         Err(broadcast::error::RecvError::Closed) => {
@@ -722,6 +995,23 @@ async fn handle_websocket_connection(
                                                                         }
                                                                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                                                             warn!("Missed {} lobby updates for lobby {}", skipped, lobby_code_for_updates);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                _ = reconciliation.tick() => {
+                                                                    match send_authoritative_lobby_update(
+                                                                        &lobby_manager_clone,
+                                                                        &lobby_code_for_updates,
+                                                                        &ws_tx_clone,
+                                                                        &mut last_sent_update,
+                                                                    ).await {
+                                                                        Ok(true) => {}
+                                                                        Ok(false) => {
+                                                                            debug!("WebSocket channel closed while reconciling lobby {}", lobby_code_for_updates);
+                                                                            break;
+                                                                        }
+                                                                        Err(error) => {
+                                                                            debug!("Periodic lobby reconciliation failed for {}: {}", lobby_code_for_updates, error);
                                                                         }
                                                                     }
                                                                 }
@@ -735,57 +1025,19 @@ async fn handle_websocket_connection(
                                                     }
 
                                                     let ws_tx_clone_for_match = ws_tx.clone();
-                                                    let redis_url_clone_for_match = redis_url.clone();
-                                                    let replication_manager_clone_for_match = replication_manager.clone();
+                                                    let pubsub_manager_clone_for_match = pubsub_manager.clone();
+                                                    let redis_clone_for_match = redis.clone();
+                                                    let cancellation_token_clone_for_match = cancellation_token.clone();
 
                                                     lobby_match_handle = Some(tokio::spawn(async move {
-                                                        let channel = crate::redis_keys::RedisKeys::matchmaking_lobby_notification_channel(&lobby_code_for_match);
-                                                        info!("Member subscribing to lobby match notifications on channel: {}", channel);
-
-                                                        if let Ok(client) = redis::Client::open(redis_url_clone_for_match.as_ref())
-                                                            && let Ok(mut pubsub) = client.get_async_pubsub().await {
-                                                                if pubsub.subscribe(&channel).await.is_ok() {
-                                                                    info!("Successfully subscribed to lobby match notifications for lobby '{}'", lobby_code_for_match);
-
-                                                                    let mut pubsub_stream = pubsub.on_message();
-                                                                    // Loop to handle multiple notifications (MatchFound, etc.)
-                                                                    while let Some(msg) = futures_util::StreamExt::next(&mut pubsub_stream).await {
-                                                                        if let Ok(payload) = msg.get_payload::<String>() {
-                                                                            // Parse the notification
-                                                                            if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&payload) {
-                                                                                let notification_type = notification["type"].as_str().unwrap_or("");
-
-                                                                                match notification_type {
-                                                                                    "MatchFound" => {
-                                                                                        if let Some(game_id) = notification["game_id"].as_u64() {
-                                                                                            info!("Lobby '{}' member matched to game {}, waiting for game to be available", lobby_code_for_match, game_id);
-
-                                                                                            // Wait for the game to become available in the replication manager
-                                                                                            match replication_manager_clone_for_match.wait_for_game(game_id as u32, 10).await {
-                                                                                                Ok(_game_state) => {
-                                                                                                    info!("Game {} is now available, sending JoinGame message to lobby '{}' member", game_id, lobby_code_for_match);
-                                                                                                    // Send JoinGame message to this client
-                                                                                                    let join_msg = WSMessage::JoinGame(game_id as u32);
-                                                                                                    let json_msg = serde_json::to_string(&join_msg).unwrap();
-                                                                                                    let _ = ws_tx_clone_for_match.send(Message::Text(json_msg.into())).await;
-                                                                                                }
-                                                                                                Err(e) => {
-                                                                                                    error!("Failed to wait for game {} to become available: {}", game_id, e);
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                    _ => {
-                                                                                        warn!("Unknown notification type: {}", notification_type);
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    error!("Failed to subscribe to lobby channel {} for lobby '{}'", channel, lobby_code_for_match);
-                                                                }
-                                                            }
+                                                        subscribe_to_lobby_match_notifications(
+                                                            lobby_code_for_match,
+                                                            pubsub_manager_clone_for_match,
+                                                            redis_clone_for_match,
+                                                            ws_tx_clone_for_match,
+                                                            cancellation_token_clone_for_match,
+                                                        )
+                                                        .await;
                                                     }));
 
                                                     // Subscribe to lobby chat
@@ -840,7 +1092,7 @@ async fn handle_websocket_connection(
                                                             );
                                                         }
                                                     }
-                                                }
+                                            }
 
                                             // Abort lobby subscription when leaving lobby
                                             // BUT keep lobby_match_handle active if entering Authenticated with a lobby_code (for Play Again notifications)
@@ -903,27 +1155,15 @@ async fn handle_websocket_connection(
 
     // Cleanup
 
-    // Leave lobby if still in one
+    // Transport loss is not an explicit LeaveLobby. Stop heartbeating and let
+    // the short presence lease expire; a replacement connection may already
+    // have installed a newer websocket-specific presence.
     if let ConnectionState::Authenticated {
-        lobby_handle: Some(mut lobby_handle),
+        lobby_handle: Some(lobby_handle),
         ..
     } = state
     {
-        let lobby_code = lobby_handle.lobby_code.clone();
-        if let LeaveLobbyResult::LobbyDeleted = lobby_handle.close().await? {
-            let mut mm = matchmaking_manager.lock().await;
-            if let Err(e) = mm.remove_lobby_from_all_queues_by_code(&lobby_code).await {
-                warn!(
-                    "Failed to remove empty lobby {} from matchmaking queues during cleanup: {}",
-                    lobby_code, e
-                );
-            } else {
-                info!(
-                    "Removed empty lobby {} from all matchmaking queues during cleanup",
-                    lobby_code
-                );
-            }
-        }
+        lobby_handle.detach_transport();
     }
 
     // Note: Game subscriptions are now handled differently
@@ -952,7 +1192,7 @@ async fn handle_websocket_connection(
 }
 
 async fn publish_lobby_chat_message(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     payload: LobbyChatBroadcast,
 ) -> Result<()> {
     let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
@@ -978,7 +1218,7 @@ async fn publish_lobby_chat_message(
 }
 
 async fn publish_game_chat_message(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     payload: GameChatBroadcast,
 ) -> Result<()> {
     let channel = RedisKeys::game_chat_channel(payload.game_id);
@@ -1028,11 +1268,6 @@ async fn queue_existing_lobby_for_game_types(
     let members: Vec<LobbyMember> = members_map.into_values().collect();
     let avg_mmr = compute_lobby_avg_mmr(db, &members).await?;
 
-    lobby_manager
-        .update_lobby_state(&lobby_handle.lobby_code, "queued")
-        .await
-        .context("Failed to update lobby state before queueing")?;
-
     let mut mm_guard = matchmaking_manager.lock().await;
     mm_guard
         .add_lobby_to_queue(
@@ -1045,6 +1280,18 @@ async fn queue_existing_lobby_for_game_types(
         )
         .await
         .context("Failed to add lobby to matchmaking queue")?;
+    drop(mm_guard);
+
+    if let Err(error) = lobby_manager
+        .publish_lobby_update(&lobby_handle.lobby_code)
+        .await
+    {
+        warn!(
+            lobby_code = lobby_handle.lobby_code,
+            %error,
+            "Failed to publish queued lobby state"
+        );
+    }
 
     Ok(())
 }
@@ -1078,7 +1325,7 @@ async fn compute_lobby_avg_mmr(db: &Arc<dyn Database>, members: &[LobbyMember]) 
 }
 
 async fn load_lobby_chat_history(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     lobby_code: &str,
 ) -> Result<Vec<LobbyChatBroadcast>> {
     let key = RedisKeys::lobby_chat_history_key(lobby_code);
@@ -1104,7 +1351,7 @@ async fn load_lobby_chat_history(
 }
 
 async fn load_game_chat_history(
-    mut redis: ConnectionManager,
+    mut redis: RedisConnection,
     game_id: u32,
 ) -> Result<Vec<GameChatBroadcast>> {
     let key = RedisKeys::game_chat_history_key(game_id);
@@ -1133,17 +1380,233 @@ fn game_state_records_user(game_state: &GameState, user_id: u32) -> bool {
     game_state.players.contains_key(&user_id) || game_state.spectators.contains(&user_id)
 }
 
+const COLD_JOIN_WARMUP_TIMEOUT: Duration = Duration::from_secs(4);
+const GAME_WARMING_RETRY_MS: u64 = 500;
+const GAME_JOIN_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(6);
+const ACTIVE_GAME_MAPPING_TIMEOUT: Duration = Duration::from_secs(1);
+const COMMAND_OUTCOME_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
+const COMMAND_OUTCOME_READ_TIMEOUT: Duration = Duration::from_millis(750);
+const COMMAND_OUTCOME_RETRY_DELAY: Duration = Duration::from_millis(100);
+const TERMINAL_COMMAND_REJECTION_REASON: &str = "game completed";
+
+type CommandOutcomeReplay =
+    Pin<Box<dyn Future<Output = Option<ResolvedCommandState>> + Send + 'static>>;
+
+// This short-lived select result is stack-local. Boxing the event variant would
+// add a heap allocation to every live game event only to reduce stack padding.
+#[allow(clippy::large_enum_variant)]
+enum GameSubscriptionInput {
+    SocketClosed,
+    CommandOutcomes(Option<ResolvedCommandState>),
+    Event(Result<GameEventMessage, broadcast::error::RecvError>),
+}
+
+fn start_command_outcome_replay(
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> CommandOutcomeReplay {
+    Box::pin(
+        async move { load_command_outcomes(&game_bus, &cluster_namespace, game_id, user_id).await },
+    )
+}
+
+async fn wait_for_command_outcome_replay(
+    replay: &mut Option<CommandOutcomeReplay>,
+) -> Option<ResolvedCommandState> {
+    match replay {
+        Some(replay) => replay.as_mut().await,
+        None => pending().await,
+    }
+}
+
+async fn next_game_subscription_input(
+    ws_tx: &mpsc::Sender<Message>,
+    rx: &mut crate::replication::FilteredEventReceiver,
+    replay: &mut Option<CommandOutcomeReplay>,
+) -> GameSubscriptionInput {
+    tokio::select! {
+        _ = ws_tx.closed() => GameSubscriptionInput::SocketClosed,
+        outcomes = wait_for_command_outcome_replay(replay) => {
+            GameSubscriptionInput::CommandOutcomes(outcomes)
+        }
+        event = rx.recv() => GameSubscriptionInput::Event(event),
+    }
+}
+
+#[derive(Debug)]
+enum GameJoinAuthorizationError {
+    /// A dependency or authoritative live-game artifact may still converge.
+    /// This maps only to `GameWarming`, never `GameLoadFailed`.
+    Warming,
+    /// The available authoritative evidence proves this join cannot recover.
+    /// This is the only branch that maps to `GameLoadFailed`.
+    Denied(String),
+}
+
+impl std::fmt::Display for GameJoinAuthorizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Warming => formatter.write_str("game replica is warming"),
+            Self::Denied(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+fn game_join_denied(reason: impl Into<String>) -> GameJoinAuthorizationError {
+    GameJoinAuthorizationError::Denied(reason.into())
+}
+
+fn game_join_failure_message(game_id: u32, failure: GameJoinAuthorizationError) -> WSMessage {
+    match failure {
+        GameJoinAuthorizationError::Warming => WSMessage::GameWarming {
+            game_id,
+            retry_after_ms: GAME_WARMING_RETRY_MS,
+        },
+        GameJoinAuthorizationError::Denied(reason) => WSMessage::GameLoadFailed { game_id, reason },
+    }
+}
+
+fn missing_game_join_failure(
+    requested_game_id: u32,
+    mapped_game_id: Option<u32>,
+) -> GameJoinAuthorizationError {
+    if mapped_game_id == Some(requested_game_id) {
+        GameJoinAuthorizationError::Warming
+    } else {
+        game_join_denied("This game was not found or has expired")
+    }
+}
+
+async fn load_durable_active_game(
+    user_id: u32,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<Option<u32>> {
+    tokio::time::timeout(ACTIVE_GAME_MAPPING_TIMEOUT, async {
+        let mut manager = {
+            let manager = matchmaking_manager.lock().await;
+            manager.clone()
+        };
+        manager.get_user_active_game(user_id).await
+    })
+    .await
+    .context("timed out resolving durable active-game mapping")?
+    .context("failed to resolve durable active-game mapping")
+}
+
+async fn has_durable_recovery_failure(
+    game_id: u32,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
+) -> bool {
+    match game_bus
+        .get_recovery_failure(cluster_namespace, game_id)
+        .await
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            warn!(game_id, %error, "Failed to inspect durable recovery-failure marker");
+            false
+        }
+    }
+}
+
+/// A targeted snapshot request can be missed while no executor owns the
+/// partition. Keep requesting this game through the bounded takeover window.
+async fn wait_for_live_game_after_snapshot_request(
+    game_id: u32,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
+) -> Option<GameState> {
+    let partition_id = game_id % PARTITION_COUNT;
+    let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+    let mut next_snapshot_request_at = tokio::time::Instant::now();
+    let mut check_recovery = true;
+
+    loop {
+        if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
+            return Some(game_state);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= next_snapshot_request_at {
+            next_snapshot_request_at = now + Duration::from_millis(500);
+            match replication_manager.request_game_snapshot(game_id).await {
+                Ok(()) => check_recovery = true,
+                Err(error) => {
+                    warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
+                }
+            }
+        }
+
+        if check_recovery {
+            match game_bus.get_recovery(cluster_namespace, game_id).await {
+                Ok(Some(envelope)) => return Some(envelope.game_state),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(game_id, %error, "Failed to load recovery during cold-join warm-up");
+                }
+            }
+            check_recovery = false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn canonical_command_identity(
+    command_id: ClientCommandIdentityV2,
+    game_id: u32,
+    user_id: u32,
+) -> ClientCommandIdentityV2 {
+    ClientCommandIdentityV2 {
+        game_id,
+        user_id,
+        client_game_session_id: command_id.client_game_session_id,
+        sequence: command_id.sequence,
+    }
+}
+
+fn snapshot_requires_command_outcomes(event: &GameEvent) -> bool {
+    matches!(event, GameEvent::Snapshot { .. })
+}
+
+fn command_outcomes_for_user(
+    resolved: ResolvedCommandState,
+    user_id: u32,
+) -> Vec<(String, SessionCommandOutcomes)> {
+    let prefix = format!("{user_id}:");
+    resolved
+        .sessions
+        .into_iter()
+        .filter_map(|(session_key, outcomes)| {
+            let client_game_session_id = session_key.strip_prefix(&prefix)?;
+            (!client_game_session_id.is_empty())
+                .then(|| (client_game_session_id.to_owned(), outcomes))
+        })
+        .collect()
+}
+
 /// Resolve and authorize a JoinGame request before it changes connection state.
 ///
 /// Live games are authoritative in replication memory. Completed games may instead live in the
 /// short Redis reload cache or DynamoDB. Returning success means the requested user was present in
 /// the canonical state from one of those sources; callers may then enable game events and chat.
-async fn authorize_game_join(
+async fn authorize_game_join_inner(
     game_id: u32,
     user_id: u32,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), GameJoinAuthorizationError> {
     if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
         if game_state_records_user(&game_state, user_id) {
             return Ok(());
@@ -1153,10 +1616,38 @@ async fn authorize_game_join(
             "Denied live game {} join to user {}: user is not a recorded participant",
             game_id, user_id
         );
-        return Err("This game is unavailable".to_string());
+        return Err(game_join_denied("This game is unavailable"));
     }
 
-    match replication_manager.get_stored_snapshot(game_id).await {
+    if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
+        return Err(game_join_denied(
+            crate::recovery::PUBLIC_UNRECOVERABLE_GAME_REASON,
+        ));
+    }
+
+    // During executor failover the authoritative recovery envelope can be
+    // available before this gateway's replica has consumed the takeover
+    // snapshot. It is sufficient for participant authorization; the event
+    // subscription below still waits for a fresh replica or uses this same
+    // recovery snapshot as its bridge.
+    match game_bus.get_recovery(cluster_namespace, game_id).await {
+        Ok(Some(envelope)) => {
+            if game_state_records_user(&envelope.game_state, user_id) {
+                return Ok(());
+            }
+            warn!(
+                game_id,
+                user_id, "Denied recovery-backed game join to non-participant"
+            );
+            return Err(game_join_denied("This game is unavailable"));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(game_id, user_id, %error, "Failed to load recovery while authorizing game join");
+        }
+    }
+
+    let cached_active_state = match replication_manager.get_stored_snapshot(game_id).await {
         Ok(Some(game_state)) if matches!(game_state.status, GameStatus::Complete { .. }) => {
             if game_state_records_user(&game_state, user_id) {
                 return Ok(());
@@ -1166,77 +1657,148 @@ async fn authorize_game_join(
                 "Denied stored Redis game {} join to user {}: user is not a recorded participant",
                 game_id, user_id
             );
-            return Err("This game is unavailable".to_string());
+            return Err(game_join_denied("This game is unavailable"));
         }
-        Ok(Some(cached_game_state)) => {
-            // A stored Redis snapshot proves the game was created, but the replica can
-            // consume its initial snapshot a moment later. A non-terminal Redis
-            // snapshot identifies that startup window, so wait briefly for the subscribable
-            // in-memory state before treating the request as a durable reload.
-            match replication_manager.wait_for_game(game_id, 1).await {
-                Ok(live_game_state)
-                    if live_game_state.start_ms == cached_game_state.start_ms
-                        && live_game_state.event_sequence >= cached_game_state.event_sequence =>
-                {
-                    if game_state_records_user(&live_game_state, user_id) {
-                        return Ok(());
-                    }
-
-                    warn!(
-                        "Denied newly replicated game {} join to user {}: user is not a recorded participant",
-                        game_id, user_id
-                    );
-                    return Err("This game is unavailable".to_string());
-                }
-                Ok(live_game_state) => {
-                    warn!(
-                        "Refusing game {} join because cached and replicated runtime identities differ (cached start {}, sequence {}; live start {}, sequence {})",
-                        game_id,
-                        cached_game_state.start_ms,
-                        cached_game_state.event_sequence,
-                        live_game_state.start_ms,
-                        live_game_state.event_sequence
-                    );
-                    return Err("This game is unavailable".to_string());
-                }
-                Err(e) => {
-                    debug!(
-                        "Live game {} did not reach replication during the bounded authorization wait; checking durable storage: {}",
-                        game_id, e
-                    );
-                }
-            }
-        }
-        Ok(None) => {}
+        Ok(Some(cached_game_state)) => Some(cached_game_state),
+        Ok(None) => None,
         Err(e) => {
             warn!(
                 "Failed to load stored Redis snapshot while authorizing game {}: {}",
                 game_id, e
             );
+            None
+        }
+    };
+
+    // Completion persistence can win the race with removal/replacement of the
+    // preceding active Redis reload snapshot. A durable terminal state is the
+    // authority for a completed game, so do not let that stale cache force the
+    // participant into an endless GameWarming retry. Failure, absence, malformed
+    // data, or a non-terminal database state is not proof that the live game is
+    // gone: retain the normal bounded replica warm-up in all of those cases.
+    if cached_active_state.is_some()
+        && let Ok(database_game_id) = i32::try_from(game_id)
+    {
+        match db.get_game_by_id(database_game_id).await {
+            Ok(Some(game)) => {
+                if let Some(game_state_json) = game.game_state {
+                    match serde_json::from_value::<GameState>(game_state_json) {
+                        Ok(game_state)
+                            if matches!(game_state.status, GameStatus::Complete { .. }) =>
+                        {
+                            if game_state_records_user(&game_state, user_id) {
+                                return Ok(());
+                            }
+                            warn!(
+                                game_id,
+                                user_id,
+                                "Denied durable completed-game join to non-participant while Redis held a stale active snapshot"
+                            );
+                            return Err(game_join_denied("This game is unavailable"));
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            game_id,
+                            user_id,
+                            %error,
+                            "Ignoring malformed durable game state while warming a cached active game"
+                        ),
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                game_id,
+                user_id,
+                %error,
+                "Durable game lookup failed while warming a cached active game"
+            ),
         }
     }
 
-    let database_game_id =
-        i32::try_from(game_id).map_err(|_| "This game was not found or has expired".to_string())?;
+    // Repeat the request while waiting: a request written during the lease gap
+    // is intentionally not relied upon. This also covers the short interval
+    // after atomic matchmaking commit but before GameCreated is consumed.
+    if let Some(live_game_state) = wait_for_live_game_after_snapshot_request(
+        game_id,
+        replication_manager,
+        game_bus,
+        cluster_namespace,
+    )
+    .await
+    {
+        if let Some(cached_game_state) = cached_active_state.as_ref()
+            && (live_game_state.start_ms != cached_game_state.start_ms
+                || live_game_state.event_sequence < cached_game_state.event_sequence)
+        {
+            warn!(
+                "Refusing game {} join because cached and live runtime identities differ (cached start {}, sequence {}; live start {}, sequence {})",
+                game_id,
+                cached_game_state.start_ms,
+                cached_game_state.event_sequence,
+                live_game_state.start_ms,
+                live_game_state.event_sequence
+            );
+            return Err(game_join_denied("This game is unavailable"));
+        }
+
+        if game_state_records_user(&live_game_state, user_id) {
+            return Ok(());
+        }
+
+        warn!(
+            "Denied warmed game {} join to user {}: user is not a recorded participant",
+            game_id, user_id
+        );
+        return Err(game_join_denied("This game is unavailable"));
+    }
+
+    if cached_active_state.is_some() {
+        debug!(
+            "Live game {} did not reach replication during the bounded authorization wait; asking the client to retry",
+            game_id
+        );
+        if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
+            return Err(game_join_denied(
+                crate::recovery::PUBLIC_UNRECOVERABLE_GAME_REASON,
+            ));
+        }
+        return Err(GameJoinAuthorizationError::Warming);
+    }
+
+    let database_game_id = i32::try_from(game_id)
+        .map_err(|_| game_join_denied("This game was not found or has expired"))?;
     let game = db.get_game_by_id(database_game_id).await.map_err(|e| {
         error!(
             "Failed to fetch game {} while authorizing user {}: {}",
             game_id, user_id, e
         );
-        "The game could not be loaded right now".to_string()
+        GameJoinAuthorizationError::Warming
     })?;
     let Some(game) = game else {
-        return Err("This game was not found or has expired".to_string());
+        let mapped_game_id = match load_durable_active_game(user_id, matchmaking_manager).await {
+            Ok(mapped_game_id) => mapped_game_id,
+            Err(error) => {
+                warn!(game_id, user_id, %error, "Active-game lookup failed while classifying a missing durable game");
+                return Err(GameJoinAuthorizationError::Warming);
+            }
+        };
+        return Err(missing_game_join_failure(game_id, mapped_game_id));
     };
     let Some(game_state_json) = game.game_state else {
-        return Err("The saved game data is unavailable".to_string());
+        if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
+            return Err(game_join_denied(
+                crate::recovery::PUBLIC_UNRECOVERABLE_GAME_REASON,
+            ));
+        }
+        return Err(GameJoinAuthorizationError::Warming);
     };
     let game_state = serde_json::from_value::<GameState>(game_state_json).map_err(|e| {
         error!(
             "Failed to deserialize game {} while authorizing user {}: {}",
             game_id, user_id, e
         );
-        "The saved game data could not be loaded".to_string()
+        game_join_denied("The saved game data could not be loaded")
     })?;
 
     if !matches!(game_state.status, GameStatus::Complete { .. }) {
@@ -1244,7 +1806,12 @@ async fn authorize_game_join(
             "Refusing database-only non-complete game {} join for user {}",
             game_id, user_id
         );
-        return Err("The saved game data is unavailable".to_string());
+        if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
+            return Err(game_join_denied(
+                crate::recovery::PUBLIC_UNRECOVERABLE_GAME_REASON,
+            ));
+        }
+        return Err(GameJoinAuthorizationError::Warming);
     }
 
     if !game_state_records_user(&game_state, user_id) {
@@ -1252,10 +1819,190 @@ async fn authorize_game_join(
             "Denied database game {} join to user {}: user is not a recorded participant",
             game_id, user_id
         );
-        return Err("This game is unavailable".to_string());
+        return Err(game_join_denied("This game is unavailable"));
     }
 
     Ok(())
+}
+
+async fn authorize_game_join(
+    game_id: u32,
+    user_id: u32,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
+    db: &Arc<dyn Database>,
+) -> std::result::Result<(), GameJoinAuthorizationError> {
+    match tokio::time::timeout(
+        GAME_JOIN_AUTHORIZATION_TIMEOUT,
+        authorize_game_join_inner(
+            game_id,
+            user_id,
+            matchmaking_manager,
+            replication_manager,
+            game_bus,
+            cluster_namespace,
+            db,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                game_id,
+                user_id, "Game join authorization timed out; returning retryable warm-up"
+            );
+            Err(GameJoinAuthorizationError::Warming)
+        }
+    }
+}
+
+/// Recover a committed matchmaking result without relying on its best-effort
+/// Pub/Sub notification. The per-user mapping is written atomically with the
+/// game command, so every participant can discover it on any gateway after a
+/// reconnect. Authorization still comes from game state; a stale or malformed
+/// mapping is never enough to disclose a game, and only fenced completion owns
+/// deletion of the mapping.
+async fn notify_durable_active_game_after_auth(
+    user_id: u32,
+    ws_tx: &mpsc::Sender<Message>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
+    db: &Arc<dyn Database>,
+) -> Result<()> {
+    let mapped_game_id = match tokio::time::timeout(ACTIVE_GAME_MAPPING_TIMEOUT, async {
+        let mut manager = {
+            let manager = matchmaking_manager.lock().await;
+            manager.clone()
+        };
+        manager.get_user_active_game(user_id).await
+    })
+    .await
+    {
+        Ok(Ok(game_id)) => game_id,
+        Ok(Err(error)) => {
+            warn!(user_id, %error, "Failed to resolve durable active-game mapping");
+            None
+        }
+        Err(_) => {
+            warn!(user_id, "Timed out resolving durable active-game mapping");
+            None
+        }
+    };
+    let Some(game_id) = mapped_game_id else {
+        return Ok(());
+    };
+
+    match authorize_game_join(
+        game_id,
+        user_id,
+        matchmaking_manager,
+        replication_manager,
+        game_bus,
+        cluster_namespace,
+        db,
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                user_id,
+                game_id, "Recovered committed match from durable user mapping"
+            );
+            ws_tx
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::JoinGame(game_id))?.into(),
+                ))
+                .await
+                .context("WebSocket closed while restoring committed match")?;
+        }
+        Err(GameJoinAuthorizationError::Warming) => {
+            info!(
+                user_id,
+                game_id, "Committed match replica is still warming; client will retry"
+            );
+            ws_tx
+                .send(Message::Text(
+                    serde_json::to_string(&WSMessage::GameWarming {
+                        game_id,
+                        retry_after_ms: GAME_WARMING_RETRY_MS,
+                    })?
+                    .into(),
+                ))
+                .await
+                .context("WebSocket closed while reporting committed match warm-up")?;
+        }
+        Err(GameJoinAuthorizationError::Denied(reason)) => {
+            warn!(
+                user_id,
+                game_id,
+                reason,
+                "Durable active-game mapping did not pass participant authorization; leaving cleanup to fenced completion"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn recovery_bridge_snapshot(envelope: &RecoveryEnvelopeV2, user_id: u32) -> GameEventMessage {
+    // Despite its historical name, `next_event_stream_sequence` is the last
+    // sequence already emitted and checkpointed. The actor increments it
+    // before its next publish, so subtracting one here manufactures a gap.
+    GameEventMessage {
+        game_id: envelope.game_id,
+        tick: envelope.game_state.tick,
+        sequence: envelope.game_state.event_sequence,
+        stream_seq: envelope.next_event_stream_sequence,
+        user_id: Some(user_id),
+        event: GameEvent::Snapshot {
+            game_state: envelope.game_state.clone(),
+        },
+    }
+}
+
+async fn send_recovery_bridge_snapshot(
+    ws_tx: &mpsc::Sender<Message>,
+    envelope: &RecoveryEnvelopeV2,
+    user_id: u32,
+) -> bool {
+    let recovery_snapshot = recovery_bridge_snapshot(envelope, user_id);
+    let Ok(json) = serde_json::to_string(&WSMessage::GameEvent(recovery_snapshot)) else {
+        return false;
+    };
+    ws_tx.send(Message::Text(json.into())).await.is_ok()
+}
+
+async fn send_recovery_bridge_if_available(
+    game_id: u32,
+    user_id: u32,
+    ws_tx: &mpsc::Sender<Message>,
+    game_bus: &Arc<GameBus>,
+    cluster_namespace: &ClusterNamespace,
+) -> bool {
+    match game_bus.get_recovery(cluster_namespace, game_id).await {
+        Ok(Some(envelope))
+            if !matches!(envelope.game_state.status, GameStatus::Complete { .. })
+                && game_state_records_user(&envelope.game_state, user_id) =>
+        {
+            // Bridge the replica warm-up window immediately from the fenced
+            // recovery envelope, then attach to the live replica. Deliberately
+            // withhold CommandOutcomesComplete until that live subscription
+            // exists: a planned replacement socket treats the barrier as its
+            // promotion signal and must not retire the old usable socket for a
+            // bridge that might have no subsequent event stream.
+            send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await
+        }
+        Ok(_) => false,
+        Err(error) => {
+            warn!(game_id, user_id, %error, "Failed to load recovery during replica warm-up");
+            false
+        }
+    }
 }
 
 // Helper function to subscribe to game events
@@ -1265,16 +2012,91 @@ async fn subscribe_to_game_events(
     ws_tx: mpsc::Sender<Message>,
     replication_manager: Arc<crate::replication::ReplicationManager>,
     db: Arc<dyn Database>,
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
 ) {
     info!(
         "Subscribing to game {} events for user {}",
         game_id, user_id
     );
 
-    let (game_state, stream_watermark, mut rx) = match replication_manager
-        .subscribe_to_game(game_id)
-        .await
-    {
+    let mut initial_subscription = replication_manager.subscribe_to_game(game_id).await;
+    if initial_subscription.is_err() {
+        let partition_id = game_id % PARTITION_COUNT;
+        if let Err(error) = replication_manager.request_game_snapshot(game_id).await {
+            warn!(game_id, partition_id, %error, "Failed to request subscription snapshots");
+        }
+        let mut next_snapshot_request_at = tokio::time::Instant::now() + Duration::from_millis(500);
+
+        let mut recovery_bridge_sent = send_recovery_bridge_if_available(
+            game_id,
+            user_id,
+            &ws_tx,
+            &game_bus,
+            &cluster_namespace,
+        )
+        .await;
+
+        // Completed games intentionally leave replication memory. Avoid
+        // spending the takeover wait on a game that already has its terminal
+        // Redis snapshot.
+        match replication_manager.get_stored_snapshot(game_id).await {
+            Ok(Some(game_state))
+                if matches!(game_state.status, GameStatus::Complete { .. })
+                    && game_state_records_user(&game_state, user_id) =>
+            {
+                send_completed_game_snapshot(
+                    &ws_tx,
+                    &game_bus,
+                    &cluster_namespace,
+                    game_id,
+                    user_id,
+                    &game_state,
+                    "stored Redis snapshot",
+                )
+                .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
+            }
+        }
+
+        // Reissue requests throughout the lease gap. A request appended before
+        // the new owner anchors its request reader is not a correctness signal.
+        let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+        while initial_subscription.is_err() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            initial_subscription = replication_manager.subscribe_to_game(game_id).await;
+            if initial_subscription.is_ok() {
+                break;
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= next_snapshot_request_at {
+                next_snapshot_request_at = now + Duration::from_millis(500);
+                match replication_manager.request_game_snapshot(game_id).await {
+                    Ok(()) if !recovery_bridge_sent => {
+                        recovery_bridge_sent = send_recovery_bridge_if_available(
+                            game_id,
+                            user_id,
+                            &ws_tx,
+                            &game_bus,
+                            &cluster_namespace,
+                        )
+                        .await;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        warn!(game_id, partition_id, %error, "Failed to retry subscription snapshots");
+                    }
+                }
+            }
+        }
+    }
+
+    let (game_state, stream_watermark, mut rx) = match initial_subscription {
         Ok(result) => result,
         Err(e) => {
             // Durably completed games are eventually evicted from replication memory. Their
@@ -1291,6 +2113,8 @@ async fn subscribe_to_game_events(
                 {
                     send_completed_game_snapshot(
                         &ws_tx,
+                        &game_bus,
+                        &cluster_namespace,
                         game_id,
                         user_id,
                         &game_state,
@@ -1331,9 +2155,13 @@ async fn subscribe_to_game_events(
                 Ok(Some(game)) => {
                     if let Some(game_state_json) = game.game_state {
                         match serde_json::from_value::<GameState>(game_state_json) {
-                            Ok(game_state) => {
+                            Ok(game_state)
+                                if matches!(game_state.status, GameStatus::Complete { .. }) =>
+                            {
                                 send_completed_game_snapshot(
                                     &ws_tx,
+                                    &game_bus,
+                                    &cluster_namespace,
                                     game_id,
                                     user_id,
                                     &game_state,
@@ -1342,6 +2170,14 @@ async fn subscribe_to_game_events(
                                 .await;
 
                                 // Return early - we can't subscribe to future events without memory state
+                                return;
+                            }
+                            Ok(_) => {
+                                info!(
+                                    game_id,
+                                    "Durable game is non-terminal while its replica is unavailable; returning retryable warm-up"
+                                );
+                                send_game_warming(&ws_tx, game_id).await;
                                 return;
                             }
                             Err(e) => {
@@ -1356,34 +2192,28 @@ async fn subscribe_to_game_events(
                             }
                         }
                     } else {
-                        error!("Game {} found in database but has no game_state", game_id);
-                        send_game_load_failed(
-                            &ws_tx,
+                        info!(
                             game_id,
-                            "The saved game data is unavailable",
-                        )
-                        .await;
+                            "Durable game has no terminal state while its replica is unavailable; returning retryable warm-up"
+                        );
+                        send_game_warming(&ws_tx, game_id).await;
                         return;
                     }
                 }
                 Ok(None) => {
-                    error!("Game {} not found in database", game_id);
-                    send_game_load_failed(
-                        &ws_tx,
+                    // Authorization already proved this game from live/recovery
+                    // state. Missing completion persistence here is therefore a
+                    // failover race, not definitive evidence that it expired.
+                    info!(
                         game_id,
-                        "This game was not found or has expired",
-                    )
-                    .await;
+                        "Authorized game is not yet durable while its replica is unavailable; returning retryable warm-up"
+                    );
+                    send_game_warming(&ws_tx, game_id).await;
                     return;
                 }
                 Err(e) => {
                     error!("Failed to fetch game {} from database: {}", game_id, e);
-                    send_game_load_failed(
-                        &ws_tx,
-                        game_id,
-                        "The game could not be loaded right now",
-                    )
-                    .await;
+                    send_game_warming(&ws_tx, game_id).await;
                     return;
                 }
             }
@@ -1391,8 +2221,16 @@ async fn subscribe_to_game_events(
     };
 
     if matches!(game_state.status, GameStatus::Complete { .. }) {
-        send_completed_game_snapshot(&ws_tx, game_id, user_id, &game_state, "replication cache")
-            .await;
+        send_completed_game_snapshot(
+            &ws_tx,
+            &game_bus,
+            &cluster_namespace,
+            game_id,
+            user_id,
+            &game_state,
+            "replication cache",
+        )
+        .await;
         return;
     }
 
@@ -1434,10 +2272,52 @@ async fn subscribe_to_game_events(
         }
     }
 
+    // Loading recovery outcomes can take several bounded Redis attempts. Keep
+    // that I/O concurrent with the live broadcast receiver so a fresh
+    // snapshot never stalls CommandScheduled delivery. The replay result still
+    // returns through this one forwarding loop, which preserves socket order.
+    let mut command_outcome_replay = Some(start_command_outcome_replay(
+        game_bus.clone(),
+        cluster_namespace.clone(),
+        game_id,
+        user_id,
+    ));
+
     loop {
-        let event_msg = match rx.recv().await {
-            Ok(event_msg) => event_msg,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+        let input =
+            next_game_subscription_input(&ws_tx, &mut rx, &mut command_outcome_replay).await;
+        let event_msg = match input {
+            GameSubscriptionInput::SocketClosed => {
+                debug!(
+                    "WebSocket send channel closed for game {}, stopping event subscription",
+                    game_id
+                );
+                return;
+            }
+            GameSubscriptionInput::CommandOutcomes(resolved) => {
+                // Taking the completed future makes the next select ignore
+                // replay until another snapshot explicitly starts one.
+                drop(command_outcome_replay.take());
+                let Some(resolved) = resolved else {
+                    send_game_warming(&ws_tx, game_id).await;
+                    return;
+                };
+                if !send_command_outcomes_from_resolved(&ws_tx, game_id, user_id, resolved, None)
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
+            GameSubscriptionInput::Event(Ok(event_msg)) => event_msg,
+            GameSubscriptionInput::Event(Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            )) => {
+                // Any barrier for the old snapshot is now stale. Dropping the
+                // in-flight future cancels its Redis read; only the replay
+                // paired with the replacement snapshot may emit a barrier.
+                drop(command_outcome_replay.take());
+
                 // This connection fell behind the broadcast and lost events.
                 // Recover by sending a fresh snapshot (with its watermark) so
                 // the client re-anchors instead of silently diverging.
@@ -1448,6 +2328,7 @@ async fn subscribe_to_game_events(
                 match replication_manager.subscribe_to_game(game_id).await {
                     Ok((state, watermark, new_rx)) => {
                         rx = new_rx;
+                        let terminal = matches!(state.status, GameStatus::Complete { .. });
                         let resync = GameEventMessage {
                             game_id,
                             tick: state.tick,
@@ -1464,6 +2345,31 @@ async fn subscribe_to_game_events(
                             );
                             return;
                         }
+                        if terminal {
+                            if !send_command_outcomes(
+                                &ws_tx,
+                                &game_bus,
+                                &cluster_namespace,
+                                game_id,
+                                user_id,
+                                Some(TERMINAL_COMMAND_REJECTION_REASON),
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            info!(
+                                game_id,
+                                "Lag resync reached terminal state after durable outcome replay"
+                            );
+                            return;
+                        }
+                        command_outcome_replay = Some(start_command_outcome_replay(
+                            game_bus.clone(),
+                            cluster_namespace.clone(),
+                            game_id,
+                            user_id,
+                        ));
                         continue;
                     }
                     Err(e) => {
@@ -1476,12 +2382,14 @@ async fn subscribe_to_game_events(
                     }
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            GameSubscriptionInput::Event(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                drop(command_outcome_replay.take());
                 // Broadcaster dropped. If the game is still live in the
                 // replica, hand the client one last authoritative snapshot so
                 // it can at least resync via RequestResync; either way, log
                 // loudly — a silent exit here is how ghost games are born.
                 if let Some(state) = replication_manager.get_game_state(game_id).await {
+                    let terminal = matches!(state.status, GameStatus::Complete { .. });
                     error!(
                         "Event broadcaster closed for live game {} (user {}); sending final snapshot",
                         game_id, user_id
@@ -1497,6 +2405,15 @@ async fn subscribe_to_game_events(
                     let json =
                         serde_json::to_string(&WSMessage::GameEvent(final_snapshot)).unwrap();
                     let _ = ws_tx.send(Message::Text(json.into())).await;
+                    let _ = send_command_outcomes(
+                        &ws_tx,
+                        &game_bus,
+                        &cluster_namespace,
+                        game_id,
+                        user_id,
+                        terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
+                    )
+                    .await;
                 } else {
                     info!(
                         "Event broadcaster closed for game {} (game evicted); ending subscription",
@@ -1508,10 +2425,22 @@ async fn subscribe_to_game_events(
         };
 
         // Check if the game has ended
-        let is_final = matches!(
+        let is_terminal = matches!(
             &event_msg.event,
             GameEvent::StatusUpdated { status } if matches!(status, GameStatus::Complete { .. })
+        ) || matches!(
+            &event_msg.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
         );
+        let is_snapshot = snapshot_requires_command_outcomes(&event_msg.event);
+
+        if is_snapshot || is_terminal {
+            // A later snapshot (or terminal frontier) invalidates a barrier
+            // for any earlier snapshot. Cancel before enqueuing the new
+            // frontier so a stale replay can never follow it.
+            drop(command_outcome_replay.take());
+        }
 
         let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
         let msg = Message::Text(json.into());
@@ -1540,11 +2469,210 @@ async fn subscribe_to_game_events(
             }
         }
 
-        if is_final {
+        if is_terminal {
+            // A takeover can replace terminal command events that were
+            // published by the old owner but never reached this socket.
+            // Terminal state requires durable replay before the client may
+            // clear its command outbox or finish certification. No later live
+            // event needs forwarding, so waiting here cannot stall gameplay.
+            if !send_command_outcomes(
+                &ws_tx,
+                &game_bus,
+                &cluster_namespace,
+                game_id,
+                user_id,
+                is_terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
+            {
+                return;
+            }
             info!("Game {} completed, stopping event subscription", game_id);
             break;
         }
+
+        if is_snapshot {
+            command_outcome_replay = Some(start_command_outcome_replay(
+                game_bus.clone(),
+                cluster_namespace.clone(),
+                game_id,
+                user_id,
+            ));
+        }
     }
+}
+
+async fn send_command_outcomes(
+    ws_tx: &mpsc::Sender<Message>,
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+    terminal_rejection_reason: Option<&str>,
+) -> bool {
+    let resolved = tokio::select! {
+        _ = ws_tx.closed() => return false,
+        resolved = load_command_outcomes(game_bus, cluster_namespace, game_id, user_id) => resolved,
+    };
+    let Some(resolved) = resolved else {
+        send_game_warming(ws_tx, game_id).await;
+        return false;
+    };
+    send_command_outcomes_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
+}
+
+async fn load_command_outcomes(
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> Option<ResolvedCommandState> {
+    let deadline = tokio::time::Instant::now() + COMMAND_OUTCOME_LOAD_TIMEOUT;
+    let envelope = loop {
+        match tokio::time::timeout(
+            COMMAND_OUTCOME_READ_TIMEOUT,
+            game_bus.get_recovery(cluster_namespace, game_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(envelope))) => break envelope,
+            Ok(Ok(None)) => {
+                debug!(game_id, user_id, "Recovery envelope is not visible yet");
+            }
+            Ok(Err(error)) => {
+                warn!(game_id, user_id, %error, "Failed to load command outcomes for snapshot; retrying");
+            }
+            Err(_) => {
+                warn!(
+                    game_id,
+                    user_id, "Timed out loading command outcomes for snapshot; retrying"
+                );
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                game_id,
+                user_id, "Command outcomes did not become readable before the warm-up deadline"
+            );
+            return None;
+        }
+        tokio::time::sleep(COMMAND_OUTCOME_RETRY_DELAY).await;
+    };
+
+    Some(envelope.resolved_client_commands)
+}
+
+async fn load_completed_command_outcomes(
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) -> Option<RecoveryEnvelopeV2> {
+    match tokio::time::timeout(
+        COMMAND_OUTCOME_READ_TIMEOUT,
+        game_bus.get_recovery(cluster_namespace, game_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(envelope))) => Some(envelope),
+        Ok(Ok(None)) => {
+            warn!(
+                game_id,
+                user_id,
+                "Terminal recovery outcomes are no longer retained; terminal fallback will remain non-dispositive"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(
+                game_id,
+                user_id,
+                %error,
+                "Failed to load terminal recovery outcomes; terminal fallback will remain non-dispositive"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                game_id,
+                user_id,
+                "Timed out loading terminal recovery outcomes; terminal fallback will remain non-dispositive"
+            );
+            None
+        }
+    }
+}
+
+async fn send_command_outcomes_from_resolved(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    resolved: ResolvedCommandState,
+    terminal_rejection_reason: Option<&str>,
+) -> bool {
+    for (client_game_session_id, session) in command_outcomes_for_user(resolved, user_id) {
+        let response = WSMessage::CommandOutcomes {
+            game_id,
+            client_game_session_id,
+            contiguous_through: session.contiguous_through,
+            outcomes: session.outcomes,
+            rejection_fence: session.rejection_fence,
+        };
+        let json = match serde_json::to_string(&response) {
+            Ok(json) => json,
+            Err(error) => {
+                error!(game_id, user_id, %error, "Failed to serialize command outcomes");
+                return false;
+            }
+        };
+        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            debug!(
+                game_id,
+                user_id, "WebSocket closed while sending command outcomes"
+            );
+            return false;
+        }
+    }
+
+    // A user can legitimately have no recorded command session. The explicit
+    // barrier distinguishes that case from a delayed/failed recovery read, so
+    // make-before-break never promotes based on a timing assumption.
+    send_command_outcome_barrier(ws_tx, game_id, user_id, terminal_rejection_reason).await
+}
+
+async fn send_command_outcome_barrier(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    terminal_rejection_reason: Option<&str>,
+) -> bool {
+    let response = WSMessage::CommandOutcomesComplete {
+        game_id,
+        terminal_rejection_reason: terminal_rejection_reason.map(str::to_owned),
+    };
+    let json = match serde_json::to_string(&response) {
+        Ok(json) => json,
+        Err(error) => {
+            error!(game_id, user_id, %error, "Failed to serialize command outcome barrier");
+            return false;
+        }
+    };
+    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+        debug!(
+            game_id,
+            user_id, "WebSocket closed while sending command outcome barrier"
+        );
+        return false;
+    }
+    true
 }
 
 async fn send_game_snapshot(
@@ -1572,6 +2700,8 @@ async fn send_game_snapshot(
 
 async fn send_completed_game_snapshot(
     ws_tx: &mpsc::Sender<Message>,
+    game_bus: &GameBus,
+    cluster_namespace: &ClusterNamespace,
     game_id: u32,
     user_id: u32,
     game_state: &GameState,
@@ -1602,12 +2732,64 @@ async fn send_completed_game_snapshot(
         "Loaded game {} state from {} for user {}",
         game_id, source, user_id
     );
-    if let Err(e) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
+    // The terminal snapshot remains useful after the short recovery envelope
+    // expires. Only a real recovery envelope proves which exact identities
+    // were processed before immutable completion; without it, keep the
+    // barrier non-dispositive so an in-memory outbox fails closed.
+    let retained =
+        load_completed_command_outcomes(game_bus, cluster_namespace, game_id, user_id).await;
+    let (resolved, terminal_rejection_reason) = match retained {
+        Some(envelope) if matches!(envelope.game_state.status, GameStatus::Complete { .. }) => (
+            envelope.resolved_client_commands,
+            Some(TERMINAL_COMMAND_REJECTION_REASON),
+        ),
+        Some(_) => {
+            warn!(
+                game_id,
+                user_id,
+                "Ignoring nonterminal recovery outcomes beside a durable completed snapshot"
+            );
+            (ResolvedCommandState::default(), None)
+        }
+        None => (ResolvedCommandState::default(), None),
+    };
+    if !send_completed_game_snapshot_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        game_state,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
+    {
         error!(
-            "Failed to send {} for game {} to user {}: {}",
-            source, game_id, user_id, e
+            "Failed to send {} and its terminal command outcomes for game {} to user {}",
+            source, game_id, user_id
         );
     }
+}
+
+async fn send_completed_game_snapshot_from_resolved(
+    ws_tx: &mpsc::Sender<Message>,
+    game_id: u32,
+    user_id: u32,
+    game_state: &GameState,
+    resolved: ResolvedCommandState,
+    terminal_rejection_reason: Option<&str>,
+) -> bool {
+    if let Err(error) = send_game_snapshot(ws_tx, game_id, user_id, game_state).await {
+        error!(game_id, user_id, %error, "Failed to send completed game snapshot");
+        return false;
+    }
+    send_command_outcomes_from_resolved(
+        ws_tx,
+        game_id,
+        user_id,
+        resolved,
+        terminal_rejection_reason,
+    )
+    .await
 }
 
 async fn send_game_load_failed(
@@ -1634,6 +2816,185 @@ async fn send_game_load_failed(
                 "Failed to serialize load failure response for game {}: {}",
                 game_id, e
             );
+        }
+    }
+}
+
+async fn send_game_warming(ws_tx: &mpsc::Sender<Message>, game_id: u32) {
+    let response = WSMessage::GameWarming {
+        game_id,
+        retry_after_ms: GAME_WARMING_RETRY_MS,
+    };
+    match serde_json::to_string(&response) {
+        Ok(json) => {
+            if let Err(error) = ws_tx.send(Message::Text(json.into())).await {
+                debug!(game_id, %error, "WebSocket closed while reporting game warm-up");
+            }
+        }
+        Err(error) => {
+            error!(game_id, %error, "Failed to serialize game warm-up response");
+        }
+    }
+}
+
+fn unsent_lobby_match(mapped_game_id: Option<u32>, last_sent_game_id: Option<u32>) -> Option<u32> {
+    mapped_game_id.filter(|game_id| Some(*game_id) != last_sent_game_id)
+}
+
+async fn reconcile_lobby_match(
+    lobby_code: &str,
+    redis: &mut RedisConnection,
+    ws_tx: &mpsc::Sender<Message>,
+    last_sent_game_id: &mut Option<u32>,
+) -> bool {
+    let mapping_key = RedisKeys::matchmaking_lobby_active_game(lobby_code);
+    let raw_game_id: Option<String> = match redis.get(&mapping_key).await {
+        Ok(game_id) => game_id,
+        Err(error) => {
+            warn!(
+                lobby_code,
+                %error,
+                "Failed to reconcile durable lobby match mapping"
+            );
+            return true;
+        }
+    };
+    let mapped_game_id = match raw_game_id {
+        Some(raw_game_id) => match raw_game_id.parse::<u32>() {
+            Ok(game_id) => Some(game_id),
+            Err(error) => {
+                error!(
+                    lobby_code,
+                    mapping_key,
+                    raw_game_id,
+                    %error,
+                    "Ignoring malformed durable lobby match mapping"
+                );
+                return true;
+            }
+        },
+        None => None,
+    };
+    let Some(game_id) = unsent_lobby_match(mapped_game_id, *last_sent_game_id) else {
+        return true;
+    };
+
+    let message = match serde_json::to_string(&WSMessage::JoinGame(game_id)) {
+        Ok(message) => message,
+        Err(error) => {
+            error!(lobby_code, game_id, %error, "Failed to serialize lobby match join");
+            return true;
+        }
+    };
+    if let Err(error) = ws_tx.send(Message::Text(message.into())).await {
+        debug!(
+            lobby_code,
+            game_id,
+            %error,
+            "WebSocket closed while forwarding durable lobby match"
+        );
+        return false;
+    }
+
+    *last_sent_game_id = Some(game_id);
+    info!(
+        lobby_code,
+        game_id, "Forwarded durable lobby match to WebSocket"
+    );
+    true
+}
+
+/// Subscribe first, then read the durable mapping. A commit before SUBSCRIBE is
+/// recovered by the GET; a commit after SUBSCRIBE is observed as a low-latency
+/// hint. Periodic reconciliation covers a lagged push receiver while the
+/// WebSocket itself remains healthy.
+async fn subscribe_to_lobby_match_notifications(
+    lobby_code: String,
+    pubsub_manager: Arc<PubSubManager>,
+    redis: impl Into<RedisConnection>,
+    ws_tx: mpsc::Sender<Message>,
+    cancellation_token: CancellationToken,
+) {
+    let mut redis = redis.into();
+    let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
+    let mut manager = (*pubsub_manager).clone();
+    let mut last_sent_game_id = None;
+
+    loop {
+        let mut receiver = match manager.subscribe_to_channel(&channel).await {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                warn!(
+                    lobby_code,
+                    channel,
+                    %error,
+                    "Failed to subscribe to lobby match hints; retrying"
+                );
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => return,
+                    _ = tokio::time::sleep(LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY) => continue,
+                }
+            }
+        };
+
+        info!(lobby_code, channel, "Subscribed to lobby match hints");
+        if !reconcile_lobby_match(&lobby_code, &mut redis, &ws_tx, &mut last_sent_game_id).await {
+            return;
+        }
+
+        let mut reconciliation = tokio::time::interval(LOBBY_MATCH_RECONCILIATION_INTERVAL);
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The immediate durable read above already covers the interval's first tick.
+        reconciliation.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return,
+                _ = reconciliation.tick() => {
+                    if !reconcile_lobby_match(
+                        &lobby_code,
+                        &mut redis,
+                        &ws_tx,
+                        &mut last_sent_game_id,
+                    ).await {
+                        return;
+                    }
+                }
+                hint = receiver.recv::<LobbyMatchHint>() => {
+                    match hint {
+                        Ok(LobbyMatchHint::MatchFound { game_id, partition_id }) => {
+                            debug!(
+                                lobby_code,
+                                hinted_game_id = game_id,
+                                hinted_partition_id = partition_id,
+                                "Received lobby MatchFound hint; reconciling durable mapping"
+                            );
+                            if !reconcile_lobby_match(
+                                &lobby_code,
+                                &mut redis,
+                                &ws_tx,
+                                &mut last_sent_game_id,
+                            ).await {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                lobby_code,
+                                channel,
+                                %error,
+                                "Lobby match hint receiver closed; resubscribing"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = cancellation_token.cancelled() => return,
+            _ = tokio::time::sleep(LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY) => {}
         }
     }
 }
@@ -1755,11 +3116,14 @@ async fn process_ws_message(
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
-    redis: &ConnectionManager,
+    redis: &RedisConnection,
     _redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     websocket_id: &str,
     region: &str,
+    lifecycle: &TaskLifecycle,
+    socket_generation: u64,
+    cluster_namespace: &ClusterNamespace,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -1805,7 +3169,7 @@ async fn process_ws_message(
         ConnectionState::Unauthenticated => {
             match ws_message {
                 WSMessage::Token(jwt_token) => {
-                    info!("Received jwt token: {}", jwt_token);
+                    debug!("Received WebSocket authentication request");
                     match jwt_verifier.verify(&jwt_token).await {
                         Ok(user_token) => {
                             info!(
@@ -1829,6 +3193,31 @@ async fn process_ws_message(
                                 "User authenticated: {} (id: {})",
                                 metadata.username, metadata.user_id
                             );
+
+                            let authenticated = WSMessage::Authenticated {
+                                task_boot_id: lifecycle.task_boot_id().to_owned(),
+                                protocol_version: WS_PROTOCOL_VERSION,
+                                capabilities: lifecycle.protocol_capabilities(),
+                                socket_generation,
+                            };
+                            ws_tx
+                                .send(Message::Text(serde_json::to_string(&authenticated)?.into()))
+                                .await
+                                .context(
+                                    "WebSocket closed before authentication acknowledgement",
+                                )?;
+                            if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                                notify_durable_active_game_after_auth(
+                                    user_id,
+                                    ws_tx,
+                                    matchmaking_manager,
+                                    replication_manager,
+                                    game_bus,
+                                    cluster_namespace,
+                                    db,
+                                )
+                                .await?;
+                            }
                             Ok(ConnectionState::Authenticated {
                                 metadata,
                                 lobby_handle: None,
@@ -1961,166 +3350,17 @@ async fn process_ws_message(
                         });
                     }
 
-                    // Fetch user's MMR from database
-                    let user = db
-                        .get_user_by_id(metadata.user_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-                    let mmr = user.mmr;
-                    info!("User {} has MMR: {}", metadata.user_id, mmr);
-
-                    // Auto-create a single-member lobby for this solo player (just like guest lobby creation)
-                    info!("Creating auto-lobby for user {}", metadata.user_id);
-                    match lobby_manager.create_lobby(metadata.user_id, region).await {
-                        Ok(lobby) => {
-                            info!(
-                                "Auto-created lobby {} for user {}",
-                                lobby.lobby_code(),
-                                metadata.user_id
-                            );
-                            // Join the newly created lobby
-                            let lobby_handle = match lobby_manager
-                                .join_lobby(
-                                    Some(lobby.lobby_code()),
-                                    metadata.user_id,
-                                    metadata.username.clone(),
-                                    websocket_id.to_string(),
-                                    region.to_string(),
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    error!("Failed to join auto-created lobby: {}", e);
-                                    let response = WSMessage::AccessDenied {
-                                        reason: format!(
-                                            "Failed to create matchmaking lobby: {}",
-                                            e
-                                        ),
-                                    };
-                                    let json_msg = serde_json::to_string(&response)?;
-                                    ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: None,
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Fetch lobby members (should be just this user)
-                            let members = match lobby_manager
-                                .get_lobby_members(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                Ok(m) => {
-                                    info!(
-                                        lobby_id = lobby_handle.lobby_code,
-                                        member_count = m.len(),
-                                        "Fetched lobby members for auto-created lobby"
-                                    );
-                                    for (idx, (_user_id, member)) in m.iter().enumerate() {
-                                        info!(
-                                            idx = idx,
-                                            user_id = member.user_id,
-                                            username = %member.username,
-                                            "Lobby member"
-                                        );
-                                    }
-                                    m
-                                }
-                                Err(e) => {
-                                    error!("Failed to get lobby members: {}", e);
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: Some(lobby_handle),
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Update lobby state to "queued"
-                            if let Err(e) = lobby_manager
-                                .update_lobby_state(&lobby_handle.lobby_code, "queued")
-                                .await
-                            {
-                                error!("Failed to update lobby state: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue lobby: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-
-                            // Add the auto-created lobby to matchmaking queue
-                            let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard
-                                .add_lobby_to_queue(
-                                    &lobby_handle.lobby_code,
-                                    members.into_values().collect(),
-                                    mmr,
-                                    vec![game_type.clone()],
-                                    queue_mode.clone(),
-                                    metadata.user_id as u32, // Solo player is the requesting user
-                                )
-                                .await
-                            {
-                                error!("Failed to add lobby to matchmaking queue: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                // Revert lobby state
-                                let _ = lobby_manager
-                                    .update_lobby_state(&lobby_handle.lobby_code, "waiting")
-                                    .await;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-                            drop(mm_guard);
-
-                            info!(
-                                "Auto-created lobby {} for solo player {} and added to matchmaking queue",
-                                lobby_handle.lobby_code, metadata.user_id
-                            );
-
-                            // Transition to InLobby state - lobby match notifications will be handled automatically
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: Some(lobby_handle),
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to create lobby: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
+                    let response = WSMessage::AccessDenied {
+                        reason: "Join a lobby before queueing for matchmaking".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
                 }
                 WSMessage::QueueForMatchMulti {
                     game_types,
@@ -2167,166 +3407,17 @@ async fn process_ws_message(
                         });
                     }
 
-                    // Fetch user's MMR from database
-                    let user = db
-                        .get_user_by_id(metadata.user_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-                    let mmr = user.mmr;
-                    info!("User {} has MMR: {}", metadata.user_id, mmr);
-
-                    // Auto-create a single-member lobby for this solo player
-                    info!("Creating auto-lobby for user {}", metadata.user_id);
-                    match lobby_manager.create_lobby(metadata.user_id, region).await {
-                        Ok(lobby) => {
-                            info!(
-                                "Auto-created lobby {} for user {}",
-                                lobby.lobby_code(),
-                                metadata.user_id
-                            );
-                            // Join the newly created lobby
-                            let lobby_handle = match lobby_manager
-                                .join_lobby(
-                                    Some(lobby.lobby_code()),
-                                    metadata.user_id,
-                                    metadata.username.clone(),
-                                    websocket_id.to_string(),
-                                    region.to_string(),
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    error!("Failed to join auto-created lobby: {}", e);
-                                    let response = WSMessage::AccessDenied {
-                                        reason: format!(
-                                            "Failed to create matchmaking lobby: {}",
-                                            e
-                                        ),
-                                    };
-                                    let json_msg = serde_json::to_string(&response)?;
-                                    ws_tx.send(Message::Text(json_msg.into())).await?;
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: None,
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Fetch lobby members (should be just this user)
-                            let members = match lobby_manager
-                                .get_lobby_members(&lobby_handle.lobby_code)
-                                .await
-                            {
-                                Ok(m) => {
-                                    info!(
-                                        lobby_id = lobby_handle.lobby_code,
-                                        member_count = m.len(),
-                                        "Fetched lobby members for auto-created lobby"
-                                    );
-                                    for (idx, (_user_id, member)) in m.iter().enumerate() {
-                                        info!(
-                                            idx = idx,
-                                            user_id = member.user_id,
-                                            username = %member.username,
-                                            "Lobby member"
-                                        );
-                                    }
-                                    m
-                                }
-                                Err(e) => {
-                                    error!("Failed to get lobby members: {}", e);
-                                    return Ok(ConnectionState::Authenticated {
-                                        metadata,
-                                        lobby_handle: Some(lobby_handle),
-                                        game_id,
-                                        websocket_id,
-                                    });
-                                }
-                            };
-
-                            // Update lobby state to "queued"
-                            if let Err(e) = lobby_manager
-                                .update_lobby_state(&lobby_handle.lobby_code, "queued")
-                                .await
-                            {
-                                error!("Failed to update lobby state: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue lobby: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-
-                            // Add the auto-created lobby to matchmaking queue with multiple game types
-                            let mut mm_guard = matchmaking_manager.lock().await;
-                            if let Err(e) = mm_guard
-                                .add_lobby_to_queue(
-                                    &lobby_handle.lobby_code,
-                                    members.into_values().collect(),
-                                    mmr,
-                                    game_types, // Use game_types directly instead of wrapping
-                                    queue_mode.clone(),
-                                    metadata.user_id as u32, // Solo player is the requesting user
-                                )
-                                .await
-                            {
-                                error!("Failed to add lobby to matchmaking queue: {}", e);
-                                let response = WSMessage::AccessDenied {
-                                    reason: format!("Failed to queue for match: {}", e),
-                                };
-                                let json_msg = serde_json::to_string(&response)?;
-                                ws_tx.send(Message::Text(json_msg.into())).await?;
-                                // Revert lobby state
-                                let _ = lobby_manager
-                                    .update_lobby_state(&lobby_handle.lobby_code, "waiting")
-                                    .await;
-                                return Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: Some(lobby_handle),
-                                    game_id,
-                                    websocket_id,
-                                });
-                            }
-                            drop(mm_guard);
-
-                            info!(
-                                "Auto-created lobby {} for solo player {} and added to matchmaking queue for multiple game types",
-                                lobby_handle.lobby_code, metadata.user_id
-                            );
-
-                            // Transition to InLobby state - lobby match notifications will be handled automatically
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: Some(lobby_handle),
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to create lobby: {}", e);
-                            let response = WSMessage::AccessDenied {
-                                reason: format!("Failed to create matchmaking lobby: {}", e),
-                            };
-                            let json_msg = serde_json::to_string(&response)?;
-                            ws_tx.send(Message::Text(json_msg.into())).await?;
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: lobby,
-                                game_id,
-                                websocket_id,
-                            })
-                        }
-                    }
+                    let response = WSMessage::AccessDenied {
+                        reason: "Join a lobby before queueing for matchmaking".to_string(),
+                    };
+                    let json_msg = serde_json::to_string(&response)?;
+                    ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
                 }
                 WSMessage::JoinGame(requested_game_id) => {
                     info!(
@@ -2352,11 +3443,21 @@ async fn process_ws_message(
                         }
                     };
 
-                    if let Err(reason) =
-                        authorize_game_join(requested_game_id, user_id, replication_manager, db)
-                            .await
+                    if let Err(failure) = authorize_game_join(
+                        requested_game_id,
+                        user_id,
+                        matchmaking_manager,
+                        replication_manager,
+                        game_bus,
+                        cluster_namespace,
+                        db,
+                    )
+                    .await
                     {
-                        send_game_load_failed(ws_tx, requested_game_id, reason).await;
+                        let response = game_join_failure_message(requested_game_id, failure);
+                        ws_tx
+                            .send(Message::Text(serde_json::to_string(&response)?.into()))
+                            .await?;
                         return Ok(ConnectionState::Authenticated {
                             metadata,
                             lobby_handle: lobby,
@@ -2398,50 +3499,37 @@ async fn process_ws_message(
                         metadata.username, metadata.user_id
                     );
 
-                    // Remove from matchmaking queue using Redis-based matchmaking
+                    // Queue admission is lobby-authoritative. Remove only the
+                    // exact currently admitted lobby identity; there is no
+                    // secondary per-player queue to reconcile.
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
-                    match remove_from_matchmaking_queue(
-                        &mut matchmaking_manager,
-                        metadata.user_id as u32,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            info!("User {} removed from matchmaking queue", metadata.user_id);
-                        }
-                        Err(e) => {
-                            error!("Failed to remove user from matchmaking queue: {}", e);
-                        }
-                    }
-
-                    // If a lobby was queued, remove the entire lobby from matchmaking as well
                     if let Some(lobby_handle) = &lobby {
                         let lobby_code = lobby_handle.lobby_code.clone();
                         match matchmaking_manager
                             .remove_lobby_from_all_queues_by_code(&lobby_code)
                             .await
                         {
-                            Ok(true) => {
-                                info!(
-                                    lobby_code = lobby_code,
-                                    "Removed lobby from matchmaking queues after cancel"
-                                );
-                                if let Err(e) = lobby_manager
-                                    .update_lobby_state(&lobby_code, "waiting")
-                                    .await
+                            Ok(removed) => {
+                                if removed {
+                                    info!(
+                                        lobby_code = lobby_code,
+                                        "Removed lobby from matchmaking queues after cancel"
+                                    );
+                                } else {
+                                    info!(
+                                        lobby_code = lobby_code,
+                                        "Lobby was not present in matchmaking queues on cancel"
+                                    );
+                                }
+                                if let Err(error) =
+                                    lobby_manager.publish_lobby_update(&lobby_code).await
                                 {
                                     warn!(
                                         lobby_code = lobby_code,
-                                        error = %e,
-                                        "Failed to reset lobby state after cancel"
+                                        %error,
+                                        "Failed to publish reconciled lobby state after cancel"
                                     );
                                 }
-                            }
-                            Ok(false) => {
-                                info!(
-                                    lobby_code = lobby_code,
-                                    "Lobby was not present in matchmaking queues on cancel"
-                                );
                             }
                             Err(e) => {
                                 error!(
@@ -2843,44 +3931,90 @@ async fn process_ws_message(
                         websocket_id,
                     })
                 }
-                WSMessage::GameCommand(command_message) => {
+                WSMessage::GameCommandV2 {
+                    command_id,
+                    command,
+                } => {
                     if let Some(game_id) = game_id {
+                        let user_id = metadata.user_id as u32;
+                        if command_id.game_id != game_id || command_id.user_id != user_id {
+                            warn!(
+                                claimed_game_id = command_id.game_id,
+                                claimed_user_id = command_id.user_id,
+                                authenticated_game_id = game_id,
+                                authenticated_user_id = user_id,
+                                "Canonicalizing untrusted v2 command identity"
+                            );
+                        }
+                        let command_id = canonical_command_identity(command_id, game_id, user_id);
+                        if let Err(error) = validate_client_command_identity(&command_id) {
+                            warn!(game_id, user_id, %error, "Rejecting invalid v2 command identity");
+                            let response = WSMessage::AccessDenied {
+                                reason: "Invalid game command identity".to_owned(),
+                            };
+                            ws_tx
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await?;
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id: Some(game_id),
+                                websocket_id,
+                            });
+                        }
                         let partition_id = game_id % PARTITION_COUNT;
-
-                        let event = StreamEvent::GameCommandSubmitted {
+                        let command_sequence = command_id.sequence;
+                        let event = StreamEvent::GameCommandSubmittedV2 {
                             game_id,
-                            user_id: metadata.user_id as u32,
-                            command: command_message,
+                            user_id,
+                            command_id,
+                            command,
                         };
-
-                        // Send command via the game bus
-                        match game_bus.publish_command(partition_id, &event).await {
-                            Ok(_) => {
+                        let publish_started = tokio::time::Instant::now();
+                        let publish_result = game_bus
+                            .publish_game_command_unless_completed(
+                                cluster_namespace,
+                                partition_id,
+                                game_id,
+                                &event,
+                            )
+                            .await;
+                        let publish_wait = publish_started.elapsed();
+                        if let Some(publish_wait_ms) = slow_command_publish_wait_ms(publish_wait) {
+                            warn!(
+                                game_id,
+                                user_id,
+                                partition_id,
+                                command_sequence,
+                                gateway_task_boot_id = lifecycle.task_boot_id(),
+                                socket_generation,
+                                publish_wait_ms,
+                                publish_succeeded = publish_result.is_ok(),
+                                "Slow v2 game command publication"
+                            );
+                        }
+                        match publish_result {
+                            Ok(true) => {}
+                            Ok(false) => {
                                 debug!(
-                                    "Successfully submitted game command via the game bus: {:?}",
-                                    event
+                                    game_id,
+                                    user_id, "Discarded command after immutable game completion"
                                 );
-                                Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: lobby,
-                                    game_id: Some(game_id),
-                                    websocket_id,
-                                })
                             }
-                            Err(e) => {
-                                error!("Failed to submit command via the game bus: {}", e);
-                                Ok(ConnectionState::Authenticated {
-                                    metadata,
-                                    lobby_handle: lobby,
-                                    game_id: Some(game_id),
-                                    websocket_id,
-                                })
+                            Err(error) => {
+                                error!(game_id, user_id, %error, "Failed to publish v2 game command");
                             }
                         }
+                        Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id: Some(game_id),
+                            websocket_id,
+                        })
                     } else {
                         warn!(
-                            "Received GameCommand there is no game id in websocket state: {:?}",
-                            command_message
+                            user_id = metadata.user_id,
+                            "Ignoring v2 game command from a connection with no active game"
                         );
                         Ok(ConnectionState::Authenticated {
                             metadata,
@@ -3221,4 +4355,645 @@ async fn spectate_game(
         user_id, actual_game_id
     );
     Ok(actual_game_id)
+}
+
+#[cfg(test)]
+mod lifecycle_protocol_tests {
+    use super::{
+        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
+        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
+        canonical_command_identity, command_outcomes_for_user, game_join_denied,
+        game_join_failure_message, missing_game_join_failure, next_game_subscription_input,
+        next_outbound_message, queue_planned_drain_notice, recovery_bridge_snapshot,
+        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
+        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
+        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
+        take_lobby_update_receiver, unsent_lobby_match,
+    };
+    use crate::lifecycle::DrainNotice;
+    use crate::lobby_manager::{Lobby, LobbyPreferences};
+    use crate::pubsub_manager::PubSubManager;
+    use crate::recovery::{
+        RecoveryEnvelopeV2, ResolvedCommandState, SPARSE_COMMAND_WINDOW_REJECTION_REASON,
+        SessionCommandOutcomes, SessionCommandRejectionFence,
+    };
+    use crate::redis_keys::RedisKeys;
+    use crate::redis_utils::create_connection_manager;
+    use common::{
+        ClientCommandIdentityV2, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
+        QueueMode,
+    };
+    use redis::{AsyncCommands, Client};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc, oneshot};
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn slow_command_publish_logging_uses_a_strict_one_second_threshold() {
+        assert_eq!(
+            slow_command_publish_wait_ms(Duration::from_millis(999)),
+            None
+        );
+        assert_eq!(slow_command_publish_wait_ms(Duration::from_secs(1)), None);
+        assert_eq!(
+            slow_command_publish_wait_ms(Duration::from_millis(1_001)),
+            Some(1_001)
+        );
+    }
+
+    #[test]
+    fn gateway_canonicalizes_untrusted_command_scope() {
+        let identity = canonical_command_identity(
+            ClientCommandIdentityV2 {
+                game_id: 999,
+                user_id: 888,
+                client_game_session_id: "session-a".to_owned(),
+                sequence: 7,
+            },
+            42,
+            5,
+        );
+        assert_eq!(identity.game_id, 42);
+        assert_eq!(identity.user_id, 5);
+        assert_eq!(identity.client_game_session_id, "session-a");
+        assert_eq!(identity.sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn lobby_forwarder_keeps_the_initial_update_published_during_join() {
+        let (updates, mut join_receiver) = broadcast::channel(4);
+        let initial = Lobby {
+            lobby_code: "USE1-INITIAL".to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 7,
+            state: "open".to_owned(),
+            preferences: LobbyPreferences::default(),
+        };
+        updates
+            .send(initial)
+            .expect("join receiver should retain the initial update");
+
+        let mut forwarder_receiver = take_lobby_update_receiver(&mut join_receiver);
+        assert_eq!(
+            forwarder_receiver
+                .recv()
+                .await
+                .expect("forwarder lost the queued initial update")
+                .lobby_code,
+            "USE1-INITIAL"
+        );
+        assert!(matches!(
+            join_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let next = Lobby {
+            lobby_code: "USE1-NEXT".to_owned(),
+            members: BTreeMap::new(),
+            host_user_id: 7,
+            state: "open".to_owned(),
+            preferences: LobbyPreferences::default(),
+        };
+        updates
+            .send(next)
+            .expect("both receivers should remain subscribed");
+        assert_eq!(
+            forwarder_receiver
+                .recv()
+                .await
+                .expect("forwarder lost a later update")
+                .lobby_code,
+            "USE1-NEXT"
+        );
+    }
+
+    #[test]
+    fn only_fresh_snapshots_require_adjacent_command_outcomes() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        assert!(snapshot_requires_command_outcomes(&GameEvent::Snapshot {
+            game_state: state,
+        }));
+        assert!(!snapshot_requires_command_outcomes(&GameEvent::TickHash {
+            hash: 1,
+            server_ts_ms: 2,
+        }));
+    }
+
+    #[test]
+    fn recovery_outcomes_are_filtered_to_the_authenticated_user() {
+        let resolved = ResolvedCommandState {
+            sessions: BTreeMap::from([
+                ("5:session-a".to_owned(), SessionCommandOutcomes::default()),
+                ("6:session-b".to_owned(), SessionCommandOutcomes::default()),
+            ]),
+        };
+        let filtered = command_outcomes_for_user(resolved, 5);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "session-a");
+    }
+
+    #[test]
+    fn authentication_ack_advertises_an_explicit_capability_envelope() {
+        let value = serde_json::to_value(WSMessage::Authenticated {
+            task_boot_id: "task-a".to_owned(),
+            protocol_version: 2,
+            capabilities: vec!["planned-drain-v1".to_owned()],
+            socket_generation: 3,
+        })
+        .unwrap();
+        assert_eq!(value["Authenticated"]["task_boot_id"], "task-a");
+        assert_eq!(value["Authenticated"]["socket_generation"], 3);
+    }
+
+    #[tokio::test]
+    async fn planned_drain_bypasses_a_saturated_gameplay_queue() {
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        for sequence in 0..1024 {
+            ws_tx
+                .try_send(Message::Text(format!("gameplay-{sequence}").into()))
+                .unwrap();
+        }
+        let (drain_tx, mut drain_rx) = mpsc::channel(1);
+        queue_planned_drain_notice(
+            &drain_tx,
+            &DrainNotice {
+                task_boot_id: "departing-task".to_owned(),
+                deadline_unix_ms: 123_456,
+            },
+        )
+        .unwrap();
+
+        let mut drain_open = true;
+        let mut ws_open = true;
+        let first = next_outbound_message(&mut drain_rx, &mut ws_rx, &mut drain_open, &mut ws_open)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decode_ws_message(first),
+            WSMessage::Drain {
+                task_boot_id,
+                deadline_unix_ms: 123_456,
+            } if task_boot_id == "departing-task"
+        ));
+
+        let second =
+            next_outbound_message(&mut drain_rx, &mut ws_rx, &mut drain_open, &mut ws_open)
+                .await
+                .unwrap();
+        assert_eq!(second, Message::Text("gameplay-0".into()));
+    }
+
+    #[test]
+    fn recovery_bridge_uses_the_exact_checkpointed_event_watermark() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(5), 0);
+        let envelope = RecoveryEnvelopeV2::new(
+            42,
+            2,
+            state,
+            "123-0".to_owned(),
+            ResolvedCommandState::default(),
+            7,
+            41,
+            1_000,
+            "lease-token".to_owned(),
+        );
+
+        let bridge = recovery_bridge_snapshot(&envelope, 5);
+        assert_eq!(bridge.stream_seq, 41);
+        assert_eq!(bridge.game_id, 42);
+    }
+
+    #[tokio::test]
+    async fn recovery_bridge_withholds_the_handoff_promotion_barrier() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(5), 0);
+        let envelope = RecoveryEnvelopeV2::new(
+            42,
+            2,
+            state,
+            "123-0".to_owned(),
+            ResolvedCommandState::default(),
+            7,
+            41,
+            1_000,
+            "lease-token".to_owned(),
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(send_recovery_bridge_snapshot(&tx, &envelope, 5).await);
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::GameEvent(_)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_outcome_replay_does_not_block_live_game_events() {
+        let (ws_tx, _ws_rx) = mpsc::channel(2);
+        let (events_tx, events_rx) = broadcast::channel(2);
+        let mut events = crate::replication::FilteredEventReceiver::new(events_rx, 0, 42);
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut replay: Option<CommandOutcomeReplay> = Some(Box::pin(async move {
+            release_rx.await.expect("test replay release was dropped");
+            Some(ResolvedCommandState::default())
+        }));
+        let live_event = GameEventMessage {
+            game_id: 42,
+            tick: 3,
+            sequence: 4,
+            stream_seq: 5,
+            user_id: None,
+            event: GameEvent::TickHash {
+                hash: 6,
+                server_ts_ms: 7,
+            },
+        };
+        events_tx
+            .send(live_event)
+            .expect("filtered receiver should remain subscribed");
+
+        let input = timeout(
+            Duration::from_secs(1),
+            next_game_subscription_input(&ws_tx, &mut events, &mut replay),
+        )
+        .await
+        .expect("a pending Redis replay blocked a ready live event");
+        assert!(matches!(
+            input,
+            GameSubscriptionInput::Event(Ok(event))
+                if event.game_id == 42 && event.stream_seq == 5
+        ));
+
+        release_tx.send(()).expect("replay future disappeared");
+        let input = timeout(
+            Duration::from_secs(1),
+            next_game_subscription_input(&ws_tx, &mut events, &mut replay),
+        )
+        .await
+        .expect("completed outcome replay was not returned to the forwarding loop");
+        assert!(matches!(
+            input,
+            GameSubscriptionInput::CommandOutcomes(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_joins_the_cancelled_game_event_forwarder() {
+        struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut handle = Some(tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(dropped_tx));
+            started_tx.send(()).expect("test starter was dropped");
+            std::future::pending::<()>().await;
+        }));
+        started_rx
+            .await
+            .expect("forwarder did not reach its pending replay");
+
+        abort_and_join_game_event_forwarder(&mut handle).await;
+
+        assert!(handle.is_none());
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("replacement returned before the cancelled forwarder was dropped")
+            .expect("forwarder drop notification was lost");
+    }
+
+    #[test]
+    fn cold_game_response_is_explicitly_retryable() {
+        let warming = serde_json::to_value(game_join_failure_message(
+            42,
+            GameJoinAuthorizationError::Warming,
+        ))
+        .unwrap();
+        assert_eq!(warming["GameWarming"]["game_id"], 42);
+        assert_eq!(warming["GameWarming"]["retry_after_ms"], 500);
+        assert!(warming.get("GameLoadFailed").is_none());
+
+        let terminal = serde_json::to_value(game_join_failure_message(
+            42,
+            game_join_denied("This game was not found or has expired"),
+        ))
+        .unwrap();
+        assert_eq!(terminal["GameLoadFailed"]["game_id"], 42);
+        assert_eq!(
+            terminal["GameLoadFailed"]["reason"],
+            "This game was not found or has expired"
+        );
+        assert!(terminal.get("GameWarming").is_none());
+    }
+
+    #[test]
+    fn durable_active_mapping_keeps_precreation_gap_retryable() {
+        assert!(matches!(
+            missing_game_join_failure(42, Some(42)),
+            GameJoinAuthorizationError::Warming
+        ));
+        assert!(matches!(
+            missing_game_join_failure(42, None),
+            GameJoinAuthorizationError::Denied(_)
+        ));
+        assert!(matches!(
+            missing_game_join_failure(42, Some(41)),
+            GameJoinAuthorizationError::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn lobby_match_reconciliation_covers_commit_before_subscribe() {
+        assert_eq!(unsent_lobby_match(Some(42), None), Some(42));
+    }
+
+    #[test]
+    fn lobby_match_reconciliation_deduplicates_hints_and_allows_play_again() {
+        assert_eq!(unsent_lobby_match(Some(42), Some(42)), None);
+        assert_eq!(unsent_lobby_match(Some(43), Some(42)), Some(43));
+        assert_eq!(unsent_lobby_match(None, Some(42)), None);
+    }
+
+    #[tokio::test]
+    async fn live_lobby_listener_recovers_committed_and_missed_hints_once() {
+        let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
+        let client = Client::open(redis_url).unwrap();
+        let (pubsub_tx, _pubsub_rx) = broadcast::channel(128);
+        let redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
+        let mut control = client.get_multiplexed_async_connection().await.unwrap();
+        let lobby_code = format!("LISTENER-{}", uuid::Uuid::new_v4());
+        let mapping_key = RedisKeys::matchmaking_lobby_active_game(&lobby_code);
+        let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
+        let first_game_id = 42_001_u32;
+        let second_game_id = 42_002_u32;
+
+        // This commit predates SUBSCRIBE. The listener's subscribe-then-GET
+        // ordering must still deliver it.
+        control
+            .set::<_, _, ()>(&mapping_key, first_game_id)
+            .await
+            .unwrap();
+        let (ws_tx, mut ws_rx) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let listener = tokio::spawn(subscribe_to_lobby_match_notifications(
+            lobby_code,
+            pubsub_manager,
+            redis,
+            ws_tx,
+            cancellation.clone(),
+        ));
+
+        let first = timeout(Duration::from_secs(2), ws_rx.recv())
+            .await
+            .expect("listener did not reconcile the preexisting mapping")
+            .expect("listener closed before delivering the preexisting mapping");
+        assert!(matches!(
+            decode_ws_message(first),
+            WSMessage::JoinGame(game_id) if game_id == first_game_id
+        ));
+
+        let duplicate_hint = serde_json::json!({
+            "type": "MatchFound",
+            "game_id": first_game_id,
+            "partition_id": 1,
+        })
+        .to_string();
+        for _ in 0..2 {
+            control
+                .publish::<_, _, ()>(&channel, &duplicate_hint)
+                .await
+                .unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(250), ws_rx.recv())
+                .await
+                .is_err(),
+            "duplicate hints must not forward a second JoinGame"
+        );
+
+        // Deliberately publish no hint for the later game. The periodic
+        // durable read is the recovery path for an at-most-once Pub/Sub loss.
+        control
+            .set::<_, _, ()>(&mapping_key, second_game_id)
+            .await
+            .unwrap();
+        let second = timeout(Duration::from_secs(6), ws_rx.recv())
+            .await
+            .expect("periodic reconciliation did not recover the missed hint")
+            .expect("listener closed before periodic reconciliation");
+        assert!(matches!(
+            decode_ws_message(second),
+            WSMessage::JoinGame(game_id) if game_id == second_game_id
+        ));
+        assert!(
+            timeout(Duration::from_millis(250), ws_rx.recv())
+                .await
+                .is_err(),
+            "periodic reads must not repeat the same JoinGame"
+        );
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), listener)
+            .await
+            .expect("listener ignored cancellation")
+            .expect("listener task panicked");
+        control.del::<_, ()>(&mapping_key).await.unwrap();
+    }
+
+    #[test]
+    fn command_outcome_barrier_has_an_explicit_game_scope() {
+        let value = serde_json::to_value(WSMessage::CommandOutcomesComplete {
+            game_id: 42,
+            terminal_rejection_reason: None,
+        })
+        .unwrap();
+        assert_eq!(value["CommandOutcomesComplete"]["game_id"], 42);
+        assert!(
+            value["CommandOutcomesComplete"]
+                .get("terminal_rejection_reason")
+                .is_none()
+        );
+    }
+
+    fn decode_ws_message(message: Message) -> WSMessage {
+        let Message::Text(text) = message else {
+            panic!("expected a text WebSocket message");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_recovery_outcomes_still_emit_the_promotion_barrier() {
+        let (tx, mut rx) = mpsc::channel(2);
+        assert!(
+            send_command_outcomes_from_resolved(&tx, 42, 5, ResolvedCommandState::default(), None,)
+                .await
+        );
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_outcomes_include_the_session_rejection_fence() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let resolved = ResolvedCommandState {
+            sessions: BTreeMap::from([(
+                "5:session-a".to_owned(),
+                SessionCommandOutcomes {
+                    contiguous_through: 7,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: Some(SessionCommandRejectionFence {
+                        from_sequence: 9,
+                        reason: SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+                    }),
+                },
+            )]),
+        };
+
+        assert!(send_command_outcomes_from_resolved(&tx, 42, 5, resolved, None).await);
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomes {
+                game_id: 42,
+                client_game_session_id,
+                contiguous_through: 7,
+                rejection_fence: Some(SessionCommandRejectionFence {
+                    from_sequence: 9,
+                    reason,
+                }),
+                ..
+            } if client_game_session_id == "session-a"
+                && reason == SPARSE_COMMAND_WINDOW_REJECTION_REASON
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_is_followed_by_terminal_recovery_fence_and_barrier() {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.add_player(5, None).unwrap();
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(0),
+        };
+        let (tx, mut rx) = mpsc::channel(3);
+        let resolved = ResolvedCommandState {
+            sessions: BTreeMap::from([(
+                "5:terminal-session".to_owned(),
+                SessionCommandOutcomes {
+                    contiguous_through: 3,
+                    outcomes: BTreeMap::new(),
+                    rejection_fence: Some(SessionCommandRejectionFence {
+                        from_sequence: 4,
+                        reason: SPARSE_COMMAND_WINDOW_REJECTION_REASON.to_owned(),
+                    }),
+                },
+            )]),
+        };
+
+        assert!(
+            send_completed_game_snapshot_from_resolved(
+                &tx,
+                42,
+                5,
+                &state,
+                resolved,
+                Some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
+        );
+
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::GameEvent(event)
+                if matches!(
+                    &event.event,
+                    GameEvent::Snapshot { game_state }
+                        if matches!(game_state.status, GameStatus::Complete { .. })
+                )
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomes {
+                game_id: 42,
+                client_game_session_id,
+                contiguous_through: 3,
+                rejection_fence: Some(SessionCommandRejectionFence {
+                    from_sequence: 4,
+                    reason,
+                }),
+                ..
+            } if client_game_session_id == "terminal-session"
+                && reason == SPARSE_COMMAND_WINDOW_REJECTION_REASON
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: Some(reason),
+            } if reason == TERMINAL_COMMAND_REJECTION_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_without_retained_outcomes_has_no_default_disposition() {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.add_player(5, None).unwrap();
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(
+            send_completed_game_snapshot_from_resolved(
+                &tx,
+                42,
+                5,
+                &state,
+                ResolvedCommandState::default(),
+                None,
+            )
+            .await
+        );
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::GameEvent(_)
+        ));
+        assert!(matches!(
+            decode_ws_message(rx.recv().await.unwrap()),
+            WSMessage::CommandOutcomesComplete {
+                game_id: 42,
+                terminal_rejection_reason: None,
+            }
+        ));
+    }
 }

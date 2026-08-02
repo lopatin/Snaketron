@@ -1,5 +1,5 @@
+use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
-use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -99,6 +99,14 @@ impl LobbyJoinHandle {
             .await
     }
 
+    /// Stop this transport's heartbeat without interpreting transport loss as
+    /// an explicit user intent to leave. The Redis presence lease expires on
+    /// its own unless a replacement socket refreshes a newer presence.
+    pub fn detach_transport(mut self) {
+        self.heartbeat_task.abort();
+        self.return_to_manager();
+    }
+
     fn return_to_manager(&mut self) {
         let mut returned = self.returned.write().unwrap();
         if !*returned {
@@ -147,7 +155,7 @@ type LobbyBroadcasters = RwLock<HashMap<String, LobbyBroadcaster>>;
 
 /// Manages lobby membership and presence using Redis heartbeats
 pub struct LobbyManager {
-    redis: ConnectionManager,
+    redis: RedisConnection,
     #[allow(dead_code)] // kept alive for future lobby persistence
     db: Arc<dyn Database>,
     lobby_broadcasters: LobbyBroadcasters,
@@ -157,7 +165,7 @@ pub struct LobbyManager {
 
 impl LobbyManager {
     pub fn new(
-        redis: ConnectionManager,
+        redis: RedisConnection,
         db: Arc<dyn Database>,
         pubsub_manager: Arc<PubSubManager>,
     ) -> Self {
@@ -473,7 +481,7 @@ impl LobbyManager {
             return Ok(None);
         }
 
-        info!("Fetching metadata for lobby '{}'", lobby_code);
+        debug!("Fetching metadata for lobby '{}'", lobby_code);
 
         // Fetch all metadata fields
         let data: HashMap<String, String> = redis
@@ -518,11 +526,17 @@ impl LobbyManager {
             RedisKeys::lobby_chat_history_key(lobby_code),
         ];
 
-        self.redis
-            .clone()
-            .del::<_, ()>(keys)
-            .await
-            .context("Failed to delete lobby keys from Redis")?;
+        // Lobby metadata participates in the matchmaking slot while the
+        // transient members/preferences/chat keys do not. Delete them
+        // independently so this remains valid on Redis Cluster/Valkey
+        // Serverless, where a multi-key DEL may not cross hash slots.
+        let mut redis = self.redis.clone();
+        for key in keys {
+            redis
+                .del::<_, ()>(key)
+                .await
+                .context("Failed to delete a lobby key from Redis")?;
+        }
 
         info!("Deleted lobby '{}'", lobby_code);
         Ok(())
@@ -654,16 +668,30 @@ impl LobbyManager {
         &self,
         lobby_code: &str,
         user_id: i32,
-        websocket_id: &str,
+        _websocket_id: &str,
     ) -> Result<LeaveLobbyResult> {
         let mut redis = self.redis.clone();
 
         let members_key = RedisKeys::lobby_members_set(lobby_code);
-        let member_value = format!("{}:{}", user_id, websocket_id);
-        redis
-            .zrem::<_, _, ()>(&members_key, &member_value)
+        // Explicit user intent supersedes every transport generation. During
+        // make-before-break both the retired and replacement websocket may
+        // have a short-lived presence entry; removing only the newest one
+        // would leave a ghost member until its lease expired.
+        let members: Vec<String> = redis
+            .zrange(&members_key, 0, -1)
             .await
-            .context("Failed to remove lobby member from Redis")?;
+            .context("Failed to list lobby transports before explicit leave")?;
+        let user_prefix = format!("{user_id}:");
+        let user_transports: Vec<String> = members
+            .into_iter()
+            .filter(|member| member.starts_with(&user_prefix))
+            .collect();
+        if !user_transports.is_empty() {
+            redis
+                .zrem::<_, _, ()>(&members_key, user_transports)
+                .await
+                .context("Failed to remove lobby member transports from Redis")?;
+        }
 
         // Drop any expired members before checking if the lobby is empty
         let now = chrono::Utc::now().timestamp_millis();

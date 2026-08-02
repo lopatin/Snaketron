@@ -21,6 +21,8 @@ async fn test_cleanup_abandoned_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Get matched
     client1
@@ -81,6 +83,8 @@ async fn test_cleanup_finished_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     client1
         .send_message(WSMessage::QueueForMatch {
@@ -139,6 +143,8 @@ async fn test_cleanup_stale_matchmaking_requests() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Queue for a match that requires 3 players
     client1
@@ -188,6 +194,8 @@ async fn test_multiple_games_cleanup() -> Result<()> {
 
         client1.authenticate(env.user_ids()[i * 2]).await?;
         client2.authenticate(env.user_ids()[i * 2 + 1]).await?;
+        client1.create_lobby().await?;
+        client2.create_lobby().await?;
 
         client1
             .send_message(WSMessage::QueueForMatch {

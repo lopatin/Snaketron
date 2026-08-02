@@ -72,6 +72,8 @@ async fn test_simple_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Clients authenticated");
 
@@ -251,18 +253,21 @@ async fn test_simple_game() -> Result<()> {
     .await??;
 
     turning_player_client
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: turning_user_id,
-                sequence_number: 0,
+        .send_game_command(
+            _game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: turning_user_id,
+                    sequence_number: 0,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: turning_snake_id,
+                    direction: Direction::Up,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id: turning_snake_id,
-                direction: Direction::Up,
-            },
-        }))
+        )
         .await?;
 
     // Wait until the Up turn has actually executed before scheduling the next
@@ -284,18 +289,21 @@ async fn test_simple_game() -> Result<()> {
 
     // Turn left to continue avoiding walls
     turning_player_client
-        .send_message(WSMessage::GameCommand(GameCommandMessage {
-            command_id_client: CommandId {
-                tick: 0,
-                user_id: turning_user_id,
-                sequence_number: 1,
+        .send_game_command(
+            _game_id,
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 0,
+                    user_id: turning_user_id,
+                    sequence_number: 1,
+                },
+                command_id_server: None,
+                command: GameCommand::Turn {
+                    snake_id: turning_snake_id,
+                    direction: Direction::Left,
+                },
             },
-            command_id_server: None,
-            command: GameCommand::Turn {
-                snake_id: turning_snake_id,
-                direction: Direction::Left,
-            },
-        }))
+        )
         .await?;
 
     // Track deaths and wait for the game to complete.
@@ -335,6 +343,36 @@ async fn test_simple_game() -> Result<()> {
             GameEvent::StatusUpdated { status } => {
                 println!("Game status updated to {:?}", status);
                 if let GameStatus::Complete { winning_snake_id } = status {
+                    final_winning_snake_id = Some(*winning_snake_id);
+                }
+            }
+            GameEvent::Snapshot { game_state } => {
+                // Completion is published by the same fenced transaction that
+                // persists the terminal record, so the terminal snapshot is
+                // the authoritative completion notification. The executor
+                // intentionally withholds the terminal transition batch: an
+                // incremental event at that tick could make a replica derive
+                // Complete before the transaction commits. Recover any death
+                // observation superseded by that snapshot from final state.
+                if let GameStatus::Complete { winning_snake_id } = &game_state.status {
+                    if snake1_death_tick.is_none()
+                        && game_state
+                            .arena
+                            .snakes
+                            .get(snake1_id as usize)
+                            .is_some_and(|snake| !snake.is_alive)
+                    {
+                        snake1_death_tick = Some(game_state.tick);
+                    }
+                    if snake2_death_tick.is_none()
+                        && game_state
+                            .arena
+                            .snakes
+                            .get(snake2_id as usize)
+                            .is_some_and(|snake| !snake.is_alive)
+                    {
+                        snake2_death_tick = Some(game_state.tick);
+                    }
                     final_winning_snake_id = Some(*winning_snake_id);
                 }
             }

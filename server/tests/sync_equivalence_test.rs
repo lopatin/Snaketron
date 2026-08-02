@@ -680,7 +680,8 @@ async fn targeted_event_loss_detected_by_tickhash() -> Result<()> {
         // With stream_seq, dropping a single FoodSpawned always also tells
         // the client via the gap counter — so to exercise the hash path in
         // isolation, corrupt the client's committed food set directly by one
-        // cell. stream_seq 0 bypasses the watermark (unassigned/legacy), and
+        // cell. stream_seq 0 bypasses the watermark for locally constructed
+        // out-of-band messages, and
         // (0, 0) is outside the food spawn area so the server can never
         // accidentally repair it.
         let corruption = GameEventMessage {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use common::{GameType, QueueMode};
-use loadtest::config::{self, Args, Config, GameMode};
+use loadtest::config::{self, Args, Config, GameMode, Population};
 use loadtest::report::{
     InfrastructureSample, LoadTestRun, RampStageRecord, SessionFailureRecord, SessionOutcome,
     SessionPhase, SessionRecord, aggregate_report, unix_time_ms, write_report,
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Barrier, mpsc};
 use tokio::task::{Id, JoinError, JoinSet};
-use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use url::Url;
@@ -27,6 +27,20 @@ const SPAWN_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 const FAILURE_CIRCUIT_BREAKER_MIN_SESSIONS: usize = 4;
 const FAILURE_CIRCUIT_BREAKER_RATE: f64 = 0.20;
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionConcurrencyState {
@@ -214,6 +228,7 @@ async fn run(config: Config) -> Result<()> {
         .preflight(&TargetOptions {
             target: config.target_url.to_string(),
             region: config.region.clone(),
+            require_same_origin: config.require_same_origin,
         })
         .await
         .context("target preflight failed before any sessions were launched")?;
@@ -227,6 +242,14 @@ async fn run(config: Config) -> Result<()> {
         Url::parse(&preflight.api_origin).context("preflight returned an invalid API origin")?;
     let selected_origin = Url::parse(&preflight.selected_origin)
         .context("preflight returned an invalid selected-region origin")?;
+    if config.require_same_origin {
+        ensure_effective_endpoints_same_origin(
+            &config.target_url,
+            &api_origin,
+            &selected_origin,
+            &websocket_url,
+        )?;
+    }
     ensure_effective_endpoints_confirmed(
         config.production_confirmed,
         &[&api_origin, &selected_origin, &websocket_url],
@@ -234,11 +257,12 @@ async fn run(config: Config) -> Result<()> {
     let settings = SessionSettings {
         api_origin,
         websocket_url,
-        origin: preflight.selected_origin.clone(),
+        origin: selected_origin.to_string(),
         game_type: game_type(config.mode),
         queue_mode: queue_mode(config.queue_mode),
         selected_mode: config.mode.as_str().to_owned(),
         competitive: matches!(config.queue_mode, config::QueueMode::Competitive),
+        population: config.population,
         connect_timeout: config.connect_timeout,
         lobby_timeout: config.lobby_timeout,
         queue_timeout: config.queue_timeout,
@@ -275,7 +299,17 @@ async fn run(config: Config) -> Result<()> {
         settings.websocket_url.to_string(),
     );
     run.metadata
+        .insert("api_origin".to_owned(), settings.api_origin.to_string());
+    run.metadata
+        .insert("selected_origin".to_owned(), settings.origin.clone());
+    run.metadata.insert(
+        "require_same_origin".to_owned(),
+        config.require_same_origin.to_string(),
+    );
+    run.metadata
         .insert("mode".to_owned(), config.mode.to_string());
+    run.metadata
+        .insert("population".to_owned(), config.population.to_string());
     run.metadata
         .insert("queue_mode".to_owned(), config.queue_mode.to_string());
     run.metadata.insert(
@@ -283,8 +317,16 @@ async fn run(config: Config) -> Result<()> {
         config.command_profile.to_string(),
     );
     run.metadata.insert(
+        "command_outcome_latency_basis".to_owned(),
+        "original-send-to-dedicated-reader-frame-receipt".to_owned(),
+    );
+    run.metadata.insert(
         "spawn_rate_per_second".to_owned(),
         config.spawn_rate.to_string(),
+    );
+    run.metadata.insert(
+        "open_loop_admission".to_owned(),
+        config.open_loop_admission.to_string(),
     );
     run.metadata.insert(
         "max_total_sessions".to_owned(),
@@ -296,11 +338,17 @@ async fn run(config: Config) -> Result<()> {
     );
     run.metadata.insert(
         "lobby_topology".to_owned(),
-        if config.players_per_game() > 1 {
+        if config.population == Population::Game && config.sessions_per_group() > 1 {
             format!(
                 "one_full_party_lobby_per_game_{}_members",
-                config.players_per_game()
+                config.sessions_per_group()
             )
+        } else if config.population == Population::Idle {
+            "none_idle_authenticated_socket".to_owned()
+        } else if config.population == Population::Matchmaking {
+            "one_player_lobby_held_in_queue".to_owned()
+        } else if config.population == Population::Lobby {
+            "one_player_lobby_held_outside_queue".to_owned()
         } else {
             "one_player_lobby_per_game".to_owned()
         },
@@ -331,11 +379,11 @@ async fn run(config: Config) -> Result<()> {
     let mut next_group_index = 1u64;
     let mut next_wave_index = 0u32;
     let mut interrupted = false;
-    let mut signal = Box::pin(tokio::signal::ctrl_c());
+    let mut signal = Box::pin(shutdown_signal());
     let mut observation_interval = interval(OBSERVATION_INTERVAL);
     observation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut spawn_interval = interval_at(Instant::now() + SPAWN_INTERVAL, SPAWN_INTERVAL);
-    spawn_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut spawn_interval = fixed_rate_spawn_interval(Instant::now());
+    let mut infrastructure_tasks = JoinSet::new();
     let baseline_backend_hints = resolver.backend_hints().observed_backend_count();
     let baseline_server_count = preflight
         .initial_server_counts
@@ -388,13 +436,17 @@ async fn run(config: Config) -> Result<()> {
         run.games.expected = run
             .games
             .expected
-            .saturating_add(launched / config.players_per_game());
+            .saturating_add(config.expected_games(launched));
         let mut target_reached = concurrency.connected() >= stage.target_concurrency;
         let mut target_reached_at = target_reached.then(unix_time_ms);
 
         let stage_deadline = Instant::now() + stage.duration;
         while Instant::now() < stage_deadline {
             tokio::select! {
+                // A wave and an observation are due together every five
+                // seconds. Poll the fixed-rate launch ahead of diagnostics so
+                // diagnostics can never perturb the workload they measure.
+                biased;
                 signal_result = &mut signal => {
                     match signal_result {
                         Ok(()) => warn!("interrupt received; stopping ramp and draining sessions"),
@@ -402,6 +454,57 @@ async fn run(config: Config) -> Result<()> {
                     }
                     interrupted = true;
                     break;
+                }
+                _ = tokio::time::sleep_until(stage_deadline) => break,
+                _ = spawn_interval.tick() => {
+                    // Terminal activity can become ready at the same instant
+                    // as the next fixed-rate wave. Refresh reservations before
+                    // enforcing the concurrency ceiling so biased timer
+                    // priority cannot create an artificial missing wave.
+                    drain_stage_activity_events(
+                        &mut activity_rx,
+                        &mut concurrency,
+                        stage.target_concurrency,
+                        &mut target_reached,
+                        &mut target_reached_at,
+                    );
+                    if concurrency.reserved() < stage.target_concurrency
+                        && Instant::now() < stage_deadline
+                    {
+                        let budget = launch_budget(&config, total_sessions_launched);
+                        if budget < config.sessions_per_group() {
+                            let reason = format!(
+                                "maximum total session limit {} reached before concurrency target {} could be maintained",
+                                config.max_total_sessions,
+                                stage.target_concurrency,
+                            );
+                            error!(%reason, "session safety limit stopped further load generation");
+                            run.metadata.insert("session_limit".to_owned(), reason);
+                            interrupted = true;
+                            break;
+                        }
+                        let launched = spawn_deficit_wave(
+                            stage.target_concurrency,
+                            budget,
+                            &mut concurrency,
+                            &mut next_session_index,
+                            &mut next_group_index,
+                            &mut next_wave_index,
+                            &mut tasks,
+                            &mut planned_groups,
+                            &config,
+                            &settings,
+                            resolver.http_client(),
+                            &activity_tx,
+                            cancellation.clone(),
+                        );
+                        sessions_launched += launched;
+                        total_sessions_launched = total_sessions_launched.saturating_add(launched);
+                        run.games.expected = run
+                            .games
+                            .expected
+                            .saturating_add(config.expected_games(launched));
+                    }
                 }
                 event = activity_rx.recv() => {
                     if let Some(event) = event {
@@ -433,49 +536,18 @@ async fn run(config: Config) -> Result<()> {
                         break;
                     }
                 }
-                _ = spawn_interval.tick() => {
-                    if concurrency.reserved() < stage.target_concurrency
-                        && Instant::now() < stage_deadline
-                    {
-                        let budget = launch_budget(&config, total_sessions_launched);
-                        if budget < config.players_per_game() {
-                            let reason = format!(
-                                "maximum total session limit {} reached before concurrency target {} could be maintained",
-                                config.max_total_sessions,
-                                stage.target_concurrency,
-                            );
-                            error!(%reason, "session safety limit stopped further load generation");
-                            run.metadata.insert("session_limit".to_owned(), reason);
-                            interrupted = true;
-                            break;
-                        }
-                        let launched = spawn_deficit_wave(
-                            stage.target_concurrency,
-                            budget,
-                            &mut concurrency,
-                            &mut next_session_index,
-                            &mut next_group_index,
-                            &mut next_wave_index,
-                            &mut tasks,
-                            &mut planned_groups,
-                            &config,
-                            &settings,
-                            resolver.http_client(),
-                            &activity_tx,
-                            cancellation.clone(),
-                        );
-                        sessions_launched += launched;
-                        total_sessions_launched = total_sessions_launched.saturating_add(launched);
-                        run.games.expected = run
-                            .games
-                            .expected
-                            .saturating_add(launched / config.players_per_game());
+                sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                    if let Some(sampled) = sampled {
+                        record_infrastructure_sample(sampled, &resolver, &mut run);
                     }
                 }
-                _ = observation_interval.tick() => {
-                    sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
+                _ = observation_interval.tick(), if infrastructure_tasks.is_empty() => {
+                    spawn_infrastructure_sample(
+                        &mut infrastructure_tasks,
+                        &resolver,
+                        &preflight.api_origin,
+                    );
                 }
-                _ = tokio::time::sleep_until(stage_deadline) => break,
             }
         }
 
@@ -503,7 +575,7 @@ async fn run(config: Config) -> Result<()> {
     info!(
         connected = concurrency.connected(),
         pending = concurrency.pending(),
-        "ramp complete; draining token-sent sessions"
+        "ramp complete; draining authenticated sessions"
     );
     let drain_deadline = Instant::now() + config.drain_timeout;
     while !tasks.is_empty() && Instant::now() < drain_deadline {
@@ -520,8 +592,17 @@ async fn run(config: Config) -> Result<()> {
                     collect_group_result(joined, &mut planned_groups, &mut run, &mut concurrency);
                 }
             }
-            _ = observation_interval.tick() => {
-                sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
+            sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                if let Some(sampled) = sampled {
+                    record_infrastructure_sample(sampled, &resolver, &mut run);
+                }
+            }
+            _ = observation_interval.tick(), if infrastructure_tasks.is_empty() => {
+                spawn_infrastructure_sample(
+                    &mut infrastructure_tasks,
+                    &resolver,
+                    &preflight.api_origin,
+                );
             }
             _ = tokio::time::sleep_until(drain_deadline) => break,
         }
@@ -559,6 +640,11 @@ async fn run(config: Config) -> Result<()> {
 
     drain_activity_events(&mut activity_rx, &mut concurrency);
 
+    // Preserve any final periodic observation without allowing its network I/O
+    // to interfere with launch cadence or session result collection.
+    while let Some(sampled) = infrastructure_tasks.join_next().await {
+        record_infrastructure_sample(sampled, &resolver, &mut run);
+    }
     sample_infrastructure(&resolver, &preflight.api_origin, &mut run).await;
     run.finished_at_unix_ms = unix_time_ms();
     let observed_backend_hints = resolver.backend_hints().observed_backend_count();
@@ -587,6 +673,10 @@ async fn run(config: Config) -> Result<()> {
         config.require_scale_out.to_string(),
     );
     run.metadata.insert(
+        "require_planned_handoff".to_owned(),
+        config.require_planned_handoff.to_string(),
+    );
+    run.metadata.insert(
         "observed_backend_hints".to_owned(),
         observed_backend_hints.to_string(),
     );
@@ -610,9 +700,10 @@ async fn run(config: Config) -> Result<()> {
         total_sessions_launched.to_string(),
     );
     run.metadata.insert(
-        "coordinator_peak_token_sent_concurrency".to_owned(),
+        "coordinator_peak_authenticated_concurrency".to_owned(),
         concurrency.peak_connected().to_string(),
     );
+    run.peak_authenticated_concurrency = concurrency.peak_connected();
     if !planned_groups.is_empty() {
         // This should be unreachable because every JoinSet result is drained,
         // but keep the report denominator complete if Tokio ever returns an
@@ -637,8 +728,8 @@ async fn run(config: Config) -> Result<()> {
     let coordinator_failures = metadata_counter(&run, "coordinator_task_failures");
     let all_sessions_accounted = aggregate.session_counts.total == total_sessions_launched;
     let all_games_observed = run.games.observed == run.games.expected;
-    let peak_token_sent_target_reached =
-        aggregate.session_counts.peak_token_sent_concurrency >= config.max_concurrency();
+    let peak_authenticated_target_reached =
+        aggregate.session_counts.peak_authenticated_concurrency >= config.max_concurrency();
     let all_stages_completed = !interrupted && run.ramp_stages.len() == config.stages.len();
     let all_targets_reached =
         all_stages_completed && run.ramp_stages.iter().all(|stage| stage.target_reached);
@@ -651,10 +742,10 @@ async fn run(config: Config) -> Result<()> {
             completed_rate * 100.0
         ));
     }
-    if !peak_token_sent_target_reached {
+    if !config.open_loop_admission && !peak_authenticated_target_reached {
         threshold_failures.push(format!(
-            "peak token-sent logical sessions {} never reached configured maximum {}",
-            aggregate.session_counts.peak_token_sent_concurrency,
+            "peak server-authenticated sessions {} never reached configured maximum {}",
+            aggregate.session_counts.peak_authenticated_concurrency,
             config.max_concurrency()
         ));
     }
@@ -683,14 +774,78 @@ async fn run(config: Config) -> Result<()> {
     }
     if !all_stages_completed {
         threshold_failures.push("the configured stage plan did not complete".to_owned());
-    } else if !all_targets_reached {
-        threshold_failures
-            .push("one or more token-sent session concurrency targets were not reached".to_owned());
+    } else if !config.open_loop_admission && !all_targets_reached {
+        threshold_failures.push(
+            "one or more server-authenticated session concurrency targets were not reached"
+                .to_owned(),
+        );
     }
     if config.require_scale_out && !scale_out_observed {
         threshold_failures.push(format!(
             "active selected-region servers did not rise above baseline {baseline_server_count}"
         ));
+    }
+    if aggregate
+        .metrics
+        .planned_handoffs
+        .pending_commands_at_finish
+        > 0
+    {
+        threshold_failures.push(format!(
+            "{} game commands lacked a terminal outcome at session finish",
+            aggregate
+                .metrics
+                .planned_handoffs
+                .pending_commands_at_finish
+        ));
+    }
+    if config.require_planned_handoff {
+        let handoffs = &aggregate.metrics.planned_handoffs;
+        if handoffs.attempts == 0 {
+            threshold_failures.push("no planned drain handoff was observed".to_owned());
+        }
+        if handoffs.failures > 0 || handoffs.successes != handoffs.attempts {
+            threshold_failures.push(format!(
+                "planned handoffs were not lossless: {} attempts, {} successes, {} failures",
+                handoffs.attempts, handoffs.successes, handoffs.failures
+            ));
+        }
+        if config.population == Population::Game
+            && handoffs
+                .outcome_barriers
+                .saturating_add(handoffs.terminal_completions)
+                != handoffs.successes
+        {
+            threshold_failures.push(format!(
+                "only {} of {} planned handoffs observed an outcome barrier or terminal snapshot",
+                handoffs
+                    .outcome_barriers
+                    .saturating_add(handoffs.terminal_completions),
+                handoffs.successes
+            ));
+        }
+        if handoffs.continuity_proofs != handoffs.successes {
+            threshold_failures.push(format!(
+                "only {} of {} successful planned handoffs had observed old/new continuity",
+                handoffs.continuity_proofs, handoffs.successes
+            ));
+        }
+        if config.population == Population::Game
+            && config.command_profile.sends_unchanged_turns()
+            && handoffs.successes > 0
+            && handoffs.commands_sent == 0
+        {
+            threshold_failures.push(
+                "no every-tick game command was emitted on an old socket while a planned candidate was prepared"
+                    .to_owned(),
+            );
+        }
+        if aggregate.metrics.usable_session_gap_ms.max_ms.unwrap_or(0) > 0 {
+            threshold_failures.push(format!(
+                "usable-session gap reached {} ms during planned-handoff certification",
+                aggregate.metrics.usable_session_gap_ms.max_ms.unwrap_or(0)
+            ));
+        }
     }
     let passed = threshold_failures.is_empty();
     run.metadata.insert(
@@ -702,8 +857,8 @@ async fn run(config: Config) -> Result<()> {
         all_games_observed.to_string(),
     );
     run.metadata.insert(
-        "peak_token_sent_target_reached".to_owned(),
-        peak_token_sent_target_reached.to_string(),
+        "peak_authenticated_target_reached".to_owned(),
+        peak_authenticated_target_reached.to_string(),
     );
     run.metadata.insert(
         "all_stages_completed".to_owned(),
@@ -732,6 +887,8 @@ async fn run(config: Config) -> Result<()> {
         completed = aggregate.session_counts.completed,
         failed = aggregate.session_counts.failed,
         peak_token_sent = aggregate.session_counts.peak_token_sent_concurrency,
+        peak_authenticated = aggregate.session_counts.peak_authenticated_concurrency,
+        peak_active_games = aggregate.session_counts.peak_active_game_concurrency,
         games_completed = aggregate.games.completed,
         games_timeboxed = aggregate.games.timeboxed,
         games_expected = aggregate.games.expected,
@@ -767,7 +924,7 @@ fn spawn_deficit_wave(
     activity_tx: &mpsc::UnboundedSender<SessionActivityEvent>,
     cancellation: CancellationToken,
 ) -> usize {
-    let players_per_game = config.players_per_game();
+    let players_per_game = config.sessions_per_group();
     let group_count = groups_to_launch(
         target,
         concurrency.reserved(),
@@ -827,11 +984,11 @@ fn groups_to_launch(
     if reserved >= target || players_per_game == 0 {
         return 0;
     }
-    // Replacements remain full match groups. If a single VU from a group
-    // exits early, the bounded overshoot is therefore less than one group.
-    (target - reserved)
-        .div_ceil(players_per_game)
-        .min(launch_budget / players_per_game)
+    // Replacements remain full match groups, but a partially vacated group
+    // does not create enough room for another complete group. Stage targets
+    // are validated as group-aligned, so rounding down reaches the exact
+    // target once the remaining member(s) finish without ever overshooting it.
+    ((target - reserved) / players_per_game).min(launch_budget / players_per_game)
 }
 
 fn record_successful_game_outcome(
@@ -994,7 +1151,49 @@ fn launch_budget(config: &Config, total_sessions_launched: usize) -> usize {
     )
 }
 
+fn fixed_rate_spawn_interval(start: Instant) -> Interval {
+    let mut spawn_interval = interval_at(start + SPAWN_INTERVAL, SPAWN_INTERVAL);
+    // Keep future waves anchored after a late poll without emitting every
+    // elapsed tick as a catch-up burst. A delayed observation must neither
+    // shift the remainder of the run nor manufacture excess admission load.
+    spawn_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    spawn_interval
+}
+
+fn spawn_infrastructure_sample(
+    tasks: &mut JoinSet<InfrastructureSample>,
+    resolver: &TargetResolver,
+    api_origin: &str,
+) {
+    let resolver = resolver.clone();
+    let api_origin = api_origin.to_owned();
+    tasks.spawn(async move { capture_infrastructure_sample(&resolver, &api_origin).await });
+}
+
+fn record_infrastructure_sample(
+    sampled: Result<InfrastructureSample, JoinError>,
+    resolver: &TargetResolver,
+    run: &mut LoadTestRun,
+) {
+    let sample = sampled.unwrap_or_else(|error| InfrastructureSample {
+        observed_at_unix_ms: unix_time_ms(),
+        regional_user_counts: Default::default(),
+        regional_server_counts: Default::default(),
+        observed_backend_hints: resolver.backend_hints().observed_backend_count(),
+        error: Some(format!("infrastructure sampler task failed: {error}")),
+    });
+    run.infrastructure_samples.push(sample);
+}
+
 async fn sample_infrastructure(resolver: &TargetResolver, api_origin: &str, run: &mut LoadTestRun) {
+    run.infrastructure_samples
+        .push(capture_infrastructure_sample(resolver, api_origin).await);
+}
+
+async fn capture_infrastructure_sample(
+    resolver: &TargetResolver,
+    api_origin: &str,
+) -> InfrastructureSample {
     let (users, servers) = tokio::join!(
         resolver.sample_user_counts_from_origin(api_origin),
         resolver.sample_server_counts_from_origin(api_origin),
@@ -1014,13 +1213,13 @@ async fn sample_infrastructure(resolver: &TargetResolver, api_origin: &str, run:
             Default::default()
         }
     };
-    run.infrastructure_samples.push(InfrastructureSample {
+    InfrastructureSample {
         observed_at_unix_ms: unix_time_ms(),
         regional_user_counts,
         regional_server_counts,
         observed_backend_hints: resolver.backend_hints().observed_backend_count(),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
-    });
+    }
 }
 
 fn game_type(mode: GameMode) -> GameType {
@@ -1053,6 +1252,57 @@ fn ensure_effective_endpoints_confirmed(
         ));
     }
     Ok(())
+}
+
+fn ensure_effective_endpoints_same_origin(
+    target: &Url,
+    api_origin: &Url,
+    selected_origin: &Url,
+    websocket_url: &Url,
+) -> Result<()> {
+    let mut mismatches = Vec::new();
+    if target.scheme() != api_origin.scheme() || !same_authority(target, api_origin) {
+        mismatches.push("API origin");
+    }
+    if target.scheme() != selected_origin.scheme() || !same_authority(target, selected_origin) {
+        mismatches.push("selected regional origin");
+    }
+    let expected_websocket_scheme = match target.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        scheme => {
+            return Err(anyhow!(
+                "same-origin gate does not support target scheme '{scheme}'"
+            ));
+        }
+    };
+    if websocket_url.scheme() != expected_websocket_scheme || !same_authority(target, websocket_url)
+    {
+        mismatches.push("WebSocket endpoint");
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "--require-same-origin rejected incoherent endpoints before guest creation: {}; target={target}, api_origin={api_origin}, selected_origin={selected_origin}, websocket_url={websocket_url}",
+        mismatches.join(", ")
+    ))
+}
+
+fn same_authority(left: &Url, right: &Url) -> bool {
+    left.host_str()
+        .zip(right.host_str())
+        .is_some_and(|(left_host, right_host)| left_host.eq_ignore_ascii_case(right_host))
+        && effective_port(left) == effective_port(right)
+}
+
+fn effective_port(url: &Url) -> Option<u16> {
+    url.port().or(match url.scheme() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    })
 }
 
 fn report_directory(root: &Path, run_id: &str) -> PathBuf {
@@ -1097,10 +1347,62 @@ fn plan_session_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+    use tokio::time::advance;
 
     #[test]
     fn four_duel_sessions_are_planned_as_two_deterministic_games() {
         assert_eq!(plan_session_groups(1, 2, 2), vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_rate_spawn_interval_skips_missed_ticks_without_bursting() {
+        let start = Instant::now();
+        let mut spawn_interval = fixed_rate_spawn_interval(start);
+
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(1));
+        advance(Duration::from_millis(2_394)).await;
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(2));
+        // Tick three is already overdue. Skip must discard it; Burst would
+        // return that tick on the next poll even after time reaches tick four.
+        advance(Duration::from_millis(606)).await;
+        assert_eq!(spawn_interval.tick().await, start + Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_infrastructure_sample_does_not_delay_actual_launch_cadence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_origin = format!("http://{}", listener.local_addr().unwrap());
+        let blackhole = tokio::spawn(async move {
+            let mut held_connections = Vec::new();
+            while let Ok((connection, _)) = listener.accept().await {
+                held_connections.push(connection);
+            }
+        });
+        let resolver = TargetResolver::new(Duration::from_millis(1_394)).unwrap();
+        let mut infrastructure_tasks = JoinSet::new();
+        spawn_infrastructure_sample(&mut infrastructure_tasks, &resolver, &api_origin);
+
+        let start = Instant::now();
+        let mut spawn_interval = fixed_rate_spawn_interval(start);
+        let mut actual_launches = vec![start];
+        let mut run = LoadTestRun::new("run", api_origin, 0, 4);
+        while actual_launches.len() < 4 {
+            tokio::select! {
+                biased;
+                _ = spawn_interval.tick() => actual_launches.push(Instant::now()),
+                sampled = infrastructure_tasks.join_next(), if !infrastructure_tasks.is_empty() => {
+                    record_infrastructure_sample(sampled.unwrap(), &resolver, &mut run);
+                }
+            }
+        }
+
+        assert!(actual_launches.windows(2).all(|launches| {
+            launches[1].duration_since(launches[0]) <= Duration::from_millis(1_100)
+        }));
+        assert_eq!(run.infrastructure_samples.len(), 1);
+        assert!(run.infrastructure_samples[0].error.is_some());
+        blackhole.abort();
     }
 
     #[test]
@@ -1115,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn individual_terminal_session_releases_capacity_before_its_group_finishes() {
+    fn partial_group_exit_does_not_overshoot_the_stage_target() {
         let mut concurrency = SessionConcurrencyTracker::default();
         concurrency.reserve(&[1, 2]);
         concurrency.observe(SessionActivityEvent::Connected { session_index: 1 });
@@ -1125,16 +1427,35 @@ mod tests {
 
         assert_eq!(concurrency.connected(), 1);
         assert_eq!(concurrency.reserved(), 1);
+        assert_eq!(groups_to_launch(2, concurrency.reserved(), 2, 2), 0);
+
+        concurrency.observe(SessionActivityEvent::Terminal { session_index: 2 });
         assert_eq!(groups_to_launch(2, concurrency.reserved(), 2, 2), 1);
     }
 
     #[test]
-    fn replacement_launches_stay_match_group_aligned_and_bounded() {
-        // One missing member of a four-player group requires one complete
-        // replacement group, producing at most a three-session overshoot.
-        assert_eq!(groups_to_launch(4, 3, 8, 4), 1);
-        assert_eq!(3 + groups_to_launch(4, 3, 8, 4) * 4, 7);
+    fn replacement_launches_stay_match_group_aligned_without_overshoot() {
+        assert_eq!(groups_to_launch(4, 3, 8, 4), 0);
+        assert_eq!(groups_to_launch(4, 0, 8, 4), 1);
         assert_eq!(groups_to_launch(4, 4, 8, 4), 0);
+    }
+
+    #[test]
+    fn replacement_launches_never_exceed_target_or_budget() {
+        for players_per_game in 1..=4 {
+            for group_target in 1..=8 {
+                let target = group_target * players_per_game;
+                for reserved in 0..=target {
+                    for launch_budget in 0..=(target + players_per_game) {
+                        let groups =
+                            groups_to_launch(target, reserved, launch_budget, players_per_game);
+                        let launched = groups * players_per_game;
+                        assert!(reserved + launched <= target);
+                        assert!(launched <= launch_budget);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1150,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_drain_records_a_transient_token_sent_target_before_terminal() {
+    fn stage_drain_records_a_transient_authenticated_target_before_terminal() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut concurrency = SessionConcurrencyTracker::default();
         concurrency.reserve(&[1]);
@@ -1282,6 +1603,55 @@ mod tests {
             .is_ok()
         );
         assert!(ensure_effective_endpoints_confirmed(false, &[&custom_api]).is_ok());
+    }
+
+    #[test]
+    fn same_origin_gate_accepts_only_coherent_effective_endpoints() {
+        let target = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let api = Url::parse("https://stg-123-1.snaketron.io:443/").unwrap();
+        let selected = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let websocket = Url::parse("wss://stg-123-1.snaketron.io/socket").unwrap();
+
+        assert!(
+            ensure_effective_endpoints_same_origin(&target, &api, &selected, &websocket).is_ok()
+        );
+    }
+
+    #[test]
+    fn same_origin_gate_reports_every_endpoint_that_escaped_the_target() {
+        let target = Url::parse("https://stg-123-1.snaketron.io/").unwrap();
+        let production_api = Url::parse("https://api.snaketron.io/").unwrap();
+        let production_region = Url::parse("https://use1.snaketron.io/").unwrap();
+        let production_websocket = Url::parse("wss://use1.snaketron.io/ws").unwrap();
+
+        let error = ensure_effective_endpoints_same_origin(
+            &target,
+            &production_api,
+            &production_region,
+            &production_websocket,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("before guest creation"));
+        assert!(error.contains("API origin"));
+        assert!(error.contains("selected regional origin"));
+        assert!(error.contains("WebSocket endpoint"));
+        assert!(error.contains("target=https://stg-123-1.snaketron.io/"));
+    }
+
+    #[test]
+    fn same_origin_gate_rejects_scheme_or_port_changes_on_the_same_host() {
+        let target = Url::parse("http://localhost:8080/").unwrap();
+        let api = Url::parse("http://localhost:8080/").unwrap();
+        let selected = Url::parse("https://localhost:8080/").unwrap();
+        let websocket = Url::parse("ws://localhost:8081/ws").unwrap();
+
+        let error = ensure_effective_endpoints_same_origin(&target, &api, &selected, &websocket)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("selected regional origin"));
+        assert!(error.contains("WebSocket endpoint"));
+        assert!(!error.contains("API origin"));
     }
 
     #[tokio::test]

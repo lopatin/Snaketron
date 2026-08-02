@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { GameClient } from 'wasm-snaketron';
 import { GameState, GameCommand, Command } from '../types';
-import { getClockDrift } from '../utils/clockSync';
+import { getServerClockOffsetMs } from '../utils/clockSync';
 import { parseU32GameId } from '../utils/gameId';
 import { startTrace, record as recordTrace, autoUploadOnce } from '../utils/syncTrace';
 
@@ -51,6 +51,7 @@ export const useGameEngine = ({
   const onRequestResyncRef = useRef(onRequestResync);
   const lastServerMsgAtRef = useRef<number | null>(null);
   const staleRef = useRef(false);
+  const staleStartedAtRef = useRef<number | null>(null);
   const lastResyncSentAtRef = useRef(0);
   const watchdogBackoffMsRef = useRef(WATCHDOG_BACKOFF_INITIAL_MS);
   const watchdogNextSendAtRef = useRef(0);
@@ -104,6 +105,7 @@ export const useGameEngine = ({
     setIsGameComplete(false);
     setConnectionStale(false);
     staleRef.current = false;
+    staleStartedAtRef.current = null;
     lastServerMsgAtRef.current = null;
     lastResyncSentAtRef.current = 0;
     watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
@@ -122,9 +124,10 @@ export const useGameEngine = ({
     }
 
     try {
-      // Apply clock drift compensation to get server-synchronized time
-      const clockDrift = getClockDrift();
-      const now = BigInt(Date.now() - Math.round(clockDrift));
+      // The sync utility reports server-minus-client offset, so add it to the
+      // browser clock. Before the first Pong, fall back to local wall time.
+      const serverClockOffsetMs = getServerClockOffsetMs() ?? 0;
+      const now = BigInt(Date.now() + Math.round(serverClockOffsetMs));
       
       // Run engine until current time. Keep this loop lean: main-thread
       // stalls delay WS message handling and can batch several server
@@ -219,6 +222,7 @@ export const useGameEngine = ({
         if (isStarted && lastMsgAt !== null && nowMs - lastMsgAt > WATCHDOG_STALE_MS) {
           if (!staleRef.current) {
             staleRef.current = true;
+            staleStartedAtRef.current = nowMs;
             setConnectionStale(true);
             watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
             watchdogNextSendAtRef.current = nowMs;
@@ -226,6 +230,12 @@ export const useGameEngine = ({
               Note: {
                 ts_ms: nowMs,
                 note: `watchdog fired: no server message for ${nowMs - lastMsgAt}ms`
+              }
+            });
+            recordTrace({
+              Note: {
+                ts_ms: nowMs,
+                note: `ws_metric name=stale_overlay_activation count=1 no_message_ms=${Math.max(0, Math.min(5 * 60 * 1000, nowMs - lastMsgAt))}`
               }
             });
           }
@@ -439,10 +449,20 @@ export const useGameEngine = ({
       // Liveness: any accepted server message for this game proves the pipe is alive
       lastServerMsgAtRef.current = Date.now();
       if (staleRef.current) {
+        const nowMs = Date.now();
         staleRef.current = false;
         setConnectionStale(false);
         watchdogBackoffMsRef.current = WATCHDOG_BACKOFF_INITIAL_MS;
-        recordTrace({ Note: { ts_ms: Date.now(), note: 'watchdog cleared: server messages resumed' } });
+        if (staleStartedAtRef.current !== null) {
+          recordTrace({
+            Note: {
+              ts_ms: nowMs,
+              note: `ws_metric name=stale_overlay_duration_ms value=${Math.max(0, Math.min(5 * 60 * 1000, nowMs - staleStartedAtRef.current))}`
+            }
+          });
+          staleStartedAtRef.current = null;
+        }
+        recordTrace({ Note: { ts_ms: nowMs, note: 'watchdog cleared: server messages resumed' } });
       }
 
       recordTrace({
@@ -454,9 +474,11 @@ export const useGameEngine = ({
       });
 
       if (engineRef.current) {
-        if (!isSnapshot) {
-          engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
-        }
+        // Rebuilding from `game_state` restores the authoritative state but
+        // not the transport watermark. Feed the complete Snapshot envelope
+        // through the engine as well so `stream_seq` is the baseline for the
+        // very next delta (and a missing first delta cannot go undetected).
+        engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
 
         if (isSnapshot) {
           // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.

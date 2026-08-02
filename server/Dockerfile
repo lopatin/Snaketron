@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.89-trixie as builder
+FROM rust:1.94.1-trixie AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -20,9 +20,11 @@ COPY server ./server
 COPY client ./client
 COPY terminal ./terminal
 COPY bot ./bot
+COPY loadtest ./loadtest
 
-# Build the server
-RUN cargo build --release --bin server
+# Build the runtime. The read-only resilience_admin tool is built by the
+# operations runner and is not part of the serving image.
+RUN cargo build --release -p server --bin server
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -54,7 +56,7 @@ WORKDIR /home/snaketron
 EXPOSE 8080 50051
 
 # Set default environment variables for local development
-ENV SNAKETRON_WS_PORT=8080
+ENV SNAKETRON_HTTP_PORT=8080
 ENV SNAKETRON_GRPC_PORT=50051
 ENV SNAKETRON_REPLAY_DIR=/var/lib/snaketron/replays
 ENV RUST_LOG=info

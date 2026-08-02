@@ -44,7 +44,7 @@ Required environment variables:
 - `SNAKETRON_DB_USER`: Database username
 - `SNAKETRON_DB_PASS`: Database password
 - `SNAKETRON_DB_NAME`: Database name
-- `SNAKETRON_WS_PORT`: WebSocket port (default: 8080)
+- `SNAKETRON_HTTP_PORT`: HTTP/WebSocket port (default: 8080)
 - `SNAKETRON_GRPC_PORT`: gRPC port (default: 50051)
 - `SNAKETRON_REGION`: Server region identifier
 
@@ -55,11 +55,8 @@ Completed game retention:
 - The server fails startup if it cannot verify that TTL is `ENABLING` or `ENABLED` on exactly the `ttl` attribute. The runtime IAM role therefore always needs `dynamodb:DescribeTimeToLive`; it also needs `dynamodb:UpdateTimeToLive` unless deployment automation guarantees TTL is already configured.
 - Prefer configuring the same TTL setting in deployment infrastructure. The startup check remains fail-fast so expired snapshots do not silently accumulate when infrastructure or IAM drifts.
 
-Runtime game ID rollout:
-
-- New servers allocate game IDs from a DynamoDB-backed namespace beginning at `1,000,000,000`; legacy Redis-only servers remain in the lower namespace during a rolling deployment.
-- The legacy `game:id:counter` must remain below that boundary until all legacy servers are removed. New servers fail game allocation if that rollout invariant is violated.
-- New servers deliberately do not advance the legacy Redis counter, so resetting Redis cannot make the new durable allocator reuse a legacy runtime ID.
+Runtime game IDs are allocated durably in DynamoDB. Redis is not an authority
+for game ID allocation.
 
 # Testing
 

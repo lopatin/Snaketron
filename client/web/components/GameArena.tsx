@@ -51,6 +51,7 @@ export default function GameArena() {
     currentLobby,
     lobbyPreferences,
     isSessionAuthenticated,
+    createLobby,
   } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
@@ -584,7 +585,7 @@ export default function GameArena() {
   const isLobbyQueued = currentLobby?.state === 'queued';
 
   // Handle play again
-  const handlePlayAgain = () => {
+  const handlePlayAgain = async () => {
     const state = gameState ?? committedState;
     if (!state) {
       return;
@@ -615,6 +616,9 @@ export default function GameArena() {
       return;
     }
 
+    if (!isInLobby) {
+      await createLobby();
+    }
     queueForMatch(state.game_type);
   };
 

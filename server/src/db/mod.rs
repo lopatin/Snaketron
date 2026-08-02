@@ -7,14 +7,10 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
+use crate::completion::{CompletionEffect, CompletionRecordV1, EffectApplyResult};
 use crate::season::Season;
 use common::GameState;
 use models::*;
-
-/// New DynamoDB-backed runtime IDs live in a namespace that legacy Redis-only allocators
-/// cannot reach during a rolling deployment. Keeping the namespaces disjoint is what makes
-/// Redis loss safe while old nodes are still present.
-pub const DURABLE_GAME_ID_FLOOR: i32 = 1_000_000_000;
 
 /// How old a server heartbeat may be before that server no longer counts as
 /// alive. Shared by every consumer (region cache, load balancing, ws-url
@@ -124,8 +120,7 @@ pub trait Database: Send + Sync {
     // Game operations
     /// Allocate a globally unique game ID from durable storage.
     ///
-    /// Runtime and database-created games use this high durable namespace. Legacy nodes
-    /// remain in the low Redis namespace during rollout, preventing cross-version reuse.
+    /// Runtime and database-created games share this authoritative allocator.
     async fn allocate_game_id(&self) -> Result<i32>;
     async fn create_game(
         &self,
@@ -141,14 +136,21 @@ pub trait Database: Send + Sync {
     /// Persist the final authoritative state for a completed runtime game.
     ///
     /// Unlike `create_game`, this uses the ID already coordinated by the runtime's
-    /// durable/legacy-compatible allocator, so it can upsert a record that was not
-    /// previously created in DynamoDB.
+    /// durable allocator, so it can upsert a record that was not previously created
+    /// in DynamoDB.
     async fn upsert_completed_game(
         &self,
         game_id: i32,
         server_id: i32,
         game_state: &GameState,
     ) -> Result<()>;
+    /// Apply one immutable completion effect with its idempotency marker in
+    /// the same database transaction as the mutation.
+    async fn apply_completion_effect(
+        &self,
+        completion: &CompletionRecordV1,
+        effect: &CompletionEffect,
+    ) -> Result<EffectApplyResult>;
     async fn add_player_to_game(&self, game_id: i32, user_id: i32, team_id: i32) -> Result<()>;
     async fn get_game_players(&self, game_id: i32) -> Result<Vec<GamePlayer>>;
     async fn get_player_count(&self, game_id: i32) -> Result<i64>;

@@ -263,8 +263,9 @@ export const NewHome: React.FC = () => {
               </div>
             )}
             {shouldShowRegionError && !shouldShowRegionLoading && (
-              <div className="home-status-badge is-error">
-                <span>Failed to load regions</span>
+              <div className="home-status-badge is-warning">
+                <span className="home-status-spinner" aria-hidden="true" />
+                <span>Retrying region data…</span>
               </div>
             )}
             {shouldShowRegionReminder && (

@@ -1,8 +1,10 @@
 use ::common::{GameEvent, GameType};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::future::join_all;
+use redis::AsyncCommands;
+use server::redis_keys::RedisKeys;
 use server::ws_server::WSMessage;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 // IMPORTANT: These tests must be run with SNAKETRON_ENV=test
 // Example: SNAKETRON_ENV=test cargo test -p server --test matchmaking_integration_tests
@@ -52,6 +54,8 @@ async fn test_simple_two_player_match() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Clients authenticated. User IDs: {:?}", env.user_ids());
 
@@ -134,6 +138,92 @@ async fn test_simple_two_player_match() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_queue_for_match_requires_an_explicit_lobby() -> Result<()> {
+    async fn expect_explicit_lobby_denial(client: &mut TestClient) -> Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match client.receive_message().await? {
+                    WSMessage::AccessDenied { reason } => {
+                        assert_eq!(reason, "Join a lobby before queueing for matchmaking");
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    WSMessage::UserCountUpdate { .. } => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "Expected no-lobby matchmaking denial, got {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+        })
+        .await?
+    }
+
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("test_queue_for_match_requires_an_explicit_lobby").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+
+    let server_addr = env.ws_addr(0).expect("Server should exist");
+    let user_id = env.user_ids()[0];
+    let mut client = TestClient::connect(&server_addr).await?;
+    client.authenticate(user_id).await?;
+
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = ::common::QueueMode::Quickmatch;
+    client
+        .send_message(WSMessage::QueueForMatch {
+            game_type: game_type.clone(),
+            queue_mode: queue_mode.clone(),
+        })
+        .await?;
+    expect_explicit_lobby_denial(&mut client).await?;
+
+    client
+        .send_message(WSMessage::QueueForMatchMulti {
+            game_types: vec![game_type.clone()],
+            queue_mode: queue_mode.clone(),
+        })
+        .await?;
+    expect_explicit_lobby_denial(&mut client).await?;
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/1")?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let lobby_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("lobby:*")
+        .query_async(&mut redis_conn)
+        .await?;
+    let lobby_queue_identity_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("matchmaking:*:lobby:*:queue-identity")
+        .query_async(&mut redis_conn)
+        .await?;
+    let user_queue_identity_exists: bool = redis_conn
+        .exists(RedisKeys::matchmaking_user_queue_identity(user_id as u32))
+        .await?;
+    let queue_len: usize = redis_conn
+        .zcard(RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode))
+        .await?;
+
+    assert!(
+        lobby_keys.is_empty(),
+        "QueueForMatch must not create any implicit lobby state"
+    );
+    assert!(
+        lobby_queue_identity_keys.is_empty(),
+        "QueueForMatch must not create a lobby queue identity"
+    );
+    assert!(
+        !user_queue_identity_exists,
+        "QueueForMatch must not reserve the user without a lobby"
+    );
+    assert_eq!(queue_len, 0, "QueueForMatch must not add a queue member");
+
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_basic_matchmaking() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("test_basic_matchmaking").await?;
@@ -148,6 +238,8 @@ async fn test_basic_matchmaking() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Queue for match
     client1
@@ -190,6 +282,7 @@ async fn test_leave_queue() -> Result<()> {
 
     let mut client = TestClient::connect(&server_addr).await?;
     client.authenticate(env.user_ids()[0]).await?;
+    client.create_lobby().await?;
 
     // Queue and immediately leave
     client
@@ -231,6 +324,7 @@ async fn test_team_matchmaking() -> Result<()> {
     for i in 0..4 {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 
@@ -292,6 +386,7 @@ async fn test_concurrent_matchmaking() -> Result<()> {
         println!("Client {} connected", i);
 
         client.authenticate(user_id).await?;
+        client.create_lobby().await?;
         println!("Client {} authenticated", i);
 
         clients.push(client);
@@ -368,6 +463,8 @@ async fn test_disconnect_during_queue() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Both queue
     client1
@@ -431,6 +528,8 @@ async fn test_rejoin_active_game() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     // Get matched
     client1
@@ -452,12 +551,34 @@ async fn test_rejoin_active_game() -> Result<()> {
     let game_id2 = wait_for_match(&mut client2).await?;
     assert_eq!(game_id, game_id2, "Both players should be in same game");
 
+    let committed_mapping: Option<u32> = redis_conn
+        .get(RedisKeys::matchmaking_user_active_game(
+            env.user_ids()[0] as u32,
+        ))
+        .await?;
+    assert_eq!(committed_mapping, Some(game_id));
+
     // Client1 disconnects
     client1.disconnect().await?;
 
     // Client1 reconnects and rejoins
     let mut client1_new = TestClient::connect(&server_addr).await?;
     client1_new.authenticate(env.user_ids()[0]).await?;
+
+    // Matchmaking commit and its per-user mapping are durable even if the
+    // original Pub/Sub notification was missed while this socket was down.
+    // Authentication on any gateway must replay the routing notification.
+    let recovered_game_id = timeout(Duration::from_secs(10), async {
+        loop {
+            if let WSMessage::JoinGame(recovered_game_id) = client1_new.receive_message().await? {
+                return Ok::<u32, anyhow::Error>(recovered_game_id);
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for durable JoinGame recovery")??;
+    assert_eq!(recovered_game_id, game_id);
+
     client1_new
         .send_message(WSMessage::JoinGame(game_id))
         .await?;
@@ -480,29 +601,12 @@ async fn wait_for_match_with_timeout(
     client: &mut TestClient,
     timeout_duration: Duration,
 ) -> Result<u32> {
-    timeout(timeout_duration, async {
-        // First wait for JoinGame message
-        let game_id = loop {
-            match client.receive_message().await? {
-                WSMessage::JoinGame(id) => {
-                    break id;
-                }
-                _ => {
-                    // Ignore other messages
-                }
-            }
-        };
-
-        // Send JoinGame acknowledgment
-        client.send_message(WSMessage::JoinGame(game_id)).await?;
-
-        // Now wait for the snapshot
+    let deadline = Instant::now() + timeout_duration;
+    let game_id = timeout_at(deadline, async {
         loop {
             match client.receive_message().await? {
-                WSMessage::GameEvent(event) => {
-                    if matches!(event.event, GameEvent::Snapshot { .. }) {
-                        return Ok(event.game_id);
-                    }
+                WSMessage::JoinGame(id) => {
+                    return Ok::<u32, anyhow::Error>(id);
                 }
                 _ => {
                     // Ignore other messages
@@ -510,7 +614,40 @@ async fn wait_for_match_with_timeout(
             }
         }
     })
-    .await?
+    .await
+    .context("Timed out waiting for matchmaking to route the client")??;
+
+    timeout_at(deadline, async {
+        client.send_message(WSMessage::JoinGame(game_id)).await?;
+        loop {
+            match client.receive_message().await? {
+                WSMessage::GameEvent(event) => {
+                    if matches!(event.event, GameEvent::Snapshot { .. }) {
+                        return Ok(event.game_id);
+                    }
+                }
+                WSMessage::GameWarming {
+                    game_id: warming_game_id,
+                    retry_after_ms,
+                } if warming_game_id == game_id => {
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms.clamp(100, 2_000)))
+                        .await;
+                    client.send_message(WSMessage::JoinGame(game_id)).await?;
+                }
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    anyhow::bail!("Matched game {failed_game_id} could not load: {reason}");
+                }
+                _ => {
+                    // Ignore other messages
+                }
+            }
+        }
+    })
+    .await
+    .context("Timed out waiting for the matched game's authoritative snapshot")?
 }
 
 async fn wait_for_snapshot(client: &mut TestClient) -> Result<()> {
@@ -556,6 +693,8 @@ async fn test_same_mmr_range_matches_instantly() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Two lobbies with MMR 550 and 570 (both silver)");
 
@@ -630,6 +769,8 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Gold (900) - 300 MMR difference");
 
@@ -708,6 +849,8 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Diamond (1500) - 900 MMR difference");
 
@@ -786,6 +929,8 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
+    client1.create_lobby().await?;
+    client2.create_lobby().await?;
 
     println!("Testing: Bronze (300) vs Grandmaster (2000) - 1700 MMR difference");
 
@@ -873,6 +1018,7 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
     for i in 0..6 {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 
@@ -1030,6 +1176,7 @@ async fn test_matchmaking_load() -> Result<()> {
     for i in 0..USER_COUNT {
         let mut client = TestClient::connect(&server_addr).await?;
         client.authenticate(env.user_ids()[i]).await?;
+        client.create_lobby().await?;
         clients.push(client);
     }
 
