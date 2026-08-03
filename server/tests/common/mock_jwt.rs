@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use server::matchmaking_pool::MatchmakingPool;
 use server::ws_server::{JwtVerifier, UserToken};
 use std::collections::HashMap;
 
@@ -31,12 +32,23 @@ impl MockJwtVerifier {
     }
 
     pub fn with_token(mut self, token: &str, user_id: i32) -> Self {
+        self = self.with_token_in_pool(token, user_id, MatchmakingPool::Public);
+        self
+    }
+
+    pub fn with_token_in_pool(
+        mut self,
+        token: &str,
+        user_id: i32,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Self {
         self.expected_tokens.insert(
             token.to_string(),
             UserToken {
                 user_id,
                 username: format!("user_{}", user_id),
                 is_guest: false,
+                matchmaking_pool,
             },
         );
         self
@@ -61,6 +73,7 @@ impl JwtVerifier for MockJwtVerifier {
                     user_id,
                     username: format!("user_{}", user_id),
                     is_guest: false,
+                    matchmaking_pool: MatchmakingPool::Public,
                 })
             } else {
                 // If not a number, just use user_id 1
@@ -68,6 +81,7 @@ impl JwtVerifier for MockJwtVerifier {
                     user_id: 1,
                     username: "user_1".to_string(),
                     is_guest: false,
+                    matchmaking_pool: MatchmakingPool::Public,
                 })
             }
         } else if let Some(user_token) = self.expected_tokens.get(token) {

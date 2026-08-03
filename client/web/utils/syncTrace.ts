@@ -78,6 +78,15 @@ export function record(rec: TraceRecord): void {
   }
 }
 
+/**
+ * Return a defensive copy of the active game's trace for automated canaries.
+ * This deliberately exposes no authentication material; the trace contains
+ * only the same game synchronization records available to download manually.
+ */
+export function getTraceRecords(): TraceRecord[] {
+  return [...records];
+}
+
 /** Download the current trace as game_<id>_client.jsonl. */
 export function downloadTrace(): void {
   if (currentGameId === null || records.length === 0) {
@@ -144,10 +153,11 @@ declare global {
     snaketronDebug?: {
       downloadTrace: () => void;
       uploadTrace: () => Promise<void>;
+      getTraceRecords: () => TraceRecord[];
     };
   }
 }
 
 if (typeof window !== 'undefined') {
-  window.snaketronDebug = { downloadTrace, uploadTrace };
+  window.snaketronDebug = { downloadTrace, uploadTrace, getTraceRecords };
 }

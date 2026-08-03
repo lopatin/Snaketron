@@ -134,6 +134,11 @@ impl CompletionRecordV1 {
                 "completion must contain exactly one persist-game effect"
             ));
         }
+        if self.final_state.is_stress_test && self.effects.len() != 1 {
+            return Err(anyhow!(
+                "stress-test completion must not contain progression or ranking effects"
+            ));
+        }
 
         for effect in &self.effects {
             if let CompletionEffect::UpdateRanking {
@@ -167,6 +172,9 @@ impl CompletionRecordV1 {
                     "completed game awards XP to non-player user {user_id}"
                 ));
             }
+        }
+        if self.final_state.is_stress_test {
+            return Ok(());
         }
         for user_id in self.final_state.players.keys() {
             let xp_count = self
@@ -463,63 +471,65 @@ pub async fn materialize_completion(
     let mut player_ids: Vec<u32> = final_state.players.keys().copied().collect();
     player_ids.sort_unstable();
 
-    for user_id in &player_ids {
-        let amount = final_state.player_xp.get(user_id).copied().unwrap_or(0);
-        if amount == 0 {
-            continue;
+    if !final_state.is_stress_test {
+        for user_id in &player_ids {
+            let amount = final_state.player_xp.get(user_id).copied().unwrap_or(0);
+            if amount == 0 {
+                continue;
+            }
+            effects.push(CompletionEffect::AddXp {
+                id: format!("xp:{user_id}"),
+                user_id: *user_id,
+                username: username_for(&final_state, *user_id),
+                amount,
+            });
         }
-        effects.push(CompletionEffect::AddXp {
-            id: format!("xp:{user_id}"),
-            user_id: *user_id,
-            username: username_for(&final_state, *user_id),
-            amount,
-        });
-    }
 
-    let region = get_region();
-    let season = get_current_season();
-    if matches!(final_state.game_type, GameType::Solo) {
-        for user_id in player_ids {
-            let player = final_state
-                .players
-                .get(&user_id)
-                .expect("player id collected from same state");
-            effects.push(CompletionEffect::InsertHighScore {
-                id: format!("high_score:{user_id}"),
-                user_id,
-                username: username_for(&final_state, user_id),
-                score: final_state
-                    .scores
-                    .get(&player.snake_id)
-                    .copied()
-                    .unwrap_or(0),
-                game_type: final_state.game_type.clone(),
-                region: region.clone(),
-                season,
-            });
-        }
-    } else {
-        let mut specs = calculate_mmr_effect_specs(db, &final_state).await?;
-        specs.sort_by_key(|spec| spec.user_id);
-        for spec in specs {
-            let username = username_for(&final_state, spec.user_id);
-            effects.push(CompletionEffect::AddMmr {
-                id: format!("mmr:{}", spec.user_id),
-                user_id: spec.user_id,
-                username: username.clone(),
-                delta: spec.delta,
-                queue_mode: final_state.queue_mode.clone(),
-            });
-            effects.push(CompletionEffect::UpdateRanking {
-                id: format!("ranking:{}", spec.user_id),
-                user_id: spec.user_id,
-                username,
-                queue_mode: final_state.queue_mode.clone(),
-                game_type: final_state.game_type.clone(),
-                region: region.clone(),
-                season,
-                won: spec.won,
-            });
+        let region = get_region();
+        let season = get_current_season();
+        if matches!(final_state.game_type, GameType::Solo) {
+            for user_id in player_ids {
+                let player = final_state
+                    .players
+                    .get(&user_id)
+                    .expect("player id collected from same state");
+                effects.push(CompletionEffect::InsertHighScore {
+                    id: format!("high_score:{user_id}"),
+                    user_id,
+                    username: username_for(&final_state, user_id),
+                    score: final_state
+                        .scores
+                        .get(&player.snake_id)
+                        .copied()
+                        .unwrap_or(0),
+                    game_type: final_state.game_type.clone(),
+                    region: region.clone(),
+                    season,
+                });
+            }
+        } else {
+            let mut specs = calculate_mmr_effect_specs(db, &final_state).await?;
+            specs.sort_by_key(|spec| spec.user_id);
+            for spec in specs {
+                let username = username_for(&final_state, spec.user_id);
+                effects.push(CompletionEffect::AddMmr {
+                    id: format!("mmr:{}", spec.user_id),
+                    user_id: spec.user_id,
+                    username: username.clone(),
+                    delta: spec.delta,
+                    queue_mode: final_state.queue_mode.clone(),
+                });
+                effects.push(CompletionEffect::UpdateRanking {
+                    id: format!("ranking:{}", spec.user_id),
+                    user_id: spec.user_id,
+                    username,
+                    queue_mode: final_state.queue_mode.clone(),
+                    game_type: final_state.game_type.clone(),
+                    region: region.clone(),
+                    season,
+                    won: spec.won,
+                });
+            }
         }
     }
 
@@ -602,5 +612,51 @@ mod tests {
     fn rejects_non_terminal_state_without_touching_database() {
         let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
         assert!(!matches!(state.status, GameStatus::Complete { .. }));
+    }
+
+    #[test]
+    fn stress_completion_rejects_player_progression_effects() {
+        let mut state = GameState::new(
+            10,
+            10,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        state.is_stress_test = true;
+        state
+            .add_player(7, Some("stress".into()))
+            .expect("stress player should be added");
+        state.player_xp.insert(7, 1);
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+
+        let mut record = CompletionRecordV1 {
+            schema_version: COMPLETION_SCHEMA_VERSION,
+            game_id: 17,
+            partition_id: 7,
+            revision: Uuid::new_v4(),
+            ended_at_ms: 10,
+            server_id: 1,
+            final_state: state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+        assert!(record.validate().is_ok());
+
+        record.effects.push(CompletionEffect::AddXp {
+            id: "xp:7".into(),
+            user_id: 7,
+            username: "stress".into(),
+            amount: 1,
+        });
+        assert!(
+            record
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("stress-test completion")
+        );
     }
 }

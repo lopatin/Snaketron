@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod lobby_manager;
 pub mod matchmaking;
 pub mod matchmaking_manager;
+pub mod matchmaking_pool;
 pub mod mmr_persistence;
 mod otel_metrics;
 pub mod partition_assignment;

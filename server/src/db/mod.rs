@@ -53,7 +53,13 @@ pub trait Database: Send + Sync {
 
     // User operations
     async fn create_user(&self, username: &str, password_hash: &str, mmr: i32) -> Result<User>;
-    async fn create_guest_user(&self, nickname: &str, guest_token: &str, mmr: i32) -> Result<User>;
+    async fn create_guest_user(
+        &self,
+        nickname: &str,
+        guest_token: &str,
+        mmr: i32,
+        is_stress_test: bool,
+    ) -> Result<User>;
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;

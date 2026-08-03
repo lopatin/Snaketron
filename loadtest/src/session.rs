@@ -1,6 +1,6 @@
 //! One coordinated match group and its virtual-user sessions.
 
-use crate::config::{CommandProfile, Population};
+use crate::config::{CommandProfile, Population, StressTestConfig, StressTestCredential};
 use crate::report::{
     CommandResolutionSource, HardRecoveryObservation, SessionFailureRecord, SessionLifecycleRecord,
     SessionMetrics, SessionOutcome, SessionPhase, SessionRecord, SlowApplicationPingObservation,
@@ -60,9 +60,18 @@ const REQUIRED_SERVER_CAPABILITIES: [&str; 7] = [
     "command-outcome-barrier-v1",
     "terminal-command-cutoff-v1",
 ];
+const STRESS_MATCHMAKING_CAPABILITY: &str = "stress-matchmaking-pool-v1";
+const STRESS_TEST_KEY_HEADER: &str = "x-snaketron-stress-test-key";
 
-fn validate_required_server_capabilities(capabilities: &BTreeSet<String>) -> Result<()> {
-    let missing = REQUIRED_SERVER_CAPABILITIES
+fn validate_required_server_capabilities(
+    capabilities: &BTreeSet<String>,
+    require_stress_attestation: bool,
+) -> Result<()> {
+    let mut required = REQUIRED_SERVER_CAPABILITIES.to_vec();
+    if require_stress_attestation {
+        required.push(STRESS_MATCHMAKING_CAPABILITY);
+    }
+    let missing = required
         .iter()
         .copied()
         .filter(|capability| !capabilities.contains(*capability))
@@ -93,6 +102,7 @@ pub struct SessionSettings {
     pub untimed_play_duration: Duration,
     pub command_profile: CommandProfile,
     pub backend_hints: BackendHintRegistry,
+    pub stress_test: Option<StressTestConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +180,18 @@ struct GuestResponse {
 struct GuestUser {
     id: i32,
     username: String,
+    #[serde(rename = "matchmakingPool", default)]
+    matchmaking_pool: Option<String>,
+}
+
+fn validate_stress_guest_attestation(user: &GuestUser, required: bool) -> Result<()> {
+    if !required || user.matchmaking_pool.as_deref() == Some("stress") {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "stress guest authentication was not attested to the isolated matchmaking pool (received {:?})",
+        user.matchmaking_pool.as_deref()
+    ))
 }
 
 struct PendingCommand {
@@ -429,6 +451,7 @@ struct LiveSession {
     pending_application_pings: BTreeMap<i64, ApplicationPingSend>,
     terminal_games_observed: BTreeSet<u32>,
     server_capabilities: BTreeSet<String>,
+    require_stress_attestation: bool,
     activity_lease: SessionActivityLease,
 }
 
@@ -446,6 +469,9 @@ struct GameRuntime {
     pending_direction: Option<Direction>,
     outstanding_ping: Option<(i64, Instant)>,
     promotion_suppression_floor: Option<u64>,
+    observed_stream_gaps: u32,
+    observed_missed_messages: u64,
+    observed_hash_mismatches: u64,
 }
 
 #[derive(Default)]
@@ -453,6 +479,90 @@ struct PlayingWarmupState {
     waiting_for_snapshot: bool,
     waiting_for_outcome_barrier: bool,
     join_retry_at: Option<tokio::time::Instant>,
+}
+
+/// One client-side divergence episode. Commands remain paused until both the
+/// replacement snapshot and its paired command-outcome replay barrier arrive.
+/// This is deliberately independent from WebSocket recovery: RequestResync
+/// repairs an otherwise-live stream without changing the logical session.
+#[derive(Default)]
+struct DesyncRecoveryState {
+    started_at: Option<Instant>,
+    deadline: Option<tokio::time::Instant>,
+    waiting_for_snapshot: bool,
+    waiting_for_outcome_barrier: bool,
+}
+
+impl DesyncRecoveryState {
+    fn begin(&mut self, timeout: Duration) -> bool {
+        if self.is_active() {
+            return false;
+        }
+        self.started_at = Some(Instant::now());
+        self.deadline = Some(tokio::time::Instant::now() + timeout);
+        self.waiting_for_snapshot = true;
+        self.waiting_for_outcome_barrier = true;
+        true
+    }
+
+    fn is_active(&self) -> bool {
+        self.started_at.is_some()
+    }
+
+    fn deadline(&self, fallback: tokio::time::Instant) -> tokio::time::Instant {
+        self.deadline.unwrap_or(fallback)
+    }
+
+    fn observe_snapshot(&mut self, metrics: &mut SessionMetrics) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        self.waiting_for_snapshot = false;
+        self.finish_if_ready(metrics)
+    }
+
+    fn observe_outcome_barrier(&mut self, metrics: &mut SessionMetrics) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        self.waiting_for_outcome_barrier = false;
+        self.finish_if_ready(metrics)
+    }
+
+    fn finish_external_recovery(&mut self, metrics: &mut SessionMetrics) {
+        if self.is_active() {
+            self.waiting_for_snapshot = false;
+            self.waiting_for_outcome_barrier = false;
+            let _ = self.finish_if_ready(metrics);
+        }
+    }
+
+    fn fail_timeout(&mut self, metrics: &mut SessionMetrics) {
+        if self.is_active() {
+            metrics.unresolved_game_desyncs = metrics.unresolved_game_desyncs.saturating_add(1);
+            self.clear();
+        }
+    }
+
+    fn finish_if_ready(&mut self, metrics: &mut SessionMetrics) -> bool {
+        if self.waiting_for_snapshot || self.waiting_for_outcome_barrier {
+            return false;
+        }
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
+        metrics.game_desync_recovery_ms.push(elapsed_ms(started_at));
+        metrics.game_desync_recoveries = metrics.game_desync_recoveries.saturating_add(1);
+        self.clear();
+        true
+    }
+
+    fn clear(&mut self) {
+        self.started_at = None;
+        self.deadline = None;
+        self.waiting_for_snapshot = false;
+        self.waiting_for_outcome_barrier = false;
+    }
 }
 
 impl PlayingWarmupState {
@@ -522,7 +632,32 @@ impl GameRuntime {
             pending_direction: None,
             outstanding_ping: None,
             promotion_suppression_floor: None,
+            observed_stream_gaps: 0,
+            observed_missed_messages: 0,
+            observed_hash_mismatches: 0,
         })
+    }
+
+    /// Copy monotonically increasing sync-health counters out of the shared
+    /// client engine before a later snapshot replaces it.
+    fn observe_sync_health(&mut self, metrics: &mut SessionMetrics) -> bool {
+        let sync = self.engine.sync_status();
+        metrics.game_stream_gaps = metrics.game_stream_gaps.saturating_add(u64::from(
+            sync.stream_gap_count
+                .saturating_sub(self.observed_stream_gaps),
+        ));
+        metrics.game_stream_messages_missed = metrics.game_stream_messages_missed.saturating_add(
+            sync.missed_messages
+                .saturating_sub(self.observed_missed_messages),
+        );
+        metrics.game_hash_mismatches = metrics.game_hash_mismatches.saturating_add(
+            sync.total_mismatches
+                .saturating_sub(self.observed_hash_mismatches),
+        );
+        self.observed_stream_gaps = sync.stream_gap_count;
+        self.observed_missed_messages = sync.missed_messages;
+        self.observed_hash_mismatches = sync.total_mismatches;
+        sync.needs_resync
     }
 
     fn suppress_covered_promotion_event(&mut self, event: &GameEventMessage) -> bool {
@@ -569,6 +704,9 @@ impl GameRuntime {
         self.last_decision_tick = None;
         self.pending_direction = None;
         self.outstanding_ping = None;
+        self.observed_stream_gaps = 0;
+        self.observed_missed_messages = 0;
+        self.observed_hash_mismatches = 0;
         Ok(false)
     }
 }
@@ -1319,9 +1457,12 @@ async fn prepare_pre_game_candidate(
                 socket_generation,
             } => {
                 let capabilities: BTreeSet<_> = capabilities.into_iter().collect();
-                validate_required_server_capabilities(&capabilities)
-                    .context("planned handoff candidate is incompatible")
-                    .map_err(PreGameHandoffAttemptError::Candidate)?;
+                validate_required_server_capabilities(
+                    &capabilities,
+                    session.require_stress_attestation,
+                )
+                .context("planned handoff candidate is incompatible")
+                .map_err(PreGameHandoffAttemptError::Candidate)?;
                 if task_boot_id == departing_task_boot_id {
                     return Err(PreGameHandoffAttemptError::Candidate(anyhow!(
                         "replacement connection returned to departing task {task_boot_id}"
@@ -1822,6 +1963,10 @@ async fn prepare_session(
             &settings.api_origin,
             &username,
             settings.connect_timeout,
+            settings
+                .stress_test
+                .as_ref()
+                .map(|stress| &stress.credential),
         ) => result,
     };
     let guest = match guest_result {
@@ -1837,6 +1982,21 @@ async fn prepare_session(
     };
     record.metrics.guest_auth_ms = Some(elapsed_ms(auth_started));
     record.username = guest.user.username.clone();
+    if let Some(pool) = guest.user.matchmaking_pool.as_deref() {
+        record
+            .diagnostics
+            .insert("matchmaking_pool".to_owned(), pool.to_owned());
+    }
+    if let Err(error) =
+        validate_stress_guest_attestation(&guest.user, settings.stress_test.is_some())
+    {
+        fail_record(
+            &mut record,
+            SessionPhase::GuestAuthentication,
+            error.to_string(),
+        );
+        return Err(record);
+    }
 
     let user_id = match u32::try_from(guest.user.id) {
         Ok(user_id) => user_id,
@@ -1923,6 +2083,7 @@ async fn prepare_session(
         pending_application_pings: BTreeMap::new(),
         terminal_games_observed: BTreeSet::new(),
         server_capabilities: BTreeSet::new(),
+        require_stress_attestation: settings.stress_test.is_some(),
         activity_lease,
     };
 
@@ -2662,6 +2823,54 @@ async fn play_session(
     }
 }
 
+async fn enforce_game_sync_health(
+    session: &mut LiveSession,
+    runtime: &mut GameRuntime,
+    recovery: &mut DesyncRecoveryState,
+    settings: &SessionSettings,
+    game_id: u32,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    let needs_resync = runtime.observe_sync_health(&mut session.record.metrics);
+    let Some(stress) = settings.stress_test.as_ref() else {
+        return Ok(false);
+    };
+    if !needs_resync || !recovery.begin(stress.recovery_timeout) {
+        return Ok(false);
+    }
+
+    session.record.metrics.game_resync_requests = session
+        .record
+        .metrics
+        .game_resync_requests
+        .saturating_add(1);
+    session.record.record_lifecycle(
+        SessionLifecycleRecord::new(SessionPhase::GameSnapshot, unix_time_ms())
+            .with_message("shared client engine requested bounded desync recovery"),
+    );
+    // Keep the episode in `recovery`; clearing only debounces the shared
+    // engine while its authoritative replacement snapshot is in flight.
+    runtime.engine.clear_needs_resync();
+    if let Err(error) = session
+        .send_cancellable(WSMessage::RequestResync { game_id }, cancellation)
+        .await
+    {
+        let snapshot_complete = synchronize_game_runtime(
+            session,
+            runtime,
+            settings,
+            game_id,
+            cancellation,
+            error.context("sending client desync RequestResync"),
+            "desync request transport recovery snapshot synchronized",
+        )
+        .await?;
+        recovery.finish_external_recovery(&mut session.record.metrics);
+        return Ok(snapshot_complete);
+    }
+    Ok(false)
+}
+
 async fn play_session_inner(
     session: &mut LiveSession,
     settings: &SessionSettings,
@@ -2755,15 +2964,23 @@ async fn play_session_inner(
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut warmup = PlayingWarmupState::default();
+    let mut desync_recovery = DesyncRecoveryState::default();
     let mut terminal_state_observed = false;
 
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
+                desync_recovery.fail_timeout(&mut session.record.metrics);
                 session.record.cancel(unix_time_ms(), "load-test drain timeout reached");
                 return Ok(runtime.snapshot_user_ids.clone());
             }
             _ = tokio::time::sleep_until(game_deadline) => {
+                if desync_recovery.is_active() {
+                    desync_recovery.fail_timeout(&mut session.record.metrics);
+                    return Err(anyhow!(
+                        "game {game_id} ended before client desync recovery completed"
+                    ));
+                }
                 match game_deadline_disposition(
                     timeboxed_untimed_game,
                     terminal_state_observed,
@@ -2820,6 +3037,8 @@ async fn play_session_inner(
                             "write-error recovery snapshot synchronized",
                         )
                         .await?;
+                        desync_recovery
+                            .finish_external_recovery(&mut session.record.metrics);
                         if snapshot_complete {
                             session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                             session.record.complete(unix_time_ms());
@@ -2832,7 +3051,9 @@ async fn play_session_inner(
                 }
             }
             _ = runtime.ai_interval.tick(),
-                if !warmup.commands_paused() && !terminal_state_observed =>
+                if !warmup.commands_paused()
+                    && !desync_recovery.is_active()
+                    && !terminal_state_observed =>
             {
                 match drive_ai(
                     session,
@@ -2855,6 +3076,8 @@ async fn play_session_inner(
                             "command-write recovery snapshot synchronized",
                         )
                         .await?;
+                        desync_recovery
+                            .finish_external_recovery(&mut session.record.metrics);
                         if snapshot_complete {
                             session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                             session.record.complete(unix_time_ms());
@@ -2884,6 +3107,7 @@ async fn play_session_inner(
                         "GameWarming retry transport recovery snapshot synchronized",
                     )
                     .await?;
+                    desync_recovery.finish_external_recovery(&mut session.record.metrics);
                     if snapshot_complete {
                         session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                         session.record.complete(unix_time_ms());
@@ -2893,6 +3117,19 @@ async fn play_session_inner(
                     ping_interval = interval(PING_INTERVAL);
                     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 }
+            }
+            _ = tokio::time::sleep_until(desync_recovery.deadline(game_deadline)),
+                if desync_recovery.is_active() =>
+            {
+                desync_recovery.fail_timeout(&mut session.record.metrics);
+                let timeout = settings
+                    .stress_test
+                    .as_ref()
+                    .map(|stress| stress.recovery_timeout)
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "game {game_id} client desync recovery exceeded {timeout:?}"
+                ));
             }
             incoming = session.next_message() => {
                 let message = match incoming {
@@ -2911,6 +3148,8 @@ async fn play_session_inner(
                             "reconnect snapshot synchronized",
                         )
                         .await?;
+                        desync_recovery
+                            .finish_external_recovery(&mut session.record.metrics);
                         if snapshot_complete {
                             session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                             session.record.complete(unix_time_ms());
@@ -2950,7 +3189,10 @@ async fn play_session_inner(
                                 if snapshot_complete {
                                     terminal_state_observed = true;
                                 }
-                                if warmup.observe_snapshot() && !snapshot_complete {
+                                let warmup_ready = warmup.observe_snapshot();
+                                let desync_ready = desync_recovery
+                                    .observe_snapshot(&mut session.record.metrics);
+                                if (warmup_ready || desync_ready) && !snapshot_complete {
                                     session
                                         .resend_pending_commands(game_id)
                                         .await
@@ -2962,8 +3204,40 @@ async fn play_session_inner(
                             GameEvent::StatusUpdated { status: GameStatus::Complete { .. } } => {
                                 runtime.engine.process_server_event(&event)?;
                                 terminal_state_observed = true;
+                                if enforce_game_sync_health(
+                                    session,
+                                    &mut runtime,
+                                    &mut desync_recovery,
+                                    settings,
+                                    game_id,
+                                    cancellation,
+                                )
+                                .await?
+                                {
+                                    session.record.metrics.game_duration_ms =
+                                        Some(elapsed_ms(game_started));
+                                    session.record.complete(unix_time_ms());
+                                    return Ok(runtime.snapshot_user_ids.clone());
+                                }
                             }
-                            _ => runtime.engine.process_server_event(&event)?,
+                            _ => {
+                                runtime.engine.process_server_event(&event)?;
+                                if enforce_game_sync_health(
+                                    session,
+                                    &mut runtime,
+                                    &mut desync_recovery,
+                                    settings,
+                                    game_id,
+                                    cancellation,
+                                )
+                                .await?
+                                {
+                                    session.record.metrics.game_duration_ms =
+                                        Some(elapsed_ms(game_started));
+                                    session.record.complete(unix_time_ms());
+                                    return Ok(runtime.snapshot_user_ids.clone());
+                                }
+                            }
                         }
                     }
                     WSMessage::CommandOutcomesComplete {
@@ -2972,13 +3246,16 @@ async fn play_session_inner(
                     }
                         if completed == game_id =>
                     {
-                        if terminal_state_observed {
+                        let warmup_ready = warmup.observe_outcome_barrier();
+                        let desync_ready = desync_recovery
+                            .observe_outcome_barrier(&mut session.record.metrics);
+                        if terminal_state_observed && !desync_recovery.is_active() {
                             session.validate_terminal_outcome_barrier(game_id)?;
                             session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                             session.record.complete(unix_time_ms());
                             return Ok(runtime.snapshot_user_ids.clone());
                         }
-                        if warmup.observe_outcome_barrier() {
+                        if warmup_ready || desync_ready {
                             session
                                 .resend_pending_commands(game_id)
                                 .await
@@ -3028,6 +3305,8 @@ async fn play_session_inner(
                             )
                             .await?,
                         };
+                        desync_recovery
+                            .finish_external_recovery(&mut session.record.metrics);
                         if snapshot_complete {
                             session.record.metrics.game_duration_ms = Some(elapsed_ms(game_started));
                             session.record.complete(unix_time_ms());
@@ -3583,6 +3862,7 @@ fn process_active_handoff_message(
                 .metrics
                 .game_events_received
                 .saturating_add(1);
+            let mut terminal = false;
             match &event.event {
                 GameEvent::Snapshot { game_state } => {
                     let complete = runtime.apply_snapshot(
@@ -3596,16 +3876,26 @@ fn process_active_handoff_message(
                     // duplicate suppression across atomic promotion.
                     runtime.engine.process_server_event(&event)?;
                     if complete {
-                        return Ok(ActiveHandoffObservation::TerminalState);
+                        terminal = true;
                     }
                 }
                 GameEvent::StatusUpdated {
                     status: GameStatus::Complete { .. },
                 } => {
                     runtime.engine.process_server_event(&event)?;
-                    return Ok(ActiveHandoffObservation::TerminalState);
+                    terminal = true;
                 }
                 _ => runtime.engine.process_server_event(&event)?,
+            }
+            if runtime.observe_sync_health(&mut session.record.metrics)
+                && session.require_stress_attestation
+            {
+                return Err(anyhow!(
+                    "shared client engine detected desynchronization during planned handoff"
+                ));
+            }
+            if terminal {
+                return Ok(ActiveHandoffObservation::TerminalState);
             }
         }
         WSMessage::CommandOutcomesComplete {
@@ -3938,7 +4228,10 @@ async fn prepare_planned_candidate(
                             continue;
                         }
                         capabilities = candidate_capabilities.into_iter().collect();
-                        validate_required_server_capabilities(&capabilities)
+                        validate_required_server_capabilities(
+                            &capabilities,
+                            session.require_stress_attestation,
+                        )
                             .context("planned handoff candidate is incompatible")
                             .map_err(PlannedHandoffAttemptError::Candidate)?;
                         outcomes_ready = false;
@@ -4218,6 +4511,13 @@ async fn perform_planned_handoff(
                     for event in candidate.buffered_events {
                         if !runtime.suppress_covered_promotion_event(&event) {
                             runtime.engine.process_server_event(&event)?;
+                            if runtime.observe_sync_health(&mut session.record.metrics)
+                                && session.require_stress_attestation
+                            {
+                                return Err(anyhow!(
+                                    "shared client engine detected desynchronization in planned-handoff buffered events"
+                                ));
+                            }
                         }
                     }
                 }
@@ -5474,8 +5774,11 @@ impl LiveSession {
                         capabilities.join(","),
                     );
                     let capabilities = capabilities.into_iter().collect();
-                    validate_required_server_capabilities(&capabilities)
-                        .context("authenticated server is incompatible")?;
+                    validate_required_server_capabilities(
+                        &capabilities,
+                        self.require_stress_attestation,
+                    )
+                    .context("authenticated server is incompatible")?;
                     self.server_capabilities = capabilities;
                     return Ok(());
                 }
@@ -5548,17 +5851,18 @@ async fn create_guest(
     api_origin: &Url,
     nickname: &str,
     timeout: Duration,
+    stress_test_credential: Option<&StressTestCredential>,
 ) -> Result<GuestResponse> {
     let endpoint = api_origin.join("/api/auth/guest")?;
-    let response = tokio::time::timeout(
-        timeout,
-        client
-            .post(endpoint.clone())
-            .json(&serde_json::json!({ "nickname": nickname }))
-            .send(),
-    )
-    .await
-    .map_err(|_| anyhow!("guest authentication timed out after {timeout:?}"))??;
+    let mut request = client
+        .post(endpoint.clone())
+        .json(&serde_json::json!({ "nickname": nickname }));
+    if let Some(credential) = stress_test_credential {
+        request = request.header(STRESS_TEST_KEY_HEADER, credential.expose());
+    }
+    let response = tokio::time::timeout(timeout, request.send())
+        .await
+        .map_err(|_| anyhow!("guest authentication timed out after {timeout:?}"))??;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -5963,12 +6267,80 @@ mod tests {
             .iter()
             .map(|capability| (*capability).to_owned())
             .collect();
-        assert!(validate_required_server_capabilities(&capabilities).is_ok());
+        assert!(validate_required_server_capabilities(&capabilities, false).is_ok());
 
         let mut capabilities = capabilities;
         capabilities.remove("command-outcomes-v1");
-        let error = validate_required_server_capabilities(&capabilities).unwrap_err();
+        let error = validate_required_server_capabilities(&capabilities, false).unwrap_err();
         assert!(error.to_string().contains("command-outcomes-v1"));
+    }
+
+    #[test]
+    fn stress_mode_requires_matchmaking_pool_capability() {
+        let mut capabilities = REQUIRED_SERVER_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect::<BTreeSet<_>>();
+        let error = validate_required_server_capabilities(&capabilities, true).unwrap_err();
+        assert!(error.to_string().contains(STRESS_MATCHMAKING_CAPABILITY));
+
+        capabilities.insert(STRESS_MATCHMAKING_CAPABILITY.to_owned());
+        assert!(validate_required_server_capabilities(&capabilities, true).is_ok());
+    }
+
+    #[test]
+    fn stress_guest_requires_explicit_pool_attestation() {
+        let stress = GuestUser {
+            id: 7,
+            username: "stress-user".to_owned(),
+            matchmaking_pool: Some("stress".to_owned()),
+        };
+        assert!(validate_stress_guest_attestation(&stress, true).is_ok());
+
+        for matchmaking_pool in [None, Some("public".to_owned())] {
+            let user = GuestUser {
+                id: 8,
+                username: "unsafe-user".to_owned(),
+                matchmaking_pool,
+            };
+            assert!(validate_stress_guest_attestation(&user, true).is_err());
+            assert!(validate_stress_guest_attestation(&user, false).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn stress_guest_credential_is_sent_only_as_the_admission_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let credential: StressTestCredential = "ab".repeat(32).parse().unwrap();
+        let expected_header = format!("{STRESS_TEST_KEY_HEADER}: {}", credential.expose());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let received = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..received]).to_ascii_lowercase();
+            assert!(request.contains(&expected_header));
+            let body = r#"{"token":"token","user":{"id":7,"username":"stress-user","matchmakingPool":"stress"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let guest = create_guest(
+            &Client::new(),
+            &Url::parse(&format!("http://{address}/")).unwrap(),
+            "stress-user",
+            Duration::from_secs(1),
+            Some(&credential),
+        )
+        .await
+        .unwrap();
+        assert_eq!(guest.user.matchmaking_pool.as_deref(), Some("stress"));
+        server.await.unwrap();
     }
 
     fn duel_snapshot(user_ids: &[u32]) -> GameState {
@@ -5986,6 +6358,90 @@ mod tests {
                 .expect("test player should fit in duel snapshot");
         }
         game_state
+    }
+
+    fn tick_hash_event(
+        game_id: u32,
+        user_id: u32,
+        tick: u32,
+        stream_seq: u64,
+        hash: u64,
+    ) -> GameEventMessage {
+        GameEventMessage {
+            game_id,
+            tick,
+            sequence: 0,
+            stream_seq,
+            user_id: Some(user_id),
+            event: GameEvent::TickHash {
+                hash,
+                server_ts_ms: Utc::now().timestamp_millis(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_engine_stream_gap_is_reported_as_a_desync() {
+        let snapshot = duel_snapshot(&[7, 8]);
+        let tick = snapshot.current_tick();
+        let hash = snapshot.sync_hash();
+        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut metrics = SessionMetrics::default();
+
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 10, hash))
+            .unwrap();
+        assert!(!runtime.observe_sync_health(&mut metrics));
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 12, hash))
+            .unwrap();
+
+        assert!(runtime.observe_sync_health(&mut metrics));
+        assert_eq!(metrics.game_stream_gaps, 1);
+        assert_eq!(metrics.game_stream_messages_missed, 1);
+        assert_eq!(metrics.game_hash_mismatches, 0);
+    }
+
+    #[tokio::test]
+    async fn two_hash_mismatches_require_resync_but_one_does_not() {
+        let snapshot = duel_snapshot(&[7, 8]);
+        let tick = snapshot.current_tick();
+        let wrong_hash = snapshot.sync_hash() ^ 1;
+        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut metrics = SessionMetrics::default();
+
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 1, wrong_hash))
+            .unwrap();
+        assert!(!runtime.observe_sync_health(&mut metrics));
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 2, wrong_hash))
+            .unwrap();
+
+        assert!(runtime.observe_sync_health(&mut metrics));
+        assert_eq!(metrics.game_hash_mismatches, 2);
+    }
+
+    #[test]
+    fn desync_recovery_requires_snapshot_and_outcome_barrier() {
+        let mut recovery = DesyncRecoveryState::default();
+        let mut metrics = SessionMetrics::default();
+        assert!(recovery.begin(Duration::from_secs(10)));
+        assert!(!recovery.begin(Duration::from_secs(10)));
+        assert!(!recovery.observe_outcome_barrier(&mut metrics));
+        assert!(recovery.is_active());
+        assert!(recovery.observe_snapshot(&mut metrics));
+        assert!(!recovery.is_active());
+        assert_eq!(metrics.game_desync_recoveries, 1);
+        assert_eq!(metrics.game_desync_recovery_ms.len(), 1);
+
+        assert!(recovery.begin(Duration::from_millis(1)));
+        recovery.fail_timeout(&mut metrics);
+        assert_eq!(metrics.unresolved_game_desyncs, 1);
     }
 
     #[test]
@@ -6873,6 +7329,7 @@ mod tests {
             pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(1, activity_sender),
         };
 
@@ -6995,6 +7452,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::Realistic,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         }
     }
 
@@ -7033,8 +7491,86 @@ mod tests {
                 .iter()
                 .map(|capability| (*capability).to_owned())
                 .collect(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         }
+    }
+
+    #[tokio::test]
+    async fn strict_sync_health_sends_one_request_and_pauses_for_snapshot() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url =
+            Url::parse(&format!("ws://{}/ws", listener.local_addr().unwrap())).unwrap();
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        });
+        let (raw, _) = connect_async(websocket_url.as_str()).await.unwrap();
+        let mut server_socket = accepted.await.unwrap();
+        let mut settings = planned_game_test_settings(websocket_url);
+        settings.stress_test = Some(StressTestConfig {
+            credential: "ab".repeat(32).parse().unwrap(),
+            recovery_timeout: Duration::from_secs(10),
+        });
+        let mut session = planned_game_test_session(Socket::new(raw), &settings, "matched");
+        session.require_stress_attestation = true;
+
+        let snapshot = duel_snapshot(&[7, 8]);
+        let tick = snapshot.current_tick();
+        let hash = snapshot.sync_hash();
+        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 10, hash))
+            .unwrap();
+        runtime
+            .engine
+            .process_server_event(&tick_hash_event(42, 7, tick, 12, hash))
+            .unwrap();
+
+        let mut recovery = DesyncRecoveryState::default();
+        let cancellation = CancellationToken::new();
+        assert!(
+            !enforce_game_sync_health(
+                &mut session,
+                &mut runtime,
+                &mut recovery,
+                &settings,
+                42,
+                &cancellation,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(recovery.is_active());
+        assert_eq!(session.record.metrics.game_resync_requests, 1);
+
+        let request = server_socket.next().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<WSMessage>(request.to_text().unwrap()).unwrap(),
+            WSMessage::RequestResync { game_id: 42 }
+        ));
+
+        // Re-observing the same engine flag while the snapshot is in flight
+        // must not emit another request.
+        runtime.engine.clear_needs_resync();
+        assert!(
+            !enforce_game_sync_health(
+                &mut session,
+                &mut runtime,
+                &mut recovery,
+                &settings,
+                42,
+                &cancellation,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(session.record.metrics.game_resync_requests, 1);
+        session.socket.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -7452,6 +7988,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::Realistic,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         };
         let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
         let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
@@ -7480,6 +8017,7 @@ mod tests {
             pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
         let (group_game_id, _) = watch::channel(None);
@@ -7635,6 +8173,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::Realistic,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         };
         let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
         let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
@@ -7663,6 +8202,7 @@ mod tests {
             pending_application_pings: BTreeMap::new(),
             terminal_games_observed: BTreeSet::new(),
             server_capabilities: BTreeSet::new(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
 
@@ -8069,6 +8609,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::Realistic,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         };
         let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
         let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
@@ -8100,6 +8641,7 @@ mod tests {
                 .iter()
                 .map(|capability| (*capability).to_owned())
                 .collect(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
 
@@ -8561,6 +9103,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::EveryTick,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         };
         let (activity_sender, _activity_receiver) = mpsc::unbounded_channel();
         let mut record = SessionRecord::new("session-7", "test-user", 0, "group", 0);
@@ -8617,6 +9160,7 @@ mod tests {
                 .iter()
                 .map(|capability| (*capability).to_owned())
                 .collect(),
+            require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
         let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
@@ -8935,6 +9479,7 @@ mod tests {
             untimed_play_duration: Duration::from_secs(1),
             command_profile: CommandProfile::Realistic,
             backend_hints: BackendHintRegistry::default(),
+            stress_test: None,
         };
         let (activity_sender, mut activity_receiver) = mpsc::unbounded_channel();
         let mut session = prepare_session(

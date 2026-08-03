@@ -1371,6 +1371,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             status: MatchStatus::Active,
             partition_id: partition,
             created_at: now - 2_000,
+            matchmaking_pool: server::matchmaking_pool::MatchmakingPool::Public,
         };
         let active_matches_key = RedisKeys::matchmaking_active_matches();
         let user_player_key = RedisKeys::matchmaking_user_active_game(101);

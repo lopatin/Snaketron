@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{Extension, Json, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use bcrypt::{DEFAULT_COST, hash, verify};
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::db::Database;
+use crate::matchmaking_pool::MatchmakingPool;
 
 use super::jwt::JwtManager;
 use super::middleware::AuthUser;
@@ -76,7 +77,11 @@ pub struct GuestUserInfo {
     pub mmr: i32,
     #[serde(rename = "isGuest")]
     pub is_guest: bool,
+    #[serde(rename = "matchmakingPool")]
+    pub matchmaking_pool: MatchmakingPool,
 }
+
+pub const STRESS_TEST_KEY_HEADER: &str = "x-snaketron-stress-test-key";
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
@@ -91,6 +96,9 @@ impl IntoResponse for AppError {
             }
             msg if msg.contains("Invalid username or password") => {
                 (StatusCode::UNAUTHORIZED, "Invalid username or password")
+            }
+            msg if msg.contains("Invalid stress test key") => {
+                (StatusCode::UNAUTHORIZED, "Invalid stress test key")
             }
             msg if msg.contains("User not found") => (StatusCode::NOT_FOUND, "User not found"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
@@ -317,6 +325,7 @@ pub async fn check_username(
 
 pub async fn create_guest(
     State(state): State<AuthState>,
+    headers: HeaderMap,
     Json(req): Json<CreateGuestRequest>,
 ) -> Result<Response, AppError> {
     // Validate nickname (same rules as username but no uniqueness check)
@@ -325,13 +334,34 @@ pub async fn create_guest(
         return Err(anyhow::anyhow!("Invalid nickname: {}", nickname_errors.join(", ")).into());
     }
 
+    // The pool can only be elevated by the environment-scoped derived key.
+    // A present but invalid header fails closed and never creates a public
+    // fallback user that could enter real matchmaking.
+    let matchmaking_pool = match headers.get(STRESS_TEST_KEY_HEADER) {
+        None => MatchmakingPool::Public,
+        Some(value) => {
+            let candidate = value
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("Invalid stress test key"))?;
+            if !state.jwt_manager.verify_stress_test_key(candidate) {
+                return Err(anyhow::anyhow!("Invalid stress test key").into());
+            }
+            MatchmakingPool::Stress
+        }
+    };
+
     // Generate a unique guest token (UUID-based)
     let guest_token = uuid::Uuid::new_v4().to_string();
 
     // Create guest user (starting MMR of 1000)
     let user = state
         .db
-        .create_guest_user(&req.nickname, &guest_token, 1000)
+        .create_guest_user(
+            &req.nickname,
+            &guest_token,
+            1000,
+            matchmaking_pool == MatchmakingPool::Stress,
+        )
         .await?;
 
     let user_info = GuestUserInfo {
@@ -339,17 +369,20 @@ pub async fn create_guest(
         username: user.username.clone(),
         mmr: user.mmr,
         is_guest: true,
+        matchmaking_pool,
     };
 
     // Generate JWT token (includes guest flag)
-    let token =
-        state
-            .jwt_manager
-            .generate_token_with_guest(user_info.id, &user_info.username, true)?;
+    let token = state.jwt_manager.generate_token_with_guest_and_pool(
+        user_info.id,
+        &user_info.username,
+        true,
+        matchmaking_pool,
+    )?;
 
     info!(
-        "Guest user created successfully: {} (id: {})",
-        user_info.username, user_info.id
+        "Guest user created successfully: {} (id: {}, pool: {})",
+        user_info.username, user_info.id, matchmaking_pool
     );
 
     // Build response with cache-control headers

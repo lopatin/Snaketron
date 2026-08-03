@@ -1426,13 +1426,18 @@ async fn main() -> Result<()> {
             let now_ms = Utc::now().timestamp_millis();
             let mut redis = connection;
             let live_members = read_live_members(&mut redis, &namespace, now_ms).await?;
-            let quickmatch_two_v_two_queued_lobbies: u64 = redis
-                .zcard(RedisKeys::matchmaking_lobby_queue(
-                    &GameType::TeamMatch { per_team: 2 },
-                    &QueueMode::Quickmatch,
-                ))
-                .await
-                .context("failed to inspect the quickmatch 2v2 queue")?;
+            let mut quickmatch_two_v_two_queued_lobbies = 0_u64;
+            for matchmaking_pool in server::matchmaking_pool::MatchmakingPool::ALL {
+                let pool_queue_count: u64 = redis
+                    .zcard(RedisKeys::matchmaking_lobby_queue_for_pool(
+                        &GameType::TeamMatch { per_team: 2 },
+                        &QueueMode::Quickmatch,
+                        matchmaking_pool,
+                    ))
+                    .await
+                    .context("failed to inspect a quickmatch 2v2 pool queue")?;
+                quickmatch_two_v_two_queued_lobbies += pool_queue_count;
+            }
             let partitions = partition.map_or_else(
                 || (0..PARTITION_COUNT).collect(),
                 |partition| vec![partition],

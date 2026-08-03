@@ -21,6 +21,7 @@ pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "command-outcomes-v1",
     "command-outcome-barrier-v1",
     "terminal-command-cutoff-v1",
+    "stress-matchmaking-pool-v1",
 ];
 
 /// A planned task-removal notification. The absolute deadline avoids clients

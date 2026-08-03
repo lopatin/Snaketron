@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 13;
+pub const REPORT_SCHEMA_VERSION: u32 = 14;
 const MAX_AGGREGATE_SLOW_COMMAND_RESOLUTIONS: usize = 256;
 const MAX_AGGREGATE_SLOW_APPLICATION_PINGS: usize = 256;
 
@@ -456,6 +456,31 @@ pub struct SessionMetrics {
     /// gap derived from the candidate-ready and old-socket probe timestamps.
     #[serde(default)]
     pub usable_session_gap_ms: Vec<u64>,
+    /// Distinct transport sequence gaps detected by the shared client engine.
+    #[serde(default)]
+    pub game_stream_gaps: u64,
+    /// Number of game stream messages known to have been skipped by those gaps.
+    #[serde(default)]
+    pub game_stream_messages_missed: u64,
+    /// Fingerprint probes that did not match the client's committed state.
+    #[serde(default)]
+    pub game_hash_mismatches: u64,
+    /// Client-initiated snapshot resync requests caused by a gap or sustained
+    /// fingerprint divergence.
+    #[serde(default)]
+    pub game_resync_requests: u64,
+    /// Resync requests that reached a fresh snapshot and its paired command
+    /// outcome barrier before the configured deadline.
+    #[serde(default)]
+    pub game_desync_recoveries: u64,
+    /// Desync episodes still outstanding when a session stopped. Strict stress
+    /// mode rejects every such episode.
+    #[serde(default)]
+    pub unresolved_game_desyncs: u64,
+    /// Detection through a fresh authoritative snapshot plus paired command
+    /// outcome barrier.
+    #[serde(default)]
+    pub game_desync_recovery_ms: Vec<u64>,
     #[serde(default)]
     pub planned_handoff_duration_ms: Vec<u64>,
     /// Observed interval in which the candidate was game-ready before the old
@@ -819,6 +844,20 @@ pub struct AggregateMetrics {
     pub rejoin_lobby_ms: DistributionSummary,
     pub rejoin_snapshot_ms: DistributionSummary,
     pub usable_session_gap_ms: DistributionSummary,
+    #[serde(default)]
+    pub game_stream_gaps: u64,
+    #[serde(default)]
+    pub game_stream_messages_missed: u64,
+    #[serde(default)]
+    pub game_hash_mismatches: u64,
+    #[serde(default)]
+    pub game_resync_requests: u64,
+    #[serde(default)]
+    pub game_desync_recoveries: u64,
+    #[serde(default)]
+    pub unresolved_game_desyncs: u64,
+    #[serde(default)]
+    pub game_desync_recovery_ms: DistributionSummary,
     pub planned_handoff_duration_ms: DistributionSummary,
     #[serde(default)]
     pub planned_handoff_active_overlap_ms: DistributionSummary,
@@ -991,6 +1030,13 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
     let mut rejoin_lobby = Vec::new();
     let mut rejoin_snapshot = Vec::new();
     let mut usable_session_gap = Vec::new();
+    let mut game_stream_gaps = 0u64;
+    let mut game_stream_messages_missed = 0u64;
+    let mut game_hash_mismatches = 0u64;
+    let mut game_resync_requests = 0u64;
+    let mut game_desync_recoveries = 0u64;
+    let mut unresolved_game_desyncs = 0u64;
+    let mut game_desync_recovery = Vec::new();
     let mut planned_handoff_duration = Vec::new();
     let mut planned_handoff_active_overlap = Vec::new();
     let mut planned_handoffs = PlannedHandoffTotals::default();
@@ -1035,6 +1081,24 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             rejoin_lobby.extend(session.metrics.rejoin_lobby_ms.iter().copied());
             rejoin_snapshot.extend(session.metrics.rejoin_snapshot_ms.iter().copied());
             usable_session_gap.extend(session.metrics.usable_session_gap_ms.iter().copied());
+            game_stream_gaps = game_stream_gaps.saturating_add(session.metrics.game_stream_gaps);
+            game_stream_messages_missed = game_stream_messages_missed
+                .saturating_add(session.metrics.game_stream_messages_missed);
+            game_hash_mismatches =
+                game_hash_mismatches.saturating_add(session.metrics.game_hash_mismatches);
+            game_resync_requests =
+                game_resync_requests.saturating_add(session.metrics.game_resync_requests);
+            game_desync_recoveries =
+                game_desync_recoveries.saturating_add(session.metrics.game_desync_recoveries);
+            unresolved_game_desyncs = unresolved_game_desyncs.saturating_add(
+                session.metrics.unresolved_game_desyncs.max(
+                    session
+                        .metrics
+                        .game_resync_requests
+                        .saturating_sub(session.metrics.game_desync_recoveries),
+                ),
+            );
+            game_desync_recovery.extend(session.metrics.game_desync_recovery_ms.iter().copied());
             planned_handoff_duration
                 .extend(session.metrics.planned_handoff_duration_ms.iter().copied());
             planned_handoff_active_overlap.extend(
@@ -1283,6 +1347,13 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             rejoin_lobby_ms: DistributionSummary::from_samples(&rejoin_lobby),
             rejoin_snapshot_ms: DistributionSummary::from_samples(&rejoin_snapshot),
             usable_session_gap_ms: DistributionSummary::from_samples(&usable_session_gap),
+            game_stream_gaps,
+            game_stream_messages_missed,
+            game_hash_mismatches,
+            game_resync_requests,
+            game_desync_recoveries,
+            unresolved_game_desyncs,
+            game_desync_recovery_ms: DistributionSummary::from_samples(&game_desync_recovery),
             planned_handoff_duration_ms: DistributionSummary::from_samples(
                 &planned_handoff_duration,
             ),
@@ -1711,6 +1782,11 @@ fn render_html(report: &AggregateReport) -> String {
     );
     append_distribution_row(
         &mut html,
+        "Client desync recovery",
+        &report.metrics.game_desync_recovery_ms,
+    );
+    append_distribution_row(
+        &mut html,
         "Planned handoff duration",
         &report.metrics.planned_handoff_duration_ms,
     );
@@ -1754,6 +1830,12 @@ fn render_html(report: &AggregateReport) -> String {
          <div class=\"card\"><span class=\"label\">Commands sent</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Disconnects</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Reconnects</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Stream gaps</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Missed stream messages</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Hash mismatches</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Resync requests</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Desync recoveries</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Unresolved desyncs</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Reader dispatch observations</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Maximum reader dispatch lag</span><b>{} ms</b></div>\
          <div class=\"card\"><span class=\"label\">Reader dispatch lag &gt; 1 s</span><b>{}</b></div></div>",
@@ -1763,6 +1845,12 @@ fn render_html(report: &AggregateReport) -> String {
         traffic.commands_sent,
         traffic.disconnects,
         traffic.reconnects,
+        report.metrics.game_stream_gaps,
+        report.metrics.game_stream_messages_missed,
+        report.metrics.game_hash_mismatches,
+        report.metrics.game_resync_requests,
+        report.metrics.game_desync_recoveries,
+        report.metrics.unresolved_game_desyncs,
         dispatch_lag.observations,
         dispatch_lag.maximum_ms,
         dispatch_lag.over_one_second,
@@ -2042,6 +2130,12 @@ mod tests {
         first.metrics.rejoin_lobby_ms = vec![31];
         first.metrics.rejoin_snapshot_ms = vec![32];
         first.metrics.usable_session_gap_ms = vec![33];
+        first.metrics.game_stream_gaps = 1;
+        first.metrics.game_stream_messages_missed = 2;
+        first.metrics.game_hash_mismatches = 3;
+        first.metrics.game_resync_requests = 1;
+        first.metrics.game_desync_recoveries = 1;
+        first.metrics.game_desync_recovery_ms = vec![36];
         first.metrics.planned_handoff_duration_ms = vec![34];
         first.metrics.planned_handoff_active_overlap_ms = vec![35];
         first.metrics.planned_handoff_attempts = 1;
@@ -2222,7 +2316,7 @@ mod tests {
         };
 
         let report = aggregate_report(&run);
-        assert_eq!(report.schema_version, 13);
+        assert_eq!(report.schema_version, 14);
         assert_eq!(report.sessions[0].started_at_unix_ms, 0);
         assert_eq!(report.sessions[0].finished_at_unix_ms, Some(100));
         assert_eq!(report.sessions[0].initial_websocket_auth_ms, Some(7));
@@ -2252,6 +2346,13 @@ mod tests {
         );
         assert_eq!(report.sessions[1].initial_websocket_auth_ms, None);
         assert_eq!(report.session_counts.total, 3);
+        assert_eq!(report.metrics.game_stream_gaps, 1);
+        assert_eq!(report.metrics.game_stream_messages_missed, 2);
+        assert_eq!(report.metrics.game_hash_mismatches, 3);
+        assert_eq!(report.metrics.game_resync_requests, 1);
+        assert_eq!(report.metrics.game_desync_recoveries, 1);
+        assert_eq!(report.metrics.unresolved_game_desyncs, 0);
+        assert_eq!(report.metrics.game_desync_recovery_ms.max_ms, Some(36));
         assert_eq!(report.session_counts.completed, 2);
         assert_eq!(report.session_counts.failed, 1);
         assert_eq!(report.session_counts.peak_token_sent_concurrency, 2);

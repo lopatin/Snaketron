@@ -2,6 +2,8 @@ use common::GameType;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::matchmaking_pool::MatchmakingPool;
+
 pub struct RedisKeys;
 
 impl RedisKeys {
@@ -128,17 +130,37 @@ impl RedisKeys {
 
     /// Lobby queue for a specific game type and queue mode
     pub fn matchmaking_lobby_queue(game_type: &GameType, queue_mode: &common::QueueMode) -> String {
+        Self::matchmaking_lobby_queue_for_pool(game_type, queue_mode, MatchmakingPool::Public)
+    }
+
+    /// Lobby queue physically partitioned by the server-attested pool.
+    ///
+    /// The public key intentionally retains its historical shape so rolling
+    /// deployments and legacy queued entries remain in the public boundary.
+    pub fn matchmaking_lobby_queue_for_pool(
+        game_type: &GameType,
+        queue_mode: &common::QueueMode,
+        matchmaking_pool: MatchmakingPool,
+    ) -> String {
         let hash = Self::hash_game_type(game_type);
         let mode_str = match queue_mode {
             common::QueueMode::Quickmatch => "quick",
             common::QueueMode::Competitive => "comp",
         };
-        format!(
-            "matchmaking:{{{}}}:lobby:queue:{}:{}",
-            Self::MATCHMAKING_TAG,
-            mode_str,
-            hash
-        )
+        match matchmaking_pool {
+            MatchmakingPool::Public => format!(
+                "matchmaking:{{{}}}:lobby:queue:{}:{}",
+                Self::MATCHMAKING_TAG,
+                mode_str,
+                hash
+            ),
+            MatchmakingPool::Stress => format!(
+                "matchmaking:{{{}}}:lobby:queue:stress:{}:{}",
+                Self::MATCHMAKING_TAG,
+                mode_str,
+                hash
+            ),
+        }
     }
 
     /// Lobby MMR index for a game type and queue mode
@@ -146,17 +168,33 @@ impl RedisKeys {
         game_type: &GameType,
         queue_mode: &common::QueueMode,
     ) -> String {
+        Self::matchmaking_lobby_mmr_index_for_pool(game_type, queue_mode, MatchmakingPool::Public)
+    }
+
+    pub fn matchmaking_lobby_mmr_index_for_pool(
+        game_type: &GameType,
+        queue_mode: &common::QueueMode,
+        matchmaking_pool: MatchmakingPool,
+    ) -> String {
         let hash = Self::hash_game_type(game_type);
         let mode_str = match queue_mode {
             common::QueueMode::Quickmatch => "quick",
             common::QueueMode::Competitive => "comp",
         };
-        format!(
-            "matchmaking:{{{}}}:lobby:mmr:{}:{}",
-            Self::MATCHMAKING_TAG,
-            mode_str,
-            hash
-        )
+        match matchmaking_pool {
+            MatchmakingPool::Public => format!(
+                "matchmaking:{{{}}}:lobby:mmr:{}:{}",
+                Self::MATCHMAKING_TAG,
+                mode_str,
+                hash
+            ),
+            MatchmakingPool::Stress => format!(
+                "matchmaking:{{{}}}:lobby:mmr:stress:{}:{}",
+                Self::MATCHMAKING_TAG,
+                mode_str,
+                hash
+            ),
+        }
     }
 
     /// Lobby notification channel for all members of a lobby
@@ -416,6 +454,21 @@ mod tests {
         let queue_key =
             RedisKeys::matchmaking_lobby_queue(&game_type, &common::QueueMode::Quickmatch);
         assert!(queue_key.contains("{snaketron:mm}"));
+        let stress_queue_key = RedisKeys::matchmaking_lobby_queue_for_pool(
+            &game_type,
+            &common::QueueMode::Quickmatch,
+            MatchmakingPool::Stress,
+        );
+        assert_ne!(queue_key, stress_queue_key);
+        assert_eq!(hash_tag(&queue_key), hash_tag(&stress_queue_key));
+        assert_eq!(
+            queue_key,
+            RedisKeys::matchmaking_lobby_queue_for_pool(
+                &game_type,
+                &common::QueueMode::Quickmatch,
+                MatchmakingPool::Public,
+            )
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, PushInfo};
 use server::{
+    api::jwt::JwtManager,
     game_bus::GameBus,
     game_executor::StreamEvent,
     lobby_manager::{Lobby, LobbyMember, LobbyPreferences},
@@ -11,11 +12,13 @@ use server::{
         ActiveMatch, GameCreatedOutboxRecord, MatchCommitOutcome, MatchStatus, MatchmakingManager,
         QueuedPlayer,
     },
+    matchmaking_pool::MatchmakingPool,
     redis_keys::RedisKeys,
     redis_utils::create_connection_manager,
     ws_server::WSMessage,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::{
     sync::broadcast,
     time::{Duration, timeout},
@@ -169,6 +172,228 @@ async fn repeated_and_concurrent_lobby_admission_keeps_one_queue_identity() -> R
     );
     assert_eq!(lobby_state("REPEAT1").await?.as_deref(), Some("queued"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn matchmaking_pools_use_separate_queues_and_revalidate_metadata() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["PUBLIC1", "STRESS1"]).await?;
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let _: usize = redis
+        .hset(
+            RedisKeys::lobby_metadata("STRESS1"),
+            "matchmakingPool",
+            "stress",
+        )
+        .await?;
+
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    let mut manager = create_test_matchmaking_manager().await?;
+    manager
+        .add_lobby_to_queue(
+            "PUBLIC1",
+            vec![make_lobby_member(101, "public-player")],
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            101,
+        )
+        .await?;
+
+    let wrong_pool = manager
+        .add_lobby_to_queue(
+            "STRESS1",
+            vec![make_lobby_member(102, "stress-player")],
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            102,
+        )
+        .await
+        .expect_err("stress lobby must not enter the public queue");
+    assert!(wrong_pool.to_string().contains("lobby-pool-mismatch"));
+
+    manager
+        .add_lobby_to_queue_in_pool(
+            "STRESS1",
+            vec![make_lobby_member(102, "stress-player")],
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            102,
+            MatchmakingPool::Stress,
+        )
+        .await?;
+
+    let public_lobbies = manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+    let stress_lobbies = manager
+        .get_queued_lobbies_in_pool(&game_type, &queue_mode, MatchmakingPool::Stress)
+        .await?;
+    assert_eq!(public_lobbies.len(), 1);
+    assert_eq!(stress_lobbies.len(), 1);
+    assert_eq!(public_lobbies[0].matchmaking_pool, MatchmakingPool::Public);
+    assert_eq!(stress_lobbies[0].matchmaking_pool, MatchmakingPool::Stress);
+
+    let public_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
+    let stress_key = RedisKeys::matchmaking_lobby_queue_for_pool(
+        &game_type,
+        &queue_mode,
+        MatchmakingPool::Stress,
+    );
+    assert_ne!(public_key, stress_key);
+    assert_eq!(redis.zcard::<_, usize>(&public_key).await?, 1);
+    assert_eq!(redis.zcard::<_, usize>(&stress_key).await?, 1);
+
+    // Even after correct physical admission, a corrupted pool marker must
+    // fail the atomic commit rather than create a mixed-boundary game.
+    let _: usize = redis
+        .hset(
+            RedisKeys::lobby_metadata("STRESS1"),
+            "matchmakingPool",
+            "public",
+        )
+        .await?;
+    let (mut active_match, payload) = committed_match_fixture(91_002, &[102])?;
+    active_match.matchmaking_pool = MatchmakingPool::Stress;
+    active_match.lobby_codes = vec!["STRESS1".to_owned()];
+    let commit_error = manager
+        .commit_match(
+            91_002,
+            91_002 % server::game_executor::PARTITION_COUNT,
+            &game_type,
+            &queue_mode,
+            &active_match,
+            &payload,
+            &stress_lobbies,
+        )
+        .await
+        .expect_err("commit must revalidate the durable lobby pool");
+    assert!(commit_error.to_string().contains("lobby-pool-mismatch"));
+
+    let _: usize = redis
+        .hset(
+            RedisKeys::lobby_metadata("STRESS1"),
+            "matchmakingPool",
+            "stress",
+        )
+        .await?;
+    assert!(matches!(
+        manager
+            .commit_match(
+                91_002,
+                91_002 % server::game_executor::PARTITION_COUNT,
+                &game_type,
+                &queue_mode,
+                &active_match,
+                &payload,
+                &stress_lobbies,
+            )
+            .await?,
+        MatchCommitOutcome::Committed { .. }
+    ));
+    assert_eq!(
+        manager
+            .get_active_match(91_002)
+            .await?
+            .expect("stress match is durable")
+            .matchmaking_pool,
+        MatchmakingPool::Stress
+    );
+    assert_eq!(redis.zcard::<_, usize>(&stress_key).await?, 0);
+    assert_eq!(redis.zcard::<_, usize>(&public_key).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_lobby_joins_are_denied_across_both_pool_directions() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("pool_isolated_lobby_joins").await?;
+    let public_host_id = env.create_user().await?;
+    let public_joiner_id = env.create_user().await?;
+    let stress_host_id = env.create_stress_user().await?;
+
+    let verifier = self::common::MockJwtVerifier::new()
+        .with_token("public-host", public_host_id)
+        .with_token("public-joiner", public_joiner_id)
+        .with_token_in_pool("stress-host", stress_host_id, MatchmakingPool::Stress);
+    env.add_server_with_jwt_verifier(
+        JwtManager::new("test_secret_key_for_testing"),
+        Arc::new(verifier),
+        false,
+    )
+    .await?;
+    let server_addr = env.ws_addr(0).expect("server should exist");
+
+    let mut public_host = TestClient::connect(&server_addr).await?;
+    public_host.authenticate_with_token("public-host").await?;
+    let public_lobby = public_host.create_lobby().await?;
+
+    let mut stress_host = TestClient::connect(&server_addr).await?;
+    stress_host.authenticate_with_token("stress-host").await?;
+    stress_host
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: public_lobby.clone(),
+            preferences: None,
+        })
+        .await?;
+    let stress_denial = timeout(Duration::from_secs(5), async {
+        loop {
+            match stress_host.receive_message().await? {
+                WSMessage::AccessDenied { reason } => return Ok::<_, anyhow::Error>(reason),
+                WSMessage::UserCountUpdate { .. } => {}
+                other => {
+                    return Err(anyhow::anyhow!("Expected cross-pool denial, got {other:?}"));
+                }
+            }
+        }
+    })
+    .await??;
+    assert!(stress_denial.contains("different matchmaking pool"));
+
+    let stress_lobby = stress_host.create_lobby().await?;
+    let mut public_joiner = TestClient::connect(&server_addr).await?;
+    public_joiner
+        .authenticate_with_token("public-joiner")
+        .await?;
+    public_joiner
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: stress_lobby.clone(),
+            preferences: None,
+        })
+        .await?;
+    let public_denial = timeout(Duration::from_secs(5), async {
+        loop {
+            match public_joiner.receive_message().await? {
+                WSMessage::AccessDenied { reason } => return Ok::<_, anyhow::Error>(reason),
+                WSMessage::UserCountUpdate { .. } => {}
+                other => {
+                    return Err(anyhow::anyhow!("Expected cross-pool denial, got {other:?}"));
+                }
+            }
+        }
+    })
+    .await??;
+    assert!(public_denial.contains("different matchmaking pool"));
+
+    assert!(
+        env.db()
+            .get_user_by_id(stress_host_id)
+            .await?
+            .expect("stress user exists")
+            .is_stress_test
+    );
+
+    public_host.disconnect().await?;
+    public_joiner.disconnect().await?;
+    stress_host.disconnect().await?;
+    env.shutdown().await?;
     Ok(())
 }
 
@@ -546,6 +771,7 @@ fn committed_match_fixture(game_id: u32, user_ids: &[u32]) -> Result<(ActiveMatc
         status: MatchStatus::Waiting,
         partition_id: game_id % server::game_executor::PARTITION_COUNT,
         created_at: Utc::now().timestamp_millis(),
+        matchmaking_pool: MatchmakingPool::Public,
     };
     let payload = serde_json::to_string(&StreamEvent::GameCreated {
         game_id,

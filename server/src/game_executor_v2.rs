@@ -4349,7 +4349,8 @@ mod tests {
         unused_database_method!(create_guest_user(
             nickname: &str,
             guest_token: &str,
-            mmr: i32
+            mmr: i32,
+            is_stress_test: bool
         ) -> User);
         unused_database_method!(get_user_by_id(user_id: i32) -> Option<User>);
         unused_database_method!(get_user_by_username(username: &str) -> Option<User>);
