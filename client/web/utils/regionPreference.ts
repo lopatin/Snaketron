@@ -3,6 +3,20 @@ import { RegionMetadata, RegionPreference } from '../types';
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8080';
 export const REGION_PREFERENCE_KEY = 'snaketron_selected_region';
 
+/** Runtime guard for a region metadata object from the network (unknown JSON). */
+const isRegionMetadata = (value: unknown): value is RegionMetadata => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === 'string' &&
+    typeof record.name === 'string' &&
+    typeof record.origin === 'string' &&
+    typeof record.ws_url === 'string'
+  );
+};
+
 export interface RegionDetectionResult {
   metadata: RegionMetadata;
   ping: number | null;
@@ -30,7 +44,7 @@ export const loadRegionPreference = (): RegionPreference | null => {
       return null;
     }
 
-    const parsed = JSON.parse(saved);
+    const parsed: unknown = JSON.parse(saved);
 
     if (typeof parsed === 'string') {
       // Legacy format stored only the region ID
@@ -40,8 +54,18 @@ export const loadRegionPreference = (): RegionPreference | null => {
       };
     }
 
-    if (parsed && typeof parsed === 'object' && parsed.regionId) {
-      return parsed as RegionPreference;
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.regionId === 'string') {
+        // Construct a validated RegionPreference instead of casting the raw
+        // parse: tolerate missing optional fields and a missing timestamp.
+        return {
+          regionId: record.regionId,
+          wsUrl: typeof record.wsUrl === 'string' ? record.wsUrl : undefined,
+          origin: typeof record.origin === 'string' ? record.origin : undefined,
+          timestamp: typeof record.timestamp === 'number' ? record.timestamp : Date.now(),
+        };
+      }
     }
   } catch (error) {
     console.error('Failed to load region preference:', error);
@@ -55,7 +79,9 @@ export const fetchRegionMetadata = async (): Promise<RegionMetadata[]> => {
   if (!response.ok) {
     throw new Error('Failed to fetch regions');
   }
-  return response.json();
+  const data: unknown = await response.json();
+  // Validate the network response rather than trusting its shape.
+  return Array.isArray(data) ? data.filter(isRegionMetadata) : [];
 };
 
 export const measureRegionPing = async (origin: string): Promise<number | null> => {

@@ -78,20 +78,10 @@ export const NewHome: React.FC = () => {
     }
   }, [currentGameId, navigate]);
 
-  useEffect(() => {
-    const cleanup = onMessage('NicknameUpdated', (message: any) => {
-      const updatedName = message.data?.username;
-      if (!updatedName) {
-        return;
-      }
-      if (!user || !user.isGuest) {
-        return;
-      }
-      updateGuestNickname(updatedName);
-    });
-
-    return cleanup;
-  }, [onMessage, updateGuestNickname, user]);
+  // NOTE: the server has no `NicknameUpdated` message (it is commented out in
+  // server/src/ws_server.rs), so the former handler here was dead code — guest
+  // nickname changes are never confirmed over the socket. Removed rather than
+  // left as an unreachable listener registered for a nonexistent wire tag.
 
   const handleRegionChange = (regionId: string) => {
     selectRegion(regionId);

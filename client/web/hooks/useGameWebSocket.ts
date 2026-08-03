@@ -2,9 +2,20 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useAuth } from '../contexts/AuthContext';
-import { GameState, GameType, GameCommand, Command, CustomGameSettings, GameLoadFailure } from '../types';
+import { GameState, GameType, GameCommand, GameEventMessage, Command, CustomGameSettings, GameLoadFailure } from '../types';
 import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
+
+/**
+ * A queued inbound game event. `raw` is the exact `{"GameEvent": ...}` frame
+ * text, forwarded to the WASM engine (processServerFrame / newFromSnapshotFrame)
+ * so full-range u64 fields survive; `message` is the JS-parsed envelope used for
+ * routing and metadata only (game_id is u32, the event kind is structural).
+ */
+export interface QueuedGameEvent {
+  raw: string;
+  message: GameEventMessage;
+}
 import {
   clearGameCommandOutbox,
   completeGameCommandOutboxTerminal,
@@ -27,7 +38,7 @@ interface UseGameWebSocketReturn {
   /** Bumped whenever new game events are queued; consumers drain with takeGameEvents. */
   gameEventSignal: number;
   /** Returns every queued game event in arrival order and empties the queue. */
-  takeGameEvents: () => any[];
+  takeGameEvents: () => QueuedGameEvent[];
   gameLoadFailure: GameLoadFailure | null;
   awaitingGameSnapshotForId: string | null;
   isGameSnapshotSynchronized: boolean;
@@ -72,7 +83,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   // SnakeDied/SnakeRespawned burst is exactly such a case, and a dropped
   // event forces a stream-gap resync. The state below is only a wake-up
   // signal; the queue itself is lossless and ordered.
-  const gameEventQueueRef = useRef<any[]>([]);
+  const gameEventQueueRef = useRef<QueuedGameEvent[]>([]);
   const [gameEventSignal, setGameEventSignal] = useState(0);
   const [gameLoadFailure, setGameLoadFailure] = useState<GameLoadFailure | null>(null);
   const [awaitingGameSnapshotForId, setAwaitingGameSnapshotForId] = useState<string | null>(null);
@@ -108,23 +119,20 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
 
     console.log('Creating game WebSocket listeners (initial state issue)');
 
-    // Game events (including game state updates)
+    // Game events (including game state updates). `message.data` is the parsed
+    // GameEventMessage, used here only for routing/outbox reconciliation
+    // (game_id is u32, the event kind is structural). `message.raw` is the
+    // exact frame text, queued for the engine so full-range u64 fields (e.g.
+    // TickHash.hash) are never corrupted by a JS JSON.parse round-trip.
     unsubscribers.push(
-      onMessage('GameEvent', (message: any) => {
-        // The message contains the full GameEventMessage from the server
-        const eventMessage = message.GameEvent || message.data || message;
-        
-        if (!eventMessage) {
-          console.error('Invalid GameEvent message structure:', message);
-          return;
-        }
-
+      onMessage('GameEvent', (message) => {
+        const eventMessage = message.data;
         const eventGameId = parseU32GameId(eventMessage.game_id);
-        const event = eventMessage.event || eventMessage;
+        const event = eventMessage.event;
 
-        if (event?.CommandScheduledV2?.command_id) {
+        if (event && 'CommandScheduledV2' in event) {
           resolveGameCommandV2(event.CommandScheduledV2.command_id);
-        } else if (event?.CommandRejected?.command_id) {
+        } else if (event && 'CommandRejected' in event) {
           rejectGameCommandV2(
             event.CommandRejected.command_id,
             event.CommandRejected.session_rejected_from,
@@ -148,8 +156,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         if (
           eventGameId !== null &&
           serverAssignedGameRef.current === eventGameId &&
-          event &&
-          typeof event === 'object' &&
           'Snapshot' in event
         ) {
           serverAssignedGameRef.current = null;
@@ -171,11 +177,11 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           );
           return;
         }
-        
-        // Queue the full event message (including tick) for the game engine
-        // to process, and wake the consumer. Never deliver via a state slot
-        // directly: coalesced commits would silently drop events.
-        gameEventQueueRef.current.push(eventMessage);
+
+        // Queue the raw frame (+ parsed envelope) for the game engine to process,
+        // and wake the consumer. Never deliver via a state slot directly:
+        // coalesced commits would silently drop events.
+        gameEventQueueRef.current.push({ raw: message.raw, message: eventMessage });
         setGameEventSignal((n) => n + 1);
         
         // Handle different event types
@@ -328,21 +334,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       })
     );
 
-    // Custom game created
-    unsubscribers.push(
-      onMessage('CustomGameCreated', (message: any) => {
-        setCurrentGameId(message.data.game_id);
-        setCustomGameCode(message.data.game_code);
-        setIsHost(true); // Creator is always the host
-      })
-    );
-
-    // Custom game joined
-    unsubscribers.push(
-      onMessage('CustomGameJoined', (message: any) => {
-        setCurrentGameId(message.data.game_id);
-      })
-    );
+    // NOTE: `CustomGameCreated` / `CustomGameJoined` handlers removed — neither
+    // is a variant of the server's WSMessage enum, so they could never fire.
 
     // Solo game created
     unsubscribers.push(

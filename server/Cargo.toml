@@ -6,6 +6,10 @@ edition = "2024"
 [features]
 default = []
 skip-proto = []
+# Codegen-only: enables ts-rs and turns on common's ts-gen so the whole wire
+# graph (protocol enum + shared game types) can be exported to TypeScript via
+# `cargo test -p server --features ts-gen`. Off for all normal builds.
+ts-gen = ["dep:ts-rs", "common/ts-gen"]
 
 [lib]
 name = "server"
@@ -60,6 +64,7 @@ indexmap = "2"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+ts-rs = { version = "11", optional = true }
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", features = ["prost"] }

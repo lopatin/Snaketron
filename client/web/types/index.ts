@@ -1,3 +1,58 @@
+// Wire types are generated from the Rust source of truth via ts-rs
+// (scripts/gen-types.sh -> client/web/types/generated/). They are re-exported
+// here so the rest of the app keeps importing them from '../types'. Do not
+// hand-write these — change the Rust definition and regenerate.
+export type {
+  Position,
+  Snake,
+  Arena,
+  TeamZoneConfig,
+  TeamId,
+  Player,
+  GameState,
+  GameStatus,
+  GameType,
+  GameMode,
+  QueueMode,
+  GameProperties,
+  CustomGameSettings,
+  GameEvent,
+  GameEventMessage,
+  GameCommandMessage,
+  CommandId,
+  SyncStatus,
+  LobbyMember,
+  WSMessage,
+  // HTTP DTOs (server/src/api/*)
+  UserInfo,
+  GuestUserInfo,
+  AuthResponse,
+  CreateGuestResponse,
+  LeaderboardEntryResponse,
+  HighScoreEntryResponse,
+  LeaderboardEntry,
+  LeaderboardResponse,
+  SeasonsResponse,
+  UserRankingResponse,
+  RegionMetadata,
+  HealthResponse,
+} from './generated';
+
+// Typed WebSocket protocol surface derived from the generated WSMessage union.
+import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
+import type { Direction, LobbyMember } from './generated';
+export type { OutboundMessage, WSMessageTag, TypedMessage, PayloadOf } from './protocol';
+
+// Leaderboard entry aliases: the components predate the generated names but the
+// shapes are identical, so alias rather than rename call sites.
+import type {
+  LeaderboardEntryResponse as GenRankingEntry,
+  HighScoreEntryResponse as GenHighScoreEntry,
+  LeaderboardEntry as GenLeaderboardEntry,
+} from './generated';
+export type RankingEntry = GenRankingEntry;
+export type HighScoreEntry = GenHighScoreEntry;
+
 // User and Authentication Types
 export interface User {
   id: number;
@@ -26,13 +81,6 @@ export interface Lobby {
   state: LobbyState;
 }
 
-export interface LobbyMember {
-  user_id: number;
-  username: string;
-  joined_at: number;
-  is_host: boolean;
-}
-
 export type ChatScope = 'lobby' | 'game';
 
 export interface ChatMessage {
@@ -51,6 +99,9 @@ export type LobbyState = 'waiting' | 'queued' | 'matched';
 export type LobbyGameMode = 'duel' | '2v2' | 'solo' | 'ffa';
 export type MatchmakingStatus = 'idle' | 'queued' | 'joining';
 
+// Client-side lobby preferences (camelCase UI shape). The wire equivalent is
+// the generated LobbyPreferences (snake_case selected_modes); WebSocketContext
+// translates between the two.
 export interface LobbyPreferences {
   selectedModes: LobbyGameMode[];
   competitive: boolean;
@@ -61,9 +112,12 @@ export interface WebSocketContextType {
   isConnected: boolean;
   isSessionAuthenticated: boolean;
   serverCapabilities: ReadonlySet<string>;
-  sendMessage: (message: any) => boolean;
+  sendMessage: (message: OutboundMessage) => boolean;
   waitForSessionReady: (timeoutMs?: number) => Promise<void>;
-  onMessage: (type: string, handler: (message: any) => void) => () => void;
+  onMessage: <K extends WSMessageTag>(
+    type: K,
+    handler: (message: TypedMessage<K>) => void,
+  ) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
   disconnect: () => void;
   connectToRegion: (
@@ -97,128 +151,36 @@ export interface LatencySettings {
   receiveDelayMs: number;
 }
 
-// Game Types
-export interface Position {
-  x: number;
-  y: number;
-}
+// Client-side movement input. The snake_id and command envelope are filled in
+// by the WASM engine (processTurn), which returns the wire GameCommandMessage.
+export type Command = { Turn: { direction: Direction } } | 'Respawn';
 
-export interface Snake {
-  body: Position[];
-  direction: 'Up' | 'Down' | 'Left' | 'Right';
-  is_alive: boolean;
-  food: number;
-  team_id?: number | null;  // Team ID: 0 or 1 for team games
-}
-
-export interface Arena {
-  width: number;
-  height: number;
-  snakes: Snake[];
-  food: Position[];
-}
-
-export interface GameState {
-  tick: number;
-  status: GameStatus;
-  arena: Arena;
-  game_type: GameType;
-  properties: GameProperties;
-  players: Record<number, Player>;
-  usernames: Record<number, string>;  // Username mappings by user_id
-  spectators: number[];               // User IDs that are spectating (no snakes)
-  game_id: string;
-  game_ended?: boolean;
-  final_score?: number;
-  duration?: number;
-  start_ms: number;
-  event_sequence: number;
-  scores: Record<number, number>;  // Snake ID to score mapping
-  team_scores?: Record<number, number>;  // Team ID to team score mapping (for team games)
-
-  // XP tracking (only present after game completion)
-  player_xp?: Record<number, number>;       // user_id -> xp_gained
-}
-
-export type GameStatus = 
-  | 'Stopped'
-  | { Started: { server_id: number } }
-  | { Complete: { winning_snake_id: number | null } };
-
-export type GameType =
-  | 'Solo'
-  | { TeamMatch: { per_team: number } }
-  | { FreeForAll: { max_players: number } }
-  | { Custom: { settings: CustomGameSettings } };
-
-export type QueueMode = 'Quickmatch' | 'Competitive';
-
-export interface CustomGameSettings {
-  arena_width: number;
-  arena_height: number;
-  tick_duration_ms: number;
-  food_spawn_rate: number;
-  max_players: number;
-  game_mode: GameMode;
-  is_private: boolean;
-  allow_spectators: boolean;
-  snake_start_length: number;
-}
-
-export type GameMode = 
-  | 'Solo'
-  | 'Duel'
-  | { FreeForAll: { max_players: number } };
-
-export interface GameProperties {
-  available_food_target: number;
-  tick_duration_ms: number;
-  time_limit_ms?: number | null;
-}
-
-export interface Player {
-  user_id: number;
-  snake_id: number;
-}
-
-// Game Command Types
-export interface GameCommand {
-  command_id_client: {
-    tick: number;
-    user_id: number;
-    sequence_number: number;
-  };
-  command_id_server: null;
-  command: Command;
-}
-
-export interface ClientCommandIdentityV2 {
-  game_id: number;
-  user_id: number;
-  client_game_session_id: string;
-  sequence: number;
-}
+// Command-protocol helper types for the v2 at-least-once command path. The
+// wire types are generated (server/src/recovery.rs + common); these compose
+// the client's view around them. `GameCommand` is the client's historical name
+// for the command envelope, which is the generated wire GameCommandMessage.
+export type { GameCommandMessage as GameCommand, ClientCommandIdentityV2, CommandOutcome, SessionCommandRejectionFence } from './generated';
+import type {
+  GameCommandMessage as GenGameCommand,
+  ClientCommandIdentityV2 as GenClientCommandIdentityV2,
+  CommandOutcome as GenCommandOutcome,
+  SessionCommandRejectionFence as GenRejectionFence,
+} from './generated';
 
 export interface GameCommandV2 {
-  command_id: ClientCommandIdentityV2;
-  command: GameCommand;
+  command_id: GenClientCommandIdentityV2;
+  command: GenGameCommand;
 }
 
-export type CommandOutcome =
-  | { result: 'SCHEDULED'; command: GameCommand }
-  | { result: 'REJECTED'; reason: string };
-
-export interface CommandRejectionFence {
-  from_sequence: number;
-  reason: string;
-}
+// Alias kept for existing call sites (wire name is SessionCommandRejectionFence).
+export type CommandRejectionFence = GenRejectionFence;
 
 export interface CommandOutcomesPayload {
   game_id: number;
   client_game_session_id: string;
   contiguous_through: number;
-  outcomes: Record<string, CommandOutcome>;
-  rejection_fence?: CommandRejectionFence;
+  outcomes: Record<string, GenCommandOutcome>;
+  rejection_fence?: GenRejectionFence;
 }
 
 export interface CommandOutcomesCompleteMessage {
@@ -228,83 +190,12 @@ export interface CommandOutcomesCompleteMessage {
   };
 }
 
-export type Command = 
-  | { Turn: { direction: 'Up' | 'Down' | 'Left' | 'Right' } }
-  | 'Respawn';
-
-// WebSocket Message Types
-export interface CreateCustomGameMessage {
-  CreateCustomGame: {
-    settings: Partial<CustomGameSettings>;
-  };
-}
-
-export interface JoinCustomGameMessage {
-  JoinCustomGame: {
-    game_code: string;
-  };
-}
-
-export interface JoinGameMessage {
-  JoinGame: number;
-}
-
-export interface GameLoadFailedPayload {
-  game_id: number;
-  reason: string;
-}
-
-export interface GameLoadFailedMessage {
-  GameLoadFailed: GameLoadFailedPayload;
-}
-
-export interface GameWarmingMessage {
-  GameWarming: {
-    game_id: number;
-    retry_after_ms: number;
-  };
-}
-
+// Game load failure (client-side view of WSMessage::GameLoadFailed)
 export interface GameLoadFailure {
   gameId: number | null;
   requestedGameId: string;
   reason: string;
 }
-
-export interface QueueForMatchMessage {
-  QueueForMatch: {
-    game_type: GameType;
-    queue_mode: QueueMode;
-  };
-}
-
-export interface QueueForMatchMultiMessage {
-  QueueForMatchMulti: {
-    game_types: GameType[];
-    queue_mode: QueueMode;
-  };
-}
-
-export interface GameCommandV2Message {
-  GameCommandV2: GameCommandV2;
-}
-
-export interface TokenMessage {
-  Token: string;
-}
-
-export type WebSocketMessage =
-  | CreateCustomGameMessage
-  | JoinCustomGameMessage
-  | JoinGameMessage
-  | GameLoadFailedMessage
-  | GameWarmingMessage
-  | CommandOutcomesCompleteMessage
-  | QueueForMatchMessage
-  | QueueForMatchMultiMessage
-  | GameCommandV2Message
-  | TokenMessage
-  | string;
 
 // API Response Types
 export interface ApiResponse<T> {
@@ -313,20 +204,15 @@ export interface ApiResponse<T> {
   message?: string;
 }
 
-export interface LoginResponse {
-  token: string;
-  user: User;
-}
-
-export interface CreateGuestResponse {
-  token: string;
-  user: User;
-}
-
-export interface CheckUsernameResponse {
+// Client-side result of the username check. `requiresPassword` is NOT part of
+// the server's wire response (generated CheckUsernameResponse is { available,
+// errors }); it is a client field the UI reads to decide whether to prompt for
+// a password. The server does not populate it today, so api.checkUsername
+// always sets it false.
+export interface CheckUsernameResult {
   available: boolean;
-  requiresPassword?: boolean;
-  errors?: string[];
+  requiresPassword: boolean;
+  errors: string[];
 }
 
 // Component Props Types
@@ -423,13 +309,8 @@ export interface Region {
   isConnected: boolean;
 }
 
-// Region metadata from backend API
-export interface RegionMetadata {
-  id: string;
-  name: string;
-  origin: string;
-  ws_url: string;  // Backend uses snake_case
-}
+// RegionMetadata is generated from the server (server/src/api/regions.rs) and
+// re-exported at the top of this file.
 
 // localStorage schema for region preference
 export interface RegionPreference {
@@ -455,61 +336,17 @@ export interface Rank {
   mmr: number;
 }
 
-// Leaderboard entry for ranking-based modes (duel, 2v2, ffa)
-export interface RankingEntry {
-  rank: number;
-  username: string;
-  mmr: number;
-  wins: number;
-  losses: number;
-  winRate: number;
-}
-
-// High score entry for solo mode
-export interface HighScoreEntry {
-  rank: number;
-  username: string;
-  score: number;
-  timestamp: string;
-  gameId: string;
-}
-
-// Union type for leaderboard entries
-export type LeaderboardEntry = RankingEntry | HighScoreEntry;
-
-// Type guards for discriminating entry types
-export function isRankingEntry(entry: LeaderboardEntry): entry is RankingEntry {
+// Type guards for discriminating the (untagged) leaderboard entry union.
+export function isRankingEntry(entry: GenLeaderboardEntry): entry is GenRankingEntry {
   return 'mmr' in entry;
 }
 
-export function isHighScoreEntry(entry: LeaderboardEntry): entry is HighScoreEntry {
+export function isHighScoreEntry(entry: GenLeaderboardEntry): entry is GenHighScoreEntry {
   return 'score' in entry;
 }
 
 export interface LeaderboardData {
   season: number;
   gameMode: LobbyGameMode;
-  entries: LeaderboardEntry[];
-}
-
-// API Response Types for Leaderboard
-export interface LeaderboardResponse {
-  entries: LeaderboardEntry[];
-  season: number;
-  queueMode: string;
-  gameType: string;
-  hasMore: boolean;
-}
-
-export interface SeasonsResponse {
-  seasons: number[];
-  current: number;
-}
-
-export interface UserRankingResponse {
-  rank: number | null;
-  mmr: number | null;
-  wins: number | null;
-  losses: number | null;
-  winRate: number | null;
+  entries: GenLeaderboardEntry[];
 }

@@ -1,4 +1,37 @@
-import { User, LoginResponse, CheckUsernameResponse, CreateGuestResponse, LeaderboardResponse, SeasonsResponse, UserRankingResponse } from '../types';
+import {
+  UserInfo,
+  AuthResponse,
+  CreateGuestResponse,
+  CheckUsernameResult,
+  LeaderboardResponse,
+  SeasonsResponse,
+  UserRankingResponse,
+} from '../types';
+import type { CheckUsernameResponse } from '../types/generated';
+
+/** Error thrown by `API.request` for a non-2xx response. */
+export interface ApiError {
+  response: { data: unknown; status: number };
+  message: string;
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'response' in error &&
+    typeof (error as ApiError).response?.status === 'number'
+  );
+}
+
+function errorMessage(data: unknown): string {
+  if (data && typeof data === 'object') {
+    const record = data as Record<string, unknown>;
+    if (typeof record.error === 'string') return record.error;
+    if (typeof record.message === 'string') return record.message;
+  }
+  return 'Request failed';
+}
 
 interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
@@ -25,7 +58,10 @@ class API {
     }
   }
 
-  async request<T = any>(endpoint: string, options: RequestOptions = {}): Promise<T> {
+  // T must be specified by the caller (typically a generated wire DTO). The
+  // response JSON lands in `unknown` and is asserted to T at this single
+  // boundary rather than defaulting every call to `any`.
+  async request<T>(endpoint: string, options: RequestOptions = {}): Promise<T> {
     const url = `${this.baseURL}${endpoint}`;
     const config: RequestOptions = {
       ...options,
@@ -41,23 +77,21 @@ class API {
     }
 
     const response = await fetch(url, config);
-    const data = await response.json();
-    
+    const data: unknown = await response.json();
+
     if (!response.ok) {
-      throw { 
-        response: { 
-          data, 
-          status: response.status 
-        },
-        message: data.error || data.message || 'Request failed'
+      const error: ApiError = {
+        response: { data, status: response.status },
+        message: errorMessage(data),
       };
+      throw error;
     }
 
     return data as T;
   }
 
-  async login(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/api/auth/login', {
+  async login(username: string, password: string): Promise<AuthResponse> {
+    const data = await this.request<AuthResponse>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -65,8 +99,8 @@ class API {
     return data;
   }
 
-  async register(username: string, password: string): Promise<LoginResponse> {
-    const data = await this.request<LoginResponse>('/api/auth/register', {
+  async register(username: string, password: string): Promise<AuthResponse> {
+    const data = await this.request<AuthResponse>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     });
@@ -83,31 +117,32 @@ class API {
     return data;
   }
 
-  async checkUsername(username: string): Promise<CheckUsernameResponse> {
+  async checkUsername(username: string): Promise<CheckUsernameResult> {
     try {
       const response = await this.request<CheckUsernameResponse>('/api/auth/check-username', {
         method: 'POST',
         body: JSON.stringify({ username }),
       });
-      
-      // Enhanced response to include password requirement info
+
       return {
         available: response.available,
-        requiresPassword: response.requiresPassword || false,
-        errors: response.errors || []
+        // The server's response has no requiresPassword field; the UI expects
+        // one, so it is defaulted false here. See CheckUsernameResult.
+        requiresPassword: false,
+        errors: response.errors,
       };
-    } catch (error) {
+    } catch {
       // Return a safe default on error
       return {
         available: false,
         requiresPassword: false,
-        errors: []
+        errors: [],
       };
     }
   }
 
-  async getCurrentUser(): Promise<User> {
-    return this.request<User>('/api/auth/me');
+  async getCurrentUser(): Promise<UserInfo> {
+    return this.request<UserInfo>('/api/auth/me');
   }
 
   async getLeaderboard(

@@ -5,7 +5,7 @@ import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode, GameLoadFailure } from '../types';
-import * as wasm from 'wasm-snaketron';
+import { getWasm } from '../wasm';
 import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
 import { LobbyChat as ChatPanel } from './LobbyChat';
@@ -70,6 +70,7 @@ export default function GameArena() {
     // isRunning,
     sendCommand,
     processServerEvent,
+    renderTo,
     stopEngine
   } = useGameEngine({
     gameId,
@@ -86,7 +87,6 @@ export default function GameArena() {
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   const [, forceUpdate] = useReducer(x => x + 1, 0);
-  const lastHeadPositionRef = useRef<{ x: number; y: number } | null>(null);
   const [rotation, setRotation] = useState<ArenaRotation>(0);
   const rotationSetRef = useRef(false); // Track if rotation has been set
   const [isShortWideScreen, setIsShortWideScreen] = useState(false);
@@ -102,7 +102,6 @@ export default function GameArena() {
       leaveGame();
       stopEngine();
       rotationSetRef.current = false;
-      lastHeadPositionRef.current = null;
       setGameOver(false);
       setShowGameOverPanel(false);
     }
@@ -270,42 +269,8 @@ export default function GameArena() {
     }
   }, [gameState, user?.id, gameOver, isGameComplete, stopEngine]);
 
-  // Transform direction based on rotation
-  // We need to apply the INVERSE transformation of the coordinate system
-  // When arena is rotated 90° CW, UP on screen corresponds to LEFT in game coordinates
-  const transformDirection = (direction: 'Up' | 'Down' | 'Left' | 'Right', rotation: ArenaRotation): 'Up' | 'Down' | 'Left' | 'Right' => {
-    switch (rotation) {
-      case 0:
-        return direction;
-      case 90:
-        // 90° CW rotation: inverse is 270° CW
-        // Screen Up → Game Left, Screen Right → Game Up, Screen Down → Game Right, Screen Left → Game Down
-        switch (direction) {
-          case 'Up': return 'Left';
-          case 'Right': return 'Up';
-          case 'Down': return 'Right';
-          case 'Left': return 'Down';
-        }
-      case 180:
-        // 180° rotation: inverse is also 180°
-        // Screen Up → Game Down, Screen Down → Game Up, Screen Left → Game Right, Screen Right → Game Left
-        switch (direction) {
-          case 'Up': return 'Down';
-          case 'Down': return 'Up';
-          case 'Left': return 'Right';
-          case 'Right': return 'Left';
-        }
-      case 270:
-        // 270° CW rotation: inverse is 90° CW
-        // Screen Up → Game Right, Screen Right → Game Down, Screen Down → Game Left, Screen Left → Game Up
-        switch (direction) {
-          case 'Up': return 'Right';
-          case 'Right': return 'Down';
-          case 'Down': return 'Left';
-          case 'Left': return 'Up';
-        }
-    }
-  };
+  // Screen->game direction mapping now lives in Rust (screenDirectionToGame,
+  // client/src/render.rs), sharing the rotation convention with the renderer.
 
   // Set rotation based on user's team when game state is first available
   useEffect(() => {
@@ -340,11 +305,11 @@ export default function GameArena() {
   }, [gameState, committedState, user?.id, isShortWideScreen, rotation]); // Recompute when game state, user, rotation, or viewport changes
 
   useEffect(() => {
-    if (!window.wasm) {
+    if (!getWasm()) {
       console.log('WASM not loaded yet');
       return;
     }
-    
+
     // Handle keyboard input
     const handleKeyPress = (e: KeyboardEvent) => {
       // Ignore repeat events
@@ -376,9 +341,15 @@ export default function GameArena() {
       if (direction) {
         e.preventDefault();
         const originalDirection = direction as 'Up' | 'Down' | 'Left' | 'Right';
-        const transformedDirection = transformDirection(originalDirection, rotation);
+        // Map the screen direction to a game direction in Rust, sharing the
+        // rotation convention with the renderer (see render.rs) so input and
+        // rendering cannot desynchronize.
+        const transformedDirection = getWasm()!.screenDirectionToGame(
+          originalDirection,
+          rotation,
+        ) as 'Up' | 'Down' | 'Left' | 'Right';
         console.log('Keydown event - sending turn command:', originalDirection, 'transformed to:', transformedDirection, 'rotation:', rotation, 'timestamp:', Date.now());
-        
+
         // Send command through game engine (handles both local prediction and server)
         sendCommand({
           Turn: { direction: transformedDirection }
@@ -398,82 +369,41 @@ export default function GameArena() {
     rotation,
   ]);
   
-  // Render game state
+  // Render game state. Rendering reads the engine's predicted state directly in
+  // Rust via renderTo -> GameClient.render, so there is no per-frame JSON
+  // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
+  // usernames and teams are resolved inside the renderer from the typed state.
   useEffect(() => {
-    if (!gameState || !canvasRef.current || !window.wasm) {
-      if (!window.wasm) console.log('Waiting for WASM to load...');
+    if (!gameState || !canvasRef.current) {
       if (!gameState) console.log('Waiting for game state...');
       return;
     }
-    
+
     // Expose game state for testing
     if (process.env.NODE_ENV !== 'production') {
       (window as any).__gameArenaState = gameState;
     }
-    
+
     let animationId: number;
     const render = () => {
       try {
-        // console.log('rendering game state:', JSON.stringify(gameState.arena.snakes[0].body));
-        
-        // Check head position for non-adjacent movement
-        if (gameState.arena.snakes.length > 0 && gameState.arena.snakes[0].body.length > 0) {
-          const currentHead = gameState.arena.snakes[0].body[0];
-          
-          if (lastHeadPositionRef.current) {
-            const dx = Math.abs(currentHead.x - lastHeadPositionRef.current.x);
-            const dy = Math.abs(currentHead.y - lastHeadPositionRef.current.y);
-            
-            // Check if the head moved more than 1 cell (not adjacent)
-            if ((dx > 1 || dy > 1) || (dx === 1 && dy === 1)) {
-              console.error('Non-adjacent head movement detected!', {
-                previous: lastHeadPositionRef.current,
-                current: currentHead,
-                dx,
-                dy
-              });
-            }
-          }
-
-          // Update last head position
-          lastHeadPositionRef.current = { x: currentHead.x, y: currentHead.y };
+        if (canvasRef.current) {
+          renderTo(canvasRef.current, cellSize, rotation, user?.id ?? undefined);
         }
-        
-        // Get opponent username for team games
-        let opponentUsername: string | null = null;
-        if (gameState.usernames && user?.id) {
-          // Find the first opponent (different user ID)
-          const opponentEntry = Object.entries(gameState.usernames).find(
-            ([userId, _]) => parseInt(userId) !== user.id
-          );
-          if (opponentEntry) {
-            opponentUsername = opponentEntry[1];
-          }
-        }
-
-        wasm.render_game(
-          JSON.stringify(gameState), 
-          canvasRef.current!, 
-          cellSize, 
-          user?.id || null, 
-          rotation,
-          user?.username || null,
-          opponentUsername
-        );
       } catch (error) {
         console.error('Error rendering game:', error);
       }
       animationId = requestAnimationFrame(render);
     };
-    
+
     render();
-    
+
     return () => {
       if (animationId) {
         cancelAnimationFrame(animationId);
       }
     };
-  }, [gameState, cellSize, rotation, user?.id]);
+  }, [gameState, cellSize, rotation, user?.id, renderTo]);
   
   // Process server events through the game engine. Events arrive via a
   // lossless queue (see useGameWebSocket): a single signal bump may cover
@@ -490,11 +420,10 @@ export default function GameArena() {
       try {
         let events = takeGameEvents();
         while (events.length > 0) {
-          for (const eventMessage of events) {
-            const processed = await processServerEvent(eventMessage);
-            const event = eventMessage.event || eventMessage;
-            if (processed && event?.Snapshot) {
-              const snapshotGameId = parseU32GameId(eventMessage.game_id);
+          for (const queued of events) {
+            const processed = await processServerEvent(queued);
+            if (processed && 'Snapshot' in queued.message.event) {
+              const snapshotGameId = parseU32GameId(queued.message.game_id);
               if (snapshotGameId !== null) {
                 acknowledgeGameSnapshot(snapshotGameId);
               }

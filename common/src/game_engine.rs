@@ -15,21 +15,28 @@ pub const MAX_PREDICTION_AHEAD_MS: u32 = 1000;
 /// message. Exposed to the UI so it can detect divergence (hash mismatches),
 /// message loss (stream gaps), and trigger a resync instead of drifting.
 #[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct SyncStatus {
     /// Last transport sequence seen (0 = none yet).
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub last_stream_seq: u64,
     /// Number of distinct gap incidents observed.
     pub stream_gap_count: u32,
     /// Total messages known to have been missed.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub missed_messages: u64,
     /// Stale/duplicate messages skipped instead of double-applied.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub stale_messages_skipped: u64,
     /// Tick of the last server fingerprint probe processed.
     pub last_probe_tick: Option<u32>,
     /// Whether the last probe matched our committed state.
     pub last_probe_matched: Option<bool>,
     pub consecutive_hash_mismatches: u32,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub total_probes: u64,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub total_mismatches: u64,
     /// First tick at which a hash mismatch was observed (for RCA).
     pub first_mismatch_tick: Option<u32>,
@@ -39,6 +46,7 @@ pub struct SyncStatus {
     /// Highest tick seen in any server message (liveness reference).
     pub last_server_tick: u32,
     /// Server wall-clock from the last TickHash heartbeat (clock reference).
+    #[cfg_attr(feature = "ts-gen", ts(type = "number | null"))]
     pub last_server_ts_ms: Option<i64>,
 }
 

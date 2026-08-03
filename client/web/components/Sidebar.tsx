@@ -98,7 +98,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="space-y-2 flex flex-col items-end mb-6">
                 {lobbyMembers.map((member) => (
                   <div
-                    key={`${member.user_id}-${member.joined_at}`}
+                    key={`${member.user_id}-${member.ts}`}
                     className="text-sm text-black-70 flex items-center gap-2"
                   >
                     <span className={member.user_id === currentUserId ? 'font-bold' : ''}>

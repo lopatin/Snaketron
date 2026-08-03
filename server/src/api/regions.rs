@@ -10,6 +10,8 @@ use crate::redis_utils::RedisConnection;
 
 /// Region metadata returned by /api/regions endpoint
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct RegionMetadata {
     pub id: String,
     pub name: String,
@@ -19,6 +21,8 @@ pub struct RegionMetadata {
 
 /// Health check response for ping measurement
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct HealthResponse {
     pub status: String,
 }

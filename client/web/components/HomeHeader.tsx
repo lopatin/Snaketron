@@ -101,10 +101,11 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                 {lobbyMembers.length > 0 && (
                   <div className="home-lobby-roster" aria-label="Lobby members">
                     {lobbyMembers.map((member) => (
-                      <div key={`${member.user_id}-${member.joined_at}`} className="home-lobby-member">
+                      <div key={`${member.user_id}-${member.ts}`} className="home-lobby-member">
                         <span className="home-lobby-member-dot" aria-hidden="true" />
                         <span>{member.username}</span>
-                        {member.is_host && <span className="home-lobby-host">Host</span>}
+                        {/* Host badge removed: the wire LobbyMember carries no host
+                            flag (host is LobbyUpdate.host_user_id, not threaded here). */}
                       </div>
                     ))}
                   </div>

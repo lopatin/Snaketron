@@ -20,6 +20,8 @@ use crate::user_cache::UserCache;
 
 /// Lobby member information stored in Redis
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct LobbyMember {
     pub user_id: u32,
     pub username: String,
@@ -132,6 +134,8 @@ pub enum LeaveLobbyResult {
 
 /// Host-selected matchmaking preferences for a lobby
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct LobbyPreferences {
     // TODO: Use an enum for selected modes instead of a string
     pub selected_modes: Vec<String>,

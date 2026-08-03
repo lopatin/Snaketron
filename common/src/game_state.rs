@@ -29,6 +29,8 @@ mod sorted_hash_set {
 const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameCommand {
     // User command for movement
     Turn { snake_id: u32, direction: Direction },
@@ -40,17 +42,23 @@ pub enum GameCommand {
 /// Stable identity for the at-least-once command protocol. Unlike the engine's
 /// tick-scoped `CommandId`, this survives reconstruction and WebSocket reconnect.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct ClientCommandIdentityV2 {
     pub game_id: u32,
     pub user_id: u32,
     pub client_game_session_id: String,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub sequence: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GameEventMessage {
     pub game_id: u32,
     pub tick: u32,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub sequence: u64,
     /// Transport-level sequence, assigned by the publishing game executor and
     /// strictly monotonic per game across ALL published messages (events,
@@ -58,6 +66,7 @@ pub struct GameEventMessage {
     /// contiguity. 0 is reserved for locally constructed or explicitly
     /// out-of-band messages that do not advance replicated state.
     #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub stream_seq: u64,
     pub user_id: Option<u32>,
     pub event: GameEvent,
@@ -68,6 +77,8 @@ pub struct GameEventMessage {
 // so boxing the snapshot would add indirection without a meaningful win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameEvent {
     SnakeTurned {
         snake_id: u32,
@@ -106,6 +117,7 @@ pub enum GameEvent {
         /// or above this sequence have the same terminal rejection. Exact
         /// outcomes and the contiguous resolved watermark take precedence.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         session_rejected_from: Option<u64>,
     },
     // PlayerJoined { user_id: u32, snake_id: u32 },
@@ -138,18 +150,24 @@ pub enum GameEvent {
     /// as a liveness signal, and use `server_ts_ms` as a clock reference.
     /// Never mutates state.
     TickHash {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         hash: u64,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         server_ts_ms: i64,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct TeamZoneConfig {
     pub end_zone_depth: u16, // Depth of each end zone (10 cells)
     pub goal_width: u16,     // Width of goal opening in cells
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct TeamId(pub u8);
 
 impl TeamId {
@@ -159,6 +177,8 @@ impl TeamId {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct Arena {
     pub width: u16,
     pub height: u16,
@@ -277,13 +297,18 @@ impl Arena {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GameProperties {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub available_food_target: usize,
     pub tick_duration_ms: u32,
     pub time_limit_ms: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct CustomGameSettings {
     pub arena_width: u16,
     pub arena_height: u16,
@@ -313,6 +338,8 @@ impl Default for CustomGameSettings {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameMode {
     Solo, // Practice mode - just one player
     Duel, // 1v1
@@ -320,12 +347,16 @@ pub enum GameMode {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum QueueMode {
     Quickmatch,  // Quick casual matches
     Competitive, // Ranked competitive matches
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameType {
     Solo,
     TeamMatch { per_team: u8 },
@@ -334,10 +365,17 @@ pub enum GameType {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameStatus {
     Stopped,
-    Started { server_id: u64 },
-    Complete { winning_snake_id: Option<u32> },
+    Started {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+        server_id: u64,
+    },
+    Complete {
+        winning_snake_id: Option<u32>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -431,6 +469,8 @@ impl CommandQueue {
 
 // Serializable state for snapshots
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GameState {
     pub tick: u32,
     pub status: GameStatus,
@@ -442,16 +482,20 @@ pub struct GameState {
     #[serde(default)]
     pub is_stress_test: bool,
     pub properties: GameProperties,
+    #[cfg_attr(feature = "ts-gen", ts(skip))]
     pub command_queue: CommandQueue,
     // Players by user_id
     pub players: HashMap<u32, Player>,
+    #[cfg_attr(feature = "ts-gen", ts(skip))]
     pub rng: Option<PseudoRandom>,
     // Custom game fields
     pub game_code: Option<String>,
     pub host_user_id: Option<u32>,
     // Game start timestamp in milliseconds
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub start_ms: i64,
     // Event sequence number for this game
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub event_sequence: u64,
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
@@ -461,6 +505,7 @@ pub struct GameState {
     // Score tracking - snake_id -> score
     pub scores: HashMap<u32, u32>,
     // Team scores for team games - team_id -> score
+    #[cfg_attr(feature = "ts-gen", ts(type = "Record<number, number> | null"))]
     pub team_scores: Option<HashMap<TeamId, u32>>,
 
     // XP tracking
@@ -468,6 +513,8 @@ pub struct GameState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct CommandId {
     pub tick: u32,
     pub user_id: u32,
@@ -492,6 +539,8 @@ impl PartialOrd for CommandId {
 
 // Wrapper for BinaryHeap to order commands by their intended execution tick.
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GameCommandMessage {
     pub command_id_client: CommandId,
     pub command_id_server: Option<CommandId>,

@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { GameClient } from 'wasm-snaketron';
-import { GameState, GameCommand, Command } from '../types';
+import { GameClient, getWasm, initWasm } from '../wasm';
+import { GameState, GameCommandMessage, Command } from '../types';
 import { getServerClockOffsetMs } from '../utils/clockSync';
 import { parseU32GameId } from '../utils/gameId';
 import { startTrace, record as recordTrace, autoUploadOnce } from '../utils/syncTrace';
+import type { QueuedGameEvent } from './useGameWebSocket';
 
 interface UseGameEngineProps {
   gameId: string;
   playerId: number;
-  onCommandReady?: (commandMessage: any) => void;
+  onCommandReady?: (commandMessage: GameCommandMessage) => void;
   onRequestResync?: () => void;
   latencyMs?: number;
 }
@@ -20,7 +21,9 @@ interface UseGameEngineReturn {
   isGameComplete: boolean;
   connectionStale: boolean;
   sendCommand: (command: Command) => void;
-  processServerEvent: (event: any) => Promise<boolean>;
+  processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
+  /** Render the engine's current predicted state to a canvas (no JSON round-trip). */
+  renderTo: (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => void;
   stopEngine: () => void;
 }
 
@@ -295,6 +298,16 @@ export const useGameEngine = ({
     }
   }, []);
 
+  // Render the engine's predicted state directly to a canvas. Reads the live
+  // engineRef, so it always targets the current GameClient even after a
+  // snapshot rebuild swaps the instance; no-ops until the engine exists.
+  const renderTo = useCallback(
+    (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => {
+      engineRef.current?.render(canvas, cellSize, rotation, localUserId);
+    },
+    [],
+  );
+
   const startEngine = useCallback(() => {
     if (!engineRef.current || animationFrameRef.current !== null) {
       return;
@@ -335,8 +348,10 @@ export const useGameEngine = ({
         return;
       }
 
-      // Parse and send to server
-      const commandMessage = JSON.parse(commandMessageJson);
+      // Parse and send to server. The command envelope contains only u32
+      // fields (CommandId tick/user_id/sequence_number), so JSON.parse is
+      // lossless here — unlike the inbound event path with its u64 hashes.
+      const commandMessage: GameCommandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
 
       recordTrace({
@@ -354,25 +369,15 @@ export const useGameEngine = ({
     }
   }, [playerId, onCommandReady]);
 
-  // Process server event for reconciliation
-  const processServerEvent = useCallback(async (eventMessage: any) => {
+  // Process server event for reconciliation. `queued.message` is the
+  // JS-parsed GameEventMessage envelope, used only for routing (game_id is
+  // u32, the event kind is structural). `queued.raw` is the exact frame text,
+  // handed to the engine so full-range u64 fields (e.g. TickHash.hash) are
+  // parsed in Rust rather than corrupted by a JS JSON round-trip.
+  const processServerEvent = useCallback(async (queued: QueuedGameEvent) => {
     try {
-      // Check if it's just an event or a full event message
-      let fullEventMessage = eventMessage;
-      
-      // If we only received the event, we need to wrap it in a GameEventMessage
-      // TODO: Is this necessary? Shouldn't the server always send full messages?
-      if (!eventMessage.game_id && !eventMessage.tick && !eventMessage.event) {
-        console.warn('Received bare event, wrapping in GameEventMessage structure');
-        fullEventMessage = {
-          game_id: parseU32GameId(gameId) ?? 0,
-          tick: 0, // The server should provide the tick
-          user_id: null,
-          event: eventMessage
-        };
-      }
-      
-      const event = fullEventMessage.event || fullEventMessage;
+      const fullEventMessage = queued.message;
+      const event = fullEventMessage.event;
       const expectedGameId = parseU32GameId(gameId);
       const messageGameId = parseU32GameId(fullEventMessage.game_id);
 
@@ -386,28 +391,18 @@ export const useGameEngine = ({
       }
 
       // Ensure WASM runtime is ready before using the game client
-      if (typeof window !== 'undefined') {
-        if (!window.wasm || !window.wasm.GameClient) {
-          if (window.wasmReady) {
-            try {
-              await window.wasmReady;
-            } catch (initError) {
-              console.error('WASM initialization failed, cannot process server event:', initError);
-              return false;
-            }
-          }
-        }
-
-        if (!window.wasm || !window.wasm.GameClient) {
-          console.warn('WASM runtime unavailable, skipping server event processing');
+      let wasm = getWasm();
+      if (!wasm) {
+        try {
+          wasm = await initWasm();
+        } catch (initError) {
+          console.error('WASM initialization failed, cannot process server event:', initError);
           return false;
         }
-      } else {
-        console.warn('Window object is not available; skipping server event');
-        return false;
       }
 
-      const isSnapshot = Boolean(event.Snapshot && event.Snapshot.game_state);
+      const snapshotState = 'Snapshot' in event ? event.Snapshot.game_state : null;
+      const isSnapshot = snapshotState !== null;
       if (isSnapshot) {
         // A reconnect Snapshot replaces both committed and predicted state. Applying it to an
         // existing client only replaces committed state, which can leave pre-disconnect
@@ -425,10 +420,9 @@ export const useGameEngine = ({
           }
         }
 
-        engineRef.current = window.wasm.GameClient.newFromState(
-            expectedGameId,
-            JSON.stringify(event.Snapshot.game_state)
-        );
+        // Rebuild from the raw frame so the snapshot's u64 fields (rng.state)
+        // are parsed in Rust rather than corrupted by a JS JSON round-trip.
+        engineRef.current = wasm.GameClient.newFromSnapshotFrame(expectedGameId, queued.raw);
         engineRef.current.setLocalPlayerId(playerId);
 
         if (isFirstInit) {
@@ -437,7 +431,7 @@ export const useGameEngine = ({
           startTrace(
             expectedGameId,
             playerId,
-            event.Snapshot.game_state?.properties?.tick_duration_ms
+            snapshotState?.properties?.tick_duration_ms
           );
         } else {
           // The rebuilt engine starts with fresh sync counters; the snapshot
@@ -478,7 +472,9 @@ export const useGameEngine = ({
         // not the transport watermark. Feed the complete Snapshot envelope
         // through the engine as well so `stream_seq` is the baseline for the
         // very next delta (and a missing first delta cannot go undetected).
-        engineRef.current.processServerEvent(JSON.stringify(fullEventMessage));
+        // Forwarding the raw frame (rather than JSON.stringify(fullEventMessage))
+        // keeps full-range u64 fields intact end-to-end.
+        engineRef.current.processServerFrame(queued.raw);
 
         if (isSnapshot) {
           // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.
@@ -524,6 +520,7 @@ export const useGameEngine = ({
     connectionStale,
     sendCommand,
     processServerEvent,
+    renderTo,
     stopEngine,
   };
 };

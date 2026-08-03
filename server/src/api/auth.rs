@@ -34,12 +34,16 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct AuthResponse {
     pub token: String,
     pub user: UserInfo,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct UserInfo {
     pub id: i32,
     pub username: String,
@@ -54,6 +58,8 @@ pub struct CheckUsernameRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct CheckUsernameResponse {
     pub available: bool,
     pub errors: Vec<String>,
@@ -65,12 +71,16 @@ pub struct CreateGuestRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct CreateGuestResponse {
     pub token: String,
     pub user: GuestUserInfo,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GuestUserInfo {
     pub id: i32,
     pub username: String,

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Region } from '../types';
+import type { WSMessageTag, TypedMessage } from '../types/protocol';
 import {
   fetchRegionMetadata,
   loadRegionPreference,
@@ -20,7 +21,10 @@ export interface UseRegionsReturn {
 
 export interface UseRegionsOptions {
   isWebSocketConnected?: boolean;
-  onMessage?: (type: string, handler: (message: any) => void) => () => void;
+  onMessage?: <K extends WSMessageTag>(
+    type: K,
+    handler: (message: TypedMessage<K>) => void,
+  ) => () => void;
 }
 
 export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
@@ -36,7 +40,14 @@ export function useRegions(options: UseRegionsOptions = {}): UseRegionsReturn {
       const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:8080';
       const response = await fetch(`${apiUrl}/api/regions/user-counts`);
       if (!response.ok) return {};
-      return response.json();
+      // Server returns HashMap<String, u32>; validate before trusting it.
+      const data: unknown = await response.json();
+      if (!data || typeof data !== 'object') return {};
+      const counts: Record<string, number> = {};
+      for (const [region, value] of Object.entries(data)) {
+        if (typeof value === 'number') counts[region] = value;
+      }
+      return counts;
     } catch (error) {
       console.error('Failed to fetch user counts:', error);
       return {};

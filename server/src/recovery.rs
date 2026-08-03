@@ -68,6 +68,8 @@ pub fn validate_client_command_identity(identity: &ClientCommandIdentityV2) -> R
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum CommandOutcome {
     Scheduled { command: GameCommandMessage },
     Rejected { reason: String },
@@ -163,7 +165,10 @@ impl CommandDecisionV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct SessionCommandRejectionFence {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub from_sequence: u64,
     pub reason: String,
 }
