@@ -15,7 +15,7 @@ const LobbyInvitePage: React.FC = () => {
   const lobbyCode = (rawCode ?? '').toUpperCase();
   const navigate = useNavigate();
   const { user, createGuest, loading: authLoading, getToken } = useAuth();
-  const { isConnected, joinLobby, sendMessage } = useWebSocket();
+  const { isConnected, joinLobby, waitForSessionReady } = useWebSocket();
 
   const inFlightRef = useRef(false);
   const hasSucceededRef = useRef(false);
@@ -28,8 +28,6 @@ const LobbyInvitePage: React.FC = () => {
   useEffect(() => {
     latestUserRef.current = user;
   }, [user]);
-
-  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
   const ensureAuthenticatedSession = useCallback(async () => {
     let activeUser = latestUserRef.current;
@@ -49,9 +47,8 @@ const LobbyInvitePage: React.FC = () => {
       throw new Error('Missing authentication token');
     }
 
-    sendMessage({ Token: token });
-    await delay(50);
-  }, [createGuest, getToken, lobbyCode, sendMessage]);
+    await waitForSessionReady();
+  }, [createGuest, getToken, lobbyCode, waitForSessionReady]);
 
   useEffect(() => {
     if (hasSucceededRef.current) {

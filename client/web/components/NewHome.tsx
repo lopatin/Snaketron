@@ -21,7 +21,7 @@ export const NewHome: React.FC = () => {
   const {
     connectToRegion,
     isConnected,
-    isSessionAuthenticated,
+    waitForSessionReady,
     onMessage,
     currentRegionUrl,
     currentLobby,
@@ -33,30 +33,12 @@ export const NewHome: React.FC = () => {
     lobbyPreferences,
     updateLobbyPreferences,
   } = useWebSocket();
-  const { currentGameId, queueForMatch, queueForMatchMulti } = useGameWebSocket();
+  const { currentGameId, isQueued, queueForMatch, queueForMatchMulti } = useGameWebSocket();
   const [isLoading, setIsLoading] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
-
-  const waitForConnection = async (timeoutMs = 5000) => {
-    const start = Date.now();
-    // Trigger a reconnect if we have region data but no active socket
-    if (!isConnected) {
-      const target = selectedRegion ?? regions[0];
-      if (target && currentRegionUrl !== target.wsUrl) {
-        connectToRegion(target.wsUrl, { regionId: target.id, origin: target.origin });
-      }
-    }
-
-    while (Date.now() - start < timeoutMs) {
-      if (isConnected && (!user || isSessionAuthenticated)) {
-        return true;
-      }
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    return false;
-  };
+  const [startError, setStartError] = useState<string | null>(null);
 
   // Use regions hook for live data
   const {
@@ -70,7 +52,7 @@ export const NewHome: React.FC = () => {
     onMessage,
   });
   const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
-  const isLobbyQueued = currentLobby?.state === 'queued';
+  const isLobbyQueued = isQueued || currentLobby?.state === 'queued';
 
   // Connect to selected region when it changes
   useEffect(() => {
@@ -125,19 +107,16 @@ export const NewHome: React.FC = () => {
     }
 
     setIsLoading(true);
+    setStartError(null);
     try {
       // If not logged in, create guest user
       if (!user) {
-        try {
-          await createGuest(nickname);
-        } catch (error) {
-          console.error('Guest creation failed:', error);
-          return;
-        }
+        await createGuest(nickname);
       }
 
-      // Wait for auth to propagate
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Wait for the active regional socket to acknowledge this exact session
+      // before issuing lobby or matchmaking commands.
+      await waitForSessionReady();
 
       if (!currentLobby) {
         await createLobby();
@@ -147,9 +126,6 @@ export const NewHome: React.FC = () => {
         selectedModes: gameModes,
         competitive: isCompetitive,
       });
-
-      // Give the WebSocket a moment to broadcast lobby preferences before queuing
-      await new Promise(resolve => setTimeout(resolve, 100));
 
       // Convert game modes to GameType format
       const gameTypes = gameModes.map(mode => {
@@ -173,6 +149,13 @@ export const NewHome: React.FC = () => {
       }
     } catch (error) {
       console.error('Failed to start game:', error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof (error as any)?.message === 'string'
+            ? (error as any).message
+            : 'Failed to start matchmaking. Please try again.';
+      setStartError(message);
     } finally {
       setIsLoading(false);
     }
@@ -196,15 +179,9 @@ export const NewHome: React.FC = () => {
           console.error('Guest creation failed for lobby invite:', error);
           return;
         }
-
-        await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      const connected = await waitForConnection();
-      if (!connected) {
-        console.error('Could not establish WebSocket connection for lobby invite');
-        return;
-      }
+      await waitForSessionReady();
 
       if (!currentLobby) {
         await createLobby();
@@ -292,6 +269,7 @@ export const NewHome: React.FC = () => {
               isLobbyQueued={isLobbyQueued}
               lobbyPreferences={lobbyPreferences}
               onPreferencesChange={updateLobbyPreferences}
+              errorMessage={startError}
             />
             <SocialFooter />
           </div>
