@@ -32,6 +32,12 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_ansi(use_ansi))
         .init();
 
+    let metrics =
+        server::telemetry::init_metrics().context("Failed to initialize OpenTelemetry metrics")?;
+    if !metrics.is_enabled() {
+        info!("OpenTelemetry metrics export disabled (no OTLP endpoint configured)");
+    }
+
     // Database setup - now using DynamoDB
     let db: Arc<dyn Database> = Arc::new(
         DynamoDatabase::new()
@@ -130,7 +136,10 @@ async fn main() -> Result<()> {
     } else {
         info!("Received shutdown signal. Shutting down gracefully...");
     }
-    game_server.shutdown().await?;
+    let server_shutdown = game_server.shutdown().await;
+    let metrics_shutdown = metrics.shutdown().await;
+    server_shutdown?;
+    metrics_shutdown?;
 
     info!("Server shut down successfully");
     match fatal {
