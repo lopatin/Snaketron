@@ -56,6 +56,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     isConnected,
     isSessionAuthenticated,
     serverCapabilities,
+    matchmakingStatus,
+    setMatchmakingStatus,
     sendMessage,
     onMessage,
   } = useWebSocket();
@@ -75,8 +77,8 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const [gameLoadFailure, setGameLoadFailure] = useState<GameLoadFailure | null>(null);
   const [awaitingGameSnapshotForId, setAwaitingGameSnapshotForId] = useState<string | null>(null);
   const [isGameSnapshotSynchronized, setIsGameSnapshotSynchronized] = useState(false);
-  const [isQueued, setIsQueued] = useState(false);
-  const [isJoiningGame, setIsJoiningGame] = useState(false);
+  const isQueued = matchmakingStatus === 'queued';
+  const isJoiningGame = matchmakingStatus === 'joining';
   const requestedGameRef = useRef<{ routeGameId: string; gameId: number } | null>(null);
   const serverAssignedGameRef = useRef<number | null>(null);
   const awaitingGameSnapshotRef = useRef<string | null>(null);
@@ -151,8 +153,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           'Snapshot' in event
         ) {
           serverAssignedGameRef.current = null;
-          setIsQueued(false);
-          setIsJoiningGame(false);
+          setMatchmakingStatus('idle');
         }
 
         const requestedGame = requestedGameRef.current;
@@ -231,7 +232,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     // A game may have existed but no longer have a loadable live or persisted snapshot.
     unsubscribers.push(
       onMessage('GameLoadFailed', (message: any) => {
-        const payload = message?.data;
+        const payload = message?.data ?? message?.GameLoadFailed ?? message;
         const gameId = parseU32GameId(payload?.game_id);
 
         if (gameId === null) {
@@ -239,6 +240,10 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           return;
         }
 
+        if (serverAssignedGameRef.current === gameId) {
+          serverAssignedGameRef.current = null;
+          setMatchmakingStatus('idle');
+        }
         const requestedGame = requestedGameRef.current;
         if (
           !requestedGame ||
@@ -260,10 +265,6 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         if (user) {
           clearGameCommandOutbox(gameId, user.id);
         }
-        if (serverAssignedGameRef.current === gameId) {
-          serverAssignedGameRef.current = null;
-          setIsQueued(false);
-        }
 
         const reason =
           typeof payload?.reason === 'string' && payload.reason.trim()
@@ -272,7 +273,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
 
         console.warn(`Failed to load game ${gameId}: ${reason}`);
         updateGameSnapshotSynchronization(false);
-        setIsJoiningGame(false);
+        setMatchmakingStatus('idle');
         updateAwaitingGameSnapshot(null);
         setGameLoadFailure({
           gameId,
@@ -297,8 +298,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           // the retry once the route is mounted.
           serverAssignedGameRef.current = gameId;
           setCurrentGameId(gameId.toString());
-          setIsQueued(false);
-          setIsJoiningGame(true);
+          setMatchmakingStatus('joining');
           navigate(`/play/${gameId}`);
           return;
         }
@@ -312,7 +312,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
         updateGameSnapshotSynchronization(false);
         updateAwaitingGameSnapshot(requestedGame.routeGameId);
         setGameLoadFailure(null);
-        setIsJoiningGame(true);
+        setMatchmakingStatus('joining');
         if (warmingRetryTimeout) {
           clearTimeout(warmingRetryTimeout);
         }
@@ -371,8 +371,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
           console.log('Match found! Game ID:', parsedGameId);
           serverAssignedGameRef.current = parsedGameId;
           setCurrentGameId(parsedGameId.toString());
-          setIsQueued(false);
-          setIsJoiningGame(true);
+          setMatchmakingStatus('joining');
           
           // DON'T send JoinGame back - GameArena will handle joining
           // sendMessage({ JoinGame: parseInt(gameId.toString()) });
@@ -388,8 +387,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('AccessDenied', (message: any) => {
         console.error('Access denied:', message.data.reason);
         serverAssignedGameRef.current = null;
-        setIsQueued(false);
-        setIsJoiningGame(false);
+        setMatchmakingStatus('idle');
         // TODO: Show error to user
       })
     );
@@ -398,8 +396,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       onMessage('QueueLeft', () => {
         console.log('Received QueueLeft message from server, clearing queue state');
         serverAssignedGameRef.current = null;
-        setIsQueued(false);
-        setIsJoiningGame(false);
+        setMatchmakingStatus('idle');
       })
     );
 
@@ -481,6 +478,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     navigate,
     sendMessage,
     serverCapabilities,
+    setMatchmakingStatus,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
     user,
@@ -492,11 +490,12 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       completedOutcomeBarriersRef.current.delete(requestedGame.gameId);
       updateGameSnapshotSynchronization(false);
       updateAwaitingGameSnapshot(requestedGame.routeGameId);
-      setIsJoiningGame(true);
+      setMatchmakingStatus('joining');
     }
   }, [
     isConnected,
     isSessionAuthenticated,
+    setMatchmakingStatus,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
   ]);
@@ -522,7 +521,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       updateGameSnapshotSynchronization(false);
       gameEventQueueRef.current = [];
       updateAwaitingGameSnapshot(null);
-      setIsJoiningGame(false);
+      setMatchmakingStatus('idle');
       setGameLoadFailure({
         gameId: null,
         requestedGameId: gameId,
@@ -541,13 +540,14 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     gameEventQueueRef.current = [];
     setGameLoadFailure(null);
     updateAwaitingGameSnapshot(gameId);
-    setIsJoiningGame(true);
+    setMatchmakingStatus('joining');
     sendMessage({
       JoinGame: parsedGameId
     });
     return true;
   }, [
     sendMessage,
+    setMatchmakingStatus,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
   ]);
@@ -561,7 +561,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     updateGameSnapshotSynchronization(true);
     updateAwaitingGameSnapshot(null);
     setGameLoadFailure(null);
-    setIsJoiningGame(false);
+    setMatchmakingStatus('idle');
     if (
       !user ||
       !serverCapabilities.has('command-delivery-v2') ||
@@ -577,7 +577,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     for (const command of takeGameCommandsDueForRetry(gameId, user.id, Date.now(), 0)) {
       sendMessage({ GameCommandV2: command });
     }
-  }, [sendMessage, serverCapabilities, updateAwaitingGameSnapshot, updateGameSnapshotSynchronization, user]);
+  }, [sendMessage, serverCapabilities, setMatchmakingStatus, updateAwaitingGameSnapshot, updateGameSnapshotSynchronization, user]);
 
   // A semantic executor result is the acknowledgement. Periodic exact resends
   // cover an ambiguous gateway/XADD failure without adding a weaker receipt
@@ -677,38 +677,55 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
   const createSoloGame = useCallback(() => {
     console.log('Queueing for a solo game');
     serverAssignedGameRef.current = null;
-    setIsQueued(true);
-    setIsJoiningGame(false);
-    sendMessage({
-      QueueForMatch: { game_type: 'Solo', queue_mode: 'Quickmatch' }
-    });
-  }, [sendMessage]);
+    setMatchmakingStatus('queued');
+    try {
+      if (!sendMessage({
+        QueueForMatch: { game_type: 'Solo', queue_mode: 'Quickmatch' }
+      })) {
+        throw new Error('Connection was lost before matchmaking could start');
+      }
+    } catch (error) {
+      setMatchmakingStatus('idle');
+      throw error;
+    }
+  }, [sendMessage, setMatchmakingStatus]);
 
   const queueForMatch = useCallback((gameType: GameType, queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
     console.log('Queueing for match with game type:', gameType, 'mode:', queueMode);
-    setIsQueued(true);
-    setIsJoiningGame(false);
-    sendMessage({
-      QueueForMatch: { game_type: gameType, queue_mode: queueMode }
-    });
-  }, [sendMessage]);
+    setMatchmakingStatus('queued');
+    try {
+      if (!sendMessage({
+        QueueForMatch: { game_type: gameType, queue_mode: queueMode }
+      })) {
+        throw new Error('Connection was lost before matchmaking could start');
+      }
+    } catch (error) {
+      setMatchmakingStatus('idle');
+      throw error;
+    }
+  }, [sendMessage, setMatchmakingStatus]);
 
   const queueForMatchMulti = useCallback((gameTypes: GameType[], queueMode: 'Quickmatch' | 'Competitive' = 'Quickmatch') => {
     console.log('Queueing for match with multiple game types:', gameTypes, 'mode:', queueMode);
-    setIsQueued(true);
-    setIsJoiningGame(false);
-    sendMessage({
-      QueueForMatchMulti: { game_types: gameTypes, queue_mode: queueMode }
-    });
-  }, [sendMessage]);
+    setMatchmakingStatus('queued');
+    try {
+      if (!sendMessage({
+        QueueForMatchMulti: { game_types: gameTypes, queue_mode: queueMode }
+      })) {
+        throw new Error('Connection was lost before matchmaking could start');
+      }
+    } catch (error) {
+      setMatchmakingStatus('idle');
+      throw error;
+    }
+  }, [sendMessage, setMatchmakingStatus]);
 
   const leaveQueue = useCallback(() => {
     console.log('Sending LeaveQueue message');
     sendMessage('LeaveQueue');
     serverAssignedGameRef.current = null;
-    setIsQueued(false);
-    setIsJoiningGame(false);
-  }, [sendMessage]);
+    setMatchmakingStatus('idle');
+  }, [sendMessage, setMatchmakingStatus]);
 
   const leaveGame = useCallback(() => {
     console.log('Sending LeaveGame message (initial state issue):');
@@ -730,10 +747,10 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     setIsHost(false);
     setCustomGameCode(null);
     setGameLoadFailure(null);
-    setIsQueued(false);
-    setIsJoiningGame(false);
+    setMatchmakingStatus('idle');
   }, [
     sendMessage,
+    setMatchmakingStatus,
     updateAwaitingGameSnapshot,
     updateGameSnapshotSynchronization,
     user,

@@ -37,6 +37,7 @@ interface GameStartFormProps {
   isLobbyQueued?: boolean;
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
+  errorMessage?: string | null;
 }
 
 export const GameStartForm: React.FC<GameStartFormProps> = ({
@@ -47,6 +48,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   isLobbyQueued = false,
   lobbyPreferences,
   onPreferencesChange,
+  errorMessage = null,
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
@@ -362,6 +364,13 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
         >
           {startButtonLabel}
         </button>
+        <div className="min-h-5 mt-3" aria-live="polite">
+          {errorMessage && (
+            <p className="text-sm text-red-600 text-center" role="alert">
+              {errorMessage}
+            </p>
+          )}
+        </div>
       </div>
     </form>
   );

@@ -9,6 +9,7 @@ import {
   LobbyGameMode,
   LobbyState,
   User,
+  MatchmakingStatus,
 } from '../types';
 import { clockSync } from '../utils/clockSync';
 import { record as recordTrace } from '../utils/syncTrace';
@@ -208,7 +209,7 @@ const normalizeLobbyPreferences = (payload: any): LobbyPreferences => {
 
 interface StoredLobbyInfo {
   code: string;
-  id?: number;
+  id?: number | null;
 }
 
 interface PendingMatchmakingIntent {
@@ -235,6 +236,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences | null>(storedPreferences);
+  const [matchmakingStatus, setMatchmakingStatus] = useState<MatchmakingStatus>('idle');
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
   const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
   const currentLobbyRef = useRef<Lobby | null>(null);
@@ -391,7 +393,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
-  const persistLobby = useCallback((lobby: { id: number; code: string }) => {
+  const persistLobby = useCallback((lobby: { id: number | null; code: string }) => {
     storedLobbyRef.current = { id: lobby.id, code: lobby.code.toUpperCase() };
 
     if (typeof window === 'undefined') {
@@ -424,6 +426,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   const resetLobbyState = useCallback(() => {
     pendingMatchmakingIntentRef.current = null;
+    setMatchmakingStatus('idle');
     setCurrentLobby(null);
     currentLobbyRef.current = null;
     setLobbyMembers([]);
@@ -1336,17 +1339,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
     setIsConnected(false);
     setAuthHandshakeState(false);
+    lastAuthTokenRef.current = null;
     setServerCapabilities(new Set());
     plannedHandoffStartedAtRef.current = null;
     recoveryStartedAtRef.current = null;
     usableGapStartedAtRef.current = null;
   }, [setAuthHandshakeState]);
 
-  const connectToRegion = useCallback((wsUrl: string, options?: { regionId?: string; origin?: string }) => {
+  const connectToRegion = useCallback((
+    wsUrl: string,
+    options?: { regionId?: string; origin?: string; forceReconnect?: boolean },
+  ) => {
     console.log('Switching to region:', wsUrl);
-    disconnect();
-    reconnectEnabledRef.current = true;
-    reconnectAttemptRef.current = 0;
     if (options?.regionId) {
       saveRegionPreference({
         regionId: options.regionId,
@@ -1355,11 +1359,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         timestamp: Date.now(),
       });
     }
+
+    const active = activeSlotRef.current;
+    const isSameActiveRegion = Boolean(
+      active &&
+      active.role === 'active' &&
+      active.url === wsUrl &&
+      (active.socket.readyState === WebSocket.OPEN ||
+        active.socket.readyState === WebSocket.CONNECTING),
+    );
+    if (isSameActiveRegion && !options?.forceReconnect) {
+      return;
+    }
+
+    disconnect();
+    reconnectEnabledRef.current = true;
+    reconnectAttemptRef.current = 0;
     connect(wsUrl, onConnectCallback.current || undefined);
   }, [connect, disconnect]);
 
   const sendMessage = useCallback((message: any) => {
-    if (isMatchmakingQueueIntent(message)) {
+    const isQueueIntent = isMatchmakingQueueIntent(message);
+    if (isQueueIntent) {
       const authToken = getToken();
       const lobbyCode = (
         currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? ''
@@ -1375,50 +1396,129 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       pendingMatchmakingIntentRef.current = null;
     }
     const target = activeSlotRef.current;
-    const doSend = () => {
+    const targetCanSend = () => Boolean(
+      target &&
+      isCommandOwner(
+        activeSlotRef.current?.generation ?? null,
+        target.generation,
+        target.role,
+        target.socket.readyState,
+      ) &&
+      (!isQueueIntent || (
+        target.authenticated &&
+        target.authTokenSent === pendingMatchmakingIntentRef.current?.authToken
+      ))
+    );
+    const doSend = (): boolean => {
       if (
         target &&
-        isCommandOwner(
-          activeSlotRef.current?.generation ?? null,
-          target.generation,
-          target.role,
-          target.socket.readyState,
-        )
+        targetCanSend()
       ) {
-        target.socket.send(JSON.stringify(message));
-        console.log('WebSocket message sent:', message, 'generation:', target.generation);
+        try {
+          target.socket.send(JSON.stringify(message));
+          console.log('WebSocket message sent:', message, 'generation:', target.generation);
+          return true;
+        } catch (error) {
+          console.error('Failed to send WebSocket message:', error);
+          return false;
+        }
       } else {
         console.error('WebSocket is not connected');
+        return false;
       }
     };
     if (latencySettings.enabled && latencySettings.sendDelayMs > 0) {
       setTimeout(doSend, latencySettings.sendDelayMs);
+      // Queue admission is a retained logical intent. A transport transition
+      // after readiness may defer the physical frame, but restoration will
+      // replay it against the same authenticated lobby identity.
+      return isQueueIntent || targetCanSend();
     } else {
-      doSend();
+      return doSend() || isQueueIntent;
     }
   }, [getToken, latencySettings]);
 
   const authenticateConnection = useCallback(() => {
     const slot = activeSlotRef.current;
-    if (!slot || slot.socket.readyState !== WebSocket.OPEN) {
+    if (
+      !slot ||
+      slot.role !== 'active' ||
+      slot.socket.readyState !== WebSocket.OPEN
+    ) {
       return false;
     }
     const token = getToken();
     if (!token) {
       return false;
     }
-    if (slot.authenticated && slot.authTokenSent === token) {
-      setAuthHandshakeState(true);
-      return true;
+    if (slot.authenticated) {
+      if (slot.authTokenSent === token) {
+        setAuthHandshakeState(true);
+        return true;
+      }
+
+      // Token is only valid during the initial server handshake. The auth
+      // effect will replace this wrong-identity socket; never send a second
+      // Token frame on an already authenticated connection.
+      return false;
     }
     if (slot.authTokenSent !== token) {
+      // A different identity is already being authenticated on this socket.
+      // Let the token-change effect replace it before sending any command.
+      if (slot.authTokenSent !== null) {
+        return false;
+      }
       slot.authStartedAtMs = Date.now();
       slot.authTokenSent = token;
-      slot.socket.send(JSON.stringify({ Token: token }));
+      try {
+        slot.socket.send(JSON.stringify({ Token: token }));
+      } catch (error) {
+        slot.authStartedAtMs = null;
+        slot.authTokenSent = null;
+        console.error('Failed to authenticate WebSocket connection:', error);
+        return false;
+      }
       lastAuthTokenRef.current = token;
     }
     return slot.authenticated;
   }, [getToken, setAuthHandshakeState]);
+
+  const waitForSessionReady = useCallback(async (timeoutMs = 10_000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const token = getToken();
+      const slot = activeSlotRef.current;
+      if (
+        token &&
+        slot &&
+        slot.role === 'active' &&
+        slot.socket.readyState === WebSocket.OPEN &&
+        slot.authenticated &&
+        slot.authTokenSent === token
+      ) {
+        return;
+      }
+
+      if (
+        token &&
+        slot &&
+        slot.role === 'active' &&
+        slot.socket.readyState === WebSocket.OPEN &&
+        !slot.authenticated &&
+        (slot.authTokenSent === null || slot.authTokenSent === token)
+      ) {
+        authenticateConnection();
+      }
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+
+    if (!getToken()) {
+      throw new Error('Your player session is not ready. Please try again.');
+    }
+    throw new Error('Could not connect to the game server. Please try again.');
+  }, [authenticateConnection, getToken]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
     const trimmed = message.trim();
@@ -1490,10 +1590,27 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       pendingMatchmakingIntentRef.current.authToken !== token
     ) {
       pendingMatchmakingIntentRef.current = null;
+      setMatchmakingStatus('idle');
     }
     if (!token) {
+      const active = activeSlotRef.current;
+      const reconnectUrl = active?.url ?? currentRegionUrl;
+      const carriedAuthenticatedIdentity = Boolean(
+        active &&
+        active.role === 'active' &&
+        (active.authenticated || active.authTokenSent !== null),
+      );
+
+      previousUserRef.current = user;
+      setMatchmakingStatus('idle');
       setAuthHandshakeState(false);
       lastAuthTokenRef.current = null;
+      // Logging out must retire the server-side identity as well as clearing
+      // React state. Reconnect anonymously so a later guest cannot issue
+      // commands through the previous user's authenticated transport.
+      if (carriedAuthenticatedIdentity && reconnectUrl) {
+        connectToRegion(reconnectUrl, { forceReconnect: true });
+      }
       return;
     }
 
@@ -1543,6 +1660,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     isSessionAuthenticated,
     currentRegionUrl,
     connect,
+    connectToRegion,
     disconnect,
     getToken,
     authenticateConnection,
@@ -1643,6 +1761,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   // Lobby methods
   const createLobby = useCallback(async () => {
+    await waitForSessionReady();
+
+    // Re-read the mutable lobby source after awaiting auth. A stored-lobby
+    // restoration or another request may have completed since this render.
+    if (currentLobbyRef.current) {
+      return;
+    }
+
     const requestedInitialPreferences = buildInitialLobbyPreferences();
     const initialPreferencesClone: LobbyPreferences = {
       selectedModes: [...requestedInitialPreferences.selectedModes],
@@ -1659,16 +1785,38 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
+      let cleanupCreated = () => {};
+      let cleanupDenied = () => {};
+      const cleanupHandlers = () => {
+        cleanupCreated();
+        cleanupDenied();
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      };
+
       // Set up one-time handler for LobbyCreated message
-      const cleanup = onMessage('LobbyCreated', (message: any) => {
+      cleanupCreated = onMessage('LobbyCreated', (message: any) => {
         if (settled) {
           return;
         }
 
-        const { lobby_id, lobby_code } = message.data;
+        const { lobby_id, lobby_code } = message.data ?? {};
+        if (typeof lobby_code !== 'string' || !lobby_code.trim()) {
+          settled = true;
+          cleanupHandlers();
+          finishRequest();
+          reject(new Error('Game server returned an invalid lobby response'));
+          return;
+        }
+
         const normalizedCode = lobby_code.toUpperCase();
+        const lobbyId = typeof lobby_id === 'number' && Number.isFinite(lobby_id)
+          ? lobby_id
+          : null;
         const newLobby: Lobby = {
-          id: lobby_id,
+          id: lobbyId,
           code: normalizedCode,
           hostUserId: user?.id ?? 0, // Optimistically assume creator is host
           region: '', // Will be set by LobbyUpdate
@@ -1678,7 +1826,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         setCurrentLobby(newLobby);
         // console.log('setLobbyPreferences', DEFAULT_LOBBY_PREFERENCES);
         // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
-        persistLobby({ id: lobby_id, code: normalizedCode });
+        persistLobby({ id: lobbyId, code: normalizedCode });
 
         if (initialPreferencesClone.selectedModes.length > 0) {
           desiredLobbyPreferencesRef.current = initialPreferencesClone;
@@ -1692,22 +1840,31 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
 
         settled = true;
-        cleanup();
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
+        cleanupHandlers();
         finishRequest();
         resolve();
       });
 
-      // Send CreateLobby message
-      try {
-        sendMessage('CreateLobby');
-      } catch (error) {
+      cleanupDenied = onMessage('AccessDenied', (message: any) => {
+        if (settled) {
+          return;
+        }
+        const reason =
+          typeof message?.data?.reason === 'string' && message.data.reason.trim()
+            ? message.data.reason.trim()
+            : 'Lobby creation was denied';
         settled = true;
-        cleanup();
+        cleanupHandlers();
         finishRequest();
-        reject(error);
+        reject(new Error(reason));
+      });
+
+      // Send CreateLobby message
+      if (!sendMessage('CreateLobby')) {
+        settled = true;
+        cleanupHandlers();
+        finishRequest();
+        reject(new Error('Connection was lost before the lobby could be created'));
         return;
       }
 
@@ -1717,7 +1874,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           return;
         }
         settled = true;
-        cleanup();
+        cleanupHandlers();
         finishRequest();
         reject(new Error('Timeout waiting for lobby creation'));
       }, 5000);
@@ -1729,9 +1886,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     persistLobby,
     user?.id,
     buildInitialLobbyPreferences,
+    waitForSessionReady,
   ]);
 
   const joinLobby = useCallback(async (lobbyCode: string) => {
+    await waitForSessionReady();
+
     const normalizedCode = lobbyCode.trim().toUpperCase();
     const joinPreferences = buildInitialLobbyPreferences();
     return new Promise<void>((resolve, reject) => {
@@ -1755,7 +1915,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
       };
 
-      const handleSuccess = (lobbyId: number, hostUserId?: number) => {
+      const handleSuccess = (lobbyId: number | null, hostUserId?: number) => {
         if (settled) {
           return;
         }
@@ -1787,8 +1947,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (settled) {
           return;
         }
-        const { lobby_id } = message.data;
-        handleSuccess(lobby_id);
+        const { lobby_id } = message.data ?? {};
+        const lobbyId = typeof lobby_id === 'number' && Number.isFinite(lobby_id)
+          ? lobby_id
+          : null;
+        handleSuccess(lobbyId);
       });
 
       cleanupDenied = onMessage('AccessDenied', (message: any) => {
@@ -1833,8 +1996,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         if (settled) {
           return;
         }
-        const { lobby_id, host_user_id } = message.data;
-        handleSuccess(lobby_id, host_user_id);
+        const { lobby_id, host_user_id } = message.data ?? {};
+        const lobbyId = typeof lobby_id === 'number' && Number.isFinite(lobby_id)
+          ? lobby_id
+          : null;
+        handleSuccess(lobbyId, host_user_id);
       });
 
       // Timeout after 5 seconds
@@ -1848,21 +2014,19 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         reject(new Error('Timeout waiting to join lobby'));
       }, 5000);
 
-      try {
-        sendMessage({
-          JoinLobby: {
-            lobby_code: normalizedCode,
-            preferences: {
-              selected_modes: joinPreferences.selectedModes,
-              competitive: joinPreferences.competitive,
-            },
+      if (!sendMessage({
+        JoinLobby: {
+          lobby_code: normalizedCode,
+          preferences: {
+            selected_modes: joinPreferences.selectedModes,
+            competitive: joinPreferences.competitive,
           },
-        });
-      } catch (error) {
+        },
+      })) {
         settled = true;
         cleanupHandlers();
         finishRequest();
-        reject(error);
+        reject(new Error('Connection was lost before the lobby could be joined'));
       }
     });
   }, [
@@ -1874,6 +2038,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     resetLobbyState,
     isLobbyMissingReason,
     buildInitialLobbyPreferences,
+    waitForSessionReady,
   ]);
 
   const leaveLobby = useCallback(async () => {
@@ -2463,6 +2628,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     isSessionAuthenticated,
     serverCapabilities,
     sendMessage,
+    waitForSessionReady,
     onMessage,
     connect,
     disconnect,
@@ -2474,6 +2640,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     lobbyChatMessages,
     gameChatMessages,
     lobbyPreferences,
+    matchmakingStatus,
+    setMatchmakingStatus,
     createLobby,
     joinLobby,
     leaveLobby,

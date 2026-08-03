@@ -19,7 +19,7 @@ export interface AuthContextType {
 
 // Lobby Types
 export interface Lobby {
-  id: number;
+  id: number | null;
   code: string;
   hostUserId: number;
   region: string;
@@ -49,6 +49,7 @@ export interface ChatMessage {
 
 export type LobbyState = 'waiting' | 'queued' | 'matched';
 export type LobbyGameMode = 'duel' | '2v2' | 'solo' | 'ffa';
+export type MatchmakingStatus = 'idle' | 'queued' | 'joining';
 
 export interface LobbyPreferences {
   selectedModes: LobbyGameMode[];
@@ -60,11 +61,15 @@ export interface WebSocketContextType {
   isConnected: boolean;
   isSessionAuthenticated: boolean;
   serverCapabilities: ReadonlySet<string>;
-  sendMessage: (message: any) => void;
+  sendMessage: (message: any) => boolean;
+  waitForSessionReady: (timeoutMs?: number) => Promise<void>;
   onMessage: (type: string, handler: (message: any) => void) => () => void;
   connect: (url: string, onConnect?: () => void) => void;
   disconnect: () => void;
-  connectToRegion: (wsUrl: string, options?: { regionId?: string; origin?: string }) => void;
+  connectToRegion: (
+    wsUrl: string,
+    options?: { regionId?: string; origin?: string; forceReconnect?: boolean }
+  ) => void;
   currentRegionUrl: string | null;
   latencyMs: number;
 
@@ -74,6 +79,8 @@ export interface WebSocketContextType {
   lobbyChatMessages: ChatMessage[];
   gameChatMessages: ChatMessage[];
   lobbyPreferences: LobbyPreferences | null;
+  matchmakingStatus: MatchmakingStatus;
+  setMatchmakingStatus: (status: MatchmakingStatus) => void;
 
   // Lobby methods
   createLobby: () => Promise<void>;
