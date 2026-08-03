@@ -1366,7 +1366,8 @@ impl GameActor {
             .clone()
             .context("terminal game has no materialized completion record")?;
         let covered = self.pending_stream_ids.clone();
-        self.bus
+        let newly_committed = self
+            .bus
             .commit_completion_record_fenced(
                 &self.guard,
                 &self.envelope(),
@@ -1375,6 +1376,19 @@ impl GameActor {
                 self.config.retention,
             )
             .await?;
+        if newly_committed {
+            let duration_ms = u64::try_from(
+                record
+                    .ended_at_ms
+                    .saturating_sub(record.final_state.start_ms)
+                    .max(0),
+            )
+            .unwrap_or(u64::MAX);
+            crate::resilience_metrics::record_game_completed(
+                duration_ms,
+                record.final_state.players.len(),
+            );
+        }
         self.pending_stream_ids.clear();
         // The immutable record and pending-effect index are now authoritative.
         // DynamoDB is deliberately decoupled from this actor: the partition

@@ -532,7 +532,33 @@ pub async fn handle_websocket(
     )
     .await
     {
+        crate::resilience_metrics::record_websocket_process_error(1);
         error!("WebSocket connection error: {}", e);
+    }
+}
+
+fn tungstenite_message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+        Message::Close(frame) => frame
+            .as_ref()
+            .map(|frame| frame.reason.len().saturating_add(2))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn axum_message_bytes(message: &axum::extract::ws::Message) -> usize {
+    match message {
+        axum::extract::ws::Message::Text(text) => text.len(),
+        axum::extract::ws::Message::Binary(data)
+        | axum::extract::ws::Message::Ping(data)
+        | axum::extract::ws::Message::Pong(data) => data.len(),
+        axum::extract::ws::Message::Close(frame) => frame
+            .as_ref()
+            .map(|frame| frame.reason.len().saturating_add(2))
+            .unwrap_or(0),
     }
 }
 
@@ -617,6 +643,7 @@ async fn handle_websocket_connection(
         )
         .await
         {
+            let outbound_bytes = tungstenite_message_bytes(&msg);
             // Convert to Axum WebSocket message
             let axum_msg = match msg {
                 Message::Text(text) => axum::extract::ws::Message::Text(text.to_string()),
@@ -634,9 +661,11 @@ async fn handle_websocket_connection(
             };
 
             if let Err(e) = ws_sink.send(axum_msg).await {
+                crate::resilience_metrics::record_websocket_send_error(1);
                 error!("Failed to send message to WebSocket: {}", e);
                 break;
             }
+            crate::resilience_metrics::record_websocket_outbound_message(outbound_bytes);
         }
     });
 
@@ -718,6 +747,9 @@ async fn handle_websocket_connection(
             Some(result) = ws_stream.next() => {
                 match result {
                     Ok(msg) => {
+                        crate::resilience_metrics::record_websocket_inbound_message(
+                            axum_message_bytes(&msg),
+                        );
                         // Convert Axum message to tokio-tungstenite message for processing
                         let tungstenite_msg = match msg {
                             axum::extract::ws::Message::Text(text) => Message::Text(text.into()),
@@ -734,6 +766,7 @@ async fn handle_websocket_connection(
                         if let Message::Text(text) = tungstenite_msg {
                             match serde_json::from_str::<WSMessage>(&text) {
                                 Ok(WSMessage::RequestResync { game_id: resync_game_id }) => {
+                                    crate::resilience_metrics::record_websocket_resync_requested(1);
                                     // The client detected loss or divergence (stream
                                     // gap, repeated fingerprint mismatch, or a dead
                                     // feed). Restart its event forwarder — which
@@ -750,6 +783,7 @@ async fn handle_websocket_connection(
                                         .map(|t| now.duration_since(t) >= Duration::from_millis(500))
                                         .unwrap_or(true);
                                     if in_this_game && allowed {
+                                        crate::resilience_metrics::record_websocket_resync_accepted(1);
                                         last_resync_at = Some(now);
                                         if let ConnectionState::Authenticated { metadata, .. } = &state {
                                             let user_id = metadata.user_id as u32;
@@ -778,11 +812,14 @@ async fn handle_websocket_connection(
                                                 ).await;
                                             }));
                                         }
-                                    } else if !in_this_game {
-                                        debug!(
-                                            "Ignoring resync request for game {} from connection not in that game",
-                                            resync_game_id
-                                        );
+                                    } else {
+                                        crate::resilience_metrics::record_websocket_resync_rejected(1);
+                                        if !in_this_game {
+                                            debug!(
+                                                "Ignoring resync request for game {} from connection not in that game",
+                                                resync_game_id
+                                            );
+                                        }
                                     }
                                 }
                                 Ok(ws_message) => {
@@ -1131,6 +1168,7 @@ async fn handle_websocket_connection(
                                             state = new_state;
                                         }
                                         Err(e) => {
+                                            crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
                                             // State was consumed, need to reset
                                             state = ConnectionState::Unauthenticated;
@@ -1139,12 +1177,14 @@ async fn handle_websocket_connection(
                                     }
                                 }
                                 Err(e) => {
+                                    crate::resilience_metrics::record_websocket_malformed_message(1);
                                     error!("Failed to parse WebSocket message: {}", e);
                                 }
                             }
                         }
                     }
                     Err(e) => {
+                        crate::resilience_metrics::record_websocket_transport_error(1);
                         error!("WebSocket error: {}", e);
                         break;
                     }

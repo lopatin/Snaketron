@@ -17,8 +17,8 @@ use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::{
-    ActiveMatch, GameCreatedOutboxRecord, MatchCommitOutcome, MatchStatus, MatchmakingManager,
-    QueuedPlayer,
+    ActiveMatch, GameCreatedOutboxRecord, MATCHMAKING_GAME_TYPES, MatchCommitOutcome, MatchStatus,
+    MatchmakingManager, QueuedPlayer,
 };
 
 // --- Configuration Constants ---
@@ -73,6 +73,7 @@ async fn deliver_game_created_outbox_record(
 ) {
     let game_id = delivery.record.game_id;
     if let Err(error) = game_bus.publish_game_created_once(&delivery.record).await {
+        crate::resilience_metrics::record_game_created_outbox_delivery_error(1);
         warn!(game_id, %error, "game-created outbox delivery failed; retrying");
         return;
     }
@@ -82,10 +83,12 @@ async fn deliver_game_created_outbox_record(
     {
         Ok(_) => {
             if let Err(error) = game_bus.expire_game_created_delivery_marker(game_id).await {
+                crate::resilience_metrics::record_game_created_outbox_delivery_error(1);
                 warn!(game_id, %error, "failed to expire acknowledged game-created marker");
             }
         }
         Err(error) => {
+            crate::resilience_metrics::record_game_created_outbox_delivery_error(1);
             warn!(game_id, %error, "game-created outbox acknowledgement failed; retrying");
         }
     }
@@ -159,6 +162,7 @@ pub async fn run_game_created_outbox_loop(
             let (next_cursor, records) = match scan_result {
                 Ok(batch) => batch,
                 Err(error) => {
+                    crate::resilience_metrics::record_game_created_outbox_delivery_error(1);
                     warn!(%error, "game-created outbox scan failed; retrying");
                     cursor = 0;
                     continue;
@@ -924,20 +928,9 @@ pub async fn run_matchmaking_loop(
             }
         }
 
-        // Get distinct game types from Redis
-        // For now, we'll check a few common game types
-        // In production, we'd maintain a set of active game types
-        let game_types = vec![
-            GameType::Solo,
-            GameType::FreeForAll { max_players: 2 },
-            GameType::FreeForAll { max_players: 4 },
-            GameType::TeamMatch { per_team: 1 },
-            GameType::TeamMatch { per_team: 2 },
-        ];
-
         let mut total_games_created = 0;
 
-        for game_type in &game_types {
+        for game_type in &MATCHMAKING_GAME_TYPES {
             // Try lobby-based matchmaking for quickmatch
             match create_lobby_matches(
                 &mut matchmaking_manager,

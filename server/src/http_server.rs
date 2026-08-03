@@ -9,6 +9,7 @@ use axum::{
     routing::{get, options, post},
 };
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -314,11 +315,22 @@ pub async fn install_http_application(
         // Nest API routes
         .nest("/", api_routes)
         .layer(cors)
+        .layer(middleware::from_fn(observe_application_request))
         .with_state(state);
 
     deferred.install(app)?;
     info!("HTTP API and WebSocket routes installed");
     Ok(())
+}
+
+async fn observe_application_request(request: Request<Body>, next: middleware::Next) -> Response {
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    crate::resilience_metrics::record_http_request(
+        response.status().as_u16(),
+        started_at.elapsed(),
+    );
+    response
 }
 
 #[derive(serde::Deserialize)]
@@ -388,6 +400,7 @@ async fn websocket_handler(
     State(state): State<HttpServerState>,
 ) -> axum::response::Response {
     if !state.lifecycle.is_ready() {
+        crate::resilience_metrics::record_websocket_rejected_upgrade(1);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "1")],
@@ -405,9 +418,11 @@ async fn websocket_handler(
         // after the 101 response is prepared but before Axum runs this future.
         let count = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
         lifecycle.websocket_opened();
+        crate::resilience_metrics::record_websocket_opened(1);
         tracing::debug!("WebSocket connection opened, total connections: {}", count);
 
         // Handle the WebSocket connection
+        let session_started_at = Instant::now();
         handle_websocket(
             socket,
             state.db,
@@ -426,10 +441,12 @@ async fn websocket_handler(
             state.cluster_namespace,
         )
         .await;
+        crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
         lifecycle.websocket_closed();
+        crate::resilience_metrics::record_websocket_closed(1);
         tracing::debug!("WebSocket connection closed, total connections: {}", count);
     })
     .into_response()

@@ -3,6 +3,10 @@
 //! Correctness must not depend on metrics. Collection therefore uses its own
 //! best-effort loop and never changes liveness or lease state when CloudWatch,
 //! Valkey, or stdout is unavailable.
+//!
+//! Count/sum/max components use independent atomics. A request concurrent with
+//! the interval snapshot can split those components across adjacent windows,
+//! so dashboard averages derived from them are approximate over short windows.
 
 use crate::cluster_membership::{
     ClusterNamespace, EXECUTOR_PROTOCOL_VERSION, MembershipStore, TaskLifecycle,
@@ -19,11 +23,13 @@ use serde_json::{Map, Value, json};
 use std::array;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-const EMF_NAMESPACE: &str = "Snaketron/Resilience";
+const PRODUCTION_EMF_NAMESPACE: &str = "Snaketron/Operational";
+const NON_PRODUCTION_EMF_NAMESPACE: &str = "Snaketron/OperationalDev";
 const DEFAULT_EMIT_INTERVAL_SECS: u64 = 15;
 const OWNERSHIP_SAMPLE_INTERVAL_MS: i64 = 500;
 // The exact regional scan performs roughly sixty independently routed cluster
@@ -34,6 +40,8 @@ const RECOVERY_METADATA_BATCH_SIZE: usize = 32;
 const RECOVERY_TAIL_SAMPLE_BYTES: i64 = 512;
 const CHECKPOINTED_AT_MARKER: &[u8] = b"\"checkpointed_at_ms\":";
 const SOURCE_LEASE_TOKEN_MARKER: &[u8] = b"\"source_lease_token\":\"";
+const MATCHMAKING_QUEUE_COUNT: usize = crate::matchmaking_manager::MATCHMAKING_GAME_TYPES.len()
+    * crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES.len();
 
 #[derive(Default)]
 struct Counters {
@@ -51,6 +59,46 @@ struct Counters {
     recovery_replays: AtomicU64,
     match_claim_conflicts: AtomicU64,
     duplicate_completion_effects_prevented: AtomicU64,
+    http_requests: AtomicU64,
+    http_responses_4xx: AtomicU64,
+    http_responses_5xx: AtomicU64,
+    http_request_latency_ms_sum: AtomicU64,
+    http_request_latency_ms_max: AtomicU64,
+    websocket_opens: AtomicU64,
+    websocket_closes: AtomicU64,
+    websocket_rejected_upgrades: AtomicU64,
+    websocket_inbound_messages: AtomicU64,
+    websocket_inbound_bytes: AtomicU64,
+    websocket_outbound_messages: AtomicU64,
+    websocket_outbound_bytes: AtomicU64,
+    websocket_malformed_messages: AtomicU64,
+    websocket_process_errors: AtomicU64,
+    websocket_send_errors: AtomicU64,
+    websocket_transport_errors: AtomicU64,
+    websocket_session_duration_ms_sum: AtomicU64,
+    websocket_session_duration_ms_max: AtomicU64,
+    websocket_resync_requests: AtomicU64,
+    websocket_resync_accepted: AtomicU64,
+    websocket_resync_rejected: AtomicU64,
+    matchmaking_admissions: AtomicU64,
+    matchmaking_admission_deduplications: AtomicU64,
+    matchmaking_admission_rejections: AtomicU64,
+    matchmaking_commits: AtomicU64,
+    matchmaking_wait_ms_sum: AtomicU64,
+    matchmaking_wait_ms_max: AtomicU64,
+    matchmaking_matched_players: AtomicU64,
+    matchmaking_matched_lobbies: AtomicU64,
+    matchmaking_errors: AtomicU64,
+    matchmaking_integrity_errors: AtomicU64,
+    game_created_outbox_delivery_errors: AtomicU64,
+    games_completed: AtomicU64,
+    game_duration_ms_sum: AtomicU64,
+    game_duration_ms_max: AtomicU64,
+    completed_game_players: AtomicU64,
+    redis_requests: AtomicU64,
+    redis_errors: AtomicU64,
+    redis_request_latency_ms_sum: AtomicU64,
+    redis_request_latency_ms_max: AtomicU64,
 }
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
@@ -88,6 +136,147 @@ counter_fn!(
     duplicate_completion_effects_prevented
 );
 
+counter_fn!(record_websocket_opened, websocket_opens);
+counter_fn!(record_websocket_closed, websocket_closes);
+counter_fn!(
+    record_websocket_rejected_upgrade,
+    websocket_rejected_upgrades
+);
+counter_fn!(
+    record_websocket_malformed_message,
+    websocket_malformed_messages
+);
+counter_fn!(record_websocket_process_error, websocket_process_errors);
+counter_fn!(record_websocket_send_error, websocket_send_errors);
+counter_fn!(record_websocket_transport_error, websocket_transport_errors);
+counter_fn!(record_websocket_resync_requested, websocket_resync_requests);
+counter_fn!(record_websocket_resync_accepted, websocket_resync_accepted);
+counter_fn!(record_websocket_resync_rejected, websocket_resync_rejected);
+counter_fn!(record_matchmaking_admission, matchmaking_admissions);
+counter_fn!(
+    record_matchmaking_admission_deduplication,
+    matchmaking_admission_deduplications
+);
+counter_fn!(
+    record_matchmaking_admission_rejection,
+    matchmaking_admission_rejections
+);
+counter_fn!(record_matchmaking_error, matchmaking_errors);
+counter_fn!(
+    record_matchmaking_integrity_error,
+    matchmaking_integrity_errors
+);
+counter_fn!(
+    record_game_created_outbox_delivery_error,
+    game_created_outbox_delivery_errors
+);
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn record_sum_and_max(sum: &AtomicU64, max: &AtomicU64, value: u64) {
+    sum.fetch_add(value, Ordering::Relaxed);
+    max.fetch_max(value, Ordering::Relaxed);
+}
+
+pub fn record_http_request(status_code: u16, latency: Duration) {
+    let counters = counters();
+    counters.http_requests.fetch_add(1, Ordering::Relaxed);
+    if (400..500).contains(&status_code) {
+        counters.http_responses_4xx.fetch_add(1, Ordering::Relaxed);
+    } else if status_code >= 500 {
+        counters.http_responses_5xx.fetch_add(1, Ordering::Relaxed);
+    }
+    record_sum_and_max(
+        &counters.http_request_latency_ms_sum,
+        &counters.http_request_latency_ms_max,
+        duration_ms(latency),
+    );
+}
+
+pub fn record_websocket_inbound_message(bytes: usize) {
+    let counters = counters();
+    counters
+        .websocket_inbound_messages
+        .fetch_add(1, Ordering::Relaxed);
+    counters
+        .websocket_inbound_bytes
+        .fetch_add(saturating_u64(bytes), Ordering::Relaxed);
+}
+
+pub fn record_websocket_outbound_message(bytes: usize) {
+    let counters = counters();
+    counters
+        .websocket_outbound_messages
+        .fetch_add(1, Ordering::Relaxed);
+    counters
+        .websocket_outbound_bytes
+        .fetch_add(saturating_u64(bytes), Ordering::Relaxed);
+}
+
+pub fn record_websocket_session(duration: Duration) {
+    let counters = counters();
+    record_sum_and_max(
+        &counters.websocket_session_duration_ms_sum,
+        &counters.websocket_session_duration_ms_max,
+        duration_ms(duration),
+    );
+}
+
+pub fn record_matchmaking_commit(wait_ms: u64, players: usize, lobbies: usize) {
+    // Only a newly committed response observed by this process reaches here.
+    // An ambiguous success recovered as AlreadyCommitted is omitted rather
+    // than risking double-counting the match and its players.
+    let counters = counters();
+    counters.matchmaking_commits.fetch_add(1, Ordering::Relaxed);
+    counters
+        .matchmaking_matched_players
+        .fetch_add(saturating_u64(players), Ordering::Relaxed);
+    counters
+        .matchmaking_matched_lobbies
+        .fetch_add(saturating_u64(lobbies), Ordering::Relaxed);
+    record_sum_and_max(
+        &counters.matchmaking_wait_ms_sum,
+        &counters.matchmaking_wait_ms_max,
+        wait_ms,
+    );
+}
+
+pub fn record_game_completed(duration_ms: u64, players: usize) {
+    // Only a newly committed response observed by this process reaches here.
+    // Recovery of an ambiguous success remains uncounted because completion
+    // does not carry a durable telemetry marker.
+    let counters = counters();
+    counters.games_completed.fetch_add(1, Ordering::Relaxed);
+    counters
+        .completed_game_players
+        .fetch_add(saturating_u64(players), Ordering::Relaxed);
+    record_sum_and_max(
+        &counters.game_duration_ms_sum,
+        &counters.game_duration_ms_max,
+        duration_ms,
+    );
+}
+
+pub fn record_redis_request(latency: Duration, failed: bool) {
+    let counters = counters();
+    counters.redis_requests.fetch_add(1, Ordering::Relaxed);
+    if failed {
+        counters.redis_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    record_sum_and_max(
+        &counters.redis_request_latency_ms_sum,
+        &counters.redis_request_latency_ms_max,
+        duration_ms(latency),
+    );
+}
+
+#[derive(Default)]
 struct CounterSnapshot {
     fenced_write_rejections: u64,
     recovery_fingerprint_divergences: u64,
@@ -103,6 +292,46 @@ struct CounterSnapshot {
     recovery_replays: u64,
     match_claim_conflicts: u64,
     duplicate_completion_effects_prevented: u64,
+    http_requests: u64,
+    http_responses_4xx: u64,
+    http_responses_5xx: u64,
+    http_request_latency_ms_sum: u64,
+    http_request_latency_ms_max: u64,
+    websocket_opens: u64,
+    websocket_closes: u64,
+    websocket_rejected_upgrades: u64,
+    websocket_inbound_messages: u64,
+    websocket_inbound_bytes: u64,
+    websocket_outbound_messages: u64,
+    websocket_outbound_bytes: u64,
+    websocket_malformed_messages: u64,
+    websocket_process_errors: u64,
+    websocket_send_errors: u64,
+    websocket_transport_errors: u64,
+    websocket_session_duration_ms_sum: u64,
+    websocket_session_duration_ms_max: u64,
+    websocket_resync_requests: u64,
+    websocket_resync_accepted: u64,
+    websocket_resync_rejected: u64,
+    matchmaking_admissions: u64,
+    matchmaking_admission_deduplications: u64,
+    matchmaking_admission_rejections: u64,
+    matchmaking_commits: u64,
+    matchmaking_wait_ms_sum: u64,
+    matchmaking_wait_ms_max: u64,
+    matchmaking_matched_players: u64,
+    matchmaking_matched_lobbies: u64,
+    matchmaking_errors: u64,
+    matchmaking_integrity_errors: u64,
+    game_created_outbox_delivery_errors: u64,
+    games_completed: u64,
+    game_duration_ms_sum: u64,
+    game_duration_ms_max: u64,
+    completed_game_players: u64,
+    redis_requests: u64,
+    redis_errors: u64,
+    redis_request_latency_ms_sum: u64,
+    redis_request_latency_ms_max: u64,
 }
 
 fn take_counter_snapshot() -> CounterSnapshot {
@@ -125,6 +354,86 @@ fn take_counter_snapshot() -> CounterSnapshot {
         match_claim_conflicts: counters.match_claim_conflicts.swap(0, Ordering::Relaxed),
         duplicate_completion_effects_prevented: counters
             .duplicate_completion_effects_prevented
+            .swap(0, Ordering::Relaxed),
+        http_requests: counters.http_requests.swap(0, Ordering::Relaxed),
+        http_responses_4xx: counters.http_responses_4xx.swap(0, Ordering::Relaxed),
+        http_responses_5xx: counters.http_responses_5xx.swap(0, Ordering::Relaxed),
+        http_request_latency_ms_sum: counters
+            .http_request_latency_ms_sum
+            .swap(0, Ordering::Relaxed),
+        http_request_latency_ms_max: counters
+            .http_request_latency_ms_max
+            .swap(0, Ordering::Relaxed),
+        websocket_opens: counters.websocket_opens.swap(0, Ordering::Relaxed),
+        websocket_closes: counters.websocket_closes.swap(0, Ordering::Relaxed),
+        websocket_rejected_upgrades: counters
+            .websocket_rejected_upgrades
+            .swap(0, Ordering::Relaxed),
+        websocket_inbound_messages: counters
+            .websocket_inbound_messages
+            .swap(0, Ordering::Relaxed),
+        websocket_inbound_bytes: counters.websocket_inbound_bytes.swap(0, Ordering::Relaxed),
+        websocket_outbound_messages: counters
+            .websocket_outbound_messages
+            .swap(0, Ordering::Relaxed),
+        websocket_outbound_bytes: counters.websocket_outbound_bytes.swap(0, Ordering::Relaxed),
+        websocket_malformed_messages: counters
+            .websocket_malformed_messages
+            .swap(0, Ordering::Relaxed),
+        websocket_process_errors: counters.websocket_process_errors.swap(0, Ordering::Relaxed),
+        websocket_send_errors: counters.websocket_send_errors.swap(0, Ordering::Relaxed),
+        websocket_transport_errors: counters
+            .websocket_transport_errors
+            .swap(0, Ordering::Relaxed),
+        websocket_session_duration_ms_sum: counters
+            .websocket_session_duration_ms_sum
+            .swap(0, Ordering::Relaxed),
+        websocket_session_duration_ms_max: counters
+            .websocket_session_duration_ms_max
+            .swap(0, Ordering::Relaxed),
+        websocket_resync_requests: counters
+            .websocket_resync_requests
+            .swap(0, Ordering::Relaxed),
+        websocket_resync_accepted: counters
+            .websocket_resync_accepted
+            .swap(0, Ordering::Relaxed),
+        websocket_resync_rejected: counters
+            .websocket_resync_rejected
+            .swap(0, Ordering::Relaxed),
+        matchmaking_admissions: counters.matchmaking_admissions.swap(0, Ordering::Relaxed),
+        matchmaking_admission_deduplications: counters
+            .matchmaking_admission_deduplications
+            .swap(0, Ordering::Relaxed),
+        matchmaking_admission_rejections: counters
+            .matchmaking_admission_rejections
+            .swap(0, Ordering::Relaxed),
+        matchmaking_commits: counters.matchmaking_commits.swap(0, Ordering::Relaxed),
+        matchmaking_wait_ms_sum: counters.matchmaking_wait_ms_sum.swap(0, Ordering::Relaxed),
+        matchmaking_wait_ms_max: counters.matchmaking_wait_ms_max.swap(0, Ordering::Relaxed),
+        matchmaking_matched_players: counters
+            .matchmaking_matched_players
+            .swap(0, Ordering::Relaxed),
+        matchmaking_matched_lobbies: counters
+            .matchmaking_matched_lobbies
+            .swap(0, Ordering::Relaxed),
+        matchmaking_errors: counters.matchmaking_errors.swap(0, Ordering::Relaxed),
+        matchmaking_integrity_errors: counters
+            .matchmaking_integrity_errors
+            .swap(0, Ordering::Relaxed),
+        game_created_outbox_delivery_errors: counters
+            .game_created_outbox_delivery_errors
+            .swap(0, Ordering::Relaxed),
+        games_completed: counters.games_completed.swap(0, Ordering::Relaxed),
+        game_duration_ms_sum: counters.game_duration_ms_sum.swap(0, Ordering::Relaxed),
+        game_duration_ms_max: counters.game_duration_ms_max.swap(0, Ordering::Relaxed),
+        completed_game_players: counters.completed_game_players.swap(0, Ordering::Relaxed),
+        redis_requests: counters.redis_requests.swap(0, Ordering::Relaxed),
+        redis_errors: counters.redis_errors.swap(0, Ordering::Relaxed),
+        redis_request_latency_ms_sum: counters
+            .redis_request_latency_ms_sum
+            .swap(0, Ordering::Relaxed),
+        redis_request_latency_ms_max: counters
+            .redis_request_latency_ms_max
             .swap(0, Ordering::Relaxed),
     }
 }
@@ -151,6 +460,109 @@ struct RegionalGauges {
     checkpoint_bytes: u64,
     active_games: u64,
     active_game_index_mismatches: u64,
+    matchmaking_queue_entries: u64,
+    matchmaking_oldest_queued_lobby_ms: u64,
+    game_created_outbox_backlog: u64,
+    game_created_outbox_oldest_age_ms: u64,
+    game_created_outbox_age_index_cardinality_delta: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MatchmakingBacklogGauges {
+    queue_entries: u64,
+    oldest_queued_lobby_ms: u64,
+    outbox_backlog: u64,
+    outbox_oldest_age_ms: u64,
+    outbox_age_index_cardinality_delta: u64,
+}
+
+fn summarize_matchmaking_backlogs(values: &[i64], now_ms: i64) -> Result<MatchmakingBacklogGauges> {
+    let expected_values = MATCHMAKING_QUEUE_COUNT * 2 + 3;
+    if values.len() != expected_values {
+        anyhow::bail!(
+            "matchmaking backlog summary returned {} values, expected {expected_values}",
+            values.len()
+        );
+    }
+    let mut summary = MatchmakingBacklogGauges::default();
+    for queue in values[..MATCHMAKING_QUEUE_COUNT * 2].chunks_exact(2) {
+        let entries = u64::try_from(queue[0]).context("negative matchmaking queue depth")?;
+        summary.queue_entries = summary.queue_entries.saturating_add(entries);
+        if queue[1] > 0 {
+            summary.oldest_queued_lobby_ms = summary
+                .oldest_queued_lobby_ms
+                .max(now_ms.saturating_sub(queue[1]).max(0) as u64);
+        }
+    }
+    let tail = &values[MATCHMAKING_QUEUE_COUNT * 2..];
+    let outbox_backlog = u64::try_from(tail[0]).context("negative GameCreated outbox depth")?;
+    let indexed_outbox = u64::try_from(tail[1]).context("negative outbox age-index depth")?;
+    summary.outbox_backlog = outbox_backlog;
+    summary.outbox_age_index_cardinality_delta = outbox_backlog.abs_diff(indexed_outbox);
+    if tail[2] > 0 {
+        summary.outbox_oldest_age_ms = now_ms.saturating_sub(tail[2]).max(0) as u64;
+    }
+    Ok(summary)
+}
+
+async fn collect_matchmaking_backlog_gauges(
+    redis: &mut RedisConnection,
+    now_ms: i64,
+) -> Result<MatchmakingBacklogGauges> {
+    // Every key shares the fixed matchmaking hash tag, so this bounded script
+    // is one routed operation regardless of queue depth. Queue counts are
+    // entry counts: one lobby intentionally appears in each selected game-mode
+    // queue and may therefore contribute more than once.
+    let script = redis::Script::new(
+        r#"
+        local function key_type(key)
+            local response = redis.call('TYPE', key)
+            if type(response) == 'table' then return response['ok'] end
+            return response
+        end
+        local result = {}
+        for index = 1, #KEYS - 2 do
+            local queue_type = key_type(KEYS[index])
+            if queue_type ~= 'none' and queue_type ~= 'zset' then
+                return redis.error_reply('matchmaking queue has wrong type')
+            end
+            table.insert(result, redis.call('ZCARD', KEYS[index]))
+            local oldest = redis.call('ZRANGE', KEYS[index], 0, 0, 'WITHSCORES')
+            table.insert(result, #oldest == 0 and 0 or tonumber(oldest[2]))
+        end
+        local outbox_key = KEYS[#KEYS - 1]
+        local age_key = KEYS[#KEYS]
+        local outbox_type = key_type(outbox_key)
+        if outbox_type ~= 'none' and outbox_type ~= 'hash' then
+            return redis.error_reply('GameCreated outbox has wrong type')
+        end
+        local age_type = key_type(age_key)
+        if age_type ~= 'none' and age_type ~= 'zset' then
+            return redis.error_reply('GameCreated outbox age index has wrong type')
+        end
+        table.insert(result, redis.call('HLEN', outbox_key))
+        table.insert(result, redis.call('ZCARD', age_key))
+        local oldest_outbox = redis.call('ZRANGE', age_key, 0, 0, 'WITHSCORES')
+        table.insert(result, #oldest_outbox == 0 and 0 or tonumber(oldest_outbox[2]))
+        return result
+        "#,
+    );
+    let mut invocation = script.prepare_invoke();
+    for game_type in &crate::matchmaking_manager::MATCHMAKING_GAME_TYPES {
+        for queue_mode in &crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES {
+            invocation.key(crate::redis_keys::RedisKeys::matchmaking_lobby_queue(
+                game_type, queue_mode,
+            ));
+        }
+    }
+    invocation
+        .key(crate::redis_keys::RedisKeys::matchmaking_game_created_outbox())
+        .key(crate::redis_keys::RedisKeys::matchmaking_game_created_outbox_age());
+    let values: Vec<i64> = invocation
+        .invoke_async(redis)
+        .await
+        .context("failed to collect matchmaking backlog gauges")?;
+    summarize_matchmaking_backlogs(&values, now_ms)
 }
 
 fn expected_recovery_prefix(partition: u32, game_id: u32) -> String {
@@ -281,7 +693,11 @@ impl PartitionOutageTracker {
 
 /// Starts a best-effort collector. One deterministic live task reports the
 /// regional gauges while every task reports local health and counters, so
-/// CloudWatch uses `Maximum` for regional gauges and `Sum` for counters.
+/// CloudWatch uses `Maximum` for regional gauges and `Sum` for counters. The
+/// active-WebSocket gauge is emitted separately per task so dashboards can
+/// sum per-task `Average` for minute-average fleet concurrency. Summed
+/// per-task `Maximum` is only a conservative upper bound because task peaks
+/// need not occur simultaneously.
 /// Dimensions deliberately exclude partitions, users, and games.
 pub fn spawn_resilience_metrics(
     redis: RedisConnection,
@@ -290,6 +706,10 @@ pub fn spawn_resilience_metrics(
     server_id: u64,
     cancellation: CancellationToken,
 ) -> JoinHandle<()> {
+    // Every clone derived below is collector-only. Excluding these reads keeps
+    // RedisRequests/RedisErrors/latency representative of application and
+    // gameplay cache work instead of recursively measuring the sampler.
+    let redis = redis.without_application_metrics();
     let environment =
         std::env::var("SNAKETRON_ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
     let task_boot_id = lifecycle.task_boot_id().to_string();
@@ -519,6 +939,14 @@ async fn collect_regional_gauges(
         return Ok(gauges);
     }
 
+    let matchmaking = collect_matchmaking_backlog_gauges(&mut redis, now_ms).await?;
+    gauges.matchmaking_queue_entries = matchmaking.queue_entries;
+    gauges.matchmaking_oldest_queued_lobby_ms = matchmaking.oldest_queued_lobby_ms;
+    gauges.game_created_outbox_backlog = matchmaking.outbox_backlog;
+    gauges.game_created_outbox_oldest_age_ms = matchmaking.outbox_oldest_age_ms;
+    gauges.game_created_outbox_age_index_cardinality_delta =
+        matchmaking.outbox_age_index_cardinality_delta;
+
     let assignment = assignment_store.load().await?;
     if let Some(assignment) = &assignment {
         gauges.assignment_version = assignment.version;
@@ -698,17 +1126,25 @@ fn metric(name: &str, unit: &str) -> Value {
     json!({ "Name": name, "Unit": unit })
 }
 
+fn emf_namespace(environment: &str) -> &'static str {
+    if environment == "prod" {
+        PRODUCTION_EMF_NAMESPACE
+    } else {
+        NON_PRODUCTION_EMF_NAMESPACE
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn emit_emf(
+fn emf_document(
     environment: &str,
     region: &str,
     task_boot_id: &str,
     local_ready: bool,
-    active_websockets: u64,
     gauges: RegionalGauges,
     counters: CounterSnapshot,
     now_ms: i64,
-) {
+) -> Value {
+    let namespace = emf_namespace(environment);
     let values = [
         (
             "RegionalCollectionFailures",
@@ -759,6 +1195,31 @@ fn emit_emf(
             "Count",
         ),
         (
+            "MatchmakingQueueEntries",
+            gauges.matchmaking_queue_entries,
+            "Count",
+        ),
+        (
+            "MatchmakingOldestQueuedLobbyMs",
+            gauges.matchmaking_oldest_queued_lobby_ms,
+            "Milliseconds",
+        ),
+        (
+            "GameCreatedOutboxBacklog",
+            gauges.game_created_outbox_backlog,
+            "Count",
+        ),
+        (
+            "GameCreatedOutboxOldestAgeMs",
+            gauges.game_created_outbox_oldest_age_ms,
+            "Milliseconds",
+        ),
+        (
+            "GameCreatedOutboxAgeIndexCardinalityDelta",
+            gauges.game_created_outbox_age_index_cardinality_delta,
+            "Count",
+        ),
+        (
             "FencedWriteRejections",
             counters.fenced_write_rejections,
             "Count",
@@ -796,8 +1257,167 @@ fn emit_emf(
             counters.duplicate_completion_effects_prevented,
             "Count",
         ),
+        ("HttpRequests", counters.http_requests, "Count"),
+        ("Http4xxResponses", counters.http_responses_4xx, "Count"),
+        ("Http5xxResponses", counters.http_responses_5xx, "Count"),
+        (
+            "HttpRequestLatencyMsSum",
+            counters.http_request_latency_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "HttpRequestLatencyMsMax",
+            counters.http_request_latency_ms_max,
+            "Milliseconds",
+        ),
+        ("WebSocketOpens", counters.websocket_opens, "Count"),
+        ("WebSocketCloses", counters.websocket_closes, "Count"),
+        (
+            "WebSocketRejectedUpgrades",
+            counters.websocket_rejected_upgrades,
+            "Count",
+        ),
+        (
+            "WebSocketInboundMessages",
+            counters.websocket_inbound_messages,
+            "Count",
+        ),
+        (
+            "WebSocketInboundBytes",
+            counters.websocket_inbound_bytes,
+            "Bytes",
+        ),
+        (
+            "WebSocketOutboundMessages",
+            counters.websocket_outbound_messages,
+            "Count",
+        ),
+        (
+            "WebSocketOutboundBytes",
+            counters.websocket_outbound_bytes,
+            "Bytes",
+        ),
+        (
+            "WebSocketMalformedMessages",
+            counters.websocket_malformed_messages,
+            "Count",
+        ),
+        (
+            "WebSocketProcessErrors",
+            counters.websocket_process_errors,
+            "Count",
+        ),
+        (
+            "WebSocketSendErrors",
+            counters.websocket_send_errors,
+            "Count",
+        ),
+        (
+            "WebSocketTransportErrors",
+            counters.websocket_transport_errors,
+            "Count",
+        ),
+        (
+            "WebSocketSessionDurationMsSum",
+            counters.websocket_session_duration_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "WebSocketSessionDurationMsMax",
+            counters.websocket_session_duration_ms_max,
+            "Milliseconds",
+        ),
+        (
+            "WebSocketResyncRequests",
+            counters.websocket_resync_requests,
+            "Count",
+        ),
+        (
+            "WebSocketResyncAccepted",
+            counters.websocket_resync_accepted,
+            "Count",
+        ),
+        (
+            "WebSocketResyncRejected",
+            counters.websocket_resync_rejected,
+            "Count",
+        ),
+        (
+            "MatchmakingAdmissions",
+            counters.matchmaking_admissions,
+            "Count",
+        ),
+        (
+            "MatchmakingAdmissionDeduplications",
+            counters.matchmaking_admission_deduplications,
+            "Count",
+        ),
+        (
+            "MatchmakingAdmissionRejections",
+            counters.matchmaking_admission_rejections,
+            "Count",
+        ),
+        ("MatchmakingCommits", counters.matchmaking_commits, "Count"),
+        (
+            "MatchmakingWaitMsSum",
+            counters.matchmaking_wait_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "MatchmakingWaitMsMax",
+            counters.matchmaking_wait_ms_max,
+            "Milliseconds",
+        ),
+        (
+            "MatchmakingMatchedPlayers",
+            counters.matchmaking_matched_players,
+            "Count",
+        ),
+        (
+            "MatchmakingMatchedLobbies",
+            counters.matchmaking_matched_lobbies,
+            "Count",
+        ),
+        ("MatchmakingErrors", counters.matchmaking_errors, "Count"),
+        (
+            "MatchmakingIntegrityErrors",
+            counters.matchmaking_integrity_errors,
+            "Count",
+        ),
+        (
+            "GameCreatedOutboxDeliveryErrors",
+            counters.game_created_outbox_delivery_errors,
+            "Count",
+        ),
+        ("GamesCompleted", counters.games_completed, "Count"),
+        (
+            "GameDurationMsSum",
+            counters.game_duration_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "GameDurationMsMax",
+            counters.game_duration_ms_max,
+            "Milliseconds",
+        ),
+        (
+            "CompletedGamePlayers",
+            counters.completed_game_players,
+            "Count",
+        ),
+        ("RedisRequests", counters.redis_requests, "Count"),
+        ("RedisErrors", counters.redis_errors, "Count"),
+        (
+            "RedisRequestLatencyMsSum",
+            counters.redis_request_latency_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "RedisRequestLatencyMsMax",
+            counters.redis_request_latency_ms_max,
+            "Milliseconds",
+        ),
         ("LocalReady", u64::from(local_ready), "Count"),
-        ("ActiveWebSockets", active_websockets, "Count"),
     ];
     let definitions: Vec<Value> = values
         .iter()
@@ -815,16 +1435,75 @@ fn emit_emf(
         json!({
             "Timestamp": now_ms,
             "CloudWatchMetrics": [{
-                "Namespace": EMF_NAMESPACE,
+                "Namespace": namespace,
                 "Dimensions": [
                     ["Environment"],
-                    ["Environment", "Region", "TaskBootId"]
+                    ["Environment", "Region"]
                 ],
                 "Metrics": definitions
             }]
         }),
     );
-    println!("{}", Value::Object(document));
+    Value::Object(document)
+}
+
+fn active_websockets_emf_document(
+    environment: &str,
+    region: &str,
+    task_boot_id: &str,
+    active_websockets: u64,
+    now_ms: i64,
+) -> Value {
+    let namespace = emf_namespace(environment);
+    json!({
+        "Environment": environment,
+        "Region": region,
+        "TaskBootId": task_boot_id,
+        "ActiveWebSockets": active_websockets,
+        "_aws": {
+            "Timestamp": now_ms,
+            "CloudWatchMetrics": [{
+                "Namespace": namespace,
+                "Dimensions": [["Environment", "Region", "TaskBootId"]],
+                "Metrics": [metric("ActiveWebSockets", "Count")]
+            }]
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_emf(
+    environment: &str,
+    region: &str,
+    task_boot_id: &str,
+    local_ready: bool,
+    active_websockets: u64,
+    gauges: RegionalGauges,
+    counters: CounterSnapshot,
+    now_ms: i64,
+) {
+    println!(
+        "{}",
+        emf_document(
+            environment,
+            region,
+            task_boot_id,
+            local_ready,
+            gauges,
+            counters,
+            now_ms,
+        )
+    );
+    println!(
+        "{}",
+        active_websockets_emf_document(
+            environment,
+            region,
+            task_boot_id,
+            active_websockets,
+            now_ms,
+        )
+    );
 }
 
 #[cfg(test)]
@@ -844,10 +1523,153 @@ mod tests {
         let _ = take_counter_snapshot();
         record_fenced_write_rejection(1);
         record_checkpoint_writes(2);
+        record_http_request(204, Duration::from_millis(7));
+        record_http_request(404, Duration::from_millis(11));
+        record_http_request(503, Duration::from_millis(17));
+        record_websocket_opened(1);
+        record_websocket_closed(1);
+        record_websocket_rejected_upgrade(1);
+        record_websocket_inbound_message(12);
+        record_websocket_outbound_message(34);
+        record_websocket_malformed_message(1);
+        record_websocket_process_error(1);
+        record_websocket_send_error(1);
+        record_websocket_transport_error(1);
+        record_websocket_session(Duration::from_millis(19));
+        record_websocket_resync_requested(2);
+        record_websocket_resync_accepted(1);
+        record_websocket_resync_rejected(1);
+        record_matchmaking_admission(1);
+        record_matchmaking_admission_deduplication(1);
+        record_matchmaking_admission_rejection(1);
+        record_matchmaking_commit(250, 4, 2);
+        record_matchmaking_error(1);
+        record_matchmaking_integrity_error(1);
+        record_game_created_outbox_delivery_error(1);
+        record_game_completed(3_000, 4);
+        record_redis_request(Duration::from_millis(9), true);
+        crate::redis_utils::drop_redis_request_measurement_for_test(true);
+        crate::redis_utils::drop_redis_request_measurement_for_test(false);
         let snapshot = take_counter_snapshot();
         assert_eq!(snapshot.fenced_write_rejections, 1);
         assert_eq!(snapshot.checkpoint_writes, 2);
+        assert!(snapshot.http_requests >= 3);
+        assert!(snapshot.http_responses_4xx >= 1);
+        assert!(snapshot.http_responses_5xx >= 1);
+        assert!(snapshot.http_request_latency_ms_sum >= 35);
+        assert!(snapshot.http_request_latency_ms_max >= 17);
+        assert!(snapshot.websocket_opens >= 1);
+        assert!(snapshot.websocket_closes >= 1);
+        assert!(snapshot.websocket_rejected_upgrades >= 1);
+        assert!(snapshot.websocket_inbound_messages >= 1);
+        assert!(snapshot.websocket_inbound_bytes >= 12);
+        assert!(snapshot.websocket_outbound_messages >= 1);
+        assert!(snapshot.websocket_outbound_bytes >= 34);
+        assert!(snapshot.websocket_malformed_messages >= 1);
+        assert!(snapshot.websocket_process_errors >= 1);
+        assert!(snapshot.websocket_send_errors >= 1);
+        assert!(snapshot.websocket_transport_errors >= 1);
+        assert!(snapshot.websocket_session_duration_ms_sum >= 19);
+        assert!(snapshot.websocket_session_duration_ms_max >= 19);
+        assert!(snapshot.websocket_resync_requests >= 2);
+        assert!(snapshot.websocket_resync_accepted >= 1);
+        assert!(snapshot.websocket_resync_rejected >= 1);
+        assert!(snapshot.matchmaking_admissions >= 1);
+        assert!(snapshot.matchmaking_admission_deduplications >= 1);
+        assert!(snapshot.matchmaking_admission_rejections >= 1);
+        assert!(snapshot.matchmaking_commits >= 1);
+        assert!(snapshot.matchmaking_wait_ms_sum >= 250);
+        assert!(snapshot.matchmaking_wait_ms_max >= 250);
+        assert!(snapshot.matchmaking_matched_players >= 4);
+        assert!(snapshot.matchmaking_matched_lobbies >= 2);
+        assert!(snapshot.matchmaking_errors >= 1);
+        assert!(snapshot.matchmaking_integrity_errors >= 1);
+        assert!(snapshot.game_created_outbox_delivery_errors >= 1);
+        assert!(snapshot.games_completed >= 1);
+        assert!(snapshot.game_duration_ms_sum >= 3_000);
+        assert!(snapshot.game_duration_ms_max >= 3_000);
+        assert!(snapshot.completed_game_players >= 4);
+        assert!(snapshot.redis_requests >= 2);
+        assert!(snapshot.redis_errors >= 2);
+        assert!(snapshot.redis_request_latency_ms_sum >= 9);
+        assert!(snapshot.redis_request_latency_ms_max >= 9);
         assert_eq!(take_counter_snapshot().checkpoint_writes, 0);
+    }
+
+    #[test]
+    fn matchmaking_backlog_summary_aggregates_fixed_queues_and_exact_ages() -> Result<()> {
+        let now_ms = 10_000_i64;
+        let mut values = Vec::with_capacity(MATCHMAKING_QUEUE_COUNT * 2 + 3);
+        for index in 0..MATCHMAKING_QUEUE_COUNT {
+            values.push(i64::try_from(index + 1)?);
+            values.push(now_ms - i64::try_from((index + 1) * 100)?);
+        }
+        values.extend([3, 2, now_ms - 2_000]);
+
+        assert_eq!(
+            summarize_matchmaking_backlogs(&values, now_ms)?,
+            MatchmakingBacklogGauges {
+                queue_entries: 55,
+                oldest_queued_lobby_ms: 1_000,
+                outbox_backlog: 3,
+                outbox_oldest_age_ms: 2_000,
+                outbox_age_index_cardinality_delta: 1,
+            }
+        );
+        assert!(summarize_matchmaking_backlogs(&values[..values.len() - 1], now_ms).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn emf_dimensions_keep_only_websocket_gauge_per_task() {
+        let main = emf_document(
+            "test",
+            "us-test-1",
+            "boot-id",
+            true,
+            RegionalGauges::default(),
+            CounterSnapshot::default(),
+            123,
+        );
+        assert_eq!(
+            main.pointer("/_aws/CloudWatchMetrics/0/Dimensions"),
+            Some(&json!([["Environment"], ["Environment", "Region"]])),
+        );
+        assert_eq!(
+            main.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
+            Some(&json!("Snaketron/OperationalDev")),
+        );
+        let main_metrics = main
+            .pointer("/_aws/CloudWatchMetrics/0/Metrics")
+            .and_then(Value::as_array)
+            .expect("main EMF metric definitions");
+        assert!(main_metrics.len() <= 100);
+        assert!(
+            main_metrics
+                .iter()
+                .all(|definition| definition["Name"] != "ActiveWebSockets")
+        );
+
+        let sockets = active_websockets_emf_document("test", "us-test-1", "boot-id", 7, 123);
+        assert_eq!(
+            sockets.pointer("/_aws/CloudWatchMetrics/0/Dimensions"),
+            Some(&json!([["Environment", "Region", "TaskBootId"]])),
+        );
+        assert_eq!(
+            sockets.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
+            Some(&json!("Snaketron/OperationalDev")),
+        );
+        assert_eq!(sockets["ActiveWebSockets"], 7);
+        assert_eq!(
+            sockets.pointer("/_aws/CloudWatchMetrics/0/Metrics/0/Name"),
+            Some(&json!("ActiveWebSockets")),
+        );
+
+        let production = active_websockets_emf_document("prod", "use1", "boot-id", 1, 123);
+        assert_eq!(
+            production.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
+            Some(&json!("Snaketron/Operational")),
+        );
     }
 
     #[test]
