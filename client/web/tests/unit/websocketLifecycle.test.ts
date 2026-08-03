@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  MATCHMAKING_ADMISSION_RETRY_DELAYS_MS,
   PLANNED_HANDOFF_MAX_MS,
   RECONNECT_MAX_MS,
   advanceCandidateGameWatermark,
@@ -10,8 +11,10 @@ import {
   candidateCoversActiveWatermark,
   isFreshSnapshotForGame,
   isCommandOwner,
+  isRetryableMatchmakingAdmissionFailure,
   isSnapshotForGame,
   isTerminalSnapshotForGame,
+  matchmakingAdmissionRetryDelayMs,
   missingRequiredServerCapabilities,
   plannedDrainRemainingMs,
   promotionOrderingFrontier,
@@ -19,6 +22,41 @@ import {
   replacementFailureAction,
   replacementReadyForPromotion,
 } from '../../services/websocketLifecycle.ts';
+
+test('only the returned matchmaking admission failure is retryable', () => {
+  assert.equal(
+    isRetryableMatchmakingAdmissionFailure(
+      'Failed to queue lobby: Failed to add lobby to matchmaking queue',
+    ),
+    true,
+  );
+  assert.equal(
+    isRetryableMatchmakingAdmissionFailure(
+      ' failed to queue lobby: failed to add lobby to matchmaking queue ',
+    ),
+    true,
+  );
+  assert.equal(
+    isRetryableMatchmakingAdmissionFailure('Join a lobby before queueing for matchmaking'),
+    false,
+  );
+  assert.equal(isRetryableMatchmakingAdmissionFailure(null), false);
+});
+
+test('matchmaking admission retries stop after the bounded delay schedule', () => {
+  assert.deepEqual(
+    MATCHMAKING_ADMISSION_RETRY_DELAYS_MS.map((_, attempt) => (
+      matchmakingAdmissionRetryDelayMs(attempt)
+    )),
+    [...MATCHMAKING_ADMISSION_RETRY_DELAYS_MS],
+  );
+  assert.equal(
+    matchmakingAdmissionRetryDelayMs(MATCHMAKING_ADMISSION_RETRY_DELAYS_MS.length),
+    null,
+  );
+  assert.equal(matchmakingAdmissionRetryDelayMs(-1), null);
+  assert.equal(matchmakingAdmissionRetryDelayMs(0.5), null);
+});
 
 test('the current websocket protocol fails closed when a capability is absent', () => {
   const current = [

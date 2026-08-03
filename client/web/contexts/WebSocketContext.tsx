@@ -37,8 +37,10 @@ import {
   candidateDeadlineDelayMs,
   activeGameIdFromPath,
   isCommandOwner,
+  isRetryableMatchmakingAdmissionFailure,
   isSnapshotForGame,
   isTerminalSnapshotForGame,
+  matchmakingAdmissionRetryDelayMs,
   missingRequiredServerCapabilities,
   plannedDrainRemainingMs,
   promotionOrderingFrontier,
@@ -220,9 +222,11 @@ interface StoredLobbyInfo {
 }
 
 interface PendingMatchmakingIntent {
-  message: any;
+  message: OutboundMessage;
   lobbyCode: string;
   authToken: string;
+  retryAttempt: number;
+  retryTimeoutId: ReturnType<typeof setTimeout> | null;
 }
 
 export const useWebSocket = (): WebSocketContextType => {
@@ -286,6 +290,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const plannedHandoffStartedAtRef = useRef<number | null>(null);
   const recoveryStartedAtRef = useRef<number | null>(null);
   const usableGapStartedAtRef = useRef<number | null>(null);
+
+  const clearPendingMatchmakingIntent = useCallback(() => {
+    const pending = pendingMatchmakingIntentRef.current;
+    if (pending?.retryTimeoutId !== null && pending?.retryTimeoutId !== undefined) {
+      clearTimeout(pending.retryTimeoutId);
+    }
+    pendingMatchmakingIntentRef.current = null;
+  }, []);
+
+  useEffect(() => () => {
+    clearPendingMatchmakingIntent();
+  }, [clearPendingMatchmakingIntent]);
 
   useEffect(() => {
     latencySettingsRef.current = latencySettings;
@@ -432,7 +448,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, []);
 
   const resetLobbyState = useCallback(() => {
-    pendingMatchmakingIntentRef.current = null;
+    clearPendingMatchmakingIntent();
     setMatchmakingStatus('idle');
     setCurrentLobby(null);
     currentLobbyRef.current = null;
@@ -440,7 +456,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     // console.log('setLobbyPreferences', DEFAULT_LOBBY_PREFERENCES);
     // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
     clearPersistedLobby();
-  }, [clearPersistedLobby]);
+  }, [clearPendingMatchmakingIntent, clearPersistedLobby]);
 
   const isLobbyMissingReason = useCallback((reason: string) => {
     if (!reason || typeof reason !== 'string') {
@@ -710,6 +726,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       candidate.authTokenSent === pendingMatchmakingIntent.authToken &&
       candidate.socket.readyState === WebSocket.OPEN
     ) {
+      if (pendingMatchmakingIntent.retryTimeoutId !== null) {
+        clearTimeout(pendingMatchmakingIntent.retryTimeoutId);
+        pendingMatchmakingIntent.retryTimeoutId = null;
+      }
       candidate.socket.send(JSON.stringify(pendingMatchmakingIntent.message));
     }
     if (previous && previous !== candidate) {
@@ -826,6 +846,56 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       messageMatchesPendingIdentity &&
       lobbyCode === pendingMatchmakingIntent.lobbyCode,
     );
+    const accessDeniedReason = typeof rawMessage?.AccessDenied?.reason === 'string'
+      ? rawMessage.AccessDenied.reason
+      : null;
+    if (
+      pendingMatchmakingIntent &&
+      messageMatchesPendingIdentity &&
+      isRetryableMatchmakingAdmissionFailure(accessDeniedReason) &&
+      slot.role === 'active' &&
+      activeSlotRef.current === slot &&
+      slot.authenticated &&
+      slot.socket.readyState === WebSocket.OPEN
+    ) {
+      const retryDelayMs = matchmakingAdmissionRetryDelayMs(
+        pendingMatchmakingIntent.retryAttempt,
+      );
+      if (retryDelayMs !== null) {
+        if (pendingMatchmakingIntent.retryTimeoutId === null) {
+          const retryNumber = pendingMatchmakingIntent.retryAttempt + 1;
+          pendingMatchmakingIntent.retryAttempt = retryNumber;
+          pendingMatchmakingIntent.retryTimeoutId = setTimeout(() => {
+            const retainedIntent = pendingMatchmakingIntentRef.current;
+            if (retainedIntent !== pendingMatchmakingIntent) {
+              return;
+            }
+            retainedIntent.retryTimeoutId = null;
+            const retrySlot = activeSlotRef.current;
+            const currentLobbyCode = (
+              currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? ''
+            ).trim().toUpperCase();
+            if (
+              retrySlot &&
+              retrySlot.role === 'active' &&
+              retrySlot.authenticated &&
+              retrySlot.authTokenSent === retainedIntent.authToken &&
+              retrySlot.socket.readyState === WebSocket.OPEN &&
+              currentLobbyCode === retainedIntent.lobbyCode
+            ) {
+              retrySlot.socket.send(JSON.stringify(retainedIntent.message));
+            }
+          }, retryDelayMs);
+          console.warn(
+            `Retrying matchmaking queue admission in ${retryDelayMs}ms ` +
+            `(attempt ${retryNumber})`,
+          );
+        }
+        return;
+      }
+      console.error('Matchmaking queue admission retries exhausted');
+      clearPendingMatchmakingIntent();
+    }
     if (
       messageMatchesPendingIdentity && (
         rawMessage?.JoinGame !== undefined ||
@@ -835,7 +905,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         (updateMatchesPendingLobby && (lobbyState === 'queued' || lobbyState === 'matched'))
       )
     ) {
-      pendingMatchmakingIntentRef.current = null;
+      clearPendingMatchmakingIntent();
     } else if (
       updateMatchesPendingLobby &&
       lobbyState === 'waiting' &&
@@ -847,6 +917,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     ) {
       // The replacement has restored the same lobby and Redis still says the
       // admission never committed. Replay the one retained logical request.
+      if (pendingMatchmakingIntent.retryTimeoutId !== null) {
+        clearTimeout(pendingMatchmakingIntent.retryTimeoutId);
+        pendingMatchmakingIntent.retryTimeoutId = null;
+      }
       slot.socket.send(JSON.stringify(pendingMatchmakingIntent.message));
     }
 
@@ -1062,7 +1136,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       // an already-caught-up candidate to complete atomic promotion.
       promoteCandidate(candidate);
     }
-  }, [buildInitialLobbyPreferences, completeActiveRecovery, dispatchRawMessage, promoteCandidate, recoverAfterCandidateFailure, restoreCandidateContext, setAuthHandshakeState]);
+  }, [
+    buildInitialLobbyPreferences,
+    clearPendingMatchmakingIntent,
+    completeActiveRecovery,
+    dispatchRawMessage,
+    promoteCandidate,
+    recoverAfterCandidateFailure,
+    restoreCandidateContext,
+    setAuthHandshakeState,
+  ]);
 
   const attachSocketHandlers = useCallback((slot: SocketSlot, onConnect?: () => void) => {
     slot.socket.onopen = () => {
@@ -1403,9 +1486,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       if (!authToken) {
         throw new Error('Cannot queue for matchmaking before authentication');
       }
-      pendingMatchmakingIntentRef.current = { message, lobbyCode, authToken };
+      clearPendingMatchmakingIntent();
+      pendingMatchmakingIntentRef.current = {
+        message,
+        lobbyCode,
+        authToken,
+        retryAttempt: 0,
+        retryTimeoutId: null,
+      };
     } else if (message === 'LeaveQueue' || message === 'LeaveLobby') {
-      pendingMatchmakingIntentRef.current = null;
+      clearPendingMatchmakingIntent();
     }
     const target = activeSlotRef.current;
     const targetCanSend = () => Boolean(
@@ -1448,7 +1538,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     } else {
       return doSend() || isQueueIntent;
     }
-  }, [getToken, latencySettings]);
+  }, [clearPendingMatchmakingIntent, getToken, latencySettings]);
 
   const authenticateConnection = useCallback(() => {
     const slot = activeSlotRef.current;
@@ -1605,7 +1695,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       pendingMatchmakingIntentRef.current &&
       pendingMatchmakingIntentRef.current.authToken !== token
     ) {
-      pendingMatchmakingIntentRef.current = null;
+      clearPendingMatchmakingIntent();
       setMatchmakingStatus('idle');
     }
     if (!token) {
@@ -1680,6 +1770,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     disconnect,
     getToken,
     authenticateConnection,
+    clearPendingMatchmakingIntent,
     setAuthHandshakeState,
   ]);
 

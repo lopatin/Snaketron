@@ -10,6 +10,9 @@ const REQUIRED_CAPABILITIES = [
   'terminal-command-cutoff-v1',
 ];
 
+const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
+  'Failed to queue lobby: Failed to add lobby to matchmaking queue';
+
 const gameState = (tick = 5) => ({
   tick,
   status: { Started: { server_id: 1 } },
@@ -840,6 +843,100 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   });
   await page.waitForTimeout(250);
   expect(await socketMessages(page, acknowledgedReplacementIndex, 'QueueForMatch')).toEqual([]);
+});
+
+for (const [messageType, payload] of [
+  ['QueueForMatch', {
+    game_type: { FreeForAll: { max_players: 2 } },
+    queue_mode: 'Quickmatch',
+  }],
+  ['QueueForMatchMulti', {
+    game_types: [
+      { FreeForAll: { max_players: 2 } },
+      { TeamMatch: { per_team: 1 } },
+    ],
+    queue_mode: 'Quickmatch',
+  }],
+]) {
+  test(`${messageType} retries the returned matchmaking admission failure`, async ({ page }) => {
+    const socketIndex = await establishAuthenticatedLobby(page);
+    await page.evaluate(({ messageType, payload }) => {
+      window.__wsContext.sendMessage({ [messageType]: payload });
+    }, { messageType, payload });
+    await expect.poll(() => socketMessages(page, socketIndex, messageType)).toHaveLength(1);
+
+    await emitServerMessage(page, socketIndex, {
+      AccessDenied: { reason: RETRYABLE_MATCHMAKING_ADMISSION_REASON },
+    });
+    await expect.poll(() => socketMessages(page, socketIndex, messageType)).toHaveLength(2);
+    const messages = await socketMessages(page, socketIndex, messageType);
+    expect(messages[1]).toEqual(messages[0]);
+
+    await emitServerMessage(page, socketIndex, {
+      AccessDenied: { reason: RETRYABLE_MATCHMAKING_ADMISSION_REASON },
+    });
+    await emitServerMessage(page, socketIndex, {
+      LobbyUpdate: {
+        ...lobbyUpdate.LobbyUpdate,
+        state: 'queued',
+      },
+    });
+    await page.waitForTimeout(600);
+    expect(await socketMessages(page, socketIndex, messageType)).toHaveLength(2);
+  });
+}
+
+test('matchmaking admission retries are bounded and surface the final denial', async ({ page }) => {
+  const socketIndex = await establishAuthenticatedLobby(page);
+  await page.evaluate(() => {
+    window.__matchmakingAdmissionDenials = [];
+    window.__wsContext.onMessage('AccessDenied', (message) => {
+      window.__matchmakingAdmissionDenials.push(message.data.reason);
+    });
+    window.__wsContext.sendMessage({
+      QueueForMatch: {
+        game_type: { FreeForAll: { max_players: 2 } },
+        queue_mode: 'Quickmatch',
+      },
+    });
+  });
+  await expect.poll(() => socketMessages(page, socketIndex, 'QueueForMatch')).toHaveLength(1);
+
+  for (let expectedSendCount = 2; expectedSendCount <= 4; expectedSendCount += 1) {
+    await emitServerMessage(page, socketIndex, {
+      AccessDenied: { reason: RETRYABLE_MATCHMAKING_ADMISSION_REASON },
+    });
+    await expect.poll(() => socketMessages(page, socketIndex, 'QueueForMatch'), {
+      timeout: 2_000,
+    }).toHaveLength(expectedSendCount);
+    expect(await page.evaluate(() => window.__matchmakingAdmissionDenials)).toEqual([]);
+  }
+
+  await emitServerMessage(page, socketIndex, {
+    AccessDenied: { reason: RETRYABLE_MATCHMAKING_ADMISSION_REASON },
+  });
+  await expect.poll(() => page.evaluate(() => window.__matchmakingAdmissionDenials))
+    .toEqual([RETRYABLE_MATCHMAKING_ADMISSION_REASON]);
+  await page.waitForTimeout(1_100);
+  expect(await socketMessages(page, socketIndex, 'QueueForMatch')).toHaveLength(4);
+});
+
+test('unrelated access denials do not retry matchmaking admission', async ({ page }) => {
+  const socketIndex = await establishAuthenticatedLobby(page);
+  await page.evaluate(() => {
+    window.__wsContext.sendMessage({
+      QueueForMatch: {
+        game_type: { FreeForAll: { max_players: 2 } },
+        queue_mode: 'Quickmatch',
+      },
+    });
+  });
+  await expect.poll(() => socketMessages(page, socketIndex, 'QueueForMatch')).toHaveLength(1);
+  await emitServerMessage(page, socketIndex, {
+    AccessDenied: { reason: 'Join a lobby before queueing for matchmaking' },
+  });
+  await page.waitForTimeout(350);
+  expect(await socketMessages(page, socketIndex, 'QueueForMatch')).toHaveLength(1);
 });
 
 test('planned lobby handoff replays only after the candidate restores authoritative waiting state', async ({ page }) => {
