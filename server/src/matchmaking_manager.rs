@@ -11,6 +11,20 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+/// Fixed queue families consumed by the production matchmaking loop. Metrics
+/// aggregate these ten queues without adding game-type or mode dimensions.
+pub const MATCHMAKING_GAME_TYPES: [GameType; 5] = [
+    GameType::Solo,
+    GameType::FreeForAll { max_players: 2 },
+    GameType::FreeForAll { max_players: 4 },
+    GameType::TeamMatch { per_team: 1 },
+    GameType::TeamMatch { per_team: 2 },
+];
+pub const MATCHMAKING_QUEUE_MODES: [common::QueueMode; 2] = [
+    common::QueueMode::Quickmatch,
+    common::QueueMode::Competitive,
+];
+
 // Data structures for Redis storage
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueuedPlayer {
@@ -57,6 +71,24 @@ pub enum MatchCommitOutcome {
     Conflict { reason: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicMatchmakingOutcome {
+    IntegrityError,
+    Applied,
+    Idempotent,
+    ExpectedConflict,
+}
+
+fn classify_atomic_matchmaking_outcome(code: i64) -> Option<AtomicMatchmakingOutcome> {
+    match code {
+        0 => Some(AtomicMatchmakingOutcome::IntegrityError),
+        1 => Some(AtomicMatchmakingOutcome::Applied),
+        2 => Some(AtomicMatchmakingOutcome::Idempotent),
+        3 => Some(AtomicMatchmakingOutcome::ExpectedConflict),
+        _ => None,
+    }
+}
+
 #[derive(Serialize)]
 struct MatchCommitQueuePair {
     queue_key: String,
@@ -85,7 +117,9 @@ struct MatchCommitUser {
 struct MatchCommitPlan {
     active_matches_key: String,
     outbox_key: String,
+    outbox_age_key: String,
     outbox_payload: String,
+    created_at_ms: i64,
     game_id: String,
     active_match_json: String,
     lobbies: Vec<MatchCommitLobby>,
@@ -179,17 +213,21 @@ if lobby_mapping_type ~= 'none' and lobby_mapping_type ~= 'string' then
     return {0, 'lobby-mapping-wrong-type'}
 end
 if redis.call('GET', plan.lobby_active_game_key) then
-    return {0, 'lobby-already-matched'}
+    return {3, 'lobby-already-matched'}
 end
-if key_type(plan.lobby_metadata_key) ~= 'hash' then
-    return {0, 'lobby-metadata-missing-or-wrong-type'}
+local lobby_metadata_type = key_type(plan.lobby_metadata_key)
+if lobby_metadata_type == 'none' then
+    return {3, 'lobby-metadata-missing'}
+end
+if lobby_metadata_type ~= 'hash' then
+    return {0, 'lobby-metadata-wrong-type'}
 end
 for _, key in ipairs(plan.user_active_game_keys) do
     local mapping_type = key_type(key)
     if mapping_type ~= 'none' and mapping_type ~= 'string' then
         return {0, 'user-mapping-wrong-type'}
     end
-    if redis.call('GET', key) then return {0, 'user-already-matched'} end
+    if redis.call('GET', key) then return {3, 'user-already-matched'} end
 end
 
 local identity_type = key_type(plan.queue_identity_key)
@@ -209,7 +247,7 @@ for _, claim in ipairs(plan.user_queue_claims) do
     end
     local existing_claim = redis.call('GET', claim.key)
     if existing_claim and existing_claim ~= claim.value then
-        return {0, 'user-already-queued'}
+        return {3, 'user-already-queued'}
     end
 end
 
@@ -328,12 +366,24 @@ if outbox_type ~= 'none' and outbox_type ~= 'hash' then
     return {0, 'game-created-outbox-wrong-type'}
 end
 
+local outbox_age_type = key_type(plan.outbox_age_key)
+if outbox_age_type ~= 'none' and outbox_age_type ~= 'zset' then
+    return {0, 'game-created-outbox-age-wrong-type'}
+end
+
 local existing = redis.call('HGET', plan.active_matches_key, plan.game_id)
 if existing then
-    if existing == plan.active_match_json then
-        return {2, 'already-committed'}
+    if existing ~= plan.active_match_json then
+        return {0, 'game-id-already-committed'}
     end
-    return {0, 'game-id-already-committed'}
+    local existing_outbox = redis.call('HGET', plan.outbox_key, plan.game_id)
+    if existing_outbox and existing_outbox ~= plan.outbox_payload then
+        return {0, 'game-created-outbox-conflict'}
+    end
+    if existing_outbox then
+        redis.call('ZADD', plan.outbox_age_key, plan.created_at_ms, plan.game_id)
+    end
+    return {2, 'already-committed'}
 end
 
 local existing_outbox = redis.call('HGET', plan.outbox_key, plan.game_id)
@@ -347,25 +397,34 @@ for _, lobby in ipairs(plan.lobbies) do
         return {0, 'lobby-mapping-wrong-type:' .. lobby.lobby_code}
     end
     if redis.call('GET', lobby.active_game_key) then
-        return {0, 'lobby-already-matched:' .. lobby.lobby_code}
+        return {3, 'lobby-already-matched:' .. lobby.lobby_code}
     end
 
-    if key_type(lobby.queue_identity_key) ~= 'string' then
-        return {0, 'queue-identity-missing-or-wrong-type:' .. lobby.lobby_code}
+    local queue_identity_type = key_type(lobby.queue_identity_key)
+    if queue_identity_type == 'none' then
+        return {3, 'queue-identity-missing:' .. lobby.lobby_code}
+    end
+    if queue_identity_type ~= 'string' then
+        return {0, 'queue-identity-wrong-type:' .. lobby.lobby_code}
     end
     if redis.call('GET', lobby.queue_identity_key) ~= lobby.member_json then
-        return {0, 'queue-entry-changed:' .. lobby.lobby_code}
+        return {3, 'queue-entry-changed:' .. lobby.lobby_code}
     end
 
     for _, pair in ipairs(lobby.queue_pairs) do
-        if key_type(pair.queue_key) ~= 'zset' or key_type(pair.mmr_key) ~= 'zset' then
-            return {0, 'queue-missing-or-wrong-type:' .. lobby.lobby_code}
+        local queue_type = key_type(pair.queue_key)
+        local mmr_type = key_type(pair.mmr_key)
+        if queue_type == 'none' or mmr_type == 'none' then
+            return {3, 'queue-missing:' .. lobby.lobby_code}
+        end
+        if queue_type ~= 'zset' or mmr_type ~= 'zset' then
+            return {0, 'queue-wrong-type:' .. lobby.lobby_code}
         end
         if not redis.call('ZSCORE', pair.queue_key, lobby.member_json) then
-            return {0, 'queue-entry-changed:' .. lobby.lobby_code}
+            return {3, 'queue-entry-changed:' .. lobby.lobby_code}
         end
         if not redis.call('ZSCORE', pair.mmr_key, lobby.member_json) then
-            return {0, 'mmr-entry-changed:' .. lobby.lobby_code}
+            return {3, 'mmr-entry-changed:' .. lobby.lobby_code}
         end
     end
 end
@@ -376,13 +435,17 @@ for _, user in ipairs(plan.users) do
         return {0, 'user-mapping-wrong-type'}
     end
     if redis.call('GET', user.active_game_key) then
-        return {0, 'user-already-matched'}
+        return {3, 'user-already-matched'}
     end
-    if key_type(user.queue_identity_key) ~= 'string' then
-        return {0, 'user-queue-identity-missing-or-wrong-type'}
+    local user_queue_identity_type = key_type(user.queue_identity_key)
+    if user_queue_identity_type == 'none' then
+        return {3, 'user-queue-identity-missing'}
+    end
+    if user_queue_identity_type ~= 'string' then
+        return {0, 'user-queue-identity-wrong-type'}
     end
     if redis.call('GET', user.queue_identity_key) ~= user.queue_identity_value then
-        return {0, 'user-queue-entry-changed'}
+        return {3, 'user-queue-entry-changed'}
     end
 end
 
@@ -408,6 +471,7 @@ for _, user in ipairs(plan.users) do
 end
 
 redis.call('HSET', plan.outbox_key, plan.game_id, plan.outbox_payload)
+redis.call('ZADD', plan.outbox_age_key, plan.created_at_ms, plan.game_id)
 for _, notification in ipairs(plan.notifications) do
     redis.call('PUBLISH', notification.channel, notification.payload)
 end
@@ -457,7 +521,11 @@ impl LobbyRemovalPlan {
 
 impl MatchCommitPlan {
     fn redis_keys(&self) -> Vec<&str> {
-        let mut keys = vec![self.active_matches_key.as_str(), self.outbox_key.as_str()];
+        let mut keys = vec![
+            self.active_matches_key.as_str(),
+            self.outbox_key.as_str(),
+            self.outbox_age_key.as_str(),
+        ];
         for lobby in &self.lobbies {
             keys.push(&lobby.active_game_key);
             keys.push(&lobby.metadata_key);
@@ -590,12 +658,14 @@ impl MatchmakingManager {
                         "Failed to add lobby to queue after {} attempts",
                         self.max_retries
                     );
+                    crate::resilience_metrics::record_matchmaking_error(1);
                     return Err(anyhow!("Failed to add lobby to queue: {}", e));
                 }
             }
         };
-        match code {
-            1 => {
+        match classify_atomic_matchmaking_outcome(code) {
+            Some(AtomicMatchmakingOutcome::Applied) => {
+                crate::resilience_metrics::record_matchmaking_admission(1);
                 info!(
                     "Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
                     lobby_code,
@@ -604,16 +674,27 @@ impl MatchmakingManager {
                     avg_mmr
                 );
             }
-            2 => {
+            Some(AtomicMatchmakingOutcome::Idempotent) => {
+                crate::resilience_metrics::record_matchmaking_admission_deduplication(1);
                 info!(
                     lobby_code,
                     "Lobby already had an admitted queue identity; kept the first request"
                 );
             }
-            0 => return Err(anyhow!("Lobby admission was rejected: {detail}")),
-            other => {
+            Some(AtomicMatchmakingOutcome::ExpectedConflict) => {
+                crate::resilience_metrics::record_matchmaking_admission_rejection(1);
+                return Err(anyhow!("Lobby admission was rejected: {detail}"));
+            }
+            Some(AtomicMatchmakingOutcome::IntegrityError) => {
+                crate::resilience_metrics::record_matchmaking_error(1);
+                crate::resilience_metrics::record_matchmaking_integrity_error(1);
+                return Err(anyhow!("Lobby admission integrity failure: {detail}"));
+            }
+            None => {
+                crate::resilience_metrics::record_matchmaking_error(1);
+                crate::resilience_metrics::record_matchmaking_integrity_error(1);
                 return Err(anyhow!(
-                    "Lobby admission returned unknown status {other}: {detail}"
+                    "Lobby admission returned unknown status {code}: {detail}"
                 ));
             }
         }
@@ -936,7 +1017,9 @@ impl MatchmakingManager {
         let plan = MatchCommitPlan {
             active_matches_key: RedisKeys::matchmaking_active_matches(),
             outbox_key: RedisKeys::matchmaking_game_created_outbox(),
+            outbox_age_key: RedisKeys::matchmaking_game_created_outbox_age(),
             outbox_payload: serde_json::to_string(&outbox_record)?,
+            created_at_ms: match_info.created_at,
             game_id: game_id.to_string(),
             active_match_json: active_match_json.clone(),
             lobbies: commit_lobbies,
@@ -944,6 +1027,14 @@ impl MatchmakingManager {
             notifications,
         };
         let plan_json = serde_json::to_string(&plan)?;
+        let matched_players = match_info.players.len();
+        let matched_lobbies = lobbies.len();
+        let committed_at_ms = Utc::now().timestamp_millis();
+        let wait_ms = lobbies
+            .iter()
+            .map(|lobby| committed_at_ms.saturating_sub(lobby.queued_at).max(0) as u64)
+            .max()
+            .unwrap_or(0);
         let script = redis::Script::new(COMMIT_MATCH_SCRIPT);
         let mut attempts = 0;
         let mut delay = self.retry_delay;
@@ -982,23 +1073,40 @@ impl MatchmakingManager {
                     if matches!(existing, Ok(Some(ref value)) if value == &active_match_json) {
                         return Ok(MatchCommitOutcome::AlreadyCommitted);
                     }
+                    crate::resilience_metrics::record_matchmaking_error(1);
                     return Err(error).context("Failed to atomically commit matchmaking claim");
                 }
             }
         };
 
-        match code {
-            1 => Ok(MatchCommitOutcome::Committed { outbox_id: detail }),
-            2 => Ok(MatchCommitOutcome::AlreadyCommitted),
-            0 => {
+        match classify_atomic_matchmaking_outcome(code) {
+            Some(AtomicMatchmakingOutcome::Applied) => {
+                crate::resilience_metrics::record_matchmaking_commit(
+                    wait_ms,
+                    matched_players,
+                    matched_lobbies,
+                );
+                Ok(MatchCommitOutcome::Committed { outbox_id: detail })
+            }
+            Some(AtomicMatchmakingOutcome::Idempotent) => Ok(MatchCommitOutcome::AlreadyCommitted),
+            Some(AtomicMatchmakingOutcome::ExpectedConflict) => {
                 crate::resilience_metrics::record_match_claim_conflicts(1);
                 Ok(MatchCommitOutcome::Conflict { reason: detail })
             }
-            other => Err(anyhow!(
-                "Atomic matchmaking script returned unknown status {} ({})",
-                other,
-                detail
-            )),
+            Some(AtomicMatchmakingOutcome::IntegrityError) => {
+                crate::resilience_metrics::record_matchmaking_error(1);
+                crate::resilience_metrics::record_matchmaking_integrity_error(1);
+                Err(anyhow!("Atomic matchmaking integrity failure: {detail}"))
+            }
+            None => {
+                crate::resilience_metrics::record_matchmaking_error(1);
+                crate::resilience_metrics::record_matchmaking_integrity_error(1);
+                Err(anyhow!(
+                    "Atomic matchmaking script returned unknown status {} ({})",
+                    code,
+                    detail
+                ))
+            }
         }
     }
 
@@ -1035,13 +1143,28 @@ impl MatchmakingManager {
     ) -> Result<bool> {
         let result: i32 = redis::Script::new(
             r#"
+            local function key_type(key)
+                local response = redis.call('TYPE', key)
+                if type(response) == 'table' then return response['ok'] end
+                return response
+            end
+            local outbox_type = key_type(KEYS[1])
+            if outbox_type ~= 'none' and outbox_type ~= 'hash' then return -2 end
+            local age_type = key_type(KEYS[2])
+            if age_type ~= 'none' and age_type ~= 'zset' then return -3 end
             local current = redis.call('HGET', KEYS[1], ARGV[1])
-            if not current then return 0 end
+            if not current then
+                redis.call('ZREM', KEYS[2], ARGV[1])
+                return 0
+            end
             if current ~= ARGV[2] then return -1 end
-            return redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('ZREM', KEYS[2], ARGV[1])
+            return 1
             "#,
         )
         .key(RedisKeys::matchmaking_game_created_outbox())
+        .key(RedisKeys::matchmaking_game_created_outbox_age())
         .arg(game_id)
         .arg(expected_payload)
         .invoke_async(&mut self.redis)
@@ -1052,6 +1175,10 @@ impl MatchmakingManager {
             0 => Ok(false),
             -1 => Err(anyhow!(
                 "game-created outbox payload changed before acknowledgement"
+            )),
+            -2 => Err(anyhow!("game-created outbox has the wrong Redis type")),
+            -3 => Err(anyhow!(
+                "game-created outbox age index has the wrong Redis type"
             )),
             other => Err(anyhow!(
                 "game-created outbox acknowledgement returned {other}"
@@ -1091,6 +1218,27 @@ mod tests {
     use super::*;
     use crate::redis_utils;
     use redis::Client;
+
+    #[test]
+    fn atomic_script_codes_separate_expected_conflicts_from_integrity_errors() {
+        assert_eq!(
+            classify_atomic_matchmaking_outcome(0),
+            Some(AtomicMatchmakingOutcome::IntegrityError)
+        );
+        assert_eq!(
+            classify_atomic_matchmaking_outcome(1),
+            Some(AtomicMatchmakingOutcome::Applied)
+        );
+        assert_eq!(
+            classify_atomic_matchmaking_outcome(2),
+            Some(AtomicMatchmakingOutcome::Idempotent)
+        );
+        assert_eq!(
+            classify_atomic_matchmaking_outcome(3),
+            Some(AtomicMatchmakingOutcome::ExpectedConflict)
+        );
+        assert_eq!(classify_atomic_matchmaking_outcome(4), None);
+    }
 
     #[tokio::test]
     async fn test_redis_connection() {

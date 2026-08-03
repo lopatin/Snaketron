@@ -90,6 +90,16 @@ impl RedisKeys {
         )
     }
 
+    /// Creation-time index for exact oldest-age observation of the durable
+    /// GameCreated outbox. It shares the outbox hash slot so commit and
+    /// acknowledgement can maintain both structures atomically.
+    pub fn matchmaking_game_created_outbox_age() -> String {
+        format!(
+            "matchmaking:{{{}}}:game-created-outbox-age:v1",
+            Self::MATCHMAKING_TAG
+        )
+    }
+
     /// Partition-local idempotency marker for one outbox delivery.
     pub fn matchmaking_game_created_delivery(game_id: u32) -> String {
         let partition = Self::game_partition(game_id);
@@ -429,6 +439,7 @@ mod tests {
         assert_same_slot(&[
             RedisKeys::matchmaking_active_matches(),
             RedisKeys::matchmaking_game_created_outbox(),
+            RedisKeys::matchmaking_game_created_outbox_age(),
             RedisKeys::matchmaking_user_status(1),
             RedisKeys::matchmaking_user_active_game(1),
             RedisKeys::matchmaking_user_queue_identity(1),

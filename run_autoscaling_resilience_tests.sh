@@ -4066,58 +4066,58 @@ collect_cloudwatch_evidence() {
   mkdir -p "$cloudwatch_dir"
 
   cloudwatch_metric "$cloudwatch_dir/ready-tasks.json" \
-    Snaketron/Resilience ReadyTasks Minimum \
+    Snaketron/OperationalDev ReadyTasks Minimum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/regional-collection-failures.json" \
-    Snaketron/Resilience RegionalCollectionFailures Sum \
+    Snaketron/OperationalDev RegionalCollectionFailures Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/fingerprint-divergences.json" \
-    Snaketron/Resilience RecoveryFingerprintDivergences Sum \
+    Snaketron/OperationalDev RecoveryFingerprintDivergences Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/owner-mismatches.json" \
-    Snaketron/Resilience PartitionOwnerMismatches Maximum \
+    Snaketron/OperationalDev PartitionOwnerMismatches Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/active-index-mismatches.json" \
-    Snaketron/Resilience ActiveGameIndexMismatches Maximum \
+    Snaketron/OperationalDev ActiveGameIndexMismatches Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/planned-drain-failures.json" \
-    Snaketron/Resilience PlannedDrainFailures Sum \
+    Snaketron/OperationalDev PlannedDrainFailures Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/partition-unowned-ms.json" \
-    Snaketron/Resilience PartitionUnownedMs Maximum \
+    Snaketron/OperationalDev PartitionUnownedMs Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/assignment-imbalance.json" \
-    Snaketron/Resilience AssignmentImbalance Maximum \
+    Snaketron/OperationalDev AssignmentImbalance Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/oldest-pending-command-ms.json" \
-    Snaketron/Resilience OldestPendingCommandMs Maximum \
+    Snaketron/OperationalDev OldestPendingCommandMs Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/pending-commands.json" \
-    Snaketron/Resilience PendingCommands Maximum \
+    Snaketron/OperationalDev PendingCommands Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/pending-completions.json" \
-    Snaketron/Resilience PendingCompletions Maximum \
+    Snaketron/OperationalDev PendingCompletions Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/checkpoint-age-ms.json" \
-    Snaketron/Resilience CheckpointAgeMs Maximum \
+    Snaketron/OperationalDev CheckpointAgeMs Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/checkpoint-bytes.json" \
-    Snaketron/Resilience CheckpointBytes Maximum \
+    Snaketron/OperationalDev CheckpointBytes Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/checkpoint-writes.json" \
-    Snaketron/Resilience CheckpointWrites Sum \
+    Snaketron/OperationalDev CheckpointWrites Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/checkpoint-failures.json" \
-    Snaketron/Resilience CheckpointFailures Sum \
+    Snaketron/OperationalDev CheckpointFailures Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/fenced-write-rejections.json" \
-    Snaketron/Resilience FencedWriteRejections Sum \
+    Snaketron/OperationalDev FencedWriteRejections Sum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/quarantined-commands.json" \
-    Snaketron/Resilience QuarantinedCommands Maximum \
+    Snaketron/OperationalDev QuarantinedCommands Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
   cloudwatch_metric "$cloudwatch_dir/active-websockets.json" \
-    Snaketron/Resilience ActiveWebSockets Maximum \
+    Snaketron/OperationalDev ActiveWebSockets Maximum \
     Name=Environment,Value="$SNAKETRON_STAGING_ENVIRONMENT"
 
   cloudwatch_metric "$cloudwatch_dir/ecs-cpu.json" \

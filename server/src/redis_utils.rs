@@ -3,7 +3,7 @@ use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
 use redis::cluster::ClusterClient;
 use redis::cluster_async::ClusterConnection;
 use redis::{Client, PushInfo, RedisFuture, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -118,18 +118,20 @@ impl RedisClient {
                 push_sender,
             } => {
                 let config = standalone_manager_config(push_sender.clone());
-                Ok(RedisConnection::StandaloneManaged(
-                    ConnectionManager::new_with_config(client.clone(), config)
-                        .await
-                        .context("failed to create standalone Redis connection manager")?,
+                Ok(RedisConnection::new(
+                    RedisConnectionInner::StandaloneManaged(
+                        ConnectionManager::new_with_config(client.clone(), config)
+                            .await
+                            .context("failed to create standalone Redis connection manager")?,
+                    ),
                 ))
             }
-            Self::Cluster(client) => Ok(RedisConnection::Cluster(
+            Self::Cluster(client) => Ok(RedisConnection::new(RedisConnectionInner::Cluster(
                 client
                     .get_async_connection()
                     .await
                     .context("failed to create Redis Cluster connection")?,
-            )),
+            ))),
         }
     }
 
@@ -138,18 +140,20 @@ impl RedisClient {
     /// the application's shared publisher connection.
     pub async fn get_dedicated_connection(&self) -> Result<RedisConnection> {
         match self {
-            Self::Standalone { client, .. } => Ok(RedisConnection::StandaloneMultiplexed(
-                client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .context("failed to create dedicated standalone Redis connection")?,
+            Self::Standalone { client, .. } => Ok(RedisConnection::new(
+                RedisConnectionInner::StandaloneMultiplexed(
+                    client
+                        .get_multiplexed_async_connection()
+                        .await
+                        .context("failed to create dedicated standalone Redis connection")?,
+                ),
             )),
-            Self::Cluster(client) => Ok(RedisConnection::Cluster(
+            Self::Cluster(client) => Ok(RedisConnection::new(RedisConnectionInner::Cluster(
                 client
                     .get_async_connection()
                     .await
                     .context("failed to create dedicated Redis Cluster connection")?,
-            )),
+            ))),
         }
     }
 }
@@ -167,40 +171,118 @@ impl From<Client> for RedisClient {
 /// redis-rs' connection trait preserves `AsyncCommands`, `Script`, pipelines,
 /// and existing call sites while cluster routing stays encapsulated here.
 #[derive(Clone)]
-pub enum RedisConnection {
+enum RedisConnectionInner {
     StandaloneManaged(ConnectionManager),
     StandaloneMultiplexed(redis::aio::MultiplexedConnection),
     Cluster(ClusterConnection),
 }
 
+#[derive(Clone)]
+pub struct RedisConnection {
+    inner: RedisConnectionInner,
+    record_application_metrics: bool,
+}
+
+struct RedisRequestMeasurement {
+    started_at: Instant,
+    enabled: bool,
+    recorded: bool,
+}
+
+impl RedisRequestMeasurement {
+    fn new(enabled: bool) -> Self {
+        Self {
+            started_at: Instant::now(),
+            enabled,
+            recorded: false,
+        }
+    }
+
+    fn complete(&mut self, failed: bool) {
+        if self.enabled {
+            crate::resilience_metrics::record_redis_request(self.started_at.elapsed(), failed);
+        }
+        self.recorded = true;
+    }
+}
+
+impl Drop for RedisRequestMeasurement {
+    fn drop(&mut self) {
+        if self.enabled && !self.recorded {
+            // A caller-side timeout or cancellation drops the redis-rs future
+            // before it yields a RedisError. Treat that abandoned request as
+            // failed and retain the elapsed time observed by the application.
+            crate::resilience_metrics::record_redis_request(self.started_at.elapsed(), true);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn drop_redis_request_measurement_for_test(enabled: bool) {
+    drop(RedisRequestMeasurement::new(enabled));
+}
+
 impl From<ConnectionManager> for RedisConnection {
     fn from(connection: ConnectionManager) -> Self {
-        Self::StandaloneManaged(connection)
+        Self {
+            inner: RedisConnectionInner::StandaloneManaged(connection),
+            record_application_metrics: true,
+        }
     }
 }
 
 impl RedisConnection {
+    fn new(inner: RedisConnectionInner) -> Self {
+        Self {
+            inner,
+            record_application_metrics: true,
+        }
+    }
+
+    /// Clone-derived connection dedicated to telemetry/control-plane reads.
+    /// Its commands remain functional but cannot recursively inflate the
+    /// application/cache Redis workload metrics they are collecting.
+    pub(crate) fn without_application_metrics(mut self) -> Self {
+        self.record_application_metrics = false;
+        self
+    }
+
     pub async fn subscribe(&mut self, channel: &str) -> redis::RedisResult<()> {
-        match self {
-            Self::StandaloneManaged(connection) => connection.subscribe(channel).await,
-            Self::Cluster(connection) => connection.subscribe(channel).await,
-            Self::StandaloneMultiplexed(connection) => {
+        let mut measurement = RedisRequestMeasurement::new(self.record_application_metrics);
+        let result = match &mut self.inner {
+            RedisConnectionInner::StandaloneManaged(connection) => {
+                connection.subscribe(channel).await
+            }
+            RedisConnectionInner::Cluster(connection) => connection.subscribe(channel).await,
+            RedisConnectionInner::StandaloneMultiplexed(connection) => {
                 redis::cmd("SUBSCRIBE")
                     .arg(channel)
                     .query_async(connection)
                     .await
             }
-        }
+        };
+        measurement.complete(result.is_err());
+        result
     }
 }
 
 impl ConnectionLike for RedisConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> RedisFuture<'a, Value> {
-        match self {
-            Self::StandaloneManaged(connection) => connection.req_packed_command(cmd),
-            Self::StandaloneMultiplexed(connection) => connection.req_packed_command(cmd),
-            Self::Cluster(connection) => connection.req_packed_command(cmd),
-        }
+        let mut measurement = RedisRequestMeasurement::new(self.record_application_metrics);
+        let request = match &mut self.inner {
+            RedisConnectionInner::StandaloneManaged(connection) => {
+                connection.req_packed_command(cmd)
+            }
+            RedisConnectionInner::StandaloneMultiplexed(connection) => {
+                connection.req_packed_command(cmd)
+            }
+            RedisConnectionInner::Cluster(connection) => connection.req_packed_command(cmd),
+        };
+        Box::pin(async move {
+            let result = request.await;
+            measurement.complete(result.is_err());
+            result
+        })
     }
 
     fn req_packed_commands<'a>(
@@ -209,22 +291,30 @@ impl ConnectionLike for RedisConnection {
         offset: usize,
         count: usize,
     ) -> RedisFuture<'a, Vec<Value>> {
-        match self {
-            Self::StandaloneManaged(connection) => {
+        let mut measurement = RedisRequestMeasurement::new(self.record_application_metrics);
+        let request = match &mut self.inner {
+            RedisConnectionInner::StandaloneManaged(connection) => {
                 connection.req_packed_commands(cmd, offset, count)
             }
-            Self::StandaloneMultiplexed(connection) => {
+            RedisConnectionInner::StandaloneMultiplexed(connection) => {
                 connection.req_packed_commands(cmd, offset, count)
             }
-            Self::Cluster(connection) => connection.req_packed_commands(cmd, offset, count),
-        }
+            RedisConnectionInner::Cluster(connection) => {
+                connection.req_packed_commands(cmd, offset, count)
+            }
+        };
+        Box::pin(async move {
+            let result = request.await;
+            measurement.complete(result.is_err());
+            result
+        })
     }
 
     fn get_db(&self) -> i64 {
-        match self {
-            Self::StandaloneManaged(connection) => connection.get_db(),
-            Self::StandaloneMultiplexed(connection) => connection.get_db(),
-            Self::Cluster(connection) => connection.get_db(),
+        match &self.inner {
+            RedisConnectionInner::StandaloneManaged(connection) => connection.get_db(),
+            RedisConnectionInner::StandaloneMultiplexed(connection) => connection.get_db(),
+            RedisConnectionInner::Cluster(connection) => connection.get_db(),
         }
     }
 }

@@ -173,6 +173,44 @@ async fn repeated_and_concurrent_lobby_admission_keeps_one_queue_identity() -> R
 }
 
 #[tokio::test]
+async fn admission_wrong_type_is_reported_as_integrity_failure() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["CORRUPT1"]).await?;
+
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let _: usize = redis
+        .rpush(
+            RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode),
+            "wrong-type",
+        )
+        .await?;
+
+    let mut manager = create_test_matchmaking_manager().await?;
+    let error = manager
+        .add_lobby_to_queue(
+            "CORRUPT1",
+            vec![make_lobby_member(92, "corrupt-player")],
+            1_000,
+            vec![game_type],
+            queue_mode,
+            92,
+        )
+        .await
+        .expect_err("wrong-type queue must not look like an expected claim race");
+    assert!(
+        error
+            .to_string()
+            .contains("integrity failure: queue-wrong-type")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn one_user_cannot_be_admitted_through_two_lobbies() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
@@ -738,6 +776,16 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
     assert_eq!(outbox.len(), 1);
     let (outbox_game_id, outbox_payload) = outbox.pop().expect("one committed outbox record");
     assert_eq!(outbox_game_id, winner_id.to_string());
+    let outbox_age_key = RedisKeys::matchmaking_game_created_outbox_age();
+    let indexed_at_ms: Option<i64> = redis.zscore(&outbox_age_key, winner_id).await?;
+    assert!(indexed_at_ms.is_some());
+    assert_eq!(redis.zcard::<_, usize>(&outbox_age_key).await?, 1);
+    assert_eq!(
+        redis
+            .zscore::<_, _, Option<i64>>(&outbox_age_key, loser_id)
+            .await?,
+        None
+    );
     let outbox_record: GameCreatedOutboxRecord = serde_json::from_str(&outbox_payload)?;
     let redis_client = Client::open(test_redis_url())?;
     let (pubsub_tx, _rx) = broadcast::channel::<PushInfo>(128);
@@ -768,6 +816,12 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
     assert!(
         left.acknowledge_game_created_outbox(winner_id, &outbox_payload)
             .await?
+    );
+    assert_eq!(
+        redis
+            .zscore::<_, _, Option<i64>>(&outbox_age_key, winner_id)
+            .await?,
+        None
     );
     game_bus
         .expire_game_created_delivery_marker(winner_id)
