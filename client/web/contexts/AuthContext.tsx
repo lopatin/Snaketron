@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../services/api';
+import { api, isApiError } from '../services/api';
 import { AuthContextType, User } from '../types';
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -38,7 +38,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setUser(userInfo);
     } catch (err) {
       console.error('Failed to fetch current user:', err);
-      const status = (err as any)?.response?.status;
+      const status = isApiError(err) ? err.response.status : undefined;
       const isAuthError = status === 401 || status === 403;
       const isAbortError = err instanceof Error && err.name === 'AbortError';
 

@@ -31,7 +31,10 @@ pub struct LeaderboardQuery {
 
 /// Leaderboard entry response format for frontend (for ranked/competitive modes)
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct LeaderboardEntryResponse {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub rank: usize,
     pub username: String,
     pub mmr: i32,
@@ -43,7 +46,10 @@ pub struct LeaderboardEntryResponse {
 
 /// High score entry response format for frontend (for solo mode)
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct HighScoreEntryResponse {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub rank: usize,
     pub username: String,
     pub score: i32,
@@ -55,6 +61,8 @@ pub struct HighScoreEntryResponse {
 /// Leaderboard response (supports both ranking and high score entries)
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum LeaderboardEntry {
     Ranking(LeaderboardEntryResponse),
     HighScore(HighScoreEntryResponse),
@@ -62,6 +70,8 @@ pub enum LeaderboardEntry {
 
 /// Leaderboard response
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct LeaderboardResponse {
     pub entries: Vec<LeaderboardEntry>,
     pub season: Season,
@@ -75,6 +85,8 @@ pub struct LeaderboardResponse {
 
 /// Seasons list response
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct SeasonsResponse {
     pub seasons: Vec<Season>,
     pub current: Season,
@@ -285,7 +297,10 @@ pub async fn list_seasons(State(_state): State<LeaderboardState>) -> Json<Season
 
 /// User ranking response
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct UserRankingResponse {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number | null"))]
     pub rank: Option<usize>,
     pub mmr: Option<i32>,
     pub wins: Option<i32>,

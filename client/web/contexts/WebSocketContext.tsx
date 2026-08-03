@@ -11,6 +11,11 @@ import {
   User,
   MatchmakingStatus,
 } from '../types';
+import {
+  OutboundMessage,
+  WSMessageTag,
+  TypedMessage,
+} from '../types/protocol';
 import { clockSync } from '../utils/clockSync';
 import { record as recordTrace } from '../utils/syncTrace';
 import { useLatency } from './LatencyContext';
@@ -46,9 +51,9 @@ interface WebSocketProviderProps {
   children: React.ReactNode;
 }
 
-interface MessageHandler {
-  (message: { type: string; data: any }): void;
-}
+// Handlers are registered per tag via onMessage<K> (typed payloads). Internally
+// they are stored type-erased and the generic is reconstructed at dispatch.
+type InternalHandler = (message: TypedMessage) => void;
 
 type SocketRole = 'active' | 'candidate' | 'retired';
 
@@ -60,7 +65,9 @@ interface SocketSlot {
   authenticated: boolean;
   capabilities: string[];
   authTokenSent: string | null;
-  bufferedMessages: any[];
+  // Retains the exact frame text alongside the parsed object so a buffered
+  // message replayed later still carries `raw` for the u64-safe WASM path.
+  bufferedMessages: Array<{ rawMessage: any; rawText: string }>;
   expectedLobbyCode: string | null;
   expectedGameId: number | null;
   lobbyReady: boolean;
@@ -253,7 +260,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const reconnectEnabledRef = useRef(true);
   const openActiveRef = useRef<(url: string, onConnect?: () => void) => void>(() => {});
   const startCandidateRef = useRef<(deadlineMs: number) => void>(() => {});
-  const messageHandlers = useRef<Map<string, MessageHandler[]>>(new Map());
+  const messageHandlers = useRef<Map<string, InternalHandler[]>>(new Map());
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
   const inFlightRequestsByGenerationRef = useRef<Map<number, number>>(new Map());
   const latestGameStreamSeqRef = useRef<Map<number, number>>(new Map());
@@ -450,7 +457,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     );
   }, []);
 
-  const dispatchRawMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
+  const dispatchRawMessage = useCallback((slot: SocketSlot, rawMessage: any, rawText: string) => {
     if (activeSlotRef.current !== slot || slot.role !== 'active') {
       return;
     }
@@ -542,10 +549,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       console.warn('Unexpected WebSocket message shape', rawMessage);
       return;
     }
-    const handlers = [...(messageHandlers.current.get(messageType) || [])];
-    handlers.forEach((handler: MessageHandler) => {
+    // `raw` carries the exact frame text so game-event consumers can hand it
+    // straight to the WASM engine (GameClient.processServerFrame) instead of
+    // re-serializing the already-JSON.parse'd `messageData` — full-range u64
+    // fields (e.g. TickHash.hash) do not survive a JS number round-trip.
+    const tag = messageType as WSMessageTag;
+    const handlers = [...(messageHandlers.current.get(tag) || [])];
+    handlers.forEach((handler) => {
       try {
-        handler({ type: messageType!, data: messageData });
+        handler({ type: tag, data: messageData, raw: rawText } as TypedMessage);
       } catch (error) {
         console.error(`WebSocket ${messageType} handler failed:`, error);
       }
@@ -684,11 +696,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     candidate.promotionSuppressionFloor = transportOverlapProved ? activeWatermark : null;
     const buffered = candidate.bufferedMessages.splice(0);
-    buffered.forEach((message) => {
-      if (suppressCoveredPromotionEvent(candidate, message)) {
+    buffered.forEach(({ rawMessage, rawText }) => {
+      if (suppressCoveredPromotionEvent(candidate, rawMessage)) {
         return;
       }
-      dispatchRawMessage(candidate, message);
+      dispatchRawMessage(candidate, rawMessage, rawText);
     });
     const pendingMatchmakingIntent = pendingMatchmakingIntentRef.current;
     if (
@@ -795,7 +807,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
-  const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any) => {
+  const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any, rawText: string) => {
     if (slot.role === 'retired') {
       return;
     }
@@ -849,7 +861,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         candidate.continuityProbeActiveGeneration === slot.generation &&
         Number(rawMessage.Pong.client_time) === candidate.continuityProbeClientTime
       ) {
-        dispatchRawMessage(slot, rawMessage);
+        dispatchRawMessage(slot, rawMessage, rawText);
         candidate.promotionStreamFrontier = candidate.expectedGameId === null
           ? null
           : latestGameStreamSeqRef.current.get(candidate.expectedGameId) ?? null;
@@ -908,7 +920,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
             },
           }));
         }
-        dispatchRawMessage(slot, rawMessage);
+        dispatchRawMessage(slot, rawMessage, rawText);
         completeActiveRecovery(slot, nowMs);
       } else if (slot.role === 'candidate' && candidateSlotRef.current === slot) {
         restoreCandidateContext(slot);
@@ -983,7 +995,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         recoverAfterCandidateFailure(slot);
         return;
       }
-      slot.bufferedMessages.push(rawMessage);
+      slot.bufferedMessages.push({ rawMessage, rawText });
       if (slot.expectedGameId !== null) {
         slot.gameStreamWatermark = advanceCandidateGameWatermark(
           slot.gameStreamWatermark,
@@ -1042,7 +1054,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (suppressCoveredPromotionEvent(slot, rawMessage)) {
       return;
     }
-    dispatchRawMessage(slot, rawMessage);
+    dispatchRawMessage(slot, rawMessage, rawText);
     const candidate = candidateSlotRef.current;
     if (candidate) {
       // Keep applying the old authoritative stream after the continuity pong.
@@ -1109,7 +1121,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           return;
         }
         try {
-          handleParsedMessage(slot, JSON.parse(event.data));
+          handleParsedMessage(slot, JSON.parse(event.data), event.data);
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
         }
@@ -1378,7 +1390,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     connect(wsUrl, onConnectCallback.current || undefined);
   }, [connect, disconnect]);
 
-  const sendMessage = useCallback((message: any) => {
+  const sendMessage = useCallback((message: OutboundMessage) => {
     const isQueueIntent = isMatchmakingQueueIntent(message);
     if (isQueueIntent) {
       const authToken = getToken();
@@ -1556,21 +1568,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     };
   }, [promoteCandidate]);
 
-  const onMessage = useCallback((messageType: string, handler: MessageHandler) => {
-    if (!messageHandlers.current.has(messageType)) {
-      messageHandlers.current.set(messageType, []);
-    }
-    messageHandlers.current.get(messageType)!.push(handler);
-
-    // Return cleanup function
-    return () => {
-      const handlers = messageHandlers.current.get(messageType) || [];
-      const index = handlers.indexOf(handler);
-      if (index > -1) {
-        handlers.splice(index, 1);
+  const onMessage = useCallback(
+    <K extends WSMessageTag>(messageType: K, handler: (message: TypedMessage<K>) => void) => {
+      const internal = handler as InternalHandler;
+      if (!messageHandlers.current.has(messageType)) {
+        messageHandlers.current.set(messageType, []);
       }
-    };
-  }, []);
+      messageHandlers.current.get(messageType)!.push(internal);
+
+      // Return cleanup function
+      return () => {
+        const handlers = messageHandlers.current.get(messageType) || [];
+        const index = handlers.indexOf(internal);
+        if (index > -1) {
+          handlers.splice(index, 1);
+        }
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!isConnected) {
@@ -2522,18 +2538,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return null;
     };
 
+    // NOTE: `CustomGameCreated` / `CustomGameJoined` handlers were removed:
+    // neither is a real WSMessage variant (see server/src/ws_server.rs), so
+    // they could never fire.
     const cleanupJoin = onMessage('JoinGame', (message: any) => {
       const payload = message?.data ?? message?.JoinGame ?? message;
-      resetGameChat(extractGameId(payload));
-    });
-
-    const cleanupCustomCreated = onMessage('CustomGameCreated', (message: any) => {
-      const payload = message?.data ?? message?.CustomGameCreated ?? message;
-      resetGameChat(extractGameId(payload));
-    });
-
-    const cleanupCustomJoined = onMessage('CustomGameJoined', (message: any) => {
-      const payload = message?.data ?? message?.CustomGameJoined ?? message;
       resetGameChat(extractGameId(payload));
     });
 
@@ -2548,8 +2557,6 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     return () => {
       cleanupJoin();
-      cleanupCustomCreated();
-      cleanupCustomJoined();
       cleanupSoloCreated();
       cleanupSpectator();
     };

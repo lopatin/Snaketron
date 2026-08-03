@@ -109,7 +109,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     return gameState.arena.snakes.map((snake, index) => {
       // Find player for this snake
       const playerEntry = Object.entries(gameState.players || {}).find(
-        ([_, player]) => player.snake_id === index
+        ([_, player]) => player?.snake_id === index
       );
       const userId = playerEntry ? parseInt(playerEntry[0]) : null;
       const isCurrentPlayer = userId === currentUserId;
@@ -217,7 +217,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     return gameState.arena.snakes.map((snake, index) => {
       // Find player for this snake
       const playerEntry = Object.entries(gameState.players || {}).find(
-        ([_, player]) => player.snake_id === index
+        ([_, player]) => player?.snake_id === index
       );
       const userId = playerEntry ? parseInt(playerEntry[0]) : null;
       const isCurrentPlayer = userId === currentUserId;

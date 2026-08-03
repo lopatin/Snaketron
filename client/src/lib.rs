@@ -118,6 +118,53 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Apply a raw server WSMessage frame (`{"GameEvent": <GameEventMessage>}`).
+    ///
+    /// The `GameEventMessage` is deserialized from the raw frame text entirely
+    /// in Rust, so full-range `u64` fields survive intact. Passing the parsed
+    /// JS object here instead would have already lost precision: `JSON.parse`
+    /// widens every number to an f64, corrupting `TickHash.hash` (an unmasked
+    /// 64-bit digest) and breaking divergence detection with false mismatches.
+    #[wasm_bindgen(js_name = processServerFrame)]
+    pub fn process_server_frame(&mut self, frame_json: &str) -> Result<(), JsValue> {
+        let frame: serde_json::Value =
+            serde_json::from_str(frame_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = frame
+            .get("GameEvent")
+            .ok_or_else(|| JsValue::from_str("expected a GameEvent frame"))?;
+        let event_message: GameEventMessage =
+            serde_json::from_value(inner.clone()).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        self.engine
+            .process_server_event(&event_message)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Build a client from a raw server WSMessage frame carrying a Snapshot
+    /// (`{"GameEvent": { ..., "event": { "Snapshot": { "game_state": ... } } }}`).
+    ///
+    /// Deserializing the `GameState` from the raw text in Rust keeps its u64
+    /// fields (notably `rng.state`) intact, matching `processServerFrame`.
+    #[wasm_bindgen(js_name = newFromSnapshotFrame)]
+    pub fn new_from_snapshot_frame(game_id: u32, frame_json: &str) -> Result<GameClient, JsValue> {
+        console_error_panic_hook::set_once();
+
+        let frame: serde_json::Value =
+            serde_json::from_str(frame_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let game_state_val = frame
+            .get("GameEvent")
+            .and_then(|e| e.get("event"))
+            .and_then(|e| e.get("Snapshot"))
+            .and_then(|s| s.get("game_state"))
+            .ok_or_else(|| JsValue::from_str("expected a GameEvent Snapshot frame"))?;
+        let game_state: GameState = serde_json::from_value(game_state_val.clone())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(GameClient {
+            engine: GameEngine::new_from_state(game_id, game_state),
+        })
+    }
+
     /// Initialize game state from a snapshot
     #[wasm_bindgen(js_name = initializeFromSnapshot)]
     pub fn initialize_from_snapshot(
@@ -218,16 +265,76 @@ impl GameClient {
     /// Returns None if the user is not in the game
     #[wasm_bindgen(js_name = getSnakeIdForUser)]
     pub fn get_snake_id_for_user(&self, user_id: u32) -> Option<u32> {
-        // Get the predicted state and look up the player
-        if let Ok(state_json) = self.engine.get_predicted_state_json()
-            && let Ok(state) = serde_json::from_str::<GameState>(&state_json)
-            && let Some(player) = state.players.get(&user_id)
-        {
-            return Some(player.snake_id);
-        }
-        None
+        // Read the player directly from the engine's predicted state. (This used
+        // to serialize the entire predicted state to JSON and re-parse it on
+        // every keypress just to read one field.)
+        self.render_state()
+            .players
+            .get(&user_id)
+            .map(|player| player.snake_id)
+    }
+
+    /// Render the engine's current predicted state directly to a canvas — no
+    /// JSON round-trip. Replaces the free `render_game(json, ...)` export, which
+    /// re-parsed the engine's own state from a string into `serde_json::Value`
+    /// every frame.
+    #[wasm_bindgen(js_name = render)]
+    pub fn render(
+        &self,
+        canvas: &web_sys::HtmlCanvasElement,
+        cell_size: f64,
+        rotation: f64,
+        local_user_id: Option<u32>,
+    ) -> Result<(), JsValue> {
+        render::render_game_state(
+            self.render_state(),
+            canvas,
+            cell_size,
+            local_user_id,
+            rotation as i32,
+        )
     }
 }
 
-/// Render functions exposed to JavaScript
-pub use render::render_game;
+impl GameClient {
+    /// The state to render/query: the predicted state, or the committed state
+    /// if prediction is not active.
+    fn render_state(&self) -> &GameState {
+        self.engine
+            .predicted_state()
+            .unwrap_or_else(|| self.engine.committed_state())
+    }
+}
+
+/// Input helper exposed to JavaScript (maps a screen direction to a game
+/// direction for the current arena rotation); see render.rs.
+pub use render::screen_direction_to_game;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The whole reason processServerFrame/newFromSnapshotFrame exist: parsing a
+    // GameEventMessage out of the raw frame text in Rust must preserve a
+    // full-range u64 hash exactly. A JS `JSON.parse` would widen it to an f64
+    // and silently alter it, which is what corrupted divergence detection.
+    #[test]
+    fn frame_parse_preserves_full_range_u64_hash() {
+        // A digest well above 2^53 (JS Number.MAX_SAFE_INTEGER).
+        let hash: u64 = 0xFEDC_BA98_7654_3210;
+        assert!(hash > (1u64 << 53));
+
+        let frame = format!(
+            r#"{{"GameEvent":{{"game_id":1,"tick":5,"sequence":9,"stream_seq":9,"user_id":null,"event":{{"TickHash":{{"hash":{hash},"server_ts_ms":123}}}}}}}}"#
+        );
+
+        let frame_val: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let inner = frame_val.get("GameEvent").expect("GameEvent key present");
+        let msg: GameEventMessage = serde_json::from_value(inner.clone()).unwrap();
+
+        match msg.event {
+            GameEvent::TickHash { hash: got, .. } => assert_eq!(got, hash),
+            other => panic!("expected TickHash, got {other:?}"),
+        }
+    }
+}

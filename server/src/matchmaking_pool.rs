@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 /// lobby admission and physically separate Redis queues.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum MatchmakingPool {
     #[default]
     Public,

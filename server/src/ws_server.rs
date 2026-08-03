@@ -41,6 +41,8 @@ use tracing::{debug, error, info, warn};
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum WSMessage {
     Token(String),
     JoinGame(u32),
@@ -57,7 +59,9 @@ pub enum WSMessage {
     CommandOutcomes {
         game_id: u32,
         client_game_session_id: String,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         contiguous_through: u64,
+        #[cfg_attr(feature = "ts-gen", ts(as = "BTreeMap<u32, CommandOutcome>"))]
         outcomes: BTreeMap<u64, CommandOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rejection_fence: Option<SessionCommandRejectionFence>,
@@ -81,6 +85,7 @@ pub enum WSMessage {
         user_id: i32,
         username: String,
         message: String,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         timestamp_ms: i64,
     },
     GameChatMessage {
@@ -89,6 +94,7 @@ pub enum WSMessage {
         user_id: i32,
         username: String,
         message: String,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         timestamp_ms: i64,
     },
     LobbyChatHistory {
@@ -105,6 +111,7 @@ pub enum WSMessage {
         task_boot_id: String,
         protocol_version: u16,
         capabilities: Vec<String>,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         socket_generation: u64,
     },
     /// Client -> server: the client detected message loss or state divergence
@@ -114,10 +121,13 @@ pub enum WSMessage {
         game_id: u32,
     },
     Ping {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         client_time: i64,
     },
     Pong {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         client_time: i64,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         server_time: i64,
     },
     // Matchmaking messages
@@ -155,6 +165,7 @@ pub enum WSMessage {
     /// without surfacing a terminal error.
     GameWarming {
         game_id: u32,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         retry_after_ms: u64,
     },
     // Solo game responses
@@ -165,6 +176,7 @@ pub enum WSMessage {
     // the replacement connection uses the same regional URL.
     Drain {
         task_boot_id: String,
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         deadline_unix_ms: i64,
     },
     // Region user count updates
@@ -239,22 +251,28 @@ fn slow_command_publish_wait_ms(publish_wait: Duration) -> Option<u64> {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct LobbyChatBroadcast {
     lobby_code: String,
     message_id: String,
     user_id: i32,
     username: String,
     message: String,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     timestamp_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct GameChatBroadcast {
     game_id: u32,
     message_id: String,
     user_id: i32,
     username: String,
     message: String,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     timestamp_ms: i64,
 }
 

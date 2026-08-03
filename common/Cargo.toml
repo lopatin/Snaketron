@@ -12,3 +12,10 @@ quote = "1.0.40"
 syn = "2.0.100"
 serde_json = "1"
 log = { version = "0.4", features = ["std"] }
+ts-rs = { version = "11", optional = true }
+
+[features]
+# Off by default: server and WASM builds never compile ts-rs. Enabled only by
+# the codegen job (`cargo test -p common --features ts-gen`) that regenerates the
+# TypeScript wire types under client/web/types/generated/.
+ts-gen = ["dep:ts-rs"]
