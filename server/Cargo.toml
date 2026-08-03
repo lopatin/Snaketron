@@ -36,6 +36,9 @@ url = "2"
 reqwest = { version = "0.11", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
 gethostname = "1"
 tonic = "0.12.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -62,3 +65,4 @@ prost-build = "0.13.5"
 [dev-dependencies]
 jsonwebtoken = "9.3"
 rand = "0.8"
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "testing"] }

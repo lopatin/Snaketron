@@ -1,4 +1,5 @@
-//! Bounded-cardinality resilience telemetry emitted in CloudWatch EMF format.
+//! Bounded-cardinality resilience telemetry exported through OpenTelemetry and
+//! mirrored to CloudWatch EMF as an independent AWS-native alarm backstop.
 //!
 //! Correctness must not depend on metrics. Collection therefore uses its own
 //! best-effort loop and never changes liveness or lease state when CloudWatch,
@@ -30,7 +31,7 @@ use tracing::warn;
 
 const PRODUCTION_EMF_NAMESPACE: &str = "Snaketron/Operational";
 const NON_PRODUCTION_EMF_NAMESPACE: &str = "Snaketron/OperationalDev";
-const DEFAULT_EMIT_INTERVAL_SECS: u64 = 15;
+const DEFAULT_EMIT_INTERVAL_SECS: u64 = 5;
 const OWNERSHIP_SAMPLE_INTERVAL_MS: i64 = 500;
 // The exact regional scan performs roughly sixty independently routed cluster
 // operations at the certification cardinality. Keep a finite deadline, but
@@ -111,6 +112,7 @@ macro_rules! counter_fn {
     ($name:ident, $field:ident) => {
         pub fn $name(count: u64) {
             counters().$field.fetch_add(count, Ordering::Relaxed);
+            crate::otel_metrics::$name(count);
         }
     };
 }
@@ -186,6 +188,7 @@ fn record_sum_and_max(sum: &AtomicU64, max: &AtomicU64, value: u64) {
 
 pub fn record_http_request(status_code: u16, latency: Duration) {
     let counters = counters();
+    let latency_ms = duration_ms(latency);
     counters.http_requests.fetch_add(1, Ordering::Relaxed);
     if (400..500).contains(&status_code) {
         counters.http_responses_4xx.fetch_add(1, Ordering::Relaxed);
@@ -195,37 +198,44 @@ pub fn record_http_request(status_code: u16, latency: Duration) {
     record_sum_and_max(
         &counters.http_request_latency_ms_sum,
         &counters.http_request_latency_ms_max,
-        duration_ms(latency),
+        latency_ms,
     );
+    crate::otel_metrics::record_http_request(status_code, latency_ms);
 }
 
 pub fn record_websocket_inbound_message(bytes: usize) {
     let counters = counters();
+    let bytes = saturating_u64(bytes);
     counters
         .websocket_inbound_messages
         .fetch_add(1, Ordering::Relaxed);
     counters
         .websocket_inbound_bytes
-        .fetch_add(saturating_u64(bytes), Ordering::Relaxed);
+        .fetch_add(bytes, Ordering::Relaxed);
+    crate::otel_metrics::record_websocket_inbound_message(bytes);
 }
 
 pub fn record_websocket_outbound_message(bytes: usize) {
     let counters = counters();
+    let bytes = saturating_u64(bytes);
     counters
         .websocket_outbound_messages
         .fetch_add(1, Ordering::Relaxed);
     counters
         .websocket_outbound_bytes
-        .fetch_add(saturating_u64(bytes), Ordering::Relaxed);
+        .fetch_add(bytes, Ordering::Relaxed);
+    crate::otel_metrics::record_websocket_outbound_message(bytes);
 }
 
 pub fn record_websocket_session(duration: Duration) {
     let counters = counters();
+    let duration_ms = duration_ms(duration);
     record_sum_and_max(
         &counters.websocket_session_duration_ms_sum,
         &counters.websocket_session_duration_ms_max,
-        duration_ms(duration),
+        duration_ms,
     );
+    crate::otel_metrics::record_websocket_session(duration_ms);
 }
 
 pub fn record_matchmaking_commit(wait_ms: u64, players: usize, lobbies: usize) {
@@ -234,17 +244,20 @@ pub fn record_matchmaking_commit(wait_ms: u64, players: usize, lobbies: usize) {
     // than risking double-counting the match and its players.
     let counters = counters();
     counters.matchmaking_commits.fetch_add(1, Ordering::Relaxed);
+    let players = saturating_u64(players);
+    let lobbies = saturating_u64(lobbies);
     counters
         .matchmaking_matched_players
-        .fetch_add(saturating_u64(players), Ordering::Relaxed);
+        .fetch_add(players, Ordering::Relaxed);
     counters
         .matchmaking_matched_lobbies
-        .fetch_add(saturating_u64(lobbies), Ordering::Relaxed);
+        .fetch_add(lobbies, Ordering::Relaxed);
     record_sum_and_max(
         &counters.matchmaking_wait_ms_sum,
         &counters.matchmaking_wait_ms_max,
         wait_ms,
     );
+    crate::otel_metrics::record_matchmaking_commit(wait_ms, players, lobbies);
 }
 
 pub fn record_game_completed(duration_ms: u64, players: usize) {
@@ -253,18 +266,21 @@ pub fn record_game_completed(duration_ms: u64, players: usize) {
     // does not carry a durable telemetry marker.
     let counters = counters();
     counters.games_completed.fetch_add(1, Ordering::Relaxed);
+    let players = saturating_u64(players);
     counters
         .completed_game_players
-        .fetch_add(saturating_u64(players), Ordering::Relaxed);
+        .fetch_add(players, Ordering::Relaxed);
     record_sum_and_max(
         &counters.game_duration_ms_sum,
         &counters.game_duration_ms_max,
         duration_ms,
     );
+    crate::otel_metrics::record_game_completed(duration_ms, players);
 }
 
 pub fn record_redis_request(latency: Duration, failed: bool) {
     let counters = counters();
+    let latency_ms = duration_ms(latency);
     counters.redis_requests.fetch_add(1, Ordering::Relaxed);
     if failed {
         counters.redis_errors.fetch_add(1, Ordering::Relaxed);
@@ -272,8 +288,9 @@ pub fn record_redis_request(latency: Duration, failed: bool) {
     record_sum_and_max(
         &counters.redis_request_latency_ms_sum,
         &counters.redis_request_latency_ms_max,
-        duration_ms(latency),
+        latency_ms,
     );
+    crate::otel_metrics::record_redis_request(latency_ms, failed);
 }
 
 #[derive(Default)]
@@ -631,7 +648,7 @@ fn checkpointed_at_ms_from_tail(tail: &[u8]) -> Option<i64> {
 }
 
 /// Tracks lease-absence windows at control-loop resolution while the regional
-/// metrics scan remains on its normal 15-second cadence. Without this
+/// metrics scan remains on its normal regional cadence. Without this
 /// rolling maximum, an outage that starts and ends between EMF samples is
 /// invisible. The first missing observation is conservatively backdated to the
 /// prior completed observation so a delayed sample cannot make a
@@ -1482,6 +1499,36 @@ fn emit_emf(
     counters: CounterSnapshot,
     now_ms: i64,
 ) {
+    crate::otel_metrics::update_gauges(&crate::otel_metrics::GaugeSnapshot {
+        regional_collection_failures: gauges.regional_collection_failures,
+        ready_tasks: gauges.ready_tasks,
+        live_tasks: gauges.live_tasks,
+        draining_tasks: gauges.draining_tasks,
+        membership_age_ms: gauges.membership_age_ms,
+        assignment_version: gauges.assignment_version,
+        assignment_age_ms: gauges.assignment_age_ms,
+        assignment_imbalance: gauges.assignment_imbalance,
+        active_partition_leases: gauges.active_partition_leases,
+        partition_lease_deficit: gauges.partition_lease_deficit,
+        partition_owner_mismatches: gauges.partition_owner_mismatches,
+        partition_unowned_ms: gauges.partition_unowned_ms,
+        oldest_pending_command_ms: gauges.oldest_pending_command_ms,
+        pending_commands: gauges.pending_commands,
+        pending_completions: gauges.pending_completions,
+        quarantined_commands: gauges.quarantined_commands,
+        checkpoint_age_ms: gauges.checkpoint_age_ms,
+        checkpoint_bytes: gauges.checkpoint_bytes,
+        active_games: gauges.active_games,
+        active_game_index_mismatches: gauges.active_game_index_mismatches,
+        matchmaking_queue_entries: gauges.matchmaking_queue_entries,
+        matchmaking_oldest_queued_lobby_ms: gauges.matchmaking_oldest_queued_lobby_ms,
+        game_created_outbox_backlog: gauges.game_created_outbox_backlog,
+        game_created_outbox_oldest_age_ms: gauges.game_created_outbox_oldest_age_ms,
+        game_created_outbox_age_index_cardinality_delta: gauges
+            .game_created_outbox_age_index_cardinality_delta,
+        local_ready: u64::from(local_ready),
+        active_websockets,
+    });
     println!(
         "{}",
         emf_document(
@@ -1730,7 +1777,7 @@ mod tests {
         tracker.observe(5_500, Some(&assignment), &leases);
         assert_eq!(tracker.take_window_max(5_500), 4_500);
 
-        // Restoration occurs before the next 15-second EMF emission. The
+        // Restoration occurs before the next regional EMF emission. The
         // completed duration is retained rather than reset to zero.
         leases[0] = Some(format!("{owner}:{acquisition}").into_bytes());
         tracker.observe(6_000, Some(&assignment), &leases);
