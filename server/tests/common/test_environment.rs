@@ -100,6 +100,16 @@ impl TestEnvironment {
         let jwt_manager = JwtManager::new("test_secret_key_for_testing");
         let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
 
+        self.add_server_with_jwt_verifier(jwt_manager, jwt_verifier, enable_grpc)
+            .await
+    }
+
+    pub async fn add_server_with_jwt_verifier(
+        &mut self,
+        jwt_manager: JwtManager,
+        jwt_verifier: Arc<dyn JwtVerifier>,
+        enable_grpc: bool,
+    ) -> Result<(usize, u64)> {
         let server = start_test_server_with_grpc(self.db(), jwt_manager, jwt_verifier, enable_grpc)
             .await
             .context("Failed to start server")?;
@@ -164,6 +174,18 @@ impl TestEnvironment {
         self.user_ids.push(user_id);
         info!("Created test user {} with ID {}", username, user_id);
         Ok(user_id)
+    }
+
+    pub async fn create_stress_user(&mut self) -> Result<i32> {
+        let index = self.user_ids.len();
+        let username = format!("stress_user_{}", index);
+        let guest_token = uuid::Uuid::new_v4().to_string();
+        let user = self
+            .db
+            .create_guest_user(&username, &guest_token, 1000, true)
+            .await?;
+        self.user_ids.push(user.id);
+        Ok(user.id)
     }
 
     /// Get the WebSocket address for a server by index

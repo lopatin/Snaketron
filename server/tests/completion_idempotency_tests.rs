@@ -278,7 +278,7 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
     // mutation remains transactional instead of failing forever on a missing
     // mirror row.
     let guest = db
-        .create_guest_user("completion_guest", "guest-token", 1_000)
+        .create_guest_user("completion_guest", "guest-token", 1_000, false)
         .await?;
     let mut guest_state = completed_state(GameType::Solo, QueueMode::Quickmatch, &[&guest], now)?;
     guest_state.player_xp.insert(guest.id as u32, 7);

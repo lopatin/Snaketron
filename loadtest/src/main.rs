@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use common::{GameType, QueueMode};
-use loadtest::config::{self, Args, Config, GameMode, Population};
+use loadtest::config::{self, Args, Config, GameMode, Population, StressTestConfig};
 use loadtest::report::{
-    InfrastructureSample, LoadTestRun, RampStageRecord, SessionFailureRecord, SessionOutcome,
-    SessionPhase, SessionRecord, aggregate_report, unix_time_ms, write_report,
+    AggregateReport, InfrastructureSample, LoadTestRun, RampStageRecord, SessionFailureRecord,
+    SessionOutcome, SessionPhase, SessionRecord, aggregate_report, unix_time_ms, write_report,
 };
 use loadtest::session::{
     MatchGroupResult, MatchGroupSpec, SessionActivityEvent, SessionSettings,
@@ -27,6 +27,7 @@ const SPAWN_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 const FAILURE_CIRCUIT_BREAKER_MIN_SESSIONS: usize = 4;
 const FAILURE_CIRCUIT_BREAKER_RATE: f64 = 0.20;
+const STRESS_COMMAND_OUTCOME_MAX_LATENCY_MS: u64 = 1_000;
 
 #[cfg(unix)]
 async fn shutdown_signal() -> std::io::Result<()> {
@@ -216,6 +217,109 @@ async fn main() -> Result<()> {
     run(config).await
 }
 
+fn stress_test_threshold_failures(
+    stress: &StressTestConfig,
+    aggregate: &AggregateReport,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let sessions = &aggregate.session_counts;
+    if sessions.total == 0
+        || sessions.completed != sessions.total
+        || sessions.failed != 0
+        || sessions.cancelled != 0
+        || sessions.incomplete != 0
+    {
+        failures.push(format!(
+            "strict stress sessions were not all successful: {} total, {} completed, {} failed, {} cancelled, {} incomplete",
+            sessions.total,
+            sessions.completed,
+            sessions.failed,
+            sessions.cancelled,
+            sessions.incomplete,
+        ));
+    }
+
+    let games = &aggregate.games;
+    if games.expected == 0
+        || games.observed != games.expected
+        || games.completed != games.expected
+        || games.timeboxed != 0
+    {
+        failures.push(format!(
+            "strict stress games did not all complete authoritatively: {} expected, {} observed, {} completed, {} timeboxed",
+            games.expected, games.observed, games.completed, games.timeboxed,
+        ));
+    }
+
+    let commands_sent = aggregate.metrics.traffic.commands_sent;
+    let terminal_outcomes = aggregate
+        .metrics
+        .command_outcome_counts_by_sent_unix_second
+        .values()
+        .copied()
+        .fold(0u64, u64::saturating_add);
+    if terminal_outcomes != commands_sent {
+        failures.push(format!(
+            "strict stress command outcomes did not reconcile: {commands_sent} sent, {terminal_outcomes} terminal outcomes"
+        ));
+    }
+    let max_command_outcome_ms = aggregate
+        .metrics
+        .command_outcome_max_latency_ms_by_sent_unix_second
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    if max_command_outcome_ms > STRESS_COMMAND_OUTCOME_MAX_LATENCY_MS {
+        failures.push(format!(
+            "strict stress command outcome latency reached {max_command_outcome_ms} ms (limit {STRESS_COMMAND_OUTCOME_MAX_LATENCY_MS} ms)"
+        ));
+    }
+
+    let recovery_timeout_ms =
+        u64::try_from(stress.recovery_timeout.as_millis()).unwrap_or(u64::MAX);
+    for (name, maximum) in [
+        (
+            "reconnect duration",
+            aggregate.metrics.reconnect_duration_ms.max_ms,
+        ),
+        (
+            "usable-session gap",
+            aggregate.metrics.usable_session_gap_ms.max_ms,
+        ),
+        (
+            "client desync recovery",
+            aggregate.metrics.game_desync_recovery_ms.max_ms,
+        ),
+    ] {
+        if maximum.unwrap_or(0) > recovery_timeout_ms {
+            failures.push(format!(
+                "strict stress {name} reached {} ms (limit {recovery_timeout_ms} ms)",
+                maximum.unwrap_or(0),
+            ));
+        }
+    }
+    if aggregate.metrics.unresolved_game_desyncs != 0
+        || aggregate.metrics.game_resync_requests != aggregate.metrics.game_desync_recoveries
+    {
+        failures.push(format!(
+            "strict stress client desyncs did not all recover: {} requests, {} recoveries, {} unresolved",
+            aggregate.metrics.game_resync_requests,
+            aggregate.metrics.game_desync_recoveries,
+            aggregate.metrics.unresolved_game_desyncs,
+        ));
+    }
+    if aggregate.metrics.traffic.disconnects > 0
+        && aggregate.metrics.reconnect_duration_ms.samples == 0
+    {
+        failures.push(format!(
+            "strict stress observed {} disconnects without a completed reconnect-duration sample",
+            aggregate.metrics.traffic.disconnects,
+        ));
+    }
+    failures
+}
+
 async fn run(config: Config) -> Result<()> {
     if config.is_production() {
         warn!(
@@ -269,6 +373,7 @@ async fn run(config: Config) -> Result<()> {
         untimed_play_duration: config.untimed_play_duration,
         command_profile: config.command_profile,
         backend_hints: resolver.backend_hints(),
+        stress_test: config.stress_test.clone(),
     };
 
     info!(
@@ -278,6 +383,7 @@ async fn run(config: Config) -> Result<()> {
         max_sessions = config.max_concurrency(),
         mode = %config.mode,
         queue = %config.queue_mode,
+        stress_test = config.stress_test.is_some(),
         "starting coordinated load test"
     );
 
@@ -306,6 +412,18 @@ async fn run(config: Config) -> Result<()> {
         "require_same_origin".to_owned(),
         config.require_same_origin.to_string(),
     );
+    run.metadata.insert(
+        "stress_test".to_owned(),
+        config.stress_test.is_some().to_string(),
+    );
+    if let Some(stress) = &config.stress_test {
+        run.metadata.insert(
+            "stress_recovery_timeout_ms".to_owned(),
+            stress.recovery_timeout.as_millis().to_string(),
+        );
+        run.metadata
+            .insert("stress_matchmaking_pool".to_owned(), "stress".to_owned());
+    }
     run.metadata
         .insert("mode".to_owned(), config.mode.to_string());
     run.metadata
@@ -798,6 +916,9 @@ async fn run(config: Config) -> Result<()> {
                 .planned_handoffs
                 .pending_commands_at_finish
         ));
+    }
+    if let Some(stress) = &config.stress_test {
+        threshold_failures.extend(stress_test_threshold_failures(stress, &aggregate));
     }
     if config.require_planned_handoff {
         let handoffs = &aggregate.metrics.planned_handoffs;
@@ -1559,6 +1680,68 @@ mod tests {
 
         assert_eq!(run.games.completed, 0);
         assert_eq!(run.games.timeboxed, 0);
+    }
+
+    fn stress_config() -> StressTestConfig {
+        StressTestConfig {
+            credential: "ab".repeat(32).parse().unwrap(),
+            recovery_timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn successful_stress_report() -> AggregateReport {
+        let mut session = SessionRecord::new("s1", "u1", 0, "g1", 0);
+        session.game_id = Some(42);
+        session.metrics.commands_sent = 1;
+        session
+            .metrics
+            .command_outcome_counts_by_sent_unix_second
+            .insert(1, 1);
+        session
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second
+            .insert(1, 999);
+        session.complete(1);
+
+        let mut run = LoadTestRun::new("run", "target", 0, 1);
+        run.finished_at_unix_ms = 1;
+        run.games.expected = 1;
+        run.games.observed = 1;
+        run.games.completed = 1;
+        run.sessions.push(session);
+        aggregate_report(&run)
+    }
+
+    #[test]
+    fn strict_stress_contract_accepts_only_clean_authoritative_games() {
+        let stress = stress_config();
+        let mut report = successful_stress_report();
+        assert!(stress_test_threshold_failures(&stress, &report).is_empty());
+
+        report.session_counts.completed = 0;
+        report.session_counts.failed = 1;
+        report.games.completed = 0;
+        let failures = stress_test_threshold_failures(&stress, &report).join("; ");
+        assert!(failures.contains("sessions were not all successful"));
+        assert!(failures.contains("did not all complete authoritatively"));
+    }
+
+    #[test]
+    fn strict_stress_contract_rejects_slow_or_unresolved_recovery() {
+        let stress = stress_config();
+        let mut report = successful_stress_report();
+        report.metrics.game_resync_requests = 1;
+        report.metrics.unresolved_game_desyncs = 1;
+        report.metrics.game_desync_recovery_ms.max_ms = Some(10_001);
+        report
+            .metrics
+            .command_outcome_max_latency_ms_by_sent_unix_second
+            .insert(1, 1_001);
+
+        let failures = stress_test_threshold_failures(&stress, &report).join("; ");
+        assert!(failures.contains("command outcome latency"));
+        assert!(failures.contains("client desync recovery reached 10001 ms"));
+        assert!(failures.contains("client desyncs did not all recover"));
     }
 
     #[test]

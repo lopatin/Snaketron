@@ -7,7 +7,8 @@ use crate::game_executor::StreamEvent;
 use crate::lifecycle::{DrainNotice, TaskLifecycle, WS_PROTOCOL_VERSION};
 use crate::lobby_manager;
 use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
-use crate::matchmaking_manager::MatchmakingManager;
+use crate::matchmaking_manager::{ActiveMatch, MatchmakingManager};
+use crate::matchmaking_pool::MatchmakingPool;
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
     CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
@@ -210,6 +211,7 @@ pub struct UserToken {
     pub user_id: i32,
     pub username: String,
     pub is_guest: bool,
+    pub matchmaking_pool: MatchmakingPool,
 }
 
 // Player metadata to store additional user information
@@ -219,6 +221,7 @@ pub struct PlayerMetadata {
     pub username: String,
     pub token: String,
     pub is_guest: bool,
+    pub matchmaking_pool: MatchmakingPool,
 }
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
@@ -360,6 +363,7 @@ impl JwtVerifier for TestJwtVerifier {
             user_id,
             username: username.clone(),
             is_guest: false,
+            matchmaking_pool: MatchmakingPool::Public,
         })
     }
 }
@@ -1283,6 +1287,7 @@ async fn publish_game_chat_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn queue_existing_lobby_for_game_types(
     lobby_handle: &LobbyJoinHandle,
     game_types: &[common::GameType],
@@ -1291,9 +1296,19 @@ async fn queue_existing_lobby_for_game_types(
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     requesting_user_id: u32,
+    matchmaking_pool: MatchmakingPool,
 ) -> Result<()> {
     if game_types.is_empty() {
         return Err(anyhow!("Must specify at least one game type to queue"));
+    }
+
+    let lobby_metadata = lobby_manager
+        .get_lobby_metadata(&lobby_handle.lobby_code)
+        .await
+        .context("Failed to load lobby metadata before queueing")?
+        .ok_or_else(|| anyhow!("Lobby no longer exists"))?;
+    if lobby_metadata.matchmaking_pool != matchmaking_pool {
+        return Err(anyhow!("Lobby belongs to a different matchmaking pool"));
     }
 
     let members_map = lobby_manager
@@ -1306,17 +1321,18 @@ async fn queue_existing_lobby_for_game_types(
     }
 
     let members: Vec<LobbyMember> = members_map.into_values().collect();
-    let avg_mmr = compute_lobby_avg_mmr(db, &members).await?;
+    let avg_mmr = compute_lobby_avg_mmr(db, &members, matchmaking_pool).await?;
 
     let mut mm_guard = matchmaking_manager.lock().await;
     mm_guard
-        .add_lobby_to_queue(
+        .add_lobby_to_queue_in_pool(
             &lobby_handle.lobby_code,
             members,
             avg_mmr,
             game_types.to_vec(),
             queue_mode.clone(),
             requesting_user_id,
+            matchmaking_pool,
         )
         .await
         .context("Failed to add lobby to matchmaking queue")?;
@@ -1336,13 +1352,27 @@ async fn queue_existing_lobby_for_game_types(
     Ok(())
 }
 
-async fn compute_lobby_avg_mmr(db: &Arc<dyn Database>, members: &[LobbyMember]) -> Result<i32> {
+async fn compute_lobby_avg_mmr(
+    db: &Arc<dyn Database>,
+    members: &[LobbyMember],
+    matchmaking_pool: MatchmakingPool,
+) -> Result<i32> {
     let mut total = 0;
     let mut count = 0;
 
     for member in members {
         match db.get_user_by_id(member.user_id as i32).await? {
             Some(user) => {
+                let user_pool = if user.is_stress_test {
+                    MatchmakingPool::Stress
+                } else {
+                    MatchmakingPool::Public
+                };
+                if user_pool != matchmaking_pool {
+                    return Err(anyhow!(
+                        "Lobby contains a member from a different matchmaking pool"
+                    ));
+                }
                 total += user.mmr;
                 count += 1;
             }
@@ -1498,6 +1528,21 @@ fn game_join_denied(reason: impl Into<String>) -> GameJoinAuthorizationError {
     GameJoinAuthorizationError::Denied(reason.into())
 }
 
+fn validate_game_matchmaking_pool(
+    expected_pool: MatchmakingPool,
+    active_match: Option<&ActiveMatch>,
+) -> std::result::Result<(), GameJoinAuthorizationError> {
+    match active_match {
+        Some(active_match) if active_match.matchmaking_pool == expected_pool => Ok(()),
+        Some(_) => Err(game_join_denied("This game is unavailable")),
+        // Legacy and custom games predate pool attestation and are public-only.
+        None if expected_pool == MatchmakingPool::Public => Ok(()),
+        // Stress identities fail closed when a direct game ID cannot be tied
+        // to a currently attested stress match.
+        None => Err(game_join_denied("This game is unavailable")),
+    }
+}
+
 fn game_join_failure_message(game_id: u32, failure: GameJoinAuthorizationError) -> WSMessage {
     match failure {
         GameJoinAuthorizationError::Warming => WSMessage::GameWarming {
@@ -1533,6 +1578,22 @@ async fn load_durable_active_game(
     .await
     .context("timed out resolving durable active-game mapping")?
     .context("failed to resolve durable active-game mapping")
+}
+
+async fn load_active_match_for_pool_authorization(
+    game_id: u32,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<Option<ActiveMatch>> {
+    tokio::time::timeout(ACTIVE_GAME_MAPPING_TIMEOUT, async {
+        let mut manager = {
+            let manager = matchmaking_manager.lock().await;
+            manager.clone()
+        };
+        manager.get_active_match(game_id).await
+    })
+    .await
+    .context("timed out resolving active match pool")?
+    .context("failed to resolve active match pool")
 }
 
 async fn has_durable_recovery_failure(
@@ -1638,15 +1699,25 @@ fn command_outcomes_for_user(
 /// Live games are authoritative in replication memory. Completed games may instead live in the
 /// short Redis reload cache or DynamoDB. Returning success means the requested user was present in
 /// the canonical state from one of those sources; callers may then enable game events and chat.
+#[allow(clippy::too_many_arguments)]
 async fn authorize_game_join_inner(
     game_id: u32,
     user_id: u32,
+    matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
 ) -> std::result::Result<(), GameJoinAuthorizationError> {
+    let active_match = load_active_match_for_pool_authorization(game_id, matchmaking_manager)
+        .await
+        .map_err(|error| {
+            warn!(game_id, user_id, %error, "Failed to attest game matchmaking pool");
+            GameJoinAuthorizationError::Warming
+        })?;
+    validate_game_matchmaking_pool(matchmaking_pool, active_match.as_ref())?;
+
     if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
         if game_state_records_user(&game_state, user_id) {
             return Ok(());
@@ -1865,9 +1936,11 @@ async fn authorize_game_join_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authorize_game_join(
     game_id: u32,
     user_id: u32,
+    matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
     game_bus: &Arc<GameBus>,
@@ -1879,6 +1952,7 @@ async fn authorize_game_join(
         authorize_game_join_inner(
             game_id,
             user_id,
+            matchmaking_pool,
             matchmaking_manager,
             replication_manager,
             game_bus,
@@ -1905,8 +1979,10 @@ async fn authorize_game_join(
 /// reconnect. Authorization still comes from game state; a stale or malformed
 /// mapping is never enough to disclose a game, and only fenced completion owns
 /// deletion of the mapping.
+#[allow(clippy::too_many_arguments)]
 async fn notify_durable_active_game_after_auth(
     user_id: u32,
+    matchmaking_pool: MatchmakingPool,
     ws_tx: &mpsc::Sender<Message>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     replication_manager: &Arc<crate::replication::ReplicationManager>,
@@ -1940,6 +2016,7 @@ async fn notify_durable_active_game_after_auth(
     match authorize_game_join(
         game_id,
         user_id,
+        matchmaking_pool,
         matchmaking_manager,
         replication_manager,
         game_bus,
@@ -3222,11 +3299,23 @@ async fn process_ws_message(
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
+                            let database_pool = if user.is_stress_test {
+                                MatchmakingPool::Stress
+                            } else {
+                                MatchmakingPool::Public
+                            };
+                            if database_pool != user_token.matchmaking_pool {
+                                return Err(anyhow::anyhow!(
+                                    "Authentication failed: matchmaking pool claim does not match user record"
+                                ));
+                            }
+
                             let metadata = PlayerMetadata {
                                 user_id: user_token.user_id,
                                 username: user.username.clone(),
                                 token: jwt_token.clone(),
                                 is_guest: user.is_guest,
+                                matchmaking_pool: database_pool,
                             };
 
                             info!(
@@ -3249,6 +3338,7 @@ async fn process_ws_message(
                             if let Ok(user_id) = u32::try_from(metadata.user_id) {
                                 notify_durable_active_game_after_auth(
                                     user_id,
+                                    metadata.matchmaking_pool,
                                     ws_tx,
                                     matchmaking_manager,
                                     replication_manager,
@@ -3363,6 +3453,7 @@ async fn process_ws_message(
                             lobby_manager,
                             matchmaking_manager,
                             metadata.user_id as u32,
+                            metadata.matchmaking_pool,
                         )
                         .await
                         {
@@ -3420,6 +3511,7 @@ async fn process_ws_message(
                             lobby_manager,
                             matchmaking_manager,
                             metadata.user_id as u32,
+                            metadata.matchmaking_pool,
                         )
                         .await
                         {
@@ -3486,6 +3578,7 @@ async fn process_ws_message(
                     if let Err(failure) = authorize_game_join(
                         requested_game_id,
                         user_id,
+                        metadata.matchmaking_pool,
                         matchmaking_manager,
                         replication_manager,
                         game_bus,
@@ -3624,17 +3717,21 @@ async fn process_ws_message(
                         metadata.username, metadata.user_id, region
                     );
 
-                    match lobby_manager.create_lobby(metadata.user_id, region).await {
+                    match lobby_manager
+                        .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                        .await
+                    {
                         Ok(lobby) => {
                             // Join the lobby
                             let lobby_handle = match lobby_manager
-                                .join_lobby(
+                                .join_lobby_for_pool(
                                     Some(lobby.lobby_code()),
                                     metadata.user_id,
                                     metadata.username.clone(),
                                     websocket_id.to_string(),
                                     region.to_string(),
                                     None,
+                                    metadata.matchmaking_pool,
                                 )
                                 .await
                             {
@@ -3714,6 +3811,20 @@ async fn process_ws_message(
                     };
 
                     if let Some(lobby_metadata) = &lobby_metadata {
+                        if lobby_metadata.matchmaking_pool != metadata.matchmaking_pool {
+                            let response = WSMessage::AccessDenied {
+                                reason: "Lobby belongs to a different matchmaking pool".to_string(),
+                            };
+                            let json_msg = serde_json::to_string(&response)?;
+                            ws_tx.send(Message::Text(json_msg.into())).await?;
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: None,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+
                         if lobby_metadata.region != region {
                             warn!(
                                 "Lobby '{}' is in region {}, user is in region {}",
@@ -3764,13 +3875,14 @@ async fn process_ws_message(
 
                     // Join (and auto-create if needed) the lobby
                     let lobby_handle = match lobby_manager
-                        .join_lobby(
+                        .join_lobby_for_pool(
                             Some(&lobby_code),
                             metadata.user_id,
                             metadata.username.clone(),
                             websocket_id.to_string(),
                             region.to_string(),
                             preferences,
+                            metadata.matchmaking_pool,
                         )
                         .await
                     {
@@ -4293,7 +4405,14 @@ fn generate_game_code() -> String {
 }
 
 #[allow(dead_code)] // custom-game/lobby feature scaffolding, not wired up yet
-async fn join_custom_game(db: &Arc<dyn Database>, user_id: i32, game_code: &str) -> Result<u32> {
+async fn join_custom_game(
+    db: &Arc<dyn Database>,
+    user_id: i32,
+    game_code: &str,
+    matchmaking_pool: MatchmakingPool,
+) -> Result<u32> {
+    ensure_custom_game_access(matchmaking_pool)?;
+
     // Find the game by code
     let game = db
         .get_game_by_code(game_code)
@@ -4347,7 +4466,10 @@ async fn spectate_game(
     user_id: i32,
     game_id: u32,
     game_code: Option<&str>,
+    matchmaking_pool: MatchmakingPool,
 ) -> Result<u32> {
+    ensure_custom_game_access(matchmaking_pool)?;
+
     // If game_code is provided, look up game by code
     let actual_game_id = if let Some(code) = game_code {
         let game = db
@@ -4397,21 +4519,33 @@ async fn spectate_game(
     Ok(actual_game_id)
 }
 
+fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
+    if matchmaking_pool == MatchmakingPool::Stress {
+        return Err(anyhow!(
+            "Stress-test identities cannot join or spectate custom games"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
         CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
         TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
-        canonical_command_identity, command_outcomes_for_user, game_join_denied,
-        game_join_failure_message, missing_game_join_failure, next_game_subscription_input,
-        next_outbound_message, queue_planned_drain_notice, recovery_bridge_snapshot,
-        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
-        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
-        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        take_lobby_update_receiver, unsent_lobby_match,
+        canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
+        game_join_denied, game_join_failure_message, missing_game_join_failure,
+        next_game_subscription_input, next_outbound_message, queue_planned_drain_notice,
+        recovery_bridge_snapshot, send_command_outcomes_from_resolved,
+        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
+        slow_command_publish_wait_ms, snapshot_requires_command_outcomes,
+        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
+        validate_game_matchmaking_pool,
     };
     use crate::lifecycle::DrainNotice;
     use crate::lobby_manager::{Lobby, LobbyPreferences};
+    use crate::matchmaking_manager::{ActiveMatch, MatchStatus};
+    use crate::matchmaking_pool::MatchmakingPool;
     use crate::pubsub_manager::PubSubManager;
     use crate::recovery::{
         RecoveryEnvelopeV2, ResolvedCommandState, SPARSE_COMMAND_WINDOW_REJECTION_REASON,
@@ -4442,6 +4576,35 @@ mod lifecycle_protocol_tests {
             slow_command_publish_wait_ms(Duration::from_millis(1_001)),
             Some(1_001)
         );
+    }
+
+    #[test]
+    fn stress_direct_and_custom_game_joins_fail_closed() {
+        let public_match = ActiveMatch {
+            players: Vec::new(),
+            spectators: Vec::new(),
+            lobby_codes: vec!["PUBLIC".to_owned()],
+            game_type: GameType::Solo,
+            status: MatchStatus::Active,
+            partition_id: 0,
+            created_at: 0,
+            matchmaking_pool: MatchmakingPool::Public,
+        };
+        let stress_match = ActiveMatch {
+            matchmaking_pool: MatchmakingPool::Stress,
+            ..public_match.clone()
+        };
+
+        assert!(validate_game_matchmaking_pool(MatchmakingPool::Public, None).is_ok());
+        assert!(validate_game_matchmaking_pool(MatchmakingPool::Stress, None).is_err());
+        assert!(
+            validate_game_matchmaking_pool(MatchmakingPool::Stress, Some(&public_match)).is_err()
+        );
+        assert!(
+            validate_game_matchmaking_pool(MatchmakingPool::Stress, Some(&stress_match)).is_ok()
+        );
+        assert!(ensure_custom_game_access(MatchmakingPool::Public).is_ok());
+        assert!(ensure_custom_game_access(MatchmakingPool::Stress).is_err());
     }
 
     #[test]

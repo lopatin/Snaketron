@@ -42,7 +42,8 @@ const RECOVERY_TAIL_SAMPLE_BYTES: i64 = 512;
 const CHECKPOINTED_AT_MARKER: &[u8] = b"\"checkpointed_at_ms\":";
 const SOURCE_LEASE_TOKEN_MARKER: &[u8] = b"\"source_lease_token\":\"";
 const MATCHMAKING_QUEUE_COUNT: usize = crate::matchmaking_manager::MATCHMAKING_GAME_TYPES.len()
-    * crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES.len();
+    * crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES.len()
+    * crate::matchmaking_pool::MatchmakingPool::ALL.len();
 
 #[derive(Default)]
 struct Counters {
@@ -565,11 +566,17 @@ async fn collect_matchmaking_backlog_gauges(
         "#,
     );
     let mut invocation = script.prepare_invoke();
-    for game_type in &crate::matchmaking_manager::MATCHMAKING_GAME_TYPES {
-        for queue_mode in &crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES {
-            invocation.key(crate::redis_keys::RedisKeys::matchmaking_lobby_queue(
-                game_type, queue_mode,
-            ));
+    for matchmaking_pool in crate::matchmaking_pool::MatchmakingPool::ALL {
+        for game_type in &crate::matchmaking_manager::MATCHMAKING_GAME_TYPES {
+            for queue_mode in &crate::matchmaking_manager::MATCHMAKING_QUEUE_MODES {
+                invocation.key(
+                    crate::redis_keys::RedisKeys::matchmaking_lobby_queue_for_pool(
+                        game_type,
+                        queue_mode,
+                        matchmaking_pool,
+                    ),
+                );
+            }
         }
     }
     invocation
@@ -1656,8 +1663,10 @@ mod tests {
         assert_eq!(
             summarize_matchmaking_backlogs(&values, now_ms)?,
             MatchmakingBacklogGauges {
-                queue_entries: 55,
-                oldest_queued_lobby_ms: 1_000,
+                queue_entries: u64::try_from(
+                    MATCHMAKING_QUEUE_COUNT * (MATCHMAKING_QUEUE_COUNT + 1) / 2
+                )?,
+                oldest_queued_lobby_ms: u64::try_from(MATCHMAKING_QUEUE_COUNT * 100)?,
                 outbox_backlog: 3,
                 outbox_oldest_age_ms: 2_000,
                 outbox_age_index_cardinality_delta: 1,

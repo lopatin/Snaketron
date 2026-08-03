@@ -28,6 +28,46 @@ The default staircase targets 4, 16, 64, 128, then 256 concurrent sessions for p
 --spawn-rate 8
 ```
 
+## Isolated strict stress mode
+
+`--stress-test` is the fail-closed contract used by the stress-test workflow.
+Supply the environment-scoped, derived 32-byte admission credential as 64 hex
+digits. Automation should use the environment variable so the value never
+appears in a process argument:
+
+```bash
+SNAKETRON_STRESS_TEST_KEY="$DERIVED_STRESS_KEY" \
+cargo run --release -p loadtest -- \
+  --target https://snaketron.io \
+  --confirm-production \
+  --stress-test \
+  --require-scale-out \
+  --mode duel \
+  --queue-mode competitive \
+  --stages 128@20m \
+  --run-id stress-production-example
+```
+
+The key is sent only as `x-snaketron-stress-test-key` on guest creation. Before
+opening a WebSocket, the runner requires `user.matchmakingPool == "stress"` in
+the guest response. Every initial, replacement, and reconnecting WebSocket must
+also advertise `stress-matchmaking-pool-v1`. A missing or invalid credential,
+public-pool fallback, or older server therefore fails before the user can enter
+matchmaking.
+
+Strict mode is limited to authoritative Duel and 2v2 game populations. It
+requires every session and expected game to complete successfully, rejects
+timeboxed completion, reconciles every game command to a terminal outcome,
+enforces the one-second command-outcome gate, and bounds reconnect, usable-gap,
+and desynchronization recovery. The recovery limit defaults to ten seconds and
+can be changed with `--stress-recovery-timeout 15s`.
+
+The shared `GameEngine` detects stream-sequence gaps and sustained fingerprint
+divergence. In strict mode the runner pauses AI commands, sends one
+`RequestResync`, and resumes only after a fresh authoritative snapshot and its
+paired command-outcome barrier. Missing or late recovery fails the session and
+the overall command.
+
 Supported modes are `solo`, `duel`, `2v2`, and `ffa`. Every target must be a multiple of the match size: 1 for solo, 2 for duel, and 4 for 2v2/FFA. Solo uses one player per lobby; duel, 2v2, and FFA put the complete 2- or 4-player party in one lobby, deliberately covering multi-user lobby create/join/update behavior. The FFA matchmaker prefers a complete party over older partial public lobbies so test membership remains deterministic.
 
 The default `--population game` runs that full lifecycle. Staging
@@ -74,7 +114,7 @@ Each virtual user performs the production lifecycle:
 8. Reconcile authoritative events, calculate AI moves once per predicted tick, and send normal game commands until authoritative completion. For an untimed Solo/FFA game, play until `--untimed-play-duration`, then leave successfully.
 9. Send application pings, measure RTT/clock offset, retry only known-transient WebSocket admission failures (HTTP 429/502/503, connect timeout, transport loss, or a drain before the admission Pong) with the same guest token inside one connection-to-pong budget, use make-before-break on a planned drain, and reconnect up to twice after an abrupt established-session transport failure.
 
-A complete duel/2v2 lobby is split across the opposing teams by the existing matchmaker; a complete FFA lobby is selected intact. These choices isolate intended games from unrelated public queue participants. Snapshot membership validation turns any unexpected pairing into an explicit session failure.
+A complete duel/2v2 lobby is split across the opposing teams by the existing matchmaker; a complete FFA lobby is selected intact. Snapshot membership validation turns any unexpected pairing into an explicit session failure. Only `--stress-test` provides a preventative matchmaking boundary from public players; ordinary load runs remain in the public pool.
 
 `--command-profile realistic` sends only actual direction changes, like UI input. `--command-profile every-tick` intentionally saturates the command path.
 
@@ -83,10 +123,10 @@ A complete duel/2v2 lobby is split across the opposing teams by the existing mat
 Artifacts are written to `loadtest-reports/<run-id>/` by default:
 
 - `index.html` — aggregate session, authoritative/timeboxed game, latency, traffic, ramp, and infrastructure overview.
-- `summary.json` — the machine-readable aggregate plus compact status and completion kind for every session. Schema 13 records initial admission readiness, aggregates logical game-command submissions and first terminal outcomes by original send second, and aggregates first-seen authoritative `CommandScheduledV2` outcomes by partition and receipt second without logging command payloads. It retains at most 256 outcomes above the fixed one-second certification gate (and at most 32 per session), reserving one representative for as many distinct violating send seconds as fit before filling the remaining slots with the slowest outcomes; each record includes command identity, send/resolve timing, resolution source, socket generation, WebSocket gateway boot ID, reader-task wake lag, and slow-Pong gateway time for correlation.
+- `summary.json` — the machine-readable aggregate plus compact status and completion kind for every session. Schema 14 adds stream-gap, missed-message, hash-mismatch, resync, unresolved-desync, and bounded desync-recovery evidence. It also records initial admission readiness, aggregates logical game-command submissions and first terminal outcomes by original send second, and aggregates first-seen authoritative `CommandScheduledV2` outcomes by partition and receipt second without logging command payloads. It retains at most 256 outcomes above the fixed one-second certification gate (and at most 32 per session), reserving one representative for as many distinct violating send seconds as fit before filling the remaining slots with the slowest outcomes; each record includes command identity, send/resolve timing, resolution source, socket generation, WebSocket gateway boot ID, reader-task wake lag, and slow-Pong gateway time for correlation.
 - `failures/*.json` — complete lifecycle, metrics, failure context, and recent protocol events for every failed, cancelled, or incomplete session; the HTML report links to these files.
 
-The command exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never acknowledged by the server as authenticated, a session is lost from coordinator accounting, a stage misses its target, a launched game is never observed, or deterministic pairing validation fails. The peak/target checks are intentionally omitted only for an explicit open-loop idle-admission run, where the target is a safety ceiling rather than a desired steady population. Reports measure initial admission from the first WebSocket attempt through the authenticated ordered pong and retain first-seen `CommandScheduledV2` counts by game partition. With `--require-planned-handoff`, every observed drain must promote a ready candidate with an old/new continuity proof and zero measured usable gap. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
+Normal mode exits unsuccessfully if fewer than 98% of launched sessions complete, the configured peak is never acknowledged by the server as authenticated, a session is lost from coordinator accounting, a stage misses its target, a launched game is never observed, or deterministic pairing validation fails. `--stress-test` replaces the completion tolerance with the strict contract described above. The peak/target checks are intentionally omitted only for an explicit open-loop idle-admission run, where the target is a safety ceiling rather than a desired steady population. Reports measure initial admission from the first WebSocket attempt through the authenticated ordered pong and retain first-seen `CommandScheduledV2` counts by game partition. With `--require-planned-handoff`, every observed drain must promote a ready candidate with an old/new continuity proof and zero measured usable gap. Coordinator panics and force-aborted groups are synthesized as individual failed-session artifacts instead of disappearing from the denominator.
 
 Autoscaling evidence is reported separately. The harness samples regional user counts and active regional server counts throughout the run. Backend-cookie aliases, when present, remain a secondary in-band routing hint.
 
@@ -94,7 +134,7 @@ Press Ctrl-C to stop adding load and drain active games. After `--drain-timeout`
 
 ## Production data note
 
-The current guest endpoint persists users, and completed matches can affect game/ranking records. Synthetic names are deterministic and prefixed `lt`; normally each created user ID is retained in its session diagnostics. A process/task panic after guest creation can lose that server-assigned ID, though the deterministic name and a synthetic failure record remain. If production load tests become routine, add a server-side synthetic-user marker with TTL and ranking exclusion.
+The guest endpoint persists users, and completed matches can affect game/ranking records. Synthetic names are deterministic and prefixed `lt`; normally each created user ID is retained in its session diagnostics. Stress users are server-marked and physically isolated from public matchmaking, but that isolation does not imply automatic data deletion. A process/task panic after guest creation can lose the server-assigned ID from the local report, though the deterministic name and a synthetic failure record remain.
 
 ## Validation
 

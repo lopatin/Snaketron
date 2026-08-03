@@ -15,7 +15,9 @@ const DEFAULT_TARGET: &str = "http://localhost:8080";
 const DEFAULT_STAGES: &str = "4@30s,16@30s,64@1m,128@2m,256@5m";
 const DEFAULT_SPAWN_RATE: usize = 4;
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4_096;
+const DEFAULT_STRESS_RECOVERY_TIMEOUT: &str = "10s";
 const MAX_RUN_ID_LEN: usize = 64;
+const STRESS_TEST_KEY_HEX_LEN: usize = 64;
 
 /// CLI arguments for the Snaketron load test.
 ///
@@ -164,6 +166,37 @@ pub struct Args {
     #[arg(long)]
     pub require_scale_out: bool,
 
+    /// Run the strict, isolated stress-test contract.
+    ///
+    /// This requires an authoritative Duel or 2v2 game population, a derived
+    /// stress credential, server attestation of the isolated matchmaking pool,
+    /// zero session/game failures, and bounded client recovery.
+    #[arg(long)]
+    pub stress_test: bool,
+
+    /// Derived 32-byte stress admission credential, encoded as 64 hex digits.
+    ///
+    /// Prefer the environment variable in automation so the credential does
+    /// not appear in process arguments. The value is sent only to guest auth
+    /// and is never written to logs or reports.
+    #[arg(
+        long,
+        env = "SNAKETRON_STRESS_TEST_KEY",
+        hide_env_values = true,
+        value_name = "64_HEX"
+    )]
+    pub stress_test_key: Option<StressTestCredential>,
+
+    /// Maximum permitted transport or desynchronization recovery interval in
+    /// strict stress-test mode.
+    #[arg(
+        long,
+        default_value = DEFAULT_STRESS_RECOVERY_TIMEOUT,
+        value_parser = parse_duration,
+        value_name = "DURATION"
+    )]
+    pub stress_recovery_timeout: Duration,
+
     /// Fail unless at least one planned drain completes make-before-break,
     /// every such handoff has an old/new continuity proof, and no usable gap is
     /// measured. Game populations additionally require the command-outcome
@@ -291,6 +324,48 @@ pub enum CommandProfile {
     /// Emit the AI decision every game tick, including unchanged directions.
     #[value(name = "every-tick", alias = "saturating")]
     EveryTick,
+}
+
+/// A validated, redacted stress-test admission credential.
+///
+/// The server accepts the HMAC-SHA256 output derived for one environment, not
+/// the environment's JWT signing secret itself.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StressTestCredential(String);
+
+impl StressTestCredential {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StressTestCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StressTestCredential([REDACTED])")
+    }
+}
+
+impl FromStr for StressTestCredential {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.len() != STRESS_TEST_KEY_HEX_LEN
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "stress-test credential must be exactly {STRESS_TEST_KEY_HEX_LEN} hexadecimal characters"
+            ));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+}
+
+/// Strict stress-test settings present only for an explicitly isolated run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StressTestConfig {
+    pub credential: StressTestCredential,
+    pub recovery_timeout: Duration,
 }
 
 impl CommandProfile {
@@ -461,6 +536,7 @@ pub struct Config {
     pub production_confirmed: bool,
     pub require_same_origin: bool,
     pub require_scale_out: bool,
+    pub stress_test: Option<StressTestConfig>,
     pub require_planned_handoff: bool,
 }
 
@@ -524,6 +600,7 @@ impl TryFrom<Args> for Config {
         validate_timeout("queue timeout", args.queue_timeout)?;
         validate_timeout("drain timeout", args.drain_timeout)?;
         validate_timeout("untimed play duration", args.untimed_play_duration)?;
+        validate_timeout("stress recovery timeout", args.stress_recovery_timeout)?;
 
         if args.report_dir.as_os_str().is_empty() {
             return Err(ConfigError::InvalidReportDirectory);
@@ -537,6 +614,24 @@ impl TryFrom<Args> for Config {
         if production_target && !args.confirm_production {
             return Err(ConfigError::ProductionConfirmationRequired);
         }
+
+        let stress_test = match (args.stress_test, args.stress_test_key) {
+            (false, None) => None,
+            (false, Some(_)) => return Err(ConfigError::StressTestKeyWithoutMode),
+            (true, None) => return Err(ConfigError::StressTestKeyRequired),
+            (true, Some(credential)) => {
+                if args.population != Population::Game {
+                    return Err(ConfigError::StressTestRequiresGamePopulation);
+                }
+                if !matches!(args.mode, GameMode::Duel | GameMode::TwoVTwo) {
+                    return Err(ConfigError::StressTestRequiresAuthoritativeMode);
+                }
+                Some(StressTestConfig {
+                    credential,
+                    recovery_timeout: args.stress_recovery_timeout,
+                })
+            }
+        };
 
         Ok(Self {
             target_url,
@@ -560,6 +655,7 @@ impl TryFrom<Args> for Config {
             production_confirmed: args.confirm_production,
             require_same_origin: args.require_same_origin,
             require_scale_out: args.require_scale_out,
+            stress_test,
             require_planned_handoff: args.require_planned_handoff,
         })
     }
@@ -601,6 +697,10 @@ pub enum ConfigError {
     InvalidReportDirectory,
     InvalidRunId(String),
     ProductionConfirmationRequired,
+    StressTestKeyRequired,
+    StressTestKeyWithoutMode,
+    StressTestRequiresGamePopulation,
+    StressTestRequiresAuthoritativeMode,
 }
 
 impl fmt::Display for ConfigError {
@@ -664,6 +764,18 @@ impl fmt::Display for ConfigError {
             Self::InvalidRunId(reason) => write!(formatter, "invalid run ID: {reason}"),
             Self::ProductionConfirmationRequired => formatter.write_str(
                 "snaketron.io is a production target; pass --confirm-production to acknowledge the load",
+            ),
+            Self::StressTestKeyRequired => formatter.write_str(
+                "--stress-test requires --stress-test-key or SNAKETRON_STRESS_TEST_KEY",
+            ),
+            Self::StressTestKeyWithoutMode => formatter.write_str(
+                "a stress-test credential may only be supplied with --stress-test",
+            ),
+            Self::StressTestRequiresGamePopulation => {
+                formatter.write_str("--stress-test requires --population game")
+            }
+            Self::StressTestRequiresAuthoritativeMode => formatter.write_str(
+                "--stress-test requires an authoritative game mode (duel or 2v2)",
             ),
         }
     }
@@ -908,6 +1020,9 @@ mod tests {
             confirm_production: false,
             require_same_origin: false,
             require_scale_out: false,
+            stress_test: false,
+            stress_test_key: None,
+            stress_recovery_timeout: Duration::from_secs(10),
             require_planned_handoff: false,
         }
     }
@@ -974,6 +1089,58 @@ mod tests {
             let args = Args::try_parse_from(["loadtest", "--mode", value]).unwrap();
             assert_eq!(args.mode.as_str(), value);
         }
+    }
+
+    #[test]
+    fn stress_credential_is_exact_hex_and_redacted() {
+        let raw = "aB".repeat(32);
+        let credential: StressTestCredential = raw.parse().unwrap();
+        assert_eq!(credential.expose(), "ab".repeat(32));
+        assert_eq!(
+            format!("{credential:?}"),
+            "StressTestCredential([REDACTED])"
+        );
+        assert!("a".repeat(63).parse::<StressTestCredential>().is_err());
+        assert!("z".repeat(64).parse::<StressTestCredential>().is_err());
+    }
+
+    #[test]
+    fn stress_mode_requires_credential_and_authoritative_games() {
+        let mut args = test_args();
+        args.stress_test = true;
+        assert_eq!(
+            args.clone().into_config().unwrap_err(),
+            ConfigError::StressTestKeyRequired
+        );
+
+        args.stress_test_key = Some("ab".repeat(32).parse().unwrap());
+        let config = args.clone().into_config().unwrap();
+        assert_eq!(
+            config.stress_test.unwrap().recovery_timeout,
+            Duration::from_secs(10)
+        );
+
+        args.population = Population::Idle;
+        assert_eq!(
+            args.clone().into_config().unwrap_err(),
+            ConfigError::StressTestRequiresGamePopulation
+        );
+        args.population = Population::Game;
+        args.mode = GameMode::Solo;
+        assert_eq!(
+            args.into_config().unwrap_err(),
+            ConfigError::StressTestRequiresAuthoritativeMode
+        );
+    }
+
+    #[test]
+    fn stress_key_cannot_accidentally_modify_a_normal_run() {
+        let mut args = test_args();
+        args.stress_test_key = Some("cd".repeat(32).parse().unwrap());
+        assert_eq!(
+            args.into_config().unwrap_err(),
+            ConfigError::StressTestKeyWithoutMode
+        );
     }
 
     #[test]

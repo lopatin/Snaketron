@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::matchmaking_pool::MatchmakingPool;
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
@@ -43,6 +44,8 @@ pub struct QueuedLobby {
     pub queue_mode: common::QueueMode,
     pub queued_at: i64,
     pub requesting_user_id: u32, // Who initiated the queue request (for spectator preference)
+    #[serde(default)]
+    pub matchmaking_pool: MatchmakingPool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,6 +58,8 @@ pub struct ActiveMatch {
     pub status: MatchStatus,
     pub partition_id: u32,
     pub created_at: i64,
+    #[serde(default)]
+    pub matchmaking_pool: MatchmakingPool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -122,6 +127,7 @@ struct MatchCommitPlan {
     created_at_ms: i64,
     game_id: String,
     active_match_json: String,
+    matchmaking_pool: String,
     lobbies: Vec<MatchCommitLobby>,
     users: Vec<MatchCommitUser>,
     notifications: Vec<MatchCommitNotification>,
@@ -173,6 +179,7 @@ struct LobbyAdmissionPlan {
     member_json: String,
     queued_at: i64,
     avg_mmr: i32,
+    matchmaking_pool: String,
     queue_pairs: Vec<MatchCommitQueuePair>,
 }
 
@@ -221,6 +228,11 @@ if lobby_metadata_type == 'none' then
 end
 if lobby_metadata_type ~= 'hash' then
     return {0, 'lobby-metadata-wrong-type'}
+end
+local lobby_pool = redis.call('HGET', plan.lobby_metadata_key, 'matchmakingPool')
+if not lobby_pool or lobby_pool == '' then lobby_pool = 'public' end
+if lobby_pool ~= plan.matchmaking_pool then
+    return {3, 'lobby-pool-mismatch'}
 end
 for _, key in ipairs(plan.user_active_game_keys) do
     local mapping_type = key_type(key)
@@ -400,6 +412,19 @@ for _, lobby in ipairs(plan.lobbies) do
         return {3, 'lobby-already-matched:' .. lobby.lobby_code}
     end
 
+    local metadata_type = key_type(lobby.metadata_key)
+    if metadata_type == 'none' then
+        return {3, 'lobby-metadata-missing:' .. lobby.lobby_code}
+    end
+    if metadata_type ~= 'hash' then
+        return {0, 'lobby-metadata-wrong-type:' .. lobby.lobby_code}
+    end
+    local lobby_pool = redis.call('HGET', lobby.metadata_key, 'matchmakingPool')
+    if not lobby_pool or lobby_pool == '' then lobby_pool = 'public' end
+    if lobby_pool ~= plan.matchmaking_pool then
+        return {0, 'lobby-pool-mismatch:' .. lobby.lobby_code}
+    end
+
     local queue_identity_type = key_type(lobby.queue_identity_key)
     if queue_identity_type == 'none' then
         return {3, 'queue-identity-missing:' .. lobby.lobby_code}
@@ -577,6 +602,30 @@ impl MatchmakingManager {
         queue_mode: common::QueueMode,
         requesting_user_id: u32, // Who initiated the queue request
     ) -> Result<()> {
+        self.add_lobby_to_queue_in_pool(
+            lobby_code,
+            members,
+            avg_mmr,
+            game_types,
+            queue_mode,
+            requesting_user_id,
+            MatchmakingPool::Public,
+        )
+        .await
+    }
+
+    /// Add a lobby only to the physical queue family for its attested pool.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_lobby_to_queue_in_pool(
+        &mut self,
+        lobby_code: &str,
+        members: Vec<crate::lobby_manager::LobbyMember>,
+        avg_mmr: i32,
+        game_types: Vec<GameType>,
+        queue_mode: common::QueueMode,
+        requesting_user_id: u32,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Result<()> {
         if game_types.is_empty() {
             return Err(anyhow!("Must specify at least one game type"));
         }
@@ -592,6 +641,7 @@ impl MatchmakingManager {
             queue_mode: queue_mode.clone(),
             queued_at: timestamp,
             requesting_user_id,
+            matchmaking_pool,
         };
 
         let lobby_json = serde_json::to_string(&lobby)?;
@@ -617,11 +667,20 @@ impl MatchmakingManager {
             member_json: lobby_json,
             queued_at: timestamp,
             avg_mmr,
+            matchmaking_pool: matchmaking_pool.to_string(),
             queue_pairs: game_types
                 .iter()
                 .map(|game_type| MatchCommitQueuePair {
-                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &queue_mode),
-                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &queue_mode),
+                    queue_key: RedisKeys::matchmaking_lobby_queue_for_pool(
+                        game_type,
+                        &queue_mode,
+                        matchmaking_pool,
+                    ),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index_for_pool(
+                        game_type,
+                        &queue_mode,
+                        matchmaking_pool,
+                    ),
                 })
                 .collect(),
         };
@@ -667,8 +726,9 @@ impl MatchmakingManager {
             Some(AtomicMatchmakingOutcome::Applied) => {
                 crate::resilience_metrics::record_matchmaking_admission(1);
                 info!(
-                    "Added lobby {} to matchmaking queue for {:?} with {} members and avg MMR {}",
+                    "Added lobby {} to {} matchmaking queue for {:?} with {} members and avg MMR {}",
                     lobby_code,
+                    matchmaking_pool,
                     game_types,
                     lobby.members.len(),
                     avg_mmr
@@ -734,10 +794,25 @@ impl MatchmakingManager {
         game_type: &GameType,
         queue_mode: &common::QueueMode,
     ) -> Result<Vec<QueuedLobby>> {
+        self.get_queued_lobbies_in_pool(game_type, queue_mode, MatchmakingPool::Public)
+            .await
+    }
+
+    pub async fn get_queued_lobbies_in_pool(
+        &mut self,
+        game_type: &GameType,
+        queue_mode: &common::QueueMode,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Result<Vec<QueuedLobby>> {
         use std::collections::HashSet;
 
-        let lobby_queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
-        let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
+        let lobby_queue_key =
+            RedisKeys::matchmaking_lobby_queue_for_pool(game_type, queue_mode, matchmaking_pool);
+        let lobby_mmr_key = RedisKeys::matchmaking_lobby_mmr_index_for_pool(
+            game_type,
+            queue_mode,
+            matchmaking_pool,
+        );
 
         const SUBSET_SIZE: isize = 499; // 0-indexed, so 499 = 500 items
 
@@ -773,13 +848,16 @@ impl MatchmakingManager {
         // Deduplicate and collect unique lobbies
         let mut seen_lobby_codes = HashSet::new();
         let mut unique_lobbies = Vec::new();
+        let mut mismatched_lobby = None;
 
         // Helper to process lobby JSON and add if unique
         let mut process_lobby = |member_json: &str| {
-            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json)
-                && seen_lobby_codes.insert(lobby.lobby_code.clone())
-            {
-                unique_lobbies.push(lobby);
+            if let Ok(lobby) = serde_json::from_str::<QueuedLobby>(member_json) {
+                if lobby.matchmaking_pool != matchmaking_pool {
+                    mismatched_lobby.get_or_insert(lobby.lobby_code);
+                } else if seen_lobby_codes.insert(lobby.lobby_code.clone()) {
+                    unique_lobbies.push(lobby);
+                }
             }
         };
 
@@ -795,6 +873,14 @@ impl MatchmakingManager {
         }
         for member_json in mid_range.iter() {
             process_lobby(member_json);
+        }
+
+        if let Some(lobby_code) = mismatched_lobby {
+            crate::resilience_metrics::record_matchmaking_integrity_error(1);
+            return Err(anyhow!(
+                "Lobby {} was stored in the wrong matchmaking pool queue",
+                lobby_code
+            ));
         }
 
         // debug!(
@@ -879,8 +965,16 @@ impl MatchmakingManager {
                 .game_types
                 .iter()
                 .map(|game_type| MatchCommitQueuePair {
-                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode),
-                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode),
+                    queue_key: RedisKeys::matchmaking_lobby_queue_for_pool(
+                        game_type,
+                        &lobby.queue_mode,
+                        lobby.matchmaking_pool,
+                    ),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index_for_pool(
+                        game_type,
+                        &lobby.queue_mode,
+                        lobby.matchmaking_pool,
+                    ),
                 })
                 .collect(),
         };
@@ -930,12 +1024,22 @@ impl MatchmakingManager {
             return Err(anyhow!("Cannot commit a match without GameCreated payload"));
         }
 
+        let matchmaking_pool = match_info.matchmaking_pool;
+
         let mut lobby_codes = HashSet::new();
         let mut user_ids = HashSet::new();
         let mut commit_lobbies = Vec::with_capacity(lobbies.len());
         let mut commit_users = Vec::new();
 
         for lobby in lobbies {
+            if lobby.matchmaking_pool != matchmaking_pool {
+                return Err(anyhow!(
+                    "Lobby {} belongs to {} pool but match belongs to {} pool",
+                    lobby.lobby_code,
+                    lobby.matchmaking_pool,
+                    matchmaking_pool
+                ));
+            }
             if lobby.game_types.is_empty() {
                 return Err(anyhow!(
                     "Lobby {} has no queue identities to claim",
@@ -962,8 +1066,16 @@ impl MatchmakingManager {
                 .game_types
                 .iter()
                 .map(|game_type| MatchCommitQueuePair {
-                    queue_key: RedisKeys::matchmaking_lobby_queue(game_type, &lobby.queue_mode),
-                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index(game_type, &lobby.queue_mode),
+                    queue_key: RedisKeys::matchmaking_lobby_queue_for_pool(
+                        game_type,
+                        &lobby.queue_mode,
+                        lobby.matchmaking_pool,
+                    ),
+                    mmr_key: RedisKeys::matchmaking_lobby_mmr_index_for_pool(
+                        game_type,
+                        &lobby.queue_mode,
+                        lobby.matchmaking_pool,
+                    ),
                 })
                 .collect();
 
@@ -1022,6 +1134,7 @@ impl MatchmakingManager {
             created_at_ms: match_info.created_at,
             game_id: game_id.to_string(),
             active_match_json: active_match_json.clone(),
+            matchmaking_pool: matchmaking_pool.to_string(),
             lobbies: commit_lobbies,
             users: commit_users,
             notifications,
@@ -1238,6 +1351,46 @@ mod tests {
             Some(AtomicMatchmakingOutcome::ExpectedConflict)
         );
         assert_eq!(classify_atomic_matchmaking_outcome(4), None);
+    }
+
+    #[test]
+    fn legacy_queue_and_match_records_default_to_public() {
+        let queued = QueuedLobby {
+            lobby_code: "LEGACY".to_owned(),
+            queue_token: "token".to_owned(),
+            members: Vec::new(),
+            avg_mmr: 1_000,
+            game_types: vec![GameType::Solo],
+            queue_mode: common::QueueMode::Quickmatch,
+            queued_at: 1,
+            requesting_user_id: 1,
+            matchmaking_pool: MatchmakingPool::Stress,
+        };
+        let mut queued_json = serde_json::to_value(queued).unwrap();
+        queued_json
+            .as_object_mut()
+            .unwrap()
+            .remove("matchmaking_pool");
+        let decoded_queue: QueuedLobby = serde_json::from_value(queued_json).unwrap();
+        assert_eq!(decoded_queue.matchmaking_pool, MatchmakingPool::Public);
+
+        let active = ActiveMatch {
+            players: Vec::new(),
+            spectators: Vec::new(),
+            lobby_codes: vec!["LEGACY".to_owned()],
+            game_type: GameType::Solo,
+            status: MatchStatus::Waiting,
+            partition_id: 0,
+            created_at: 1,
+            matchmaking_pool: MatchmakingPool::Stress,
+        };
+        let mut active_json = serde_json::to_value(active).unwrap();
+        active_json
+            .as_object_mut()
+            .unwrap()
+            .remove("matchmaking_pool");
+        let decoded_match: ActiveMatch = serde_json::from_value(active_json).unwrap();
+        assert_eq!(decoded_match.matchmaking_pool, MatchmakingPool::Public);
     }
 
     #[tokio::test]

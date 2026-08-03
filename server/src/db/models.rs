@@ -28,6 +28,8 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub is_guest: bool,
     pub guest_token: Option<String>,
+    #[serde(default)]
+    pub is_stress_test: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,8 @@ pub struct LobbyMetadata {
     pub region: String,
     pub created_at: DateTime<Utc>,
     pub state: String, // waiting | queued | matched
+    #[serde(default)]
+    pub matchmaking_pool: crate::matchmaking_pool::MatchmakingPool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

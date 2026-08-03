@@ -437,6 +437,10 @@ pub struct GameState {
     pub arena: Arena,
     pub game_type: GameType,
     pub queue_mode: QueueMode,
+    /// Server-attested synthetic game marker. Stress games exercise the full
+    /// runtime but must not produce player progression or leaderboard effects.
+    #[serde(default)]
+    pub is_stress_test: bool,
     pub properties: GameProperties,
     pub command_queue: CommandQueue,
     // Players by user_id
@@ -596,6 +600,7 @@ impl GameState {
             },
             game_type: game_type.clone(),
             queue_mode,
+            is_stress_test: false,
             properties,
             command_queue: CommandQueue::new(),
             players: HashMap::new(),

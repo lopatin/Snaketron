@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::db::{Database, models::LobbyMetadata};
 use crate::lobby_manager::LobbyEvent::{LobbyDelete, LobbyUpdate};
+use crate::matchmaking_pool::MatchmakingPool;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_keys::RedisKeys;
 use crate::user_cache::UserCache;
@@ -283,6 +284,17 @@ impl LobbyManager {
 
     /// Create a new lobby. Generates an id and assigns the host user.
     pub async fn create_lobby(&self, host_user_id: i32, region: &str) -> Result<Lobby> {
+        self.create_lobby_for_pool(host_user_id, region, MatchmakingPool::Public)
+            .await
+    }
+
+    /// Create a lobby in the server-attested matchmaking pool of its host.
+    pub async fn create_lobby_for_pool(
+        &self,
+        host_user_id: i32,
+        region: &str,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Result<Lobby> {
         use chrono::Utc;
 
         let now = Utc::now();
@@ -294,6 +306,7 @@ impl LobbyManager {
             region: region.to_string(),
             created_at: now,
             state: "waiting".to_string(),
+            matchmaking_pool,
         };
 
         // Store lobby metadata in Redis
@@ -312,8 +325,8 @@ impl LobbyManager {
             .context("Failed to touch lobby on creation")?;
 
         info!(
-            "Created lobby '{}' for user {} in region {}",
-            lobby_metadata.lobby_code, host_user_id, region
+            "Created lobby '{}' for user {} in region {} (pool: {})",
+            lobby_metadata.lobby_code, host_user_id, region, matchmaking_pool
         );
 
         Ok(Lobby {
@@ -340,6 +353,7 @@ impl LobbyManager {
                     ("region", metadata.region.to_string()),
                     ("createdAt", metadata.created_at.to_rfc3339()),
                     ("state", metadata.state.to_string()),
+                    ("matchmakingPool", metadata.matchmaking_pool.to_string()),
                 ],
             )
             .await
@@ -359,11 +373,42 @@ impl LobbyManager {
         region: String,
         requested_preferences: Option<LobbyPreferences>,
     ) -> Result<LobbyJoinHandle> {
+        self.join_lobby_for_pool(
+            lobby_code,
+            user_id,
+            _username,
+            websocket_id,
+            region,
+            requested_preferences,
+            MatchmakingPool::Public,
+        )
+        .await
+    }
+
+    /// Join only a lobby in the authenticated user's server-attested pool.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn join_lobby_for_pool(
+        self: &Arc<Self>,
+        lobby_code: Option<&str>,
+        user_id: i32,
+        _username: String,
+        websocket_id: String,
+        region: String,
+        requested_preferences: Option<LobbyPreferences>,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Result<LobbyJoinHandle> {
         let lobby = if let Some(lobby_code) = lobby_code {
-            self.ensure_joinable_lobby(lobby_code, user_id, &region, requested_preferences.as_ref())
-                .await?
+            self.ensure_joinable_lobby(
+                lobby_code,
+                user_id,
+                &region,
+                requested_preferences.as_ref(),
+                matchmaking_pool,
+            )
+            .await?
         } else {
-            self.create_lobby(user_id, &region).await?
+            self.create_lobby_for_pool(user_id, &region, matchmaking_pool)
+                .await?
         };
 
         let member_value = MemberValue {
@@ -509,6 +554,17 @@ impl LobbyManager {
                 .get("state")
                 .ok_or_else(|| anyhow!("Missing state"))?
                 .to_string(),
+            matchmaking_pool: match data.get("matchmakingPool").map(String::as_str) {
+                None | Some("public") => MatchmakingPool::Public,
+                Some("stress") => MatchmakingPool::Stress,
+                Some(value) => {
+                    return Err(anyhow!(
+                        "Invalid matchmaking pool '{}' for lobby '{}'",
+                        value,
+                        lobby_code
+                    ));
+                }
+            },
         };
 
         Ok(Some(lobby))
@@ -548,8 +604,11 @@ impl LobbyManager {
         host_user_id: i32,
         region: &str,
         requested_preferences: Option<&LobbyPreferences>,
+        matchmaking_pool: MatchmakingPool,
     ) -> Result<Lobby> {
         if let Some(lobby) = self.get_lobby_opt(lobby_code).await? {
+            self.ensure_matching_pool(lobby_code, matchmaking_pool)
+                .await?;
             return Ok(lobby);
         }
 
@@ -558,10 +617,33 @@ impl LobbyManager {
             host_user_id,
             region,
             requested_preferences,
+            matchmaking_pool,
         )
         .await?;
 
+        // A different task may have won the missing-lobby race. Always reload
+        // and validate the stored pool before adding presence.
+        self.ensure_matching_pool(lobby_code, matchmaking_pool)
+            .await?;
         self.get_lobby(lobby_code).await
+    }
+
+    async fn ensure_matching_pool(
+        &self,
+        lobby_code: &str,
+        expected_pool: MatchmakingPool,
+    ) -> Result<()> {
+        let metadata = self
+            .get_lobby_metadata(lobby_code)
+            .await?
+            .ok_or_else(|| anyhow!("Lobby '{}' not found", lobby_code))?;
+        if metadata.matchmaking_pool != expected_pool {
+            return Err(anyhow!(
+                "Lobby '{}' belongs to a different matchmaking pool",
+                lobby_code
+            ));
+        }
+        Ok(())
     }
 
     async fn create_lobby_with_code_if_absent(
@@ -570,6 +652,7 @@ impl LobbyManager {
         host_user_id: i32,
         region: &str,
         requested_preferences: Option<&LobbyPreferences>,
+        matchmaking_pool: MatchmakingPool,
     ) -> Result<bool> {
         use chrono::Utc;
 
@@ -586,7 +669,8 @@ impl LobbyManager {
                 'hostUserId', ARGV[1],
                 'region', ARGV[2],
                 'createdAt', ARGV[3],
-                'state', ARGV[4]
+                'state', ARGV[4],
+                'matchmakingPool', ARGV[5]
             )
             return 1
         "#,
@@ -598,6 +682,7 @@ impl LobbyManager {
             .arg(region)
             .arg(&created_at)
             .arg("waiting")
+            .arg(matchmaking_pool.as_str())
             .invoke_async(&mut redis)
             .await
             .context("Failed to atomically create lobby metadata")?;
@@ -616,8 +701,8 @@ impl LobbyManager {
             .context("Failed to initialize lobby TTLs")?;
 
         info!(
-            "Auto-created lobby '{}' for user {} in region {}",
-            lobby_code, host_user_id, region
+            "Auto-created lobby '{}' for user {} in region {} (pool: {})",
+            lobby_code, host_user_id, region, matchmaking_pool
         );
 
         Ok(true)

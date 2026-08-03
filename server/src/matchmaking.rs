@@ -20,6 +20,7 @@ use crate::matchmaking_manager::{
     ActiveMatch, GameCreatedOutboxRecord, MATCHMAKING_GAME_TYPES, MatchCommitOutcome, MatchStatus,
     MatchmakingManager, QueuedPlayer,
 };
+use crate::matchmaking_pool::MatchmakingPool;
 
 // --- Configuration Constants ---
 const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
@@ -930,58 +931,50 @@ pub async fn run_matchmaking_loop(
 
         let mut total_games_created = 0;
 
-        for game_type in &MATCHMAKING_GAME_TYPES {
-            // Try lobby-based matchmaking for quickmatch
-            match create_lobby_matches(
-                &mut matchmaking_manager,
-                game_type.clone(),
-                common::QueueMode::Quickmatch,
-                lobby_manager.clone(),
-                db.clone(),
-            )
-            .await
-            {
-                Ok(games_count) if games_count > 0 => {
-                    total_games_created += games_count;
-                    info!(
-                        game_type = ?game_type,
-                        queue_mode = "quickmatch",
-                        games_count,
-                        "Created quickmatch games via lobby matchmaking"
-                    );
-                }
-                Ok(_) => {
-                    trace!(game_type = ?game_type, queue_mode = "quickmatch", "No suitable lobby matches found");
-                }
-                Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "quickmatch", error = %e, "Lobby matchmaking error");
-                }
-            }
-
-            // Try lobby-based matchmaking for competitive
-            match create_lobby_matches(
-                &mut matchmaking_manager,
-                game_type.clone(),
-                common::QueueMode::Competitive,
-                lobby_manager.clone(),
-                db.clone(),
-            )
-            .await
-            {
-                Ok(games_count) if games_count > 0 => {
-                    total_games_created += games_count;
-                    info!(
-                        game_type = ?game_type,
-                        queue_mode = "competitive",
-                        games_count,
-                        "Created competitive games via lobby matchmaking"
-                    );
-                }
-                Ok(_) => {
-                    trace!(game_type = ?game_type, queue_mode = "competitive", "No suitable lobby matches found");
-                }
-                Err(e) => {
-                    error!(game_type = ?game_type, queue_mode = "competitive", error = %e, "Lobby matchmaking error");
+        for matchmaking_pool in MatchmakingPool::ALL {
+            for game_type in &MATCHMAKING_GAME_TYPES {
+                for queue_mode in [
+                    common::QueueMode::Quickmatch,
+                    common::QueueMode::Competitive,
+                ] {
+                    match create_lobby_matches(
+                        &mut matchmaking_manager,
+                        game_type.clone(),
+                        queue_mode.clone(),
+                        matchmaking_pool,
+                        lobby_manager.clone(),
+                        db.clone(),
+                    )
+                    .await
+                    {
+                        Ok(games_count) if games_count > 0 => {
+                            total_games_created += games_count;
+                            info!(
+                                game_type = ?game_type,
+                                queue_mode = ?queue_mode,
+                                matchmaking_pool = %matchmaking_pool,
+                                games_count,
+                                "Created games via lobby matchmaking"
+                            );
+                        }
+                        Ok(_) => {
+                            trace!(
+                                game_type = ?game_type,
+                                queue_mode = ?queue_mode,
+                                matchmaking_pool = %matchmaking_pool,
+                                "No suitable lobby matches found"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                game_type = ?game_type,
+                                queue_mode = ?queue_mode,
+                                matchmaking_pool = %matchmaking_pool,
+                                error = %e,
+                                "Lobby matchmaking error"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1016,6 +1009,10 @@ fn are_lobbies_compatible(
     lobby2: &crate::matchmaking_manager::QueuedLobby,
     now_ms: i64,
 ) -> bool {
+    if lobby1.matchmaking_pool != lobby2.matchmaking_pool {
+        return false;
+    }
+
     let wait1_s = ((now_ms - lobby1.queued_at) as f64) / 1000.0;
     let wait2_s = ((now_ms - lobby2.queued_at) as f64) / 1000.0;
 
@@ -1064,12 +1061,13 @@ async fn create_lobby_matches(
     matchmaking_manager: &mut MatchmakingManager,
     game_type: GameType,
     queue_mode: common::QueueMode,
+    matchmaking_pool: MatchmakingPool,
     lobby_manager: Arc<LobbyManager>,
     db: Arc<dyn Database>,
 ) -> Result<usize> {
     // Get all queued lobbies for this game type and queue mode
     let mut available_lobbies = matchmaking_manager
-        .get_queued_lobbies(&game_type, &queue_mode)
+        .get_queued_lobbies_in_pool(&game_type, &queue_mode, matchmaking_pool)
         .await?;
 
     if available_lobbies.is_empty() {
@@ -1267,6 +1265,21 @@ async fn prepare_game_from_lobbies(
     combination: &MatchmakingCombination,
     db: &dyn Database,
 ) -> Result<PreparedMatch> {
+    let matchmaking_pool = combination
+        .lobbies
+        .first()
+        .map(|lobby| lobby.matchmaking_pool)
+        .ok_or_else(|| anyhow::anyhow!("Cannot prepare a match without lobbies"))?;
+    if combination
+        .lobbies
+        .iter()
+        .any(|lobby| lobby.matchmaking_pool != matchmaking_pool)
+    {
+        return Err(anyhow::anyhow!(
+            "Cannot prepare a match from mixed matchmaking pools"
+        ));
+    }
+
     let game_id = matchmaking_manager.generate_game_id(db).await?;
     let partition_id = game_id % PARTITION_COUNT;
 
@@ -1287,6 +1300,7 @@ async fn prepare_game_from_lobbies(
         rng_seed,
         start_ms,
     );
+    game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
     // Apply queue-mode-specific time limits for team games
     if matches!(game_type, GameType::TeamMatch { .. }) {
@@ -1400,6 +1414,7 @@ async fn prepare_game_from_lobbies(
         created_at: Utc::now().timestamp_millis(),
         spectators,
         lobby_codes,
+        matchmaking_pool,
     };
 
     Ok(PreparedMatch {
@@ -1491,6 +1506,7 @@ mod tests {
             queue_mode: QueueMode::Quickmatch,
             queued_at,
             requesting_user_id: user_ids[0],
+            matchmaking_pool: MatchmakingPool::Public,
         }
     }
 
@@ -1833,6 +1849,7 @@ mod tests {
             queue_mode: QueueMode::Quickmatch,
             queued_at: 0,
             requesting_user_id: 5,
+            matchmaking_pool: MatchmakingPool::Public,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::Solo)
@@ -1866,6 +1883,7 @@ mod tests {
             queue_mode: QueueMode::Quickmatch,
             queued_at: 0,
             requesting_user_id: 10,
+            matchmaking_pool: MatchmakingPool::Public,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 1 })
@@ -1907,6 +1925,7 @@ mod tests {
             queue_mode: QueueMode::Quickmatch,
             queued_at: 0,
             requesting_user_id: 20,
+            matchmaking_pool: MatchmakingPool::Public,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 2 })

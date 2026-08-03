@@ -1295,6 +1295,7 @@ impl Database for DynamoDatabase {
         item.insert("xp".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
+        item.insert("isStressTest".to_string(), Self::av_bool(false));
 
         self.client
             .put_item()
@@ -1315,10 +1316,17 @@ impl Database for DynamoDatabase {
             created_at: now,
             is_guest: false,
             guest_token: None,
+            is_stress_test: false,
         })
     }
 
-    async fn create_guest_user(&self, nickname: &str, guest_token: &str, mmr: i32) -> Result<User> {
+    async fn create_guest_user(
+        &self,
+        nickname: &str,
+        guest_token: &str,
+        mmr: i32,
+        is_stress_test: bool,
+    ) -> Result<User> {
         let user_id = self.generate_id_for_entity("USER").await?;
         let now = Utc::now();
 
@@ -1339,6 +1347,7 @@ impl Database for DynamoDatabase {
         item.insert("xp".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
+        item.insert("isStressTest".to_string(), Self::av_bool(is_stress_test));
         item.insert("guestToken".to_string(), Self::av_s(guest_token));
 
         self.client
@@ -1365,6 +1374,7 @@ impl Database for DynamoDatabase {
             created_at: now,
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
+            is_stress_test,
         })
     }
 
@@ -1397,6 +1407,7 @@ impl Database for DynamoDatabase {
                         .unwrap_or_else(Utc::now),
                     is_guest: Self::extract_bool(&item, "isGuest").unwrap_or(false),
                     guest_token: Self::extract_string(&item, "guestToken"),
+                    is_stress_test: Self::extract_bool(&item, "isStressTest").unwrap_or(false),
                 };
                 Ok(Some(user))
             }
@@ -1432,6 +1443,7 @@ impl Database for DynamoDatabase {
                     created_at: Utc::now(), // Not stored in username table, use current time
                     is_guest: false,        // Users in username table are never guests
                     guest_token: None,
+                    is_stress_test: false,
                 };
                 Ok(Some(user))
             }
