@@ -1,5 +1,6 @@
 export const RECONNECT_BASE_MS = 100;
 export const RECONNECT_MAX_MS = 2000;
+export const MATCHMAKING_ADMISSION_RETRY_DELAYS_MS = [250, 500, 1000] as const;
 export const PLANNED_HANDOFF_MAX_MS = 20_000;
 export const PLANNED_HANDOFF_MIN_MS = 2_000;
 export const REQUIRED_SERVER_CAPABILITIES = [
@@ -13,6 +14,9 @@ export const REQUIRED_SERVER_CAPABILITIES = [
 ] as const;
 
 export type ReplacementFailureAction = 'retry-candidate' | 'reconnect-active' | 'none';
+
+const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
+  'failed to queue lobby: failed to add lobby to matchmaking queue';
 
 export interface ReplacementReadiness {
   socketOpen: boolean;
@@ -38,6 +42,18 @@ export function isCommandOwner(
   readyState: number,
 ): boolean {
   return activeGeneration === targetGeneration && role === 'active' && readyState === 1;
+}
+
+export function isRetryableMatchmakingAdmissionFailure(reason: unknown): boolean {
+  return typeof reason === 'string' &&
+    reason.trim().toLowerCase() === RETRYABLE_MATCHMAKING_ADMISSION_REASON;
+}
+
+export function matchmakingAdmissionRetryDelayMs(attempt: number): number | null {
+  if (!Number.isInteger(attempt) || attempt < 0) {
+    return null;
+  }
+  return MATCHMAKING_ADMISSION_RETRY_DELAYS_MS[attempt] ?? null;
 }
 
 /** First retry is immediate; later retries use bounded full-width jitter. */
