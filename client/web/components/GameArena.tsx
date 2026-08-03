@@ -10,6 +10,15 @@ import Scoreboard from './Scoreboard';
 import LoadingScreen from './LoadingScreen';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
+import {
+  CRASH_EXPLOSION_SPRITE_URL,
+  drawCrashExplosions,
+  syncPredictedCrashExplosions,
+} from '../utils/crashExplosion';
+import type {
+  CrashExplosion,
+  PredictedCrashVisualState,
+} from '../utils/crashExplosion';
 
 export default function GameArena() {
   const { gameId } = useParams();
@@ -24,6 +33,12 @@ export default function GameArena() {
   const joinedGameIdRef = useRef<string | null>(null);
   const previousGameIdRef = useRef<string | null>(null);
   const drainingGameEventsRef = useRef(false);
+  const crashExplosionSpriteRef = useRef<HTMLImageElement | null>(null);
+  const crashExplosionsRef = useRef<CrashExplosion[]>([]);
+  const seenCrashEventIdsRef = useRef<Set<string>>(new Set());
+  const crashVisualEpochRef = useRef<number | null>(null);
+  const lastCrashVisualJsonRef = useRef<string | null>(null);
+  const prefersReducedMotionRef = useRef(false);
   
   const {
     connected,
@@ -71,6 +86,7 @@ export default function GameArena() {
     sendCommand,
     processServerEvent,
     renderTo,
+    readPredictedCrashVisualState,
     stopEngine
   } = useGameEngine({
     gameId,
@@ -104,6 +120,10 @@ export default function GameArena() {
       rotationSetRef.current = false;
       setGameOver(false);
       setShowGameOverPanel(false);
+      crashExplosionsRef.current.length = 0;
+      seenCrashEventIdsRef.current.clear();
+      crashVisualEpochRef.current = null;
+      lastCrashVisualJsonRef.current = null;
     }
 
     previousGameIdRef.current = gameId;
@@ -169,6 +189,36 @@ export default function GameArena() {
       stopEngine();
     }
   }, [isGameInteractionActive, stopEngine]);
+
+  // Preload and decode the atlas before gameplay starts. The arena countdown
+  // gives this a generous head start, while the render loop safely tolerates a
+  // cold cache without blocking simulation or input.
+  useEffect(() => {
+    const sprite = new Image();
+    sprite.decoding = 'async';
+    sprite.fetchPriority = 'high';
+    sprite.src = CRASH_EXPLOSION_SPRITE_URL;
+    crashExplosionSpriteRef.current = sprite;
+    void sprite.decode().catch((error) => {
+      console.warn('Crash explosion sprite could not be decoded:', error);
+    });
+
+    const motionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const updateMotionPreference = () => {
+      prefersReducedMotionRef.current = motionPreference.matches;
+    };
+    updateMotionPreference();
+    motionPreference.addEventListener('change', updateMotionPreference);
+
+    return () => {
+      motionPreference.removeEventListener('change', updateMotionPreference);
+      crashExplosionSpriteRef.current = null;
+      crashExplosionsRef.current.length = 0;
+      seenCrashEventIdsRef.current.clear();
+      crashVisualEpochRef.current = null;
+      lastCrashVisualJsonRef.current = null;
+    };
+  }, []);
 
 
   useEffect(() => {
@@ -369,41 +419,96 @@ export default function GameArena() {
     rotation,
   ]);
   
+  // Keep the existing development-only state probe current without restarting
+  // the visual requestAnimationFrame loop on every game tick.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'production' && gameState) {
+      (window as any).__gameArenaState = gameState;
+    }
+  }, [gameState]);
+
+  const renderArenaWidth = gameState?.arena.width ?? committedState?.arena.width ?? 0;
+  const renderArenaHeight = gameState?.arena.height ?? committedState?.arena.height ?? 0;
+  const hasRenderableGameState = gameState !== null;
+
   // Render game state. Rendering reads the engine's predicted state directly in
   // Rust via renderTo -> GameClient.render, so there is no per-frame JSON
   // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
   // usernames and teams are resolved inside the renderer from the typed state.
+  // Cosmetic crash effects are painted immediately afterwards in this same
+  // loop because the Rust renderer clears the canvas at the start of each frame.
   useEffect(() => {
-    if (!gameState || !canvasRef.current) {
-      if (!gameState) console.log('Waiting for game state...');
+    const canvas = canvasRef.current;
+    if (!hasRenderableGameState || !canvas || renderArenaWidth <= 0 || renderArenaHeight <= 0) {
+      if (!hasRenderableGameState) console.log('Waiting for game state...');
       return;
     }
 
-    // Expose game state for testing
-    if (process.env.NODE_ENV !== 'production') {
-      (window as any).__gameArenaState = gameState;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      console.error('Unable to create the arena canvas context');
+      return;
     }
 
-    let animationId: number;
-    const render = () => {
+    let animationId = 0;
+    const render = (now: number) => {
       try {
-        if (canvasRef.current) {
-          renderTo(canvasRef.current, cellSize, rotation, user?.id ?? undefined);
+        renderTo(canvas, cellSize, rotation, user?.id ?? undefined);
+        const crashSnapshot = readPredictedCrashVisualState();
+        if (crashSnapshot) {
+          // Suppress durable history only on this arena's first snapshot. On a
+          // later resync, a recent unseen cue may be the very prediction frame
+          // being reconciled, so it must remain eligible to render.
+          const isInitialCrashBaseline = crashVisualEpochRef.current === null;
+          const epochChanged = crashVisualEpochRef.current !== crashSnapshot.engineEpoch;
+          if (epochChanged || lastCrashVisualJsonRef.current !== crashSnapshot.json) {
+            const visualState = JSON.parse(
+              crashSnapshot.json,
+            ) as PredictedCrashVisualState;
+            syncPredictedCrashExplosions(
+              crashExplosionsRef.current,
+              seenCrashEventIdsRef.current,
+              gameId,
+              visualState,
+              now,
+              isInitialCrashBaseline ? crashSnapshot.baselineTick : undefined,
+            );
+            crashVisualEpochRef.current = crashSnapshot.engineEpoch;
+            lastCrashVisualJsonRef.current = crashSnapshot.json;
+          }
         }
+        drawCrashExplosions(
+          context,
+          crashExplosionSpriteRef.current,
+          crashExplosionsRef.current,
+          now,
+          cellSize,
+          renderArenaWidth,
+          renderArenaHeight,
+          rotation,
+          prefersReducedMotionRef.current,
+        );
       } catch (error) {
         console.error('Error rendering game:', error);
       }
       animationId = requestAnimationFrame(render);
     };
 
-    render();
+    animationId = requestAnimationFrame(render);
 
     return () => {
-      if (animationId) {
-        cancelAnimationFrame(animationId);
-      }
+      cancelAnimationFrame(animationId);
     };
-  }, [gameState, cellSize, rotation, user?.id, renderTo]);
+  }, [
+    hasRenderableGameState,
+    cellSize,
+    rotation,
+    user?.id,
+    renderTo,
+    readPredictedCrashVisualState,
+    renderArenaWidth,
+    renderArenaHeight,
+  ]);
   
   // Process server events through the game engine. Events arrive via a
   // lossless queue (see useGameWebSocket): a single signal bump may cover

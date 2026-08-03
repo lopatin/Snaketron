@@ -157,6 +157,24 @@ pub enum GameEvent {
     },
 }
 
+/// A collision produced by simulation. Recent cues stay in `GameState` for a
+/// short, bounded window so a renderer cannot miss one when prediction catches
+/// up by several ticks in a single frame. Including the tick also lets a
+/// prediction replay retract or relocate an effect deterministically.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct SnakeCrash {
+    pub tick: u32,
+    pub snake_id: u32,
+    pub position: Position,
+}
+
+/// Keep cosmetic crash history slightly longer than the web animation. This
+/// is deliberately time-based so custom games with faster ticks retain the
+/// same rollback-visible window without allowing unbounded snapshot growth.
+const RECENT_CRASH_RETENTION_MS: u32 = 1_000;
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
@@ -475,6 +493,8 @@ pub struct GameState {
     pub tick: u32,
     pub status: GameStatus,
     pub arena: Arena,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_crashes: Vec<SnakeCrash>,
     pub game_type: GameType,
     pub queue_mode: QueueMode,
     /// Server-attested synthetic game marker. Stress games exercise the full
@@ -647,6 +667,7 @@ impl GameState {
                 food: Vec::new(),
                 team_zone_config,
             },
+            recent_crashes: Vec::new(),
             game_type: game_type.clone(),
             queue_mode,
             is_stress_test: false,
@@ -1127,6 +1148,13 @@ impl GameState {
 
     pub fn tick_forward(&mut self, movement_only: bool) -> Result<Vec<(u64, GameEvent)>> {
         let mut out: Vec<(u64, GameEvent)> = Vec::new();
+        let tick_duration_ms = self.properties.tick_duration_ms.max(1);
+        self.recent_crashes.retain(|crash| {
+            self.tick
+                .saturating_sub(crash.tick)
+                .saturating_mul(tick_duration_ms)
+                <= RECENT_CRASH_RETENTION_MS
+        });
 
         // Emit snapshot on first tick
         if self.tick == 0 {
@@ -1198,7 +1226,7 @@ impl GameState {
         }
 
         // Check for collisions
-        let mut died_snake_ids = HashSet::new();
+        let mut crashed_snakes: HashMap<u32, Position> = HashMap::new();
         let width = self.arena.width as i16;
         let height = self.arena.height as i16;
         'main_snake_loop: for (snake_id, snake) in self.iter_snakes() {
@@ -1206,7 +1234,7 @@ impl GameState {
             if snake.is_alive {
                 // Check for wall collisions in team games
                 if self.arena.is_wall_position(head) {
-                    died_snake_ids.insert(snake_id);
+                    crashed_snakes.insert(snake_id, *head);
                     continue 'main_snake_loop;
                 }
 
@@ -1214,13 +1242,13 @@ impl GameState {
                 if let Some(team_id) = snake.team_id
                     && self.arena.is_in_enemy_base(head, team_id)
                 {
-                    died_snake_ids.insert(snake_id);
+                    crashed_snakes.insert(snake_id, *head);
                     continue 'main_snake_loop;
                 }
 
                 // If not within bounds
                 if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
-                    died_snake_ids.insert(snake_id);
+                    crashed_snakes.insert(snake_id, *head);
                     continue 'main_snake_loop;
                 }
 
@@ -1228,7 +1256,7 @@ impl GameState {
                 for (other_snake_id, other_snake) in self.iter_snakes() {
                     let is_self = snake_id == other_snake_id;
                     if other_snake.is_alive && other_snake.contains_point(head, is_self) {
-                        died_snake_ids.insert(snake_id);
+                        crashed_snakes.insert(snake_id, *head);
                         continue 'main_snake_loop;
                     }
                 }
@@ -1240,10 +1268,19 @@ impl GameState {
         // differs between processes (native server vs WASM client), and
         // respawn events consume RNG / emit events whose order must be
         // identical on both sides.
-        let mut died_snake_ids: Vec<u32> = died_snake_ids.into_iter().collect();
-        died_snake_ids.sort_unstable();
-        for snake_id in died_snake_ids {
+        let mut crashed_snakes: Vec<(u32, Position)> = crashed_snakes.into_iter().collect();
+        crashed_snakes.sort_unstable_by_key(|(snake_id, _)| *snake_id);
+        for (snake_id, attempted_head) in crashed_snakes {
             self.arena.snakes[snake_id as usize] = old_snakes[snake_id as usize].clone();
+            let crash_position = Position {
+                x: attempted_head.x.clamp(0, width.saturating_sub(1)),
+                y: attempted_head.y.clamp(0, height.saturating_sub(1)),
+            };
+            self.recent_crashes.push(SnakeCrash {
+                tick: self.tick.saturating_add(1),
+                snake_id,
+                position: crash_position,
+            });
             self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
 
             if let GameType::TeamMatch { .. } = &self.game_type
@@ -1786,6 +1823,63 @@ mod tests {
             "expected snake to die after colliding with itself"
         );
         assert!(!game.arena.snakes[0].is_alive);
+    }
+
+    #[test]
+    fn wall_crash_position_is_clamped_to_the_visible_arena() {
+        let mut game = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        game.arena.snakes.push(Snake {
+            body: vec![Position { x: 0, y: 5 }, Position { x: 3, y: 5 }],
+            direction: Direction::Left,
+            is_alive: true,
+            food: 0,
+            team_id: None,
+        });
+
+        let events = game
+            .tick_forward(true)
+            .expect("tick_forward should succeed");
+
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }))
+        );
+        assert_eq!(game.arena.snakes[0].body[0], Position { x: 0, y: 5 });
+        assert_eq!(
+            game.recent_crashes,
+            vec![SnakeCrash {
+                tick: 1,
+                snake_id: 0,
+                position: Position { x: 0, y: 5 },
+            }]
+        );
+
+        while game.current_tick() < 12 {
+            game.tick_forward(true).expect("advance crash history");
+        }
+        assert_eq!(
+            game.recent_crashes.len(),
+            1,
+            "history must cover the animation and reconciliation window"
+        );
+        game.tick_forward(true).expect("prune crash history");
+        assert!(
+            game.recent_crashes.is_empty(),
+            "crash history must remain bounded"
+        );
+    }
+
+    #[test]
+    fn snapshots_without_recent_crashes_remain_compatible() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut json = serde_json::to_value(state).expect("serialize state");
+        json.as_object_mut()
+            .expect("state object")
+            .remove("recent_crashes");
+
+        let restored: GameState = serde_json::from_value(json).expect("deserialize old snapshot");
+        assert!(restored.recent_crashes.is_empty());
     }
 
     fn clockwise(direction: Direction) -> Direction {
@@ -2385,6 +2479,14 @@ mod tests {
             matches!(event, GameEvent::SnakeRespawned { snake_id, .. } if *snake_id == 0)
         });
         assert!(respawned, "snake should respawn after scoring");
+
+        let reset_without_crash = events
+            .iter()
+            .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }));
+        assert!(
+            reset_without_crash && game.recent_crashes.is_empty(),
+            "banking food should reset the snake without recording a collision"
+        );
 
         let score = game
             .team_scores
