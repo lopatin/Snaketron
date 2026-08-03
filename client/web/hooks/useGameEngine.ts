@@ -24,6 +24,12 @@ interface UseGameEngineReturn {
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
   /** Render the engine's current predicted state to a canvas (no JSON round-trip). */
   renderTo: (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => void;
+  /** Read compact crash history from the same predicted state used by renderTo. */
+  readPredictedCrashVisualState: () => {
+    engineEpoch: number;
+    baselineTick: number;
+    json: string;
+  } | null;
   stopEngine: () => void;
 }
 
@@ -44,6 +50,8 @@ export const useGameEngine = ({
   latencyMs = 0
 }: UseGameEngineProps): UseGameEngineReturn => {
   const engineRef = useRef<GameClient | null>(null);
+  const engineEpochRef = useRef(0);
+  const engineBaselineTickRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [committedState, setCommittedState] = useState<GameState | null>(null);
@@ -103,6 +111,8 @@ export const useGameEngine = ({
     }
 
     engineGameIdRef.current = gameId;
+    engineEpochRef.current = 0;
+    engineBaselineTickRef.current = 0;
     setGameState(null);
     setCommittedState(null);
     setIsGameComplete(false);
@@ -308,6 +318,18 @@ export const useGameEngine = ({
     [],
   );
 
+  const readPredictedCrashVisualState = useCallback(() => {
+    const engine = engineRef.current;
+    if (!engine) {
+      return null;
+    }
+    return {
+      engineEpoch: engineEpochRef.current,
+      baselineTick: engineBaselineTickRef.current,
+      json: engine.getPredictedCrashVisualStateJson(),
+    };
+  }, []);
+
   const startEngine = useCallback(() => {
     if (!engineRef.current || animationFrameRef.current !== null) {
       return;
@@ -423,6 +445,8 @@ export const useGameEngine = ({
         // Rebuild from the raw frame so the snapshot's u64 fields (rng.state)
         // are parsed in Rust rather than corrupted by a JS JSON round-trip.
         engineRef.current = wasm.GameClient.newFromSnapshotFrame(expectedGameId, queued.raw);
+        engineEpochRef.current += 1;
+        engineBaselineTickRef.current = snapshotState.tick;
         engineRef.current.setLocalPlayerId(playerId);
 
         if (isFirstInit) {
@@ -475,6 +499,13 @@ export const useGameEngine = ({
         // Forwarding the raw frame (rather than JSON.stringify(fullEventMessage))
         // keeps full-range u64 fields intact end-to-end.
         engineRef.current.processServerFrame(queued.raw);
+        // Reconcile immediately, even when wall-clock time has not crossed a
+        // tick boundary. The arena's next paint must see corrections (and
+        // retract invalid crash effects) in the same visual frame.
+        const serverClockOffsetMs = getServerClockOffsetMs() ?? 0;
+        engineRef.current.rebuildPredictedState(
+          BigInt(Date.now() + Math.round(serverClockOffsetMs)),
+        );
 
         if (isSnapshot) {
           // Synchronize React state before the caller dismisses its awaiting-snapshot overlay.
@@ -521,6 +552,7 @@ export const useGameEngine = ({
     sendCommand,
     processServerEvent,
     renderTo,
+    readPredictedCrashVisualState,
     stopEngine,
   };
 };

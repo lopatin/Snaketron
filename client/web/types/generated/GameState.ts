@@ -5,8 +5,9 @@ import type { GameStatus } from "./GameStatus";
 import type { GameType } from "./GameType";
 import type { Player } from "./Player";
 import type { QueueMode } from "./QueueMode";
+import type { SnakeCrash } from "./SnakeCrash";
 
-export type GameState = { tick: number, status: GameStatus, arena: Arena, game_type: GameType, queue_mode: QueueMode, 
+export type GameState = { tick: number, status: GameStatus, arena: Arena, recent_crashes?: Array<SnakeCrash>, game_type: GameType, queue_mode: QueueMode,
 /**
  * Server-attested synthetic game marker. Stress games exercise the full
  * runtime but must not produce player progression or leaderboard effects.

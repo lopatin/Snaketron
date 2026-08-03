@@ -35,6 +35,7 @@ export * from './RegionMetadata';
 export * from './SeasonsResponse';
 export * from './SessionCommandRejectionFence';
 export * from './Snake';
+export * from './SnakeCrash';
 export * from './SyncStatus';
 export * from './TeamId';
 export * from './TeamZoneConfig';

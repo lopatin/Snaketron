@@ -199,6 +199,22 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// A compact rollback-visible view of recent predicted collisions. The web
+    /// renderer reads this beside the canvas render so crash effects start (or
+    /// retract) in the exact frame the predicted visual state changes, without
+    /// waiting for React state propagation or serializing the full game state.
+    #[wasm_bindgen(js_name = getPredictedCrashVisualStateJson)]
+    pub fn get_predicted_crash_visual_state_json(&self) -> Result<String, JsValue> {
+        let state = self.render_state();
+        serde_json::to_string(&serde_json::json!({
+            "predicted_tick": state.current_tick(),
+            "committed_tick": self.engine.current_tick(),
+            "tick_duration_ms": state.properties.tick_duration_ms,
+            "cues": &state.recent_crashes,
+        }))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Get the committed (server-authoritative) state as JSON
     #[wasm_bindgen(js_name = getCommittedStateJson)]
     pub fn get_committed_state_json(&self) -> Result<String, JsValue> {

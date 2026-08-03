@@ -64,6 +64,10 @@ pub struct GameEngine {
     /// deferral turns that order into tick spacing at execution time.
     local_command_seq: u32,
     sync_status: SyncStatus,
+    /// Authoritative input changed since the last prediction replay. A replay
+    /// must happen even when wall-clock time has not crossed another tick so
+    /// visual prediction (including crash cues) retracts in the same frame.
+    prediction_needs_rebuild: bool,
 }
 
 impl GameEngine {
@@ -92,6 +96,7 @@ impl GameEngine {
             command_counter: 0,
             local_command_seq: 0,
             sync_status: SyncStatus::default(),
+            prediction_needs_rebuild: false,
         }
     }
 
@@ -144,6 +149,7 @@ impl GameEngine {
             command_counter: 0,
             local_command_seq: 0,
             sync_status: SyncStatus::default(),
+            prediction_needs_rebuild: false,
         }
     }
 
@@ -171,6 +177,7 @@ impl GameEngine {
             command_counter: next_command_sequence,
             local_command_seq: 0,
             sync_status: SyncStatus::default(),
+            prediction_needs_rebuild: false,
         }
     }
 
@@ -298,6 +305,7 @@ impl GameEngine {
 
         self.committed_state
             .apply_event(event_message.event.clone(), None);
+        self.prediction_needs_rebuild = true;
 
         if is_snapshot {
             // Fresh authoritative state: divergence bookkeeping starts over.
@@ -332,6 +340,12 @@ impl GameEngine {
         // Handle pre-start case: if current time is before start time, don't advance
         let elapsed_ms = current_ts - self.committed_state.start_ms;
         if elapsed_ms < 0 {
+            if self.prediction_needs_rebuild {
+                let mut new_predicted_state = self.committed_state.clone();
+                new_predicted_state.rng = None;
+                self.predicted_state = Some(new_predicted_state);
+                self.prediction_needs_rebuild = false;
+            }
             return Ok(());
         }
 
@@ -347,14 +361,16 @@ impl GameEngine {
             let mut new_predicted_state = self.committed_state.clone();
             new_predicted_state.rng = None;
             self.predicted_state = Some(new_predicted_state);
+            self.prediction_needs_rebuild = false;
             return Ok(());
         }
 
         // Check if we need to rebuild by comparing with existing predicted state
-        let needs_rebuild = self
-            .predicted_state
-            .as_ref()
-            .is_none_or(|state| predicted_target_tick > state.current_tick());
+        let needs_rebuild = self.prediction_needs_rebuild
+            || self
+                .predicted_state
+                .as_ref()
+                .is_none_or(|state| predicted_target_tick > state.current_tick());
 
         if needs_rebuild {
             // Clone committed state
@@ -371,6 +387,7 @@ impl GameEngine {
             }
 
             self.predicted_state = Some(new_predicted_state);
+            self.prediction_needs_rebuild = false;
         }
 
         Ok(())
@@ -411,6 +428,9 @@ impl GameEngine {
 
         // Run predicted state to current time (not lagged), bounded by the
         // prediction cap relative to the just-advanced committed state.
+        if self.prediction_needs_rebuild {
+            self.rebuild_predicted_state(ts_ms)?;
+        }
         let predicted_target_tick = wallclock_target_tick.min(self.max_predicted_tick());
         if let Some(predicted_state) = &mut self.predicted_state {
             while !predicted_state.is_complete()
@@ -552,7 +572,21 @@ impl GameEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Direction;
+    use crate::{Direction, Position};
+
+    fn engine_with_imminent_wall_crash() -> (GameEngine, u32, i64) {
+        let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        state.add_player(1, None).expect("add player");
+        let snake_id = state.players[&1].snake_id;
+        let snake = &mut state.arena.snakes[snake_id as usize];
+        snake.body = vec![Position { x: 1, y: 5 }, Position { x: 4, y: 5 }];
+        snake.direction = Direction::Left;
+        snake.is_alive = true;
+        snake.food = 0;
+
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        (GameEngine::new_from_state(1, state), snake_id, tick_ms)
+    }
 
     fn clockwise(direction: Direction) -> Direction {
         match direction {
@@ -653,6 +687,91 @@ mod tests {
             "prediction must play the double-tap as a two-step maneuver"
         );
         assert_eq!(snake.length(), length_before);
+    }
+
+    #[test]
+    fn prediction_rebuild_retains_crash_cue_across_multi_tick_catch_up() {
+        let (mut engine, snake_id, tick_ms) = engine_with_imminent_wall_crash();
+
+        // One rebuild crosses five simulation ticks. The snake hits the left
+        // wall on tick 2, so a one-tick-only cue would have been gone by the
+        // final state observed by the renderer.
+        engine
+            .rebuild_predicted_state(tick_ms * 5)
+            .expect("multi-tick prediction rebuild");
+
+        let predicted = engine.predicted_state().expect("predicted state");
+        assert_eq!(predicted.current_tick(), 5);
+        assert!(!predicted.arena.snakes[snake_id as usize].is_alive);
+        assert!(
+            predicted
+                .recent_crashes
+                .iter()
+                .any(|crash| crash.tick == 2 && crash.snake_id == snake_id),
+            "the tick-2 crash must remain visible after catching up through tick 5"
+        );
+
+        let committed = engine.committed_state();
+        assert_eq!(committed.current_tick(), 0);
+        assert!(committed.arena.snakes[snake_id as usize].is_alive);
+        assert!(
+            committed.recent_crashes.is_empty(),
+            "prediction must expose the crash before committed state reaches it"
+        );
+    }
+
+    #[test]
+    fn authoritative_event_forces_same_target_prediction_reconciliation() {
+        let (mut engine, snake_id, tick_ms) = engine_with_imminent_wall_crash();
+        let target_ts = tick_ms * 5;
+
+        engine
+            .rebuild_predicted_state(target_ts)
+            .expect("initial prediction rebuild");
+        assert!(
+            engine
+                .predicted_state()
+                .expect("predicted state")
+                .recent_crashes
+                .iter()
+                .any(|crash| crash.snake_id == snake_id),
+            "test setup must first predict the wall crash"
+        );
+
+        // Authoritative input turns the snake away before the predicted crash.
+        // The wall-clock target remains tick 5, so reconciliation depends on
+        // `prediction_needs_rebuild`, not on advancing to tick 6.
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 1,
+                tick: 0,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: Some(1),
+                event: GameEvent::SnakeTurned {
+                    snake_id,
+                    direction: Direction::Up,
+                },
+            })
+            .expect("authoritative turn");
+        assert!(engine.prediction_needs_rebuild);
+
+        engine
+            .rebuild_predicted_state(target_ts)
+            .expect("same-target reconciliation rebuild");
+
+        let predicted = engine.predicted_state().expect("reconciled prediction");
+        assert_eq!(predicted.current_tick(), 5);
+        assert!(predicted.arena.snakes[snake_id as usize].is_alive);
+        assert_eq!(
+            predicted.arena.snakes[snake_id as usize].direction,
+            Direction::Up
+        );
+        assert!(
+            predicted.recent_crashes.is_empty(),
+            "same-target replay must retract the invalid predicted crash cue"
+        );
+        assert!(!engine.prediction_needs_rebuild);
     }
 
     /// The prod path of the same-tick double-turn bug: two quick inputs are
