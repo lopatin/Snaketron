@@ -20,7 +20,7 @@ use tracing::info;
 use crate::api::auth::{self, AuthState};
 use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
-use crate::api::middleware::auth_middleware;
+use crate::api::middleware::{AuthMiddlewareState, auth_middleware};
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
 use crate::cluster_membership::ClusterNamespace;
@@ -231,6 +231,11 @@ pub async fn install_http_application(
     let auth_state = AuthState {
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
+        user_cache: Some(state.user_cache.clone()),
+    };
+    let auth_middleware_state = AuthMiddlewareState {
+        jwt_manager: jwt_manager.clone(),
+        db: db.clone(),
     };
 
     // Configure CORS
@@ -246,7 +251,7 @@ pub async fn install_http_application(
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
         .layer(middleware::from_fn_with_state(
-            jwt_manager.clone(),
+            auth_middleware_state.clone(),
             auth_middleware,
         ))
         .with_state(auth_state.clone());
@@ -280,7 +285,7 @@ pub async fn install_http_application(
     let protected_leaderboard_routes = Router::new()
         .route("/api/leaderboard/me", get(leaderboard::get_my_ranking))
         .layer(middleware::from_fn_with_state(
-            jwt_manager.clone(),
+            auth_middleware_state,
             auth_middleware,
         ))
         .with_state(leaderboard_state);

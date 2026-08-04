@@ -229,7 +229,7 @@ function Auth() {
                     Currently playing as guest: <strong>{user.username}</strong>
                   </p>
                   <p className="text-xs text-blue-600 mt-1">
-                    Log in to access more features such as competitive play.
+                    Sign in to access more features such as competitive play.
                   </p>
                 </div>
               )}
@@ -283,7 +283,7 @@ function Auth() {
                       : 'border-gray-300 bg-gray-50 cursor-not-allowed opacity-50 text-gray-500'
                   }`}
                 >
-                  LOGIN
+                  SIGN IN
                 </button>
               </div>
             </>

@@ -4352,6 +4352,11 @@ mod tests {
             mmr: i32,
             is_stress_test: bool
         ) -> User);
+        unused_database_method!(upgrade_guest_to_account(
+            user_id: i32,
+            username: &str,
+            password_hash: &str
+        ) -> User);
         unused_database_method!(get_user_by_id(user_id: i32) -> Option<User>);
         unused_database_method!(get_user_by_username(username: &str) -> Option<User>);
         unused_database_method!(update_user_mmr(user_id: i32, mmr: i32) -> ());

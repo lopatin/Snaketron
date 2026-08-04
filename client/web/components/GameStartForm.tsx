@@ -56,7 +56,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   const [isCompetitive, setIsCompetitive] = useState<boolean | null>(null);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
   const lastSubmittedNicknameRef = useRef<string | null>(null);
-  const { user } = useAuth();
+  const { user, updateGuestNickname } = useAuth();
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
   const canEdit = !isLobbyQueued;
@@ -152,9 +152,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       return;
     }
 
-    sendMessage({ UpdateNickname: { nickname: nextNickname } });
+    if (!sendMessage({ UpdateNickname: { nickname: nextNickname } })) {
+      return;
+    }
+    updateGuestNickname(nextNickname);
     lastSubmittedNicknameRef.current = nextNickname;
-  }, [debouncedNickname, user, sendMessage]);
+  }, [debouncedNickname, user, sendMessage, updateGuestNickname]);
 
   const gameModes: Array<{ id: LobbyGameMode; label: string }> = [
     { id: 'duel', label: 'DUEL' },
@@ -196,11 +199,27 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
   const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading;
+  const startButtonActivating = isLobbyQueued || isLoading;
   const startButtonLabel = isLobbyQueued
     ? 'Finding Match...'
     : isLoading
         ? 'Starting...'
         : 'Start Game';
+  const wasStartButtonDisabledRef = useRef(startButtonDisabled);
+  const [enableAnimation, setEnableAnimation] = useState({ key: 0, visible: false });
+
+  useEffect(() => {
+    const wasDisabled = wasStartButtonDisabledRef.current;
+    wasStartButtonDisabledRef.current = startButtonDisabled;
+
+    if (wasDisabled && !startButtonDisabled) {
+      setEnableAnimation(({ key }) => ({ key: key + 1, visible: true }));
+    } else if (startButtonDisabled) {
+      setEnableAnimation((current) => (
+        current.visible ? { ...current, visible: false } : current
+      ));
+    }
+  }, [startButtonDisabled]);
 
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
@@ -256,7 +275,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                   onClick={() => toggleMode(mode.id)}
                   disabled={!canEdit || isLoading}
                   className={`
-                    relative py-4 px-4 rounded-lg font-black italic uppercase tracking-1 text-base
+                    game-mode-choice relative py-4 px-4 rounded-lg font-black uppercase tracking-1 text-base
                     transition-all border-2
                     ${isSelected
                       ? 'border-blue-500 bg-blue-50 text-black-70'
@@ -353,16 +372,68 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
         <button
           type="submit"
           disabled={startButtonDisabled}
+          aria-busy={startButtonActivating}
           className={`
-            w-full py-4 rounded-lg font-black italic uppercase tracking-1 text-lg
-            transition-all border-2
+            game-start-button w-full py-4 rounded-lg font-black uppercase tracking-1 text-lg
+            inline-flex items-center justify-center
+            border-2
             ${startButtonDisabled
-              ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
-              : 'bg-white border-black-70 text-black-70 hover:bg-gray-50 cursor-pointer'
+              ? startButtonActivating
+                ? 'is-activating cursor-wait'
+                : 'is-disabled bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
+              : 'cursor-pointer'
             }
           `}
         >
-          {startButtonLabel}
+          {enableAnimation.visible && (
+            <span
+              key={enableAnimation.key}
+              className="game-start-enable-sweep"
+              aria-hidden="true"
+            >
+              <svg
+                className="game-start-enable-chevron is-primary"
+                viewBox="0 0 42 34"
+              >
+                <path d="M0 0h11l17 17-17 17H0l17-17ZM13 0h11l17 17-17 17H13l17-17Z" />
+              </svg>
+              <svg
+                className="game-start-enable-chevron is-echo"
+                viewBox="0 0 42 34"
+                onAnimationEnd={(event) => {
+                  if (event.animationName !== 'game-start-enable-sweep-motion') {
+                    return;
+                  }
+                  setEnableAnimation((current) => (
+                    current.key === enableAnimation.key
+                      ? { ...current, visible: false }
+                      : current
+                  ));
+                }}
+              >
+                <path d="M0 0h11l17 17-17 17H0l17-17ZM13 0h11l17 17-17 17H13l17-17Z" />
+              </svg>
+            </span>
+          )}
+          <svg
+            className="game-start-chevrons is-left"
+            viewBox="0 0 31 28"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <path d="M0 2h8l12 12L8 26H0l12-12Z" />
+          </svg>
+          <span className="game-start-content">
+            <span className="game-start-label">{startButtonLabel}</span>
+          </span>
+          <svg
+            className="game-start-chevrons is-right"
+            viewBox="0 0 31 28"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <path d="M10 2h8l12 12-12 12h-8l12-12Z" />
+          </svg>
         </button>
         <div className="min-h-5 mt-3" aria-live="polite">
           {errorMessage && (

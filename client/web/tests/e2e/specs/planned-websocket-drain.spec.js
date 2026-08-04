@@ -367,6 +367,64 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test('logout explicitly leaves the lobby before retiring the authenticated socket', async ({ page }) => {
+  const oldSocketIndex = await establishAuthenticatedLobby(page);
+  await emitServerMessage(page, oldSocketIndex, {
+    LobbyChatMessage: {
+      lobby_id: 1,
+      message_id: 'logout-regression-message',
+      user_id: 7,
+      username: 'drain-tester',
+      message: 'This must not leak into the next session.',
+      timestamp_ms: Date.now(),
+    },
+  });
+
+  await expect.poll(() => page.evaluate(() => ({
+    lobbyCode: window.__wsContext?.currentLobby?.code,
+    memberCount: window.__wsContext?.lobbyMembers.length,
+    chatCount: window.__wsContext?.lobbyChatMessages.length,
+  }))).toEqual({ lobbyCode: 'LOBBY1', memberCount: 1, chatCount: 1 });
+  const socketCountBeforeLogout = await page.evaluate(() => window.__mockSockets.length);
+
+  await page.getByRole('button', { name: 'drain-tester' }).click();
+  await page.getByRole('menuitem', { name: 'Logout' }).click();
+
+  await expect.poll(() => page.evaluate((socketIndex) => {
+    const oldSocket = window.__mockSockets[socketIndex];
+    const decodedMessages = oldSocket.sent.map((raw) => JSON.parse(raw));
+    return {
+      leaveCount: decodedMessages.filter((message) => message === 'LeaveLobby').length,
+      closeCount: oldSocket.closeCalls.length,
+      lobby: window.__wsContext?.currentLobby ?? null,
+      memberCount: window.__wsContext?.lobbyMembers.length,
+      chatCount: window.__wsContext?.lobbyChatMessages.length,
+      token: localStorage.getItem('token'),
+      storedLobby: localStorage.getItem('snaketron:lastLobby'),
+    };
+  }, oldSocketIndex)).toEqual({
+    leaveCount: 1,
+    closeCount: 1,
+    lobby: null,
+    memberCount: 0,
+    chatCount: 0,
+    token: null,
+    storedLobby: null,
+  });
+
+  await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__mockSockets.length))
+    .toBeGreaterThan(socketCountBeforeLogout);
+  await expect.poll(() => page.evaluate((index) => window.__mockSockets
+    .slice(index)
+    .flatMap((socket) => socket.sent.map((raw) => JSON.parse(raw)))
+    .filter((message) => (
+      message &&
+      typeof message === 'object' &&
+      ('Token' in message || 'JoinLobby' in message)
+    )).length, socketCountBeforeLogout)).toBe(0);
+});
+
 test('planned drain keeps the old game socket usable until the replacement is fully ready', async ({ page }) => {
   const oldSocketIndex = await establishActiveGame(page);
   await sendCommandProbe(page, 'before-drain');

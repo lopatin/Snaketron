@@ -38,14 +38,22 @@ impl TestClient {
         // boundary. Merely writing a token is not authentication.
         self.send_message(WSMessage::Token(token.to_string()))
             .await?;
-        let response = self.receive_message().await?;
-        match response {
-            WSMessage::Authenticated { .. } => Ok(()),
-            other => Err(anyhow::anyhow!(
-                "Expected Authenticated response, got {:?}",
-                other
-            )),
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.receive_message().await? {
+                    WSMessage::Authenticated { .. } => return Ok(()),
+                    WSMessage::UserCountUpdate { .. } => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "Expected Authenticated response, got {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for Authenticated response"))?
     }
 
     /// Create and join an explicit matchmaking lobby.

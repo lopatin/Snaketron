@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import type { AccountModalView } from './AccountModal';
 import { HomeHeader } from './HomeHeader';
 import { SocialFooter } from './SocialFooter';
 import { LobbyChat } from './LobbyChat';
@@ -122,6 +123,7 @@ const LeaderboardContent: React.FC<{
   seasons,
   isAuthenticated
 }) => {
+  const navigate = useNavigate();
   const { queueForMatch } = useGameWebSocket();
   const { isConnected, currentLobby, createLobby, updateLobbyPreferences } = useWebSocket();
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
@@ -131,11 +133,11 @@ const LeaderboardContent: React.FC<{
   const [offset, setOffset] = useState(0);
   const [userRanking, setUserRanking] = useState<UserRankingResponse | null>(null);
   const LIMIT = 25;
-  const [isStartingPlacementQueue, setIsStartingPlacementQueue] = useState(false);
+  const [isStartingQueue, setIsStartingQueue] = useState(false);
 
-  // Fetch user's ranking when authenticated and filters change
+  // Fetch the user's competitive ranking when it is relevant to the selected mode.
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || selectedMode === 'solo') {
       setUserRanking(null);
       return;
     }
@@ -212,12 +214,13 @@ const LeaderboardContent: React.FC<{
     }
   };
 
-  const startPlacementQueue = async () => {
-    if (isStartingPlacementQueue || selectedMode === 'solo') {
+  const startSelectedQueue = async (competitive: boolean) => {
+    if (isStartingQueue) {
       return;
     }
 
-    setIsStartingPlacementQueue(true);
+    const modeToStart = selectedMode;
+    setIsStartingQueue(true);
     try {
       if (!isConnected) {
         throw new Error('Not connected to game server');
@@ -228,18 +231,18 @@ const LeaderboardContent: React.FC<{
       }
 
       updateLobbyPreferences({
-        selectedModes: [selectedMode],
-        competitive: true,
+        selectedModes: [modeToStart],
+        competitive,
       });
 
       // Small delay so the server registers preference updates
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      queueForMatch(toGameType(selectedMode), 'Competitive');
+      queueForMatch(toGameType(modeToStart), competitive ? 'Competitive' : 'Quickmatch');
     } catch (err) {
-      console.error('Failed to start placement matchmaking:', err);
+      console.error('Failed to start matchmaking:', err);
     } finally {
-      setIsStartingPlacementQueue(false);
+      setIsStartingQueue(false);
     }
   };
 
@@ -248,50 +251,81 @@ const LeaderboardContent: React.FC<{
   const rankImage = getRankImage(rankTier);
   const hasCompetitiveMMR = Boolean(rank);
   const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
+  const isSoloMode = selectedMode === 'solo';
+  const selectedModeLabel =
+    GAME_MODES.find(mode => mode.id === selectedMode)?.label ?? selectedMode.toUpperCase();
+  const playActionLabel = isSoloMode ? 'Play Snake Now' : 'Play Ranked Now';
+  const startingActionLabel = isSoloMode ? 'Starting game...' : 'Starting matchmaking...';
+
+  const playSelectedMode = () => {
+    const competitive = !isSoloMode;
+
+    if (!isAuthenticated) {
+      updateLobbyPreferences({
+        selectedModes: [selectedMode],
+        competitive,
+      });
+      navigate('/');
+      return;
+    }
+
+    void startSelectedQueue(competitive);
+  };
 
   return (
     <div className="leaderboard-content w-full max-w-4xl mx-auto px-4 py-8">
       {/* Header row with rank and selectors */}
       <div className="leaderboard-summary flex flex-col md:flex-row md:items-start md:justify-between gap-6 mb-8">
-        {/* Your Rank Display (left side) - Not shown for Solo mode */}
-        {selectedMode !== 'solo' ? (
-          <div className="flex items-start gap-4">
+        {/* Keep a stable left summary column as the selected game mode changes. */}
+        <div className="leaderboard-mode-summary flex items-start gap-4">
+          {isSoloMode ? (
+            <svg
+              className="w-16 h-16 flex-shrink-0 text-black-70"
+              viewBox="0 0 64 64"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              role="img"
+              aria-label="Solo trophy"
+            >
+              <path d="M19 10h26v11c0 10-5.8 17-13 17s-13-7-13-17V10Z" />
+              <path d="M19 15H9v4c0 7.8 4.5 12.5 11.8 13.4" />
+              <path d="M45 15h10v4c0 7.8-4.5 12.5-11.8 13.4" />
+              <path d="M32 38v9" />
+              <path d="M25 47h14l3 7H22l3-7Z" />
+            </svg>
+          ) : (
             <img
               src={rankImage}
               alt={rankTier}
-              className="w-16 h-16 object-contain"
+              className="w-16 h-16 flex-shrink-0 object-contain"
             />
-            <div className="flex flex-col gap-1">
-              <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
-                Your Rank
-              </div>
-              <div className="font-black italic tracking-1 text-lg text-black-70">
-                {rankLabel}
-              </div>
-              <div className="text-xs text-black-70">
-                {!isAuthenticated ? (
-                  <Link to="/auth" className="font-bold text-blue-600 hover:underline">
-                    Login to play ranked
-                  </Link>
-                ) : hasCompetitiveMMR && userRanking?.mmr != null ? (
-                  `${userRanking.mmr} MMR`
-                ) : (
-                  <button
-                    type="button"
-                    onClick={startPlacementQueue}
-                    disabled={isStartingPlacementQueue}
-                    className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
-                  >
-                    {isStartingPlacementQueue ? 'Starting matchmaking...' : 'Play ranked now'}
-                  </button>
-                )}
-              </div>
+          )}
+          <div className="flex flex-col gap-1">
+            <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
+              {isSoloMode ? 'Classic Snake' : isAuthenticated ? 'Your Rank' : 'Ranked Play'}
+            </div>
+            <div className="font-black italic tracking-1 text-lg text-black-70">
+              {isSoloMode ? 'SOLO' : isAuthenticated ? rankLabel : selectedModeLabel}
+            </div>
+            <div className="text-xs text-black-70">
+              {!isSoloMode && isAuthenticated && hasCompetitiveMMR && userRanking?.mmr != null ? (
+                `${userRanking.mmr} MMR`
+              ) : (
+                <button
+                  type="button"
+                  onClick={playSelectedMode}
+                  disabled={isStartingQueue}
+                  className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isStartingQueue ? startingActionLabel : playActionLabel}
+                </button>
+              )}
             </div>
           </div>
-        ) : (
-          // Empty div to maintain flex layout spacing
-          <div className="hidden md:block"></div>
-        )}
+        </div>
 
         {/* Selectors (right side) */}
         <div className="flex flex-col sm:flex-row gap-6">
@@ -542,7 +576,12 @@ const LeaderboardContent: React.FC<{
   );
 };
 
-export const Leaderboard: React.FC = () => {
+interface LeaderboardProps {
+  onOpenAuth: () => void;
+  onOpenAccount: (view: AccountModalView) => void;
+}
+
+export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { user, logout } = useAuth();
@@ -734,10 +773,6 @@ export const Leaderboard: React.FC = () => {
     }
   };
 
-  const handleLoginClick = () => {
-    navigate('/auth');
-  };
-
   const shouldShowRegionReminder = !regionsLoading && !regionsError && currentRegionId === '';
   const shouldShowRegionError = Boolean(regionsError);
   const shouldShowConnectionBanner = !isConnected;
@@ -757,7 +792,8 @@ export const Leaderboard: React.FC = () => {
           onInvite={handleInvite}
           onJoinGame={() => setShowJoinModal(true)}
           onLeaveLobby={handleLeaveLobby}
-          onLoginClick={handleLoginClick}
+          onAuthClick={onOpenAuth}
+          onOpenAccount={onOpenAccount}
           onLogout={logout}
         />
 
@@ -798,7 +834,7 @@ export const Leaderboard: React.FC = () => {
             selectedRegion={selectedLeaderboardRegion}
             setSelectedRegion={setSelectedLeaderboardRegion}
             seasons={seasons}
-            isAuthenticated={Boolean(user && !user.isGuest)}
+            isAuthenticated={Boolean(user)}
           />
         </main>
 

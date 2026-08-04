@@ -42,12 +42,33 @@ impl MockJwtVerifier {
         user_id: i32,
         matchmaking_pool: MatchmakingPool,
     ) -> Self {
+        self = self.with_token_kind(token, user_id, false, matchmaking_pool);
+        self
+    }
+
+    pub fn with_guest_token_in_pool(
+        mut self,
+        token: &str,
+        user_id: i32,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Self {
+        self = self.with_token_kind(token, user_id, true, matchmaking_pool);
+        self
+    }
+
+    fn with_token_kind(
+        mut self,
+        token: &str,
+        user_id: i32,
+        is_guest: bool,
+        matchmaking_pool: MatchmakingPool,
+    ) -> Self {
         self.expected_tokens.insert(
             token.to_string(),
             UserToken {
                 user_id,
                 username: format!("user_{}", user_id),
-                is_guest: false,
+                is_guest,
                 matchmaking_pool,
             },
         );

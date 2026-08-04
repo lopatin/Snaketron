@@ -237,7 +237,7 @@ function GameModeSelector() {
               />
               <div className="auth-message ml-2 h-8 mb-1 mt-1 flex items-center">
                 {isAuthenticating && (
-                  <p className="text-sm text-gray-700">Logging in...</p>
+                  <p className="text-sm text-gray-700">Signing in...</p>
                 )}
                 {authError && (
                   <p className="text-red-600 text-sm">{authError}</p>

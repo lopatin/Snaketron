@@ -12,15 +12,20 @@ use crate::db::Database;
 
 use super::auth::{self, AuthState};
 use super::jwt::JwtManager;
-use super::middleware::auth_middleware;
+use super::middleware::{AuthMiddlewareState, auth_middleware};
 use super::rate_limit::{rate_limit_layer, rate_limit_middleware};
 
 pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str) -> Result<()> {
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
 
     let auth_state = AuthState {
-        db,
+        db: db.clone(),
         jwt_manager: jwt_manager.clone(),
+        user_cache: None,
+    };
+    let auth_middleware_state = AuthMiddlewareState {
+        jwt_manager: jwt_manager.clone(),
+        db,
     };
 
     // Configure CORS
@@ -36,7 +41,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
         .layer(middleware::from_fn_with_state(
-            jwt_manager.clone(),
+            auth_middleware_state,
             auth_middleware,
         ));
 

@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
-import { KeyIcon, LogoutIcon, UserPlusIcon } from './Icons';
+import type { AccountModalView } from './AccountModal';
+import { HistoryIcon, KeyIcon, LogoutIcon, UserIcon, UserPlusIcon } from './Icons';
 
 interface HomeHeaderProps {
   activePage?: 'play' | 'leaderboards';
@@ -12,7 +13,8 @@ interface HomeHeaderProps {
   onInvite: () => void;
   onJoinGame: () => void;
   onLeaveLobby: () => void;
-  onLoginClick: () => void;
+  onAuthClick: () => void;
+  onOpenAccount: (view: AccountModalView) => void;
   onLogout: () => void;
 }
 
@@ -25,22 +27,34 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onInvite,
   onJoinGame,
   onLeaveLobby,
-  onLoginClick,
+  onAuthClick,
+  onOpenAccount,
   onLogout,
 }) => {
   const [isSocialOpen, setIsSocialOpen] = useState(false);
+  const [isAccountOpen, setIsAccountOpen] = useState(false);
   const socialMenuRef = useRef<HTMLDivElement>(null);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
+  const accountTriggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     const handlePointerDown = (event: MouseEvent) => {
       if (socialMenuRef.current && !socialMenuRef.current.contains(event.target as Node)) {
         setIsSocialOpen(false);
       }
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target as Node)) {
+        setIsAccountOpen(false);
+      }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         setIsSocialOpen(false);
+        setIsAccountOpen(false);
+
+        if (accountMenuRef.current?.contains(document.activeElement)) {
+          accountTriggerRef.current?.focus();
+        }
       }
     };
 
@@ -53,6 +67,12 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   }, []);
 
   const closeSocialMenu = () => setIsSocialOpen(false);
+  const closeAccountMenu = () => setIsAccountOpen(false);
+  const openAccountModal = (view: AccountModalView) => {
+    closeAccountMenu();
+    accountTriggerRef.current?.focus();
+    onOpenAccount(view);
+  };
 
   return (
     <header className="home-header">
@@ -76,7 +96,10 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
             <button
               type="button"
               className={`home-nav-link home-social-trigger ${isSocialOpen ? 'is-open' : ''}`}
-              onClick={() => setIsSocialOpen((current) => !current)}
+              onClick={() => {
+                setIsAccountOpen(false);
+                setIsSocialOpen((current) => !current);
+              }}
               aria-expanded={isSocialOpen}
               aria-haspopup="menu"
             >
@@ -155,17 +178,135 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
           </div>
         </nav>
 
-        <div className="home-account">
+        <div className="home-account home-account-menu" ref={accountMenuRef}>
           {currentUser && !currentUser.isGuest ? (
             <>
-              <span className="home-account-name">{currentUser.username}</span>
-              <button type="button" onClick={onLogout} className="home-account-action">
-                Log out
+              <button
+                ref={accountTriggerRef}
+                id="account-menu-trigger"
+                type="button"
+                className={`home-account-action home-account-trigger ${isAccountOpen ? 'is-open' : ''}`}
+                onClick={() => {
+                  setIsSocialOpen(false);
+                  setIsAccountOpen((current) => !current);
+                }}
+                aria-expanded={isAccountOpen}
+                aria-haspopup="menu"
+                aria-controls="account-menu"
+              >
+                <span className="home-account-username">{currentUser.username}</span>
+                <svg viewBox="0 0 12 8" aria-hidden="true">
+                  <path d="M1 1.5 6 6.5l5-5" />
+                </svg>
               </button>
+
+              {isAccountOpen && (
+                <div
+                  id="account-menu"
+                  className="home-social-panel home-account-panel"
+                  role="menu"
+                  aria-labelledby="account-menu-trigger"
+                >
+                  <div className="home-social-actions home-account-actions">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => openAccountModal('profile')}
+                    >
+                      <span>Profile</span>
+                      <UserIcon className="home-social-action-icon" />
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => openAccountModal('history')}
+                    >
+                      <span>History</span>
+                      <HistoryIcon className="home-social-action-icon" />
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="is-destructive"
+                      onClick={() => {
+                        closeAccountMenu();
+                        onLogout();
+                      }}
+                    >
+                      <span>Logout</span>
+                      <LogoutIcon className="home-social-action-icon" />
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : currentUser?.isGuest ? (
+            <>
+              <button
+                ref={accountTriggerRef}
+                id="guest-account-menu-trigger"
+                type="button"
+                className={`home-account-action home-account-trigger ${isAccountOpen ? 'is-open' : ''}`}
+                onClick={() => {
+                  setIsSocialOpen(false);
+                  setIsAccountOpen((current) => !current);
+                }}
+                aria-expanded={isAccountOpen}
+                aria-haspopup="menu"
+                aria-controls="guest-account-menu"
+              >
+                <span className="home-account-guest-label">
+                  <span className="home-account-username">{currentUser.username}</span>
+                  <span className="home-account-guest-suffix">(guest)</span>
+                </span>
+                <svg viewBox="0 0 12 8" aria-hidden="true">
+                  <path d="M1 1.5 6 6.5l5-5" />
+                </svg>
+              </button>
+
+              {isAccountOpen && (
+                <div
+                  id="guest-account-menu"
+                  className="home-social-panel home-account-panel"
+                  role="menu"
+                  aria-labelledby="guest-account-menu-trigger"
+                >
+                  <div className="home-social-actions home-account-actions">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        closeAccountMenu();
+                        accountTriggerRef.current?.focus();
+                        onAuthClick();
+                      }}
+                    >
+                      <span>Sign in</span>
+                      <UserIcon className="home-social-action-icon" />
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="is-destructive"
+                      onClick={() => {
+                        closeAccountMenu();
+                        onLogout();
+                      }}
+                    >
+                      <span>Logout</span>
+                      <LogoutIcon className="home-social-action-icon" />
+                    </button>
+                  </div>
+                </div>
+              )}
             </>
           ) : (
-            <button type="button" onClick={onLoginClick} className="home-account-action">
-              Log in
+            <button
+              type="button"
+              onClick={onAuthClick}
+              className="home-account-action"
+            >
+              Sign in
             </button>
           )}
         </div>

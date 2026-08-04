@@ -128,7 +128,7 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
   }
 
   const statusMessage = !currentUsername
-    ? 'Login to chat'
+    ? 'Sign in to chat'
     : isActive
       ? null
       : inactiveMessage;

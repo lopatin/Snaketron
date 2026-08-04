@@ -57,6 +57,7 @@ export type HighScoreEntry = GenHighScoreEntry;
 export interface User {
   id: number;
   username: string;
+  mmr?: number;
   token?: string;
   isGuest?: boolean;
 }

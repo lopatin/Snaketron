@@ -316,6 +316,16 @@ pub async fn get_my_ranking(
     State(state): State<LeaderboardState>,
     Query(query): Query<LeaderboardQuery>,
 ) -> Result<Json<UserRankingResponse>, StatusCode> {
+    let user = state
+        .db
+        .get_user_by_id(auth_user.user_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if user.is_guest != auth_user.is_guest {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     // Parse queue mode
     let queue_mode = match query.queue_mode.to_lowercase().as_str() {
         "quickmatch" | "casual" => QueueMode::Quickmatch,

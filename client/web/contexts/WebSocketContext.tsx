@@ -453,6 +453,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     setCurrentLobby(null);
     currentLobbyRef.current = null;
     setLobbyMembers([]);
+    setLobbyChatMessages([]);
+    lobbyChatLobbyIdRef.current = null;
     // console.log('setLobbyPreferences', DEFAULT_LOBBY_PREFERENCES);
     // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
     clearPersistedLobby();
@@ -1707,6 +1709,27 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         (active.authenticated || active.authTokenSent !== null),
       );
 
+      // A transport close is intentionally resumable on the server, so it does
+      // not mean "leave the lobby." Logout is explicit user intent: enqueue a
+      // LeaveLobby frame on the authenticated socket before retiring it. The
+      // WebSocket close handshake preserves frames queued before close, and the
+      // server removes every transport generation for this user on explicit
+      // leave. Clear local/persisted state immediately so the old identity can
+      // never remain visible or be restored into a later session.
+      if (
+        currentLobbyRef.current &&
+        active?.role === 'active' &&
+        active.authenticated &&
+        active.socket.readyState === WebSocket.OPEN
+      ) {
+        try {
+          active.socket.send(JSON.stringify('LeaveLobby'));
+        } catch (error) {
+          console.warn('Failed to notify the game server while leaving the lobby on logout', error);
+        }
+      }
+      resetLobbyState();
+
       previousUserRef.current = user;
       setMatchmakingStatus('idle');
       setAuthHandshakeState(false);
@@ -1771,6 +1794,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     getToken,
     authenticateConnection,
     clearPendingMatchmakingIntent,
+    resetLobbyState,
     setAuthHandshakeState,
   ]);
 

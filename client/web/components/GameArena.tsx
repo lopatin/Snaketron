@@ -659,7 +659,7 @@ export default function GameArena() {
   const showAuthLoading = authLoading || !user;
 
   if (showAuthLoading) {
-    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please log in to play'} />;
+    return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please sign in to play'} />;
   }
   
   return (

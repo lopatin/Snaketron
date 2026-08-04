@@ -33,7 +33,14 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
+const GUEST_UPGRADE_MAX_ATTEMPTS: usize = 8;
 const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
+
+#[derive(Clone, Copy)]
+enum UserProgressMutation {
+    Add(i32),
+    Set(i32),
+}
 
 /// How long a SERVER registration item lives past its last heartbeat before
 /// DynamoDB TTL reaps it. Deliberately generous: staleness is already handled
@@ -962,6 +969,99 @@ impl DynamoDatabase {
         ))
     }
 
+    fn user_progress_value(user: &User, field: &str) -> Result<i32> {
+        match field {
+            "mmr" => Ok(user.mmr),
+            "rankedMmr" => Ok(user.ranked_mmr),
+            "casualMmr" => Ok(user.casual_mmr),
+            "xp" => Ok(user.xp),
+            _ => Err(anyhow!("Unsupported user progress field '{field}'")),
+        }
+    }
+
+    /// Mutate canonical progress and its registered-user compatibility mirror
+    /// in one transaction. The guest/account state guard makes an upgrade race
+    /// retry with the correct mirror shape instead of skipping or doubling it.
+    async fn mutate_user_progress(
+        &self,
+        user_id: i32,
+        field: &str,
+        mutation: UserProgressMutation,
+    ) -> Result<i32> {
+        for attempt in 0..GUEST_UPGRADE_MAX_ATTEMPTS {
+            let user = self
+                .get_user_by_id(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("User not found"))?;
+            let (update_expression, value) = match mutation {
+                UserProgressMutation::Add(delta) => ("ADD #progress :value", delta),
+                UserProgressMutation::Set(value) => ("SET #progress = :value", value),
+            };
+
+            let main_update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("META"))
+                .update_expression(update_expression)
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                    "username=:username AND isGuest=:is_guest"
+                ))
+                .expression_attribute_names("#progress", field)
+                .expression_attribute_values(":value", Self::av_n(value))
+                .expression_attribute_values(":username", Self::av_s(&user.username))
+                .expression_attribute_values(":is_guest", Self::av_bool(user.is_guest))
+                .build()
+                .with_context(|| format!("Failed to build canonical {field} mutation"))?;
+            let mut mutations = vec![TransactWriteItem::builder().update(main_update).build()];
+
+            if !user.is_guest {
+                let mirror_update = Update::builder()
+                    .table_name(self.usernames_table())
+                    .key("username", Self::av_s(&user.username))
+                    .update_expression(update_expression)
+                    .condition_expression("attribute_exists(username) AND userId=:user_id")
+                    .expression_attribute_names("#progress", field)
+                    .expression_attribute_values(":value", Self::av_n(value))
+                    .expression_attribute_values(":user_id", Self::av_n(user_id))
+                    .build()
+                    .with_context(|| format!("Failed to build mirrored {field} mutation"))?;
+                mutations.push(TransactWriteItem::builder().update(mirror_update).build());
+            }
+
+            let result = self
+                .client
+                .transact_write_items()
+                .client_request_token(uuid::Uuid::new_v4().to_string())
+                .set_transact_items(Some(mutations))
+                .send()
+                .await;
+            match result {
+                Ok(_) => {
+                    let current = self
+                        .get_user_by_id(user_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("User not found"))?;
+                    return Self::user_progress_value(&current, field);
+                }
+                Err(error) if attempt + 1 < GUEST_UPGRADE_MAX_ATTEMPTS => {
+                    let exponent = attempt.min(6) as u32;
+                    sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    debug!(
+                        "Retrying {} mutation for user {} after concurrent identity change: {}",
+                        field, user_id, error
+                    );
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to atomically mutate user {field}"));
+                }
+            }
+        }
+
+        unreachable!("user progress mutation attempt loop always returns")
+    }
+
     async fn transact_completion_effect(
         &self,
         completion: &CompletionRecordV1,
@@ -1275,7 +1375,7 @@ impl Database for DynamoDatabase {
             .put_item()
             .table_name(self.usernames_table())
             .set_item(Some(username_item))
-            .condition_expression("attribute_not_exists(username)")
+            .condition_expression("attribute_not_exists(username) OR attribute_not_exists(userId)")
             .send()
             .await
             .map_err(|_| anyhow!("Username already exists"))?;
@@ -1378,6 +1478,144 @@ impl Database for DynamoDatabase {
         })
     }
 
+    async fn upgrade_guest_to_account(
+        &self,
+        user_id: i32,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<User> {
+        for attempt in 0..GUEST_UPGRADE_MAX_ATTEMPTS {
+            let guest = self
+                .get_user_by_id(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("Guest account not found"))?;
+
+            if !guest.is_guest {
+                return Err(anyhow!("Guest account has already been upgraded"));
+            }
+            if guest.is_stress_test {
+                return Err(anyhow!("Stress-test guest accounts cannot be upgraded"));
+            }
+
+            // Keep a complete mirror during rolling deployments, even though
+            // current readers use this table only as a username -> user ID
+            // index and load canonical progress from the main user record.
+            let mut username_item = HashMap::new();
+            username_item.insert("username".to_string(), Self::av_s(username));
+            username_item.insert("userId".to_string(), Self::av_n(user_id));
+            username_item.insert("passwordHash".to_string(), Self::av_s(password_hash));
+            username_item.insert("mmr".to_string(), Self::av_n(guest.mmr));
+            username_item.insert("rankedMmr".to_string(), Self::av_n(guest.ranked_mmr));
+            username_item.insert("casualMmr".to_string(), Self::av_n(guest.casual_mmr));
+            username_item.insert("xp".to_string(), Self::av_n(guest.xp));
+
+            let username_put = Put::builder()
+                .table_name(self.usernames_table())
+                .set_item(Some(username_item))
+                .condition_expression(concat!(
+                    "attribute_not_exists(username) OR ",
+                    "attribute_not_exists(userId) OR userId=:user_id"
+                ))
+                .expression_attribute_values(":user_id", Self::av_n(user_id))
+                .build()
+                .context("Failed to build guest username reservation")?;
+
+            // Progress fields participate in the condition, but not the SET.
+            // If a game completes between the read and transaction, the
+            // conditional cancellation forces a fresh snapshot and prevents a
+            // stale username mirror from being published.
+            let guest_update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("META"))
+                .update_expression(concat!(
+                    "SET username=:username, passwordHash=:password_hash, ",
+                    "isGuest=:not_guest, isStressTest=:not_stress ",
+                    "REMOVE guestToken"
+                ))
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                    "isGuest=:guest AND ",
+                    "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress) AND ",
+                    "username=:old_username AND passwordHash=:old_password_hash AND ",
+                    "mmr=:mmr AND rankedMmr=:ranked_mmr AND ",
+                    "casualMmr=:casual_mmr AND xp=:xp"
+                ))
+                .expression_attribute_values(":username", Self::av_s(username))
+                .expression_attribute_values(":password_hash", Self::av_s(password_hash))
+                .expression_attribute_values(":not_guest", Self::av_bool(false))
+                .expression_attribute_values(":not_stress", Self::av_bool(false))
+                .expression_attribute_values(":guest", Self::av_bool(true))
+                .expression_attribute_values(":old_username", Self::av_s(&guest.username))
+                .expression_attribute_values(":old_password_hash", Self::av_s(&guest.password_hash))
+                .expression_attribute_values(":mmr", Self::av_n(guest.mmr))
+                .expression_attribute_values(":ranked_mmr", Self::av_n(guest.ranked_mmr))
+                .expression_attribute_values(":casual_mmr", Self::av_n(guest.casual_mmr))
+                .expression_attribute_values(":xp", Self::av_n(guest.xp))
+                .build()
+                .context("Failed to build in-place guest account upgrade")?;
+
+            let result = self
+                .client
+                .transact_write_items()
+                .client_request_token(uuid::Uuid::new_v4().to_string())
+                .transact_items(TransactWriteItem::builder().put(username_put).build())
+                .transact_items(TransactWriteItem::builder().update(guest_update).build())
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => {
+                    let mut upgraded = guest;
+                    upgraded.username = username.to_string();
+                    upgraded.password_hash = password_hash.to_string();
+                    upgraded.is_guest = false;
+                    upgraded.guest_token = None;
+                    upgraded.is_stress_test = false;
+                    info!(
+                        "Upgraded guest user {} in place as account '{}'",
+                        user_id, username
+                    );
+                    return Ok(upgraded);
+                }
+                Err(error) => {
+                    // A response can be lost after DynamoDB commits. Recognize
+                    // this exact attempt as success instead of marooning the
+                    // browser with an invalidated guest token.
+                    let current = self
+                        .get_user_by_id(user_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("Guest account not found"))?;
+                    if !current.is_guest {
+                        if current.username == username && current.password_hash == password_hash {
+                            return Ok(current);
+                        }
+                        return Err(anyhow!("Guest account has already been upgraded"));
+                    }
+
+                    if let Some(owner) = self.get_user_by_username(username).await?
+                        && owner.id != user_id
+                    {
+                        return Err(anyhow!("Username already exists"));
+                    }
+
+                    if attempt + 1 == GUEST_UPGRADE_MAX_ATTEMPTS {
+                        return Err(error).context("Failed to atomically upgrade guest account");
+                    }
+
+                    let exponent = attempt.min(6) as u32;
+                    sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    debug!(
+                        "Retrying guest upgrade for user {} after concurrent mutation",
+                        user_id
+                    );
+                }
+            }
+        }
+
+        unreachable!("guest upgrade attempt loop always returns")
+    }
+
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>> {
         let response = self
             .client
@@ -1422,65 +1660,33 @@ impl Database for DynamoDatabase {
             .get_item()
             .table_name(self.usernames_table())
             .key("username", Self::av_s(username))
+            .consistent_read(true)
             .send()
             .await
             .context("Failed to get user by username")?;
 
         match response.item {
             Some(item) => {
-                let user_id = Self::extract_number(&item, "userId")
-                    .ok_or_else(|| anyhow!("Missing user ID"))?;
-
-                // Return user data directly from username table (it has all needed fields)
-                let user = User {
-                    id: user_id,
-                    username: username.to_string(),
-                    password_hash: Self::extract_string(&item, "passwordHash").unwrap_or_default(),
-                    mmr: Self::extract_number(&item, "mmr").unwrap_or(1000),
-                    ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
-                    casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
-                    xp: Self::extract_number(&item, "xp").unwrap_or(0),
-                    created_at: Utc::now(), // Not stored in username table, use current time
-                    is_guest: false,        // Users in username table are never guests
-                    guest_token: None,
-                    is_stress_test: false,
+                let Some(user_id) = Self::extract_number(&item, "userId") else {
+                    // Older progress writers could accidentally create a
+                    // partial row for a guest nickname. Treat it as an
+                    // unclaimed index entry so account creation can repair it.
+                    warn!("Ignoring incomplete username index row for '{}'", username);
+                    return Ok(None);
                 };
-                Ok(Some(user))
+
+                // The username table is the uniqueness/index boundary. The
+                // main record remains canonical for credentials and progress,
+                // avoiding stale mirror reads during an in-place guest claim.
+                self.get_user_by_id(user_id).await
             }
             None => Ok(None),
         }
     }
 
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()> {
-        // Update main table
-        self.client
-            .update_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("USER#{}", user_id)))
-            .key("sk", Self::av_s("META"))
-            .update_expression("SET mmr = :mmr")
-            .expression_attribute_values(":mmr", Self::av_n(mmr))
-            .send()
-            .await
-            .context("Failed to update user MMR")?;
-
-        // Also need to update username table
-        // First get username
-        let user = self
-            .get_user_by_id(user_id)
-            .await?
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        self.client
-            .update_item()
-            .table_name(self.usernames_table())
-            .key("username", Self::av_s(&user.username))
-            .update_expression("SET mmr = :mmr")
-            .expression_attribute_values(":mmr", Self::av_n(mmr))
-            .send()
-            .await
-            .context("Failed to update user MMR in username table")?;
-
+        self.mutate_user_progress(user_id, "mmr", UserProgressMutation::Set(mmr))
+            .await?;
         Ok(())
     }
 
@@ -1491,7 +1697,9 @@ impl Database for DynamoDatabase {
             .key("pk", Self::av_s(format!("USER#{}", user_id)))
             .key("sk", Self::av_s("META"))
             .update_expression("SET username = :username")
+            .condition_expression("attribute_exists(pk) AND isGuest = :guest")
             .expression_attribute_values(":username", Self::av_s(username))
+            .expression_attribute_values(":guest", Self::av_bool(true))
             .send()
             .await
             .context("Failed to update guest username")?;
@@ -1500,41 +1708,9 @@ impl Database for DynamoDatabase {
     }
 
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32> {
-        // Atomic ADD operation in DynamoDB main table
-        let response = self
-            .client
-            .update_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("USER#{}", user_id)))
-            .key("sk", Self::av_s("META"))
-            .update_expression("ADD xp :xp_delta")
-            .expression_attribute_values(":xp_delta", Self::av_n(xp_to_add))
-            .return_values(ReturnValue::AllNew)
-            .send()
-            .await
-            .context("Failed to add user XP")?;
-
-        // Extract and return new XP total
-        let new_xp = response
-            .attributes
-            .and_then(|attrs| Self::extract_number(&attrs, "xp"))
-            .unwrap_or(xp_to_add);
-
-        // Also update username table for consistency
-        let user = self
-            .get_user_by_id(user_id)
-            .await?
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        self.client
-            .update_item()
-            .table_name(self.usernames_table())
-            .key("username", Self::av_s(&user.username))
-            .update_expression("ADD xp :xp_delta")
-            .expression_attribute_values(":xp_delta", Self::av_n(xp_to_add))
-            .send()
-            .await
-            .context("Failed to update XP in username table")?;
+        let new_xp = self
+            .mutate_user_progress(user_id, "xp", UserProgressMutation::Add(xp_to_add))
+            .await?;
 
         info!(
             "Added {} XP to user {} (new total: {})",
@@ -1555,41 +1731,9 @@ impl Database for DynamoDatabase {
             common::QueueMode::Quickmatch => "casualMmr",
         };
 
-        // Atomic ADD operation in DynamoDB main table
-        let response = self
-            .client
-            .update_item()
-            .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("USER#{}", user_id)))
-            .key("sk", Self::av_s("META"))
-            .update_expression(format!("ADD {} :mmr_delta", mmr_field))
-            .expression_attribute_values(":mmr_delta", Self::av_n(mmr_delta))
-            .return_values(ReturnValue::AllNew)
-            .send()
-            .await
-            .context("Failed to update user MMR")?;
-
-        // Extract and return new MMR total
-        let new_mmr = response
-            .attributes
-            .and_then(|attrs| Self::extract_number(&attrs, mmr_field))
-            .unwrap_or(1000 + mmr_delta);
-
-        // Also update username table for consistency
-        let user = self
-            .get_user_by_id(user_id)
-            .await?
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        self.client
-            .update_item()
-            .table_name(self.usernames_table())
-            .key("username", Self::av_s(&user.username))
-            .update_expression(format!("ADD {} :mmr_delta", mmr_field))
-            .expression_attribute_values(":mmr_delta", Self::av_n(mmr_delta))
-            .send()
-            .await
-            .context("Failed to update MMR in username table")?;
+        let new_mmr = self
+            .mutate_user_progress(user_id, mmr_field, UserProgressMutation::Add(mmr_delta))
+            .await?;
 
         info!(
             "Updated {} for user {} by {} (new total: {})",
@@ -1887,7 +2031,12 @@ impl Database for DynamoDatabase {
     ) -> Result<EffectApplyResult> {
         completion.validate_effect(effect)?;
 
-        let max_attempts = if matches!(effect, CompletionEffect::UpdateRanking { .. }) {
+        let max_attempts = if matches!(
+            effect,
+            CompletionEffect::AddXp { .. }
+                | CompletionEffect::AddMmr { .. }
+                | CompletionEffect::UpdateRanking { .. }
+        ) {
             COMPLETION_RANKING_MAX_ATTEMPTS
         } else {
             1
@@ -2002,11 +2151,13 @@ impl Database for DynamoDatabase {
                         .key("pk", Self::av_s(format!("USER#{user_id}")))
                         .key("sk", Self::av_s("META"))
                         .update_expression("ADD xp :delta")
-                        .condition_expression(
-                            "attribute_exists(pk) AND attribute_exists(sk) AND username=:username",
-                        )
+                        .condition_expression(concat!(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                            "username=:username AND isGuest=:is_guest"
+                        ))
                         .expression_attribute_values(":delta", Self::av_n(amount))
                         .expression_attribute_values(":username", Self::av_s(&current_username))
+                        .expression_attribute_values(":is_guest", Self::av_bool(is_guest))
                         .build()
                         .context("Failed to build idempotent XP update")?;
                     let mut mutations =
@@ -2042,11 +2193,13 @@ impl Database for DynamoDatabase {
                         .key("pk", Self::av_s(format!("USER#{user_id}")))
                         .key("sk", Self::av_s("META"))
                         .update_expression(format!("ADD {field} :delta"))
-                        .condition_expression(
-                            "attribute_exists(pk) AND attribute_exists(sk) AND username=:username",
-                        )
+                        .condition_expression(concat!(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                            "username=:username AND isGuest=:is_guest"
+                        ))
                         .expression_attribute_values(":delta", Self::av_n(delta))
                         .expression_attribute_values(":username", Self::av_s(&current_username))
+                        .expression_attribute_values(":is_guest", Self::av_bool(is_guest))
                         .build()
                         .context("Failed to build idempotent MMR update")?;
                     let mut mutations =
@@ -2304,13 +2457,13 @@ impl Database for DynamoDatabase {
             {
                 Ok(result) => return Ok(result),
                 Err(error) if attempt + 1 < max_attempts => {
-                    // Ranking rows are sorted by MMR, so concurrent games for
-                    // one user race a conditional delete/put. Re-read and
-                    // rebuild the transaction until one observes the winner.
+                    // Ranking rows and guest-to-account transitions both use
+                    // conditional state. Re-read and rebuild until one attempt
+                    // observes the winning MMR/account state.
                     let exponent = attempt.min(6) as u32;
                     sleep(Duration::from_millis(1_u64 << exponent)).await;
                     debug!(
-                        "Retrying completion ranking effect {} after concurrent mutation: {}",
+                        "Retrying completion effect {} after concurrent mutation: {}",
                         effect.id(),
                         error
                     );

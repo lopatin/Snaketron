@@ -322,7 +322,7 @@ async fn websocket_lobby_joins_are_denied_across_both_pool_directions() -> Resul
     let verifier = self::common::MockJwtVerifier::new()
         .with_token("public-host", public_host_id)
         .with_token("public-joiner", public_joiner_id)
-        .with_token_in_pool("stress-host", stress_host_id, MatchmakingPool::Stress);
+        .with_guest_token_in_pool("stress-host", stress_host_id, MatchmakingPool::Stress);
     env.add_server_with_jwt_verifier(
         JwtManager::new("test_secret_key_for_testing"),
         Arc::new(verifier),

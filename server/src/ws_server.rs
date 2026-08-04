@@ -3317,6 +3317,12 @@ async fn process_ws_message(
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
+                            if user.is_guest != user_token.is_guest {
+                                return Err(anyhow::anyhow!(
+                                    "Authentication failed: guest claim does not match user record"
+                                ));
+                            }
+
                             let database_pool = if user.is_stress_test {
                                 MatchmakingPool::Stress
                             } else {
