@@ -2,12 +2,14 @@
 
 use crate::cluster_membership::EXECUTOR_PROTOCOL_VERSION;
 use anyhow::{Context, Result, bail};
-use common::{ClientCommandIdentityV2, GameCommandMessage, GameEvent, GameEventMessage, GameState};
+use common::{
+    ClientCommandIdentityV2, CommandId, GameCommandMessage, GameEvent, GameEventMessage, GameState,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub const RECOVERY_SCHEMA_VERSION: u16 = 2;
+pub const RECOVERY_SCHEMA_VERSION: u16 = 3;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);
@@ -71,8 +73,23 @@ pub fn validate_client_command_identity(identity: &ClientCommandIdentityV2) -> R
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum CommandOutcome {
-    Scheduled { command: GameCommandMessage },
-    Rejected { reason: String },
+    Scheduled {
+        command: GameCommandMessage,
+    },
+    Rejected {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id_client: Option<CommandId>,
+    },
+}
+
+impl CommandOutcome {
+    pub fn rejection_reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { reason, .. } => Some(reason),
+            Self::Scheduled { .. } => None,
+        }
+    }
 }
 
 /// Write-ahead record for a client-visible command outcome. The partition
@@ -114,11 +131,15 @@ impl CommandDecisionV1 {
                 },
             )),
             GameEvent::CommandRejected {
-                command_id, reason, ..
+                command_id,
+                reason,
+                command_id_client,
+                ..
             } => Ok((
                 command_id,
                 CommandOutcome::Rejected {
                     reason: reason.clone(),
+                    command_id_client: command_id_client.clone(),
                 },
             )),
             _ => bail!("command decision must contain a V2 command outcome"),
@@ -500,6 +521,7 @@ impl RecoveryEnvelopeV2 {
         for session in self.resolved_client_commands.sessions.values() {
             session.validate()?;
         }
+        self.game_state.validate_boost_invariants()?;
         Ok(())
     }
 }
@@ -629,6 +651,7 @@ mod tests {
     fn rejected(reason: &str) -> CommandOutcome {
         CommandOutcome::Rejected {
             reason: reason.into(),
+            command_id_client: None,
         }
     }
 
@@ -1027,5 +1050,130 @@ mod tests {
         let cadence = CheckpointCadence::new(Duration::from_secs(1), now).unwrap();
         assert!(!cadence.due(now + Duration::from_millis(999)));
         assert!(cadence.due(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn recovery_preserves_mid_boost_state_and_exact_next_quantum() {
+        let game_id = 45;
+        let start_ms = 1_000_000;
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(0xB0057),
+            start_ms,
+        );
+        state.status = common::GameStatus::Started { server_id: 7 };
+        state.properties.available_food_target = 0;
+        let snake_id = state
+            .add_player(9, Some("boost-player".into()))
+            .unwrap()
+            .snake_id;
+        let pad_position = state.arena.boost_pads[0].position;
+        let pad_charge_ms = state.arena.boost_pads[0].charge_ms;
+        state.arena.snakes[snake_id as usize].body = vec![
+            pad_position,
+            common::Position {
+                x: pad_position.x - 3,
+                y: pad_position.y,
+            },
+        ];
+        state.arena.snakes[snake_id as usize].direction = Direction::Right;
+        state.validate_boost_invariants().unwrap();
+
+        let mut original = common::GameEngine::new_from_state(game_id, state);
+
+        // First 50 ms quantum: normal speed accrues half a cell and the head
+        // stores one packet without activating.
+        original.run_until(start_ms + 500 + 50).unwrap();
+        let collected = &original.get_committed_state().arena.snakes[snake_id as usize];
+        assert_eq!(collected.boost().charge_ms, pad_charge_ms);
+        assert!(!collected.boost().active);
+        assert_eq!(collected.movement_credit(), 50_000);
+        assert!(
+            original.get_committed_state().arena.boost_pads[0]
+                .respawn_at_tick
+                .is_some()
+        );
+
+        original
+            .process_command(GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: original.current_tick(),
+                    user_id: 9,
+                    sequence_number: 1,
+                },
+                command_id_server: None,
+                command: GameCommand::ActivateBoost { snake_id },
+            })
+            .unwrap();
+
+        // Second quantum activates before credit, reserves exactly 50 ms of
+        // fuel, moves once, and leaves a nonzero residual. This is the state a
+        // successor must restore without adding or losing a cell.
+        original.run_until(start_ms + 500 + 100).unwrap();
+        let checkpoint_snake = &original.get_committed_state().arena.snakes[snake_id as usize];
+        assert!(checkpoint_snake.boost().active);
+        assert_eq!(
+            checkpoint_snake.boost().charge_ms,
+            pad_charge_ms - common::BOOST_TICK_INTERVAL_MS
+        );
+        assert_eq!(
+            checkpoint_snake.speed_milli(),
+            original
+                .get_committed_state()
+                .properties
+                .boost
+                .as_ref()
+                .unwrap()
+                .speed_milli
+        );
+        assert_eq!(checkpoint_snake.movement_credit(), 25_000);
+        let checkpoint_head = *checkpoint_snake.head().unwrap();
+
+        let envelope = RecoveryEnvelopeV2::new(
+            game_id,
+            4,
+            original.get_committed_state().clone(),
+            "123-4".into(),
+            ResolvedCommandState::default(),
+            original.next_server_command_sequence(),
+            91,
+            start_ms + 600,
+            "token".into(),
+        );
+        let decoded: RecoveryEnvelopeV2 =
+            serde_json::from_slice(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        decoded.validate().unwrap();
+        let mut recovered = common::GameEngine::try_new_from_state_with_command_counter(
+            game_id,
+            decoded.game_state,
+            decoded.next_server_command_sequence,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(original.get_committed_state()).unwrap(),
+            serde_json::to_value(recovered.get_committed_state()).unwrap(),
+            "checkpoint round trip must preserve fuel, speed, credit, and pad cooldown"
+        );
+
+        // One more 50 ms quantum must produce the same funded movement on the
+        // incumbent and recovered successor.
+        original.run_until(start_ms + 500 + 150).unwrap();
+        recovered.run_until(start_ms + 500 + 150).unwrap();
+        assert_eq!(
+            serde_json::to_value(original.get_committed_state()).unwrap(),
+            serde_json::to_value(recovered.get_committed_state()).unwrap()
+        );
+        let recovered_snake = &recovered.get_committed_state().arena.snakes[snake_id as usize];
+        assert!(recovered_snake.boost().active);
+        assert_eq!(
+            recovered_snake.boost().charge_ms,
+            pad_charge_ms - 2 * common::BOOST_TICK_INTERVAL_MS
+        );
+        assert_eq!(recovered_snake.movement_credit(), 0);
+        assert_ne!(*recovered_snake.head().unwrap(), checkpoint_head);
     }
 }

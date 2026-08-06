@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { LobbyModal } from './LobbyModal';
 
 interface InviteFriendsModalProps {
   isOpen: boolean;
@@ -6,110 +7,187 @@ interface InviteFriendsModalProps {
   lobbyCode: string | null;
 }
 
+type CopyState = 'idle' | 'copied' | 'failed';
+type CopyTarget = 'code' | 'link';
+
+const copyFeedbackText = (
+  target: CopyTarget,
+  state: CopyState,
+): string => {
+  if (state === 'copied') {
+    return target === 'code' ? 'Lobby code copied.' : 'Invite link copied.';
+  }
+  if (state === 'failed') {
+    return target === 'code'
+      ? 'Could not copy the lobby code. Try again.'
+      : 'Could not copy the invite link. Try again.';
+  }
+  return '';
+};
+
 export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
   isOpen,
   onClose,
   lobbyCode,
 }) => {
-  const [copiedCode, setCopiedCode] = useState(false);
-  const [copiedUrl, setCopiedUrl] = useState(false);
+  const [codeCopyState, setCodeCopyState] = useState<CopyState>('idle');
+  const [linkCopyState, setLinkCopyState] = useState<CopyState>('idle');
+  const [latestCopyTarget, setLatestCopyTarget] = useState<CopyTarget | null>(null);
+  const copyCodeButtonRef = useRef<HTMLButtonElement>(null);
+  const resetTimersRef = useRef<Partial<Record<CopyTarget, ReturnType<typeof setTimeout>>>>({});
+  const copyOperationRef = useRef<Record<CopyTarget, number>>({ code: 0, link: 0 });
+  const isMountedRef = useRef(true);
+  const isOpenRef = useRef(isOpen);
+  isOpenRef.current = isOpen;
 
-  if (!isOpen) return null;
+  const lobbyUrl = useMemo(() => {
+    if (!lobbyCode || typeof window === 'undefined') {
+      return '';
+    }
+    return `${window.location.origin}/lobby/${encodeURIComponent(lobbyCode)}`;
+  }, [lobbyCode]);
 
-  const lobbyUrl = lobbyCode
-    ? `${window.location.origin}/lobby/${lobbyCode}`
+  const clearResetTimer = (target: CopyTarget) => {
+    const timer = resetTimersRef.current[target];
+    if (timer) {
+      clearTimeout(timer);
+      delete resetTimersRef.current[target];
+    }
+  };
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      clearResetTimer('code');
+      clearResetTimer('link');
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isOpen) {
+      return;
+    }
+    clearResetTimer('code');
+    clearResetTimer('link');
+    copyOperationRef.current.code += 1;
+    copyOperationRef.current.link += 1;
+    setCodeCopyState('idle');
+    setLinkCopyState('idle');
+    setLatestCopyTarget(null);
+  }, [isOpen]);
+
+  const copyToClipboard = async (
+    target: CopyTarget,
+    value: string,
+    setCopyState: React.Dispatch<React.SetStateAction<CopyState>>,
+  ) => {
+    if (!value) {
+      return;
+    }
+
+    clearResetTimer(target);
+    const operation = copyOperationRef.current[target] + 1;
+    copyOperationRef.current[target] = operation;
+    setLatestCopyTarget(target);
+    setCopyState('idle');
+
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Clipboard API unavailable');
+      }
+      await navigator.clipboard.writeText(value);
+      if (
+        !isMountedRef.current ||
+        !isOpenRef.current ||
+        copyOperationRef.current[target] !== operation
+      ) {
+        return;
+      }
+      setCopyState('copied');
+    } catch (error: unknown) {
+      console.error(`Failed to copy lobby ${target}:`, error);
+      if (
+        !isMountedRef.current ||
+        !isOpenRef.current ||
+        copyOperationRef.current[target] !== operation
+      ) {
+        return;
+      }
+      setCopyState('failed');
+    }
+
+    if (isMountedRef.current && isOpenRef.current) {
+      resetTimersRef.current[target] = setTimeout(() => {
+        if (
+          isMountedRef.current &&
+          isOpenRef.current &&
+          copyOperationRef.current[target] === operation
+        ) {
+          setCopyState('idle');
+        }
+        delete resetTimersRef.current[target];
+      }, 2000);
+    }
+  };
+
+  const statusMessage = latestCopyTarget
+    ? copyFeedbackText(
+        latestCopyTarget,
+        latestCopyTarget === 'code' ? codeCopyState : linkCopyState,
+      )
     : '';
 
-  const handleCopyCode = async () => {
-    if (lobbyCode) {
-      try {
-        await navigator.clipboard.writeText(lobbyCode);
-        setCopiedCode(true);
-        setTimeout(() => setCopiedCode(false), 2000);
-      } catch (err) {
-        console.error('Failed to copy code:', err);
-      }
-    }
-  };
-
-  const handleCopyUrl = async () => {
-    if (lobbyUrl) {
-      try {
-        await navigator.clipboard.writeText(lobbyUrl);
-        setCopiedUrl(true);
-        setTimeout(() => setCopiedUrl(false), 2000);
-      } catch (err) {
-        console.error('Failed to copy URL:', err);
-      }
-    }
-  };
-
   return (
-    <div
-      className="fixed inset-0 flex items-center justify-center p-4 z-50"
-      onClick={onClose}
-      style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)' }}
+    <LobbyModal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Invite friends"
+      description="Share the lobby code or send a direct invite link."
+      initialFocusRef={copyCodeButtonRef}
     >
-      <div
-        className="bg-white rounded-lg p-8 w-full max-w-lg"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          border: '2px solid rgba(0, 0, 0, 0.65)',
-          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.2)'
-        }}
-      >
-        <div className="text-center mb-6">
-          <h2 className="text-2xl font-black italic uppercase tracking-1 text-black-70 mb-2">
-            Invite Friends
-          </h2>
-          <p className="text-sm text-black-70 opacity-60">
-            Share this code or link with your friends
-          </p>
-        </div>
-
-        <div className="mb-5">
-          <label className="block text-xs font-black italic uppercase tracking-1 text-black-70 mb-2 opacity-50">
-            Code
-          </label>
-          <div className="flex gap-2">
-            <div className="flex-1 px-4 py-3 border-2 border-black-70 rounded-lg font-mono text-2xl text-center uppercase tracking-widest text-black-70">
-              {lobbyCode || 'XXXXXXXX'}
-            </div>
+      <div className="lobby-modal-share-list">
+        <div className="lobby-modal-field">
+          <span className="lobby-modal-label">Lobby code</span>
+          <div className="lobby-modal-share-row">
+            <div className="lobby-modal-value is-code">{lobbyCode || 'Preparing…'}</div>
             <button
-              onClick={handleCopyCode}
-              className="px-5 py-3 border-2 border-black-70 rounded-lg font-black italic uppercase text-xs text-black-70 hover:bg-gray-50 transition-colors"
-              style={{ letterSpacing: '1px' }}
+              ref={copyCodeButtonRef}
+              type="button"
+              className="lobby-modal-button is-copy"
+              onClick={() => copyToClipboard('code', lobbyCode ?? '', setCodeCopyState)}
+              disabled={!lobbyCode}
             >
-              {copiedCode ? 'Copied!' : 'Copy'}
+              {codeCopyState === 'copied' ? 'Copied' : codeCopyState === 'failed' ? 'Try again' : 'Copy'}
             </button>
           </div>
         </div>
 
-        <div className="mb-6">
-          <label className="block text-xs font-black italic uppercase tracking-1 text-black-70 mb-2 opacity-50">
-            Link
-          </label>
-          <div className="flex gap-2">
-            <div className="flex-1 px-4 py-3 border-2 border-black-70 rounded-lg text-sm text-black-70 overflow-hidden text-ellipsis whitespace-nowrap">
-              {lobbyUrl}
-            </div>
+        <div className="lobby-modal-field">
+          <span className="lobby-modal-label">Invite link</span>
+          <div className="lobby-modal-share-row">
+            <div className="lobby-modal-value is-link" title={lobbyUrl}>{lobbyUrl || 'Preparing…'}</div>
             <button
-              onClick={handleCopyUrl}
-              className="px-5 py-3 border-2 border-black-70 rounded-lg font-black italic uppercase text-xs text-black-70 hover:bg-gray-50 transition-colors"
-              style={{ letterSpacing: '1px' }}
+              type="button"
+              className="lobby-modal-button is-copy"
+              onClick={() => copyToClipboard('link', lobbyUrl, setLinkCopyState)}
+              disabled={!lobbyUrl}
             >
-              {copiedUrl ? 'Copied!' : 'Copy'}
+              {linkCopyState === 'copied' ? 'Copied' : linkCopyState === 'failed' ? 'Try again' : 'Copy'}
             </button>
           </div>
         </div>
+      </div>
 
-        <button
-          onClick={onClose}
-          className="w-full px-6 py-3 border-2 border-black-70 rounded-lg font-black italic uppercase tracking-1 text-black-70 hover:bg-gray-50 transition-colors"
-        >
-          Close
+      <p className="sr-only" aria-live="polite">
+        {statusMessage}
+      </p>
+
+      <div className="lobby-modal-actions lobby-modal-invite-actions">
+        <button type="button" className="lobby-modal-button is-secondary" onClick={onClose}>
+          Done
         </button>
       </div>
-    </div>
+    </LobbyModal>
   );
 };

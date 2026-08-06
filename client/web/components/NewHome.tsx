@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import type { AccountModalView } from './AccountModal';
 import { HomeHeader } from './HomeHeader';
 import { GameStartForm } from './GameStartForm';
 import { SocialFooter } from './SocialFooter';
@@ -15,9 +16,14 @@ import { LobbyGameMode } from '../types';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
-export const NewHome: React.FC = () => {
+interface NewHomeProps {
+  onOpenAuth: () => void;
+  onOpenAccount: (view: AccountModalView) => void;
+}
+
+export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
-  const { user, createGuest, logout, updateGuestNickname } = useAuth();
+  const { user, createGuest, logout } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -195,10 +201,6 @@ export const NewHome: React.FC = () => {
     }
   };
 
-  const handleLoginClick = () => {
-    navigate('/auth');
-  };
-
   const shouldShowRegionReminder = !regionsLoading && !regionsError && currentRegionId === '';
   const shouldShowRegionError = Boolean(regionsError);
   const shouldShowConnectionBanner = !isConnected;
@@ -210,6 +212,7 @@ export const NewHome: React.FC = () => {
     <>
       <div className="home-page">
         <HomeHeader
+          activePage="play"
           currentUser={user}
           lobbyMembers={lobbyMembers}
           hasLobby={Boolean(currentLobby)}
@@ -217,7 +220,8 @@ export const NewHome: React.FC = () => {
           onInvite={handleInvite}
           onJoinGame={() => setShowJoinModal(true)}
           onLeaveLobby={handleLeaveLobby}
-          onLoginClick={handleLoginClick}
+          onAuthClick={onOpenAuth}
+          onOpenAccount={onOpenAccount}
           onLogout={logout}
         />
 

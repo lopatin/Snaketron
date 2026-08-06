@@ -22,10 +22,10 @@ test.describe('Custom Game Creation', () => {
     // Wait for WebSocket connection
     await wsMonitor.waitForConnection();
     
-    // The app should automatically send the JWT token from localStorage
-    // Wait for the token message to be sent
-    const tokenMessage = await wsMonitor.waitForMessage('Token', 'sent', 5000);
-    console.log('Token sent to server');
+    // The app should automatically send the JWT token and exact gameplay
+    // protocol version from localStorage during authentication.
+    const tokenMessage = await wsMonitor.waitForMessage('Authenticate', 'sent', 5000);
+    console.log('Authentication sent to server');
     
     // Initialize page objects
     const homePage = new HomePage(page);

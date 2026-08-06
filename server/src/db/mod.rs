@@ -60,6 +60,14 @@ pub trait Database: Send + Sync {
         mmr: i32,
         is_stress_test: bool,
     ) -> Result<User>;
+    /// Convert an existing public guest into a password-backed account while
+    /// preserving the guest's durable user ID and all ID-owned progress.
+    async fn upgrade_guest_to_account(
+        &self,
+        user_id: i32,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<User>;
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;

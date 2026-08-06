@@ -8,16 +8,16 @@
 //!
 //! Deliberately excluded from the hash:
 //! - `rng`: the client never spawns food, so its RNG state is not advanced.
-//! - `command_queue`: legitimately differs while a local command is in flight
-//!   (scheduled optimistically on the client, not yet confirmed by the server).
-//!   Divergence caused by lost/mis-scheduled commands still surfaces through
-//!   snake direction/body positions once the command executes.
+//! - speculative command-queue entries: these legitimately differ while a
+//!   local command is in flight. Confirmed authoritative player commands are
+//!   fingerprinted by server schedule and payload, so a lost/mis-scheduled
+//!   activation or turn is detected before it mutates geometry.
 //! - `event_sequence`: client and server count locally-generated events
 //!   differently by design.
 //! - `usernames`, `spectators`, `game_code`, `host_user_id`, `start_ms`:
 //!   cosmetic or static; not gameplay state.
 
-use crate::game_state::{GameState, GameStatus};
+use crate::game_state::{GameCommand, GameState, GameStatus};
 
 /// FNV-1a 64-bit, hand-rolled so both native and WASM builds hash identically
 /// with no dependencies. All multi-byte values are hashed little-endian.
@@ -114,6 +114,10 @@ impl GameState {
             h.write_u8(snake.is_alive as u8);
             h.write_u8(direction_tag(&snake.direction));
             h.write_u32(snake.food);
+            h.write_u16(snake.speed_milli);
+            h.write_u32(snake.movement_credit);
+            h.write_u32(snake.boost.charge_ms);
+            h.write_u8(snake.boost.active as u8);
             match snake.team_id {
                 Some(team) => {
                     h.write_u8(1);
@@ -125,6 +129,24 @@ impl GameState {
             for pos in &snake.body {
                 h.write_i16(pos.x);
                 h.write_i16(pos.y);
+            }
+        }
+
+        let mut boost_pads = self.arena.boost_pads.clone();
+        boost_pads.sort_unstable_by_key(|pad| pad.id);
+        h.write_u32(boost_pads.len() as u32);
+        for pad in boost_pads {
+            h.write_u8(pad.id);
+            h.write_i16(pad.position.x);
+            h.write_i16(pad.position.y);
+            h.write_u32(pad.charge_ms);
+            h.write_u8(pad.size_cells);
+            match pad.respawn_at_tick {
+                Some(tick) => {
+                    h.write_u8(1);
+                    h.write_u32(tick);
+                }
+                None => h.write_u8(0),
             }
         }
 
@@ -181,6 +203,18 @@ impl GameState {
             h.write_u32(amount);
         }
 
+        let mut action_counts: Vec<(u32, u32)> = self
+            .player_action_counts
+            .iter()
+            .map(|(user_id, count)| (*user_id, *count))
+            .collect();
+        action_counts.sort_unstable();
+        h.write_u32(action_counts.len() as u32);
+        for (user_id, count) in action_counts {
+            h.write_u32(user_id);
+            h.write_u32(count);
+        }
+
         h.write_u64(self.properties.available_food_target as u64);
         h.write_u32(self.properties.tick_duration_ms);
         match self.properties.time_limit_ms {
@@ -189,6 +223,51 @@ impl GameState {
                 h.write_u32(limit);
             }
             None => h.write_u8(0),
+        }
+        match &self.properties.boost {
+            Some(boost) => {
+                h.write_u8(1);
+                h.write_u16(boost.speed_milli);
+                h.write_u32(boost.capacity_ms);
+                h.write_u32(boost.packet_charge_ms);
+                h.write_u32(boost.pad_respawn_ms);
+                h.write_u16(boost.spot_layout_version);
+                h.write_u16(boost.rules_version);
+            }
+            None => h.write_u8(0),
+        }
+
+        let commands = self.command_queue.authoritative_commands();
+        h.write_u32(commands.len() as u32);
+        for command in commands {
+            let server_id = command
+                .command_id_server
+                .as_ref()
+                .expect("authoritative fingerprint command has a server ID");
+            h.write_u32(server_id.tick);
+            h.write_u32(server_id.user_id);
+            h.write_u32(server_id.sequence_number);
+            match command.command {
+                GameCommand::Turn {
+                    snake_id,
+                    direction,
+                } => {
+                    h.write_u8(0);
+                    h.write_u32(snake_id);
+                    h.write_u8(direction_tag(&direction));
+                }
+                GameCommand::ActivateBoost { snake_id } => {
+                    h.write_u8(1);
+                    h.write_u32(snake_id);
+                }
+                GameCommand::DeactivateBoost { snake_id } => {
+                    h.write_u8(2);
+                    h.write_u32(snake_id);
+                }
+                GameCommand::UpdateStatus { .. } => {
+                    unreachable!("system commands are excluded from the sync fingerprint")
+                }
+            }
         }
 
         h.finish()
@@ -206,12 +285,15 @@ fn direction_tag(direction: &crate::Direction) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{GameState, GameType, Position, QueueMode};
+    use crate::{
+        CommandId, Direction, GameCommand, GameCommandMessage, GameState, GameType, Position,
+        QueueMode,
+    };
 
     fn test_state() -> GameState {
         GameState::new(
-            20,
-            20,
+            60,
+            40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
             Some(42),
@@ -244,11 +326,50 @@ mod tests {
     }
 
     #[test]
-    fn hash_ignores_rng_and_command_queue() {
+    fn hash_ignores_rng_and_speculative_command_queue_entries() {
         let mut a = test_state();
-        let b = test_state();
+        let mut b = test_state();
         a.rng = None;
+        a.command_queue.push(GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 10,
+                user_id: 7,
+                sequence_number: 1,
+            },
+            command_id_server: None,
+            command: GameCommand::ActivateBoost { snake_id: 0 },
+        });
+        b.rng = Some(crate::util::PseudoRandom::new(99));
         assert_eq!(a.sync_hash(), b.sync_hash());
+    }
+
+    #[test]
+    fn hash_detects_authoritative_queued_boost_edges_and_turns() {
+        let baseline = test_state();
+        for command in [
+            GameCommand::ActivateBoost { snake_id: 0 },
+            GameCommand::DeactivateBoost { snake_id: 0 },
+            GameCommand::Turn {
+                snake_id: 0,
+                direction: Direction::Up,
+            },
+        ] {
+            let mut changed = baseline.clone();
+            changed.command_queue.push(GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: 10,
+                    user_id: 7,
+                    sequence_number: 3,
+                },
+                command_id_server: Some(CommandId {
+                    tick: 12,
+                    user_id: 7,
+                    sequence_number: 9,
+                }),
+                command,
+            });
+            assert_ne!(baseline.sync_hash(), changed.sync_hash());
+        }
     }
 
     #[test]
@@ -257,5 +378,63 @@ mod tests {
         let b = test_state();
         a.tick += 1;
         assert_ne!(a.sync_hash(), b.sync_hash());
+    }
+
+    #[test]
+    fn hash_detects_player_action_count_divergence() {
+        let baseline = test_state();
+        let mut changed = baseline.clone();
+        changed.player_action_counts.insert(7, 1);
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+    }
+
+    #[test]
+    fn hash_detects_every_snake_boost_field() {
+        let mut baseline = test_state();
+        baseline.add_player(1, None).unwrap();
+
+        for mutate in [
+            0_u8, // speed
+            1_u8, // movement credit
+            2_u8, // charge
+            3_u8, // active flag
+        ] {
+            let mut changed = baseline.clone();
+            let snake = &mut changed.arena.snakes[0];
+            match mutate {
+                0 => snake.speed_milli = 1_500,
+                1 => snake.movement_credit = 50_000,
+                2 => snake.boost.charge_ms = 1_000,
+                3 => snake.boost.active = true,
+                _ => unreachable!(),
+            }
+            assert_ne!(baseline.sync_hash(), changed.sync_hash());
+        }
+    }
+
+    #[test]
+    fn hash_detects_boost_configuration_and_every_pad_field() {
+        let baseline = test_state();
+
+        let mut config_changed = baseline.clone();
+        config_changed
+            .properties
+            .boost
+            .as_mut()
+            .expect("Boost config")
+            .speed_milli = 1_750;
+        assert_ne!(baseline.sync_hash(), config_changed.sync_hash());
+
+        let mut pad_changed = baseline.clone();
+        pad_changed.arena.boost_pads[0].respawn_at_tick = Some(123);
+        assert_ne!(baseline.sync_hash(), pad_changed.sync_hash());
+
+        let mut pad_changed = baseline.clone();
+        pad_changed.arena.boost_pads[0].charge_ms -= 50;
+        assert_ne!(baseline.sync_hash(), pad_changed.sync_hash());
+
+        let mut pad_changed = baseline.clone();
+        pad_changed.arena.boost_pads[0].size_cells = 1;
+        assert_ne!(baseline.sync_hash(), pad_changed.sync_hash());
     }
 }

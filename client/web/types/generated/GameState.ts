@@ -12,4 +12,12 @@ export type GameState = { tick: number, status: GameStatus, arena: Arena, recent
  * Server-attested synthetic game marker. Stress games exercise the full
  * runtime but must not produce player progression or leaderboard effects.
  */
-is_stress_test: boolean, properties: GameProperties, players: { [key in number]?: Player }, game_code: string | null, host_user_id: number | null, start_ms: number, event_sequence: number, usernames: { [key in number]?: string }, spectators: Array<number>, scores: { [key in number]?: number }, team_scores: Record<number, number> | null, player_xp: { [key in number]?: number }, };
+is_stress_test: boolean, properties: GameProperties, players: { [key in number]?: Player }, game_code: string | null, host_user_id: number | null, start_ms: number, event_sequence: number, usernames: { [key in number]?: string }, spectators: Array<number>, scores: { [key in number]?: number }, team_scores: Record<number, number> | null, player_xp: { [key in number]?: number },
+/**
+ * Authoritative accepted gameplay actions by user. An action is counted
+ * only when execution changes gameplay state: a legal turn or an
+ * inactive-to-active Boost start or active-to-inactive manual stop.
+ * Transport retries, rejected commands, and gameplay no-ops therefore
+ * never inflate this metric.
+ */
+player_action_counts: { [key in number]?: number }, };

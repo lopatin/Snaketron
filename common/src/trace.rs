@@ -198,8 +198,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let state = GameState::new(
-            10,
-            10,
+            60,
+            40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
             Some(7),

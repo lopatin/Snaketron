@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::{
-    DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS, GameState, GameType,
+    BoostConfig, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS, GameState,
+    GameType,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -1292,14 +1293,15 @@ async fn prepare_game_from_lobbies(
     };
 
     let rng_seed = Some(Utc::now().timestamp_millis() as u64 ^ (game_id as u64));
-    let mut game_state = GameState::new(
+    let mut game_state = build_match_game_state(
         width,
         height,
         game_type.clone(),
         queue_mode.clone(),
         rng_seed,
         start_ms,
-    );
+        matchmaking_manager.boost_config(),
+    )?;
     game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
     // Apply queue-mode-specific time limits for team games
@@ -1425,6 +1427,33 @@ async fn prepare_game_from_lobbies(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_match_game_state(
+    width: u16,
+    height: u16,
+    game_type: GameType,
+    queue_mode: common::QueueMode,
+    rng_seed: Option<u64>,
+    start_ms: i64,
+    boost_config: &BoostConfig,
+) -> Result<GameState> {
+    if matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+        GameState::new_with_boost_config(
+            width,
+            height,
+            game_type,
+            queue_mode,
+            rng_seed,
+            start_ms,
+            boost_config.clone(),
+        )
+    } else {
+        Ok(GameState::new(
+            width, height, game_type, queue_mode, rng_seed, start_ms,
+        ))
+    }
+}
+
 async fn create_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
     game_type: &GameType,
@@ -1538,6 +1567,43 @@ mod tests {
             expected_payload: serde_json::to_string(&record)?,
             record,
         })
+    }
+
+    #[test]
+    fn configured_fractional_boost_is_snapshotted_into_duel_and_two_v_two() -> Result<()> {
+        let boost_config = BoostConfig {
+            speed_milli: 1_750,
+            ..BoostConfig::default()
+        };
+
+        for per_team in [1, 2] {
+            for queue_mode in [QueueMode::Quickmatch, QueueMode::Competitive] {
+                let mut state = build_match_game_state(
+                    60,
+                    40,
+                    GameType::TeamMatch { per_team },
+                    queue_mode,
+                    Some(7),
+                    123,
+                    &boost_config,
+                )?;
+                for user_id in 1..=u32::from(per_team) * 2 {
+                    state.add_player(user_id, None)?;
+                }
+
+                assert_eq!(state.properties.boost.as_ref(), Some(&boost_config));
+                assert_eq!(state.properties.boost.as_ref().unwrap().speed_milli, 1_750);
+                assert!(
+                    state
+                        .arena
+                        .snakes
+                        .iter()
+                        .all(|snake| snake.speed_milli() == 1_000)
+                );
+                state.validate_boost_invariants()?;
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

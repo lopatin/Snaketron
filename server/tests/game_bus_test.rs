@@ -1155,6 +1155,7 @@ async fn replyable_rejection_is_durable_before_command_ack() -> Result<()> {
             event: GameEvent::CommandRejected {
                 command_id: command_id.clone(),
                 reason: reason.into(),
+                command_id_client: None,
                 session_rejected_from: None,
             },
         };

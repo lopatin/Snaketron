@@ -59,7 +59,7 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
               onClick={onLoginClick}
               className="text-sm text-black-70 font-bold uppercase hover:opacity-70 transition-opacity"
             >
-              LOGIN
+              SIGN IN
             </button>
           )}
         </div>

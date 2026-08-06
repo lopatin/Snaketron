@@ -48,6 +48,10 @@ Required environment variables:
 - `SNAKETRON_GRPC_PORT`: gRPC port (default: 50051)
 - `SNAKETRON_REGION`: Server region identifier
 
+Optional gameplay balance:
+
+- `SNAKETRON_BOOST_SPEED_MULTIPLIER`: Boosted snake speed for newly created duel and 2v2 matches. Accepts `1.000` through `2.000` with up to three decimal places; defaults to `1.500`. The server validates it at startup and snapshots the resolved value into each match.
+
 Completed game retention:
 
 - `SNAKETRON_COMPLETED_GAME_RETENTION_DAYS`: Number of days to retain final game snapshots in DynamoDB (default: `30`)

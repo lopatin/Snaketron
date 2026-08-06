@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use server::api::jwt::{JwtManager, ProductionJwtVerifier};
 use server::db::{Database, dynamodb::DynamoDatabase};
-use server::game_server::{GameServer, GameServerConfig};
+use server::game_server::{
+    BOOST_SPEED_MULTIPLIER_ENV, GameServer, GameServerConfig, resolve_boost_config,
+};
 use server::ws_server::TestJwtVerifier;
 use std::env;
 use std::sync::Arc;
@@ -106,6 +108,15 @@ async fn main() -> Result<()> {
     // gRPC is currently not used, but the config expects it
     let grpc_addr = String::new();
 
+    let configured_boost_multiplier = env::var(BOOST_SPEED_MULTIPLIER_ENV).ok();
+    let boost_config = resolve_boost_config(configured_boost_multiplier.as_deref())
+        .with_context(|| format!("Invalid {BOOST_SPEED_MULTIPLIER_ENV}"))?;
+    info!(
+        speed_milli = boost_config.speed_milli,
+        multiplier = boost_config.speed_milli as f64 / 1000.0,
+        "Resolved Boost balance for new duel and 2v2 matches"
+    );
+
     // Create server configuration
     let config = GameServerConfig {
         db: db.clone(),
@@ -118,6 +129,7 @@ async fn main() -> Result<()> {
         jwt_verifier,
         replay_dir,
         redis_url: redis_url.clone(),
+        boost_config,
     };
 
     let mut game_server = GameServer::start(config).await?;

@@ -23,9 +23,12 @@ impl GameObjectRenderer for StandardRenderer {
         _direction: Option<Direction>,
         is_head: bool,
         player_id: u32,
+        boost_active: bool,
     ) -> CharPattern {
-        // Use solid blocks for all snakes, vary only the color
-        let chars = vec![vec!['█'; self.char_dims.horizontal]; self.char_dims.vertical];
+        // A boosted snake uses a visibly different texture in addition to a
+        // style modifier, so monochrome terminals still communicate state.
+        let glyph = if boost_active { '▓' } else { '█' };
+        let chars = vec![vec![glyph; self.char_dims.horizontal]; self.char_dims.vertical];
 
         // Select base color for the player
         let color = match player_id % 4 {
@@ -59,7 +62,14 @@ impl GameObjectRenderer for StandardRenderer {
             } // Light Yellow → Yellow
         };
 
-        let style = Style::default().fg(color);
+        let style = if boost_active {
+            Style::default()
+                .fg(color)
+                .bg(Color::DarkGray)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
         CharPattern::new_with_style(chars, style)
     }
 
@@ -89,7 +99,36 @@ impl GameObjectRenderer for StandardRenderer {
         CharPattern::new_with_style(chars, style)
     }
 
+    fn render_boost_pad(&self) -> CharPattern {
+        // A filled, slanted canister silhouette is the terminal counterpart to
+        // the blue NOS bottle used by the browser canvas. ArenaRenderer repeats
+        // it over the authoritative footprint, so a full 2x2 pad remains four
+        // times the area of a quarter 1x1 packet without retaining the legacy
+        // pickup symbol in the alternate renderer.
+        let glyph = '▰';
+        let chars = vec![vec![glyph; self.char_dims.horizontal]; self.char_dims.vertical];
+        let style = Style::default().fg(Color::LightBlue);
+        CharPattern::new_with_style(chars, style)
+    }
+
     fn render_empty(&self) -> CharPattern {
         CharPattern::empty(self.char_dims)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boost_visuals_use_distinct_non_color_glyphs() {
+        let renderer = StandardRenderer::new(CharDimensions::new(1, 1));
+        let ordinary = renderer.render_snake_segment(None, false, 0, false);
+        let boosted = renderer.render_snake_segment(None, false, 0, true);
+        let available = renderer.render_boost_pad();
+
+        assert_ne!(ordinary.chars, boosted.chars);
+        assert_eq!(available.chars, vec![vec!['▰']]);
+        assert_eq!(available.styles[0][0].fg, Some(Color::LightBlue));
     }
 }

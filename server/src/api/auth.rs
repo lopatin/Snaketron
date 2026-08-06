@@ -7,10 +7,11 @@ use axum::{
 use bcrypt::{DEFAULT_COST, hash, verify};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::user_cache::UserCache;
 
 use super::jwt::JwtManager;
 use super::middleware::AuthUser;
@@ -19,6 +20,7 @@ use super::middleware::AuthUser;
 pub struct AuthState {
     pub db: Arc<dyn Database>,
     pub jwt_manager: Arc<JwtManager>,
+    pub user_cache: Option<UserCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,12 +106,32 @@ impl IntoResponse for AppError {
             msg if msg.contains("Username already exists") => {
                 (StatusCode::CONFLICT, "Username already exists")
             }
+            msg if msg.contains("Account is already registered") => {
+                (StatusCode::CONFLICT, "Account is already registered")
+            }
             msg if msg.contains("Invalid username or password") => {
                 (StatusCode::UNAUTHORIZED, "Invalid username or password")
             }
+            msg if msg.contains("Invalid or expired guest session")
+                || msg.contains("Guest account not found")
+                || msg.contains("Guest account has already been upgraded") =>
+            {
+                (StatusCode::UNAUTHORIZED, "Invalid or expired guest session")
+            }
+            msg if msg.contains("Stress-test guest accounts cannot be upgraded") => (
+                StatusCode::FORBIDDEN,
+                "Stress-test guest accounts cannot be upgraded",
+            ),
             msg if msg.contains("Invalid stress test key") => {
                 (StatusCode::UNAUTHORIZED, "Invalid stress test key")
             }
+            msg if msg.contains("Invalid username") => {
+                (StatusCode::BAD_REQUEST, "Invalid username")
+            }
+            msg if msg.contains("Password must be at least 6 characters") => (
+                StatusCode::BAD_REQUEST,
+                "Password must be at least 6 characters",
+            ),
             msg if msg.contains("User not found") => (StatusCode::NOT_FOUND, "User not found"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
@@ -167,6 +189,7 @@ pub fn validate_username(username: &str) -> Vec<String> {
 
 pub async fn register(
     State(state): State<AuthState>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Response, AppError> {
     // Validate username format
@@ -179,20 +202,104 @@ pub async fn register(
         return Err(anyhow::anyhow!("Password must be at least 6 characters").into());
     }
 
-    // Check if username already exists
-    let existing_user = state.db.get_user_by_username(&req.username).await?;
-    if existing_user.is_some() {
-        return Err(anyhow::anyhow!("Username already exists").into());
+    // Registration is also the guest-upgrade endpoint. The browser already
+    // sends its current bearer token; fail closed when a presented token is
+    // malformed or stale so an upgrade can never silently create a second ID.
+    let guest_claims = match headers.get(header::AUTHORIZATION) {
+        None => None,
+        Some(value) => {
+            let value = value
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("Invalid or expired guest session"))?;
+            let token = value
+                .strip_prefix("Bearer ")
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Invalid or expired guest session"))?;
+            let claims = state
+                .jwt_manager
+                .verify_token(token)
+                .map_err(|_| anyhow::anyhow!("Invalid or expired guest session"))?;
+            Some(claims)
+        }
+    };
+
+    let upgraded_guest_id = guest_claims
+        .as_ref()
+        .map(|claims| {
+            if !claims.is_guest {
+                return Err(anyhow::anyhow!("Account is already registered"));
+            }
+            if claims.matchmaking_pool != MatchmakingPool::Public {
+                return Err(anyhow::anyhow!(
+                    "Stress-test guest accounts cannot be upgraded"
+                ));
+            }
+            claims
+                .sub
+                .parse::<i32>()
+                .map_err(|_| anyhow::anyhow!("Invalid or expired guest session"))
+        })
+        .transpose()?;
+
+    let user = if let Some(guest_id) = upgraded_guest_id {
+        let current = state
+            .db
+            .get_user_by_id(guest_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Guest account not found"))?;
+
+        if current.is_stress_test {
+            return Err(anyhow::anyhow!("Stress-test guest accounts cannot be upgraded").into());
+        }
+
+        if !current.is_guest {
+            // If DynamoDB committed but the prior HTTP response was lost, the
+            // browser still holds its old guest token. Allow an exact retry
+            // only when the submitted credentials already authenticate the
+            // converted account.
+            let is_exact_retry = current.username == req.username
+                && verify(&req.password, &current.password_hash)
+                    .context("Failed to verify upgraded account password")?;
+            if !is_exact_retry {
+                return Err(anyhow::anyhow!("Guest account has already been upgraded").into());
+            }
+            current
+        } else {
+            let password_hash =
+                hash(&req.password, DEFAULT_COST).context("Failed to hash password")?;
+            state
+                .db
+                .upgrade_guest_to_account(guest_id, &req.username, &password_hash)
+                .await?
+        }
+    } else {
+        // Signed-out registration retains the original new-account behavior.
+        if state
+            .db
+            .get_user_by_username(&req.username)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow::anyhow!("Username already exists").into());
+        }
+        let password_hash = hash(&req.password, DEFAULT_COST).context("Failed to hash password")?;
+        state
+            .db
+            .create_user(&req.username, &password_hash, 1000)
+            .await?
+    };
+
+    if upgraded_guest_id.is_some()
+        && let Some(user_cache) = &state.user_cache
+        && let Err(cache_error) = user_cache.replace_after_guest_upgrade(&user).await
+    {
+        // The durable conversion already committed. A cache outage must not
+        // turn that success into an apparent failure that encourages retries.
+        warn!(
+            "Failed to replace user cache after upgrading guest {}: {}",
+            user.id, cache_error
+        );
     }
-
-    // Hash password
-    let password_hash = hash(&req.password, DEFAULT_COST).context("Failed to hash password")?;
-
-    // Create user
-    let user = state
-        .db
-        .create_user(&req.username, &password_hash, 1000)
-        .await?;
 
     let user_info = UserInfo {
         id: user.id,
@@ -285,11 +392,15 @@ pub async fn get_current_user(
         .await?
         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
+    if user.is_guest != auth_user.is_guest {
+        return Err(anyhow::anyhow!("Invalid or expired guest session").into());
+    }
+
     let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
-        is_guest: auth_user.is_guest,
+        is_guest: user.is_guest,
     };
 
     // Build response with cache-control headers to prevent caching

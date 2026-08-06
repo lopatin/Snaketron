@@ -11,8 +11,8 @@ use crate::recovery::{
 };
 use anyhow::{Context, Result, bail};
 use common::{
-    ClientCommandIdentityV2, GameCommandMessage, GameEngine, GameEvent, GameEventMessage,
-    GameStatus,
+    ClientCommandIdentityV2, CommandId, EXECUTOR_POLL_INTERVAL_MS, GameCommand, GameCommandMessage,
+    GameEngine, GameEvent, GameEventMessage, GameStatus,
 };
 use futures_util::FutureExt;
 use std::collections::{HashMap, VecDeque};
@@ -37,10 +37,22 @@ const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const COMPLETION_MATERIALIZATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const TICK_HASH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep cross-game work concurrent without turning one large XREADGROUP reply
 // into an unbounded handoff obligation. Accepted deliveries are still ordered
 // and settled in per-game stream order by each game's FIFO mailbox.
 const DISPATCH_FANOUT_WINDOW: usize = 64;
+
+/// Activation metrics intentionally describe only inactive-to-active requests.
+/// A manual stop is an independent command and must not inflate activation
+/// attempts or activation scheduling decisions.
+fn boost_activation_snake_id(command: &GameCommand) -> Option<u32> {
+    match command {
+        GameCommand::ActivateBoost { snake_id } => Some(*snake_id),
+        GameCommand::DeactivateBoost { .. } => None,
+        _ => None,
+    }
+}
 
 fn is_retryable_checkpoint_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -521,6 +533,7 @@ struct GameActor {
     pending_completion: Option<CompletionRecordV1>,
     completion_materialization_retry_at: Option<Instant>,
     last_checkpoint_success: Instant,
+    next_tick_hash_at: Instant,
     bus: Arc<GameBus>,
     guard: PartitionLeaseGuard,
     db: Arc<dyn Database>,
@@ -641,6 +654,7 @@ impl GameActor {
             pending_completion: None,
             completion_materialization_retry_at: None,
             last_checkpoint_success,
+            next_tick_hash_at: now + TICK_HASH_INTERVAL,
             bus,
             guard,
             db,
@@ -652,7 +666,7 @@ impl GameActor {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        let mut tick = tokio::time::interval(Duration::from_millis(EXECUTOR_POLL_INTERVAL_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut checkpoint = tokio::time::interval(self.config.checkpoint_interval);
         checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -902,6 +916,8 @@ impl GameActor {
         command: GameCommandMessage,
         decision: Option<&CommandDecisionV1>,
     ) -> Result<V2Incorporation> {
+        let submitted_command_id = command.command_id_client.clone();
+        let activation_snake_id = boost_activation_snake_id(&command.command);
         if let Some(decision) = decision {
             return self.incorporate_recorded_decision(&identity, decision);
         }
@@ -919,6 +935,7 @@ impl GameActor {
             crate::resilience_metrics::record_command_resends(1);
             let outcome = CommandOutcome::Rejected {
                 reason: fence.reason,
+                command_id_client: Some(submitted_command_id.clone()),
             };
             if self.live {
                 self.publish_outcome(
@@ -948,6 +965,7 @@ impl GameActor {
             )?;
             let outcome = CommandOutcome::Rejected {
                 reason: fence.reason,
+                command_id_client: Some(submitted_command_id.clone()),
             };
             crate::resilience_metrics::record_command_rejections(1);
             if self.live {
@@ -969,6 +987,13 @@ impl GameActor {
             return Ok(V2Incorporation::Quarantine(error.to_string()));
         }
 
+        if let Some(snake_id) = activation_snake_id {
+            crate::resilience_metrics::record_boost_activation_attempt(
+                self.engine.get_committed_state(),
+                snake_id,
+            );
+        }
+
         let outcome = match authorize_game_command(
             self.engine.get_committed_state(),
             identity.user_id,
@@ -978,14 +1003,23 @@ impl GameActor {
                 Ok(command) => CommandOutcome::Scheduled { command },
                 Err(error) => CommandOutcome::Rejected {
                     reason: error.to_string(),
+                    command_id_client: Some(submitted_command_id.clone()),
                 },
             },
             Err(reason) => CommandOutcome::Rejected {
                 reason: reason.to_string(),
+                command_id_client: Some(submitted_command_id),
             },
         };
-        if matches!(outcome, CommandOutcome::Rejected { .. }) {
+        if matches!(&outcome, CommandOutcome::Rejected { .. }) {
             crate::resilience_metrics::record_command_rejections(1);
+        }
+        if let Some(snake_id) = activation_snake_id {
+            crate::resilience_metrics::record_boost_activation_decision(
+                self.engine.get_committed_state(),
+                snake_id,
+                matches!(&outcome, CommandOutcome::Scheduled { .. }),
+            );
         }
         self.resolved.record(
             &identity,
@@ -1027,11 +1061,7 @@ impl GameActor {
         };
 
         if let Some((from_sequence, reason)) = rejection_fence {
-            if outcome
-                != (CommandOutcome::Rejected {
-                    reason: reason.to_owned(),
-                })
-            {
+            if outcome.rejection_reason() != Some(reason) {
                 bail!("command-session rejection fence has a non-rejection outcome");
             }
             self.resolved
@@ -1043,11 +1073,7 @@ impl GameActor {
                 bail!("durable command decision conflicts with checkpointed outcome");
             }
         } else if let Some(fence) = self.resolved.rejection_fence_for(identity) {
-            if outcome
-                != (CommandOutcome::Rejected {
-                    reason: fence.reason.clone(),
-                })
-            {
+            if outcome.rejection_reason() != Some(fence.reason.as_str()) {
                 bail!("durable command decision conflicts with session rejection fence");
             }
         } else if !self.resolved.is_terminally_resolved(identity) {
@@ -1093,9 +1119,13 @@ impl GameActor {
                     deduplicated_replay,
                 }
             }
-            CommandOutcome::Rejected { reason } => GameEvent::CommandRejected {
+            CommandOutcome::Rejected {
+                reason,
+                command_id_client,
+            } => GameEvent::CommandRejected {
                 command_id: identity.clone(),
                 reason: reason.clone(),
+                command_id_client: command_id_client.clone(),
                 session_rejected_from,
             },
         };
@@ -1124,7 +1154,7 @@ impl GameActor {
         Ok(())
     }
 
-    async fn publish_event(&mut self, event: GameEvent) -> Result<()> {
+    async fn publish_event_at(&mut self, tick: u32, sequence: u64, event: GameEvent) -> Result<()> {
         // Once the engine is terminal, even an unrelated event stamped with
         // the terminal tick can make replicas derive Complete while catching
         // up. The fenced completion transaction bypasses this helper and is
@@ -1132,17 +1162,53 @@ impl GameActor {
         if self.engine.get_committed_state().is_complete() {
             return Ok(());
         }
-        self.next_event_stream_sequence += 1;
-        let state = self.engine.get_committed_state();
+        self.next_event_stream_sequence = self
+            .next_event_stream_sequence
+            .checked_add(1)
+            .context("game event stream sequence overflow")?;
         let message = GameEventMessage {
             game_id: self.game_id,
-            tick: state.tick,
-            sequence: state.event_sequence,
+            tick,
+            sequence,
             stream_seq: self.next_event_stream_sequence,
             user_id: None,
             event,
         };
         self.bus.publish_event_fenced(&self.guard, &message).await?;
+        if let GameEvent::BoostPacketCollected {
+            pad_id, snake_id, ..
+        } = &message.event
+        {
+            crate::resilience_metrics::record_boost_packet_collected(
+                self.engine.get_committed_state(),
+                *snake_id,
+                *pad_id,
+            );
+        }
+        Ok(())
+    }
+
+    async fn publish_event(&mut self, event: GameEvent) -> Result<()> {
+        let state = self.engine.get_committed_state();
+        self.publish_event_at(state.tick, state.event_sequence, event)
+            .await
+    }
+
+    async fn publish_tick_hash_if_due(&mut self, now: Instant, server_ts_ms: i64) -> Result<()> {
+        if now < self.next_tick_hash_at {
+            return Ok(());
+        }
+
+        let state = self.engine.get_committed_state();
+        let tick = state.tick;
+        let sequence = state.event_sequence;
+        let hash = state.sync_hash();
+        self.publish_event_at(tick, sequence, GameEvent::TickHash { hash, server_ts_ms })
+            .await?;
+
+        // A delayed actor emits one fresh heartbeat and resumes the ordinary
+        // wall-clock cadence. It must not burst one probe per missed second.
+        self.next_tick_hash_at = now + TICK_HASH_INTERVAL;
         Ok(())
     }
 
@@ -1317,9 +1383,48 @@ impl GameActor {
     }
 
     async fn advance_live(&mut self) -> Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let before_tick = self.engine.get_committed_state().tick;
+        let scheduler_lag_ms = self.engine.authoritative_scheduler_lag_ms(now_ms);
+        let cooling_pads = self
+            .engine
+            .get_committed_state()
+            .arena
+            .boost_pads
+            .iter()
+            .filter_map(|pad| pad.respawn_at_tick.map(|tick| (pad.id, tick)))
+            .collect::<Vec<_>>();
+        let mut boost_transitions = Vec::new();
+        let advance_started = Instant::now();
         let events = self
             .engine
-            .run_until(chrono::Utc::now().timestamp_millis())?;
+            .run_until_observing_boost(now_ms, &mut |transition| {
+                boost_transitions.push(transition);
+            })?;
+        let advance_duration = advance_started.elapsed();
+        let advanced_state = self.engine.get_committed_state();
+        let batch_quanta = advanced_state.tick.saturating_sub(before_tick);
+        // The actor polls more frequently than a simulation quantum. Recording
+        // only passes that actually advanced state avoids fivefold zero-work
+        // metric amplification at the 10 ms poll cadence.
+        if batch_quanta > 0 {
+            crate::resilience_metrics::record_game_actor_advance(
+                batch_quanta,
+                scheduler_lag_ms,
+                advance_duration,
+            );
+            for (pad_id, respawn_at_tick) in cooling_pads {
+                if respawn_at_tick <= advanced_state.tick {
+                    crate::resilience_metrics::record_boost_pad_respawned(advanced_state, pad_id);
+                }
+            }
+        }
+        for transition in boost_transitions {
+            crate::resilience_metrics::record_boost_lifecycle_transition(
+                advanced_state,
+                transition,
+            );
+        }
         if self.terminal_pending() {
             // A replica fast-forwarding to any event from the terminal tick can
             // derive Complete even if the explicit status event is withheld.
@@ -1328,10 +1433,12 @@ impl GameActor {
             self.commit_completion_until_handoff().await?;
             return Ok(());
         }
-        for (_, _, event) in events {
-            self.publish_event(event).await?;
+        for (event_tick, event_sequence, event) in events {
+            self.publish_event_at(event_tick, event_sequence, event)
+                .await?;
         }
-        Ok(())
+        self.publish_tick_hash_if_due(Instant::now(), chrono::Utc::now().timestamp_millis())
+            .await
     }
 
     async fn commit_completion(&mut self) -> Result<()> {
@@ -1939,14 +2046,15 @@ async fn reject_or_quarantine_delivery(
     bus: &GameBus,
     guard: &PartitionLeaseGuard,
     stream_id: &str,
-    command_id: Option<&ClientCommandIdentityV2>,
+    command: Option<&ReplyableCommand>,
     reason: &str,
 ) -> Result<()> {
-    let Some(command_id) = command_id else {
+    let Some(command) = command else {
         return bus
             .quarantine_and_ack_fenced(guard, stream_id, &[], reason)
             .await;
     };
+    let command_id = &command.identity;
     crate::resilience_metrics::record_command_rejections(1);
     let rejection = GameEventMessage {
         game_id: command_id.game_id,
@@ -1960,6 +2068,7 @@ async fn reject_or_quarantine_delivery(
         event: GameEvent::CommandRejected {
             command_id: command_id.clone(),
             reason: reason.to_string(),
+            command_id_client: Some(command.command_id_client.clone()),
             session_rejected_from: None,
         },
     };
@@ -1980,8 +2089,14 @@ fn attach_command_decisions(
 struct PendingDispatchDelivery {
     game_id: u32,
     stream_id: String,
-    replyable_command_id: Option<ClientCommandIdentityV2>,
+    replyable_command: Option<ReplyableCommand>,
     actor_reply: PendingActorReply,
+}
+
+#[derive(Clone)]
+struct ReplyableCommand {
+    identity: ClientCommandIdentityV2,
+    command_id_client: CommandId,
 }
 
 fn pending_delivery_position_for_game(
@@ -2079,7 +2194,7 @@ fn advance_cursor_monotonically(
 async fn apply_delivery_disposition(
     game_id: u32,
     stream_id: String,
-    replyable_command_id: Option<&ClientCommandIdentityV2>,
+    replyable_command: Option<&ReplyableCommand>,
     disposition: Option<DeliveryDisposition>,
     bus: &GameBus,
     guard: &PartitionLeaseGuard,
@@ -2093,7 +2208,7 @@ async fn apply_delivery_disposition(
             bus,
             guard,
             &stream_id,
-            replyable_command_id,
+            replyable_command,
             "command targets a game whose authoritative actor has completed",
         )
         .await;
@@ -2103,8 +2218,7 @@ async fn apply_delivery_disposition(
             advance_cursor_monotonically(cursors, game_id, stream_id)
         }
         DeliveryDisposition::Quarantine { reason } => {
-            reject_or_quarantine_delivery(bus, guard, &stream_id, replyable_command_id, &reason)
-                .await
+            reject_or_quarantine_delivery(bus, guard, &stream_id, replyable_command, &reason).await
         }
     }
 }
@@ -2199,7 +2313,7 @@ async fn settle_pending_dispatch_delivery_at(
     if let Err(error) = apply_delivery_disposition(
         pending_delivery.game_id,
         pending_delivery.stream_id,
-        pending_delivery.replyable_command_id.as_ref(),
+        pending_delivery.replyable_command.as_ref(),
         disposition,
         bus,
         guard,
@@ -2328,11 +2442,15 @@ async fn dispatch_batch(
                 continue;
             }
         }
-        let replyable_command_id = match &delivery.payload {
+        let replyable_command = match &delivery.payload {
             CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
                 command_id,
+                command,
                 ..
-            }) => Some(command_id.clone()),
+            }) => Some(ReplyableCommand {
+                identity: command_id.clone(),
+                command_id_client: command.command_id_client.clone(),
+            }),
             _ => None,
         };
         let duplicate = match cursors.get(&game_id) {
@@ -2398,7 +2516,7 @@ async fn dispatch_batch(
                     let disposition = apply_delivery_disposition(
                         game_id,
                         stream_id,
-                        replyable_command_id.as_ref(),
+                        replyable_command.as_ref(),
                         None,
                         bus,
                         guard,
@@ -2412,7 +2530,7 @@ async fn dispatch_batch(
             pending.push_back(PendingDispatchDelivery {
                 game_id,
                 stream_id,
-                replyable_command_id,
+                replyable_command,
                 actor_reply,
             });
             if pending.len() >= DISPATCH_FANOUT_WINDOW {
@@ -2431,7 +2549,7 @@ async fn dispatch_batch(
                     bus,
                     guard,
                     &stream_id,
-                    replyable_command_id.as_ref(),
+                    replyable_command.as_ref(),
                     "command targets an inactive game without GameCreated",
                 )
                 .await;
@@ -2478,7 +2596,7 @@ async fn dispatch_batch(
         let apply = apply_delivery_disposition(
             game_id,
             stream_id,
-            replyable_command_id.as_ref(),
+            replyable_command.as_ref(),
             disposition,
             bus,
             guard,
@@ -2809,6 +2927,18 @@ mod tests {
     use crate::replication::{GameStateReader, ReplicationManager};
     use common::{CommandId, Direction, GameCommand, GameState, GameType, Position, QueueMode};
     use redis::AsyncCommands;
+
+    #[test]
+    fn manual_stop_is_not_classified_as_a_boost_activation() {
+        assert_eq!(
+            boost_activation_snake_id(&GameCommand::ActivateBoost { snake_id: 7 }),
+            Some(7)
+        );
+        assert_eq!(
+            boost_activation_snake_id(&GameCommand::DeactivateBoost { snake_id: 7 }),
+            None
+        );
+    }
 
     #[test]
     fn lease_watchdog_retries_one_transient_probe_and_keeps_an_expiry_margin() {
@@ -3299,7 +3429,7 @@ mod tests {
                 PendingDispatchDelivery {
                     game_id: unrelated_game,
                     stream_id: "1-0".to_string(),
-                    replyable_command_id: None,
+                    replyable_command: None,
                     actor_reply: PendingActorReply {
                         reply: blocked_reply,
                         terminally_completed: Arc::new(AtomicBool::new(false)),
@@ -3308,7 +3438,7 @@ mod tests {
                 PendingDispatchDelivery {
                     game_id: repeated_game,
                     stream_id: "2-0".to_string(),
-                    replyable_command_id: None,
+                    replyable_command: None,
                     actor_reply: PendingActorReply {
                         reply: ready_reply,
                         terminally_completed: Arc::new(AtomicBool::new(false)),
@@ -3697,7 +3827,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingDispatchDelivery {
             game_id: 27,
             stream_id: "2-0".to_string(),
-            replyable_command_id: None,
+            replyable_command: None,
             actor_reply: PendingActorReply {
                 reply: failed_reply,
                 terminally_completed: Arc::new(AtomicBool::new(false)),
@@ -3730,7 +3860,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingDispatchDelivery {
             game_id: 27,
             stream_id: "2-0".to_string(),
-            replyable_command_id: None,
+            replyable_command: None,
             actor_reply: PendingActorReply {
                 reply,
                 terminally_completed: Arc::new(AtomicBool::new(false)),
@@ -3840,7 +3970,7 @@ mod tests {
         let pending = VecDeque::from([PendingDispatchDelivery {
             game_id: 17,
             stream_id: "1-0".to_string(),
-            replyable_command_id: None,
+            replyable_command: None,
             actor_reply: PendingActorReply {
                 reply,
                 terminally_completed: Arc::new(AtomicBool::new(false)),
@@ -4352,6 +4482,11 @@ mod tests {
             mmr: i32,
             is_stress_test: bool
         ) -> User);
+        unused_database_method!(upgrade_guest_to_account(
+            user_id: i32,
+            username: &str,
+            password_hash: &str
+        ) -> User);
         unused_database_method!(get_user_by_id(user_id: i32) -> Option<User>);
         unused_database_method!(get_user_by_username(username: &str) -> Option<User>);
         unused_database_method!(update_user_mmr(user_id: i32, mmr: i32) -> ());
@@ -4765,6 +4900,168 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn catch_up_publishes_distinct_quantum_events_with_consistent_snapshot_tick() -> Result<()>
+    {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("origin-event-metadata").await?;
+            let mut envelope = harness.recovery().await?;
+            let start_ms = chrono::Utc::now().timestamp_millis() - 1_000;
+            let mut state = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 2 },
+                QueueMode::Competitive,
+                Some(7),
+                start_ms,
+            );
+            for user_id in 77..=80 {
+                state.add_player(user_id, Some(format!("player-{user_id}")))?;
+            }
+            state.status = GameStatus::Started { server_id: 1 };
+            state.properties.available_food_target = 0;
+            state.arena.food.clear();
+
+            // Tick 1: snake 1 is stationary on a packet and collects it.
+            let packet = state.arena.boost_pads[0].clone();
+            state.arena.snakes[1].body = vec![
+                packet.position,
+                Position {
+                    x: packet.position.x + 3,
+                    y: packet.position.y,
+                },
+            ];
+            state.arena.snakes[1].direction = Direction::Left;
+
+            // Tick 2: snake 0 crosses its own goal carrying one point, while
+            // snake 2 independently hits the top boundary. Both transitions
+            // include a death/respawn pair, giving catch-up multiple real
+            // engine events across distinct simulation quanta.
+            state.arena.snakes[0].body = vec![Position { x: 10, y: 20 }, Position { x: 13, y: 20 }];
+            state.arena.snakes[0].direction = Direction::Left;
+            state.arena.snakes[0].food = 2;
+            state.arena.snakes[2].body = vec![Position { x: 30, y: 0 }, Position { x: 30, y: 3 }];
+            state.arena.snakes[2].direction = Direction::Up;
+            state.arena.snakes[3].body = vec![Position { x: 40, y: 30 }, Position { x: 37, y: 30 }];
+            state.arena.snakes[3].direction = Direction::Right;
+            state.validate_boost_invariants()?;
+            envelope.game_state = state;
+            let mut actor = harness.actor(envelope, harness.guard.clone());
+
+            actor.advance_live().await?;
+            let final_tick = actor.engine.current_tick();
+            assert!(
+                final_tick > 1,
+                "test must execute a multi-tick catch-up batch"
+            );
+
+            let published = read_game_events(&mut harness.raw, harness.partition).await?;
+            let first_engine_snapshot = published
+                .iter()
+                .find(|message| matches!(&message.event, GameEvent::Snapshot { .. }))
+                .context("catch-up batch did not publish its initial engine snapshot")?;
+            assert_eq!(first_engine_snapshot.tick, 0);
+            assert_eq!(first_engine_snapshot.sequence, 1);
+            let GameEvent::Snapshot { game_state } = &first_engine_snapshot.event else {
+                unreachable!();
+            };
+            assert_eq!(game_state.tick, first_engine_snapshot.tick);
+            assert_ne!(
+                first_engine_snapshot.tick, final_tick,
+                "catch-up event was incorrectly stamped with the batch's final tick"
+            );
+
+            assert!(published.iter().any(|message| {
+                message.tick == 1
+                    && matches!(
+                        &message.event,
+                        GameEvent::BoostPacketCollected {
+                            snake_id: 1,
+                            pad_id,
+                            ..
+                        } if *pad_id == packet.id
+                    )
+            }));
+            for snake_id in [0, 2] {
+                assert!(published.iter().any(|message| {
+                    message.tick == 2
+                        && matches!(
+                            &message.event,
+                            GameEvent::SnakeDied { snake_id: observed } if *observed == snake_id
+                        )
+                }));
+                assert!(published.iter().any(|message| {
+                    message.tick == 2
+                        && matches!(
+                            &message.event,
+                            GameEvent::SnakeRespawned { snake_id: observed, .. }
+                                if *observed == snake_id
+                        )
+                }));
+            }
+            assert!(published.iter().any(|message| {
+                message.tick == 2
+                    && matches!(
+                        &message.event,
+                        GameEvent::TeamScoreUpdated { team_id, score }
+                            if team_id.0 == 0 && *score == 1
+                    )
+            }));
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tick_hash_uses_a_wall_clock_deadline_and_does_not_burst() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("wall-clock-tick-hash").await?;
+            let mut envelope = harness.recovery().await?;
+            envelope.game_state.start_ms = chrono::Utc::now().timestamp_millis() + 60_000;
+            let mut actor = harness.actor(envelope, harness.guard.clone());
+
+            actor.next_tick_hash_at = Instant::now();
+            actor.advance_live().await?;
+            actor.advance_live().await?;
+
+            let first_batch = read_game_events(&mut harness.raw, harness.partition).await?;
+            let probes: Vec<_> = first_batch
+                .iter()
+                .filter(|message| matches!(&message.event, GameEvent::TickHash { .. }))
+                .collect();
+            assert_eq!(probes.len(), 1, "heartbeat deadline emitted a burst");
+            assert_eq!(probes[0].tick, 0);
+            assert_eq!(probes[0].sequence, 0);
+            assert!(matches!(
+                &probes[0].event,
+                GameEvent::TickHash { hash, .. }
+                    if *hash == actor.engine.get_committed_state().sync_hash()
+            ));
+
+            actor.next_tick_hash_at = Instant::now() - Duration::from_secs(5);
+            actor.advance_live().await?;
+            let second_batch = read_game_events(&mut harness.raw, harness.partition).await?;
+            assert_eq!(
+                second_batch
+                    .iter()
+                    .filter(|message| matches!(&message.event, GameEvent::TickHash { .. }))
+                    .count(),
+                2,
+                "a later elapsed-time deadline did not emit a fresh heartbeat"
+            );
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     async fn prepare_sparse_window_overflow(
         harness: &mut CrashBoundaryHarness,
     ) -> Result<RecoveryEnvelopeV2> {
@@ -4777,6 +5074,7 @@ mod tests {
             &sparse_identity,
             CommandOutcome::Rejected {
                 reason: "seed sparse result".to_owned(),
+                command_id_client: None,
             },
             1,
         )?;
@@ -4950,6 +5248,7 @@ mod tests {
                             command_id,
                             reason,
                             session_rejected_from: Some(3),
+                            ..
                         },
                     ..
                 }] if *stream_seq > 0
@@ -5594,6 +5893,7 @@ mod tests {
                     event: GameEvent::CommandRejected {
                         command_id: harness.command_id.clone(),
                         reason: "recorded rejection".into(),
+                        command_id_client: None,
                         session_rejected_from: None,
                     },
                 },
@@ -7244,6 +7544,7 @@ mod tests {
             };
             let exact_outcome = CommandOutcome::Rejected {
                 reason: "already resolved".to_string(),
+                command_id_client: None,
             };
             let resolved = ResolvedCommandState {
                 sessions: std::collections::BTreeMap::from([(

@@ -41,7 +41,9 @@ pub(crate) fn authorize_game_command(
     mut command: GameCommandMessage,
 ) -> Result<GameCommandMessage, &'static str> {
     match command.command {
-        GameCommand::Turn { snake_id, .. } => match state.players.get(&user_id) {
+        GameCommand::Turn { snake_id, .. }
+        | GameCommand::ActivateBoost { snake_id }
+        | GameCommand::DeactivateBoost { snake_id } => match state.players.get(&user_id) {
             None => return Err("user is not a player in this game"),
             Some(player) if player.snake_id != snake_id => {
                 return Err("snake is not owned by the submitting user");
@@ -98,6 +100,30 @@ mod tests {
         }
     }
 
+    fn activate_boost_command(claimed_user_id: u32, snake_id: u32) -> GameCommandMessage {
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 5,
+                user_id: claimed_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::ActivateBoost { snake_id },
+        }
+    }
+
+    fn deactivate_boost_command(claimed_user_id: u32, snake_id: u32) -> GameCommandMessage {
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 5,
+                user_id: claimed_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: None,
+            command: GameCommand::DeactivateBoost { snake_id },
+        }
+    }
+
     #[test]
     fn turn_for_unowned_snake_is_rejected() {
         let (state, _, snake_b) = two_player_state();
@@ -129,6 +155,64 @@ mod tests {
     fn spectator_turn_is_rejected() {
         let (state, snake_a, _) = two_player_state();
         assert!(authorize_game_command(&state, 99, turn_command(99, snake_a)).is_err());
+    }
+
+    #[test]
+    fn boost_activation_for_unowned_snake_is_rejected() {
+        let (state, _, snake_b) = two_player_state();
+        assert!(
+            authorize_game_command(&state, USER_A, activate_boost_command(USER_A, snake_b))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn own_boost_activation_is_authorized_with_authenticated_identity() {
+        let (state, snake_a, _) = two_player_state();
+        let authorized =
+            authorize_game_command(&state, USER_A, activate_boost_command(USER_B, snake_a))
+                .unwrap();
+        assert_eq!(authorized.command_id_client.user_id, USER_A);
+        assert_eq!(authorized.command_id_server, None);
+        assert!(matches!(
+            authorized.command,
+            GameCommand::ActivateBoost { snake_id } if snake_id == snake_a
+        ));
+    }
+
+    #[test]
+    fn spectator_boost_activation_is_rejected() {
+        let (state, snake_a, _) = two_player_state();
+        assert!(authorize_game_command(&state, 99, activate_boost_command(99, snake_a)).is_err());
+    }
+
+    #[test]
+    fn boost_deactivation_for_unowned_snake_is_rejected() {
+        let (state, _, snake_b) = two_player_state();
+        assert!(
+            authorize_game_command(&state, USER_A, deactivate_boost_command(USER_A, snake_b),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn own_boost_deactivation_is_authorized_with_authenticated_identity() {
+        let (state, snake_a, _) = two_player_state();
+        let authorized =
+            authorize_game_command(&state, USER_A, deactivate_boost_command(USER_B, snake_a))
+                .unwrap();
+        assert_eq!(authorized.command_id_client.user_id, USER_A);
+        assert_eq!(authorized.command_id_server, None);
+        assert!(matches!(
+            authorized.command,
+            GameCommand::DeactivateBoost { snake_id } if snake_id == snake_a
+        ));
+    }
+
+    #[test]
+    fn spectator_boost_deactivation_is_rejected() {
+        let (state, snake_a, _) = two_player_state();
+        assert!(authorize_game_command(&state, 99, deactivate_boost_command(99, snake_a)).is_err());
     }
 
     #[test]

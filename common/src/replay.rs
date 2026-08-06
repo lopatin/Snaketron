@@ -874,7 +874,7 @@ mod tests {
     /// recording a server trace with the real TraceRecord shapes.
     fn build_synthetic_server_trace() -> Vec<TraceRecord> {
         let mut state = GameState::new(
-            40,
+            60,
             40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,

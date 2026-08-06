@@ -1,0 +1,349 @@
+import type { GameState, QueueMode } from '../types';
+
+export const GAME_SHELL_COLORS = {
+  graphite: '#172033',
+  paper: '#F7F9FB',
+  blue: '#3C8DDE',
+  red: '#EF5A5A',
+  grid: '#C9D3DF',
+  boost: '#F8C84A',
+} as const;
+
+// Must mirror client/src/render.rs. The hues preserve team ownership while a
+// restrained second shade makes the 2v2 roster a real snake-to-player legend.
+export const TEAM_SNAKE_COLORS = {
+  blue: ['#70bfe3', '#3c8dde'],
+  red: ['#ff6b6b', '#e34e5b'],
+} as const;
+
+export const TEAM_SNAKE_OUTLINE_COLORS = {
+  blue: ['#5299bb', '#286eae'],
+  red: ['#b84444', '#a92f3a'],
+} as const;
+
+const FIELD_SNAKE_SKINS = [
+  { color: '#70bfe3', outlineColor: '#5299bb' },
+  { color: '#ff6b6b', outlineColor: '#b84444' },
+  { color: '#556270', outlineColor: '#353c47' },
+  { color: '#f7b731', outlineColor: '#a87d1f' },
+] as const;
+
+export interface MatchPlayerPresentation {
+  snakeId: number;
+  userId: number | null;
+  name: string;
+  isCurrentPlayer: boolean;
+  isAlive: boolean;
+  teamId: number | null;
+  color: string;
+  outlineColor: string;
+  score: number;
+  finalLength: number;
+  foodHeld: number;
+  xpGained: number;
+  actionCount: number;
+  isWinner: boolean;
+}
+
+export interface MatchSidePresentation {
+  teamId: number;
+  label: string;
+  color: string;
+  score: number;
+  players: MatchPlayerPresentation[];
+  isCurrentSide: boolean;
+  isWinner: boolean;
+}
+
+export type MatchResultTone = 'victory' | 'defeat' | 'draw' | 'complete';
+
+export type MatchResultArtwork =
+  | 'azure-cut'
+  | 'ruby-shatter'
+  | 'jade-fracture'
+  | 'topaz-cut'
+  | 'neutral';
+
+export interface MatchPresentation {
+  modeLabel: string;
+  isTeamGame: boolean;
+  isSoloGame: boolean;
+  isComplete: boolean;
+  timeLabel: 'Time' | 'Time left';
+  timeValue: string;
+  elapsedMs: number;
+  timeTaken: string;
+  pointsPerMinute: number;
+  actionsPerMinute: number;
+  spectatorCount: number;
+  players: MatchPlayerPresentation[];
+  currentPlayer: MatchPlayerPresentation | null;
+  sides: MatchSidePresentation[];
+  soloScore: number;
+  resultTitle: string;
+  resultSummary: string;
+  resultTone: MatchResultTone;
+  resultArtwork: MatchResultArtwork;
+}
+
+const valueAt = (
+  values: { [key: number]: number | undefined } | null | undefined,
+  key: number,
+): number => (
+  values?.[key] ?? 0
+);
+
+export const formatMatchClock = (milliseconds: number, roundUp = false): string => {
+  const bounded = Math.max(0, Number.isFinite(milliseconds) ? milliseconds : 0);
+  const seconds = roundUp ? Math.ceil(bounded / 1000) : Math.floor(bounded / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes.toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+};
+
+export const calculatePerMinuteRate = (count: number, elapsedMs: number): number => {
+  if (!Number.isFinite(count) || count < 0 || !Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return 0;
+  }
+  return count * 60_000 / elapsedMs;
+};
+
+export const formatPerMinuteRate = (rate: number): string => (
+  (Number.isFinite(rate) && rate >= 0 ? rate : 0).toFixed(1)
+);
+
+export const isCompleteGameState = (gameState: GameState | null): boolean => Boolean(
+  gameState &&
+  typeof gameState.status === 'object' &&
+  gameState.status !== null &&
+  'Complete' in gameState.status,
+);
+
+const getWinningSnakeId = (gameState: GameState): number | null => {
+  const status = gameState.status;
+  if (typeof status === 'object' && status !== null && 'Complete' in status) {
+    return status.Complete.winning_snake_id;
+  }
+  return null;
+};
+
+const modeDetails = (gameState: GameState, queueMode: QueueMode) => {
+  const gameType = gameState.game_type;
+  if (gameType === 'Solo') {
+    return { label: 'Solo run', isSolo: true, isTeam: false };
+  }
+  if ('TeamMatch' in gameType) {
+    const size = gameType.TeamMatch.per_team === 1 ? 'Duel' : '2v2';
+    return {
+      label: queueMode === 'Competitive' ? `Competitive ${size}` : `Quick ${size}`,
+      isSolo: false,
+      isTeam: true,
+    };
+  }
+  if ('FreeForAll' in gameType) {
+    return {
+      label: queueMode === 'Competitive' ? 'Competitive FFA' : 'Free for all',
+      isSolo: false,
+      isTeam: false,
+    };
+  }
+
+  const customMode = gameType.Custom.settings.game_mode;
+  if (customMode === 'Solo') {
+    return { label: 'Custom solo', isSolo: true, isTeam: false };
+  }
+  if (customMode === 'Duel') {
+    return { label: 'Custom duel', isSolo: false, isTeam: false };
+  }
+  return { label: 'Custom FFA', isSolo: false, isTeam: false };
+};
+
+export const buildMatchPresentation = (
+  gameState: GameState,
+  currentUserId?: number,
+  queueMode: QueueMode = gameState.queue_mode,
+): MatchPresentation => {
+  const mode = modeDetails(gameState, queueMode);
+  const playerBySnake = new Map<number, number>();
+  for (const [rawUserId, player] of Object.entries(gameState.players ?? {})) {
+    if (player) {
+      playerBySnake.set(player.snake_id, Number(rawUserId));
+    }
+  }
+
+  const currentSnakeId = currentUserId === undefined
+    ? null
+    : gameState.players?.[currentUserId]?.snake_id ?? null;
+  const currentTeamId = currentSnakeId === null
+    ? null
+    : gameState.arena.snakes[currentSnakeId]?.team_id ?? null;
+  const teamIds = Array.from(new Set(
+    gameState.arena.snakes
+      .map((snake) => snake.team_id)
+      .filter((teamId): teamId is number => teamId !== null),
+  )).sort((a, b) => a - b);
+  const orderedTeamIds = mode.isTeam && currentTeamId !== null
+    ? [currentTeamId, ...teamIds.filter((teamId) => teamId !== currentTeamId)]
+    : teamIds;
+  const winningSnakeId = getWinningSnakeId(gameState);
+  const winningTeamId = winningSnakeId === null
+    ? null
+    : gameState.arena.snakes[winningSnakeId]?.team_id ?? null;
+
+  const players: MatchPlayerPresentation[] = gameState.arena.snakes.map((snake, snakeId) => {
+    const userId = playerBySnake.get(snakeId) ?? null;
+    const isCurrentPlayer = userId !== null && userId === currentUserId;
+    const teamDisplayIndex = snake.team_id === null
+      ? -1
+      : Math.max(0, orderedTeamIds.indexOf(snake.team_id));
+    const teamMemberSlot = gameState.arena.snakes
+      .slice(0, snakeId)
+      .filter((candidate) => candidate.team_id === snake.team_id)
+      .length % 2;
+    const fieldSkin = isCurrentPlayer
+      ? FIELD_SNAKE_SKINS[0]
+      : gameState.arena.snakes.length === 2
+        ? FIELD_SNAKE_SKINS[1]
+        : currentSnakeId === null
+          ? FIELD_SNAKE_SKINS[snakeId % FIELD_SNAKE_SKINS.length]
+          : snakeId % 4 === 1
+            ? FIELD_SNAKE_SKINS[1]
+            : snakeId % 4 === 2
+              ? FIELD_SNAKE_SKINS[2]
+              : FIELD_SNAKE_SKINS[3];
+    const teamTone = teamDisplayIndex === 0 ? 'blue' : 'red';
+    const skin = mode.isTeam
+      ? {
+          color: TEAM_SNAKE_COLORS[teamTone][teamMemberSlot],
+          outlineColor: TEAM_SNAKE_OUTLINE_COLORS[teamTone][teamMemberSlot],
+        }
+      : fieldSkin;
+    const score = valueAt(gameState.scores, snakeId);
+    const isWinner = mode.isTeam && winningTeamId !== null
+      ? snake.team_id === winningTeamId
+      : snakeId === winningSnakeId;
+
+    return {
+      snakeId,
+      userId,
+      name: isCurrentPlayer
+        ? 'You'
+        : (userId === null ? null : gameState.usernames?.[userId]) ?? `Player ${snakeId + 1}`,
+      isCurrentPlayer,
+      isAlive: snake.is_alive,
+      teamId: snake.team_id,
+      color: skin.color,
+      outlineColor: skin.outlineColor,
+      score,
+      finalLength: score + 2,
+      foodHeld: snake.food,
+      xpGained: userId === null ? 0 : valueAt(gameState.player_xp, userId),
+      actionCount: userId === null ? 0 : valueAt(gameState.player_action_counts, userId),
+      isWinner,
+    };
+  });
+
+  const sides: MatchSidePresentation[] = mode.isTeam
+    ? orderedTeamIds.slice(0, 2).map((teamId, index) => ({
+      teamId,
+      label: currentTeamId === null
+        ? (index === 0 ? 'Blue side' : 'Red side')
+        : (teamId === currentTeamId ? 'Your team' : 'Opponents'),
+      color: index === 0 ? GAME_SHELL_COLORS.blue : GAME_SHELL_COLORS.red,
+      score: valueAt(gameState.team_scores, teamId),
+      players: players.filter((player) => player.teamId === teamId),
+      isCurrentSide: teamId === currentTeamId,
+      isWinner: winningTeamId === teamId,
+    }))
+    : [];
+
+  const elapsedMs = gameState.tick * gameState.properties.tick_duration_ms;
+  const timeLimitMs = gameState.properties.time_limit_ms;
+  const timeValue = timeLimitMs === null
+    ? formatMatchClock(elapsedMs)
+    : formatMatchClock(timeLimitMs - elapsedMs, true);
+  const currentPlayer = players.find((player) => player.isCurrentPlayer) ?? null;
+  const soloScore = currentPlayer?.score ?? players[0]?.score ?? 0;
+  const pointsPerMinute = calculatePerMinuteRate(currentPlayer?.score ?? 0, elapsedMs);
+  const actionsPerMinute = calculatePerMinuteRate(currentPlayer?.actionCount ?? 0, elapsedMs);
+
+  let resultTitle = 'Match complete';
+  let resultSummary = 'Final scores are in.';
+  let resultTone: MatchResultTone = 'complete';
+  let resultArtwork: MatchResultArtwork = 'neutral';
+  if (mode.isSolo) {
+    resultTitle = 'Run complete';
+    resultSummary = `You finished with ${soloScore} point${soloScore === 1 ? '' : 's'}.`;
+    resultArtwork = 'jade-fracture';
+  } else if (winningSnakeId === null) {
+    resultTitle = 'Draw';
+    resultSummary = 'Nothing separated the field at the horn.';
+    resultTone = 'draw';
+    resultArtwork = 'topaz-cut';
+  } else if (currentPlayer) {
+    const didWin = currentPlayer.isWinner;
+    resultTitle = didWin ? 'Victory' : 'Defeat';
+    resultSummary = didWin ? 'Your side controlled the finish.' : 'The other side took this one.';
+    resultTone = didWin ? 'victory' : 'defeat';
+    resultArtwork = didWin ? 'azure-cut' : 'ruby-shatter';
+  } else {
+    const winner = players.find((player) => player.isWinner);
+    resultSummary = winner ? `${winner.name} took the match.` : 'Final scores are in.';
+  }
+
+  return {
+    modeLabel: mode.label,
+    isTeamGame: mode.isTeam,
+    isSoloGame: mode.isSolo,
+    isComplete: isCompleteGameState(gameState),
+    timeLabel: timeLimitMs === null ? 'Time' : 'Time left',
+    timeValue,
+    elapsedMs,
+    timeTaken: formatMatchClock(elapsedMs),
+    pointsPerMinute,
+    actionsPerMinute,
+    spectatorCount: gameState.spectators?.length ?? 0,
+    players,
+    currentPlayer,
+    sides,
+    soloScore,
+    resultTitle,
+    resultSummary,
+    resultTone,
+    resultArtwork,
+  };
+};
+
+export type PlayAgainShortcutAction = 'ignore' | 'suppress' | 'play-again';
+
+interface ShortcutEventLike {
+  code: string;
+  repeat: boolean;
+  target: EventTarget | null;
+}
+
+const targetOwnsSpace = (target: EventTarget | null): boolean => {
+  if (!target || typeof target !== 'object') {
+    return false;
+  }
+  const element = target as EventTarget & {
+    tagName?: unknown;
+    isContentEditable?: unknown;
+  };
+  const tagName = typeof element.tagName === 'string' ? element.tagName.toUpperCase() : '';
+  return ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(tagName) ||
+    element.isContentEditable === true;
+};
+
+export const getPlayAgainShortcutAction = (
+  event: ShortcutEventLike,
+  modalOpen: boolean,
+  disabled: boolean,
+): PlayAgainShortcutAction => {
+  if (!modalOpen || event.code !== 'Space' || targetOwnsSpace(event.target)) {
+    return 'ignore';
+  }
+  if (event.repeat || disabled) {
+    return 'suppress';
+  }
+  return 'play-again';
+};

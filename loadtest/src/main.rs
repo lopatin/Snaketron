@@ -1007,7 +1007,7 @@ async fn run(config: Config) -> Result<()> {
         sessions = aggregate.session_counts.total,
         completed = aggregate.session_counts.completed,
         failed = aggregate.session_counts.failed,
-        peak_token_sent = aggregate.session_counts.peak_token_sent_concurrency,
+        peak_authenticate_sent = aggregate.session_counts.peak_token_sent_concurrency,
         peak_authenticated = aggregate.session_counts.peak_authenticated_concurrency,
         peak_active_games = aggregate.session_counts.peak_active_game_concurrency,
         games_completed = aggregate.games.completed,

@@ -27,6 +27,8 @@ use futures_util::SinkExt;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
+use std::fmt;
 use std::future::{Future, pending};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,13 +40,57 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const CLIENT_UPDATE_REQUIRED_REASON: &str = "Client update required";
+
+#[derive(Debug)]
+struct ClientProtocolMismatch {
+    detail: String,
+}
+
+impl fmt::Display for ClientProtocolMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl StdError for ClientProtocolMismatch {}
+
+async fn queue_client_update_required(ws_tx: &mpsc::Sender<Message>) -> Result<()> {
+    let denial = WSMessage::AccessDenied {
+        reason: CLIENT_UPDATE_REQUIRED_REASON.to_owned(),
+    };
+    ws_tx
+        .send(Message::Text(serde_json::to_string(&denial)?.into()))
+        .await
+        .context("WebSocket closed before protocol rejection")?;
+    // FIFO after the denial. The connection cleanup waits for the forwarding
+    // task to send this close frame instead of aborting that task immediately.
+    ws_tx
+        .send(Message::Close(None))
+        .await
+        .context("WebSocket closed before protocol close frame")
+}
+
+fn ws_protocol_version_is_supported(protocol_version: u16) -> bool {
+    protocol_version == WS_PROTOCOL_VERSION
+}
+
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum WSMessage {
+    /// Legacy authentication shape retained only so the server can return a
+    /// clear update-required error before closing a stale client's socket.
     Token(String),
+    /// Client -> server authentication. The version is checked before token
+    /// verification so a maintenance cutover cannot admit an old gameplay
+    /// protocol into a current executor fleet.
+    Authenticate {
+        token: String,
+        protocol_version: u16,
+    },
     JoinGame(u32),
     LeaveGame,
     /// At-least-once client command. The gateway canonicalizes `game_id` and
@@ -248,6 +294,14 @@ fn slow_command_publish_wait_ms(publish_wait: Duration) -> Option<u64> {
         return None;
     }
     Some(u64::try_from(publish_wait.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// A command publication error has an ambiguous outcome: the write may have
+/// reached the stream even though the gateway did not receive confirmation.
+/// Fail the socket closed so its ordered outbox retries before a later command
+/// can overtake the ambiguous one on this connection.
+fn require_game_command_publication(publish_result: Result<bool>) -> Result<bool> {
+    publish_result.context("v2 game command publication failed")
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -635,6 +689,7 @@ async fn handle_websocket_connection(
     let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
     tokio::pin!(shutdown_timeout);
     let mut shutdown_started = false;
+    let mut graceful_protocol_close = false;
 
     // Will be used to track Redis stream subscription for game events
     let mut game_event_handle: Option<JoinHandle<()>> = None;
@@ -654,7 +709,7 @@ async fn handle_websocket_connection(
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
     // Spawn task to forward messages from channel to WebSocket
-    let forward_task = tokio::spawn(async move {
+    let mut forward_task = tokio::spawn(async move {
         let mut drain_open = true;
         let mut ws_open = true;
         while let Some(msg) = next_outbound_message(
@@ -665,6 +720,7 @@ async fn handle_websocket_connection(
         )
         .await
         {
+            let is_close = matches!(msg, Message::Close(_));
             let outbound_bytes = tungstenite_message_bytes(&msg);
             // Convert to Axum WebSocket message
             let axum_msg = match msg {
@@ -688,6 +744,9 @@ async fn handle_websocket_connection(
                 break;
             }
             crate::resilience_metrics::record_websocket_outbound_message(outbound_bytes);
+            if is_close {
+                break;
+            }
         }
     });
 
@@ -1192,6 +1251,9 @@ async fn handle_websocket_connection(
                                         Err(e) => {
                                             crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
+                                            graceful_protocol_close = e
+                                                .downcast_ref::<ClientProtocolMismatch>()
+                                                .is_some();
                                             // State was consumed, need to reset
                                             state = ConnectionState::Unauthenticated;
                                             break;
@@ -1247,7 +1309,16 @@ async fn handle_websocket_connection(
     if let Some(handle) = game_chat_handle {
         handle.abort();
     }
-    forward_task.abort();
+    if graceful_protocol_close {
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward_task)
+            .await
+            .is_err()
+        {
+            forward_task.abort();
+        }
+    } else {
+        forward_task.abort();
+    }
 
     info!("WebSocket connection closed");
     Ok(())
@@ -3303,7 +3374,24 @@ async fn process_ws_message(
     match state {
         ConnectionState::Unauthenticated => {
             match ws_message {
-                WSMessage::Token(jwt_token) => {
+                WSMessage::Token(_) => {
+                    queue_client_update_required(ws_tx).await?;
+                    Err(anyhow::Error::new(ClientProtocolMismatch {
+                        detail: "legacy WebSocket authentication protocol rejected".into(),
+                    }))
+                }
+                WSMessage::Authenticate {
+                    token: jwt_token,
+                    protocol_version,
+                } => {
+                    if !ws_protocol_version_is_supported(protocol_version) {
+                        queue_client_update_required(ws_tx).await?;
+                        return Err(anyhow::Error::new(ClientProtocolMismatch {
+                            detail: format!(
+                                "WebSocket protocol version {protocol_version} rejected; expected {WS_PROTOCOL_VERSION}"
+                            ),
+                        }));
+                    }
                     debug!("Received WebSocket authentication request");
                     match jwt_verifier.verify(&jwt_token).await {
                         Ok(user_token) => {
@@ -3316,6 +3404,12 @@ async fn process_ws_message(
                                 .get_user_by_id(user_token.user_id)
                                 .await?
                                 .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+
+                            if user.is_guest != user_token.is_guest {
+                                return Err(anyhow::anyhow!(
+                                    "Authentication failed: guest claim does not match user record"
+                                ));
+                            }
 
                             let database_pool = if user.is_stress_test {
                                 MatchmakingPool::Stress
@@ -4163,17 +4257,22 @@ async fn process_ws_message(
                                 "Slow v2 game command publication"
                             );
                         }
-                        match publish_result {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                debug!(
+                        let published = require_game_command_publication(publish_result).map_err(
+                            |error| {
+                                error!(
                                     game_id,
-                                    user_id, "Discarded command after immutable game completion"
+                                    user_id,
+                                    %error,
+                                    "Failed to publish v2 game command; closing socket for ordered retry"
                                 );
-                            }
-                            Err(error) => {
-                                error!(game_id, user_id, %error, "Failed to publish v2 game command");
-                            }
+                                error
+                            },
+                        )?;
+                        if !published {
+                            debug!(
+                                game_id,
+                                user_id, "Discarded command after immutable game completion"
+                            );
                         }
                         Ok(ConnectionState::Authenticated {
                             metadata,
@@ -4549,18 +4648,19 @@ fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
-        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
-        canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
-        game_join_denied, game_join_failure_message, missing_game_join_failure,
-        next_game_subscription_input, next_outbound_message, queue_planned_drain_notice,
-        recovery_bridge_snapshot, send_command_outcomes_from_resolved,
+        CLIENT_UPDATE_REQUIRED_REASON, CommandOutcomeReplay, GameJoinAuthorizationError,
+        GameSubscriptionInput, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
+        abort_and_join_game_event_forwarder, canonical_command_identity, command_outcomes_for_user,
+        ensure_custom_game_access, game_join_denied, game_join_failure_message,
+        missing_game_join_failure, next_game_subscription_input, next_outbound_message,
+        queue_client_update_required, queue_planned_drain_notice, recovery_bridge_snapshot,
+        require_game_command_publication, send_command_outcomes_from_resolved,
         send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
         slow_command_publish_wait_ms, snapshot_requires_command_outcomes,
         subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
-        validate_game_matchmaking_pool,
+        validate_game_matchmaking_pool, ws_protocol_version_is_supported,
     };
-    use crate::lifecycle::DrainNotice;
+    use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
     use crate::matchmaking_manager::{ActiveMatch, MatchStatus};
     use crate::matchmaking_pool::MatchmakingPool;
@@ -4593,6 +4693,20 @@ mod lifecycle_protocol_tests {
         assert_eq!(
             slow_command_publish_wait_ms(Duration::from_millis(1_001)),
             Some(1_001)
+        );
+    }
+
+    #[test]
+    fn command_publication_errors_fail_closed_while_completion_is_not_an_error() {
+        assert!(require_game_command_publication(Ok(true)).unwrap());
+        assert!(!require_game_command_publication(Ok(false)).unwrap());
+
+        let error =
+            require_game_command_publication(Err(anyhow::anyhow!("ambiguous write"))).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("v2 game command publication failed")
         );
     }
 
@@ -4720,13 +4834,54 @@ mod lifecycle_protocol_tests {
     fn authentication_ack_advertises_an_explicit_capability_envelope() {
         let value = serde_json::to_value(WSMessage::Authenticated {
             task_boot_id: "task-a".to_owned(),
-            protocol_version: 2,
+            protocol_version: WS_PROTOCOL_VERSION,
             capabilities: vec!["planned-drain-v1".to_owned()],
             socket_generation: 3,
         })
         .unwrap();
         assert_eq!(value["Authenticated"]["task_boot_id"], "task-a");
+        assert_eq!(
+            value["Authenticated"]["protocol_version"],
+            WS_PROTOCOL_VERSION
+        );
         assert_eq!(value["Authenticated"]["socket_generation"], 3);
+    }
+
+    #[test]
+    fn authentication_request_requires_the_exact_protocol_version() {
+        let value = serde_json::to_value(WSMessage::Authenticate {
+            token: "jwt".to_owned(),
+            protocol_version: WS_PROTOCOL_VERSION,
+        })
+        .unwrap();
+        assert_eq!(value["Authenticate"]["token"], "jwt");
+        assert_eq!(
+            value["Authenticate"]["protocol_version"],
+            WS_PROTOCOL_VERSION
+        );
+        assert!(ws_protocol_version_is_supported(WS_PROTOCOL_VERSION));
+        assert!(!ws_protocol_version_is_supported(
+            WS_PROTOCOL_VERSION.saturating_sub(1)
+        ));
+        assert_eq!(CLIENT_UPDATE_REQUIRED_REASON, "Client update required");
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_queues_denial_before_close() {
+        let (tx, mut rx) = mpsc::channel(2);
+        queue_client_update_required(&tx).await.unwrap();
+
+        let denial = rx.recv().await.expect("denial frame");
+        let Message::Text(text) = denial else {
+            panic!("first protocol-mismatch frame must be text");
+        };
+        let parsed: WSMessage = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            parsed,
+            WSMessage::AccessDenied { reason }
+                if reason == CLIENT_UPDATE_REQUIRED_REASON
+        ));
+        assert!(matches!(rx.recv().await, Some(Message::Close(_))));
     }
 
     #[tokio::test]

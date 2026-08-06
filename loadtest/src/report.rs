@@ -428,8 +428,8 @@ pub struct SessionMetrics {
     /// that proves authentication is usable. This includes bounded transient
     /// admission retries made with the same guest token.
     pub initial_admission_ready_ms: Option<u64>,
-    /// Initial and reconnect token-to-Authenticated handshakes. Bounded by the
-    /// per-session reconnect budget.
+    /// Initial and reconnect Authenticate-to-Authenticated handshakes. Bounded
+    /// by the per-session reconnect budget.
     #[serde(default)]
     pub websocket_auth_ms: Vec<u64>,
     pub lobby_ready_ms: Option<u64>,
@@ -906,10 +906,11 @@ pub struct SessionCounts {
     pub incomplete: usize,
     pub success_rate_percent: f64,
     pub failure_rate_percent: f64,
-    /// Peak overlapping logical sessions after their authentication token was
-    /// written to the initial WebSocket. A logical session remains active across
-    /// short reconnect gaps; this does not claim server-side authentication was
-    /// confirmed or that one transport socket stayed continuously open.
+    /// Peak overlapping logical sessions after their Authenticate request was
+    /// written to the initial WebSocket. A logical session remains active
+    /// across short reconnect gaps; this does not claim server-side
+    /// authentication was confirmed or that one transport socket stayed
+    /// continuously open.
     pub peak_token_sent_concurrency: usize,
     /// Peak sessions whose server returned `Authenticated`. This is maintained
     /// by the coordinator's activity tracker and is the certification measure;
@@ -932,7 +933,7 @@ pub struct SessionSummary {
     /// while a specific control-plane transition was in progress.
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: Option<u64>,
-    /// First token-to-`Authenticated` handshake for this logical session.
+    /// First `Authenticate`-to-`Authenticated` handshake for this session.
     /// Later reconnect/handoff samples remain in the aggregate distribution.
     pub initial_websocket_auth_ms: Option<u64>,
     /// First WebSocket connection attempt through the authenticated ordered
@@ -1383,7 +1384,7 @@ fn push_option(values: &mut Vec<u64>, value: Option<u64>) {
 }
 
 fn peak_token_sent_concurrency(run: &LoadTestRun) -> usize {
-    // Token-sent logical sessions are half-open intervals [token, finish).
+    // Authenticate-sent logical sessions are half-open intervals [request, finish).
     // Finish events sort before starts at the same timestamp, avoiding a false
     // overlap. Sessions that never wrote a token do not inflate this metric.
     let mut events = Vec::with_capacity(run.sessions.len() * 2);
@@ -1676,7 +1677,7 @@ fn render_html(report: &AggregateReport) -> String {
          <div class=\"card\"><span class=\"label\">Completed</span><b class=\"completed\">{}</b></div>\
          <div class=\"card\"><span class=\"label\">Failed</span><b class=\"failed\">{}</b></div>\
          <div class=\"card\"><span class=\"label\">Success rate</span><b>{:.1}%</b></div>\
-         <div class=\"card\"><span class=\"label\">Peak token-sent sessions</span><b>{}</b></div>\
+         <div class=\"card\"><span class=\"label\">Peak Authenticate-sent sessions</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Peak authenticated sessions</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Peak active games</span><b>{}</b></div>\
          <div class=\"card\"><span class=\"label\">Configured max</span><b>{}</b></div>\

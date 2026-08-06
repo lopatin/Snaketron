@@ -5,7 +5,10 @@
 export type {
   Position,
   Snake,
+  SnakeBoost,
   Arena,
+  BoostConfig,
+  BoostPad,
   TeamZoneConfig,
   TeamId,
   Player,
@@ -57,6 +60,7 @@ export type HighScoreEntry = GenHighScoreEntry;
 export interface User {
   id: number;
   username: string;
+  mmr?: number;
   token?: string;
   isGuest?: boolean;
 }
@@ -111,6 +115,7 @@ export interface LobbyPreferences {
 export interface WebSocketContextType {
   isConnected: boolean;
   isSessionAuthenticated: boolean;
+  clientUpdateRequired: boolean;
   serverCapabilities: ReadonlySet<string>;
   sendMessage: (message: OutboundMessage) => boolean;
   waitForSessionReady: (timeoutMs?: number) => Promise<void>;
@@ -151,9 +156,14 @@ export interface LatencySettings {
   receiveDelayMs: number;
 }
 
-// Client-side movement input. The snake_id and command envelope are filled in
-// by the WASM engine (processTurn), which returns the wire GameCommandMessage.
-export type Command = { Turn: { direction: Direction } } | 'Respawn';
+// Client-side gameplay input. The snake_id and command envelope are filled in
+// by the WASM engine, which returns the wire GameCommandMessage. Boost carries
+// no client-selected speed, duration, or charge.
+export type Command =
+  | { Turn: { direction: Direction } }
+  | 'ActivateBoost'
+  | 'DeactivateBoost'
+  | 'Respawn';
 
 // Command-protocol helper types for the v2 at-least-once command path. The
 // wire types are generated (server/src/recovery.rs + common); these compose

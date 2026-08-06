@@ -1,106 +1,196 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useGameWebSocket } from '../hooks/useGameWebSocket';
-import { JoinGameModalProps, FormEventHandler } from '../types';
+import React, { useId, useRef, useState } from 'react';
+import { useAuth } from '../contexts/AuthContext';
+import { useWebSocket } from '../contexts/WebSocketContext';
+import { FormEventHandler, JoinGameModalProps } from '../types';
+import {
+  getLobbyCodeValidationError,
+  normalizeLobbyCodeInput,
+} from '../utils/lobbyCode';
+import { LobbyModal } from './LobbyModal';
+
+const generateGuestNickname = (): string =>
+  `Guest${Math.floor(1000 + Math.random() * 9000)}`;
+
+const guestNickname = (): string => {
+  try {
+    const savedNickname = window.localStorage.getItem('savedUsername')?.trim();
+    if (savedNickname && savedNickname.length >= 3) {
+      return savedNickname;
+    }
+  } catch {
+    // Storage can be unavailable in privacy modes; a generated name is enough.
+  }
+  return generateGuestNickname();
+};
+
+const joinErrorMessage = (error: unknown): string => {
+  const message = error instanceof Error
+    ? error.message.trim()
+    : error && typeof error === 'object' && 'message' in error && typeof error.message === 'string'
+      ? error.message.trim()
+      : '';
+  const normalizedMessage = message.toLowerCase();
+
+  if (normalizedMessage.includes('leave your current lobby')) {
+    return 'Leave your current lobby before joining another one.';
+  }
+  if (normalizedMessage.includes('timeout waiting to join lobby')) {
+    return 'Joining took too long. Check the code and try again.';
+  }
+  if (
+    normalizedMessage.includes('not connected') ||
+    normalizedMessage.includes('could not connect') ||
+    normalizedMessage.includes('connection was lost')
+  ) {
+    return 'The game server is still connecting. Try again in a moment.';
+  }
+  if (normalizedMessage.includes('not found') || normalizedMessage.includes('missing')) {
+    return 'That lobby could not be found. Check the code and try again.';
+  }
+  if (message && !normalizedMessage.includes('access denied')) {
+    return message;
+  }
+
+  return 'Could not join that lobby. Check the code and try again.';
+};
 
 function JoinGameModal({ isOpen, onClose }: JoinGameModalProps) {
-  const navigate = useNavigate();
-  const { joinCustomGame, isConnected } = useGameWebSocket();
-  const [gameCode, setGameCode] = useState('');
-  const [error, setError] = useState('');
-  const [isJoining, setIsJoining] = useState(false);
+  const { user, createGuest, loading: isAuthLoading } = useAuth();
+  const { isConnected, joinLobby } = useWebSocket();
+  const [codeInput, setCodeInput] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [joinStatus, setJoinStatus] = useState<'idle' | 'creating-guest' | 'joining'>('idle');
+  const inputRef = useRef<HTMLInputElement>(null);
+  const inputId = useId();
+  const hintId = useId();
+  const errorId = useId();
+  const isJoining = joinStatus !== 'idle';
 
-  const handleSubmit: FormEventHandler = async (e) => {
-    e.preventDefault();
-    
-    if (!gameCode.trim()) {
-      setError('Please enter a game code');
-      return;
-    }
-    
-    if (!isConnected) {
-      setError('Not connected to server');
-      return;
-    }
-    
-    setIsJoining(true);
-    setError('');
-    
-    try {
-      await joinCustomGame(gameCode.toUpperCase());
-      // Navigation will be handled by WebSocket response
-      navigate(`/game/${gameCode.toUpperCase()}`);
+  const handleDismiss = () => {
+    if (!isJoining) {
       onClose();
-    } catch (err) {
-      setError('Failed to join game. Please check the code and try again.');
-      setIsJoining(false);
     }
   };
 
-  if (!isOpen) return null;
+  const handleSubmit: FormEventHandler = async (event) => {
+    event.preventDefault();
+
+    const validationError = getLobbyCodeValidationError(codeInput);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+
+    if (isAuthLoading) {
+      setError('Your player session is still loading. Try again in a moment.');
+      return;
+    }
+
+    if (!isConnected) {
+      setError('The game server is still connecting. Try again in a moment.');
+      return;
+    }
+
+    const lobbyCode = normalizeLobbyCodeInput(codeInput);
+    setError(null);
+
+    try {
+      if (!user) {
+        setJoinStatus('creating-guest');
+        await createGuest(guestNickname());
+      }
+
+      setJoinStatus('joining');
+      await joinLobby(lobbyCode);
+
+      setCodeInput('');
+      setError(null);
+      setJoinStatus('idle');
+      onClose();
+    } catch (joinError: unknown) {
+      setError(joinErrorMessage(joinError));
+      setJoinStatus('idle');
+    }
+  };
+
+  const submitLabel = isAuthLoading
+    ? 'Checking session…'
+    : joinStatus === 'creating-guest'
+      ? 'Creating guest…'
+      : joinStatus === 'joining'
+        ? 'Joining lobby…'
+        : 'Join lobby';
 
   return (
-    <div
-      className="fixed inset-0 flex items-center justify-center p-4 z-50"
-      onClick={onClose}
-      style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)' }}
+    <LobbyModal
+      isOpen={isOpen}
+      onClose={handleDismiss}
+      title="Join game"
+      description="Enter a lobby code or paste an invite link."
+      initialFocusRef={inputRef}
+      isDismissDisabled={isJoining}
     >
-      <div
-        className="bg-white rounded-lg p-8 w-full max-w-lg"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          border: '2px solid rgba(0, 0, 0, 0.65)',
-          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.2)'
-        }}
+      <form
+        className="lobby-modal-form"
+        onSubmit={handleSubmit}
+        noValidate
+        aria-busy={isJoining}
       >
-        <div className="text-center mb-6">
-          <h2 className="text-2xl font-black italic uppercase tracking-1 text-black-70 mb-2">
-            Join Game
-          </h2>
-          <p className="text-sm text-black-70 opacity-60">
-            Enter the lobby code to join your friends
+        <div className="lobby-modal-field">
+          <label className="lobby-modal-label" htmlFor={inputId}>Lobby code</label>
+          <div className="lobby-modal-input-wrap">
+            <input
+              ref={inputRef}
+              id={inputId}
+              type="text"
+              value={codeInput}
+              onChange={(event) => {
+                setCodeInput(event.target.value);
+                if (error) {
+                  setError(null);
+                }
+              }}
+              placeholder="USE1-XXXXXXXX"
+              className="lobby-modal-input"
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              disabled={isJoining}
+              aria-invalid={Boolean(error)}
+              aria-describedby={error ? `${hintId} ${errorId}` : hintId}
+            />
+          </div>
+          <p id={hintId} className="lobby-modal-hint">
+            Example: USE1-4K7MP9QX.
           </p>
         </div>
 
-        <form onSubmit={handleSubmit}>
-          <div className="mb-5">
-            <label className="block text-xs font-black italic uppercase tracking-1 text-black-70 mb-2 opacity-50">
-              Code
-            </label>
-            <input
-              type="text"
-              value={gameCode}
-              onChange={(e) => setGameCode(e.target.value.toUpperCase())}
-              placeholder="XXXXXXXX"
-              maxLength={8}
-              className="w-full px-4 py-3 border-2 border-black-70 rounded-lg font-mono text-2xl text-center uppercase tracking-widest text-black-70"
-              autoFocus
-            />
-          </div>
+        {error && (
+          <p id={errorId} className="lobby-modal-error" role="alert">
+            {error}
+          </p>
+        )}
 
-          {error && (
-            <p className="text-red-600 text-sm mb-5 text-center">{error}</p>
-          )}
-
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="flex-1 px-6 py-3 border-2 border-black-70 rounded-lg font-black italic uppercase tracking-1 text-black-70 hover:bg-gray-50 transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={isJoining || !gameCode.trim()}
-              className="flex-1 px-6 py-3 border-2 border-black-70 rounded-lg font-black italic uppercase tracking-1 text-black-70 hover:bg-gray-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isJoining ? 'Joining...' : 'Join'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+        <div className="lobby-modal-actions">
+          <button
+            type="button"
+            className="lobby-modal-button is-secondary"
+            onClick={handleDismiss}
+            disabled={isJoining}
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="lobby-modal-button is-primary"
+            disabled={isJoining || isAuthLoading || !codeInput.trim()}
+          >
+            {isJoining && <span className="lobby-modal-spinner" aria-hidden="true" />}
+            <span>{submitLabel}</span>
+          </button>
+        </div>
+      </form>
+    </LobbyModal>
   );
 }
 

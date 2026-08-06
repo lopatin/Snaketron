@@ -65,6 +65,23 @@ export const UserPlusIcon = ({ className = '' }) => (
   </svg>
 );
 
+export const HistoryIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={1.8}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M4.5 8.5V4.75m0 0h3.75m-3.75 0A8.5 8.5 0 1 1 3.6 14M12 7.5V12l3 2"
+    />
+  </svg>
+);
+
 export const KeyIcon = ({ className = '' }) => (
   <svg
     className={className}

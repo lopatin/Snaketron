@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use common::{ClientCommandIdentityV2, GameCommandMessage, GameEventMessage};
 use futures_util::{SinkExt, StreamExt};
+use server::lifecycle::WS_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio::time::Duration;
@@ -36,16 +37,27 @@ impl TestClient {
     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
         // Send the exact token string and wait for the server-side verification
         // boundary. Merely writing a token is not authentication.
-        self.send_message(WSMessage::Token(token.to_string()))
-            .await?;
-        let response = self.receive_message().await?;
-        match response {
-            WSMessage::Authenticated { .. } => Ok(()),
-            other => Err(anyhow::anyhow!(
-                "Expected Authenticated response, got {:?}",
-                other
-            )),
-        }
+        self.send_message(WSMessage::Authenticate {
+            token: token.to_string(),
+            protocol_version: WS_PROTOCOL_VERSION,
+        })
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.receive_message().await? {
+                    WSMessage::Authenticated { .. } => return Ok(()),
+                    WSMessage::UserCountUpdate { .. } => {}
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "Expected Authenticated response, got {:?}",
+                            other
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for Authenticated response"))?
     }
 
     /// Create and join an explicit matchmaking lobby.

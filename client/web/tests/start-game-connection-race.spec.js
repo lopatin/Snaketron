@@ -44,13 +44,13 @@ test('an early Start Game click waits for the authenticated regional socket', as
         }));
       }
 
-      if (message?.Token) {
+      if (message?.Authenticate) {
         setTimeout(() => {
           authenticationAcknowledged = true;
           socket.send(JSON.stringify({
             Authenticated: {
               task_boot_id: 'start-race-test',
-              protocol_version: 2,
+              protocol_version: 5,
               capabilities: REQUIRED_CAPABILITIES,
               socket_generation: 1,
             },
@@ -145,10 +145,15 @@ test('an early Start Game click waits for the authenticated regional socket', as
     await expect(startButton).toHaveText('Finding Match...');
 
     const startSequence = receivedMessages.filter(message =>
-      message?.Token || message === 'CreateLobby' || message?.QueueForMatch
+      message?.Authenticate || message === 'CreateLobby' || message?.QueueForMatch
     );
     expect(startSequence).toEqual([
-      { Token: 'guest-race-token' },
+      {
+        Authenticate: {
+          token: 'guest-race-token',
+          protocol_version: 5,
+        },
+      },
       'CreateLobby',
       {
         QueueForMatch: {

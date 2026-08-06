@@ -358,10 +358,14 @@ export const useGameEngine = ({
 
       // Process command based on type
       let commandMessageJson: string;
-       if (typeof command === 'object' && 'Turn' in command) {
+      if (typeof command === 'object' && 'Turn' in command) {
         console.log('Processing turn command:', command.Turn.direction, 'at', Date.now());
         commandMessageJson = engineRef.current.processTurn(snakeId, command.Turn.direction);
         console.log('processTurn returned at', Date.now());
+      } else if (command === 'ActivateBoost') {
+        commandMessageJson = engineRef.current.processActivateBoost(snakeId);
+      } else if (command === 'DeactivateBoost') {
+        commandMessageJson = engineRef.current.processDeactivateBoost(snakeId);
       } else if (command === 'Respawn') {
         console.error('Respawn command not implemented yet');
         return;

@@ -1,6 +1,6 @@
 use crate::{
-    CommandId, DEFAULT_TICK_INTERVAL_MS, GameCommand, GameCommandMessage, GameEvent,
-    GameEventMessage, GameState, GameType, QueueMode,
+    BoostLifecycleTransition, CommandId, DEFAULT_TICK_INTERVAL_MS, GameCommand, GameCommandMessage,
+    GameEvent, GameEventMessage, GameState, GameType, QueueMode,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -10,6 +10,17 @@ use serde::Serialize;
 /// (server silent, stream dead), prediction freezes after this window instead
 /// of simulating a ghost game indefinitely.
 pub const MAX_PREDICTION_AHEAD_MS: u32 = 1000;
+
+/// Client snapshot admission is strict for every live state and every current
+/// Boost snapshot. The sole compatibility exception is immutable pre-Boost
+/// team-match history after the server has supplied deserialization defaults.
+fn validate_client_snapshot_state(game_state: &GameState) -> Result<()> {
+    match game_state.validate_boost_invariants() {
+        Ok(()) => Ok(()),
+        Err(_strict_error) if game_state.is_legacy_completed_team_snapshot() => Ok(()),
+        Err(strict_error) => Err(strict_error),
+    }
+}
 
 /// Client-side synchronization health, updated on every processed server
 /// message. Exposed to the UI so it can detect divergence (hash mismatches),
@@ -63,6 +74,11 @@ pub struct GameEngine {
     /// same-tick local commands; the engine's one-turn-per-snake-per-tick
     /// deferral turns that order into tick spacing at execution time.
     local_command_seq: u32,
+    /// Locally predicted commands that do not yet have an authoritative
+    /// scheduled/rejected outcome. They live outside committed state so a
+    /// rejection can always rebuild cleanly even if its server tick is later
+    /// than the speculative execution tick.
+    speculative_commands: Vec<GameCommandMessage>,
     sync_status: SyncStatus,
     /// Authoritative input changed since the last prediction replay. A replay
     /// must happen even when wall-clock time has not crossed another tick so
@@ -75,16 +91,16 @@ impl GameEngine {
         GameEngine {
             game_id,
             committed_state: GameState::new(
-                10,
-                10,
+                60,
+                40,
                 GameType::TeamMatch { per_team: 1 },
                 QueueMode::Quickmatch,
                 None,
                 start_ms,
             ),
             predicted_state: Some(GameState::new(
-                10,
-                10,
+                60,
+                40,
                 GameType::TeamMatch { per_team: 1 },
                 QueueMode::Quickmatch,
                 None,
@@ -95,6 +111,7 @@ impl GameEngine {
             local_player_id: None,
             command_counter: 0,
             local_command_seq: 0,
+            speculative_commands: Vec::new(),
             sync_status: SyncStatus::default(),
             prediction_needs_rebuild: false,
         }
@@ -122,7 +139,8 @@ impl GameEngine {
                 settings.arena_height,
                 settings.tick_duration_ms,
             ),
-            _ => (40, 40, DEFAULT_TICK_INTERVAL_MS), // Default dimensions for non-custom games
+            GameType::TeamMatch { .. } => (60, 40, DEFAULT_TICK_INTERVAL_MS),
+            _ => (40, 40, DEFAULT_TICK_INTERVAL_MS),
         };
 
         GameEngine {
@@ -148,18 +166,55 @@ impl GameEngine {
             local_player_id: None,
             command_counter: 0,
             local_command_seq: 0,
+            speculative_commands: Vec::new(),
             sync_status: SyncStatus::default(),
             prediction_needs_rebuild: false,
         }
     }
 
     pub fn new_from_state(game_id: u32, game_state: GameState) -> Self {
-        Self::new_from_state_with_command_counter(game_id, game_state, 0)
+        Self::try_new_from_state(game_id, game_state)
+            .expect("restored game state must satisfy gameplay invariants")
+    }
+
+    pub fn try_new_from_state(game_id: u32, game_state: GameState) -> Result<Self> {
+        Self::try_new_from_state_with_command_counter(game_id, game_state, 0)
+    }
+
+    /// Restore a state received through a client snapshot boundary. Unlike
+    /// authoritative recovery, this permits the narrow immutable legacy shape
+    /// recognized by `validate_client_snapshot_state` so completed pre-Boost
+    /// results remain viewable.
+    pub fn try_new_from_snapshot_state(game_id: u32, game_state: GameState) -> Result<Self> {
+        validate_client_snapshot_state(&game_state)?;
+        Ok(Self::from_validated_state(game_id, game_state, 0))
     }
 
     /// Restore an authoritative engine without reusing server command IDs.
     /// `next_command_sequence` is part of the v2 recovery envelope.
     pub fn new_from_state_with_command_counter(
+        game_id: u32,
+        game_state: GameState,
+        next_command_sequence: u32,
+    ) -> Self {
+        Self::try_new_from_state_with_command_counter(game_id, game_state, next_command_sequence)
+            .expect("recovered game state must satisfy gameplay invariants")
+    }
+
+    pub fn try_new_from_state_with_command_counter(
+        game_id: u32,
+        game_state: GameState,
+        next_command_sequence: u32,
+    ) -> Result<Self> {
+        game_state.validate_boost_invariants()?;
+        Ok(Self::from_validated_state(
+            game_id,
+            game_state,
+            next_command_sequence,
+        ))
+    }
+
+    fn from_validated_state(
         game_id: u32,
         game_state: GameState,
         next_command_sequence: u32,
@@ -176,6 +231,7 @@ impl GameEngine {
             local_player_id: None,
             command_counter: next_command_sequence,
             local_command_seq: 0,
+            speculative_commands: Vec::new(),
             sync_status: SyncStatus::default(),
             prediction_needs_rebuild: false,
         }
@@ -228,8 +284,10 @@ impl GameEngine {
             command,
         };
 
-        // Add to committed state command queue
-        self.committed_state.schedule_command(&command_message);
+        self.speculative_commands.push(command_message.clone());
+        if let Some(predicted_state) = &mut self.predicted_state {
+            predicted_state.schedule_command(&command_message);
+        }
 
         Ok(command_message)
     }
@@ -237,6 +295,20 @@ impl GameEngine {
     /// Process a server event and reconcile with local predictions
     pub fn process_server_event(&mut self, event_message: &GameEventMessage) -> Result<()> {
         let is_snapshot = matches!(&event_message.event, GameEvent::Snapshot { .. });
+        if let GameEvent::Snapshot { game_state } = &event_message.event {
+            if game_state.tick != event_message.tick {
+                self.sync_status.needs_resync = true;
+                return Err(anyhow::anyhow!(
+                    "snapshot envelope tick {} does not match state tick {}",
+                    event_message.tick,
+                    game_state.tick
+                ));
+            }
+            if let Err(error) = validate_client_snapshot_state(game_state) {
+                self.sync_status.needs_resync = true;
+                return Err(error);
+            }
+        }
 
         // Transport-integrity accounting. A gap means messages were lost
         // somewhere between the game executor and us; our committed state can
@@ -268,10 +340,21 @@ impl GameEngine {
             self.sync_status.last_server_tick = event_message.tick;
         }
 
-        // Step the committed state forward to the event tick before applying the event
-        // This ensures events are applied at the correct tick (similar to ReplayViewer)
-        while self.committed_state.current_tick() < event_message.tick {
-            self.committed_state.tick_forward(true)?;
+        // Advance and apply against a candidate so malformed deltas cannot
+        // leave movement/cooldown catch-up committed without their event (or
+        // mutate only one half of a Boost collection). A rejected candidate is
+        // discarded and the transport is told to request a fresh snapshot.
+        let mut candidate = match &event_message.event {
+            GameEvent::Snapshot { game_state } => game_state.clone(),
+            _ => self.committed_state.clone(),
+        };
+        if !is_snapshot {
+            while candidate.current_tick() < event_message.tick {
+                if let Err(error) = candidate.tick_forward(true) {
+                    self.sync_status.needs_resync = true;
+                    return Err(error);
+                }
+            }
         }
 
         // Fingerprint probes compare instead of mutate.
@@ -280,7 +363,7 @@ impl GameEngine {
             server_ts_ms,
         } = &event_message.event
         {
-            let local_hash = self.committed_state.sync_hash();
+            let local_hash = candidate.sync_hash();
             let matched = local_hash == *server_hash;
             self.sync_status.last_probe_tick = Some(event_message.tick);
             self.sync_status.last_probe_matched = Some(matched);
@@ -300,24 +383,55 @@ impl GameEngine {
                     self.sync_status.needs_resync = true;
                 }
             }
+            self.committed_state = candidate;
             return Ok(());
         }
 
-        self.committed_state
-            .apply_event(event_message.event.clone(), None);
+        if !is_snapshot
+            && let Err(error) = candidate.try_apply_replicated_event(event_message.event.clone())
+        {
+            self.sync_status.needs_resync = true;
+            return Err(error);
+        }
+        self.committed_state = candidate;
+
+        match &event_message.event {
+            GameEvent::CommandScheduled { command_message }
+            | GameEvent::CommandScheduledV2 {
+                command_message, ..
+            } => {
+                self.speculative_commands.retain(|speculative| {
+                    speculative.command_id_client != command_message.command_id_client
+                });
+            }
+            GameEvent::CommandRejected {
+                command_id_client: Some(command_id_client),
+                session_rejected_from,
+                ..
+            } => {
+                self.speculative_commands
+                    .retain(|speculative| speculative.command_id_client != *command_id_client);
+                // A session-wide fence can cover commands whose v2 identity
+                // is known only to the transport outbox. Force snapshot repair
+                // after retracting the exact decoded command.
+                if session_rejected_from.is_some() {
+                    self.sync_status.needs_resync = true;
+                }
+            }
+            _ => {}
+        }
         self.prediction_needs_rebuild = true;
 
         if is_snapshot {
             // Fresh authoritative state: divergence bookkeeping starts over.
+            // A snapshot is a complete state anchor. Retaining pre-snapshot
+            // speculative commands could replay an input that the snapshot
+            // already reflects (or that executed before it), especially a
+            // turn. The transport outbox still owns retrying any genuinely
+            // unacknowledged command after the anchor.
+            self.speculative_commands.clear();
             self.sync_status.needs_resync = false;
             self.sync_status.consecutive_hash_mismatches = 0;
-        }
-
-        // Also schedule in predicted state if it exists
-        if let GameEvent::CommandScheduled { command_message: _ } = &event_message.event
-            && let Some(predicted_state) = &mut self.predicted_state
-        {
-            predicted_state.apply_event(event_message.event.clone(), None);
         }
 
         Ok(())
@@ -378,6 +492,9 @@ impl GameEngine {
 
             // Remove RNG from predicted state so it doesn't generate food locally
             new_predicted_state.rng = None;
+            for command in &self.speculative_commands {
+                new_predicted_state.schedule_command(command);
+            }
 
             // Advance to target tick (stops if game completes)
             while !new_predicted_state.is_complete()
@@ -396,6 +513,17 @@ impl GameEngine {
     /// Run the required amount of ticks so that the game is at the given timestamp.
     /// Can be called from a very fast interval loop or requestAnimationFrame.
     pub fn run_until(&mut self, ts_ms: i64) -> Result<Vec<(u32, u64, GameEvent)>> {
+        self.run_until_observing_boost(ts_ms, &mut |_| {})
+    }
+
+    /// Advance committed simulation while reporting exact Boost lifecycle
+    /// transitions from each authoritative quantum. Predicted-state replay is
+    /// intentionally excluded from the observer.
+    pub fn run_until_observing_boost(
+        &mut self,
+        ts_ms: i64,
+        observer: &mut impl FnMut(BoostLifecycleTransition),
+    ) -> Result<Vec<(u32, u64, GameEvent)>> {
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms;
 
         // Handle pre-start case: if current time is before start time, don't advance
@@ -412,7 +540,9 @@ impl GameEngine {
         while !self.committed_state.is_complete()
             && self.committed_state.current_tick() < lagged_target_tick
         {
-            let events = self.committed_state.tick_forward(false)?;
+            let events = self
+                .committed_state
+                .tick_forward_observing_boost(false, observer)?;
             // Label events with the POST-step tick: an event produced during
             // the step N -> N+1 describes the state at N+1. Receivers
             // fast-forward their committed state to the event's tick before
@@ -422,7 +552,15 @@ impl GameEngine {
             // the body geometry permanently.
             let post_tick = self.committed_state.current_tick();
             for (sequence, event) in events {
-                out.push((post_tick, sequence, event));
+                // The engine's initial snapshot is deliberately captured
+                // before the first 0 -> 1 simulation step. Its envelope must
+                // carry that same internal tick; all mutation events describe
+                // the post-step state and keep the post-step label.
+                let event_tick = match &event {
+                    GameEvent::Snapshot { game_state } => game_state.tick,
+                    _ => post_tick,
+                };
+                out.push((event_tick, sequence, event));
             }
         }
 
@@ -441,6 +579,24 @@ impl GameEngine {
         }
 
         Ok(out)
+    }
+
+    /// Milliseconds the committed state trails the wall-clock target after the
+    /// engine's intentional committed-state lag window is applied. A terminal
+    /// or not-yet-started game has no scheduler lag.
+    pub fn authoritative_scheduler_lag_ms(&self, ts_ms: i64) -> u64 {
+        if self.committed_state.is_complete() || ts_ms < self.committed_state.start_ms {
+            return 0;
+        }
+
+        let tick_duration_ms = self.committed_state.properties.tick_duration_ms.max(1);
+        let elapsed_ms = ts_ms.saturating_sub(self.committed_state.start_ms);
+        let wallclock_target_tick =
+            u32::try_from(elapsed_ms / i64::from(tick_duration_ms)).unwrap_or(u32::MAX);
+        let lagged_target_tick =
+            wallclock_target_tick.saturating_sub(self.committed_state_lag_ms / tick_duration_ms);
+        u64::from(lagged_target_tick.saturating_sub(self.committed_state.current_tick()))
+            * u64::from(tick_duration_ms)
     }
 
     pub fn process_command(
@@ -572,7 +728,10 @@ impl GameEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Direction, Position};
+    use crate::{
+        BOOST_TICK_INTERVAL_MS, ClientCommandIdentityV2, DEFAULT_BOOST_SPEED_MILLI, Direction,
+        GameStatus, NORMAL_SNAKE_SPEED_MILLI, Position,
+    };
 
     fn engine_with_imminent_wall_crash() -> (GameEngine, u32, i64) {
         let mut state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
@@ -640,6 +799,432 @@ mod tests {
             cmd1.command_id_client, cmd2.command_id_client,
             "same-tick local commands must have distinct ids"
         );
+    }
+
+    #[test]
+    fn rejected_predicted_boost_rebuilds_from_unmodified_committed_state() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.arena.snakes[snake_id as usize].boost.charge_ms = 1_000;
+        let mut engine = GameEngine::new_from_state(99, state);
+        engine.set_local_player_id(7);
+
+        let local = engine
+            .process_local_command(GameCommand::ActivateBoost { snake_id })
+            .unwrap();
+        engine.rebuild_predicted_state(50).unwrap();
+        let predicted = &engine.predicted_state().unwrap().arena.snakes[snake_id as usize];
+        assert!(predicted.boost.active);
+        assert_eq!(predicted.speed_milli, DEFAULT_BOOST_SPEED_MILLI);
+
+        let committed = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(!committed.boost.active);
+        assert_eq!(committed.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 99,
+                tick: 1,
+                sequence: 0,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::CommandRejected {
+                    command_id: ClientCommandIdentityV2 {
+                        game_id: 99,
+                        user_id: 7,
+                        client_game_session_id: "session".into(),
+                        sequence: 1,
+                    },
+                    reason: "rejected for test".into(),
+                    command_id_client: Some(local.command_id_client),
+                    session_rejected_from: None,
+                },
+            })
+            .unwrap();
+        engine.rebuild_predicted_state(50).unwrap();
+
+        let predicted = &engine.predicted_state().unwrap().arena.snakes[snake_id as usize];
+        assert!(!predicted.boost.active);
+        assert_eq!(predicted.boost.charge_ms, 1_000);
+        assert_eq!(predicted.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+    }
+
+    #[test]
+    fn predicted_boost_release_stops_immediately_without_spending_charge() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        let snake = &mut state.arena.snakes[snake_id as usize];
+        snake.boost.charge_ms = 1_000;
+        snake.boost.active = true;
+        snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
+        let mut engine = GameEngine::new_from_state(99, state);
+        engine.set_local_player_id(7);
+
+        engine
+            .process_local_command(GameCommand::DeactivateBoost { snake_id })
+            .unwrap();
+        engine.rebuild_predicted_state(50).unwrap();
+
+        let predicted = &engine.predicted_state().unwrap().arena.snakes[snake_id as usize];
+        assert!(!predicted.boost.active);
+        assert_eq!(predicted.boost.charge_ms, 1_000);
+        assert_eq!(predicted.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+
+        let committed = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(committed.boost.active);
+        assert_eq!(committed.boost.charge_ms, 1_000);
+        assert_eq!(committed.speed_milli, DEFAULT_BOOST_SPEED_MILLI);
+    }
+
+    #[test]
+    fn snapshot_reanchor_discards_pre_snapshot_boost_prediction() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.arena.snakes[snake_id as usize].boost.charge_ms = 1_000;
+        let mut engine = GameEngine::new_from_state(99, state);
+        engine.set_local_player_id(7);
+
+        engine
+            .process_local_command(GameCommand::ActivateBoost { snake_id })
+            .unwrap();
+        engine.rebuild_predicted_state(50).unwrap();
+        assert!(
+            engine.predicted_state().unwrap().arena.snakes[snake_id as usize]
+                .boost
+                .active
+        );
+
+        let authoritative_anchor = engine.committed_state().clone();
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 99,
+                tick: authoritative_anchor.current_tick(),
+                sequence: 0,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::Snapshot {
+                    game_state: authoritative_anchor,
+                },
+            })
+            .unwrap();
+        engine.rebuild_predicted_state(50).unwrap();
+
+        let predicted = &engine.predicted_state().unwrap().arena.snakes[snake_id as usize];
+        assert!(!predicted.boost.active);
+        assert_eq!(predicted.boost.charge_ms, 1_000);
+        assert_eq!(predicted.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+    }
+
+    #[test]
+    fn malformed_boost_snapshot_is_rejected_before_it_can_run_forever() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        let snake = &mut state.arena.snakes[snake_id as usize];
+        snake.boost.active = true;
+        snake.boost.charge_ms = 25;
+        snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
+
+        assert!(GameEngine::try_new_from_state(99, state).is_err());
+    }
+
+    fn legacy_team_snapshot(status: GameStatus) -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            Some(17),
+            0,
+        );
+        state.add_player(7, Some("legacy-blue".into())).unwrap();
+        state.add_player(8, Some("legacy-red".into())).unwrap();
+        state.status = status;
+
+        // Recreate the durable pre-Boost JSON, then deserialize it through the
+        // compatibility defaults exactly as the server's history path does.
+        let mut persisted = serde_json::to_value(state).unwrap();
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("player_action_counts");
+        persisted["properties"]["tick_duration_ms"] = serde_json::json!(DEFAULT_TICK_INTERVAL_MS);
+        persisted["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("boost");
+        persisted["arena"]
+            .as_object_mut()
+            .unwrap()
+            .remove("boost_pads");
+        for snake in persisted["arena"]["snakes"].as_array_mut().unwrap() {
+            let snake = snake.as_object_mut().unwrap();
+            snake.remove("speed_milli");
+            snake.remove("movement_credit");
+            snake.remove("boost");
+        }
+        serde_json::from_value(persisted).unwrap()
+    }
+
+    #[test]
+    fn client_snapshot_admission_is_terminal_and_legacy_shape_only() {
+        let completed = legacy_team_snapshot(GameStatus::Complete {
+            winning_snake_id: Some(0),
+        });
+        assert!(completed.validate_boost_invariants().is_err());
+        assert!(GameEngine::try_new_from_state(99, completed.clone()).is_err());
+
+        let restored = GameEngine::try_new_from_snapshot_state(99, completed.clone())
+            .expect("pre-Boost completed history must remain viewable");
+        assert!(restored.committed_state().is_complete());
+
+        let nonterminal = legacy_team_snapshot(GameStatus::Started { server_id: 1 });
+        assert!(GameEngine::try_new_from_snapshot_state(99, nonterminal).is_err());
+
+        let mut wrong_quantum = completed.clone();
+        wrong_quantum.properties.tick_duration_ms = BOOST_TICK_INTERVAL_MS;
+        assert!(GameEngine::try_new_from_snapshot_state(99, wrong_quantum).is_err());
+
+        let mut malformed_current = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        malformed_current.add_player(7, None).unwrap();
+        malformed_current.add_player(8, None).unwrap();
+        malformed_current.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        malformed_current.arena.boost_pads.pop();
+        assert!(GameEngine::try_new_from_snapshot_state(99, malformed_current).is_err());
+
+        let mut live_engine = GameEngine::new(99, 0);
+        live_engine
+            .process_server_event(&GameEventMessage {
+                game_id: 99,
+                tick: completed.tick,
+                sequence: completed.event_sequence,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::Snapshot {
+                    game_state: completed,
+                },
+            })
+            .expect("terminal history snapshot must re-anchor a client");
+        assert!(live_engine.committed_state().is_complete());
+    }
+
+    #[test]
+    fn authoritative_scheduler_lag_uses_the_committed_lagged_target() {
+        let state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let mut engine = GameEngine::new_from_state(99, state);
+
+        assert_eq!(engine.authoritative_scheduler_lag_ms(500), 0);
+        assert_eq!(engine.authoritative_scheduler_lag_ms(650), 150);
+        engine.run_until(650).unwrap();
+        assert_eq!(engine.current_tick(), 3);
+        assert_eq!(engine.authoritative_scheduler_lag_ms(650), 0);
+    }
+
+    #[test]
+    fn authoritative_boost_observer_keeps_same_quantum_activation_and_depletion() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        let snake = &mut state.arena.snakes[snake_id as usize];
+        snake.body = vec![Position { x: 30, y: 20 }, Position { x: 29, y: 20 }];
+        snake.direction = Direction::Right;
+        snake.boost.charge_ms = 50;
+        state.schedule_command(&GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: 7,
+                sequence_number: 1,
+            },
+            command_id_server: Some(CommandId {
+                tick: 0,
+                user_id: 7,
+                sequence_number: 1,
+            }),
+            command: GameCommand::ActivateBoost { snake_id },
+        });
+        let mut engine = GameEngine::new_from_state(99, state);
+        let mut transitions = Vec::new();
+
+        engine
+            .run_until_observing_boost(550, &mut |transition| transitions.push(transition))
+            .unwrap();
+
+        assert_eq!(
+            transitions,
+            vec![
+                BoostLifecycleTransition::Activated { snake_id },
+                BoostLifecycleTransition::Depleted { snake_id },
+            ]
+        );
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.boost.charge_ms, 0);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+    }
+
+    #[test]
+    fn scheduled_noop_activation_is_not_a_lifecycle_activation() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.schedule_command(&GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 0,
+                user_id: 7,
+                sequence_number: 1,
+            },
+            command_id_server: Some(CommandId {
+                tick: 0,
+                user_id: 7,
+                sequence_number: 1,
+            }),
+            command: GameCommand::ActivateBoost { snake_id },
+        });
+        let mut engine = GameEngine::new_from_state(99, state);
+        let mut transitions = Vec::new();
+
+        engine
+            .run_until_observing_boost(550, &mut |transition| transitions.push(transition))
+            .unwrap();
+
+        assert!(transitions.is_empty());
+        let snake = &engine.committed_state().arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.boost.charge_ms, 0);
+    }
+
+    #[test]
+    fn snapshot_tick_mismatch_and_malformed_delta_leave_committed_state_untouched() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        state.add_player(7, None).unwrap();
+        let mut engine = GameEngine::new_from_state(99, state);
+        let before = serde_json::to_value(engine.committed_state()).unwrap();
+
+        let mismatched_anchor = engine.committed_state().clone();
+        assert!(
+            engine
+                .process_server_event(&GameEventMessage {
+                    game_id: 99,
+                    tick: mismatched_anchor.tick + 1,
+                    sequence: 1,
+                    stream_seq: 1,
+                    user_id: None,
+                    event: GameEvent::Snapshot {
+                        game_state: mismatched_anchor,
+                    },
+                })
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(engine.committed_state()).unwrap(),
+            before
+        );
+        assert!(engine.sync_status().needs_resync);
+        assert_eq!(engine.sync_status().last_stream_seq, 0);
+
+        engine.clear_needs_resync();
+        assert!(
+            engine
+                .process_server_event(&GameEventMessage {
+                    game_id: 99,
+                    tick: 2,
+                    sequence: 2,
+                    stream_seq: 1,
+                    user_id: None,
+                    event: GameEvent::BoostPacketCollected {
+                        pad_id: u8::MAX,
+                        snake_id: 0,
+                        charge_ms_after: 750,
+                        respawn_at_tick: 162,
+                    },
+                })
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(engine.committed_state()).unwrap(),
+            before,
+            "candidate catch-up and the malformed packet transition must both roll back"
+        );
+        assert!(engine.sync_status().needs_resync);
+    }
+
+    #[test]
+    fn initial_engine_snapshot_uses_its_internal_pre_step_tick() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut engine = GameEngine::new_from_state(1, state);
+        let events = engine.run_until(600).expect("first committed quantum");
+        let (envelope_tick, _, snapshot_tick) = events
+            .iter()
+            .find_map(|(tick, sequence, event)| match event {
+                GameEvent::Snapshot { game_state } => Some((*tick, *sequence, game_state.tick)),
+                _ => None,
+            })
+            .expect("first quantum emits the initial engine snapshot");
+        assert_eq!(envelope_tick, 0);
+        assert_eq!(snapshot_tick, 0);
+        assert_eq!(envelope_tick, snapshot_tick);
     }
 
     /// The client-path double-tap: two turns issued within one predicted

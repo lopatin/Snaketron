@@ -32,7 +32,67 @@ use crate::{
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use common::{BoostConfig, NORMAL_SNAKE_SPEED_MILLI};
+
 const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const BOOST_SPEED_MULTIPLIER_ENV: &str = "SNAKETRON_BOOST_SPEED_MULTIPLIER";
+
+/// Resolve the human-facing Boost multiplier into the integer simulation
+/// representation. Milli-speed keeps fractional values deterministic across
+/// native, replay, replica, and WASM engines.
+pub fn resolve_boost_config(speed_multiplier: Option<&str>) -> Result<BoostConfig> {
+    let mut config = BoostConfig::default();
+    if let Some(raw_multiplier) = speed_multiplier {
+        config.speed_milli = parse_speed_multiplier_milli(raw_multiplier)?;
+    }
+    config
+        .validate()
+        .context("Invalid server Boost configuration")?;
+    Ok(config)
+}
+
+fn parse_speed_multiplier_milli(raw_multiplier: &str) -> Result<u16> {
+    let multiplier = raw_multiplier.trim();
+    let mut parts = multiplier.split('.');
+    let whole = parts
+        .next()
+        .filter(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{BOOST_SPEED_MULTIPLIER_ENV} must be a decimal multiplier from 1.000 to 2.000"
+            )
+        })?;
+    let fractional = parts.next();
+    if parts.next().is_some()
+        || fractional.is_some_and(|part| {
+            part.is_empty()
+                || part.len() > 3
+                || !part.chars().all(|character| character.is_ascii_digit())
+        })
+    {
+        return Err(anyhow::anyhow!(
+            "{BOOST_SPEED_MULTIPLIER_ENV} supports at most three decimal places"
+        ));
+    }
+
+    let whole_milli = whole
+        .parse::<u16>()
+        .ok()
+        .and_then(|value| value.checked_mul(NORMAL_SNAKE_SPEED_MILLI))
+        .ok_or_else(|| anyhow::anyhow!("{BOOST_SPEED_MULTIPLIER_ENV} is out of range"))?;
+    let fractional_milli = match fractional {
+        Some(part) => {
+            let parsed = part
+                .parse::<u16>()
+                .with_context(|| format!("Invalid {BOOST_SPEED_MULTIPLIER_ENV}"))?;
+            parsed * 10_u16.pow(3 - part.len() as u32)
+        }
+        None => 0,
+    };
+    whole_milli
+        .checked_add(fractional_milli)
+        .ok_or_else(|| anyhow::anyhow!("{BOOST_SPEED_MULTIPLIER_ENV} is out of range"))
+}
 
 #[derive(Deserialize)]
 struct EcsTaskMetadata {
@@ -132,6 +192,8 @@ pub struct GameServerConfig {
     /// Redis URL for membership, assignment, leases, and durable streams
     /// (e.g., "redis://127.0.0.1:6379")
     pub redis_url: String,
+    /// Boost rules resolved and validated once at process startup.
+    pub boost_config: BoostConfig,
 }
 
 /// A complete game server instance with all components
@@ -196,7 +258,12 @@ impl GameServer {
             jwt_verifier,
             replay_dir: _,
             redis_url,
+            boost_config,
         } = config;
+
+        boost_config
+            .validate()
+            .context("Invalid Boost configuration supplied to game server")?;
 
         // Register server in database
         info!("Registering server in database for region: {}", region);
@@ -380,7 +447,7 @@ impl GameServer {
         lobby_manager.start_lobby_update_forwarder();
 
         // Create the matchmaking manager
-        let matchmaking = MatchmakingManager::new(redis.clone())
+        let matchmaking = MatchmakingManager::new_with_boost_config(redis.clone(), boost_config)
             .context("Failed to create matchmaking manager")?;
         let outbox_matchmaking = matchmaking.clone();
         let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(matchmaking));
@@ -890,6 +957,7 @@ pub async fn start_test_server_with_grpc(
         jwt_verifier: jwt_verifier.clone(),
         replay_dir,
         redis_url: redis_url.clone(),
+        boost_config: BoostConfig::default(),
     };
 
     let game_server = GameServer::start(config).await?;
@@ -969,8 +1037,45 @@ pub async fn run_heartbeat_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{announce_client_drain_after_executor_handoff, ecs_task_id_from_arn};
+    use super::{
+        announce_client_drain_after_executor_handoff, ecs_task_id_from_arn, resolve_boost_config,
+    };
     use crate::lifecycle::TaskLifecycle;
+    use common::DEFAULT_BOOST_SPEED_MILLI;
+
+    #[test]
+    fn boost_multiplier_config_supports_fractional_values_and_defaults() {
+        assert_eq!(
+            resolve_boost_config(None).unwrap().speed_milli,
+            DEFAULT_BOOST_SPEED_MILLI
+        );
+        for (multiplier, speed_milli) in [
+            ("1", 1_000),
+            ("1.0", 1_000),
+            ("1.25", 1_250),
+            (" 1.750 ", 1_750),
+            ("1.999", 1_999),
+            ("2.000", 2_000),
+        ] {
+            assert_eq!(
+                resolve_boost_config(Some(multiplier)).unwrap().speed_milli,
+                speed_milli,
+                "wrong milli-speed for {multiplier}"
+            );
+        }
+    }
+
+    #[test]
+    fn boost_multiplier_config_fails_startup_validation_outside_one_to_two_x() {
+        for invalid in [
+            "", "0.999", "1.", ".5", "1.0001", "1.2.3", "2.001", "nan", "-1.5",
+        ] {
+            assert!(
+                resolve_boost_config(Some(invalid)).is_err(),
+                "accepted invalid Boost multiplier {invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn extracts_task_id_from_long_and_short_ecs_arns() {

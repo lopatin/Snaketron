@@ -617,8 +617,8 @@ mod tests {
     #[test]
     fn stress_completion_rejects_player_progression_effects() {
         let mut state = GameState::new(
-            10,
-            10,
+            60,
+            40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
             Some(1),
