@@ -2,7 +2,9 @@ mod common;
 
 use crate::common::{TestClient, TestEnvironment};
 use ::common::{
-    CommandId, Direction, GameCommand, GameCommandMessage, GameEvent, GameStatus, GameType, TeamId,
+    BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS, CommandId, DEFAULT_BOOST_CAPACITY_MS,
+    DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS, DEFAULT_BOOST_SPEED_MILLI,
+    Direction, GameCommand, GameCommandMessage, GameEvent, GameStatus, GameType, Position, TeamId,
 };
 use anyhow::Result;
 use server::ws_server::WSMessage;
@@ -321,6 +323,50 @@ async fn test_duel_game() -> Result<()> {
                     );
                     println!("End zone depth: {}", team_config.end_zone_depth);
                     println!("Goal width: {}", team_config.goal_width);
+
+                    assert_eq!(
+                        state1.properties.tick_duration_ms, BOOST_TICK_INTERVAL_MS,
+                        "canonical duel matchmaking must use the fixed Boost quantum"
+                    );
+                    let boost = state1
+                        .properties
+                        .boost
+                        .as_ref()
+                        .expect("canonical duel matchmaking must snapshot Boost rules");
+                    assert_eq!(boost.speed_milli, DEFAULT_BOOST_SPEED_MILLI);
+                    assert_eq!(boost.capacity_ms, DEFAULT_BOOST_CAPACITY_MS);
+                    assert_eq!(boost.packet_charge_ms, DEFAULT_BOOST_PACKET_CHARGE_MS);
+                    assert_eq!(boost.pad_respawn_ms, DEFAULT_BOOST_PAD_RESPAWN_MS);
+                    assert_eq!(boost.spot_layout_version, BOOST_SPOT_LAYOUT_VERSION);
+                    assert_eq!(
+                        state1
+                            .arena
+                            .boost_pads
+                            .iter()
+                            .map(|pad| (pad.position, pad.charge_ms, pad.size_cells))
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (Position { x: 14, y: 4 }, DEFAULT_BOOST_CAPACITY_MS, 2),
+                            (Position { x: 14, y: 34 }, DEFAULT_BOOST_CAPACITY_MS, 2),
+                            (Position { x: 44, y: 4 }, DEFAULT_BOOST_CAPACITY_MS, 2),
+                            (Position { x: 44, y: 34 }, DEFAULT_BOOST_CAPACITY_MS, 2),
+                            (Position { x: 26, y: 12 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 33, y: 12 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 37, y: 16 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 37, y: 23 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 33, y: 27 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 26, y: 27 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 22, y: 23 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                            (Position { x: 22, y: 16 }, DEFAULT_BOOST_PACKET_CHARGE_MS, 1),
+                        ],
+                        "canonical duel matchmaking must materialize the v3 octagonal pad layout"
+                    );
+                    assert!(state1.arena.boost_pads.iter().all(|pad| {
+                        pad.footprint_cells()
+                            .iter()
+                            .all(|cell| !state1.arena.food.contains(cell))
+                            && pad.respawn_at_tick.is_none()
+                    }));
 
                     println!("\n✅ Duel mode test passed!");
                     println!("  - Snakes correctly positioned in their endzones");

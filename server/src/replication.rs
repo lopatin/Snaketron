@@ -210,12 +210,40 @@ impl PartitionReplica {
     }
 
     /// Process a game event and update the game state
-    async fn process_event(&self, event_msg: GameEventMessage) -> Result<()> {
+    async fn process_event(&self, event_msg: GameEventMessage) -> Result<bool> {
         let game_id = event_msg.game_id;
         debug!(
             "Processing game event for game {} in partition {}",
             game_id, self.partition_id
         );
+
+        // A snapshot is the only object allowed to thaw a cold replica, so it
+        // must be structurally valid before continuity bookkeeping removes the
+        // cold marker. Rejecting here also prevents an envelope/internal tick
+        // mismatch from being broadcast as a valid re-anchor.
+        if let GameEvent::Snapshot { game_state } = &event_msg.event {
+            let validation = if game_state.tick != event_msg.tick {
+                Err(anyhow::anyhow!(
+                    "snapshot envelope tick {} does not match state tick {}",
+                    event_msg.tick,
+                    game_state.tick
+                ))
+            } else {
+                game_state.validate_boost_invariants()
+            };
+            if let Err(error) = validation {
+                self.cold_games.write().await.insert(game_id);
+                warn!(
+                    game_id,
+                    partition = self.partition_id,
+                    tick = event_msg.tick,
+                    %error,
+                    "Replica rejected malformed snapshot; waiting for a fresh snapshot"
+                );
+                self.request_snapshots_rate_limited().await;
+                return Ok(false);
+            }
+        }
 
         // Transport-integrity check, kept as defense-in-depth. The Streams
         // bus itself doesn't drop, but a gap can still appear past it (trim
@@ -256,7 +284,7 @@ impl PartitionReplica {
                     event_msg.stream_seq.saturating_sub(expected)
                 );
                 self.request_snapshots_rate_limited().await;
-                return Ok(());
+                return Ok(false);
             }
             ContinuityAction::SuppressWhileCold => {
                 debug!(
@@ -264,7 +292,7 @@ impl PartitionReplica {
                     self.partition_id, game_id, event_msg.stream_seq
                 );
                 self.request_snapshots_rate_limited().await;
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -275,11 +303,12 @@ impl PartitionReplica {
                     "Replica for partition {} dropping stale message for game {} (stream_seq {} <= {})",
                     self.partition_id, game_id, event_msg.stream_seq, last
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
 
         let mut fingerprint_divergence = None;
+        let mut invalid_transition = None;
         {
             // State mutation and its watermark update share this one write
             // guard. A subscriber therefore observes either the complete old
@@ -313,40 +342,43 @@ impl PartitionReplica {
                         _ => None,
                     };
                     if let Some(replica) = replicas.get_mut(&game_id) {
-                        {
-                            let game_state = &mut replica.game_state;
-                            // Tick forward until we reach the event's tick. This must
-                            // loop: events can arrive more than one tick apart (quiet
-                            // stretches emit nothing), and catching up a single tick
-                            // per event leaves the replica permanently behind —
-                            // corrupting every join snapshot served from it.
-                            while game_state.tick < event_msg.tick {
-                                if let Err(e) = game_state.tick_forward(true) {
-                                    error!("Error during tick_forward: {:?}", e);
-                                    break;
-                                }
-                            }
-
-                            if let Some(expected) = expected_fingerprint {
-                                let actual = game_state.sync_hash();
-                                if actual != expected {
-                                    fingerprint_divergence = Some((expected, actual));
-                                }
-                            }
-
-                            if fingerprint_divergence.is_none() {
-                                // TickHash is a no-op; every other event mutates the
-                                // local replica after it has advanced to the event tick.
-                                game_state.apply_event(event_msg.event.clone(), None);
-                                debug!(
-                                    "Applied event to game {} state: {:?}",
-                                    game_id, event_msg.event
-                                );
+                        // Catch-up and delta application are one transaction:
+                        // an invalid delta must not leave the replica advanced
+                        // to its tick or half-apply a pad/snake transition.
+                        let mut candidate = replica.game_state.clone();
+                        while candidate.tick < event_msg.tick {
+                            if let Err(error) = candidate.tick_forward(true) {
+                                invalid_transition = Some(format!(
+                                    "failed to derive tick {} while applying event at tick {}: {error}",
+                                    candidate.tick.saturating_add(1),
+                                    event_msg.tick
+                                ));
+                                break;
                             }
                         }
 
-                        if fingerprint_divergence.is_none() && event_msg.stream_seq > 0 {
-                            replica.stream_seq = event_msg.stream_seq;
+                        if invalid_transition.is_none() {
+                            if let Some(expected) = expected_fingerprint {
+                                let actual = candidate.sync_hash();
+                                if actual != expected {
+                                    fingerprint_divergence = Some((expected, actual));
+                                }
+                            } else if let Err(error) =
+                                candidate.try_apply_replicated_event(event_msg.event.clone())
+                            {
+                                invalid_transition = Some(error.to_string());
+                            }
+                        }
+
+                        if invalid_transition.is_none() && fingerprint_divergence.is_none() {
+                            replica.game_state = candidate;
+                            if event_msg.stream_seq > 0 {
+                                replica.stream_seq = event_msg.stream_seq;
+                            }
+                            debug!(
+                                "Applied event to game {} state: {:?}",
+                                game_id, event_msg.event
+                            );
                         }
                     } else {
                         if is_stateful_unknown_event(&event_msg) {
@@ -370,6 +402,19 @@ impl PartitionReplica {
             }
         }
 
+        if let Some(error) = invalid_transition {
+            self.cold_games.write().await.insert(game_id);
+            warn!(
+                game_id,
+                partition = self.partition_id,
+                tick = event_msg.tick,
+                %error,
+                "Replica rejected malformed delta atomically; suppressing deltas until a fresh snapshot"
+            );
+            self.request_snapshots_rate_limited().await;
+            return Ok(false);
+        }
+
         if let Some((expected, actual)) = fingerprint_divergence {
             crate::resilience_metrics::record_recovery_fingerprint_divergence(1);
             self.cold_games.write().await.insert(game_id);
@@ -382,7 +427,7 @@ impl PartitionReplica {
                 "Replica fingerprint diverged; suppressing deltas until a fresh snapshot"
             );
             self.request_snapshots_rate_limited().await;
-            return Ok(());
+            return Ok(false);
         }
 
         // Broadcast the event to any local subscribers
@@ -405,7 +450,7 @@ impl PartitionReplica {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn process_received_event(&self, event: GameEventMessage) -> Result<()> {
@@ -415,8 +460,8 @@ impl PartitionReplica {
             GameEvent::Snapshot { game_state }
                 if matches!(game_state.status, GameStatus::Complete { .. })
         );
-        self.process_event(event).await?;
-        if is_terminal_snapshot {
+        let applied = self.process_event(event).await?;
+        if applied && is_terminal_snapshot {
             // The fenced completion transaction writes the immutable
             // completion record, recovery envelope, stored snapshot, and
             // pending-effect index before appending this event.
@@ -936,8 +981,8 @@ mod tests {
 
     fn snapshot(sequence: u64, stream_seq: u64) -> GameEventMessage {
         let state = GameState::new(
-            10,
-            10,
+            60,
+            40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
             None,
@@ -945,7 +990,7 @@ mod tests {
         );
         GameEventMessage {
             game_id: 1,
-            tick: 1,
+            tick: state.tick,
             sequence,
             stream_seq,
             user_id: None,
@@ -1008,6 +1053,7 @@ mod tests {
                 sequence: 1,
             },
             reason: "invalid command".to_owned(),
+            command_id_client: None,
             session_rejected_from: None,
         };
         tx.send(rejection).unwrap();
@@ -1025,8 +1071,8 @@ mod tests {
     #[tokio::test]
     async fn replica_snapshot_never_observes_state_without_its_watermark() {
         let old_state = GameState::new(
-            10,
-            10,
+            60,
+            40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
             None,
@@ -1257,6 +1303,121 @@ mod tests {
         ));
         assert!(replica_store.read().await.is_empty());
         assert!(broadcasters.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_boost_messages_are_atomic_and_keep_replica_cold_until_valid_snapshot() {
+        let client = redis::Client::open("redis://127.0.0.1:6379/1?protocol=resp3")
+            .expect("valid local Redis URL");
+        let (push_tx, _push_rx) = broadcast::channel(8);
+        let manager = crate::redis_utils::create_connection_manager(client.clone(), push_tx)
+            .await
+            .expect("local Redis is required for replication tests");
+        let token = CancellationToken::new();
+        let bus = Arc::new(
+            GameBus::new(
+                manager.clone(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                (0..PARTITION_COUNT)
+                    .map(|_| manager.clone().into())
+                    .collect(),
+                manager.clone(),
+                manager,
+                client,
+                token.clone(),
+            )
+            .expect("test GameBus"),
+        );
+
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        state.add_player(7, None).expect("add player");
+        let game_id = 1;
+        let store: ReplicaStore = Arc::new(RwLock::new(HashMap::from([(
+            game_id,
+            ReplicatedGame {
+                game_state: state.clone(),
+                stream_seq: 10,
+            },
+        )])));
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let replica = PartitionReplica::new(
+            1,
+            bus,
+            store.clone(),
+            Arc::new(RwLock::new(HashMap::from([(game_id, event_tx)]))),
+            token.clone(),
+        );
+        // Keep this unit test self-contained: malformed-state behavior still
+        // marks the game cold, while the already-recent request timestamp
+        // suppresses an external snapshot-request write.
+        replica.last_gap_request_ms.store(
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let before = serde_json::to_value(&state).unwrap();
+        let footprint_cell = state.arena.boost_pads[0].footprint_cells()[3];
+
+        let malformed_delta = GameEventMessage {
+            game_id,
+            tick: state.tick,
+            sequence: 1,
+            stream_seq: 11,
+            user_id: None,
+            event: GameEvent::FoodSpawned {
+                position: footprint_cell,
+            },
+        };
+        assert!(!replica.process_event(malformed_delta).await.unwrap());
+        let (observed, watermark) = replica_snapshot(&store, game_id).await.unwrap();
+        assert_eq!(serde_json::to_value(observed).unwrap(), before);
+        assert_eq!(watermark, 10);
+        assert!(replica.cold_games.read().await.contains(&game_id));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut malformed_state = state.clone();
+        malformed_state.arena.food.push(footprint_cell);
+        let malformed_snapshot = GameEventMessage {
+            game_id,
+            tick: malformed_state.tick,
+            sequence: 2,
+            stream_seq: 12,
+            user_id: None,
+            event: GameEvent::Snapshot {
+                game_state: malformed_state,
+            },
+        };
+        assert!(!replica.process_event(malformed_snapshot).await.unwrap());
+        assert!(replica.cold_games.read().await.contains(&game_id));
+        assert_eq!(replica_snapshot(&store, game_id).await.unwrap().1, 10);
+
+        let valid_snapshot = GameEventMessage {
+            game_id,
+            tick: state.tick,
+            sequence: 3,
+            stream_seq: 13,
+            user_id: None,
+            event: GameEvent::Snapshot { game_state: state },
+        };
+        assert!(replica.process_event(valid_snapshot).await.unwrap());
+        assert!(!replica.cold_games.read().await.contains(&game_id));
+        assert_eq!(replica_snapshot(&store, game_id).await.unwrap().1, 13);
+        assert!(matches!(
+            event_rx.recv().await.unwrap().event,
+            GameEvent::Snapshot { .. }
+        ));
+        token.cancel();
     }
 
     #[test]

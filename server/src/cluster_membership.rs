@@ -15,7 +15,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 2;
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 5;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);

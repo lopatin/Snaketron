@@ -16,7 +16,11 @@ fn completed_state(
     users: &[&User],
     started_at_ms: i64,
 ) -> Result<GameState> {
-    let mut state = GameState::new(40, 40, game_type, queue_mode, Some(7), started_at_ms);
+    let (width, height) = match &game_type {
+        GameType::TeamMatch { per_team: 1 | 2 } => (60, 40),
+        _ => (40, 40),
+    };
+    let mut state = GameState::new(width, height, game_type, queue_mode, Some(7), started_at_ms);
     for user in users {
         state.add_player(user.id as u32, Some(user.username.clone()))?;
     }

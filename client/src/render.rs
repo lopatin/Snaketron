@@ -1,4 +1,4 @@
-use common::GameState;
+use common::{BoostPad, GameState};
 use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
@@ -17,6 +17,481 @@ fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64
     match rotation {
         90 | 270 => (height, width),
         _ => (width, height),
+    }
+}
+
+/// Return the screen-space bounding box of a square Boost footprint in grid
+/// cells. Transforming every occupied cell keeps the 2x2 full-tank packet
+/// centered correctly through all four arena rotations.
+fn transformed_pad_bounds(
+    pad: &BoostPad,
+    game_width: f64,
+    game_height: f64,
+    rotation: i32,
+) -> Option<(f64, f64, f64, f64)> {
+    let mut cells = pad.footprint_cells().into_iter();
+    let first = cells.next()?;
+    let (first_x, first_y) = transform_coords(
+        first.x as f64,
+        first.y as f64,
+        game_width,
+        game_height,
+        rotation,
+    );
+    let (mut min_x, mut max_x) = (first_x, first_x);
+    let (mut min_y, mut max_y) = (first_y, first_y);
+
+    for cell in cells {
+        let (x, y) = transform_coords(
+            cell.x as f64,
+            cell.y as f64,
+            game_width,
+            game_height,
+            rotation,
+        );
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    Some((min_x, min_y, max_x - min_x + 1.0, max_y - min_y + 1.0))
+}
+
+fn transformed_active_pad_bounds(
+    pads: &[BoostPad],
+    game_width: f64,
+    game_height: f64,
+    rotation: i32,
+) -> Vec<(f64, f64, f64, f64)> {
+    pads.iter()
+        .filter(|pad| pad.respawn_at_tick.is_none())
+        .filter_map(|pad| transformed_pad_bounds(pad, game_width, game_height, rotation))
+        .collect()
+}
+
+const NOS_INK: &str = "#172033";
+const NOS_BLUE: &str = "#3b82f6";
+const NOS_BLUE_HIGHLIGHT: &str = "#93c5fd";
+const NOS_BLUE_SHADE: &str = "#2563eb";
+const NOS_LABEL: &str = "#f8fafc";
+const NOS_STEEL_DARK: &str = "#475569";
+const NOS_STEEL_LIGHT: &str = "#cbd5e1";
+const NOS_ORANGE: &str = "#ff641e";
+
+const BOOST_OUTER_COLOR: &str = "#fff200";
+const BOOST_OUTER_EXTRA: f64 = 6.0;
+const ORDINARY_OUTLINE_EXTRA: f64 = 2.0;
+const BOOST_MASK_EXTRA: f64 = 3.0;
+const ORDINARY_MASK_EXTRA: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SnakeOutlinePaint {
+    BoostOuter,
+    Ordinary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SnakeOutlineLayer {
+    paint: SnakeOutlinePaint,
+    extra: f64,
+}
+
+impl SnakeOutlineLayer {
+    fn color(self, ordinary_color: &str) -> &str {
+        match self.paint {
+            SnakeOutlinePaint::BoostOuter => BOOST_OUTER_COLOR,
+            SnakeOutlinePaint::Ordinary => ordinary_color,
+        }
+    }
+
+    fn line_width(self, cell_size: f64) -> f64 {
+        cell_size + self.extra
+    }
+
+    fn radius(self, cell_size: f64) -> f64 {
+        cell_size / 2.0 + self.extra / 2.0
+    }
+}
+
+const ACTIVE_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 2] = [
+    SnakeOutlineLayer {
+        paint: SnakeOutlinePaint::BoostOuter,
+        extra: BOOST_OUTER_EXTRA,
+    },
+    SnakeOutlineLayer {
+        paint: SnakeOutlinePaint::Ordinary,
+        extra: ORDINARY_OUTLINE_EXTRA,
+    },
+];
+
+const ORDINARY_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 1] = [SnakeOutlineLayer {
+    paint: SnakeOutlinePaint::Ordinary,
+    extra: ORDINARY_OUTLINE_EXTRA,
+}];
+
+fn snake_outline_layers(boost_active: bool) -> &'static [SnakeOutlineLayer] {
+    if boost_active {
+        &ACTIVE_SNAKE_OUTLINE_LAYERS
+    } else {
+        &ORDINARY_SNAKE_OUTLINE_LAYERS
+    }
+}
+
+fn snake_mask_extra(boost_active: bool) -> f64 {
+    if boost_active {
+        BOOST_MASK_EXTRA
+    } else {
+        ORDINARY_MASK_EXTRA
+    }
+}
+
+const NOS_REGULAR_WIDTH_RATIO: f64 = 0.50;
+const NOS_REGULAR_HEIGHT_RATIO: f64 = 0.88;
+const NOS_FULL_WIDTH_RATIO: f64 = 0.68;
+const NOS_FULL_HEIGHT_RATIO: f64 = 0.88;
+const NOS_PRESSURE_PLATE_WHITE_WIDTH_RATIO: f64 = 1.0;
+const NOS_PRESSURE_PLATE_WHITE_HEIGHT_RATIO: f64 = 0.60;
+const NOS_STANDARD_ORANGE_WIDTH_RATIO: f64 = 0.46;
+const NOS_STANDARD_ORANGE_HEIGHT_RATIO: f64 = 0.42;
+const NOS_FULL_ORANGE_WIDTH_RATIO: f64 = 0.76;
+const NOS_FULL_ORANGE_HEIGHT_RATIO: f64 = 0.44;
+const NOS_FULL_WORDMARK_MIN_WIDTH: f64 = 10.0;
+const NOS_FULL_WORDMARK_MIN_HEIGHT: f64 = 6.0;
+const NOS_FULL_PLATE_CENTER_Y_RATIO: f64 = 0.075;
+const NOS_REGULAR_GROWTH_PER_SIDE_PX: f64 = 1.0;
+
+#[derive(Clone, Copy)]
+enum NosBottleSkin {
+    Standard,
+    Full,
+}
+
+impl NosBottleSkin {
+    fn orange_ratios(self) -> (f64, f64) {
+        match self {
+            Self::Standard => (
+                NOS_STANDARD_ORANGE_WIDTH_RATIO,
+                NOS_STANDARD_ORANGE_HEIGHT_RATIO,
+            ),
+            Self::Full => (NOS_FULL_ORANGE_WIDTH_RATIO, NOS_FULL_ORANGE_HEIGHT_RATIO),
+        }
+    }
+
+    fn plate_center_y(self, height: f64) -> f64 {
+        match self {
+            Self::Standard => 0.0,
+            Self::Full => height * NOS_FULL_PLATE_CENTER_Y_RATIO,
+        }
+    }
+}
+
+/// Give each pickup a slight amount of optical overscan. At the 5px arena
+/// floor this is one extra pixel; at normal sizes it grows to at most two.
+/// Curves and fractional coordinates can then antialias into that room without
+/// making the icon feel smaller than the gameplay cell it represents.
+fn nos_visual_extent(footprint_px: f64) -> f64 {
+    footprint_px + (footprint_px * 0.16).clamp(1.0, 2.0)
+}
+
+fn regular_nos_dimensions(cell_size: f64) -> (f64, f64, f64) {
+    let base_extent = nos_visual_extent(cell_size);
+    let base_width = (base_extent * NOS_REGULAR_WIDTH_RATIO).max(3.8);
+    let base_height = base_extent * NOS_REGULAR_HEIGHT_RATIO;
+
+    // Regular pickups sit at 45 degrees. Scale the bottle uniformly until its
+    // projected bounds gain one screen pixel on every side, preserving the
+    // established canister proportions while allowing a small cell overlap.
+    let base_projected_size = (base_width + base_height) / std::f64::consts::SQRT_2;
+    let projected_growth = NOS_REGULAR_GROWTH_PER_SIDE_PX * 2.0;
+    let scale = (base_projected_size + projected_growth) / base_projected_size;
+
+    (
+        base_extent + projected_growth,
+        base_width * scale,
+        base_height * scale,
+    )
+}
+
+fn full_nos_dimensions(cell_size: f64) -> (f64, f64, f64) {
+    let extent = nos_visual_extent(cell_size * 2.0);
+    (
+        extent,
+        (extent * NOS_FULL_WIDTH_RATIO).max(7.0),
+        extent * NOS_FULL_HEIGHT_RATIO,
+    )
+}
+
+fn rect_path(ctx: &web_sys::CanvasRenderingContext2d, x: f64, y: f64, width: f64, height: f64) {
+    ctx.begin_path();
+    ctx.move_to(x, y);
+    ctx.line_to(x + width, y);
+    ctx.line_to(x + width, y + height);
+    ctx.line_to(x, y + height);
+    ctx.close_path();
+}
+
+fn nos_bottle_body_path(ctx: &web_sys::CanvasRenderingContext2d, width: f64, height: f64) {
+    let half_width = width / 2.0;
+    let neck = width * 0.24;
+    ctx.begin_path();
+    ctx.move_to(-neck, -height * 0.43);
+    ctx.line_to(neck, -height * 0.43);
+    ctx.line_to(neck, -height * 0.37);
+    ctx.line_to(half_width * 0.72, -height * 0.31);
+    ctx.line_to(half_width, -height * 0.23);
+    ctx.line_to(half_width, height * 0.39);
+    ctx.line_to(half_width * 0.76, height * 0.48);
+    ctx.line_to(-half_width * 0.76, height * 0.48);
+    ctx.line_to(-half_width, height * 0.39);
+    ctx.line_to(-half_width, -height * 0.23);
+    ctx.line_to(-half_width * 0.72, -height * 0.31);
+    ctx.line_to(-neck, -height * 0.37);
+    ctx.close_path();
+}
+
+fn nos_wordmark_size(width: f64, height: f64, skin: NosBottleSkin) -> Option<f64> {
+    if matches!(skin, NosBottleSkin::Standard) {
+        return None;
+    }
+
+    let (orange_width_ratio, orange_height_ratio) = skin.orange_ratios();
+    let plate_width = width * orange_width_ratio;
+    let plate_height = height * orange_height_ratio;
+    if plate_width < NOS_FULL_WORDMARK_MIN_WIDTH || plate_height < NOS_FULL_WORDMARK_MIN_HEIGHT {
+        return None;
+    }
+
+    Some((plate_height * 0.72).clamp(5.0, 9.0))
+}
+
+fn nos_pressure_plate_dimensions(
+    width: f64,
+    height: f64,
+    skin: NosBottleSkin,
+) -> (f64, f64, f64, f64) {
+    let (orange_width_ratio, orange_height_ratio) = skin.orange_ratios();
+    (
+        width * NOS_PRESSURE_PLATE_WHITE_WIDTH_RATIO,
+        height * NOS_PRESSURE_PLATE_WHITE_HEIGHT_RATIO,
+        width * orange_width_ratio,
+        height * orange_height_ratio,
+    )
+}
+
+fn nos_wordmark_font(size: f64) -> String {
+    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+}
+
+/// Paint one faceted Pressure Plate NOS bottle in a local vector coordinate
+/// system. Canvas antialiasing keeps the angled silhouette clean, while every
+/// authored edge remains straight and mechanical.
+fn draw_nos_bottle(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    center_x: f64,
+    center_y: f64,
+    width: f64,
+    height: f64,
+    angle: f64,
+    skin: NosBottleSkin,
+) -> Result<(), JsValue> {
+    ctx.save();
+    ctx.translate(center_x, center_y)?;
+    ctx.rotate(angle)?;
+    ctx.set_line_join("bevel");
+    ctx.set_line_cap("butt");
+
+    let outline = (width * 0.095).clamp(0.52, 1.1);
+
+    // The shell uses the exact active Start Game blue. A restrained planar
+    // facet supplies depth without restoring the old rounded/cartoon gloss.
+    nos_bottle_body_path(ctx, width, height);
+    ctx.set_fill_style_str(NOS_BLUE);
+    ctx.fill();
+    ctx.set_line_width(outline);
+    ctx.set_stroke_style_str(NOS_INK);
+    ctx.stroke();
+
+    ctx.begin_path();
+    ctx.move_to(width * 0.22, -height * 0.34);
+    ctx.line_to(width * 0.43, -height * 0.23);
+    ctx.line_to(width * 0.43, height * 0.38);
+    ctx.line_to(width * 0.31, height * 0.45);
+    ctx.line_to(width * 0.16, height * 0.45);
+    ctx.line_to(width * 0.16, -height * 0.34);
+    ctx.close_path();
+    ctx.set_fill_style_str(NOS_BLUE_SHADE);
+    ctx.fill();
+
+    ctx.begin_path();
+    ctx.move_to(-width * 0.28, -height * 0.22);
+    ctx.line_to(-width * 0.28, height * 0.35);
+    ctx.set_stroke_style_str(NOS_BLUE_HIGHLIGHT);
+    ctx.set_line_width((width * 0.075).clamp(0.34, 0.72));
+    ctx.stroke();
+
+    // The white plate spans the entire canister width. The orange face remains
+    // an inset, axis-aligned rectangle so white is a separator rather than a
+    // competing body color.
+    let (white_plate_width, white_plate_height, orange_plate_width, orange_plate_height) =
+        nos_pressure_plate_dimensions(width, height, skin);
+    let plate_center_y = skin.plate_center_y(height);
+    rect_path(
+        ctx,
+        -white_plate_width / 2.0,
+        plate_center_y - white_plate_height / 2.0,
+        white_plate_width,
+        white_plate_height,
+    );
+    ctx.set_fill_style_str(NOS_LABEL);
+    ctx.fill();
+
+    rect_path(
+        ctx,
+        -orange_plate_width / 2.0,
+        plate_center_y - orange_plate_height / 2.0,
+        orange_plate_width,
+        orange_plate_height,
+    );
+    ctx.set_fill_style_str(NOS_ORANGE);
+    ctx.fill();
+
+    // The full pickup has enough horizontal label area for the actual NOS
+    // wordmark. Micro field icons keep only the orange pressure plate rather
+    // than pretending three unreadable marks are letters.
+    if let Some(wordmark_size) = nos_wordmark_size(width, height, skin) {
+        ctx.save();
+        ctx.translate(0.0, plate_center_y)?;
+        ctx.set_fill_style_str(NOS_LABEL);
+        ctx.set_text_align("center");
+        ctx.set_text_baseline("middle");
+        ctx.set_font(&nos_wordmark_font(wordmark_size));
+        ctx.fill_text_with_max_width("NOS", 0.0, 0.0, orange_plate_width * 0.88)?;
+        ctx.restore();
+    }
+
+    // A squared steel collar and orange valve complete the pressure-vessel
+    // silhouette without introducing soft caps or beverage-bottle curves.
+    let cap_width = (width * 0.52).max(1.7);
+    let cap_height = (height * 0.105).clamp(0.75, 2.2);
+    rect_path(ctx, -cap_width / 2.0, -height * 0.52, cap_width, cap_height);
+    ctx.set_fill_style_str(NOS_STEEL_LIGHT);
+    ctx.fill();
+    ctx.set_line_width((outline * 0.65).max(0.42));
+    ctx.set_stroke_style_str(NOS_STEEL_DARK);
+    ctx.stroke();
+
+    let valve_width = (width * 0.20).max(0.75);
+    rect_path(
+        ctx,
+        -valve_width / 2.0,
+        -height * 0.58,
+        valve_width,
+        (cap_height * 0.50).max(0.45),
+    );
+    ctx.set_fill_style_str(NOS_ORANGE);
+    ctx.fill();
+
+    // Restore the dark outer edge after the label and highlights meet it.
+    nos_bottle_body_path(ctx, width, height);
+    ctx.set_line_width(outline);
+    ctx.set_stroke_style_str(NOS_INK);
+    ctx.stroke();
+    ctx.restore();
+    Ok(())
+}
+
+fn draw_regular_nos_canister(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    left: f64,
+    top: f64,
+    cell_size: f64,
+) -> Result<(), JsValue> {
+    let (_extent, width, height) = regular_nos_dimensions(cell_size);
+    draw_nos_bottle(
+        ctx,
+        left + cell_size / 2.0,
+        top + cell_size / 2.0,
+        width,
+        height,
+        std::f64::consts::FRAC_PI_4,
+        NosBottleSkin::Standard,
+    )
+}
+
+fn draw_full_nos_canister(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    left: f64,
+    top: f64,
+    cell_size: f64,
+) -> Result<(), JsValue> {
+    let footprint = cell_size * 2.0;
+    let (_extent, bottle_width, bottle_height) = full_nos_dimensions(cell_size);
+    let center_x = left + footprint / 2.0;
+    let center_y = top + footprint / 2.0;
+
+    // One deliberately broad pressure vessel makes the 2x2 packet read as a
+    // single high-value item. Its upright stance and oversized label are the
+    // visual hierarchy; no rack or connector suggests multiple collectibles.
+    draw_nos_bottle(
+        ctx,
+        center_x,
+        center_y,
+        bottle_width,
+        bottle_height,
+        0.0,
+        NosBottleSkin::Full,
+    )
+}
+
+fn grid_dot_is_covered_by_boost(
+    dot_x: f64,
+    dot_y: f64,
+    active_pad_bounds: &[(f64, f64, f64, f64)],
+) -> bool {
+    active_pad_bounds.iter().any(|(x, y, width, height)| {
+        dot_x >= *x && dot_x <= x + width && dot_y >= *y && dot_y <= y + height
+    })
+}
+
+fn snake_palette(
+    snake_index: usize,
+    snake_team: Option<u8>,
+    team_member_slot: usize,
+    snake_count: usize,
+    is_team_game: bool,
+    local_snake_id: Option<usize>,
+    local_team: Option<u8>,
+) -> (&'static str, &'static str) {
+    const BLUE: [(&str, &str); 2] = [("#70bfe3", "#5299bb"), ("#3c8dde", "#286eae")];
+    const RED: [(&str, &str); 2] = [("#ff6b6b", "#b84444"), ("#e34e5b", "#a92f3a")];
+
+    if is_team_game {
+        // Players see teammates as blue and opponents as red, with restrained
+        // within-team shades so the roster can map each 2v2 player to the
+        // corresponding snake. Spectators retain canonical team 0/1 colors.
+        let shade = team_member_slot % 2;
+        return match (local_team, snake_team) {
+            (Some(ours), Some(theirs)) if ours == theirs => BLUE[shade],
+            (Some(_), Some(_)) => RED[shade],
+            (None, Some(0)) => BLUE[shade],
+            (None, Some(_)) => RED[shade],
+            _ if Some(snake_index) == local_snake_id => BLUE[shade],
+            _ => RED[shade],
+        };
+    }
+
+    if Some(snake_index) == local_snake_id {
+        BLUE[0]
+    } else if snake_count == 2 {
+        RED[0]
+    } else {
+        match snake_index % 4 {
+            0 if local_snake_id.is_none() => BLUE[0],
+            1 => RED[0],
+            2 => ("#556270", "#353c47"),
+            _ => ("#f7b731", "#a87d1f"),
+        }
     }
 }
 
@@ -202,6 +677,13 @@ pub fn render_game_state(
         }
     }
 
+    // Available Boost footprints own the grid intersections on their boundary
+    // and interior. Omitting those dots up front avoids a white cleanup halo
+    // and matches the way solid gameplay objects visually clear the grid.
+    // Cooling pads are deliberately absent from this mask as well as the art.
+    let active_boost_pad_bounds =
+        transformed_active_pad_bounds(&arena.boost_pads, game_width, game_height, rotation_int);
+
     // Draw dots at grid intersections (like the background pattern)
     ctx.set_fill_style_str("rgba(0, 0, 0, 0.3)"); // Same as background dots
 
@@ -215,6 +697,10 @@ pub fn render_game_state(
         for y in 1..dots_y {
             let dot_x = x as f64 * dot_spacing;
             let dot_y = y as f64 * dot_spacing;
+
+            if grid_dot_is_covered_by_boost(x as f64, y as f64, &active_boost_pad_bounds) {
+                continue;
+            }
 
             // Skip dots that are on the exact edges
             if dot_x >= width * cell_size || dot_y >= height * cell_size {
@@ -540,6 +1026,28 @@ pub fn render_game_state(
         }
     }
 
+    // Draw only available Boost packets after food and before snakes. Cooling
+    // pads disappear completely; there is no gray placeholder competing with
+    // gameplay. The authoritative footprint selects a single diagonal NOS
+    // canister for a 1x pad or one oversized upright tank for a 2x2 pad.
+    for pad in &arena.boost_pads {
+        if pad.respawn_at_tick.is_some() {
+            continue;
+        }
+        let Some((x, y, width_cells, height_cells)) =
+            transformed_pad_bounds(pad, game_width, game_height, rotation_int)
+        else {
+            continue;
+        };
+        let left = x * cell_size;
+        let top = y * cell_size;
+        if pad.size_cells > 1 && width_cells >= 2.0 && height_cells >= 2.0 {
+            draw_full_nos_canister(&ctx, left, top, cell_size)?;
+        } else {
+            draw_regular_nos_canister(&ctx, left, top, cell_size)?;
+        }
+    }
+
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;
     for (index, snake) in snakes.iter().enumerate() {
@@ -547,33 +1055,22 @@ pub fn render_game_state(
 
         if is_alive {
             // Choose snake color based on perspective in team games
-            let (color, border_color) = if team_zone_config_data.is_some() {
-                // Team game: use perspective-based coloring
-                if Some(index) == local_snake_id {
-                    // Local player is always blue
-                    ("#70bfe3", "#5299bb")
-                } else {
-                    // Opponent is always red (in 2-team games)
-                    ("#ff6b6b", "#b84444")
-                }
-            } else {
-                // Non-team game: use existing perspective-based logic
-                if Some(index) == local_snake_id {
-                    // Local player is always blue
-                    ("#70bfe3", "#5299bb")
-                } else if snakes.len() == 2 {
-                    // In 2-player games, opponent is always red
-                    ("#ff6b6b", "#b84444")
-                } else {
-                    // Multi-player: use different colors for other players
-                    match index % 4 {
-                        0 if local_snake_id.is_none() => ("#70bfe3", "#5299bb"), // Blue if no local player
-                        1 => ("#ff6b6b", "#b84444"),                             // Red
-                        2 => ("#556270", "#353c47"),                             // Gray
-                        _ => ("#f7b731", "#a87d1f"),                             // Yellow
-                    }
-                }
-            };
+            let team_member_slot = snakes[..index]
+                .iter()
+                .filter(|candidate| candidate.team_id == snake.team_id)
+                .count();
+            let (color, ordinary_border_color) = snake_palette(
+                index,
+                snake.team_id.map(|team| team.0),
+                team_member_slot,
+                snakes.len(),
+                team_zone_config_data.is_some(),
+                local_snake_id,
+                local_player_team,
+            );
+            let boost_active = snake.boost().active;
+            let outline_layers = snake_outline_layers(boost_active);
+            let mask_extra = snake_mask_extra(boost_active);
 
             ctx.set_fill_style_str(color);
 
@@ -596,17 +1093,20 @@ pub fn render_game_state(
                 let center_x = tx * cell_size + cell_size / 2.0;
                 let center_y = ty * cell_size + cell_size / 2.0;
 
-                // Draw border
-                ctx.set_fill_style_str(border_color);
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0 + 1.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
+                // Paint the active Boost band underneath the ordinary contour.
+                // The body radius remains unchanged, so this is cosmetic only.
+                for layer in outline_layers {
+                    ctx.set_fill_style_str(layer.color(ordinary_border_color));
+                    ctx.begin_path();
+                    ctx.arc(
+                        center_x,
+                        center_y,
+                        layer.radius(cell_size),
+                        0.0,
+                        2.0 * std::f64::consts::PI,
+                    )?;
+                    ctx.fill();
+                }
 
                 // Draw as a full circle
                 ctx.set_fill_style_str(color);
@@ -638,7 +1138,9 @@ pub fn render_game_state(
             // First pass: Fill with white rectangles to cover grid dots
             ctx.set_fill_style_str("#ffffff");
 
-            // Fill white rectangles for body segments (expanded by 1px)
+            // Fill white rectangles through the complete visual outline. Boost
+            // adds a crisp two-pixel signal band, while ordinary snakes retain
+            // their exact existing 1px mask.
             for window in body.windows(2) {
                 let (p1, p2) = (&window[0], &window[1]);
                 let x1 = p1.x as f64;
@@ -656,10 +1158,10 @@ pub fn render_game_state(
                     let min_y = ty1.min(ty2) * cell_size;
                     let max_y = ty1.max(ty2) * cell_size;
                     ctx.fill_rect(
-                        x - 1.0,
-                        min_y - 1.0,
-                        cell_size + 2.0,
-                        (max_y - min_y) + cell_size + 2.0,
+                        x - mask_extra,
+                        min_y - mask_extra,
+                        cell_size + mask_extra * 2.0,
+                        (max_y - min_y) + cell_size + mask_extra * 2.0,
                     );
                 } else if (ty1 - ty2).abs() < 0.01 {
                     // Horizontal segment after transformation - draw rectangle
@@ -667,15 +1169,15 @@ pub fn render_game_state(
                     let min_x = tx1.min(tx2) * cell_size;
                     let max_x = tx1.max(tx2) * cell_size;
                     ctx.fill_rect(
-                        min_x - 1.0,
-                        y - 1.0,
-                        (max_x - min_x) + cell_size + 2.0,
-                        cell_size + 2.0,
+                        min_x - mask_extra,
+                        y - mask_extra,
+                        (max_x - min_x) + cell_size + mask_extra * 2.0,
+                        cell_size + mask_extra * 2.0,
                     );
                 }
             }
 
-            // Fill white rectangles for all body points (expanded by 1px)
+            // Fill white rectangles for all body points through the same mask.
             for point in body.iter() {
                 let (tx, ty) = transform_coords(
                     point.x as f64,
@@ -684,75 +1186,88 @@ pub fn render_game_state(
                     game_height,
                     rotation_int,
                 );
-                let rect_x = tx * cell_size - 1.0;
-                let rect_y = ty * cell_size - 1.0;
-                ctx.fill_rect(rect_x, rect_y, cell_size + 2.0, cell_size + 2.0);
-            }
-
-            // Second pass: Draw borders (1px larger)
-            ctx.set_stroke_style_str(border_color);
-
-            // Draw border for body segments
-            for window in body.windows(2) {
-                let (p1, p2) = (&window[0], &window[1]);
-                let x1 = p1.x as f64;
-                let y1 = p1.y as f64;
-                let x2 = p2.x as f64;
-                let y2 = p2.y as f64;
-
-                // Transform both points
-                let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
-                let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
-
-                if (tx1 - tx2).abs() < 0.01 {
-                    // Vertical segment after transformation
-                    let x = tx1 * cell_size + cell_size / 2.0;
-                    let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
-                    let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size + 2.0);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(x, min_y);
-                    ctx.line_to(x, max_y);
-                    ctx.stroke();
-                } else if (ty1 - ty2).abs() < 0.01 {
-                    // Horizontal segment after transformation
-                    let y = ty1 * cell_size + cell_size / 2.0;
-                    let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
-                    let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size + 2.0);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(min_x, y);
-                    ctx.line_to(max_x, y);
-                    ctx.stroke();
-                }
-            }
-
-            // Draw border for corner joints
-            ctx.set_fill_style_str(border_color);
-            for point in &body[1..body.len() - 1] {
-                let (tx, ty) = transform_coords(
-                    point.x as f64,
-                    point.y as f64,
-                    game_width,
-                    game_height,
-                    rotation_int,
+                let rect_x = tx * cell_size - mask_extra;
+                let rect_y = ty * cell_size - mask_extra;
+                ctx.fill_rect(
+                    rect_x,
+                    rect_y,
+                    cell_size + mask_extra * 2.0,
+                    cell_size + mask_extra * 2.0,
                 );
-                let center_x = tx * cell_size + cell_size / 2.0;
-                let center_y = ty * cell_size + cell_size / 2.0;
+            }
 
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0 + 1.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
+            // Second pass: paint complete outline layers from outside in. An
+            // active snake gets yellow first and its ordinary contour second;
+            // an inactive snake keeps the original single contour pass.
+            for layer in outline_layers {
+                let layer_color = layer.color(ordinary_border_color);
+                ctx.set_stroke_style_str(layer_color);
+
+                // Draw this outline layer for every body segment before moving
+                // inward, preventing outer yellow from crossing dark joints.
+                for window in body.windows(2) {
+                    let (p1, p2) = (&window[0], &window[1]);
+                    let x1 = p1.x as f64;
+                    let y1 = p1.y as f64;
+                    let x2 = p2.x as f64;
+                    let y2 = p2.y as f64;
+
+                    // Transform both points
+                    let (tx1, ty1) =
+                        transform_coords(x1, y1, game_width, game_height, rotation_int);
+                    let (tx2, ty2) =
+                        transform_coords(x2, y2, game_width, game_height, rotation_int);
+
+                    if (tx1 - tx2).abs() < 0.01 {
+                        // Vertical segment after transformation
+                        let x = tx1 * cell_size + cell_size / 2.0;
+                        let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
+                        let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
+
+                        ctx.set_line_width(layer.line_width(cell_size));
+                        ctx.set_line_cap("round");
+                        ctx.begin_path();
+                        ctx.move_to(x, min_y);
+                        ctx.line_to(x, max_y);
+                        ctx.stroke();
+                    } else if (ty1 - ty2).abs() < 0.01 {
+                        // Horizontal segment after transformation
+                        let y = ty1 * cell_size + cell_size / 2.0;
+                        let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
+                        let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
+
+                        ctx.set_line_width(layer.line_width(cell_size));
+                        ctx.set_line_cap("round");
+                        ctx.begin_path();
+                        ctx.move_to(min_x, y);
+                        ctx.line_to(max_x, y);
+                        ctx.stroke();
+                    }
+                }
+
+                // Fill every corner joint for this same layer.
+                ctx.set_fill_style_str(layer_color);
+                for point in &body[1..body.len() - 1] {
+                    let (tx, ty) = transform_coords(
+                        point.x as f64,
+                        point.y as f64,
+                        game_width,
+                        game_height,
+                        rotation_int,
+                    );
+                    let center_x = tx * cell_size + cell_size / 2.0;
+                    let center_y = ty * cell_size + cell_size / 2.0;
+
+                    ctx.begin_path();
+                    ctx.arc(
+                        center_x,
+                        center_y,
+                        layer.radius(cell_size),
+                        0.0,
+                        2.0 * std::f64::consts::PI,
+                    )?;
+                    ctx.fill();
+                }
             }
 
             // Third pass: Draw the actual snake
@@ -1453,4 +1968,282 @@ pub fn render_game_state(
     ctx.restore();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_palette_distinguishes_teammates_without_crossing_team_hues() {
+        let local = snake_palette(0, Some(0), 0, 4, true, Some(0), Some(0));
+        let teammate = snake_palette(2, Some(0), 1, 4, true, Some(0), Some(0));
+        let opponent = snake_palette(1, Some(1), 0, 4, true, Some(0), Some(0));
+
+        assert_ne!(local, teammate);
+        assert_ne!(local, opponent);
+        assert!(local.0.starts_with("#70"));
+        assert!(teammate.0.starts_with("#3c"));
+        assert!(opponent.0.starts_with("#ff"));
+    }
+
+    #[test]
+    fn team_palette_is_stable_for_spectators() {
+        assert_eq!(
+            snake_palette(3, Some(0), 1, 4, true, None, None),
+            ("#3c8dde", "#286eae")
+        );
+        assert_eq!(
+            snake_palette(0, Some(1), 0, 4, true, None, None),
+            ("#ff6b6b", "#b84444")
+        );
+    }
+
+    #[test]
+    fn active_boost_outline_layers_yellow_outside_the_ordinary_contour() {
+        let ordinary_color = "#5299bb";
+        let layers = snake_outline_layers(true);
+
+        assert_eq!(BOOST_OUTER_COLOR, "#fff200");
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].paint, SnakeOutlinePaint::BoostOuter);
+        assert_eq!(layers[0].color(ordinary_color), BOOST_OUTER_COLOR);
+        assert_eq!(layers[1].paint, SnakeOutlinePaint::Ordinary);
+        assert_eq!(layers[1].color(ordinary_color), ordinary_color);
+
+        let cell_size = 10.0;
+        assert_eq!(layers[0].line_width(cell_size), 16.0);
+        assert_eq!(layers[1].line_width(cell_size), 12.0);
+        assert_eq!(layers[0].radius(cell_size), 8.0);
+        assert_eq!(layers[1].radius(cell_size), 6.0);
+        assert_eq!(
+            layers[0].radius(cell_size) - layers[1].radius(cell_size),
+            2.0
+        );
+        assert_eq!(layers[1].radius(cell_size) - cell_size / 2.0, 1.0);
+        assert_eq!(snake_mask_extra(true), 3.0);
+    }
+
+    #[test]
+    fn inactive_snake_keeps_the_existing_single_pixel_contour_and_mask() {
+        let ordinary_color = "#b84444";
+        let layers = snake_outline_layers(false);
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].paint, SnakeOutlinePaint::Ordinary);
+        assert_eq!(layers[0].color(ordinary_color), ordinary_color);
+
+        let cell_size = 10.0;
+        assert_eq!(layers[0].line_width(cell_size), 12.0);
+        assert_eq!(layers[0].radius(cell_size), 6.0);
+        assert_eq!(layers[0].radius(cell_size) - cell_size / 2.0, 1.0);
+        assert_eq!(snake_mask_extra(false), 1.0);
+    }
+
+    #[test]
+    fn pad_coordinates_follow_every_arena_rotation() {
+        assert_eq!(transform_coords(2.0, 3.0, 10.0, 8.0, 0), (2.0, 3.0));
+        assert_eq!(transform_coords(2.0, 3.0, 10.0, 8.0, 90), (4.0, 2.0));
+        assert_eq!(transform_coords(2.0, 3.0, 10.0, 8.0, 180), (7.0, 4.0));
+        assert_eq!(transform_coords(2.0, 3.0, 10.0, 8.0, 270), (3.0, 7.0));
+    }
+
+    #[test]
+    fn full_packet_footprint_stays_two_by_two_through_rotation() {
+        let pad = BoostPad {
+            id: 0,
+            position: common::Position { x: 2, y: 3 },
+            charge_ms: 3_000,
+            size_cells: 2,
+            respawn_at_tick: None,
+        };
+
+        assert_eq!(
+            transformed_pad_bounds(&pad, 10.0, 8.0, 0),
+            Some((2.0, 3.0, 2.0, 2.0))
+        );
+        assert_eq!(
+            transformed_pad_bounds(&pad, 10.0, 8.0, 90),
+            Some((3.0, 2.0, 2.0, 2.0))
+        );
+        assert_eq!(
+            transformed_pad_bounds(&pad, 10.0, 8.0, 180),
+            Some((6.0, 3.0, 2.0, 2.0))
+        );
+        assert_eq!(
+            transformed_pad_bounds(&pad, 10.0, 8.0, 270),
+            Some((3.0, 6.0, 2.0, 2.0))
+        );
+    }
+
+    #[test]
+    fn pressure_plate_palette_uses_start_game_blue_and_nos_orange() {
+        let colors: HashSet<_> = [
+            NOS_INK,
+            NOS_BLUE,
+            NOS_BLUE_HIGHLIGHT,
+            NOS_BLUE_SHADE,
+            NOS_LABEL,
+            NOS_STEEL_DARK,
+            NOS_STEEL_LIGHT,
+            NOS_ORANGE,
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(colors.len(), 8);
+        assert_eq!(NOS_BLUE, "#3b82f6");
+        assert_eq!(NOS_LABEL, "#f8fafc");
+        assert_eq!(NOS_ORANGE, "#ff641e");
+        assert!(!colors.contains("#f8c84a"));
+    }
+
+    #[test]
+    fn pressure_plate_white_band_spans_the_body_and_orange_face_is_inset() {
+        let body_width = 10.0;
+        let body_height = 20.0;
+        let (white_width, white_height, standard_width, standard_height) =
+            nos_pressure_plate_dimensions(body_width, body_height, NosBottleSkin::Standard);
+        let (_, _, full_width, full_height) =
+            nos_pressure_plate_dimensions(body_width, body_height, NosBottleSkin::Full);
+
+        assert_eq!(white_width, body_width);
+        assert!(standard_width < full_width);
+        assert!(standard_height < full_height);
+        assert!(full_width < white_width);
+        assert!(full_height < white_height);
+        assert_eq!(NosBottleSkin::Standard.orange_ratios(), (0.46, 0.42));
+
+        let full_center_y = NosBottleSkin::Full.plate_center_y(body_height);
+        assert!(full_center_y - white_height / 2.0 >= body_height * -0.23);
+        assert!(full_center_y + white_height / 2.0 <= body_height * 0.39);
+    }
+
+    #[test]
+    fn pressure_plate_wordmark_uses_only_the_legible_full_pickup_skin() {
+        for cell_size in 5..=15 {
+            let (_, width, height) = regular_nos_dimensions(f64::from(cell_size));
+            assert_eq!(
+                nos_wordmark_size(width, height, NosBottleSkin::Standard),
+                None
+            );
+        }
+
+        for cell_size in 5..=8 {
+            let (_, width, height) = full_nos_dimensions(f64::from(cell_size));
+            assert_eq!(nos_wordmark_size(width, height, NosBottleSkin::Full), None);
+        }
+
+        let (_, width, height) = full_nos_dimensions(9.0);
+        let size = nos_wordmark_size(width, height, NosBottleSkin::Full)
+            .expect("the wide full-pickup label should fit its horizontal wordmark");
+        let font = nos_wordmark_font(size);
+        assert!(font.starts_with("900 "));
+        assert!(!font.to_ascii_lowercase().contains("italic"));
+    }
+
+    #[test]
+    fn regular_pressure_plate_grows_one_pixel_per_side_without_distortion() {
+        for cell_size in 5..=15 {
+            let cell_size = f64::from(cell_size);
+            let (extent, width, height) = regular_nos_dimensions(cell_size);
+            let base_extent = nos_visual_extent(cell_size);
+            let base_width = (base_extent * NOS_REGULAR_WIDTH_RATIO).max(3.8);
+            let base_height = base_extent * NOS_REGULAR_HEIGHT_RATIO;
+            let base_rotated_bounds = (base_width + base_height) / std::f64::consts::SQRT_2;
+            let rotated_bounds = (width + height) / std::f64::consts::SQRT_2;
+
+            assert_eq!(extent, base_extent + NOS_REGULAR_GROWTH_PER_SIDE_PX * 2.0);
+            assert!(
+                (width / height - base_width / base_height).abs() < 1e-12,
+                "bottle proportions changed at {cell_size}px"
+            );
+            assert!(
+                (rotated_bounds - base_rotated_bounds - NOS_REGULAR_GROWTH_PER_SIDE_PX * 2.0).abs()
+                    < 1e-10,
+                "diagonal bottle did not grow one pixel per side at {cell_size}px"
+            );
+        }
+    }
+
+    #[test]
+    fn full_pressure_plate_is_one_large_upright_canister_inside_its_optical_box() {
+        for cell_size in 5..=15 {
+            let cell_size = f64::from(cell_size);
+            let footprint = cell_size * 2.0;
+            let (extent, bottle_width, bottle_height) = full_nos_dimensions(cell_size);
+
+            assert!(extent >= footprint + 1.0);
+            assert!(extent <= footprint + 2.0);
+            assert!(bottle_width >= 7.0);
+            assert!(bottle_height >= 8.0);
+            assert!(bottle_height > bottle_width);
+            assert!(bottle_width / bottle_height > 0.75);
+            assert!(bottle_width / bottle_height < 0.80);
+            let outline = (bottle_width * 0.095).clamp(0.52, 1.1);
+            assert!(
+                bottle_width + outline * 2.0 < extent,
+                "wide bottle overflows horizontally at {cell_size}px"
+            );
+            assert!(
+                bottle_height * 1.08 < extent,
+                "upright bottle overflows vertically at {cell_size}px"
+            );
+        }
+    }
+
+    #[test]
+    fn active_boosts_mask_only_their_surrounding_grid_intersections() {
+        let regular = (2.0, 3.0, 1.0, 1.0);
+        let double = (6.0, 1.0, 2.0, 2.0);
+        let bounds = [regular, double];
+
+        for x in 2..=3 {
+            for y in 3..=4 {
+                assert!(grid_dot_is_covered_by_boost(
+                    f64::from(x),
+                    f64::from(y),
+                    &bounds,
+                ));
+            }
+        }
+        for x in 6..=8 {
+            for y in 1..=3 {
+                assert!(grid_dot_is_covered_by_boost(
+                    f64::from(x),
+                    f64::from(y),
+                    &bounds,
+                ));
+            }
+        }
+
+        assert!(!grid_dot_is_covered_by_boost(1.0, 3.0, &bounds));
+        assert!(!grid_dot_is_covered_by_boost(4.0, 4.0, &bounds));
+        assert!(!grid_dot_is_covered_by_boost(9.0, 2.0, &bounds));
+    }
+
+    #[test]
+    fn cooling_boosts_do_not_mask_grid_dots() {
+        let pads = [
+            BoostPad {
+                id: 0,
+                position: common::Position { x: 2, y: 3 },
+                charge_ms: 750,
+                size_cells: 1,
+                respawn_at_tick: None,
+            },
+            BoostPad {
+                id: 1,
+                position: common::Position { x: 6, y: 1 },
+                charge_ms: 3_000,
+                size_cells: 2,
+                respawn_at_tick: Some(80),
+            },
+        ];
+        let bounds = transformed_active_pad_bounds(&pads, 10.0, 8.0, 0);
+
+        assert_eq!(bounds, vec![(2.0, 3.0, 1.0, 1.0)]);
+        assert!(grid_dot_is_covered_by_boost(2.0, 3.0, &bounds));
+        assert!(!grid_dot_is_covered_by_boost(6.0, 1.0, &bounds));
+    }
 }

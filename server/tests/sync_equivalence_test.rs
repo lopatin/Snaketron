@@ -10,21 +10,23 @@
 
 use anyhow::Result;
 use common::{
-    Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState,
-    GameStatus, GameType, MAX_PREDICTION_AHEAD_MS, PseudoRandom, QueueMode,
+    BoostConfig, CommandId, Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent,
+    GameEventMessage, GameState, GameStatus, GameType, MAX_PREDICTION_AHEAD_MS, Position,
+    PseudoRandom, QueueMode,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Duration;
 
 const GAME_ID: u32 = 777;
-/// Matches `EXECUTOR_POLL_INTERVAL_MS`: the executor advances the engine on a
-/// 50ms interval.
+/// Virtual server poll cadence. A 50 ms poll lands exactly on each Boost-team
+/// simulation boundary; production's 10 ms actor poll may wake more often.
 const POLL_MS: i64 = 50;
 /// Client animation-frame cadence.
 const FRAME_MS: i64 = 16;
-/// The server emits a `TickHash` heartbeat every this many committed ticks.
-const PROBE_EVERY_TICKS: u32 = 10;
+/// The server emits a `TickHash` heartbeat on an elapsed-time deadline,
+/// independent of the match's simulation quantum.
+const PROBE_INTERVAL_MS: i64 = 1_000;
 /// `GameEngine`'s internal `committed_state_lag_ms` (not exported).
 const COMMITTED_LAG_MS: u32 = 500;
 
@@ -218,7 +220,7 @@ struct SimWorld {
     /// Monotonic transport sequence, assigned at publish time like the
     /// executor does. Starts at 1 for the initial join snapshot.
     stream_seq: u64,
-    next_probe_tick: u32,
+    next_probe_at_ms: i64,
     clock_drift_ms: i64,
     /// Full published stream for determinism comparisons:
     /// (tick, stream_seq, engine sequence, event as JSON value).
@@ -238,6 +240,12 @@ struct SimWorld {
     drop_first_enemy_respawn: bool,
     /// (tick, stream_seq) of the dropped respawn, once it happened.
     dropped_respawn: Option<(u32, u64)>,
+    /// Drop one opponent ActivateBoost schedule while retaining its consumed
+    /// stream sequence. This creates a real speed/fuel divergence that only a
+    /// snapshot can repair; movement itself is intentionally not streamed.
+    drop_first_enemy_boost_activation: bool,
+    /// (tick, stream_seq) of the dropped activation schedule.
+    dropped_boost_activation: Option<(u32, u64)>,
 }
 
 impl SimWorld {
@@ -247,7 +255,7 @@ impl SimWorld {
         // the seeded RNG, the executor flips it to Started and builds the
         // engine from that state.
         let mut state = GameState::new(
-            40,
+            60,
             40,
             GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
@@ -263,6 +271,10 @@ impl SimWorld {
         state.status = GameStatus::Started { server_id: 7 };
         state.spawn_initial_food();
 
+        Self::from_state(state, cfg)
+    }
+
+    fn from_state(state: GameState, cfg: TransportConfig) -> Self {
         let server = GameEngine::new_from_state(GAME_ID, state);
         let mut world = SimWorld {
             now_ms: 0,
@@ -270,7 +282,7 @@ impl SimWorld {
             client: None,
             transport: Transport::new(cfg),
             stream_seq: 0,
-            next_probe_tick: PROBE_EVERY_TICKS,
+            next_probe_at_ms: PROBE_INTERVAL_MS,
             clock_drift_ms: 0,
             published: Vec::new(),
             record_published: false,
@@ -281,6 +293,8 @@ impl SimWorld {
             resync_in_flight: false,
             drop_first_enemy_respawn: false,
             dropped_respawn: None,
+            drop_first_enemy_boost_activation: false,
+            dropped_boost_activation: None,
         };
 
         // Initial snapshot at t0, the way a client join does (stream_seq 1).
@@ -299,6 +313,20 @@ impl SimWorld {
             && matches!(event, GameEvent::SnakeRespawned { snake_id: 1, .. })
         {
             self.dropped_respawn = Some((tick, self.stream_seq));
+            return;
+        }
+        if self.drop_first_enemy_boost_activation
+            && self.dropped_boost_activation.is_none()
+            && matches!(
+                &event,
+                GameEvent::CommandScheduled { command_message }
+                    if matches!(
+                        &command_message.command,
+                        GameCommand::ActivateBoost { snake_id: 1 }
+                    )
+            )
+        {
+            self.dropped_boost_activation = Some((tick, self.stream_seq));
             return;
         }
         if self.record_published {
@@ -338,8 +366,8 @@ impl SimWorld {
     }
 
     /// One executor poll: advance the authoritative engine by wall clock and
-    /// publish every emitted event, plus a TickHash heartbeat every
-    /// `PROBE_EVERY_TICKS` committed ticks.
+    /// publish every emitted event, plus a TickHash heartbeat on its
+    /// wall-clock deadline.
     fn server_poll(&mut self) {
         let events = self
             .server
@@ -348,9 +376,9 @@ impl SimWorld {
         for (tick, sequence, event) in events {
             self.publish(tick, sequence, event);
         }
-        if self.server.current_tick() >= self.next_probe_tick {
+        if self.now_ms >= self.next_probe_at_ms {
             self.publish_probe();
-            self.next_probe_tick = self.server.current_tick() + PROBE_EVERY_TICKS;
+            self.next_probe_at_ms = self.now_ms + PROBE_INTERVAL_MS;
         }
     }
 
@@ -564,6 +592,63 @@ fn run_lossless_scenario(game_seed: u64, transport_seed: u64, record: bool) -> S
     world
 }
 
+fn boost_sync_state() -> GameState {
+    let mut state = GameState::new_with_boost_config(
+        60,
+        40,
+        GameType::TeamMatch { per_team: 1 },
+        QueueMode::Quickmatch,
+        Some(0xB0057),
+        0,
+        BoostConfig::default(),
+    )
+    .expect("valid Boost sync state");
+    state
+        .add_player(1, Some("alice".to_string()))
+        .expect("add player 1");
+    state
+        .add_player(2, Some("bob".to_string()))
+        .expect("add player 2");
+    state.status = GameStatus::Started { server_id: 7 };
+    state.properties.available_food_target = 0;
+    state.arena.food.clear();
+
+    let first_full_pad = state
+        .arena
+        .boost_pads
+        .iter()
+        .find(|pad| pad.id == 0 && pad.size_cells == 2)
+        .expect("top-left full pad")
+        .position;
+    let opposite_full_pad = state
+        .arena
+        .boost_pads
+        .iter()
+        .find(|pad| pad.id == 3 && pad.size_cells == 2)
+        .expect("bottom-right full pad")
+        .position;
+    state.arena.snakes[0].body = vec![
+        first_full_pad,
+        Position {
+            x: first_full_pad.x,
+            y: first_full_pad.y - 3,
+        },
+    ];
+    state.arena.snakes[0].direction = Direction::Down;
+    state.arena.snakes[1].body = vec![
+        opposite_full_pad,
+        Position {
+            x: opposite_full_pad.x,
+            y: opposite_full_pad.y + 3,
+        },
+    ];
+    state.arena.snakes[1].direction = Direction::Up;
+    state
+        .validate_boost_invariants()
+        .expect("positioned state remains valid");
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -648,8 +733,17 @@ async fn lossy_transport_detects_gaps_and_resyncs() -> Result<()> {
             !post_resync.is_empty(),
             "expected probes after the resync snapshot"
         );
+        // A heartbeat published before the snapshot request can still be in
+        // flight when recovery begins. Once the first post-snapshot match is
+        // observed, every later wall-clock heartbeat must remain converged.
+        let first_matching_probe = post_resync
+            .iter()
+            .position(|probe| probe.matched)
+            .expect("expected a matching heartbeat after resync");
         assert!(
-            post_resync.iter().all(|p| p.matched),
+            post_resync[first_matching_probe..]
+                .iter()
+                .all(|probe| probe.matched),
             "probes after resync must match again: {post_resync:?}"
         );
         assert_eq!(
@@ -701,8 +795,8 @@ async fn targeted_event_loss_detected_by_tickhash() -> Result<()> {
             .process_server_event(&corruption)
             .expect("corruption event applies");
 
-        // Probes run every PROBE_EVERY_TICKS ticks (1 virtual second); give
-        // the heartbeat time for at least two of them.
+        // Probes run every wall-clock second; give the heartbeat time for at
+        // least two of them.
         world.run_for(4_000);
 
         let status = world.client().sync_status();
@@ -797,9 +891,12 @@ async fn lost_enemy_respawn_is_detected_and_healed_by_resync() -> Result<()> {
             !post_resync.is_empty(),
             "expected probes after the resync snapshot"
         );
+        // A heartbeat already in transport when the snapshot is requested may
+        // still observe the pre-snapshot divergence. Require stable matching
+        // after the re-anchor, not retroactive healing of that in-flight probe.
         assert!(
-            post_resync.iter().all(|p| p.matched),
-            "probes after resync must match again: {post_resync:?}"
+            post_resync.len() >= 2 && post_resync.iter().rev().take(2).all(|p| p.matched),
+            "the final probes after resync must match again: {post_resync:?}"
         );
         assert_eq!(
             world.client().committed_state().arena.snakes[1].is_alive,
@@ -810,6 +907,161 @@ async fn lost_enemy_respawn_is_detected_and_healed_by_resync() -> Result<()> {
             world.client().committed_sync_hash(),
             world.server.committed_sync_hash(),
             "resynced client must converge to the server state"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// A missed opponent activation cannot be reconstructed from movement events:
+/// movement is deliberately derived locally and never streamed. The consumed
+/// stream sequence must request a snapshot, and that snapshot must restore the
+/// complete snake-owned movement state (fuel, active flag, speed, residual
+/// credit, position) plus pad cooldown. It must also discard an unrelated
+/// unresolved local prediction so the snapshot is a true authoritative anchor.
+#[tokio::test]
+async fn lost_boost_activation_is_detected_and_healed_by_snapshot() -> Result<()> {
+    with_timeout(async {
+        let mut world = SimWorld::from_state(boost_sync_state(), TransportConfig::lossless());
+        let capacity_ms = world
+            .server
+            .committed_state()
+            .properties
+            .boost
+            .as_ref()
+            .expect("Boost config")
+            .capacity_ms;
+
+        // The first real 50 ms quantum collects both packets without
+        // activating either snake. Wait until both authoritative and client
+        // committed states have derived and observed that transition.
+        let mut waited_ms = 0;
+        loop {
+            world.run_for(50);
+            waited_ms += 50;
+            let server_collected = world.server.committed_state().arena.snakes[1]
+                .boost()
+                .charge_ms
+                == capacity_ms;
+            let client_collected = world.client.as_ref().is_some_and(|client| {
+                client.committed_state().arena.snakes[1].boost().charge_ms == capacity_ms
+            });
+            if server_collected && client_collected {
+                break;
+            }
+            assert!(
+                waited_ms < 2_000,
+                "Boost packet collection did not converge before activation"
+            );
+        }
+        assert!(
+            world
+                .server
+                .committed_state()
+                .arena
+                .boost_pads
+                .iter()
+                .find(|pad| pad.id == 3)
+                .is_some_and(|pad| pad.respawn_at_tick.is_some()),
+            "collection must start the pad cooldown"
+        );
+
+        world.drop_first_enemy_boost_activation = true;
+        world.server_receive_command(GameCommandMessage {
+            command_id_client: CommandId {
+                tick: world.server.current_tick(),
+                user_id: 2,
+                sequence_number: 1,
+            },
+            command_id_server: None,
+            command: GameCommand::ActivateBoost { snake_id: 1 },
+        });
+
+        // The next heartbeat consumes a later stream sequence, exposing the
+        // exact dropped schedule and the resulting speed/fuel divergence.
+        let mut waited_ms = 0;
+        while (world.dropped_boost_activation.is_none()
+            || !world.client().sync_status().needs_resync)
+            && waited_ms < 2_000
+        {
+            world.run_for(50);
+            waited_ms += 50;
+        }
+        let (drop_tick, drop_seq) = world
+            .dropped_boost_activation
+            .expect("opponent Boost schedule should be dropped");
+        let server_enemy = &world.server.committed_state().arena.snakes[1];
+        let client_enemy = &world.client().committed_state().arena.snakes[1];
+        assert!(
+            server_enemy.boost().active,
+            "server opponent must be actively boosted after tick {drop_tick}"
+        );
+        assert!(
+            !client_enemy.boost().active,
+            "client must not infer an unseen activation at stream sequence {drop_seq}"
+        );
+        assert_ne!(
+            server_enemy.speed_milli(),
+            client_enemy.speed_milli(),
+            "the missed activation must create a real snake-speed divergence"
+        );
+        assert!(world.client().sync_status().stream_gap_count > 0);
+
+        // Leave one unrelated local activation speculative. A snapshot must
+        // discard it rather than replaying it on top of authoritative state.
+        world
+            .client
+            .as_mut()
+            .expect("client joined")
+            .process_local_command(GameCommand::ActivateBoost { snake_id: 0 })?;
+        let prediction_time = world.now_ms + 200;
+        world
+            .client
+            .as_mut()
+            .expect("client joined")
+            .rebuild_predicted_state(prediction_time)?;
+        assert!(
+            world.client().predicted_state().unwrap().arena.snakes[0]
+                .boost()
+                .active,
+            "premise: local activation must be visible before snapshot repair"
+        );
+
+        world.request_resync();
+        world.drain_and_probe();
+        let rebuild_time = world.now_ms;
+        world
+            .client
+            .as_mut()
+            .expect("client joined")
+            .rebuild_predicted_state(rebuild_time)?;
+
+        let server_state = world.server.committed_state();
+        let client_state = world.client().committed_state();
+        let server_enemy = &server_state.arena.snakes[1];
+        let client_enemy = &client_state.arena.snakes[1];
+        assert_eq!(client_enemy.boost(), server_enemy.boost());
+        assert_eq!(client_enemy.speed_milli(), server_enemy.speed_milli());
+        assert_eq!(
+            client_enemy.movement_credit(),
+            server_enemy.movement_credit()
+        );
+        assert_eq!(client_enemy.head()?, server_enemy.head()?);
+        assert_eq!(
+            client_state.arena.boost_pads, server_state.arena.boost_pads,
+            "snapshot must restore absolute pad cooldown state"
+        );
+        assert!(
+            !world.client().predicted_state().unwrap().arena.snakes[0]
+                .boost()
+                .active,
+            "snapshot must discard speculative commands already superseded by its anchor"
+        );
+        assert!(!world.client().sync_status().needs_resync);
+        assert_eq!(
+            world.client().committed_sync_hash(),
+            world.server.committed_sync_hash(),
+            "snapshot-healed Boost state must fingerprint identically"
         );
         Ok(())
     })

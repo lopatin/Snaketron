@@ -18,6 +18,7 @@ use crate::partition_assignment::AssignmentStore;
 use crate::recovery::RECOVERY_SCHEMA_VERSION;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result};
+use common::{BoostLifecycleTransition, GameState, GameType, QueueMode};
 use redis::AsyncCommands;
 use redis::streams::StreamPendingReply;
 use serde_json::{Map, Value, json};
@@ -55,6 +56,21 @@ struct Counters {
     command_resends: AtomicU64,
     command_deduplications: AtomicU64,
     command_rejections: AtomicU64,
+    boost_packet_collections: AtomicU64,
+    boost_pad_respawns: AtomicU64,
+    boost_activation_attempts: AtomicU64,
+    boost_activation_commands_scheduled: AtomicU64,
+    boost_activation_command_rejections: AtomicU64,
+    boost_activations: AtomicU64,
+    boost_manual_stops: AtomicU64,
+    boost_depletions: AtomicU64,
+    game_actor_advances: AtomicU64,
+    game_actor_batch_quanta_sum: AtomicU64,
+    game_actor_batch_quanta_max: AtomicU64,
+    game_actor_lag_ms_sum: AtomicU64,
+    game_actor_lag_ms_max: AtomicU64,
+    game_actor_advance_duration_us_sum: AtomicU64,
+    game_actor_advance_duration_us_max: AtomicU64,
     checkpoint_writes: AtomicU64,
     checkpoint_failures: AtomicU64,
     recovered_games: AtomicU64,
@@ -139,6 +155,175 @@ counter_fn!(
     duplicate_completion_effects_prevented
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoostMetricDimensions {
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+}
+
+fn boost_metric_dimensions(state: &GameState, snake_id: u32) -> BoostMetricDimensions {
+    let game_type = match &state.game_type {
+        GameType::TeamMatch { per_team: 1 } => "duel",
+        GameType::TeamMatch { per_team: 2 } => "2v2",
+        GameType::TeamMatch { .. } => "other-team",
+        GameType::Solo => "solo",
+        GameType::FreeForAll { .. } => "free-for-all",
+        GameType::Custom { .. } => "custom",
+    };
+    let queue_mode = match &state.queue_mode {
+        QueueMode::Quickmatch => "quickmatch",
+        QueueMode::Competitive => "competitive",
+    };
+    let team_side = match state
+        .arena
+        .snakes
+        .get(snake_id as usize)
+        .and_then(|snake| snake.team_id)
+        .map(|team| team.0)
+    {
+        Some(0) => "team-0",
+        Some(1) => "team-1",
+        _ => "unknown",
+    };
+    let speed_band = match state
+        .properties
+        .boost
+        .as_ref()
+        .map(|config| config.speed_milli)
+    {
+        Some(1_000) => "1.00x",
+        Some(1_001..=1_250) => "1.01-1.25x",
+        Some(1_251..=1_500) => "1.26-1.50x",
+        Some(1_501..=1_750) => "1.51-1.75x",
+        Some(1_751..=2_000) => "1.76-2.00x",
+        _ => "unsupported",
+    };
+
+    BoostMetricDimensions {
+        game_type,
+        queue_mode,
+        team_side,
+        speed_band,
+    }
+}
+
+/// Record one authoritative packet event after it has been durably published.
+/// Dimensions are deliberately selected from finite enums/bands; game, user,
+/// command, and snake identifiers are never exported as labels.
+pub fn record_boost_packet_collected(state: &GameState, snake_id: u32, pad_id: u8) {
+    counters()
+        .boost_packet_collections
+        .fetch_add(1, Ordering::Relaxed);
+    let dimensions = boost_metric_dimensions(state, snake_id);
+    crate::otel_metrics::record_boost_packet_collected(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.team_side,
+        dimensions.speed_band,
+        pad_id,
+    );
+}
+
+/// Record an absolute pad-cooldown transition observed while advancing an
+/// authoritative actor. A fixed layout bounds `pad_id` cardinality.
+pub fn record_boost_pad_respawned(state: &GameState, pad_id: u8) {
+    counters()
+        .boost_pad_respawns
+        .fetch_add(1, Ordering::Relaxed);
+    let dimensions = boost_metric_dimensions(state, u32::MAX);
+    crate::otel_metrics::record_boost_pad_respawned(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.speed_band,
+        pad_id,
+    );
+}
+
+/// Count a new (non-retry) activation command at the executor decision point.
+pub fn record_boost_activation_attempt(state: &GameState, snake_id: u32) {
+    counters()
+        .boost_activation_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    let dimensions = boost_metric_dimensions(state, snake_id);
+    crate::otel_metrics::record_boost_activation_attempt(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.team_side,
+        dimensions.speed_band,
+    );
+}
+
+/// Count the server decision for a new activation command. "Scheduled" is
+/// intentionally distinct from "activated": gameplay-invalid activation is
+/// a deterministic scheduled no-op. Lifecycle metrics are recorded separately
+/// only when the authoritative simulation changes snake Boost state.
+pub fn record_boost_activation_decision(state: &GameState, snake_id: u32, scheduled: bool) {
+    let dimensions = boost_metric_dimensions(state, snake_id);
+    if scheduled {
+        counters()
+            .boost_activation_commands_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        counters()
+            .boost_activation_command_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    crate::otel_metrics::record_boost_activation_decision(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.team_side,
+        dimensions.speed_band,
+        scheduled,
+    );
+}
+
+/// Record an exact lifecycle transition emitted by an authoritative simulation
+/// quantum. Unlike command scheduling telemetry, this cannot count a no-op
+/// Space command as an activation.
+pub fn record_boost_lifecycle_transition(state: &GameState, transition: BoostLifecycleTransition) {
+    let snake_id = match transition {
+        BoostLifecycleTransition::Activated { snake_id }
+        | BoostLifecycleTransition::ManuallyStopped { snake_id }
+        | BoostLifecycleTransition::Depleted { snake_id } => snake_id,
+    };
+    let dimensions = boost_metric_dimensions(state, snake_id);
+    match transition {
+        BoostLifecycleTransition::Activated { .. } => {
+            counters().boost_activations.fetch_add(1, Ordering::Relaxed);
+            crate::otel_metrics::record_boost_lifecycle_transition(
+                dimensions.game_type,
+                dimensions.queue_mode,
+                dimensions.team_side,
+                dimensions.speed_band,
+                true,
+            );
+        }
+        BoostLifecycleTransition::ManuallyStopped { .. } => {
+            counters()
+                .boost_manual_stops
+                .fetch_add(1, Ordering::Relaxed);
+            crate::otel_metrics::record_boost_manual_stop(
+                dimensions.game_type,
+                dimensions.queue_mode,
+                dimensions.team_side,
+                dimensions.speed_band,
+            );
+        }
+        BoostLifecycleTransition::Depleted { .. } => {
+            counters().boost_depletions.fetch_add(1, Ordering::Relaxed);
+            crate::otel_metrics::record_boost_lifecycle_transition(
+                dimensions.game_type,
+                dimensions.queue_mode,
+                dimensions.team_side,
+                dimensions.speed_band,
+                false,
+            );
+        }
+    }
+}
+
 counter_fn!(record_websocket_opened, websocket_opens);
 counter_fn!(record_websocket_closed, websocket_closes);
 counter_fn!(
@@ -182,9 +367,38 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn record_sum_and_max(sum: &AtomicU64, max: &AtomicU64, value: u64) {
     sum.fetch_add(value, Ordering::Relaxed);
     max.fetch_max(value, Ordering::Relaxed);
+}
+
+/// Record one authoritative actor simulation pass. All values are
+/// attribute-free and bounded-cardinality so they remain safe at game scale.
+pub fn record_game_actor_advance(batch_quanta: u32, lag_ms: u64, duration: Duration) {
+    let counters = counters();
+    let batch_quanta = u64::from(batch_quanta);
+    let advance_duration_us = duration_us(duration);
+    counters.game_actor_advances.fetch_add(1, Ordering::Relaxed);
+    record_sum_and_max(
+        &counters.game_actor_batch_quanta_sum,
+        &counters.game_actor_batch_quanta_max,
+        batch_quanta,
+    );
+    record_sum_and_max(
+        &counters.game_actor_lag_ms_sum,
+        &counters.game_actor_lag_ms_max,
+        lag_ms,
+    );
+    record_sum_and_max(
+        &counters.game_actor_advance_duration_us_sum,
+        &counters.game_actor_advance_duration_us_max,
+        advance_duration_us,
+    );
+    crate::otel_metrics::record_game_actor_advance(advance_duration_us, batch_quanta, lag_ms);
 }
 
 pub fn record_http_request(status_code: u16, latency: Duration) {
@@ -304,6 +518,21 @@ struct CounterSnapshot {
     command_resends: u64,
     command_deduplications: u64,
     command_rejections: u64,
+    boost_packet_collections: u64,
+    boost_pad_respawns: u64,
+    boost_activation_attempts: u64,
+    boost_activation_commands_scheduled: u64,
+    boost_activation_command_rejections: u64,
+    boost_activations: u64,
+    boost_manual_stops: u64,
+    boost_depletions: u64,
+    game_actor_advances: u64,
+    game_actor_batch_quanta_sum: u64,
+    game_actor_batch_quanta_max: u64,
+    game_actor_lag_ms_sum: u64,
+    game_actor_lag_ms_max: u64,
+    game_actor_advance_duration_us_sum: u64,
+    game_actor_advance_duration_us_max: u64,
     checkpoint_writes: u64,
     checkpoint_failures: u64,
     recovered_games: u64,
@@ -365,6 +594,35 @@ fn take_counter_snapshot() -> CounterSnapshot {
         command_resends: counters.command_resends.swap(0, Ordering::Relaxed),
         command_deduplications: counters.command_deduplications.swap(0, Ordering::Relaxed),
         command_rejections: counters.command_rejections.swap(0, Ordering::Relaxed),
+        boost_packet_collections: counters.boost_packet_collections.swap(0, Ordering::Relaxed),
+        boost_pad_respawns: counters.boost_pad_respawns.swap(0, Ordering::Relaxed),
+        boost_activation_attempts: counters
+            .boost_activation_attempts
+            .swap(0, Ordering::Relaxed),
+        boost_activation_commands_scheduled: counters
+            .boost_activation_commands_scheduled
+            .swap(0, Ordering::Relaxed),
+        boost_activation_command_rejections: counters
+            .boost_activation_command_rejections
+            .swap(0, Ordering::Relaxed),
+        boost_activations: counters.boost_activations.swap(0, Ordering::Relaxed),
+        boost_manual_stops: counters.boost_manual_stops.swap(0, Ordering::Relaxed),
+        boost_depletions: counters.boost_depletions.swap(0, Ordering::Relaxed),
+        game_actor_advances: counters.game_actor_advances.swap(0, Ordering::Relaxed),
+        game_actor_batch_quanta_sum: counters
+            .game_actor_batch_quanta_sum
+            .swap(0, Ordering::Relaxed),
+        game_actor_batch_quanta_max: counters
+            .game_actor_batch_quanta_max
+            .swap(0, Ordering::Relaxed),
+        game_actor_lag_ms_sum: counters.game_actor_lag_ms_sum.swap(0, Ordering::Relaxed),
+        game_actor_lag_ms_max: counters.game_actor_lag_ms_max.swap(0, Ordering::Relaxed),
+        game_actor_advance_duration_us_sum: counters
+            .game_actor_advance_duration_us_sum
+            .swap(0, Ordering::Relaxed),
+        game_actor_advance_duration_us_max: counters
+            .game_actor_advance_duration_us_max
+            .swap(0, Ordering::Relaxed),
         checkpoint_writes: counters.checkpoint_writes.swap(0, Ordering::Relaxed),
         checkpoint_failures: counters.checkpoint_failures.swap(0, Ordering::Relaxed),
         recovered_games: counters.recovered_games.swap(0, Ordering::Relaxed),
@@ -1267,6 +1525,61 @@ fn emf_document(
             "Count",
         ),
         ("CommandRejections", counters.command_rejections, "Count"),
+        (
+            "BoostPacketCollections",
+            counters.boost_packet_collections,
+            "Count",
+        ),
+        ("BoostPadRespawns", counters.boost_pad_respawns, "Count"),
+        (
+            "BoostActivationAttempts",
+            counters.boost_activation_attempts,
+            "Count",
+        ),
+        (
+            "BoostActivationCommandsScheduled",
+            counters.boost_activation_commands_scheduled,
+            "Count",
+        ),
+        (
+            "BoostActivationCommandRejections",
+            counters.boost_activation_command_rejections,
+            "Count",
+        ),
+        ("BoostActivations", counters.boost_activations, "Count"),
+        ("BoostManualStops", counters.boost_manual_stops, "Count"),
+        ("BoostDepletions", counters.boost_depletions, "Count"),
+        ("GameActorAdvances", counters.game_actor_advances, "Count"),
+        (
+            "GameActorBatchQuantaSum",
+            counters.game_actor_batch_quanta_sum,
+            "Count",
+        ),
+        (
+            "GameActorBatchQuantaMax",
+            counters.game_actor_batch_quanta_max,
+            "Count",
+        ),
+        (
+            "GameActorLagMsSum",
+            counters.game_actor_lag_ms_sum,
+            "Milliseconds",
+        ),
+        (
+            "GameActorLagMsMax",
+            counters.game_actor_lag_ms_max,
+            "Milliseconds",
+        ),
+        (
+            "GameActorAdvanceDurationUsSum",
+            counters.game_actor_advance_duration_us_sum,
+            "Microseconds",
+        ),
+        (
+            "GameActorAdvanceDurationUsMax",
+            counters.game_actor_advance_duration_us_max,
+            "Microseconds",
+        ),
         ("CheckpointWrites", counters.checkpoint_writes, "Count"),
         ("CheckpointFailures", counters.checkpoint_failures, "Count"),
         ("RecoveredGames", counters.recovered_games, "Count"),
@@ -1590,6 +1903,34 @@ mod tests {
         record_websocket_send_error(1);
         record_websocket_transport_error(1);
         record_websocket_session(Duration::from_millis(19));
+        record_game_actor_advance(3, 50, Duration::from_micros(730));
+        let mut boost_state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let boost_snake_id = boost_state.add_player(99, None).unwrap().snake_id;
+        record_boost_lifecycle_transition(
+            &boost_state,
+            BoostLifecycleTransition::Activated {
+                snake_id: boost_snake_id,
+            },
+        );
+        record_boost_lifecycle_transition(
+            &boost_state,
+            BoostLifecycleTransition::ManuallyStopped {
+                snake_id: boost_snake_id,
+            },
+        );
+        record_boost_lifecycle_transition(
+            &boost_state,
+            BoostLifecycleTransition::Depleted {
+                snake_id: boost_snake_id,
+            },
+        );
         record_websocket_resync_requested(2);
         record_websocket_resync_accepted(1);
         record_websocket_resync_rejected(1);
@@ -1625,6 +1966,16 @@ mod tests {
         assert!(snapshot.websocket_transport_errors >= 1);
         assert!(snapshot.websocket_session_duration_ms_sum >= 19);
         assert!(snapshot.websocket_session_duration_ms_max >= 19);
+        assert!(snapshot.game_actor_advances >= 1);
+        assert!(snapshot.game_actor_batch_quanta_sum >= 3);
+        assert!(snapshot.game_actor_batch_quanta_max >= 3);
+        assert!(snapshot.game_actor_lag_ms_sum >= 50);
+        assert!(snapshot.game_actor_lag_ms_max >= 50);
+        assert!(snapshot.game_actor_advance_duration_us_sum >= 730);
+        assert!(snapshot.game_actor_advance_duration_us_max >= 730);
+        assert!(snapshot.boost_activations >= 1);
+        assert!(snapshot.boost_manual_stops >= 1);
+        assert!(snapshot.boost_depletions >= 1);
         assert!(snapshot.websocket_resync_requests >= 2);
         assert!(snapshot.websocket_resync_accepted >= 1);
         assert!(snapshot.websocket_resync_rejected >= 1);
@@ -1901,7 +2252,7 @@ mod tests {
         let prefix = expected_recovery_prefix(7, 127);
         assert_eq!(
             prefix,
-            "{\"schema_version\":2,\"executor_protocol_version\":2,\"game_id\":127,\"partition_id\":7,"
+            "{\"schema_version\":3,\"executor_protocol_version\":5,\"game_id\":127,\"partition_id\":7,"
         );
 
         let envelope = RecoveryEnvelopeV2::new(
@@ -1947,6 +2298,33 @@ mod tests {
             checkpointed_at_ms_from_tail(br#""checkpointed_at_ms":123,"source_lease_token":"}"#,),
             None,
             "an unterminated source token must not look like a checkpoint",
+        );
+    }
+
+    #[test]
+    fn boost_metric_dimensions_are_finite_labels_without_identifiers() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        let player = state.add_player(9_876_543, None).unwrap();
+
+        assert_eq!(
+            boost_metric_dimensions(&state, player.snake_id),
+            BoostMetricDimensions {
+                game_type: "2v2",
+                queue_mode: "competitive",
+                team_side: "team-0",
+                speed_band: "1.26-1.50x",
+            }
+        );
+        assert_eq!(
+            boost_metric_dimensions(&state, u32::MAX).team_side,
+            "unknown"
         );
     }
 }

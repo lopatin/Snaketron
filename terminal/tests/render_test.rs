@@ -1,4 +1,4 @@
-use common::{Arena, Direction, Position, Snake};
+use common::{Arena, BoostPad, Direction, Position, Snake};
 use terminal::render::{
     arena::ArenaRenderer,
     standard_renderer::StandardRenderer,
@@ -11,17 +11,18 @@ fn test_2x1_rendering() {
     let arena = Arena {
         width: 10,
         height: 10,
-        snakes: vec![Snake {
-            body: vec![
+        snakes: vec![Snake::new(
+            vec![
                 Position { x: 5, y: 5 }, // head
                 Position { x: 4, y: 5 }, // turn/tail
             ],
-            direction: Direction::Right,
-            is_alive: true,
-            food: 0,
-            team_id: None,
-        }],
+            Direction::Right,
+            true,
+            0,
+            None,
+        )],
         food: vec![Position { x: 7, y: 7 }],
+        boost_pads: Vec::new(),
         team_zone_config: None,
     };
 
@@ -60,14 +61,15 @@ fn test_1x1_rendering() {
     let arena = Arena {
         width: 5,
         height: 5,
-        snakes: vec![Snake {
-            body: vec![Position { x: 2, y: 2 }, Position { x: 1, y: 2 }],
-            direction: Direction::Right,
-            is_alive: true,
-            food: 0,
-            team_id: None,
-        }],
+        snakes: vec![Snake::new(
+            vec![Position { x: 2, y: 2 }, Position { x: 1, y: 2 }],
+            Direction::Right,
+            true,
+            0,
+            None,
+        )],
         food: vec![Position { x: 3, y: 3 }],
+        boost_pads: Vec::new(),
         team_zone_config: None,
     };
 
@@ -105,6 +107,7 @@ fn test_custom_dimensions() {
         height: 3,
         snakes: vec![],
         food: vec![Position { x: 1, y: 1 }],
+        boost_pads: Vec::new(),
         team_zone_config: None,
     };
 
@@ -130,4 +133,52 @@ fn test_custom_dimensions() {
     assert_eq!(lines[3][3], ' '); // (0,1) in pattern
     assert_eq!(lines[3][4], '●'); // (1,1) in pattern
     assert_eq!(lines[3][5], ' '); // (2,1) in pattern
+}
+
+#[test]
+fn boost_rendering_uses_authoritative_footprints_and_hides_cooldowns() {
+    let arena = Arena {
+        width: 6,
+        height: 5,
+        snakes: vec![],
+        food: vec![],
+        boost_pads: vec![
+            BoostPad {
+                id: 0,
+                position: Position { x: 0, y: 0 },
+                charge_ms: 3_000,
+                size_cells: 2,
+                respawn_at_tick: None,
+            },
+            BoostPad {
+                id: 4,
+                position: Position { x: 3, y: 1 },
+                charge_ms: 750,
+                size_cells: 1,
+                respawn_at_tick: None,
+            },
+            BoostPad {
+                id: 5,
+                position: Position { x: 5, y: 4 },
+                charge_ms: 750,
+                size_cells: 1,
+                respawn_at_tick: Some(10),
+            },
+        ],
+        team_zone_config: None,
+    };
+    let char_dims = CharDimensions::new(1, 1);
+    let lines = ArenaRenderer::new(StandardRenderer::new(char_dims))
+        .render(
+            &arena,
+            &RenderConfig {
+                chars_per_point: char_dims,
+            },
+        )
+        .into_lines();
+
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1), (3, 1)] {
+        assert_eq!(lines[y][x], '▰');
+    }
+    assert_eq!(lines[4][5], ' ', "cooling packet must not render");
 }

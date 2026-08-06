@@ -222,6 +222,17 @@ pub struct GameBus {
     executor_read_reply_gate: std::sync::Arc<std::sync::Mutex<Option<ExecutorReadReplyGate>>>,
 }
 
+fn deserialize_stored_snapshot(bytes: &[u8]) -> Result<GameState> {
+    let game_state: GameState =
+        serde_json::from_slice(bytes).context("Failed to deserialize snapshot")?;
+    if let Err(strict_error) = game_state.validate_boost_invariants()
+        && !game_state.is_legacy_completed_team_snapshot()
+    {
+        return Err(strict_error).context("Stored snapshot failed gameplay invariants");
+    }
+    Ok(game_state)
+}
+
 impl GameBus {
     pub fn new(
         redis: impl Into<RedisConnection>,
@@ -522,9 +533,7 @@ impl GameBus {
             .await
             .context("Failed to get snapshot from Redis")?;
         match data {
-            Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).context("Failed to deserialize snapshot")?,
-            )),
+            Some(bytes) => Ok(Some(deserialize_stored_snapshot(&bytes)?)),
             None => Ok(None),
         }
     }
@@ -1238,6 +1247,7 @@ impl GameBus {
             command_id,
             reason: event_reason,
             session_rejected_from,
+            ..
         } = &event.event
         else {
             anyhow::bail!("replyable command disposition requires CommandRejected");
@@ -2801,7 +2811,10 @@ mod tests {
     use crate::partition_lease::PartitionLeaseStore;
     use crate::redis_utils::{RedisClient, create_connection_manager};
     use anyhow::Context;
-    use common::{ClientCommandIdentityV2, CommandId, Direction, GameCommand, GameCommandMessage};
+    use common::{
+        ClientCommandIdentityV2, CommandId, Direction, GameCommand, GameCommandMessage, GameState,
+        GameStatus, GameType, QueueMode,
+    };
     use redis::AsyncCommands;
 
     #[test]
@@ -2822,6 +2835,69 @@ mod tests {
         assert!(!stream_cursor_fell_behind("10-0", Some("10-0")));
         assert!(stream_cursor_fell_behind("10-0", Some("11-0")));
         assert!(stream_cursor_fell_behind("10-0", None));
+    }
+
+    fn stored_pre_boost_team_snapshot(status: GameStatus) -> Vec<u8> {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        state.status = status;
+        let mut value = serde_json::to_value(state).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("player_action_counts");
+        value["properties"]["tick_duration_ms"] = serde_json::json!(100);
+        value["properties"].as_object_mut().unwrap().remove("boost");
+        value["arena"].as_object_mut().unwrap().remove("boost_pads");
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    #[test]
+    fn stored_snapshot_admission_allows_legacy_completion_but_rejects_legacy_active_game() {
+        let completed = stored_pre_boost_team_snapshot(GameStatus::Complete {
+            winning_snake_id: None,
+        });
+        assert!(deserialize_stored_snapshot(&completed).is_ok());
+
+        let active = stored_pre_boost_team_snapshot(GameStatus::Started { server_id: 1 });
+        let error = deserialize_stored_snapshot(&active)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Stored snapshot failed gameplay invariants"),
+            "unexpected admission error: {error}"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_admission_rejects_malformed_current_completion() {
+        let mut malformed = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        malformed.add_player(7, None).unwrap();
+        malformed.add_player(8, None).unwrap();
+        malformed.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        malformed.arena.boost_pads.pop();
+
+        let bytes = serde_json::to_vec(&malformed).unwrap();
+        let error = deserialize_stored_snapshot(&bytes).unwrap_err().to_string();
+        assert!(
+            error.contains("Stored snapshot failed gameplay invariants"),
+            "unexpected admission error: {error}"
+        );
     }
 
     #[test]

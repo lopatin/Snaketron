@@ -4,7 +4,7 @@ use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use common::GameType;
+use common::{BoostConfig, GameType};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -580,16 +580,35 @@ pub struct MatchmakingManager {
     redis: RedisConnection,
     max_retries: u32,
     retry_delay: Duration,
+    boost_config: BoostConfig,
 }
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
     pub fn new(redis: impl Into<RedisConnection>) -> Result<Self> {
+        Self::new_with_boost_config(redis, BoostConfig::default())
+    }
+
+    /// Create a matchmaking manager with the Boost balance resolved at server
+    /// startup. Eligible matches clone this value into their immutable game
+    /// properties and never re-read process configuration while active.
+    pub fn new_with_boost_config(
+        redis: impl Into<RedisConnection>,
+        boost_config: BoostConfig,
+    ) -> Result<Self> {
+        boost_config
+            .validate()
+            .context("Invalid matchmaking Boost configuration")?;
         Ok(Self {
             redis: redis.into(),
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
+            boost_config,
         })
+    }
+
+    pub(crate) fn boost_config(&self) -> &BoostConfig {
+        &self.boost_config
     }
 
     /// Add a lobby to the matchmaking queue for multiple game types

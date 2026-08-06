@@ -374,7 +374,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
           disabled={startButtonDisabled}
           aria-busy={startButtonActivating}
           className={`
-            game-start-button w-full py-4 rounded-lg font-black uppercase tracking-1 text-lg
+            game-start-button game-primary-motion w-full py-4 rounded-lg font-black uppercase tracking-1 text-lg
             inline-flex items-center justify-center
             border-2
             ${startButtonDisabled

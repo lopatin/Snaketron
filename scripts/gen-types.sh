@@ -22,6 +22,10 @@ TS_RS_EXPORT_DIR="$OUT" cargo test -p common --features ts-gen export_bindings -
 # common types via the chained `common/ts-gen` feature).
 TS_RS_EXPORT_DIR="$OUT" cargo test -p server --features ts-gen export_bindings -- --quiet
 
+# ts-rs can leave spaces at the ends of wrapped doc-comment lines. Normalize
+# generated output so repository whitespace checks and regeneration CI agree.
+perl -pi -e 's/[ \t]+$//' "$OUT"/*.ts
+
 # Barrel: re-export every generated type so consumers can
 # `import { GameState, WSMessage } from '../types/generated'`.
 BARREL="$OUT/index.ts"

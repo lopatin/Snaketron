@@ -10,6 +10,23 @@ pub struct GameClient {
     engine: GameEngine,
 }
 
+fn game_client_from_snapshot_frame(game_id: u32, frame_json: &str) -> Result<GameClient, String> {
+    let frame: serde_json::Value = serde_json::from_str(frame_json).map_err(|e| e.to_string())?;
+    let game_state_val = frame
+        .get("GameEvent")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("Snapshot"))
+        .and_then(|s| s.get("game_state"))
+        .ok_or_else(|| "expected a GameEvent Snapshot frame".to_string())?;
+    let game_state: GameState =
+        serde_json::from_value(game_state_val.clone()).map_err(|e| e.to_string())?;
+
+    Ok(GameClient {
+        engine: GameEngine::try_new_from_snapshot_state(game_id, game_state)
+            .map_err(|e| e.to_string())?,
+    })
+}
+
 #[wasm_bindgen]
 impl GameClient {
     /// Creates a new game client instance
@@ -39,7 +56,8 @@ impl GameClient {
             serde_json::from_str(state_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(GameClient {
-            engine: GameEngine::new_from_state(game_id, game_state),
+            engine: GameEngine::try_new_from_snapshot_state(game_id, game_state)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
         })
     }
 
@@ -107,6 +125,37 @@ impl GameClient {
         serde_json::to_string(&command_message).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Activate the snake's stored Boost charge with client-side prediction.
+    ///
+    /// The command deliberately carries only the snake ID. Charge, duration,
+    /// speed, and pad state are all derived by the shared engine.
+    #[wasm_bindgen(js_name = processActivateBoost)]
+    pub fn process_activate_boost(&mut self, snake_id: u32) -> Result<String, JsValue> {
+        let command = GameCommand::ActivateBoost { snake_id };
+
+        let command_message = self
+            .engine
+            .process_local_command(command)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        serde_json::to_string(&command_message).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Stop consuming the snake's stored Boost charge with client-side
+    /// prediction. The explicit command is idempotent, so retries cannot
+    /// accidentally toggle Boost back on.
+    #[wasm_bindgen(js_name = processDeactivateBoost)]
+    pub fn process_deactivate_boost(&mut self, snake_id: u32) -> Result<String, JsValue> {
+        let command = GameCommand::DeactivateBoost { snake_id };
+
+        let command_message = self
+            .engine
+            .process_local_command(command)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        serde_json::to_string(&command_message).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Process a server event for reconciliation
     #[wasm_bindgen(js_name = processServerEvent)]
     pub fn process_server_event(&mut self, event_message_json: &str) -> Result<(), JsValue> {
@@ -148,21 +197,8 @@ impl GameClient {
     #[wasm_bindgen(js_name = newFromSnapshotFrame)]
     pub fn new_from_snapshot_frame(game_id: u32, frame_json: &str) -> Result<GameClient, JsValue> {
         console_error_panic_hook::set_once();
-
-        let frame: serde_json::Value =
-            serde_json::from_str(frame_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let game_state_val = frame
-            .get("GameEvent")
-            .and_then(|e| e.get("event"))
-            .and_then(|e| e.get("Snapshot"))
-            .and_then(|s| s.get("game_state"))
-            .ok_or_else(|| JsValue::from_str("expected a GameEvent Snapshot frame"))?;
-        let game_state: GameState = serde_json::from_value(game_state_val.clone())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(GameClient {
-            engine: GameEngine::new_from_state(game_id, game_state),
-        })
+        game_client_from_snapshot_frame(game_id, frame_json)
+            .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Initialize game state from a snapshot
@@ -329,6 +365,97 @@ pub use render::screen_direction_to_game;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::{
+        DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameStatus, GameType, Position, QueueMode,
+    };
+
+    fn charged_duel_state() -> (GameState, u32) {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state
+            .add_player(7, Some("boost-client".into()))
+            .unwrap()
+            .snake_id;
+        let pad = state.arena.boost_pads[0].clone();
+        let snake = &mut state.arena.snakes[snake_id as usize];
+        snake.body = vec![
+            pad.position,
+            Position {
+                x: pad.position.x - 1,
+                y: pad.position.y,
+            },
+        ];
+        snake.direction = Direction::Right;
+
+        // A normal-speed snake has only half a movement opportunity in the
+        // first 50 ms quantum, so it remains on the selected packet and
+        // collects that pad's authoritative per-packet value.
+        state.tick_forward(true).unwrap();
+        assert_eq!(
+            state.arena.snakes[snake_id as usize].boost().charge_ms,
+            pad.charge_ms
+        );
+        state.validate_boost_invariants().unwrap();
+        (state, snake_id)
+    }
+
+    fn legacy_completed_duel_state() -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            Some(91),
+            0,
+        );
+        state.add_player(7, Some("legacy-blue".into())).unwrap();
+        state.add_player(8, Some("legacy-red".into())).unwrap();
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(0),
+        };
+
+        let mut persisted = serde_json::to_value(state).unwrap();
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("player_action_counts");
+        persisted["properties"]["tick_duration_ms"] = serde_json::json!(DEFAULT_TICK_INTERVAL_MS);
+        persisted["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("boost");
+        persisted["arena"]
+            .as_object_mut()
+            .unwrap()
+            .remove("boost_pads");
+        for snake in persisted["arena"]["snakes"].as_array_mut().unwrap() {
+            let snake = snake.as_object_mut().unwrap();
+            snake.remove("speed_milli");
+            snake.remove("movement_credit");
+            snake.remove("boost");
+        }
+        serde_json::from_value(persisted).unwrap()
+    }
+
+    fn snapshot_frame(game_id: u32, state: &GameState) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "GameEvent": {
+                "game_id": game_id,
+                "tick": state.tick,
+                "sequence": state.event_sequence,
+                "stream_seq": 0,
+                "user_id": null,
+                "event": { "Snapshot": { "game_state": state } }
+            }
+        }))
+        .unwrap()
+    }
 
     // The whole reason processServerFrame/newFromSnapshotFrame exist: parsing a
     // GameEventMessage out of the raw frame text in Rust must preserve a
@@ -352,5 +479,152 @@ mod tests {
             GameEvent::TickHash { hash: got, .. } => assert_eq!(got, hash),
             other => panic!("expected TickHash, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wasm_snapshot_boundary_renders_only_legacy_compatible_completed_team_history() {
+        let completed = legacy_completed_duel_state();
+        let frame = snapshot_frame(42, &completed);
+        let client = game_client_from_snapshot_frame(42, &frame)
+            .expect("legacy completed snapshot frame must render");
+        let rendered = client.engine.predicted_state().unwrap();
+        assert!(matches!(rendered.status, GameStatus::Complete { .. }));
+        assert_eq!(rendered.properties.boost, None);
+        assert!(rendered.arena.boost_pads.is_empty());
+
+        let mut nonterminal = completed.clone();
+        nonterminal.status = GameStatus::Started { server_id: 1 };
+        assert!(game_client_from_snapshot_frame(42, &snapshot_frame(42, &nonterminal)).is_err());
+
+        let mut malformed_current = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        malformed_current.add_player(7, None).unwrap();
+        malformed_current.add_player(8, None).unwrap();
+        malformed_current.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        malformed_current.arena.boost_pads.pop();
+        assert!(
+            game_client_from_snapshot_frame(42, &snapshot_frame(42, &malformed_current)).is_err()
+        );
+    }
+
+    #[test]
+    fn activate_boost_wire_command_contains_only_snake_identity() {
+        let command = GameCommand::ActivateBoost { snake_id: 17 };
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            serde_json::json!({ "ActivateBoost": { "snake_id": 17 } })
+        );
+    }
+
+    #[test]
+    fn deactivate_boost_wire_command_contains_only_snake_identity() {
+        let command = GameCommand::DeactivateBoost { snake_id: 17 };
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            serde_json::json!({ "DeactivateBoost": { "snake_id": 17 } })
+        );
+    }
+
+    #[test]
+    fn frame_parse_recognizes_absolute_boost_packet_event() {
+        let frame = r#"{"GameEvent":{"game_id":1,"tick":12,"sequence":3,"stream_seq":4,"user_id":null,"event":{"BoostPacketCollected":{"pad_id":2,"snake_id":1,"charge_ms_after":2000,"respawn_at_tick":172}}}}"#;
+        let frame_val: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let message: GameEventMessage =
+            serde_json::from_value(frame_val["GameEvent"].clone()).unwrap();
+
+        match message.event {
+            GameEvent::BoostPacketCollected {
+                pad_id,
+                snake_id,
+                charge_ms_after,
+                respawn_at_tick,
+            } => {
+                assert_eq!((pad_id, snake_id), (2, 1));
+                assert_eq!(charge_ms_after, 2_000);
+                assert_eq!(respawn_at_tick, 172);
+            }
+            other => panic!("expected BoostPacketCollected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_boundary_roundtrip_matches_shared_engine_with_nonzero_boost() {
+        let (state, snake_id) = charged_duel_state();
+        let committed_json = serde_json::to_string(&state).unwrap();
+
+        let restored: GameState = serde_json::from_str(&committed_json).unwrap();
+        restored.validate_boost_invariants().unwrap();
+        assert_eq!(restored.sync_hash(), state.sync_hash());
+
+        // Exercise the same methods exported through wasm-bindgen, then compare
+        // their predicted result with an independently driven native engine.
+        let mut client = GameClient {
+            engine: GameEngine::try_new_from_state(42, restored.clone()).unwrap(),
+        };
+        client.set_local_player_id(7);
+        let boundary_command: GameCommandMessage =
+            serde_json::from_str(&client.process_activate_boost(snake_id).unwrap()).unwrap();
+        client.rebuild_predicted_state(100).unwrap();
+
+        let mut native = GameEngine::try_new_from_state(42, restored).unwrap();
+        native.set_local_player_id(7);
+        let native_command = native
+            .process_local_command(GameCommand::ActivateBoost { snake_id })
+            .unwrap();
+        native.rebuild_predicted_state(100).unwrap();
+
+        assert_eq!(boundary_command, native_command);
+        let boundary_state: GameState =
+            serde_json::from_str(&client.get_game_state_json().unwrap()).unwrap();
+        let native_state = native.predicted_state().unwrap();
+        assert_eq!(boundary_state.sync_hash(), native_state.sync_hash());
+        assert_eq!(
+            serde_json::to_value(&boundary_state).unwrap(),
+            serde_json::to_value(native_state).unwrap()
+        );
+
+        let snake = &boundary_state.arena.snakes[snake_id as usize];
+        assert!(snake.boost().active);
+        assert_eq!(
+            snake.boost().charge_ms,
+            state.arena.snakes[snake_id as usize].boost().charge_ms
+                - state.properties.tick_duration_ms
+        );
+        assert_eq!(snake.speed_milli(), 1_500);
+
+        let boundary_stop: GameCommandMessage =
+            serde_json::from_str(&client.process_deactivate_boost(snake_id).unwrap()).unwrap();
+        let native_stop = native
+            .process_local_command(GameCommand::DeactivateBoost { snake_id })
+            .unwrap();
+        assert_eq!(boundary_stop, native_stop);
+
+        client.rebuild_predicted_state(150).unwrap();
+        native.rebuild_predicted_state(150).unwrap();
+        let boundary_stopped: GameState =
+            serde_json::from_str(&client.get_game_state_json().unwrap()).unwrap();
+        let native_stopped = native.predicted_state().unwrap();
+        assert_eq!(boundary_stopped.sync_hash(), native_stopped.sync_hash());
+        assert_eq!(
+            serde_json::to_value(&boundary_stopped).unwrap(),
+            serde_json::to_value(native_stopped).unwrap()
+        );
+
+        let stopped_snake = &boundary_stopped.arena.snakes[snake_id as usize];
+        assert!(!stopped_snake.boost().active);
+        assert_eq!(
+            stopped_snake.boost().charge_ms,
+            state.arena.snakes[snake_id as usize].boost().charge_ms
+                - state.properties.tick_duration_ms
+        );
+        assert_eq!(stopped_snake.speed_milli(), 1_000);
     }
 }

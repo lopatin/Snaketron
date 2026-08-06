@@ -1,4 +1,4 @@
-use crate::TeamId;
+use crate::{BOOST_TICK_INTERVAL_MS, MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, TeamId};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,19 @@ pub struct Player {
     pub snake_id: u32,
 }
 
+/// Snake-owned Boost fuel and activation state.
+///
+/// Charge is stored as milliseconds of funded Boost time. It may only be
+/// mutated through the crate-visible lifecycle methods on [`Snake`], keeping
+/// speed changes coupled to Boost activation and depletion.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct SnakeBoost {
+    pub charge_ms: u32,
+    pub active: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
@@ -59,9 +72,196 @@ pub struct Snake {
     pub is_alive: bool,
     pub food: u32,
     pub team_id: Option<TeamId>, // New field for team assignment
+    /// Authoritative movement rate in milli-normal units. Internal Boost
+    /// lifecycle methods are the only gameplay code allowed to change it.
+    #[serde(default = "default_snake_speed_milli")]
+    pub(crate) speed_milli: u16,
+    /// Residual milli-milliseconds toward the snake's next cell movement.
+    #[serde(default)]
+    pub(crate) movement_credit: u32,
+    #[serde(default)]
+    pub(crate) boost: SnakeBoost,
+}
+
+fn default_snake_speed_milli() -> u16 {
+    NORMAL_SNAKE_SPEED_MILLI
 }
 
 impl Snake {
+    /// Construct a snake in the only valid externally-creatable movement
+    /// state: normal speed, zero residual credit, and no stored/active Boost.
+    /// Boost fields intentionally have no public setters; gameplay transitions
+    /// inside `common` own every later mutation.
+    pub fn new(
+        body: Vec<Position>,
+        direction: Direction,
+        is_alive: bool,
+        food: u32,
+        team_id: Option<TeamId>,
+    ) -> Self {
+        Self {
+            body,
+            direction,
+            is_alive,
+            food,
+            team_id,
+            speed_milli: NORMAL_SNAKE_SPEED_MILLI,
+            movement_credit: 0,
+            boost: SnakeBoost::default(),
+        }
+    }
+
+    pub fn speed_milli(&self) -> u16 {
+        self.speed_milli
+    }
+
+    pub fn movement_credit(&self) -> u32 {
+        self.movement_credit
+    }
+
+    pub fn boost(&self) -> &SnakeBoost {
+        &self.boost
+    }
+
+    /// Add packet charge without activating Boost or changing speed.
+    ///
+    /// Returns the absolute post-collection charge when any fuel was stored.
+    /// `None` means the packet was not consumed (dead snake, empty packet, or
+    /// an already-full/invalid-capacity meter).
+    pub(crate) fn collect_boost_charge(&mut self, amount_ms: u32, capacity_ms: u32) -> Option<u32> {
+        if !self.is_alive
+            || amount_ms == 0
+            || capacity_ms == 0
+            || !amount_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS)
+            || !capacity_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS)
+            || self.boost.charge_ms >= capacity_ms
+        {
+            return None;
+        }
+
+        let available_ms = capacity_ms - self.boost.charge_ms;
+        self.boost.charge_ms += amount_ms.min(available_ms);
+        Some(self.boost.charge_ms)
+    }
+
+    /// Activate stored Boost using immutable, validated match configuration.
+    ///
+    /// The command is a deterministic no-op unless this is a living, inactive
+    /// snake with a whole-quantum charge inside the configured capacity.
+    pub(crate) fn try_activate_boost(
+        &mut self,
+        configured_speed_milli: u16,
+        capacity_ms: u32,
+    ) -> bool {
+        let valid_config = (NORMAL_SNAKE_SPEED_MILLI..=MAX_BOOST_SPEED_MILLI)
+            .contains(&configured_speed_milli)
+            && capacity_ms > 0
+            && capacity_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS);
+        let valid_charge = self.boost.charge_ms > 0
+            && self.boost.charge_ms <= capacity_ms
+            && self.boost.charge_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS);
+
+        if !self.is_alive
+            || self.boost.active
+            || self.speed_milli != NORMAL_SNAKE_SPEED_MILLI
+            || !valid_config
+            || !valid_charge
+        {
+            return false;
+        }
+
+        self.boost.active = true;
+        self.speed_milli = configured_speed_milli;
+        true
+    }
+
+    /// Stop active Boost without discarding stored fuel or movement phase.
+    ///
+    /// This is the authoritative release edge for hold-to-Boost controls. The
+    /// transition is deliberately idempotent so retries cannot invert state.
+    pub(crate) fn try_deactivate_boost(&mut self) -> bool {
+        if !self.is_alive || !self.boost.active {
+            return false;
+        }
+
+        self.boost.active = false;
+        self.speed_milli = NORMAL_SNAKE_SPEED_MILLI;
+        true
+    }
+
+    /// Reserve one funded 50 ms Boost quantum while retaining boosted speed.
+    ///
+    /// Depletion is finalized only after movement and packet collection, so a
+    /// snake that lands on a packet during its final funded quantum continues
+    /// Boost seamlessly.
+    pub(crate) fn reserve_boost_quantum(&mut self) -> bool {
+        if !self.is_alive || !self.boost.active || self.boost.charge_ms < BOOST_TICK_INTERVAL_MS {
+            return false;
+        }
+
+        self.boost.charge_ms -= BOOST_TICK_INTERVAL_MS;
+        true
+    }
+
+    /// Restore normal speed if the post-collection meter is still empty.
+    /// Returns whether active Boost was depleted and finalized.
+    pub(crate) fn finalize_boost_depletion(&mut self) -> bool {
+        if !self.boost.active || self.boost.charge_ms != 0 {
+            return false;
+        }
+
+        self.boost.active = false;
+        self.speed_milli = NORMAL_SNAKE_SPEED_MILLI;
+        true
+    }
+
+    /// Add deterministic movement credit and consume at most one opportunity.
+    ///
+    /// `normal_movement_interval_ms` defines one cell at normal speed. Boost
+    /// team games pass 100 ms while running at a 50 ms simulation quantum;
+    /// legacy and Custom modes pass their configured tick duration for both
+    /// arguments. Arithmetic is widened so multiplication cannot overflow.
+    pub(crate) fn accrue_movement_credit(
+        &mut self,
+        tick_duration_ms: u32,
+        normal_movement_interval_ms: u32,
+    ) -> bool {
+        if !self.is_alive {
+            return false;
+        }
+
+        assert!(
+            normal_movement_interval_ms > 0,
+            "normal movement interval must be positive"
+        );
+
+        let threshold =
+            u64::from(NORMAL_SNAKE_SPEED_MILLI) * u64::from(normal_movement_interval_ms);
+        let accumulated = u64::from(self.movement_credit)
+            + u64::from(self.speed_milli) * u64::from(tick_duration_ms);
+
+        assert!(
+            accumulated < threshold * 2,
+            "a snake may accrue at most one movement opportunity per simulation quantum"
+        );
+
+        let (moves, residual) = if accumulated >= threshold {
+            (true, accumulated - threshold)
+        } else {
+            (false, accumulated)
+        };
+        self.movement_credit =
+            u32::try_from(residual).expect("movement credit residual must fit in serialized state");
+        moves
+    }
+
+    /// Clear all fuel and movement phase when the snake gets a new life.
+    pub(crate) fn reset_boost_and_movement(&mut self) {
+        self.speed_milli = NORMAL_SNAKE_SPEED_MILLI;
+        self.movement_credit = 0;
+        self.boost = SnakeBoost::default();
+    }
+
     pub fn head(&self) -> Result<&Position> {
         self.body.first().context("Snake has no head")
     }
@@ -202,7 +402,143 @@ mod tests {
             is_alive: true,
             food: 0,
             team_id: None,
+            speed_milli: NORMAL_SNAKE_SPEED_MILLI,
+            movement_credit: 0,
+            boost: SnakeBoost::default(),
         }
+    }
+
+    #[test]
+    fn boost_defaults_are_normal_and_empty() {
+        let snake = snake_with_body(
+            vec![Position { x: 1, y: 1 }, Position { x: 0, y: 1 }],
+            Direction::Right,
+        );
+
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.movement_credit, 0);
+        assert_eq!(snake.boost, SnakeBoost::default());
+    }
+
+    #[test]
+    fn collecting_charge_caps_at_capacity_without_activating() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+
+        assert_eq!(snake.collect_boost_charge(1_000, 3_000), Some(1_000));
+        assert_eq!(snake.collect_boost_charge(25, 3_000), None);
+        assert_eq!(snake.collect_boost_charge(1_000, 3_025), None);
+        assert_eq!(snake.collect_boost_charge(5_000, 3_000), Some(3_000));
+        assert_eq!(snake.collect_boost_charge(1_000, 3_000), None);
+        assert_eq!(snake.boost.charge_ms, 3_000);
+        assert!(!snake.boost.active);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+    }
+
+    #[test]
+    fn activation_requires_valid_living_snake_and_match_configuration() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+
+        assert!(!snake.try_activate_boost(1_500, 3_000));
+        snake.collect_boost_charge(1_000, 3_000);
+        assert!(!snake.try_activate_boost(MAX_BOOST_SPEED_MILLI + 1, 3_000));
+        assert!(!snake.try_activate_boost(1_500, 3_025));
+
+        assert!(snake.try_activate_boost(1_500, 3_000));
+        assert!(snake.boost.active);
+        assert_eq!(snake.speed_milli, 1_500);
+        assert!(!snake.try_activate_boost(2_000, 3_000));
+    }
+
+    #[test]
+    fn deactivation_is_idempotent_and_preserves_charge_and_movement_phase() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+        snake.collect_boost_charge(1_000, 3_000);
+        snake.movement_credit = 42_000;
+        assert!(snake.try_activate_boost(1_500, 3_000));
+
+        assert!(snake.try_deactivate_boost());
+        assert!(!snake.boost.active);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.boost.charge_ms, 1_000);
+        assert_eq!(snake.movement_credit, 42_000);
+
+        assert!(!snake.try_deactivate_boost());
+        assert_eq!(snake.boost.charge_ms, 1_000);
+        assert!(snake.try_activate_boost(1_500, 3_000));
+    }
+
+    #[test]
+    fn final_funded_quantum_can_refill_before_depletion_finalizes() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+        snake.collect_boost_charge(BOOST_TICK_INTERVAL_MS, 100);
+        assert!(snake.try_activate_boost(1_500, 100));
+
+        assert!(snake.reserve_boost_quantum());
+        assert_eq!(snake.boost.charge_ms, 0);
+        assert!(snake.boost.active);
+        assert_eq!(snake.speed_milli, 1_500);
+
+        assert_eq!(
+            snake.collect_boost_charge(BOOST_TICK_INTERVAL_MS, 100),
+            Some(BOOST_TICK_INTERVAL_MS)
+        );
+        assert!(!snake.finalize_boost_depletion());
+        assert!(snake.boost.active);
+
+        assert!(snake.reserve_boost_quantum());
+        assert!(snake.finalize_boost_depletion());
+        assert!(!snake.boost.active);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+    }
+
+    #[test]
+    fn movement_credit_is_deterministic_and_preserves_residual() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+
+        assert!(!snake.accrue_movement_credit(50, 100));
+        assert_eq!(snake.movement_credit, 50_000);
+        assert!(snake.accrue_movement_credit(50, 100));
+        assert_eq!(snake.movement_credit, 0);
+
+        snake.collect_boost_charge(100, 100);
+        assert!(snake.try_activate_boost(1_500, 100));
+        assert!(!snake.accrue_movement_credit(50, 100));
+        assert_eq!(snake.movement_credit, 75_000);
+        assert!(snake.accrue_movement_credit(50, 100));
+        assert_eq!(snake.movement_credit, 50_000);
+    }
+
+    #[test]
+    fn every_supported_speed_has_exact_long_run_distance() {
+        const QUANTA: u32 = 200;
+        for speed_milli in [1_000, 1_250, 1_500, 1_750, 2_000] {
+            let mut snake = snake_with_body(vec![], Direction::Right);
+            snake.speed_milli = speed_milli;
+
+            let moves = (0..QUANTA)
+                .filter(|_| snake.accrue_movement_credit(50, 100))
+                .count() as u32;
+            assert_eq!(
+                moves,
+                u32::from(speed_milli) / 10,
+                "wrong ten-second distance at {speed_milli} milli-speed"
+            );
+            assert_eq!(snake.movement_credit, 0);
+        }
+    }
+
+    #[test]
+    fn reset_clears_boost_and_movement_phase() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+        snake.collect_boost_charge(1_000, 3_000);
+        assert!(snake.try_activate_boost(1_500, 3_000));
+        snake.movement_credit = 42_000;
+
+        snake.reset_boost_and_movement();
+
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.movement_credit, 0);
+        assert_eq!(snake.boost, SnakeBoost::default());
     }
 
     /// Pins `travel_direction` to the engine's coordinate system, where y

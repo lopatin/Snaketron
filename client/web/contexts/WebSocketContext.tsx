@@ -18,6 +18,11 @@ import {
 } from '../types/protocol';
 import { clockSync } from '../utils/clockSync';
 import { record as recordTrace } from '../utils/syncTrace';
+import {
+  buildGameplayAuthentication,
+  isClientUpdateRequiredReason,
+  GAMEPLAY_PROTOCOL_VERSION,
+} from '../constants';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
 import {
@@ -107,6 +112,15 @@ const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
 const AUTHENTICATION_TIMEOUT_MS = 5_000;
+// RFC close codes in the 1001-2999 range are reserved for the protocol and
+// servers; browsers reject them when passed to WebSocket.close(). Preserve
+// their semantic suffixes in the application-private 4000 range whenever the
+// client initiates the equivalent shutdown.
+const CLIENT_PROTOCOL_CLOSE_CODE = 4002;
+const CLIENT_POLICY_CLOSE_CODE = 4008;
+const CLIENT_FAILURE_CLOSE_CODE = 4011;
+const CLIENT_RESTART_CLOSE_CODE = 4012;
+const CLIENT_RETRY_CLOSE_CODE = 4013;
 
 const isMatchmakingQueueIntent = (message: any): boolean =>
   Boolean(
@@ -249,6 +263,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences | null>(storedPreferences);
   const [matchmakingStatus, setMatchmakingStatus] = useState<MatchmakingStatus>('idle');
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
+  const [clientUpdateRequired, setClientUpdateRequired] = useState(false);
+  const clientUpdateRequiredRef = useRef(false);
   const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
   const currentLobbyRef = useRef<Lobby | null>(null);
   const desiredLobbyPreferencesRef = useRef<LobbyPreferences | null>(storedPreferences);
@@ -667,7 +683,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           clearContinuityProof(candidate);
           console.warn('Old WebSocket failed the planned-handoff continuity probe', error);
           try {
-            previous.socket.close(1011, 'planned handoff continuity probe failed');
+            previous.socket.close(CLIENT_FAILURE_CLOSE_CODE, 'planned handoff continuity probe failed');
           } catch {
             // The normal close/recovery path will run if the transport is gone.
           }
@@ -829,6 +845,55 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
   }, []);
 
+  const shutdownForClientUpdate = useCallback((offendingSlot: SocketSlot) => {
+    clientUpdateRequiredRef.current = true;
+    reconnectEnabledRef.current = false;
+    setClientUpdateRequired(true);
+    clockSync.stop();
+    if (reconnectTimeout.current) {
+      clearTimeout(reconnectTimeout.current);
+      reconnectTimeout.current = null;
+    }
+    if (candidateRetryTimeoutRef.current) {
+      clearTimeout(candidateRetryTimeoutRef.current);
+      candidateRetryTimeoutRef.current = null;
+    }
+    if (candidateDeadlineTimeoutRef.current) {
+      clearTimeout(candidateDeadlineTimeoutRef.current);
+      candidateDeadlineTimeoutRef.current = null;
+    }
+
+    const slots = new Set<SocketSlot>([
+      offendingSlot,
+      ...(activeSlotRef.current ? [activeSlotRef.current] : []),
+      ...(candidateSlotRef.current ? [candidateSlotRef.current] : []),
+    ]);
+    activeSlotRef.current = null;
+    candidateSlotRef.current = null;
+    ws.current = null;
+    if (typeof window !== 'undefined') {
+      window.__wsInstance = undefined;
+    }
+    for (const slot of slots) {
+      slot.role = 'retired';
+      inFlightRequestsByGenerationRef.current.delete(slot.generation);
+      clearAuthenticationTimeout(slot);
+      clearGameWarmRetryTimeout(slot);
+      try {
+        slot.socket.close(CLIENT_PROTOCOL_CLOSE_CODE, 'client update required');
+      } catch (error) {
+        console.warn('Failed to close incompatible WebSocket:', error);
+      }
+    }
+
+    setIsConnected(false);
+    setAuthHandshakeState(false);
+    setServerCapabilities(new Set());
+    lastAuthTokenRef.current = null;
+    syncRequestTimes.current.clear();
+    clearPendingMatchmakingIntent();
+  }, [clearPendingMatchmakingIntent, setAuthHandshakeState]);
+
   const handleParsedMessage = useCallback((slot: SocketSlot, rawMessage: any, rawText: string) => {
     if (slot.role === 'retired') {
       return;
@@ -851,6 +916,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     const accessDeniedReason = typeof rawMessage?.AccessDenied?.reason === 'string'
       ? rawMessage.AccessDenied.reason
       : null;
+    if (isClientUpdateRequiredReason(accessDeniedReason)) {
+      shutdownForClientUpdate(slot);
+      return;
+    }
     if (
       pendingMatchmakingIntent &&
       messageMatchesPendingIdentity &&
@@ -950,15 +1019,23 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (rawMessage?.Authenticated) {
       const nowMs = Date.now();
       const payload = rawMessage.Authenticated;
+      if (Number(payload?.protocol_version) !== GAMEPLAY_PROTOCOL_VERSION) {
+        console.error(
+          'Server gameplay protocol mismatch:',
+          payload?.protocol_version,
+          'expected:',
+          GAMEPLAY_PROTOCOL_VERSION,
+        );
+        shutdownForClientUpdate(slot);
+        return;
+      }
       slot.capabilities = Array.isArray(payload?.capabilities)
         ? payload.capabilities.filter((value: unknown): value is string => typeof value === 'string')
         : [];
       const missingCapabilities = missingRequiredServerCapabilities(slot.capabilities);
       if (missingCapabilities.length > 0) {
         console.error('Server is missing required WebSocket capabilities:', missingCapabilities);
-        clearAuthenticationTimeout(slot);
-        slot.authenticated = false;
-        slot.socket.close(1002, 'unsupported server protocol');
+        shutdownForClientUpdate(slot);
         return;
       }
       clearAuthenticationTimeout(slot);
@@ -1030,7 +1107,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       } else if (slot.role === 'candidate' && candidateSlotRef.current === slot) {
         slot.role = 'retired';
         candidateSlotRef.current = null;
-        slot.socket.close(1012, 'candidate backend is draining');
+        slot.socket.close(CLIENT_RESTART_CLOSE_CODE, 'candidate backend is draining');
         recoverAfterCandidateFailure(slot);
       }
       return;
@@ -1067,7 +1144,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       if (rawMessage?.AccessDenied || rawMessage?.GameLoadFailed) {
         slot.role = 'retired';
         candidateSlotRef.current = null;
-        slot.socket.close(1008, 'replacement context restore rejected');
+        slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'replacement context restore rejected');
         recoverAfterCandidateFailure(slot);
         return;
       }
@@ -1147,6 +1224,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     recoverAfterCandidateFailure,
     restoreCandidateContext,
     setAuthHandshakeState,
+    shutdownForClientUpdate,
   ]);
 
   const attachSocketHandlers = useCallback((slot: SocketSlot, onConnect?: () => void) => {
@@ -1171,12 +1249,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           return;
         }
         slot.authTimeoutId = null;
-        slot.socket.close(1013, 'authentication timed out');
+        slot.socket.close(CLIENT_RETRY_CLOSE_CODE, 'authentication timed out');
       }, AUTHENTICATION_TIMEOUT_MS);
       if (token) {
         slot.authStartedAtMs = Date.now();
         slot.authTokenSent = token;
-        slot.socket.send(JSON.stringify({ Token: token }));
+        slot.socket.send(JSON.stringify(buildGameplayAuthentication(token)));
         lastAuthTokenRef.current = token;
       }
 
@@ -1375,7 +1453,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         clearGameWarmRetryTimeout(slot);
         recordPlannedHandoffFailure('candidate_deadline', Date.now());
         try {
-          slot.socket.close(1013, 'planned handoff deadline reached');
+          slot.socket.close(CLIENT_RETRY_CLOSE_CODE, 'planned handoff deadline reached');
         } finally {
           recoverAfterCandidateFailure(slot);
         }
@@ -1392,6 +1470,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   startCandidateRef.current = startCandidate;
 
   const connect = useCallback((url: string, onConnect?: () => void) => {
+    if (clientUpdateRequiredRef.current) {
+      return;
+    }
     reconnectEnabledRef.current = true;
     if (onConnect) {
       onConnectCallback.current = onConnect;
@@ -1447,6 +1528,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     wsUrl: string,
     options?: { regionId?: string; origin?: string; forceReconnect?: boolean },
   ) => {
+    if (clientUpdateRequiredRef.current) {
+      return;
+    }
     console.log('Switching to region:', wsUrl);
     if (options?.regionId) {
       saveRegionPreference({
@@ -1561,9 +1645,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return true;
       }
 
-      // Token is only valid during the initial server handshake. The auth
+      // Authenticate is only valid during the initial server handshake. The auth
       // effect will replace this wrong-identity socket; never send a second
-      // Token frame on an already authenticated connection.
+      // Authenticate frame on an already authenticated connection.
       return false;
     }
     if (slot.authTokenSent !== token) {
@@ -1575,7 +1659,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       slot.authStartedAtMs = Date.now();
       slot.authTokenSent = token;
       try {
-        slot.socket.send(JSON.stringify({ Token: token }));
+        slot.socket.send(JSON.stringify(buildGameplayAuthentication(token)));
       } catch (error) {
         slot.authStartedAtMs = null;
         slot.authTokenSent = null;
@@ -1787,6 +1871,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     user,
     isConnected,
     isSessionAuthenticated,
+    clientUpdateRequired,
     currentRegionUrl,
     connect,
     connectToRegion,
@@ -2748,6 +2833,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const value: WebSocketContextType = {
     isConnected,
     isSessionAuthenticated,
+    clientUpdateRequired,
     serverCapabilities,
     sendMessage,
     waitForSessionReady,

@@ -58,6 +58,8 @@ services:
       SNAKETRON_GRPC_PORT: 50051
       SNAKETRON_REGION: us
       SNAKETRON_ENV: dev
+      # New team matches snapshot this once at creation (valid range 1.000-2.000).
+      SNAKETRON_BOOST_SPEED_MULTIPLIER: "1.500"
       # Logging
       RUST_LOG: info,server=debug
       # Replay directory (using volume)

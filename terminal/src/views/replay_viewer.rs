@@ -5,7 +5,6 @@ use crate::render::standard_renderer::StandardRenderer;
 use crate::render::types::{CharDimensions, RenderConfig};
 use crate::replay::{player::ReplayPlayer, ReplayData};
 use common::GameStatus;
-use common::DEFAULT_TICK_INTERVAL_MS;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -21,6 +20,10 @@ use std::time::{Duration, Instant};
 enum LayoutMode {
     SingleColumn, // Tall/narrow screens
     TwoColumn,    // Wide screens
+}
+
+fn playback_seconds_per_tick(tick_duration_ms: u32) -> f32 {
+    tick_duration_ms.max(1) as f32 / 1_000.0
 }
 
 impl LayoutMode {
@@ -133,12 +136,13 @@ impl View for ReplayViewerState {
             // Accumulate time for smooth playback
             self.playback_accumulator += dt.as_secs_f32() * self.player.play_speed;
 
-            // Step forward when we've accumulated enough time for a tick
-            // Assuming 3 ticks per second as standard game speed
-            const SECONDS_PER_TICK: f32 = DEFAULT_TICK_INTERVAL_MS as f32 / 1000.0;
-            while self.playback_accumulator >= SECONDS_PER_TICK {
+            // Replay at the snapshotted match quantum. Boost team games use
+            // 50ms while legacy/custom games may use another duration.
+            let seconds_per_tick =
+                playback_seconds_per_tick(self.player.current_state.properties.tick_duration_ms);
+            while self.playback_accumulator >= seconds_per_tick {
                 self.player.step_forward(1);
-                self.playback_accumulator -= SECONDS_PER_TICK;
+                self.playback_accumulator -= seconds_per_tick;
 
                 // Stop playing if the game is complete
                 if matches!(
@@ -595,5 +599,17 @@ impl ReplayViewerState {
             }),
             &mut *scrollbar_state,
         );
+    }
+}
+
+#[cfg(test)]
+mod boost_timing_tests {
+    use super::playback_seconds_per_tick;
+
+    #[test]
+    fn replay_uses_the_snapshotted_game_quantum() {
+        assert_eq!(playback_seconds_per_tick(50), 0.05);
+        assert_eq!(playback_seconds_per_tick(100), 0.1);
+        assert_eq!(playback_seconds_per_tick(175), 0.175);
     }
 }

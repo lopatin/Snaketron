@@ -12,7 +12,7 @@ const PHASE_STOPPING: u8 = 3;
 /// Capabilities advertised only after the server has actually authenticated a
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
-pub const WS_PROTOCOL_VERSION: u16 = 2;
+pub const WS_PROTOCOL_VERSION: u16 = 5;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",

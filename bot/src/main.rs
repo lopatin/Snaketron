@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 const GAME_OVER_TIMEOUT: Duration = Duration::from_secs(120);
 const MATCHMAKING_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_PROTOCOL_VERSION: u16 = 5;
+const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -366,12 +368,28 @@ where
         + Stream<Item = std::result::Result<Message, WebSocketError>>
         + Unpin,
 {
-    send_ws(socket, WSMessage::Token(token.to_owned())).await?;
+    send_ws(
+        socket,
+        WSMessage::Authenticate {
+            token: token.to_owned(),
+            protocol_version: CLIENT_PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     wait_for_setup_response(
         socket,
         "WebSocket authentication",
-        "Authenticated",
-        |message| matches!(message, WSMessage::Authenticated { .. }).then_some(()),
+        "Authenticated protocol v5",
+        |message| {
+            matches!(
+                message,
+                WSMessage::Authenticated {
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                    ..
+                }
+            )
+            .then_some(())
+        },
     )
     .await?;
 
@@ -705,20 +723,23 @@ where
         return Ok(());
     }
 
-    let direction =
-        calculate_ai_move(predicted_state, snake_id, snake.direction).unwrap_or(snake.direction);
-
-    let command = GameCommand::Turn {
-        snake_id,
-        direction,
-    };
+    let command = choose_bot_command(predicted_state, snake_id)
+        .expect("a living snake should always produce a bot command");
     let command_msg = engine.process_local_command(command)?;
-    debug!(
-        "Bot {} sending command for tick {} direction {:?}",
-        idx + 1,
-        command_msg.command_id_client.tick,
-        direction
-    );
+    match &command_msg.command {
+        GameCommand::Turn { direction, .. } => debug!(
+            "Bot {} sending command for tick {} direction {:?}",
+            idx + 1,
+            command_msg.command_id_client.tick,
+            direction
+        ),
+        GameCommand::ActivateBoost { .. } => debug!(
+            "Bot {} activating stored Boost for tick {}",
+            idx + 1,
+            command_msg.command_id_client.tick
+        ),
+        _ => {}
+    }
     send_ws(
         ws_writer,
         WSMessage::GameCommandV2 {
@@ -728,6 +749,24 @@ where
     )
     .await?;
     Ok(())
+}
+
+fn choose_bot_command(game_state: &GameState, snake_id: u32) -> Option<GameCommand> {
+    let snake = game_state.arena.snakes.get(snake_id as usize)?;
+    if !snake.is_alive {
+        return None;
+    }
+    if game_state.properties.boost.is_some() && snake.boost().charge_ms > 0 && !snake.boost().active
+    {
+        return Some(GameCommand::ActivateBoost { snake_id });
+    }
+
+    let direction =
+        calculate_ai_move(game_state, snake_id, snake.direction).unwrap_or(snake.direction);
+    Some(GameCommand::Turn {
+        snake_id,
+        direction,
+    })
 }
 
 async fn send_ws<S>(ws_writer: &mut S, msg: WSMessage) -> Result<()>
@@ -838,20 +877,30 @@ fn build_interval(game_state: &GameState) -> Option<Interval> {
     if tick_ms == 0 {
         return None;
     }
+    let decision_ms = decision_interval_ms(game_state);
 
     let now_ms = Utc::now().timestamp_millis();
     let start_ms = game_state.start_ms;
     let elapsed_ms = (now_ms - start_ms).max(0) as u64;
-    let ticks_elapsed = elapsed_ms / tick_ms;
-    let next_tick_ms = start_ms + ((ticks_elapsed + 1) * tick_ms) as i64;
-    let delay_ms = (next_tick_ms - now_ms).max(0) as u64;
+    let decisions_elapsed = elapsed_ms / decision_ms;
+    let next_decision_ms = start_ms + ((decisions_elapsed + 1) * decision_ms) as i64;
+    let delay_ms = (next_decision_ms - now_ms).max(0) as u64;
 
     let mut interval = tokio::time::interval_at(
         Instant::now() + Duration::from_millis(delay_ms),
-        Duration::from_millis(tick_ms),
+        Duration::from_millis(decision_ms),
     );
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     Some(interval)
+}
+
+fn decision_interval_ms(game_state: &GameState) -> u64 {
+    let tick_ms = game_state.properties.tick_duration_ms as u64;
+    if game_state.properties.boost.is_some() {
+        tick_ms.max(NORMAL_MOVEMENT_INTERVAL_MS)
+    } else {
+        tick_ms
+    }
 }
 
 fn send_status(
@@ -895,6 +944,64 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
+    #[test]
+    fn boost_decisions_are_bounded_by_normal_movement_opportunities() {
+        let mut boost_game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        assert!(boost_game.properties.boost.is_some());
+        assert_eq!(boost_game.properties.tick_duration_ms, 50);
+        assert_eq!(decision_interval_ms(&boost_game), 100);
+
+        boost_game.properties.tick_duration_ms = 150;
+        assert_eq!(decision_interval_ms(&boost_game), 150);
+
+        let mut non_boost_game =
+            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        non_boost_game.properties.tick_duration_ms = 50;
+        assert_eq!(decision_interval_ms(&non_boost_game), 50);
+    }
+
+    #[test]
+    fn bot_activates_collected_boost_before_choosing_another_turn() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let player = game.add_player(41, None).unwrap();
+        let pad = game.arena.boost_pads[0].clone();
+        let snake = &mut game.arena.snakes[player.snake_id as usize];
+        snake.body = vec![
+            pad.position,
+            common::Position {
+                x: pad.position.x - 1,
+                y: pad.position.y,
+            },
+        ];
+        snake.direction = common::Direction::Right;
+
+        game.tick_forward(true).unwrap();
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize]
+                .boost()
+                .charge_ms,
+            pad.charge_ms
+        );
+        assert!(matches!(
+            choose_bot_command(&game, player.snake_id),
+            Some(GameCommand::ActivateBoost { snake_id }) if snake_id == player.snake_id
+        ));
+    }
+
     #[tokio::test]
     async fn matchmaking_setup_waits_for_authentication_and_lobby_before_queueing() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -904,8 +1011,13 @@ mod tests {
             let mut socket = accept_async(stream).await.unwrap();
 
             assert!(matches!(
-                next_ws_message(&mut socket, "test token").await.unwrap(),
-                WSMessage::Token(token) if token == "test-token"
+                next_ws_message(&mut socket, "test authentication request")
+                    .await
+                    .unwrap(),
+                WSMessage::Authenticate {
+                    token,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if token == "test-token"
             ));
             send_ws(
                 &mut socket,
@@ -919,7 +1031,7 @@ mod tests {
                 &mut socket,
                 WSMessage::Authenticated {
                     task_boot_id: "test-task".to_owned(),
-                    protocol_version: 2,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
                     capabilities: Vec::new(),
                     socket_generation: 1,
                 },
@@ -989,14 +1101,19 @@ mod tests {
             let mut socket = accept_async(stream).await.unwrap();
 
             assert!(matches!(
-                next_ws_message(&mut socket, "test token").await.unwrap(),
-                WSMessage::Token(_)
+                next_ws_message(&mut socket, "test authentication request")
+                    .await
+                    .unwrap(),
+                WSMessage::Authenticate {
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                    ..
+                }
             ));
             send_ws(
                 &mut socket,
                 WSMessage::Authenticated {
                     task_boot_id: "test-task".to_owned(),
-                    protocol_version: 2,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
                     capabilities: Vec::new(),
                     socket_generation: 1,
                 },

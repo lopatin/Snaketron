@@ -14,10 +14,1648 @@
   --font-size-18: 18px;
   
   --letter-spacing-1: 1px;
-  
+
   --border-width-3: 3px;
-  
+
   --text-underline-offset-6: 6px;
+}
+
+/* Live game HUD ------------------------------------------------------------
+   This is the original Snaketron scoreboard language: editorial spacing,
+   white paper, graphite rules, blue/red match data, and no broadcast chrome. */
+:root {
+  --game-hud-top-footprint: 132px;
+  --game-scoreboard-footprint: 64px;
+  --game-graphite: #3f3f41;
+  --game-paper: #ffffff;
+  --game-blue: #3b82f6;
+  --game-red: #ef4444;
+  --game-rule: #d1d5db;
+  --game-muted: #667085;
+  --game-boost: #f8c84a;
+}
+
+.game-hud-shell {
+  position: fixed;
+  /* Lift the open edge and its shadow beyond the viewport so the scoreboard
+     reads as a continuation of the page edge, never as a floating card. */
+  top: -3px;
+  right: 0;
+  left: 0;
+  z-index: 45;
+  display: grid;
+  width: min(var(--game-arena-panel-width, 650px), calc(100vw - 24px));
+  height: var(--game-scoreboard-footprint);
+  grid-template-rows: var(--game-scoreboard-footprint);
+  margin: 0 auto;
+  padding: 0;
+  pointer-events: none;
+}
+
+.game-hud-shell > * {
+  pointer-events: auto;
+}
+
+/* Arena telemetry is owned by the field through a portal target. Boost now
+   lives beneath the canvas, leaving this row mathematically centered. */
+.game-hud-utility-row {
+  display: grid;
+  height: 44px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.game-hud-utility-row > * {
+  pointer-events: auto;
+}
+
+.game-scoreboard,
+.game-roster-band {
+  box-sizing: border-box;
+  color: var(--game-graphite);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 180ms ease, transform 220ms ease;
+}
+
+.game-scoreboard.is-visible,
+.game-roster-band.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* The scoreboard keeps the original hand-built double graphite rule; its open
+   top edge visually continues beyond the viewport. Results never expand it. */
+.game-scoreboard {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 64px;
+  grid-template-columns:
+    minmax(0, 1fr)
+    1px
+    minmax(150px, 1.38fr)
+    1px
+    minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(8px, 1.8vw, 18px);
+  padding: 9px clamp(10px, 2vw, 18px);
+  border: 3px solid #fff;
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
+  background-color: #fff;
+  background-image: linear-gradient(to bottom, #fff, #fafafa);
+  box-shadow:
+    inset -0.5px 0 0 rgb(0 0 0 / 70%),
+    inset 0.5px 0 0 rgb(0 0 0 / 70%),
+    inset 0 -0.5px 0 rgb(0 0 0 / 70%),
+    0.5px 0.5px 0 1.5px rgb(0 0 0 / 70%);
+}
+
+.game-scoreboard-brand {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-start;
+  padding-left: 1px;
+}
+
+button.game-scoreboard-brand {
+  width: 100%;
+  padding: 0 0 0 1px;
+  border: 0;
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.game-scoreboard-brand.is-home-action {
+  cursor: pointer;
+}
+
+.game-scoreboard-brand img {
+  width: min(100%, 172px);
+  height: auto;
+  max-height: 25px;
+  opacity: 0.78;
+  transition: opacity 140ms ease;
+}
+
+.game-scoreboard-brand.is-home-action:hover img {
+  opacity: 1;
+}
+
+.game-scoreboard-brand.is-home-action:focus-visible {
+  border-radius: 3px;
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 3px;
+}
+
+.game-scoreboard-divider {
+  display: block;
+  width: 1px;
+  height: 31px;
+  align-self: center;
+  background: rgb(63 63 65 / 13%);
+}
+
+.game-scoreboard-match {
+  display: grid;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  justify-self: stretch;
+}
+
+.game-scoreboard-match.is-team {
+  grid-template-columns: minmax(24px, 1fr) minmax(76px, 96px) minmax(24px, 1fr);
+  gap: clamp(7px, 1.5vw, 17px);
+}
+
+.game-scoreboard-match.is-solo {
+  grid-template-columns: minmax(58px, 1fr) minmax(76px, 96px);
+  gap: clamp(10px, 2vw, 24px);
+}
+
+.game-scoreboard-team-score {
+  color: var(--game-blue);
+  font-size: 26px;
+  font-style: italic;
+  font-weight: 950;
+  line-height: 1;
+  text-align: right;
+}
+
+.game-scoreboard-team-score.is-red {
+  color: var(--game-red);
+  text-align: left;
+}
+
+.game-scoreboard-time,
+.game-scoreboard-solo-score {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.game-scoreboard-time span,
+.game-scoreboard-solo-score span {
+  color: var(--game-muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.075em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.game-scoreboard-time time {
+  margin-top: 3px;
+  color: var(--game-graphite);
+  font-size: 23px;
+  font-weight: 950;
+  letter-spacing: -0.025em;
+  line-height: 1;
+}
+
+.game-scoreboard-solo-score strong {
+  margin-top: 2px;
+  color: var(--game-blue);
+  font-size: 25px;
+  font-style: italic;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.game-scoreboard-mode {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  justify-self: stretch;
+  text-align: center;
+}
+
+.game-scoreboard-mode strong {
+  display: -webkit-box;
+  width: 100%;
+  overflow: hidden;
+  color: var(--game-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.055em;
+  line-height: 1.18;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* Roster content deliberately has no panel, card, enclosing border, shadow, or
+   fill. It floats in the whitespace between the scoreboard and the arena. */
+.game-roster-band {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  height: 44px;
+  /* Equal air on either side pins the matchup to the arena center. Completed
+     actions occupy those outer tracks without moving the teams or their VS. */
+  grid-template-columns: minmax(82px, 1fr) minmax(0, 430px) minmax(82px, 1fr);
+  align-items: center;
+  overflow: hidden;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Live games have no outer actions, so the staredown owns the entire arena
+   width. Completed games restore the symmetric action rails from the base
+   three-column grid without shifting the matchup off center. */
+.game-roster-band.is-live {
+  grid-template-columns: minmax(0, 430px);
+  justify-content: center;
+}
+
+.game-roster-band.is-live .game-roster-matchup,
+.game-roster-band.is-live .game-roster-field {
+  grid-column: 1;
+}
+
+.game-roster-matchup {
+  display: grid;
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 38px minmax(0, 1fr);
+  align-items: center;
+}
+
+.game-roster-side {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  padding: 0 8px;
+}
+
+.game-roster-field {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  grid-column: 2;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 4px 8px;
+  text-align: center;
+}
+
+.game-roster-side.is-blue {
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.game-roster-side.is-red {
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.game-roster-versus {
+  position: relative;
+  display: flex;
+  width: 38px;
+  height: 36px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.game-roster-versus::before {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  left: 50%;
+  width: 1px;
+  background: rgb(63 63 65 / 18%);
+  content: "";
+  transform: translateX(-50%);
+}
+
+.game-roster-versus-label {
+  position: relative;
+  z-index: 1;
+  padding: 1px 4px;
+  background: var(--game-paper);
+  color: rgb(63 63 65 / 62%);
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.055em;
+  line-height: 1;
+}
+
+.game-roster-players {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+}
+
+.game-roster-side.is-red .game-roster-players {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.game-roster-side.is-blue .game-roster-players {
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: flex-end;
+}
+
+.game-roster-field .game-roster-players {
+  flex-flow: row wrap;
+  justify-content: center;
+}
+
+.game-roster-player {
+  display: block;
+  min-width: 0;
+  color: var(--game-graphite);
+  white-space: nowrap;
+}
+
+.game-roster-player.is-out {
+  opacity: 0.4;
+  filter: grayscale(0.32);
+}
+
+/* The results table still uses the compact legacy swatch; the live roster uses
+   the more descriptive snake glyph below. */
+.game-roster-swatch {
+  width: 12px;
+  height: 7px;
+  flex: 0 0 auto;
+  border: 1px solid rgb(63 63 65 / 24%);
+  border-radius: 999px 3px 3px 999px;
+  background: var(--snake-color, var(--game-blue));
+  box-shadow: inset -3px 0 0 rgb(63 63 65 / 13%);
+}
+
+.game-roster-snake {
+  position: relative;
+  display: block;
+  width: clamp(88px, 12vw, 124px);
+  height: 19px;
+  flex: 0 0 auto;
+  color: var(--snake-label, #172033);
+}
+
+.game-roster-snake-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.game-roster-action-slot {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.game-roster-action-slot.is-left {
+  grid-column: 1;
+  justify-content: flex-start;
+  padding-right: 8px;
+}
+
+.game-roster-action-slot.is-right {
+  grid-column: 3;
+  justify-content: flex-end;
+  padding-left: 8px;
+}
+
+.game-roster-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
+.game-roster-actions.is-left {
+  justify-content: flex-start;
+}
+
+.game-roster-actions.is-right {
+  justify-content: flex-end;
+}
+
+.game-shell-button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 11px;
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
+  background: #fff;
+  color: var(--game-graphite);
+  font-size: 9px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.game-shell-button:hover:not(:disabled) {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.game-shell-button:focus-visible,
+.game-over-close:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
+}
+
+.game-shell-button.is-primary {
+  border-color: var(--game-blue);
+  background: var(--game-blue);
+  color: #fff;
+}
+
+.game-shell-button.is-primary:hover:not(:disabled) {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
+.game-shell-button:disabled {
+  border-color: #d1d5db;
+  background: #f3f4f6;
+  color: #9ca3af;
+  cursor: not-allowed;
+}
+
+/* Final score card ---------------------------------------------------------
+   Unlike the scoreboard and arena, the modal uses one quiet edge. Its action
+   footer is a distinct row, echoing the Start Game control with a blue CTA. */
+.game-over-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(63 63 65 / 30%);
+  animation: game-over-backdrop-in 180ms ease-out both;
+}
+
+.game-over-card {
+  position: relative;
+  width: min(560px, 100%);
+  max-height: min(680px, calc(100dvh - 40px));
+  overflow: auto;
+  border: 1px solid rgb(63 63 65 / 52%);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 18px 48px rgb(31 41 55 / 22%);
+  animation: game-over-card-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.game-over-card::before,
+.game-over-card::after {
+  display: none;
+  content: none;
+}
+
+.game-over-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+  display: flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: none;
+  color: #14181f;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.game-over-close:hover {
+  background: #eff6ff;
+  border-color: var(--game-blue);
+}
+
+.game-over-header {
+  position: relative;
+  height: 124px;
+  overflow: hidden;
+  padding: 0;
+  border-bottom: 1.5px solid #14181f;
+  background: #fff;
+}
+
+.game-over-jewel {
+  --jewel-color: #3b82f6;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -9.6153846%;
+  width: 82.6923077%;
+  overflow: hidden;
+  border-right: 3px solid #14181f;
+  background: linear-gradient(
+    112deg,
+    color-mix(in oklch, var(--jewel-color), black 30%) 0%,
+    color-mix(in oklch, var(--jewel-color), white 14%) 30%,
+    var(--jewel-color) 50%,
+    color-mix(in oklch, var(--jewel-color), black 52%) 78%,
+    color-mix(in oklch, var(--jewel-color), black 72%) 100%
+  );
+  pointer-events: none;
+  transform: skewX(-22deg);
+  transform-origin: top left;
+}
+
+.game-over-jewel.is-azure-cut {
+  --jewel-color: #3b82f6;
+}
+
+.game-over-jewel.is-ruby-shatter {
+  --jewel-color: #ef4443;
+}
+
+.game-over-jewel.is-topaz-cut {
+  --jewel-color: #f5b301;
+}
+
+.game-over-jewel.is-jade-fracture {
+  --jewel-color: #7db47c;
+  width: 88.4615385%;
+}
+
+.game-over-jewel-layer {
+  position: absolute;
+  inset: 0;
+}
+
+.game-over-jewel-layer.is-caustic {
+  background: radial-gradient(
+    70% 90% at 18% 100%,
+    color-mix(in srgb, var(--jewel-color) 40%, white) 0%,
+    transparent 65%
+  );
+  opacity: 0.4;
+}
+
+.game-over-jewel.is-azure-cut .is-blade-light {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), white 46%) 0%,
+    color-mix(in oklch, var(--jewel-color), white 12%) 60%,
+    rgb(255 255 255 / 0%) 100%
+  );
+  clip-path: polygon(34% 0, 56% 0, 24% 100%, 8% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-blade-dark {
+  background: linear-gradient(
+    160deg,
+    color-mix(in oklch, var(--jewel-color), black 46%),
+    color-mix(in oklch, var(--jewel-color), black 20%)
+  );
+  clip-path: polygon(56% 0, 64% 0, 34% 100%, 24% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-blade-mid {
+  background: linear-gradient(
+    150deg,
+    color-mix(in oklch, var(--jewel-color), white 10%),
+    color-mix(in oklch, var(--jewel-color), black 24%)
+  );
+  clip-path: polygon(64% 0, 78% 0, 50% 100%, 34% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-blade-edge-strong {
+  background: linear-gradient(to bottom, rgb(255 255 255 / 92%), rgb(255 255 255 / 35%));
+  clip-path: polygon(78% 0, 80% 0, 52.5% 100%, 50% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-blade-edge-soft {
+  background: linear-gradient(to bottom, rgb(255 255 255 / 55%), rgb(255 255 255 / 15%));
+  clip-path: polygon(83% 0, 84.5% 0, 58% 100%, 56% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-dark-tail {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), black 32%) 0%,
+    color-mix(in oklch, var(--jewel-color), black 68%) 85%
+  );
+  clip-path: polygon(88% 0, 100% 0, 100% 100%, 66% 100%);
+}
+
+.game-over-jewel.is-azure-cut .is-seams {
+  background:
+    linear-gradient(
+      107deg,
+      transparent calc(60% - 2px),
+      rgb(255 255 255 / 90%) calc(60% - 1px),
+      color-mix(in oklch, var(--jewel-color), black 50%) calc(60% + 1px),
+      transparent calc(60% + 2px)
+    ),
+    linear-gradient(
+      107deg,
+      transparent calc(86% - 1px),
+      rgb(255 255 255 / 35%) 86%,
+      transparent calc(86% + 1px)
+    );
+}
+
+.game-over-jewel.is-ruby-shatter .is-counter-dark {
+  background: linear-gradient(
+    70deg,
+    color-mix(in oklch, var(--jewel-color), black 34%),
+    color-mix(in oklch, var(--jewel-color), black 10%)
+  );
+  clip-path: polygon(12% 0, 18% 0, 52% 100%, 44% 100%);
+  opacity: 0.65;
+}
+
+.game-over-jewel.is-ruby-shatter .is-counter-light {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), white 44%) 0%,
+    color-mix(in oklch, var(--jewel-color), white 10%) 65%,
+    rgb(255 255 255 / 0%) 100%
+  );
+  clip-path: polygon(44% 0, 60% 0, 24% 100%, 12% 100%);
+}
+
+.game-over-jewel.is-ruby-shatter .is-counter-cross {
+  background: linear-gradient(80deg, rgb(255 255 255 / 40%), rgb(255 255 255 / 6%) 80%);
+  clip-path: polygon(28% 0, 36% 0, 74% 100%, 62% 100%);
+  opacity: 0.85;
+}
+
+.game-over-jewel.is-ruby-shatter .is-counter-depth {
+  background: linear-gradient(
+    160deg,
+    color-mix(in oklch, var(--jewel-color), black 18%),
+    color-mix(in oklch, var(--jewel-color), black 50%)
+  );
+  clip-path: polygon(60% 0, 74% 0, 44% 100%, 34% 100%);
+}
+
+.game-over-jewel.is-ruby-shatter .is-counter-edge {
+  background: linear-gradient(to bottom, rgb(255 255 255 / 90%), rgb(255 255 255 / 30%));
+  clip-path: polygon(74% 0, 76.5% 0, 48% 100%, 45% 100%);
+}
+
+.game-over-jewel.is-ruby-shatter .is-dark-tail {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), black 30%) 0%,
+    color-mix(in oklch, var(--jewel-color), black 66%) 85%
+  );
+  clip-path: polygon(84% 0, 100% 0, 100% 100%, 62% 100%);
+}
+
+.game-over-jewel.is-ruby-shatter .is-seams {
+  background:
+    linear-gradient(
+      107deg,
+      transparent calc(56% - 2px),
+      rgb(255 255 255 / 90%) calc(56% - 1px),
+      color-mix(in oklch, var(--jewel-color), black 50%) calc(56% + 1px),
+      transparent calc(56% + 2px)
+    ),
+    linear-gradient(
+      64deg,
+      transparent calc(40% - 1px),
+      rgb(255 255 255 / 40%) 40%,
+      transparent calc(40% + 1px)
+    ),
+    linear-gradient(
+      107deg,
+      transparent calc(88% - 1px),
+      rgb(255 255 255 / 35%) 88%,
+      transparent calc(88% + 1px)
+    );
+}
+
+.game-over-jewel.is-topaz-cut .is-radial-facets {
+  background: conic-gradient(
+    from 240deg at 70% 30%,
+    color-mix(in oklch, var(--jewel-color), white 28%) 0deg 40deg,
+    color-mix(in oklch, var(--jewel-color), black 26%) 40deg 95deg,
+    color-mix(in oklch, var(--jewel-color), white 8%) 95deg 160deg,
+    color-mix(in oklch, var(--jewel-color), black 44%) 160deg 230deg,
+    color-mix(in oklch, var(--jewel-color), white 18%) 230deg 290deg,
+    color-mix(in oklch, var(--jewel-color), black 30%) 290deg 360deg
+  );
+  opacity: 0.8;
+}
+
+.game-over-jewel.is-topaz-cut .is-radial-glint {
+  background: radial-gradient(30% 40% at 70% 30%, rgb(255 255 255 / 45%), transparent 70%);
+}
+
+.game-over-jewel.is-topaz-cut .is-caustic {
+  opacity: 0.45;
+}
+
+.game-over-jewel.is-topaz-cut .is-cut-light {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), white 46%) 0%,
+    color-mix(in oklch, var(--jewel-color), white 10%) 70%,
+    rgb(255 255 255 / 0%) 100%
+  );
+  clip-path: polygon(52% 0, 60% 0, 30% 100%, 22% 100%);
+}
+
+.game-over-jewel.is-topaz-cut .is-cut-edge {
+  background: linear-gradient(to bottom, rgb(255 255 255 / 90%), rgb(255 255 255 / 30%));
+  clip-path: polygon(60% 0, 62.5% 0, 33% 100%, 30% 100%);
+}
+
+.game-over-jewel.is-topaz-cut .is-dark-tail {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), black 32%) 0%,
+    color-mix(in oklch, var(--jewel-color), black 66%) 85%
+  );
+  clip-path: polygon(90% 0, 100% 0, 100% 100%, 70% 100%);
+}
+
+.game-over-jewel.is-topaz-cut .is-seams {
+  background:
+    linear-gradient(
+      107deg,
+      transparent calc(66% - 2px),
+      rgb(255 255 255 / 90%) calc(66% - 1px),
+      color-mix(in oklch, var(--jewel-color), black 48%) calc(66% + 1px),
+      transparent calc(66% + 2px)
+    ),
+    linear-gradient(
+      64deg,
+      transparent calc(82% - 1px),
+      rgb(255 255 255 / 35%) 82%,
+      transparent calc(82% + 1px)
+    );
+}
+
+.game-over-jewel.is-jade-fracture .is-fracture-light {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), white 14%),
+    rgb(255 255 255 / 0%) 80%
+  );
+  clip-path: polygon(0 0, 62% 0, 54% 30%, 22% 100%, 0 100%);
+  opacity: 0.75;
+}
+
+.game-over-jewel.is-jade-fracture .is-fracture-depth {
+  background: linear-gradient(
+    125deg,
+    color-mix(in oklch, var(--jewel-color), black 18%),
+    color-mix(in oklch, var(--jewel-color), black 46%)
+  );
+  clip-path: polygon(62% 0, 100% 0, 100% 100%, 22% 100%, 54% 30%);
+  opacity: 0.85;
+}
+
+.game-over-jewel.is-jade-fracture .is-cracks {
+  background:
+    linear-gradient(
+      107deg,
+      transparent calc(56% - 2px),
+      rgb(255 255 255 / 90%) calc(56% - 1px),
+      color-mix(in oklch, var(--jewel-color), black 52%) calc(56% + 1px),
+      transparent calc(56% + 2px)
+    ),
+    linear-gradient(
+      64deg,
+      transparent calc(44% - 1px),
+      rgb(255 255 255 / 50%) 44%,
+      transparent calc(44% + 1px)
+    ),
+    linear-gradient(
+      150deg,
+      transparent calc(38% - 1px),
+      rgb(255 255 255 / 55%) 38%,
+      transparent calc(38% + 1px)
+    );
+}
+
+.game-over-jewel.is-jade-fracture .is-dark-tail {
+  background: linear-gradient(
+    115deg,
+    color-mix(in oklch, var(--jewel-color), black 30%) 0%,
+    color-mix(in oklch, var(--jewel-color), black 62%) 85%
+  );
+  clip-path: polygon(88% 0, 100% 0, 100% 100%, 70% 100%);
+}
+
+.game-over-jewel-layer.is-top-gloss {
+  background: linear-gradient(
+    to bottom,
+    rgb(255 255 255 / 30%),
+    rgb(255 255 255 / 4%) 30%,
+    transparent 42%
+  );
+}
+
+.game-over-jewel-layer.is-bottom-shade {
+  background: linear-gradient(to top, rgb(0 0 0 / 30%), transparent 26%);
+}
+
+.game-over-jewel-layer.is-rim {
+  box-shadow:
+    inset -3px 0 0 rgb(255 255 255 / 80%),
+    inset -8px 0 0 color-mix(in oklch, var(--jewel-color), black 45%),
+    inset 0 2px 0 rgb(255 255 255 / 40%),
+    inset 0 -4px 0 rgb(0 0 0 / 36%);
+}
+
+.game-over-title-section {
+  position: relative;
+  z-index: 2;
+  box-sizing: border-box;
+  width: 69.2307692%;
+  min-width: 0;
+  padding: 15px 0 0 20px;
+  background: transparent;
+}
+
+.game-over-score-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  width: 30.7692308%;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #14181f;
+}
+
+.game-over-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #fff;
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.game-over-kicker::before {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  background: #fff;
+  content: "";
+}
+
+.game-over-header h2,
+.game-over-card.is-victory .game-over-header h2,
+.game-over-card.is-defeat .game-over-header h2 {
+  margin: 5px 0 0;
+  color: #fff;
+  font-size: clamp(30px, 7.3vw, 41px);
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.035em;
+  line-height: 1.02;
+  text-shadow: 2px 2px 0 rgb(20 24 31 / 50%), 4px 4px 0 rgb(20 24 31 / 50%);
+  text-transform: uppercase;
+}
+
+.game-over-header p {
+  max-width: 100%;
+  margin: 8px 0 0 -20px;
+  overflow: hidden;
+  padding: 5px 5px 5px 22px;
+  background: linear-gradient(90deg, rgb(0 0 0 / 70%), rgb(0 0 0 / 0%));
+  color: #fff;
+  font-size: 13px;
+  font-style: normal;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  text-shadow: none;
+  white-space: nowrap;
+}
+
+.game-over-scoreline {
+  color: #14181f;
+  font-size: 37px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.game-over-header.is-neutral .game-over-title-section {
+  width: 69.2307692%;
+}
+
+.game-over-header.is-neutral .game-over-kicker,
+.game-over-header.is-neutral h2,
+.game-over-header.is-neutral p {
+  color: #14181f;
+  text-shadow: none;
+}
+
+.game-over-header.is-neutral .game-over-kicker::before {
+  background: #14181f;
+}
+
+.game-over-header.is-neutral p {
+  background: none;
+}
+
+.game-over-header.is-jade-fracture h2 {
+  text-shadow: 2px 2px 0 rgb(20 24 31 / 50%), 4px 4px 0 rgb(20 24 31 / 20%);
+}
+
+.game-over-statline {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-bottom: 1px solid #d8dbe0;
+  background: #fff;
+  color: var(--game-graphite);
+}
+
+.game-over-statline > div {
+  display: flex;
+  min-height: 56px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 10px;
+  border-right: 1px solid #e1e3e7;
+  text-align: center;
+}
+
+.game-over-statline > div:last-child {
+  border-right: 0;
+}
+
+.game-over-statline > div > span,
+.game-over-standings-heading {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.game-over-statline > div > span {
+  font-size: 8.5px;
+}
+
+.game-over-statline strong {
+  margin-top: 3px;
+  color: var(--game-graphite);
+  font-size: 19px;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.game-over-statline strong.is-xp {
+  color: #d49a00;
+}
+
+.game-over-statline strong.is-score {
+  color: #16a34a;
+}
+
+.game-over-statline strong.is-time,
+.game-over-statline strong.is-ppm,
+.game-over-statline strong.is-apm {
+  color: var(--game-graphite);
+}
+
+.game-over-metric-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.game-over-metric-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.game-over-metric-help > button {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid rgb(63 63 65 / 35%);
+  border-radius: 50%;
+  appearance: none;
+  background: #fff;
+  color: rgb(63 63 65 / 68%);
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1;
+  cursor: help;
+}
+
+.game-over-metric-help-mark {
+  display: block;
+  width: 12px;
+  height: 12px;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 12px;
+  text-align: center;
+}
+
+.game-over-metric-help > button:hover,
+.game-over-metric-help > button:focus-visible {
+  border-color: var(--game-blue);
+  color: #2563eb;
+}
+
+.game-over-metric-help > button:focus-visible {
+  outline: 2px solid rgb(59 130 246 / 34%);
+  outline-offset: 1px;
+}
+
+.game-over-statline .game-over-metric-tooltip {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  z-index: 4;
+  width: max-content;
+  max-width: 190px;
+  padding: 7px 8px;
+  border-radius: 4px;
+  background: var(--game-graphite);
+  box-shadow: 0 5px 14px rgb(31 41 55 / 18%);
+  color: #fff;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 650;
+  letter-spacing: 0;
+  line-height: 1.35;
+  text-transform: none;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(-2px);
+  visibility: hidden;
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+}
+
+.game-over-statline > div:last-child .game-over-metric-tooltip {
+  right: 0;
+  left: auto;
+  transform: translateY(-2px);
+}
+
+.game-over-metric-help:hover .game-over-metric-tooltip,
+.game-over-metric-help:focus-within .game-over-metric-tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  visibility: visible;
+}
+
+.game-over-statline > div:last-child .game-over-metric-help:hover .game-over-metric-tooltip,
+.game-over-statline > div:last-child .game-over-metric-help:focus-within .game-over-metric-tooltip {
+  transform: translateY(0);
+}
+
+.game-over-standings {
+  margin: 16px 22px;
+  overflow: hidden;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.game-over-standings-heading,
+.game-over-player {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+}
+
+.game-over-standings-heading {
+  grid-template-columns: 1fr auto;
+  background: #f3f4f6;
+  font-style: normal;
+}
+
+.game-over-player {
+  min-height: 38px;
+  border-top: 1px solid #e5e7eb;
+  color: var(--game-graphite);
+  font-size: 12px;
+}
+
+.game-over-player-name {
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.game-over-winner {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #cbd5e1;
+  border-radius: 3px;
+  background: #fff;
+  color: rgb(63 63 65 / 65%);
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.game-over-player > strong {
+  font-size: 14px;
+}
+
+.game-over-actions {
+  display: flex;
+  min-height: 70px;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 22px;
+  border-top: 1px solid #d8dbe0;
+  background: #fafafa;
+}
+
+.game-over-actions .game-shell-button {
+  min-height: 40px;
+  font-size: 11px;
+}
+
+.game-over-actions .game-shell-button.is-menu {
+  padding: 0 17px;
+  border-color: #9ca3af;
+  background: #fff;
+  font-style: normal;
+}
+
+.game-over-actions .game-shell-button.is-menu:hover:not(:disabled),
+.game-over-actions .game-shell-button.is-menu:focus-visible {
+  border-color: #3b82f6;
+  background: #eff6ff;
+  color: var(--game-graphite);
+}
+
+.game-over-actions .game-shell-button.is-menu:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.game-over-replay-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-left: auto;
+}
+
+.game-over-actions .game-shell-button.is-primary {
+  min-width: 112px;
+  padding: 0 18px;
+  border: 1px solid var(--game-blue);
+  border-radius: 6px;
+  background: var(--game-blue);
+  box-shadow: none;
+  color: #fff;
+  font-size: 11px;
+}
+
+.game-over-play-content {
+  gap: 6px;
+}
+
+.game-over-play-chevron {
+  width: 13px;
+  height: 11px;
+  flex: 0 0 13px;
+  fill: currentColor;
+}
+
+.game-over-actions .game-shell-button.is-primary:hover:not(:disabled) {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
+.game-over-actions .game-shell-button.is-primary:focus-visible {
+  outline: 0;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.game-over-actions .game-shell-button.is-primary:disabled {
+  border-color: #d1d5db;
+  background: #e5e7eb;
+  color: #9ca3af;
+  box-shadow: none;
+}
+
+.game-over-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: rgb(63 63 65 / 54%);
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.065em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.game-over-shortcut kbd {
+  display: inline-grid;
+  min-width: 42px;
+  height: 24px;
+  place-items: center;
+  padding: 0 7px;
+  border: 1px solid #b7bcc4;
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: #fff;
+  color: var(--game-graphite);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 850;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.game-over-shortcut kbd > span {
+  transform: translateY(1px);
+}
+
+@keyframes game-over-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes game-over-card-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (max-width: 760px) {
+  :root {
+    --game-hud-top-footprint: 116px;
+    --game-scoreboard-footprint: 56px;
+  }
+
+  .game-hud-shell {
+    width: min(var(--game-arena-panel-width, 650px), calc(100vw - 12px));
+    grid-template-rows: var(--game-scoreboard-footprint);
+  }
+
+  .game-hud-utility-row {
+    height: 42px;
+    gap: 6px;
+  }
+
+  .game-scoreboard {
+    height: 56px;
+    grid-template-columns: minmax(0, 1fr) 1px minmax(126px, 1.55fr) 1px minmax(0, 1fr);
+    gap: 6px;
+    padding: 7px 7px;
+  }
+
+  .game-scoreboard-brand img {
+    max-width: 88px;
+    max-height: 18px;
+  }
+
+  .game-scoreboard-divider {
+    height: 27px;
+  }
+
+  .game-scoreboard-match.is-team {
+    grid-template-columns: minmax(20px, 1fr) 64px minmax(20px, 1fr);
+    gap: 5px;
+  }
+
+  .game-scoreboard-match.is-solo {
+    grid-template-columns: minmax(38px, 1fr) 64px;
+    gap: 6px;
+  }
+
+  .game-scoreboard-team-score {
+    font-size: 21px;
+  }
+
+  .game-scoreboard-time span,
+  .game-scoreboard-solo-score span {
+    font-size: 7px;
+  }
+
+  .game-scoreboard-time time {
+    margin-top: 2px;
+    font-size: 17px;
+  }
+
+  .game-scoreboard-solo-score strong {
+    font-size: 20px;
+  }
+
+  .game-scoreboard-mode strong {
+    font-size: 8px;
+    line-height: 1.1;
+  }
+
+  .game-roster-band {
+    height: 42px;
+    grid-template-columns: minmax(64px, 1fr) minmax(0, 430px) minmax(64px, 1fr);
+  }
+
+  .game-roster-matchup {
+    grid-template-columns: minmax(0, 1fr) 32px minmax(0, 1fr);
+  }
+
+  .game-roster-side,
+  .game-roster-field {
+    gap: 3px;
+    padding: 2px 4px;
+  }
+
+  .game-roster-versus {
+    width: 32px;
+  }
+
+  .game-roster-players {
+    gap: 2px;
+  }
+
+  .game-roster-swatch {
+    width: 10px;
+    height: 6px;
+  }
+
+  .game-roster-snake {
+    width: clamp(72px, 22vw, 102px);
+    height: 17px;
+  }
+
+  .game-roster-action-slot.is-left {
+    padding-right: 4px;
+  }
+
+  .game-roster-action-slot.is-right {
+    padding-left: 4px;
+  }
+
+  .game-roster-actions {
+    gap: 3px;
+  }
+
+  .game-roster-actions .game-shell-button {
+    min-height: 29px;
+    padding: 0 6px;
+    font-size: 7px;
+  }
+
+  .game-over-backdrop {
+    padding: 8px;
+  }
+
+  .game-over-card {
+    max-height: calc(100dvh - 16px);
+  }
+
+  .game-over-statline > div {
+    min-height: 52px;
+    padding: 8px 7px;
+  }
+
+  .game-over-statline strong {
+    font-size: 17px;
+  }
+
+  .game-over-standings {
+    margin: 12px 14px;
+  }
+
+  .game-over-actions {
+    min-height: 66px;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+
+  .game-over-replay-actions {
+    gap: 6px;
+  }
+
+  .game-over-actions .game-shell-button {
+    min-height: 38px;
+    padding-right: 10px;
+    padding-left: 10px;
+    font-size: 10px;
+  }
+
+  .game-over-actions .game-shell-button.is-primary {
+    min-width: 100px;
+    padding-right: 12px;
+    padding-left: 12px;
+    font-size: 10px;
+  }
+
+  .game-over-shortcut {
+    gap: 5px;
+    font-size: 7px;
+  }
+
+  .game-over-shortcut kbd {
+    min-width: 38px;
+    height: 22px;
+    padding: 0 5px;
+    font-size: 7px;
+  }
+}
+
+@media (max-width: 420px) {
+  .game-scoreboard {
+    grid-template-columns: minmax(0, 1fr) 1px minmax(118px, 1fr) 1px minmax(0, 1fr);
+    gap: 5px;
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .game-scoreboard-brand img {
+    max-width: 60px;
+  }
+
+  .game-roster-band {
+    grid-template-columns: minmax(58px, 1fr) minmax(0, 430px) minmax(58px, 1fr);
+  }
+
+  .game-over-header {
+    height: 112px;
+  }
+
+  .game-over-title-section {
+    padding: 14px 0 0 14px;
+  }
+
+  .game-over-kicker {
+    gap: 5px;
+    font-size: 8px;
+    letter-spacing: 0.12em;
+  }
+
+  .game-over-kicker::before {
+    width: 6px;
+    height: 6px;
+    flex-basis: 6px;
+  }
+
+  .game-over-header h2,
+  .game-over-card.is-victory .game-over-header h2,
+  .game-over-card.is-defeat .game-over-header h2 {
+    margin-top: 5px;
+    font-size: clamp(24px, 7.5vw, 31px);
+  }
+
+  .game-over-header p {
+    margin-top: 8px;
+  }
+
+  .game-over-scoreline {
+    font-size: 24px;
+  }
+
+  .game-over-close {
+    top: 8px;
+    right: 8px;
+    width: 25px;
+    height: 25px;
+    font-size: 12px;
+  }
+
+  .game-over-statline > div {
+    padding-right: 5px;
+    padding-left: 5px;
+  }
+
+  .game-over-statline > div > span {
+    font-size: 7.5px;
+  }
+
+  .game-over-statline strong {
+    font-size: 16px;
+  }
+
+  .game-over-metric-label {
+    gap: 2px;
+  }
+
+  .game-over-metric-help > button {
+    width: 13px;
+    height: 13px;
+  }
+
+  .game-over-metric-help-mark {
+    width: 11px;
+    height: 11px;
+    font-size: 9px;
+    line-height: 11px;
+  }
+}
+
+@media (max-width: 350px) {
+  .game-over-actions {
+    flex-wrap: wrap;
+  }
+
+  .game-over-replay-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .game-scoreboard,
+  .game-roster-band,
+  .game-shell-button,
+  .game-over-backdrop,
+  .game-over-card {
+    animation: none;
+    transition: none;
+  }
+
+  .game-over-metric-tooltip {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .game-over-header {
+    border-color: CanvasText;
+    background: Canvas;
+    forced-color-adjust: auto;
+  }
+
+  .game-over-jewel {
+    display: none;
+  }
+
+  .game-over-kicker,
+  .game-over-header h2,
+  .game-over-header p,
+  .game-over-scoreline {
+    color: CanvasText;
+    text-shadow: none;
+  }
+
+  .game-over-kicker::before {
+    background: CanvasText;
+  }
 }
 
 body {
@@ -333,17 +1971,20 @@ body {
   width: 100%;
 }
 
-/* Keep the primary action's frame upright while its label and paired chevrons
-   lean forward. A primary wake and lighter echo mark each enable transition. */
+/* Keep primary action frames upright while their content carries the motion.
+   The Start Game and Play Again actions share one restrained chevron sweep. */
 .game-mode-choice {
   font-style: normal;
 }
 
-.game-start-button {
+.game-primary-motion {
   position: relative;
   isolation: isolate;
-  min-height: 64px;
   overflow: hidden;
+}
+
+.game-start-button {
+  min-height: 64px;
   font-size: 19px;
   font-style: normal;
   transform: none;
@@ -1780,7 +3421,9 @@ a.home-social-icon:hover {
     transition: none;
   }
 
-  .game-start-enable-chevron {
+  .game-start-enable-chevron,
+  .game-start-enable-chevron.is-primary,
+  .game-start-enable-chevron.is-echo {
     animation: none;
     opacity: 0;
     will-change: auto;
@@ -1853,12 +3496,12 @@ a.home-social-icon:hover {
     border: 2px solid rgba(0, 0, 0, 0.1);
   }
 
-  /* Game arena panel with restored double border treatment */
+  /* One crisp graphite edge around the white paper bezel. Keeping the border
+     on the panel itself avoids the inner/outer pair produced by a spread
+     shadow around the old white border. */
   .panel.game-arena-panel {
-    border: 3px solid white;
-    box-shadow:
-      inset 0 0 0 0.75px rgba(0, 0, 0, 0.8),  /* Inner black line */
-      0 0 0 1.5px rgba(0, 0, 0, 0.8);         /* Outer black line */
+    border: 1px solid rgba(0, 0, 0, 0.8);
+    box-shadow: none;
   }
 
   /* Panel with no top border, only bottom corners rounded */

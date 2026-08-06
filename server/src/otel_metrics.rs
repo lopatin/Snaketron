@@ -5,8 +5,8 @@
 //! observable gauges. No instrument attribute contains a player, game,
 //! partition, request, or session identifier.
 
-use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
+use opentelemetry::{KeyValue, global};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,10 @@ const SESSION_BUCKETS_MS: &[f64] = &[
     1_800_000.0,
     3_600_000.0,
 ];
+const ACTOR_ADVANCE_BUCKETS_US: &[f64] = &[
+    10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0,
+];
+const ACTOR_BATCH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
 
 struct OtelMetrics {
     fenced_write_rejections: Counter<u64>,
@@ -36,6 +40,17 @@ struct OtelMetrics {
     command_resends: Counter<u64>,
     command_deduplications: Counter<u64>,
     command_rejections: Counter<u64>,
+    boost_packet_collections: Counter<u64>,
+    boost_pad_respawns: Counter<u64>,
+    boost_activation_attempts: Counter<u64>,
+    boost_activation_commands_scheduled: Counter<u64>,
+    boost_activation_command_rejections: Counter<u64>,
+    boost_activations: Counter<u64>,
+    boost_manual_stops: Counter<u64>,
+    boost_depletions: Counter<u64>,
+    game_actor_advance_duration: Histogram<u64>,
+    game_actor_batch_quanta: Histogram<u64>,
+    game_actor_lag: Histogram<u64>,
     checkpoint_writes: Counter<u64>,
     checkpoint_failures: Counter<u64>,
     recovered_games: Counter<u64>,
@@ -176,6 +191,21 @@ fn histogram(
         .u64_histogram(name)
         .with_description(description)
         .with_unit("ms")
+        .with_boundaries(boundaries.to_vec())
+        .build()
+}
+
+fn histogram_with_unit(
+    meter: &Meter,
+    name: &'static str,
+    description: &'static str,
+    unit: &'static str,
+    boundaries: &[f64],
+) -> Histogram<u64> {
+    meter
+        .u64_histogram(name)
+        .with_description(description)
+        .with_unit(unit)
         .with_boundaries(boundaries.to_vec())
         .build()
 }
@@ -372,6 +402,66 @@ impl OtelMetrics {
                 &meter,
                 "snaketron.command_rejections",
                 "Executor commands rejected",
+            ),
+            boost_packet_collections: counter(
+                &meter,
+                "snaketron.boost.packet_collections",
+                "Authoritative Boost packets collected",
+            ),
+            boost_pad_respawns: counter(
+                &meter,
+                "snaketron.boost.pad_respawns",
+                "Authoritative Boost pad cooldowns completed",
+            ),
+            boost_activation_attempts: counter(
+                &meter,
+                "snaketron.boost.activation_attempts",
+                "Unique Boost activation commands evaluated by an executor",
+            ),
+            boost_activation_commands_scheduled: counter(
+                &meter,
+                "snaketron.boost.activation_commands_scheduled",
+                "Boost activation commands accepted into authoritative simulation",
+            ),
+            boost_activation_command_rejections: counter(
+                &meter,
+                "snaketron.boost.activation_command_rejections",
+                "Boost activation commands rejected before authoritative simulation",
+            ),
+            boost_activations: counter(
+                &meter,
+                "snaketron.boost.activations",
+                "Successful authoritative Boost state activations",
+            ),
+            boost_manual_stops: counter(
+                &meter,
+                "snaketron.boost.manual_stops",
+                "Successful authoritative player-requested Boost stops",
+            ),
+            boost_depletions: counter(
+                &meter,
+                "snaketron.boost.depletions",
+                "Authoritative Boost state depletions after the final funded quantum",
+            ),
+            game_actor_advance_duration: histogram_with_unit(
+                &meter,
+                "snaketron.game_actor.advance_duration",
+                "Authoritative game actor simulation advance duration in microseconds",
+                "us",
+                ACTOR_ADVANCE_BUCKETS_US,
+            ),
+            game_actor_batch_quanta: histogram_with_unit(
+                &meter,
+                "snaketron.game_actor.batch_quanta",
+                "Simulation quanta processed by one authoritative actor advance",
+                "1",
+                ACTOR_BATCH_BUCKETS,
+            ),
+            game_actor_lag: histogram(
+                &meter,
+                "snaketron.game_actor.lag",
+                "Authoritative actor lag behind its intended committed target in milliseconds",
+                LATENCY_BUCKETS_MS,
             ),
             checkpoint_writes: counter(
                 &meter,
@@ -651,6 +741,116 @@ counter_recorder!(
     game_created_outbox_delivery_errors
 );
 
+fn boost_attributes(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: Option<&'static str>,
+    speed_band: &'static str,
+    pad_id: Option<u8>,
+) -> Vec<KeyValue> {
+    let mut attributes = vec![
+        KeyValue::new("game.type", game_type),
+        KeyValue::new("game.queue_mode", queue_mode),
+        KeyValue::new("boost.speed_band", speed_band),
+    ];
+    if let Some(team_side) = team_side {
+        attributes.push(KeyValue::new("game.team_side", team_side));
+    }
+    if let Some(pad_id) = pad_id {
+        attributes.push(KeyValue::new("boost.pad_id", i64::from(pad_id)));
+    }
+    attributes
+}
+
+pub(crate) fn record_boost_packet_collected(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+    pad_id: u8,
+) {
+    metrics().boost_packet_collections.add(
+        1,
+        &boost_attributes(
+            game_type,
+            queue_mode,
+            Some(team_side),
+            speed_band,
+            Some(pad_id),
+        ),
+    );
+}
+
+pub(crate) fn record_boost_pad_respawned(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    speed_band: &'static str,
+    pad_id: u8,
+) {
+    metrics().boost_pad_respawns.add(
+        1,
+        &boost_attributes(game_type, queue_mode, None, speed_band, Some(pad_id)),
+    );
+}
+
+pub(crate) fn record_boost_activation_attempt(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+) {
+    metrics().boost_activation_attempts.add(
+        1,
+        &boost_attributes(game_type, queue_mode, Some(team_side), speed_band, None),
+    );
+}
+
+pub(crate) fn record_boost_activation_decision(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+    scheduled: bool,
+) {
+    let attributes = boost_attributes(game_type, queue_mode, Some(team_side), speed_band, None);
+    if scheduled {
+        metrics()
+            .boost_activation_commands_scheduled
+            .add(1, &attributes);
+    } else {
+        metrics()
+            .boost_activation_command_rejections
+            .add(1, &attributes);
+    }
+}
+
+pub(crate) fn record_boost_lifecycle_transition(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+    activated: bool,
+) {
+    let attributes = boost_attributes(game_type, queue_mode, Some(team_side), speed_band, None);
+    if activated {
+        metrics().boost_activations.add(1, &attributes);
+    } else {
+        metrics().boost_depletions.add(1, &attributes);
+    }
+}
+
+pub(crate) fn record_boost_manual_stop(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    speed_band: &'static str,
+) {
+    metrics().boost_manual_stops.add(
+        1,
+        &boost_attributes(game_type, queue_mode, Some(team_side), speed_band, None),
+    );
+}
+
 pub(crate) fn record_http_request(status_code: u16, latency_ms: u64) {
     let metrics = metrics();
     metrics.http_requests.add(1, &[]);
@@ -660,6 +860,15 @@ pub(crate) fn record_http_request(status_code: u16, latency_ms: u64) {
         metrics.http5xx_responses.add(1, &[]);
     }
     metrics.http_request_latency.record(latency_ms, &[]);
+}
+
+pub(crate) fn record_game_actor_advance(advance_duration_us: u64, batch_quanta: u64, lag_ms: u64) {
+    let metrics = metrics();
+    metrics
+        .game_actor_advance_duration
+        .record(advance_duration_us, &[]);
+    metrics.game_actor_batch_quanta.record(batch_quanta, &[]);
+    metrics.game_actor_lag.record(lag_ms, &[]);
 }
 
 pub(crate) fn record_websocket_inbound_message(bytes: u64) {
@@ -766,6 +975,21 @@ mod tests {
         instruments.redis_requests.add(1, &[]);
         instruments.redis_errors.add(1, &[]);
         instruments.redis_request_latency.record(12, &[]);
+        instruments.boost_packet_collections.add(
+            1,
+            &boost_attributes("2v2", "competitive", Some("team-1"), "1.26-1.50x", Some(3)),
+        );
+        instruments.boost_activations.add(
+            1,
+            &boost_attributes("2v2", "competitive", Some("team-1"), "1.76-2.00x", None),
+        );
+        instruments.boost_manual_stops.add(
+            1,
+            &boost_attributes("2v2", "competitive", Some("team-1"), "1.76-2.00x", None),
+        );
+        instruments.game_actor_advance_duration.record(730, &[]);
+        instruments.game_actor_batch_quanta.record(3, &[]);
+        instruments.game_actor_lag.record(50, &[]);
         update_gauges(&GaugeSnapshot {
             live_tasks: 3,
             active_websockets: 7,
@@ -808,6 +1032,7 @@ mod tests {
             "snaketron.http_request_latency",
             "snaketron.websocket_session_duration",
             "snaketron.redis_request_latency",
+            "snaketron.game_actor.lag",
         ] {
             let exported_histogram = metric(name);
             assert_eq!(exported_histogram.unit(), "ms");
@@ -819,6 +1044,52 @@ mod tests {
                 }
                 data => panic!("{name} used the wrong aggregation: {data:?}"),
             }
+        }
+
+        for (name, unit) in [
+            ("snaketron.game_actor.advance_duration", "us"),
+            ("snaketron.game_actor.batch_quanta", "1"),
+        ] {
+            let exported_histogram = metric(name);
+            assert_eq!(exported_histogram.unit(), unit);
+            match exported_histogram.data() {
+                AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                    let points = histogram.data_points().collect::<Vec<_>>();
+                    assert_eq!(points.len(), 1);
+                    assert_eq!(points[0].attributes().count(), 0);
+                }
+                data => panic!("{name} used the wrong aggregation: {data:?}"),
+            }
+        }
+
+        match metric("snaketron.boost.packet_collections").data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                let points = sum.data_points().collect::<Vec<_>>();
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].value(), 1);
+                assert_eq!(points[0].attributes().count(), 5);
+            }
+            data => panic!("Boost packet collections used the wrong aggregation: {data:?}"),
+        }
+
+        match metric("snaketron.boost.activations").data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                let points = sum.data_points().collect::<Vec<_>>();
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].value(), 1);
+                assert_eq!(points[0].attributes().count(), 4);
+            }
+            data => panic!("Boost activations used the wrong aggregation: {data:?}"),
+        }
+
+        match metric("snaketron.boost.manual_stops").data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                let points = sum.data_points().collect::<Vec<_>>();
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].value(), 1);
+                assert_eq!(points[0].attributes().count(), 4);
+            }
+            data => panic!("Boost manual stops used the wrong aggregation: {data:?}"),
         }
 
         for (name, expected) in [

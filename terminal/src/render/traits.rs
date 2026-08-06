@@ -11,9 +11,12 @@ pub trait GameObjectRenderer {
         direction: Option<Direction>,
         is_head: bool,
         player_id: u32,
+        boost_active: bool,
     ) -> CharPattern;
 
     fn render_food(&self) -> CharPattern;
+
+    fn render_boost_pad(&self) -> CharPattern;
 
     fn render_empty(&self) -> CharPattern;
 }

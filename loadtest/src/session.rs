@@ -39,6 +39,8 @@ type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SocketSink = SplitSink<RawSocket, Message>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+const CLIENT_PROTOCOL_VERSION: u16 = 5;
+const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 const READER_WAKE_SENTINEL_INTERVAL: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MAX_RECONNECTS: u32 = 2;
@@ -464,6 +466,7 @@ struct GameRuntime {
     engine: GameEngine,
     snake_id: u32,
     snapshot_user_ids: BTreeSet<u32>,
+    command_profile: CommandProfile,
     ai_interval: Interval,
     last_decision_tick: Option<u32>,
     pending_direction: Option<Direction>,
@@ -618,15 +621,17 @@ impl GameRuntime {
         user_id: u32,
         game_state: GameState,
         clock_offset_ms: i64,
+        command_profile: CommandProfile,
     ) -> Result<Self> {
         let (snapshot_user_ids, snake_id) = snapshot_identity(game_id, user_id, &game_state)?;
-        let ai_interval = ai_interval_for(&game_state, clock_offset_ms);
+        let ai_interval = ai_interval_for(&game_state, clock_offset_ms, command_profile);
         let mut engine = GameEngine::new_from_state(game_id, game_state);
         engine.set_local_player_id(user_id);
         Ok(Self {
             engine,
             snake_id,
             snapshot_user_ids,
+            command_profile,
             ai_interval,
             last_decision_tick: None,
             pending_direction: None,
@@ -695,7 +700,7 @@ impl GameRuntime {
             return Ok(true);
         }
 
-        let ai_interval = ai_interval_for(&game_state, clock_offset_ms);
+        let ai_interval = ai_interval_for(&game_state, clock_offset_ms, self.command_profile);
         let mut engine = GameEngine::new_from_state(game_id, game_state);
         engine.set_local_player_id(user_id);
         self.engine = engine;
@@ -1433,7 +1438,10 @@ async fn prepare_pre_game_candidate(
     send_candidate_message(
         session,
         &mut socket,
-        WSMessage::Token(session.token.clone()),
+        WSMessage::Authenticate {
+            token: session.token.clone(),
+            protocol_version: CLIENT_PROTOCOL_VERSION,
+        },
         cancellation,
     )
     .await
@@ -1452,7 +1460,7 @@ async fn prepare_pre_game_candidate(
         {
             WSMessage::Authenticated {
                 task_boot_id,
-                protocol_version: _,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
                 capabilities,
                 socket_generation,
             } => {
@@ -1887,18 +1895,25 @@ async fn authenticate_initial_admission_attempt(
     let token = session.token.clone();
     tokio::time::timeout_at(
         admission_deadline,
-        session.send_cancellable(WSMessage::Token(token), cancellation),
+        session.send_cancellable(
+            WSMessage::Authenticate {
+                token,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+            },
+            cancellation,
+        ),
     )
     .await
-    .map_err(|_| anyhow!("bounded admission deadline expired while sending the token"))?
-    .context("failed to send authentication token")?;
+    .map_err(|_| anyhow!("bounded admission deadline expired while sending authentication"))?
+    .context("failed to send WebSocket authentication request")?;
 
-    // The token has crossed the initial socket, which is the report's logical
-    // concurrency boundary. The ordered ping below then confirms processing
-    // and establishes the server clock offset before any game timing occurs.
+    // The authentication request has crossed the initial socket, which is the
+    // report's logical concurrency boundary. The ordered ping below then
+    // confirms processing and establishes the server clock offset before any
+    // game timing occurs.
     session.record.record_lifecycle(
         SessionLifecycleRecord::new(SessionPhase::WebSocketAuthentication, unix_time_ms())
-            .with_message("token sent; awaiting explicit authentication"),
+            .with_message("authentication request sent; awaiting acknowledgement"),
     );
     let remaining = admission_deadline.saturating_duration_since(tokio::time::Instant::now());
     session
@@ -2954,6 +2969,7 @@ async fn play_session_inner(
         session.user_id,
         game_state,
         session.clock_offset_ms,
+        settings.command_profile,
     )?;
     session.record.record_lifecycle(SessionLifecycleRecord::new(
         SessionPhase::Playing,
@@ -4019,9 +4035,17 @@ async fn prepare_planned_candidate(
 
     let auth_started = Instant::now();
     let token = session.token.clone();
-    send_candidate_message(session, &mut socket, WSMessage::Token(token), cancellation)
-        .await
-        .map_err(PlannedHandoffAttemptError::Candidate)?;
+    send_candidate_message(
+        session,
+        &mut socket,
+        WSMessage::Authenticate {
+            token,
+            protocol_version: CLIENT_PROTOCOL_VERSION,
+        },
+        cancellation,
+    )
+    .await
+    .map_err(PlannedHandoffAttemptError::Candidate)?;
 
     let lobby_code = session.record.lobby_code.clone();
     let preferences = LobbyPreferences {
@@ -4220,7 +4244,7 @@ async fn prepare_planned_candidate(
                 match message {
                     WSMessage::Authenticated {
                         task_boot_id: candidate_task_boot_id,
-                        protocol_version: _,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: candidate_capabilities,
                         socket_generation: candidate_socket_generation,
                     } => {
@@ -4778,17 +4802,21 @@ fn snapshot_identity(
     Ok((snapshot_user_ids, snake_id))
 }
 
-fn ai_interval_for(game_state: &GameState, clock_offset_ms: i64) -> Interval {
-    let tick_ms = game_state.properties.tick_duration_ms.max(25) as u64;
-    let ai_period = Duration::from_millis(tick_ms.min(100));
+fn ai_interval_for(
+    game_state: &GameState,
+    clock_offset_ms: i64,
+    command_profile: CommandProfile,
+) -> Interval {
+    let decision_ms = ai_decision_interval_ms(game_state, command_profile);
+    let ai_period = Duration::from_millis(decision_ms);
     let now_ms = Utc::now()
         .timestamp_millis()
         .saturating_add(clock_offset_ms);
     let delay_to_next_tick = if now_ms < game_state.start_ms {
-        game_state.start_ms.saturating_sub(now_ms) as u64 + tick_ms
+        game_state.start_ms.saturating_sub(now_ms) as u64 + decision_ms
     } else {
         let elapsed_since_start = now_ms.saturating_sub(game_state.start_ms) as u64;
-        tick_ms.saturating_sub(elapsed_since_start % tick_ms)
+        decision_ms.saturating_sub(elapsed_since_start % decision_ms)
     };
     let mut ai_interval = interval_at(
         tokio::time::Instant::now() + Duration::from_millis(delay_to_next_tick),
@@ -4796,6 +4824,15 @@ fn ai_interval_for(game_state: &GameState, clock_offset_ms: i64) -> Interval {
     );
     ai_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ai_interval
+}
+
+fn ai_decision_interval_ms(game_state: &GameState, command_profile: CommandProfile) -> u64 {
+    let tick_ms = game_state.properties.tick_duration_ms.max(25) as u64;
+    if game_state.properties.boost.is_some() && command_profile == CommandProfile::Realistic {
+        tick_ms.max(NORMAL_MOVEMENT_INTERVAL_MS)
+    } else {
+        tick_ms.min(NORMAL_MOVEMENT_INTERVAL_MS)
+    }
 }
 
 async fn wait_for_match_with_recovery(
@@ -4978,6 +5015,20 @@ async fn drive_ai(
             "certification command producer reached the {MAX_PENDING_COMMANDS_PER_GAME_SESSION}-command session outcome window"
         )));
     }
+    if let Some(boost_command) =
+        boost_command_for_profile(state, snake_id, predicted_tick, command_profile)
+    {
+        let command = engine
+            .process_local_command(boost_command)
+            .map_err(DriveAiError::Fatal)?;
+        session
+            .send_game_command(engine.game_id(), command)
+            .await
+            .map_err(|error| {
+                DriveAiError::Transport(error.context("sending AI Boost edge over WebSocket"))
+            })?;
+        return Ok(());
+    }
     let direction =
         calculate_ai_move(state, snake_id, current_direction).unwrap_or(current_direction);
     if direction == current_direction && !command_profile.sends_unchanged_turns() {
@@ -5003,6 +5054,30 @@ async fn drive_ai(
         *pending_direction = Some(direction);
     }
     Ok(())
+}
+
+fn boost_command_for_profile(
+    state: &GameState,
+    snake_id: u32,
+    predicted_tick: u32,
+    command_profile: CommandProfile,
+) -> Option<GameCommand> {
+    state.properties.boost.as_ref()?;
+    let snake = state.arena.snakes.get(snake_id as usize)?;
+
+    match command_profile {
+        CommandProfile::Realistic => (snake.boost().charge_ms > 0 && !snake.boost().active)
+            .then_some(GameCommand::ActivateBoost { snake_id }),
+        // Saturation alternates explicit Boost edges on even quanta and turn
+        // decisions on odd quanta. Empty/already-active start attempts and
+        // already-inactive stops intentionally exercise deterministic no-ops
+        // without exceeding the existing one-command-per-quantum contract.
+        CommandProfile::EveryTick => match predicted_tick % 4 {
+            0 => Some(GameCommand::ActivateBoost { snake_id }),
+            2 => Some(GameCommand::DeactivateBoost { snake_id }),
+            _ => None,
+        },
+    }
 }
 
 fn record_pending_command_resolution(
@@ -5724,8 +5799,14 @@ impl LiveSession {
         }
         let websocket_auth_started = Instant::now();
         let token = self.token.clone();
-        self.send_cancellable(WSMessage::Token(token), cancellation)
-            .await?;
+        self.send_cancellable(
+            WSMessage::Authenticate {
+                token,
+                protocol_version: CLIENT_PROTOCOL_VERSION,
+            },
+            cancellation,
+        )
+        .await?;
         self.wait_for_authenticated(timeout, cancellation).await?;
         self.record
             .metrics
@@ -5755,6 +5836,11 @@ impl LiveSession {
                     capabilities,
                     socket_generation,
                 } => {
+                    if protocol_version != CLIENT_PROTOCOL_VERSION {
+                        return Err(anyhow!(
+                            "server acknowledged WebSocket protocol version {protocol_version}; expected {CLIENT_PROTOCOL_VERSION}"
+                        ));
+                    }
                     let suffix = self.reconnects.to_string();
                     self.current_task_boot_id = Some(task_boot_id.clone());
                     self.current_socket_generation = Some(socket_generation);
@@ -6109,7 +6195,7 @@ fn sticky_cookie_value(header: &str) -> Option<&str> {
 
 fn message_kind(message: &WSMessage) -> &'static str {
     match message {
-        WSMessage::Token(_) => "Token",
+        WSMessage::Authenticate { .. } => "Authenticate",
         WSMessage::JoinGame(_) => "JoinGame",
         WSMessage::LeaveGame => "LeaveGame",
         WSMessage::GameCommandV2 { .. } => "GameCommandV2",
@@ -6360,6 +6446,91 @@ mod tests {
         game_state
     }
 
+    #[test]
+    fn boost_command_profiles_use_distinct_decision_cadences() {
+        let mut boost_game = duel_snapshot(&[]);
+        assert!(boost_game.properties.boost.is_some());
+        assert_eq!(boost_game.properties.tick_duration_ms, 50);
+        assert_eq!(
+            ai_decision_interval_ms(&boost_game, CommandProfile::Realistic),
+            100
+        );
+        assert_eq!(
+            ai_decision_interval_ms(&boost_game, CommandProfile::EveryTick),
+            50
+        );
+
+        boost_game.properties.tick_duration_ms = 150;
+        assert_eq!(
+            ai_decision_interval_ms(&boost_game, CommandProfile::Realistic),
+            150
+        );
+        assert_eq!(
+            ai_decision_interval_ms(&boost_game, CommandProfile::EveryTick),
+            100
+        );
+    }
+
+    #[test]
+    fn non_boost_command_profile_cadence_is_preserved() {
+        let mut non_boost_game =
+            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        non_boost_game.properties.tick_duration_ms = 50;
+        for profile in [CommandProfile::Realistic, CommandProfile::EveryTick] {
+            assert_eq!(ai_decision_interval_ms(&non_boost_game, profile), 50);
+        }
+        non_boost_game.properties.tick_duration_ms = 150;
+        for profile in [CommandProfile::Realistic, CommandProfile::EveryTick] {
+            assert_eq!(ai_decision_interval_ms(&non_boost_game, profile), 100);
+        }
+    }
+
+    #[test]
+    fn boost_profiles_exercise_valid_activation_and_both_saturated_edges() {
+        let mut game = duel_snapshot(&[71]);
+        let snake_id = game.players[&71].snake_id;
+        assert!(boost_command_for_profile(&game, snake_id, 0, CommandProfile::Realistic).is_none());
+        assert!(matches!(
+            boost_command_for_profile(&game, snake_id, 0, CommandProfile::EveryTick),
+            Some(GameCommand::ActivateBoost {
+                snake_id: command_snake_id
+            }) if command_snake_id == snake_id
+        ));
+        assert!(boost_command_for_profile(&game, snake_id, 1, CommandProfile::EveryTick).is_none());
+        assert!(matches!(
+            boost_command_for_profile(&game, snake_id, 2, CommandProfile::EveryTick),
+            Some(GameCommand::DeactivateBoost {
+                snake_id: command_snake_id
+            }) if command_snake_id == snake_id
+        ));
+        assert!(boost_command_for_profile(&game, snake_id, 3, CommandProfile::EveryTick).is_none());
+        assert!(matches!(
+            boost_command_for_profile(&game, snake_id, 4, CommandProfile::EveryTick),
+            Some(GameCommand::ActivateBoost {
+                snake_id: command_snake_id
+            }) if command_snake_id == snake_id
+        ));
+
+        let pad = game.arena.boost_pads[0].position;
+        let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.body = vec![
+            pad,
+            common::Position {
+                x: pad.x - 1,
+                y: pad.y,
+            },
+        ];
+        snake.direction = Direction::Right;
+        game.tick_forward(true).unwrap();
+
+        assert!(matches!(
+            boost_command_for_profile(&game, snake_id, game.tick, CommandProfile::Realistic),
+            Some(GameCommand::ActivateBoost {
+                snake_id: command_snake_id
+            }) if command_snake_id == snake_id
+        ));
+    }
+
     fn tick_hash_event(
         game_id: u32,
         user_id: u32,
@@ -6385,7 +6556,8 @@ mod tests {
         let snapshot = duel_snapshot(&[7, 8]);
         let tick = snapshot.current_tick();
         let hash = snapshot.sync_hash();
-        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut runtime =
+            GameRuntime::from_snapshot(42, 7, snapshot, 0, CommandProfile::Realistic).unwrap();
         let mut metrics = SessionMetrics::default();
 
         runtime
@@ -6409,7 +6581,8 @@ mod tests {
         let snapshot = duel_snapshot(&[7, 8]);
         let tick = snapshot.current_tick();
         let wrong_hash = snapshot.sync_hash() ^ 1;
-        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut runtime =
+            GameRuntime::from_snapshot(42, 7, snapshot, 0, CommandProfile::Realistic).unwrap();
         let mut metrics = SessionMetrics::default();
 
         runtime
@@ -6828,6 +7001,7 @@ mod tests {
                     sequence: 1,
                 },
                 reason: "bounded outcome window exhausted".to_owned(),
+                command_id_client: None,
                 session_rejected_from: Some(1),
             },
         });
@@ -7521,7 +7695,8 @@ mod tests {
         let snapshot = duel_snapshot(&[7, 8]);
         let tick = snapshot.current_tick();
         let hash = snapshot.sync_hash();
-        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut runtime =
+            GameRuntime::from_snapshot(42, 7, snapshot, 0, CommandProfile::Realistic).unwrap();
         runtime
             .engine
             .process_server_event(&tick_hash_event(42, 7, tick, 10, hash))
@@ -7908,13 +8083,16 @@ mod tests {
             let token = socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
             socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -8073,13 +8251,16 @@ mod tests {
             let token = replacement.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
             replacement
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -8261,13 +8442,16 @@ mod tests {
             let token = candidate_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
             candidate_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -8413,13 +8597,16 @@ mod tests {
             let token = candidate_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
             candidate_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -8523,13 +8710,16 @@ mod tests {
             let token = candidate_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
             candidate_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -8692,7 +8882,10 @@ mod tests {
             let token = candidate_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(value) if value == "test-token"
+                WSMessage::Authenticate {
+                    token: value,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if value == "test-token"
             ));
 
             old_socket
@@ -8716,7 +8909,7 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "candidate-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -9163,7 +9356,8 @@ mod tests {
             require_stress_attestation: false,
             activity_lease: SessionActivityLease::new(7, activity_sender),
         };
-        let mut runtime = GameRuntime::from_snapshot(42, 7, snapshot, 0).unwrap();
+        let mut runtime =
+            GameRuntime::from_snapshot(42, 7, snapshot, 0, settings.command_profile).unwrap();
 
         let complete = perform_planned_handoff(
             &mut session,
@@ -9289,7 +9483,8 @@ mod tests {
     #[tokio::test]
     async fn complete_reconnect_snapshot_is_terminal_and_replaces_membership() {
         let initial = duel_snapshot(&[10, 11]);
-        let mut runtime = GameRuntime::from_snapshot(42, 10, initial, 0).unwrap();
+        let mut runtime =
+            GameRuntime::from_snapshot(42, 10, initial, 0, CommandProfile::Realistic).unwrap();
 
         let mut completed = duel_snapshot(&[10, 99]);
         completed.status = GameStatus::Complete {
@@ -9370,7 +9565,10 @@ mod tests {
             let first_token = first_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(first_token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(token) if token == "stable-token"
+                WSMessage::Authenticate {
+                    token,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if token == "stable-token"
             ));
             drop(first_socket);
 
@@ -9379,13 +9577,16 @@ mod tests {
             let draining_token = draining_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(draining_token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(token) if token == "stable-token"
+                WSMessage::Authenticate {
+                    token,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if token == "stable-token"
             ));
             draining_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "draining-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())
@@ -9425,13 +9626,16 @@ mod tests {
             let replacement_token = replacement_socket.next().await.unwrap().unwrap();
             assert!(matches!(
                 serde_json::from_str::<WSMessage>(replacement_token.to_text().unwrap()).unwrap(),
-                WSMessage::Token(token) if token == "stable-token"
+                WSMessage::Authenticate {
+                    token,
+                    protocol_version: CLIENT_PROTOCOL_VERSION,
+                } if token == "stable-token"
             ));
             replacement_socket
                 .send(Message::Text(
                     serde_json::to_string(&WSMessage::Authenticated {
                         task_boot_id: "replacement-task".to_owned(),
-                        protocol_version: 2,
+                        protocol_version: CLIENT_PROTOCOL_VERSION,
                         capabilities: REQUIRED_SERVER_CAPABILITIES
                             .iter()
                             .map(|capability| (*capability).to_owned())

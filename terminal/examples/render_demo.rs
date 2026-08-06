@@ -11,43 +11,44 @@ fn main() {
         width: 20,
         height: 10,
         snakes: vec![
-            Snake {
-                body: vec![
+            Snake::new(
+                vec![
                     Position { x: 5, y: 5 }, // head
                     Position { x: 5, y: 7 }, // turn point
                     Position { x: 3, y: 7 }, // tail
                 ],
-                direction: Direction::Up,
-                is_alive: true,
-                food: 0,
-                team_id: None,
-            },
-            Snake {
-                body: vec![
+                Direction::Up,
+                true,
+                0,
+                None,
+            ),
+            Snake::new(
+                vec![
                     Position { x: 15, y: 3 }, // head
                     Position { x: 12, y: 3 }, // tail
                 ],
-                direction: Direction::Right,
-                is_alive: true,
-                food: 0,
-                team_id: None,
-            },
-            Snake {
-                body: vec![
+                Direction::Right,
+                true,
+                0,
+                None,
+            ),
+            Snake::new(
+                vec![
                     Position { x: 8, y: 8 }, // head
                     Position { x: 8, y: 6 }, // tail
                 ],
-                direction: Direction::Down,
-                is_alive: true,
-                food: 0,
-                team_id: None,
-            },
+                Direction::Down,
+                true,
+                0,
+                None,
+            ),
         ],
         food: vec![
             Position { x: 10, y: 5 },
             Position { x: 2, y: 2 },
             Position { x: 17, y: 8 },
         ],
+        boost_pads: Vec::new(),
         team_zone_config: None,
     };
 

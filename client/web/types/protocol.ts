@@ -24,7 +24,7 @@ type UnionToIntersection<U> = (U extends unknown ? (k: U) => void : never) exten
 
 /**
  * Merge every single-key tagged variant into one map:
- * `{ Token: string; JoinGame: number; GameEvent: GameEventMessage; ... }`.
+ * `{ Authenticate: {...}; JoinGame: number; GameEvent: GameEventMessage; ... }`.
  */
 type TaggedPayloadMap = UnionToIntersection<TaggedVariant>;
 

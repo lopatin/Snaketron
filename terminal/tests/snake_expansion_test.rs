@@ -4,13 +4,13 @@ use terminal::render::snake::SnakeRenderer;
 #[test]
 fn test_snake_expansion_all_directions() {
     // Test snake going right
-    let snake_right = Snake {
-        body: vec![Position { x: 5, y: 10 }, Position { x: 3, y: 10 }],
-        direction: Direction::Right,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake_right = Snake::new(
+        vec![Position { x: 5, y: 10 }, Position { x: 3, y: 10 }],
+        Direction::Right,
+        true,
+        0,
+        None,
+    );
     let expanded = SnakeRenderer::expand_snake_body(&snake_right);
     assert_eq!(
         expanded,
@@ -22,13 +22,13 @@ fn test_snake_expansion_all_directions() {
     );
 
     // Test snake going left
-    let snake_left = Snake {
-        body: vec![Position { x: 3, y: 10 }, Position { x: 5, y: 10 }],
-        direction: Direction::Left,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake_left = Snake::new(
+        vec![Position { x: 3, y: 10 }, Position { x: 5, y: 10 }],
+        Direction::Left,
+        true,
+        0,
+        None,
+    );
     let expanded = SnakeRenderer::expand_snake_body(&snake_left);
     assert_eq!(
         expanded,
@@ -40,13 +40,13 @@ fn test_snake_expansion_all_directions() {
     );
 
     // Test snake going down
-    let snake_down = Snake {
-        body: vec![Position { x: 10, y: 5 }, Position { x: 10, y: 3 }],
-        direction: Direction::Down,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake_down = Snake::new(
+        vec![Position { x: 10, y: 5 }, Position { x: 10, y: 3 }],
+        Direction::Down,
+        true,
+        0,
+        None,
+    );
     let expanded = SnakeRenderer::expand_snake_body(&snake_down);
     assert_eq!(
         expanded,
@@ -58,13 +58,13 @@ fn test_snake_expansion_all_directions() {
     );
 
     // Test snake going up
-    let snake_up = Snake {
-        body: vec![Position { x: 10, y: 3 }, Position { x: 10, y: 5 }],
-        direction: Direction::Up,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake_up = Snake::new(
+        vec![Position { x: 10, y: 3 }, Position { x: 10, y: 5 }],
+        Direction::Up,
+        true,
+        0,
+        None,
+    );
     let expanded = SnakeRenderer::expand_snake_body(&snake_up);
     assert_eq!(
         expanded,
@@ -76,17 +76,17 @@ fn test_snake_expansion_all_directions() {
     );
 
     // Test snake with a turn (L-shape)
-    let snake_turn = Snake {
-        body: vec![
+    let snake_turn = Snake::new(
+        vec![
             Position { x: 5, y: 5 }, // head
             Position { x: 5, y: 3 }, // turn point
             Position { x: 3, y: 3 }, // tail
         ],
-        direction: Direction::Down,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+        Direction::Down,
+        true,
+        0,
+        None,
+    );
     let expanded = SnakeRenderer::expand_snake_body(&snake_turn);
     assert_eq!(
         expanded,
@@ -103,13 +103,13 @@ fn test_snake_expansion_all_directions() {
 #[test]
 fn test_snake_expansion_scenarios() {
     // Test case 1: Snake moving left (like in the replay)
-    let snake1 = Snake {
-        body: vec![Position { x: 36, y: 20 }, Position { x: 38, y: 20 }],
-        direction: Direction::Left,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake1 = Snake::new(
+        vec![Position { x: 36, y: 20 }, Position { x: 38, y: 20 }],
+        Direction::Left,
+        true,
+        0,
+        None,
+    );
 
     println!("Snake 1 (moving left):");
     println!("  Compressed: {:?}", snake1.body);
@@ -133,13 +133,13 @@ fn test_snake_expansion_scenarios() {
     }
 
     // Test case 3: Snake at edge
-    let snake3 = Snake {
-        body: vec![Position { x: 1, y: 20 }, Position { x: 3, y: 20 }],
-        direction: Direction::Left,
-        is_alive: true,
-        food: 0,
-        team_id: None,
-    };
+    let snake3 = Snake::new(
+        vec![Position { x: 1, y: 20 }, Position { x: 3, y: 20 }],
+        Direction::Left,
+        true,
+        0,
+        None,
+    );
 
     println!("\n\nSnake 3 (near left edge):");
     println!("  Compressed: {:?}", snake3.body);

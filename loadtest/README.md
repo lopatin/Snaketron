@@ -116,7 +116,7 @@ Each virtual user performs the production lifecycle:
 
 A complete duel/2v2 lobby is split across the opposing teams by the existing matchmaker; a complete FFA lobby is selected intact. Snapshot membership validation turns any unexpected pairing into an explicit session failure. Only `--stress-test` provides a preventative matchmaking boundary from public players; ordinary load runs remain in the public pool.
 
-`--command-profile realistic` sends only actual direction changes, like UI input. `--command-profile every-tick` intentionally saturates the command path.
+`--command-profile realistic` evaluates no faster than a normal snake can move (100 ms in a Boost match), activates stored Boost when available, lets it run until empty, and otherwise sends only actual direction changes, like UI input. In Boost matches, `--command-profile every-tick` alternates explicit Boost start/stop edges on even 50 ms simulation quanta (start at tick modulo four 0, stop at modulo four 2) with turn decisions on odd quanta. Empty/already-active starts and already-inactive stops intentionally exercise deterministic no-ops while preserving the existing one-command-per-quantum ingress contract. Non-Boost games keep emitting a turn decision each quantum.
 
 ## Reports
 

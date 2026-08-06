@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback, useReducer, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, useReducer, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
@@ -6,7 +6,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode, GameLoadFailure } from '../types';
 import { getWasm } from '../wasm';
-import Scoreboard from './Scoreboard';
+import GameHudShell from './GameHudShell';
+import GameControlsHint from './GameControlsHint';
 import LoadingScreen from './LoadingScreen';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
@@ -15,10 +16,101 @@ import {
   drawCrashExplosions,
   syncPredictedCrashExplosions,
 } from '../utils/crashExplosion';
+import {
+  BoostInputController,
+  loadBoostInputMode,
+  persistBoostInputMode,
+  targetOwnsGameplayKeys,
+  type BoostInputCommand,
+  type BoostInputContext,
+  type BoostInputDecision,
+  type BoostInputMode,
+} from '../utils/boostInput';
+import { buildBoostHudView } from '../utils/boostHud';
+import {
+  createScoreEffectRuntime,
+  drawScoreEffects,
+  resetScoreEffects,
+  syncScoreEffects,
+} from '../utils/scoreEffects';
 import type {
   CrashExplosion,
   PredictedCrashVisualState,
 } from '../utils/crashExplosion';
+import './GameArena.css';
+
+function BoostCanisterMark() {
+  return (
+    <svg
+      className="game-boost-meter__canister"
+      data-testid="boost-nos-bottle"
+      viewBox="0 0 34 24"
+      preserveAspectRatio="xMidYMid meet"
+      shapeRendering="geometricPrecision"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <g className="game-boost-meter__canister-tilt" transform="rotate(-24 17 12)">
+        <path
+          className="game-boost-meter__canister-base"
+          fill="#3b82f6"
+          d="M2.8 4.8h18.4l3.2 2.8h2V6.1h4.3v2H33v7.8h-2.3v2h-4.3v-1.5h-2l-3.2 2.8H2.8L.6 17V7l2.2-2.2Z"
+        />
+        <path
+          className="game-boost-meter__canister-body"
+          fill="#3b82f6"
+          d="M3.2 6.3h17.4l2.2 2v7.4l-2.2 2H3.2L2 16.5v-9l1.2-1.2Z"
+        />
+        <path
+          className="game-boost-meter__canister-highlight"
+          fill="#93c5fd"
+          d="M2.8 4.8h18.4l3.2 2.8h2v1.1h-2.3l-3.2-2.4H3.2L2 7.5v3H.6V7l2.2-2.2Z"
+        />
+        <path
+          className="game-boost-meter__canister-shade"
+          fill="#2563eb"
+          d="M.6 13.5H2v3l1.2 1.2h17.4l2.2-2v-2.2h1.6v2.9h2v1.5h-2l-3.2 1.3H2.8L.6 17v-3.5Z"
+        />
+        <rect
+          className="game-boost-meter__pressure-plate-separator"
+          x="5"
+          y="6.3"
+          width="15.8"
+          height="11.4"
+          fill="#f8fafc"
+        />
+        <rect
+          className="game-boost-meter__pressure-plate"
+          x="6.7"
+          y="8"
+          width="12.4"
+          height="8"
+          fill="#ff641e"
+        />
+        <text
+          className="game-boost-meter__nos-wordmark"
+          x="12.9"
+          y="12.25"
+          fill="#fff"
+          fontFamily="Arial, sans-serif"
+          fontSize="5.5"
+          fontStyle="normal"
+          fontWeight="900"
+          letterSpacing="0"
+          textAnchor="middle"
+          dominantBaseline="middle"
+        >
+          NOS
+        </text>
+        <path fill="#f8fafc" d="M24.2 9.2h2.4v5.6h-2.4Z" />
+        <path fill="#93c5fd" d="M26.2 7.5h3.1v9h-3.1Z" />
+        <path fill="#f8fafc" d="M27 7.5h2.3v4.3H27Z" />
+        <path fill="#ff641e" d="M29.3 8.6h2v2.6h-2Z" />
+        <path fill="#2563eb" d="M29.3 13h2v2.4h-2Z" />
+      </g>
+    </svg>
+  );
+}
 
 export default function GameArena() {
   const { gameId } = useParams();
@@ -39,6 +131,7 @@ export default function GameArena() {
   const crashVisualEpochRef = useRef<number | null>(null);
   const lastCrashVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
+  const scoreEffectsRef = useRef(createScoreEffectRuntime());
   
   const {
     connected,
@@ -97,10 +190,57 @@ export default function GameArena() {
   });
 
   const [gameOver, setGameOver] = useState(false);
-  const [showGameOverPanel, setShowGameOverPanel] = useState(false);
+  const [boostInputMode, setBoostInputMode] = useState<BoostInputMode>(loadBoostInputMode);
+  const boostInputControllerRef = useRef<BoostInputController | null>(null);
+  if (boostInputControllerRef.current === null) {
+    boostInputControllerRef.current = new BoostInputController(boostInputMode);
+  }
+  const boostInputContextRef = useRef<BoostInputContext>({
+    active: false,
+    canActivate: false,
+    interactionActive: false,
+    gameOver: false,
+  });
+  const sendBoostCommandRef = useRef<(command: BoostInputCommand) => void>(() => {});
+  const boostInputGameIdRef = useRef(gameId);
+  const boostPointerIdRef = useRef<number | null>(null);
+  const releaseBoostBeforeLeave = useCallback(() => {
+    const controller = boostInputControllerRef.current;
+    if (!controller) {
+      return;
+    }
+    const decision = controller.teardown(boostInputContextRef.current);
+    if (decision.command) {
+      sendBoostCommandRef.current(decision.command);
+    }
+    boostPointerIdRef.current = null;
+  }, []);
+  const gameSessionClosedRef = useRef(false);
+  const leaveGameRef = useRef(leaveGame);
+  const stopEngineRef = useRef(stopEngine);
+  leaveGameRef.current = leaveGame;
+  stopEngineRef.current = stopEngine;
+  const teardownGameSession = useCallback(() => {
+    if (gameSessionClosedRef.current) {
+      return;
+    }
+    gameSessionClosedRef.current = true;
+    releaseBoostBeforeLeave();
+    leaveGameRef.current();
+    stopEngineRef.current();
+  }, [releaseBoostBeforeLeave]);
+
+  // Run before passive hook cleanup can mark the old socket unsynchronized.
+  // This keeps a held Boost stop ordered ahead of LeaveGame on SPA route
+  // changes as well as a true arena unmount.
+  useLayoutEffect(() => {
+    gameSessionClosedRef.current = false;
+    return teardownGameSession;
+  }, [gameId, teardownGameSession]);
   const [cellSize, setCellSize] = useState(15);
   const [canvasSize, setCanvasSize] = useState({ width: 600, height: 600 });
   const [panelSize, setPanelSize] = useState({ width: 610, height: 610 });
+  const [hudUtilityHost, setHudUtilityHost] = useState<HTMLDivElement | null>(null);
   const [isArenaVisible, setIsArenaVisible] = useState(false);
   const [, forceUpdate] = useReducer(x => x + 1, 0);
   const [rotation, setRotation] = useState<ArenaRotation>(0);
@@ -115,20 +255,19 @@ export default function GameArena() {
 
     if (previousGameIdRef.current && previousGameIdRef.current !== gameId) {
       console.log('Game ID changed, tearing down previous arena before joining new game:', previousGameIdRef.current, '→', gameId);
-      leaveGame();
-      stopEngine();
       rotationSetRef.current = false;
       setGameOver(false);
-      setShowGameOverPanel(false);
       crashExplosionsRef.current.length = 0;
       seenCrashEventIdsRef.current.clear();
       crashVisualEpochRef.current = null;
       lastCrashVisualJsonRef.current = null;
+      resetScoreEffects(scoreEffectsRef.current);
+      boostInputControllerRef.current?.reset();
     }
 
     previousGameIdRef.current = gameId;
     joinedGameIdRef.current = null;
-  }, [gameId, leaveGame, stopEngine]);
+  }, [gameId]);
 
   // Join only after the token has been sent on this WebSocket connection. This keeps
   // JoinGame ordered behind authentication during a cold page load or reconnect.
@@ -217,6 +356,7 @@ export default function GameArena() {
       seenCrashEventIdsRef.current.clear();
       crashVisualEpochRef.current = null;
       lastCrashVisualJsonRef.current = null;
+      resetScoreEffects(scoreEffectsRef.current);
     };
   }, []);
 
@@ -235,8 +375,6 @@ export default function GameArena() {
 
       joinedGameIdRef.current = null; // Reset for next mount
       rotationSetRef.current = false; // Reset rotation flag for next game
-      leaveGame();
-      stopEngine();
     };
   }, []);
 
@@ -267,10 +405,20 @@ export default function GameArena() {
       const vh = window.innerHeight;
       const vw = window.innerWidth;
       
-      // Account for scoreboard (~120px), bottom padding (40px), 
-      // container padding (2*16px), and panel border+shadow (~10px)
-      const availableHeight = vh - 200 - 32 - 10;
-      const availableWidth = vw - 100 - 32 - 10;
+      // Read the responsive chrome budget from CSS so arena sizing stays in
+      // lockstep with the scoreboard, arena-owned utility rail, and controls.
+      const hudHeight = Number.parseFloat(
+        getComputedStyle(document.documentElement)
+          .getPropertyValue('--game-hud-top-footprint'),
+      ) || 128;
+      const boostIndicatorHeight = state.properties.boost
+        ? Number.parseFloat(
+            getComputedStyle(document.documentElement)
+              .getPropertyValue('--game-boost-indicator-height'),
+          ) || 40
+        : 0;
+      const availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
+      const availableWidth = vw - 32 - 10;
       
       // For vertical orientations (90° and 270°), we need to swap dimensions
       const isVertical = rotation === 90 || rotation === 270;
@@ -312,7 +460,6 @@ export default function GameArena() {
       console.log('Game complete (from committed state), showing game over UI');
       setGameOver(true);
       stopEngine(); // Stop the engine when game ends
-      setShowGameOverPanel(true);
 
       // Note: Users remain in InGame state on this route after game ends.
       // They must explicitly click "Menu" to leave or wait for host to "Play Again"
@@ -362,13 +509,17 @@ export default function GameArena() {
 
     // Handle keyboard input
     const handleKeyPress = (e: KeyboardEvent) => {
-      // Ignore repeat events
+      // Once the match is complete, the score card owns Space (including the
+      // native activation behavior of its focused Play Again button).
+      if (gameOver || targetOwnsGameplayKeys(e.target)) {
+        return;
+      }
+
       if (e.repeat) {
         return;
       }
       
       if (
-        gameOver ||
         !gameState ||
         !isGameInteractionActive
       ) {
@@ -379,7 +530,7 @@ export default function GameArena() {
       if ((typeof status === 'object' && 'Complete' in status) || status === 'Stopped') {
         return;
       }
-      
+
       let direction = null;
       switch(e.key) {
         case 'ArrowUp': direction = 'Up'; break;
@@ -430,13 +581,48 @@ export default function GameArena() {
   const renderArenaWidth = gameState?.arena.width ?? committedState?.arena.width ?? 0;
   const renderArenaHeight = gameState?.arena.height ?? committedState?.arena.height ?? 0;
   const hasRenderableGameState = gameState !== null;
+  const renderState = gameState ?? committedState;
+  const renderLocalPlayer = user?.id !== undefined
+    ? renderState?.players?.[user.id]
+    : undefined;
+  const renderLocalTeamId = renderLocalPlayer
+    ? renderState?.arena.snakes?.[renderLocalPlayer.snake_id]?.team_id ?? null
+    : null;
+
+  // Score celebrations follow committed state only: prediction can make
+  // movement feel immediate, but it must never create a duplicate score cue.
+  // The engine epoch changes on every authoritative snapshot rebuild, making
+  // the snapshot state a fresh baseline rather than replaying old points.
+  useEffect(() => {
+    if (!committedState) {
+      return;
+    }
+
+    const visualSnapshot = readPredictedCrashVisualState();
+    if (!visualSnapshot) {
+      return;
+    }
+
+    syncScoreEffects(scoreEffectsRef.current, {
+      gameId,
+      engineEpoch: visualSnapshot.engineEpoch,
+      tick: committedState.tick,
+      teamScores: committedState.team_scores,
+      arenaWidth: committedState.arena.width,
+      arenaHeight: committedState.arena.height,
+      endZoneDepth: committedState.arena.team_zone_config?.end_zone_depth ?? null,
+      nowMs: performance.now(),
+    });
+  }, [gameId, committedState, readPredictedCrashVisualState]);
 
   // Render game state. Rendering reads the engine's predicted state directly in
   // Rust via renderTo -> GameClient.render, so there is no per-frame JSON
   // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
   // usernames and teams are resolved inside the renderer from the typed state.
-  // Cosmetic crash effects are painted immediately afterwards in this same
-  // loop because the Rust renderer clears the canvas at the start of each frame.
+  // Cosmetic effects are painted immediately afterwards in this same loop
+  // because the Rust renderer clears the canvas at the start of each frame.
+  // Rust currently paints field and snakes atomically, so the restrained cell
+  // wave overlays that complete frame; crash effects remain the topmost layer.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!hasRenderableGameState || !canvas || renderArenaWidth <= 0 || renderArenaHeight <= 0) {
@@ -455,6 +641,24 @@ export default function GameArena() {
       try {
         renderTo(canvas, cellSize, rotation, user?.id ?? undefined);
         const crashSnapshot = readPredictedCrashVisualState();
+        // Cancel in the first possible visual frame of a resync, before the
+        // React committed-state effect establishes the new score baseline.
+        if (
+          crashSnapshot &&
+          scoreEffectsRef.current.engineEpoch !== null &&
+          scoreEffectsRef.current.engineEpoch !== crashSnapshot.engineEpoch
+        ) {
+          resetScoreEffects(scoreEffectsRef.current);
+        }
+        drawScoreEffects(context, scoreEffectsRef.current, {
+          nowMs: now,
+          cellSize,
+          arenaWidth: renderArenaWidth,
+          arenaHeight: renderArenaHeight,
+          rotation,
+          localTeamId: renderLocalTeamId,
+          reducedMotion: prefersReducedMotionRef.current,
+        });
         if (crashSnapshot) {
           // Suppress durable history only on this arena's first snapshot. On a
           // later resync, a recent unseen cue may be the very prediction frame
@@ -508,6 +712,7 @@ export default function GameArena() {
     readPredictedCrashVisualState,
     renderArenaWidth,
     renderArenaHeight,
+    renderLocalTeamId,
   ]);
   
   // Process server events through the game engine. Events arrive via a
@@ -584,6 +789,237 @@ export default function GameArena() {
 
   const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
   const showCountdown = countdownState ? countdownSeconds > 0 : false;
+
+  // HUD state is read from predicted Rust state so Space/touch activation is
+  // immediate and still retracts naturally if the authoritative server
+  // rejects or reschedules the command.
+  const localPlayer = user?.id !== undefined ? gameState?.players?.[user.id] : undefined;
+  const localSnake = localPlayer
+    ? gameState?.arena.snakes?.[localPlayer.snake_id]
+    : undefined;
+  const boostConfig = gameState?.properties.boost ?? null;
+  const boostHud = boostConfig && localSnake
+    ? buildBoostHudView(boostConfig, localSnake, isGameInteractionActive, gameOver)
+    : null;
+
+  const currentStatus = gameState?.status;
+  const isBoostGameTerminal = Boolean(
+    gameOver ||
+    currentStatus === 'Stopped' ||
+    (typeof currentStatus === 'object' && currentStatus !== null && 'Complete' in currentStatus),
+  );
+  const boostInputContext: BoostInputContext = {
+    active: Boolean(localSnake?.boost.active),
+    canActivate: Boolean(
+      boostConfig &&
+      localSnake?.is_alive &&
+      localSnake.boost.charge_ms > 0 &&
+      !localSnake.boost.active &&
+      isGameInteractionActive &&
+      !isBoostGameTerminal
+    ),
+    interactionActive: Boolean(
+      boostConfig &&
+      localSnake?.is_alive &&
+      isGameInteractionActive &&
+      !isBoostGameTerminal
+    ),
+    gameOver: isBoostGameTerminal,
+  };
+  boostInputContextRef.current = boostInputContext;
+
+  const sendBoostInputCommand = useCallback((command: BoostInputCommand) => {
+    sendCommand(command);
+  }, [sendCommand]);
+  sendBoostCommandRef.current = sendBoostInputCommand;
+
+  const sendBoostDecision = useCallback((decision: BoostInputDecision) => {
+    if (decision.command) {
+      sendBoostInputCommand(decision.command);
+    }
+  }, [sendBoostInputCommand]);
+
+  const handleBoostButtonPress = useCallback(() => {
+    const controller = boostInputControllerRef.current;
+    if (!controller) {
+      return;
+    }
+    sendBoostDecision(controller.handleButtonPress(boostInputContextRef.current));
+  }, [sendBoostDecision]);
+
+  const handleBoostControlKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const controller = boostInputControllerRef.current;
+    if (!controller || controller.getMode() !== 'hold' || event.code !== 'Space') {
+      return;
+    }
+
+    // The window-level gameplay listener deliberately leaves focused controls
+    // alone. Start the same physical Space hold here; the window keyup path
+    // then owns release even if depletion disables the focused button first.
+    const decision = controller.handleKeyDown({
+      code: event.code,
+      repeat: event.repeat,
+      target: null,
+    }, boostInputContextRef.current);
+    if (decision.preventDefault) {
+      event.preventDefault();
+    }
+    sendBoostDecision(decision);
+  }, [sendBoostDecision]);
+
+  const handleBoostPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const controller = boostInputControllerRef.current;
+    if (!controller || controller.getMode() !== 'hold' || event.button !== 0) {
+      return;
+    }
+
+    const decision = controller.handlePointerDown(boostInputContextRef.current);
+    if (decision.preventDefault) {
+      event.preventDefault();
+    }
+    if (!boostInputContextRef.current.interactionActive || boostInputContextRef.current.gameOver) {
+      return;
+    }
+
+    boostPointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic and older embedded browsers may not expose pointer capture;
+      // pointerup/cancel still delivers the matching release in the common path.
+    }
+    sendBoostDecision(decision);
+  }, [sendBoostDecision]);
+
+  const handleBoostPointerRelease = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (boostPointerIdRef.current !== event.pointerId) {
+      return;
+    }
+    boostPointerIdRef.current = null;
+
+    const controller = boostInputControllerRef.current;
+    if (!controller) {
+      return;
+    }
+    const decision = controller.handlePointerUp(boostInputContextRef.current);
+    if (decision.preventDefault) {
+      event.preventDefault();
+    }
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // The browser may already have released capture during cancellation.
+    }
+    sendBoostDecision(decision);
+  }, [sendBoostDecision]);
+
+  const handleBoostInputModeChange = useCallback((mode: BoostInputMode) => {
+    const controller = boostInputControllerRef.current;
+    if (!controller || controller.getMode() === mode) {
+      return;
+    }
+
+    sendBoostDecision(controller.setMode(mode, boostInputContextRef.current));
+    setBoostInputMode(mode);
+    persistBoostInputMode(mode);
+  }, [sendBoostDecision]);
+
+  // Keep one set of physical-key listeners for the arena lifetime. Mutable
+  // refs let keyup use the latest snake state even if focus or connectivity
+  // changes between keydown and release.
+  useEffect(() => {
+    const dispatch = (decision: BoostInputDecision, event?: KeyboardEvent) => {
+      if (decision.preventDefault) {
+        event?.preventDefault();
+      }
+      if (decision.command) {
+        sendBoostCommandRef.current(decision.command);
+      }
+    };
+    const handleBoostKeyDown = (event: KeyboardEvent) => {
+      dispatch(
+        boostInputControllerRef.current!.handleKeyDown(
+          event,
+          boostInputContextRef.current,
+        ),
+        event,
+      );
+    };
+    const handleBoostKeyUp = (event: KeyboardEvent) => {
+      dispatch(
+        boostInputControllerRef.current!.handleKeyUp(
+          event,
+          boostInputContextRef.current,
+        ),
+        event,
+      );
+    };
+    const releaseHeldBoost = () => {
+      dispatch(
+        boostInputControllerRef.current!.releaseHeld(boostInputContextRef.current),
+      );
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        releaseHeldBoost();
+      }
+    };
+
+    window.addEventListener('keydown', handleBoostKeyDown);
+    window.addEventListener('keyup', handleBoostKeyUp);
+    window.addEventListener('blur', releaseHeldBoost);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('keydown', handleBoostKeyDown);
+      window.removeEventListener('keyup', handleBoostKeyUp);
+      window.removeEventListener('blur', releaseHeldBoost);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      const context = boostInputContextRef.current;
+      if (context.interactionActive && !context.gameOver) {
+        dispatch(boostInputControllerRef.current!.cleanup(context));
+      } else {
+        boostInputControllerRef.current!.reset();
+      }
+    };
+  }, []);
+
+  // Reconcile predictions and clean up any held state as the route or socket
+  // lifecycle changes. A disconnected release is deferred until commands can
+  // be sent again, avoiding a permanently active Hold boost after reconnect.
+  useEffect(() => {
+    const controller = boostInputControllerRef.current;
+    if (!controller) {
+      return;
+    }
+
+    if (boostInputGameIdRef.current !== gameId) {
+      boostInputGameIdRef.current = gameId;
+      controller.reset();
+      return;
+    }
+
+    if (boostInputContext.gameOver) {
+      controller.reset();
+      return;
+    }
+
+    const decision = boostInputContext.interactionActive
+      ? controller.reconcile(boostInputContext)
+      : controller.releaseHeld(boostInputContext);
+    sendBoostDecision(decision);
+  }, [
+    gameId,
+    boostInputContext.active,
+    boostInputContext.canActivate,
+    boostInputContext.interactionActive,
+    boostInputContext.gameOver,
+    sendBoostDecision,
+  ]);
+
+  const boostButtonDisabled = !boostHud || boostHud.buttonDisabled;
   
   const convertLobbyModeToGameType = (mode: LobbyGameMode): GameType => {
     switch (mode) {
@@ -601,8 +1037,8 @@ export default function GameArena() {
 
   // Handle back to menu
   const handleBackToMenu = () => {
-    // Leave the game first, then navigate
-    leaveGame();
+    // Keep the stop ordered before LeaveGame clears the command channel.
+    teardownGameSession();
     navigate('/');
   };
 
@@ -658,125 +1094,197 @@ export default function GameArena() {
 
   const showAuthLoading = authLoading || !user;
 
+  const boostControl = boostConfig && localSnake && boostHud && !gameOver ? (
+    <div
+      className={`game-boost-hud${isArenaVisible ? ' is-visible' : ''}${boostHud.active ? ' is-active' : ''}${boostHud.ready ? ' is-ready' : ''}`}
+      data-testid="boost-hud"
+      data-location="arena-bottom"
+      data-ready={boostHud.ready ? 'true' : 'false'}
+    >
+      <span
+        className="game-boost-meter__track"
+        role="progressbar"
+        aria-label="Stored Boost charge"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={boostHud.percent}
+        aria-valuetext={`${boostHud.percent}%${boostHud.active ? ', active' : ''}`}
+      >
+        <span
+          className="game-boost-meter__fill"
+          style={{ transform: `scaleX(${boostHud.fillRatio})` }}
+        />
+      </span>
+      <button
+        type="button"
+        onClick={handleBoostButtonPress}
+        onKeyDown={handleBoostControlKeyDown}
+        onPointerDown={handleBoostPointerDown}
+        onPointerUp={handleBoostPointerRelease}
+        onPointerCancel={handleBoostPointerRelease}
+        onLostPointerCapture={handleBoostPointerRelease}
+        disabled={boostButtonDisabled}
+        aria-label={boostInputMode === 'hold'
+          ? (boostHud.active
+              ? `Release Boost, ${boostHud.percent}% remaining`
+              : `Hold to Boost, ${boostHud.percent}% charged`)
+          : (boostHud.active
+              ? `Stop Boost, ${boostHud.percent}% remaining`
+              : `Activate Boost, ${boostHud.percent}% charged`)}
+        aria-keyshortcuts="Space"
+        className="game-boost-meter"
+        data-testid="boost-button"
+      >
+        <span className="game-boost-meter__canister-dock" aria-hidden="true">
+          <BoostCanisterMark />
+        </span>
+        <span className="game-boost-meter__reservoir" aria-hidden="true" />
+        <strong className="game-boost-meter__value">
+          {boostHud.percent}%
+        </strong>
+      </button>
+    </div>
+  ) : null;
+
   if (showAuthLoading) {
     return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please sign in to play'} />;
   }
   
   return (
-    <div className="fixed inset-0 flex flex-col overflow-hidden">
+    <div className="game-arena-screen fixed inset-0 flex flex-col overflow-hidden">
 
       <>
-        {/* Scoreboard */}
-        <Scoreboard
+        <GameHudShell
           gameState={committedState}
           isVisible={isArenaVisible}
+          arenaWidth={panelSize.width}
           currentUserId={user?.id}
-          showGameOver={showGameOverPanel}
-          onBackToMenu={handleBackToMenu}
-          onPlayAgain={handlePlayAgain}
-          isLobbyQueued={isLobbyQueued}
           queueMode={queueMode}
+          onMenu={handleBackToMenu}
+          onPlayAgain={handlePlayAgain}
+          playAgainDisabled={isLobbyQueued}
+          utilityHost={hudUtilityHost}
         />
 
         {/* Game Arena Container */}
-        <div className="flex-1 flex flex-col items-center justify-center p-4" style={{ paddingTop: '120px', paddingBottom: '40px' }}>
+        <div
+          className="game-arena-stage flex-1 flex flex-col items-center justify-center p-4"
+          style={{ '--game-arena-panel-width': `${panelSize.width}px` } as React.CSSProperties}
+        >
+          <div
+            ref={setHudUtilityHost}
+            className="game-arena-utility-anchor"
+            style={{ width: `${panelSize.width}px` }}
+            data-testid="game-arena-utility-anchor"
+          />
           {/* Game Canvas */}
           <div
-            className={`panel game-arena-panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
-              isArenaVisible ? 'opacity-100' : 'opacity-0'
-            }`}
-            ref={containerRef}
-            style={{
-              width: `${panelSize.width}px`,
-              height: `${panelSize.height}px`,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              position: 'relative'
-            }}
+            className={`game-arena-frame${boostControl ? ' has-boost-indicator' : ''}`}
+            style={{ width: `${panelSize.width}px` }}
           >
-            <canvas
-              ref={canvasRef}
-              width={canvasSize.width}
-              height={canvasSize.height}
-              className="bg-white block"
+            <div
+              className={`panel game-arena-panel bg-white overflow-hidden transition-opacity duration-400 ease-out ${
+                isArenaVisible ? 'opacity-100' : 'opacity-0'
+              }`}
+              ref={containerRef}
               style={{
-                border: 'none'
+                width: '100%',
+                height: `${panelSize.height}px`,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                position: 'relative'
               }}
-            />
-            {currentGameLoadFailure && (
-              <div
-                className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-30 px-6 text-center"
-                role="alert"
-                data-testid="game-load-failure"
-              >
-                <h2 className="text-xl font-black italic uppercase tracking-1 text-black-70 mb-3">
-                  Game unavailable
-                </h2>
-                <p className="text-sm text-gray-600 max-w-md mb-6">
-                  {currentGameLoadFailure.reason}
-                </p>
-                <div className="flex flex-wrap items-center justify-center gap-3">
-                  {routeGameId !== null && (
+            >
+              <canvas
+                ref={canvasRef}
+                width={canvasSize.width}
+                height={canvasSize.height}
+                className="bg-white block"
+                style={{
+                  border: 'none'
+                }}
+              />
+              {currentGameLoadFailure && (
+                <div
+                  className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-30 px-6 text-center"
+                  role="alert"
+                  data-testid="game-load-failure"
+                >
+                  <h2 className="text-xl font-black italic uppercase tracking-1 text-black-70 mb-3">
+                    Game unavailable
+                  </h2>
+                  <p className="text-sm text-gray-600 max-w-md mb-6">
+                    {currentGameLoadFailure.reason}
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    {routeGameId !== null && (
+                      <button
+                        type="button"
+                        onClick={handleRetryGameLoad}
+                        disabled={!connected || !isSessionAuthenticated}
+                        className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-black text-white hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        Retry
+                      </button>
+                    )}
                     <button
                       type="button"
-                      onClick={handleRetryGameLoad}
-                      disabled={!connected || !isSessionAuthenticated}
-                      className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-black text-white hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      onClick={handleBackToMenu}
+                      className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-white text-black hover:bg-gray-100 transition-colors"
                     >
-                      Retry
+                      Back to menu
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleBackToMenu}
-                    className="px-5 py-2 text-sm border-2 border-black font-bold uppercase bg-white text-black hover:bg-gray-100 transition-colors"
-                  >
-                    Back to menu
-                  </button>
+                  </div>
                 </div>
-              </div>
-            )}
-            {isWaitingForSnapshot && !currentGameLoadFailure && (
-              <div
-                className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-20"
-                data-testid="game-snapshot-loading"
-              >
-                <span className="w-6 h-6 border-2 border-gray-300 border-t-black rounded-full animate-spin mb-3" aria-hidden="true" />
-                <span className="text-gray-600 font-semibold uppercase tracking-1 text-xs">
-                  {waitingMessage}
-                </span>
-              </div>
-            )}
+              )}
+              {isWaitingForSnapshot && !currentGameLoadFailure && (
+                <div
+                  className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-20"
+                  data-testid="game-snapshot-loading"
+                >
+                  <span className="w-6 h-6 border-2 border-gray-300 border-t-black rounded-full animate-spin mb-3" aria-hidden="true" />
+                  <span className="text-gray-600 font-semibold uppercase tracking-1 text-xs">
+                    {waitingMessage}
+                  </span>
+                </div>
+              )}
             
-            {/* Connection watchdog overlay: prediction is frozen by the engine
-                while server messages are missing; explain the freeze */}
-            {connectionStale && !gameOver && (
-              <div className="absolute inset-0 flex items-center justify-center bg-white/85 z-30">
-                <span className="text-black font-black italic uppercase tracking-1 text-xl text-center px-4">
-                  CONNECTION LOST — RESYNCING
-                </span>
-              </div>
-            )}
+              {/* Connection watchdog overlay: prediction is frozen by the engine
+                  while server messages are missing; explain the freeze */}
+              {connectionStale && !gameOver && (
+                <div className="absolute inset-0 flex items-center justify-center bg-white/85 z-30">
+                  <span className="text-black font-black italic uppercase tracking-1 text-xl text-center px-4">
+                    CONNECTION LOST — RESYNCING
+                  </span>
+                </div>
+              )}
 
-            {/* Countdown Overlay */}
-            {showCountdown && countdownState && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
-                <div className="text-white font-bold text-3xl mb-4" style={{
-                  textShadow: '0 2px 4px rgba(0,0,0,0.5)'
-                }}>
-                  Starting In
+              {/* Countdown Overlay */}
+              {showCountdown && countdownState && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
+                  <div className="text-white font-bold text-3xl mb-4" style={{
+                    textShadow: '0 2px 4px rgba(0,0,0,0.5)'
+                  }}>
+                    Starting In
+                  </div>
+                  <div className="text-white font-black italic uppercase" style={{
+                    fontSize: '120px',
+                    textShadow: '0 4px 8px rgba(0,0,0,0.5)',
+                    letterSpacing: '0.05em'
+                  }}>
+                    {countdownSeconds}
+                  </div>
                 </div>
-                <div className="text-white font-black italic uppercase" style={{
-                  fontSize: '120px',
-                  textShadow: '0 4px 8px rgba(0,0,0,0.5)',
-                  letterSpacing: '0.05em'
-                }}>
-                  {countdownSeconds}
-                </div>
-              </div>
-            )}
+              )}
+            </div>
+            {boostControl}
           </div>
+          <GameControlsHint
+            showBoost={Boolean(boostConfig)}
+            boostInputMode={boostInputMode}
+            onBoostInputModeChange={handleBoostInputModeChange}
+          />
         </div>
 
       </>

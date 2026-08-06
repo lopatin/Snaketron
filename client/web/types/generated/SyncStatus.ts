@@ -5,44 +5,44 @@
  * message. Exposed to the UI so it can detect divergence (hash mismatches),
  * message loss (stream gaps), and trigger a resync instead of drifting.
  */
-export type SyncStatus = { 
+export type SyncStatus = {
 /**
  * Last transport sequence seen (0 = none yet).
  */
-last_stream_seq: number, 
+last_stream_seq: number,
 /**
  * Number of distinct gap incidents observed.
  */
-stream_gap_count: number, 
+stream_gap_count: number,
 /**
  * Total messages known to have been missed.
  */
-missed_messages: number, 
+missed_messages: number,
 /**
  * Stale/duplicate messages skipped instead of double-applied.
  */
-stale_messages_skipped: number, 
+stale_messages_skipped: number,
 /**
  * Tick of the last server fingerprint probe processed.
  */
-last_probe_tick: number | null, 
+last_probe_tick: number | null,
 /**
  * Whether the last probe matched our committed state.
  */
-last_probe_matched: boolean | null, consecutive_hash_mismatches: number, total_probes: number, total_mismatches: number, 
+last_probe_matched: boolean | null, consecutive_hash_mismatches: number, total_probes: number, total_mismatches: number,
 /**
  * First tick at which a hash mismatch was observed (for RCA).
  */
-first_mismatch_tick: number | null, 
+first_mismatch_tick: number | null,
 /**
  * Set when a gap or repeated mismatch means the client should request a
  * fresh snapshot. Cleared automatically when a snapshot is applied.
  */
-needs_resync: boolean, 
+needs_resync: boolean,
 /**
  * Highest tick seen in any server message (liveness reference).
  */
-last_server_tick: number, 
+last_server_tick: number,
 /**
  * Server wall-clock from the last TickHash heartbeat (clock reference).
  */
