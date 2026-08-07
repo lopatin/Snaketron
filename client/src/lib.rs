@@ -329,9 +329,9 @@ impl GameClient {
     }
 
     /// Render the engine's current predicted state directly to a canvas — no
-    /// JSON round-trip. Replaces the free `render_game(json, ...)` export, which
-    /// re-parsed the engine's own state from a string into `serde_json::Value`
-    /// every frame.
+    /// JSON round-trip. `draw_celebration` is invoked after the field and pickups
+    /// but before snakes, so JavaScript-owned cosmetic effects can share this
+    /// canvas without covering gameplay actors.
     #[wasm_bindgen(js_name = render)]
     pub fn render(
         &self,
@@ -339,6 +339,7 @@ impl GameClient {
         cell_size: f64,
         rotation: f64,
         local_user_id: Option<u32>,
+        draw_celebration: &js_sys::Function,
     ) -> Result<(), JsValue> {
         render::render_game_state(
             self.render_state(),
@@ -346,6 +347,7 @@ impl GameClient {
             cell_size,
             local_user_id,
             rotation as i32,
+            draw_celebration,
         )
     }
 }

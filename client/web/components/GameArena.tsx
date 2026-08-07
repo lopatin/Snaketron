@@ -597,10 +597,10 @@ export default function GameArena() {
   // Rust via renderTo -> GameClient.render, so there is no per-frame JSON
   // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
   // usernames and teams are resolved inside the renderer from the typed state.
-  // Cosmetic effects are painted immediately afterwards in this same loop
-  // because the Rust renderer clears the canvas at the start of each frame.
-  // Rust currently paints field and snakes atomically, so the restrained cell
-  // wave overlays that complete frame; crash effects remain the topmost layer.
+  // The Rust renderer clears the canvas at the start of each frame, paints the
+  // field, invokes our score-effect callback, and then paints snakes and walls.
+  // This keeps celebrations behind gameplay actors while crash effects remain
+  // the intentionally topmost layer.
   //
   // Both crash and score cues are driven from the same predicted visual state,
   // read here rather than from React committed state, so a celebration starts
@@ -622,7 +622,6 @@ export default function GameArena() {
     let animationId = 0;
     const render = (now: number) => {
       try {
-        renderTo(canvas, cellSize, rotation, user?.id ?? undefined);
         const visualSnapshot = readPredictedVisualState();
         if (visualSnapshot) {
           // Suppress durable history only on this arena's first snapshot. On a
@@ -655,15 +654,23 @@ export default function GameArena() {
             lastVisualJsonRef.current = visualSnapshot.json;
           }
         }
-        drawScoreEffects(context, scoreEffectsRef.current, {
-          nowMs: now,
+        renderTo(
+          canvas,
           cellSize,
-          arenaWidth: renderArenaWidth,
-          arenaHeight: renderArenaHeight,
           rotation,
-          localTeamId: renderLocalTeamId,
-          reducedMotion: prefersReducedMotionRef.current,
-        });
+          user?.id ?? undefined,
+          () => {
+            drawScoreEffects(context, scoreEffectsRef.current, {
+              nowMs: now,
+              cellSize,
+              arenaWidth: renderArenaWidth,
+              arenaHeight: renderArenaHeight,
+              rotation,
+              localTeamId: renderLocalTeamId,
+              reducedMotion: prefersReducedMotionRef.current,
+            });
+          },
+        );
         drawCrashExplosions(
           context,
           crashExplosionSpriteRef.current,

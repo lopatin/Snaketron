@@ -22,8 +22,14 @@ interface UseGameEngineReturn {
   connectionStale: boolean;
   sendCommand: (command: Command) => void;
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
-  /** Render the engine's current predicted state to a canvas (no JSON round-trip). */
-  renderTo: (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => void;
+  /** Render predicted state, injecting score effects between field and snakes. */
+  renderTo: (
+    canvas: HTMLCanvasElement,
+    cellSize: number,
+    rotation: number,
+    localUserId: number | undefined,
+    drawCelebration: () => void,
+  ) => void;
   /** Read compact crash and goal history from the same predicted state used by renderTo. */
   readPredictedVisualState: () => {
     engineEpoch: number;
@@ -312,8 +318,20 @@ export const useGameEngine = ({
   // engineRef, so it always targets the current GameClient even after a
   // snapshot rebuild swaps the instance; no-ops until the engine exists.
   const renderTo = useCallback(
-    (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => {
-      engineRef.current?.render(canvas, cellSize, rotation, localUserId);
+    (
+      canvas: HTMLCanvasElement,
+      cellSize: number,
+      rotation: number,
+      localUserId: number | undefined,
+      drawCelebration: () => void,
+    ) => {
+      engineRef.current?.render(
+        canvas,
+        cellSize,
+        rotation,
+        localUserId,
+        drawCelebration,
+      );
     },
     [],
   );

@@ -450,7 +450,7 @@ test('even the largest goal keeps the wave bounded and off the whole arena', () 
   )));
 });
 
-test('the points readout rises from the scoring cell, fades out, and outlives the wave', () => {
+test('the points readout rises beside the scoring cell, fades, and outlives the wave', () => {
   const frame = {
     cellSize: 10,
     arenaWidth: 60,
@@ -462,9 +462,11 @@ test('the points readout rises from the scoring cell, fades out, and outlives th
   const start = sampleScoreReadout(activation, { ...frame, nowMs: 1_000 });
   assert.ok(start);
   assert.equal(start.text, '+12');
-  // Origin (9, 12) with a 10px cell and 1px canvas padding.
-  assert.equal(start.centerX, 96);
-  assert.equal(start.centerY, 126);
+  // Origin (9, 12) with a 10px cell and 1px canvas padding. The wave
+  // remains centered at (96, 126), while the readout starts field-side of
+  // team zero's left goal and away from the crossing and respawn lanes.
+  assert.ok(start.centerX > 96 + frame.cellSize / 2);
+  assert.ok(start.centerY < 126 - frame.cellSize / 2);
   assert.equal(start.opacity, 1, 'a goal must never lose a frame to a fade-in');
   assert.ok(start.scale < 1, 'and pops in from a smaller scale instead');
 
@@ -513,7 +515,7 @@ test('the points readout rises from the scoring cell, fades out, and outlives th
   );
 });
 
-test('the readout follows the rotated cell and stays inside the canvas', () => {
+test('the readout follows the rotated goal mouth and stays inside the canvas', () => {
   const topEdge: ScoreEffectActivation = {
     ...activation,
     origin: { x: 9, y: 0 },
@@ -528,9 +530,15 @@ test('the readout follows the rotated cell and stays inside the canvas', () => {
   });
 
   assert.ok(readout);
-  assert.ok(readout.centerY >= (readout.fontSize * readout.scale) / 2 - 1e-9);
+  const paintedHalfHeight =
+    (readout.fontSize * readout.scale) / 2 +
+    (Math.max(2, readout.fontSize * 0.18) * readout.scale) / 2;
+  assert.ok(readout.centerY >= paintedHalfHeight - 1e-9);
 
   // Rotated 90°, cell (9, 12) renders at (27, 9) on a 40x60 cell canvas.
+  // The goal mouth is horizontal in this view. This crossing is right of its
+  // centre respawn lane, so the readout moves farther right and above the wall
+  // while the wave stays on the crossing cell.
   const rotated = sampleScoreReadout(activation, {
     nowMs: 1_000,
     cellSize: 10,
@@ -540,8 +548,263 @@ test('the readout follows the rotated cell and stays inside the canvas', () => {
     reducedMotion: false,
   });
   assert.ok(rotated);
-  assert.equal(rotated.centerX, 1 + 27 * 10 + 5);
-  assert.equal(rotated.centerY, 1 + 9 * 10 + 5);
+  assert.ok(rotated.centerX > 1 + 28 * 10);
+  assert.ok(rotated.centerY < 1 + 9 * 10);
+});
+
+test('readouts clear boosted crossings, entry elbows, respawns, and walls everywhere', () => {
+  const arenaWidth = 60;
+  const arenaHeight = 40;
+  const canvasPadding = 1;
+  const wallHalfWidth = 1.5;
+  const goalWidth = 9;
+  const goalMouthStart = Math.floor(arenaHeight / 2 - goalWidth / 2);
+  const goalMouthEnd = Math.ceil(arenaHeight / 2 + goalWidth / 2);
+  const goalRows = Array.from(
+    { length: goalMouthEnd - goalMouthStart - 1 },
+    (_, index) => goalMouthStart + 1 + index,
+  );
+  const respawnLanes = [19, 20, 21] as const;
+  const rectanglesOverlap = (
+    left: number,
+    top: number,
+    right: number,
+    bottom: number,
+    wall: { left: number; top: number; right: number; bottom: number },
+  ): boolean => (
+    left < wall.right && right > wall.left &&
+    top < wall.bottom && bottom > wall.top
+  );
+
+  for (const cellSize of [5, 10, 15]) {
+    for (const points of [1, 4, 12]) {
+      for (const teamId of [0, 1]) {
+        const goalX = teamId === 0 ? 9 : 50;
+        const baseDirection = teamId === 0 ? -1 : 1;
+        const fieldDirection = -baseDirection;
+
+        for (const goalY of goalRows) {
+          const goal: ScoreEffectActivation = {
+            ...activation,
+            eventId: `goal-${teamId}-${goalY}-${points}`,
+            teamId,
+            points,
+            origin: { x: goalX, y: goalY },
+          };
+
+          for (const rotation of [0, 90, 180, 270] as const) {
+            const verticalArena = rotation === 90 || rotation === 270;
+            const screenColumns = verticalArena ? arenaHeight : arenaWidth;
+            const screenRows = verticalArena ? arenaWidth : arenaHeight;
+            const canvasCenterX =
+              (canvasPadding * 2 + screenColumns * cellSize) / 2;
+            const canvasCenterY =
+              (canvasPadding * 2 + screenRows * cellSize) / 2;
+            const transformed = transformScoreEffectPosition(
+              goal.origin,
+              arenaWidth,
+              arenaHeight,
+              rotation,
+            );
+            const fieldNeighbor = transformScoreEffectPosition(
+              { x: goalX + fieldDirection, y: goalY },
+              arenaWidth,
+              arenaHeight,
+              rotation,
+            );
+            const waveCenterX =
+              canvasPadding + transformed.x * cellSize + cellSize / 2;
+            const waveCenterY =
+              canvasPadding + transformed.y * cellSize + cellSize / 2;
+            const fieldDirectionX = fieldNeighbor.x - transformed.x;
+            const fieldDirectionY = fieldNeighbor.y - transformed.y;
+            const wallCenterX = waveCenterX + fieldDirectionX * cellSize / 2;
+            const wallCenterY = waveCenterY + fieldDirectionY * cellSize / 2;
+            const walls = verticalArena
+              ? [
+                {
+                  left: canvasPadding,
+                  top: wallCenterY - wallHalfWidth,
+                  right: canvasPadding + goalMouthStart * cellSize,
+                  bottom: wallCenterY + wallHalfWidth,
+                },
+                {
+                  left: canvasPadding + goalMouthEnd * cellSize,
+                  top: wallCenterY - wallHalfWidth,
+                  right: canvasPadding + screenColumns * cellSize,
+                  bottom: wallCenterY + wallHalfWidth,
+                },
+              ]
+              : [
+                {
+                  left: wallCenterX - wallHalfWidth,
+                  top: canvasPadding,
+                  right: wallCenterX + wallHalfWidth,
+                  bottom: canvasPadding + goalMouthStart * cellSize,
+                },
+                {
+                  left: wallCenterX - wallHalfWidth,
+                  top: canvasPadding + goalMouthEnd * cellSize,
+                  right: wallCenterX + wallHalfWidth,
+                  bottom: canvasPadding + screenRows * cellSize,
+                },
+              ];
+
+            for (const reducedMotion of [false, true]) {
+              const sampleTimes = reducedMotion
+                ? [1_000, 1_300, 1_599]
+                : [1_000, 1_168, 1_300, 1_660, 1_950, 2_199];
+              for (const nowMs of sampleTimes) {
+                const readout = sampleScoreReadout(goal, {
+                  nowMs,
+                  cellSize,
+                  arenaWidth,
+                  arenaHeight,
+                  rotation,
+                  reducedMotion,
+                });
+                assert.ok(readout);
+
+                const strokeHalfWidth =
+                  (Math.max(2, readout.fontSize * 0.18) * readout.scale) / 2;
+                const paintedHalfWidth =
+                  (readout.fontSize * readout.scale * 0.62 * readout.text.length) / 2 +
+                  strokeHalfWidth;
+                const paintedHalfHeight =
+                  (readout.fontSize * readout.scale) / 2 + strokeHalfWidth;
+                const readoutLeft = readout.centerX - paintedHalfWidth;
+                const readoutRight = readout.centerX + paintedHalfWidth;
+                const readoutTop = readout.centerY - paintedHalfHeight;
+                const readoutBottom = readout.centerY + paintedHalfHeight;
+                // The scoring cue can exist while movement-only prediction
+                // still paints the old Boost-active snake. Its yellow outline
+                // extends three pixels beyond the ordinary half-cell body.
+                const boostedSnakeRadius = cellSize / 2 + 3;
+                const overlapsSnakeAt = (centerX: number, centerY: number): boolean => (
+                  Math.abs(readout.centerX - centerX) <
+                    paintedHalfWidth + boostedSnakeRadius &&
+                  Math.abs(readout.centerY - centerY) <
+                    paintedHalfHeight + boostedSnakeRadius
+                );
+
+                // Prediction can paint the old scoring snake for the same
+                // frame as its cue. Check the head and a straight four-cell
+                // trailing body in the field; perpendicular placement means
+                // the guarantee does not depend on how long that run is.
+                for (let depth = 0; depth <= 4; depth += 1) {
+                  const crossingBody = transformScoreEffectPosition(
+                    { x: goalX + fieldDirection * depth, y: goalY },
+                    arenaWidth,
+                    arenaHeight,
+                    rotation,
+                  );
+                  const crossingCenterX =
+                    canvasPadding + crossingBody.x * cellSize + cellSize / 2;
+                  const crossingCenterY =
+                    canvasPadding + crossingBody.y * cellSize + cellSize / 2;
+                  assert.equal(
+                    overlapsSnakeAt(crossingCenterX, crossingCenterY),
+                    false,
+                    `crossing body overlap: depth ${depth}, cell ${cellSize}, +${points}, team ${teamId}, row ${goalY}, ${rotation}°`,
+                  );
+                }
+
+                // A snake can turn on the field-neighbour cell immediately
+                // before entering the goal. Check both possible goal-mouth
+                // directions through the full arena; entry-axis clearance
+                // must keep that elbow run away from the readout as well.
+                for (let elbowY = 0; elbowY < arenaHeight; elbowY += 1) {
+                  const elbowBody = transformScoreEffectPosition(
+                    { x: goalX + fieldDirection, y: elbowY },
+                    arenaWidth,
+                    arenaHeight,
+                    rotation,
+                  );
+                  const elbowCenterX =
+                    canvasPadding + elbowBody.x * cellSize + cellSize / 2;
+                  const elbowCenterY =
+                    canvasPadding + elbowBody.y * cellSize + cellSize / 2;
+                  assert.equal(
+                    overlapsSnakeAt(elbowCenterX, elbowCenterY),
+                    false,
+                    `entry elbow overlap: y ${elbowY}, cell ${cellSize}, +${points}, team ${teamId}, row ${goalY}, ${rotation}°`,
+                  );
+                }
+
+                // Ranked 2v2 uses lanes 19 and 21; duel uses lane 20. Check
+                // every segment in the four-cell starting body for all three.
+                for (const lane of respawnLanes) {
+                  for (let depth = 1; depth <= 4; depth += 1) {
+                    const respawned = transformScoreEffectPosition(
+                      { x: goalX + baseDirection * depth, y: lane },
+                      arenaWidth,
+                      arenaHeight,
+                      rotation,
+                    );
+                    const respawnCenterX =
+                      canvasPadding + respawned.x * cellSize + cellSize / 2;
+                    const respawnCenterY =
+                      canvasPadding + respawned.y * cellSize + cellSize / 2;
+                    assert.equal(
+                      overlapsSnakeAt(respawnCenterX, respawnCenterY),
+                      false,
+                      `respawn overlap: lane ${lane}, depth ${depth}, cell ${cellSize}, +${points}, team ${teamId}, row ${goalY}, ${rotation}°`,
+                    );
+                  }
+                }
+
+                for (const wall of walls) {
+                  assert.equal(
+                    rectanglesOverlap(
+                      readoutLeft,
+                      readoutTop,
+                      readoutRight,
+                      readoutBottom,
+                      wall,
+                    ),
+                    false,
+                    `wall overlap: cell ${cellSize}, +${points}, team ${teamId}, row ${goalY}, ${rotation}°`,
+                  );
+                }
+              }
+            }
+
+            const start = sampleScoreReadout(goal, {
+              nowMs: 1_000,
+              cellSize,
+              arenaWidth,
+              arenaHeight,
+              rotation,
+              reducedMotion: false,
+            });
+            assert.ok(start);
+            if (verticalArena) {
+              assert.ok(start.centerY < waveCenterY);
+              assert.ok(
+                Math.abs(start.centerX - canvasCenterX) >
+                  Math.abs(waveCenterX - canvasCenterX),
+                'horizontal goals offset away from every centre respawn lane',
+              );
+            } else {
+              assert.equal(
+                Math.sign(start.centerX - waveCenterX),
+                fieldDirectionX,
+              );
+              assert.equal(
+                Math.sign(start.centerY - waveCenterY),
+                Math.sign(waveCenterY - canvasCenterY),
+              );
+              assert.ok(
+                Math.abs(start.centerY - canvasCenterY) >
+                  Math.abs(waveCenterY - canvasCenterY),
+                'side goals offset away from every centre respawn lane',
+              );
+            }
+          }
+        }
+      }
+    }
+  }
 });
 
 test('reduced motion holds the readout in place and shortens the celebration', () => {
@@ -647,8 +910,75 @@ test('the default renderer paints rotated inset cells and a stroked readout', ()
     getScoreEffectTeamColor(0, 0),
     'the readout must be darker than the wave to stay legible on a tinted end zone',
   );
-  assert.equal(saves, 2);
-  assert.equal(restores, 2);
+  assert.equal(saves, 3);
+  assert.equal(restores, 3);
+});
+
+test('a failing cosmetic renderer is contained and later effects still draw', () => {
+  const failure = new Error('paint failed');
+  const rendered: string[] = [];
+  let globalCompositeOperation = 'source-over';
+  const compositeStack: string[] = [];
+  const context = {
+    get globalCompositeOperation() { return globalCompositeOperation; },
+    set globalCompositeOperation(value: string) { globalCompositeOperation = value; },
+    save() { compositeStack.push(globalCompositeOperation); },
+    restore() {
+      const restored = compositeStack.pop();
+      if (restored !== undefined) globalCompositeOperation = restored;
+    },
+  } as unknown as CanvasRenderingContext2D;
+  const failingRenderer: ScoreEffectRenderer = {
+    id: 'failing-flash',
+    durationMs: 1_200,
+    reducedMotionDurationMs: 600,
+    draw(renderContext) {
+      renderContext.globalCompositeOperation = 'destination-out';
+      throw failure;
+    },
+  };
+  const healthyRenderer: ScoreEffectRenderer = {
+    id: 'healthy-flash',
+    durationMs: 1_200,
+    reducedMotionDurationMs: 600,
+    draw(renderContext) {
+      rendered.push(renderContext.globalCompositeOperation);
+    },
+  };
+  const registry = createScoreEffectRegistry([failingRenderer, healthyRenderer]);
+  const runtime = createScoreEffectRuntime();
+  runtime.active.push(
+    { ...activation, effectId: failingRenderer.id },
+    { ...activation, eventId: 'second-goal', effectId: healthyRenderer.id },
+  );
+
+  const originalConsoleError = console.error;
+  const errors: unknown[][] = [];
+  console.error = (...args: unknown[]) => { errors.push(args); };
+  try {
+    assert.doesNotThrow(() => drawScoreEffects(
+      context,
+      runtime,
+      {
+        nowMs: 1_000,
+        cellSize: 10,
+        arenaWidth: 60,
+        arenaHeight: 40,
+        rotation: 0,
+        localTeamId: 0,
+        reducedMotion: false,
+      },
+      registry,
+    ));
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.deepEqual(rendered, ['source-over']);
+  assert.equal(context.globalCompositeOperation, 'source-over');
+  assert.deepEqual(compositeStack, []);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][1], failure);
 });
 
 test('the registry supports a swapped renderer and owns lifecycle expiry', () => {

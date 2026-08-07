@@ -33,6 +33,24 @@ const READOUT_RISE_CELLS = 3.4;
 const READOUT_MIN_FONT_PX = 14;
 const READOUT_MAX_FONT_PX = 62;
 const READOUT_FONT_CELL_FRACTION = 2.4;
+const READOUT_INITIAL_SCALE = 0.55;
+const READOUT_POP_GAIN = 0.62;
+const READOUT_SETTLE = 0.17;
+const READOUT_PEAK_SCALE = READOUT_INITIAL_SCALE + READOUT_POP_GAIN;
+// The score sits beside the scoring snake rather than on top of it. Half a
+// cell clears the snake itself; the remaining gap accommodates the italic
+// face's overhang and keeps the two silhouettes visually distinct.
+const READOUT_SNAKE_RADIUS_CELLS = 0.5;
+const READOUT_SNAKE_GAP_CELLS = 0.35;
+// The head has already entered the scoring cell when its cue is recorded, so
+// its guaranteed neck is one field-facing cell away. Clearing that cell along
+// the entry axis also clears a perpendicular body run that turns at the neck.
+const READOUT_CROSSING_NECK_CELLS = 1;
+// Mirrors the active snake's outer Boost layer (`BOOST_OUTER_EXTRA / 2`).
+const READOUT_BOOST_OUTLINE_PX = 3;
+// A 2v2 goal of width nine respawns its two snakes one row either side of
+// centre. Reserve that entire lane band along the goal mouth in every view.
+const READOUT_2V2_RESPAWN_LANE_SPREAD_CELLS = 1;
 
 /**
  * Points at which a goal renders at its nominal size. Goals worth less are
@@ -421,10 +439,12 @@ export const sampleScoreWaveCells = (
 };
 
 /**
- * The floating points readout: it pops in over the cell the goal was scored
- * on, rises, and fades. Sampled purely from the activation timestamp so the
- * renderer and its tests agree exactly, and clamped to the canvas so a goal
- * near an edge still shows its number.
+ * The floating points readout: it pops in beside the cell where the goal was
+ * scored, rises, and fades. Side-goal readouts sit field-side of the crossing;
+ * top/bottom readouts sit above the boundary and away from the respawn lane.
+ * The circular wave stays centered on the exact crossing cell. Sampled purely
+ * from the activation timestamp so the renderer and its tests agree exactly,
+ * and clamped to the canvas so a goal near an edge still shows its number.
  */
 export const sampleScoreReadout = (
   activation: ScoreEffectActivation,
@@ -486,36 +506,84 @@ export const sampleScoreReadout = (
     : frame.cellSize * READOUT_RISE_CELLS * progress;
   const scale = frame.reducedMotion
     ? 1
-    : 0.55 +
-      0.62 * smoothstep(0, 0.14, progress) -
-      0.17 * smoothstep(0.14, 0.4, progress);
+    : READOUT_INITIAL_SCALE +
+      READOUT_POP_GAIN * smoothstep(0, 0.14, progress) -
+      READOUT_SETTLE * smoothstep(0.14, 0.4, progress);
 
   const text = `+${activation.points}`;
-  const halfWidth =
-    (fontSize * scale * READOUT_GLYPH_ADVANCE_EM * text.length) / 2;
-  const halfHeight = (fontSize * scale) / 2;
+  const peakHalfWidth =
+    (fontSize * READOUT_PEAK_SCALE * READOUT_GLYPH_ADVANCE_EM * text.length) / 2;
+  const peakHalfHeight = (fontSize * READOUT_PEAK_SCALE) / 2;
+  const peakStrokeHalfWidth =
+    (Math.max(2, fontSize * 0.18) * READOUT_PEAK_SCALE) / 2;
+  const peakPaintedHalfWidth = peakHalfWidth + peakStrokeHalfWidth;
+  const peakPaintedHalfHeight = peakHalfHeight + peakStrokeHalfWidth;
   const canvasWidth = CANVAS_PADDING_PX * 2 + screenColumns * frame.cellSize;
   const canvasHeight = CANVAS_PADDING_PX * 2 + screenRows * frame.cellSize;
 
-  const rawCenterX =
+  const waveCenterX =
     CANVAS_PADDING_PX + transformed.x * frame.cellSize + frame.cellSize / 2;
-  const rawCenterY =
+  const waveCenterY =
     CANVAS_PADDING_PX +
     transformed.y * frame.cellSize +
-    frame.cellSize / 2 -
-    rise;
+    frame.cellSize / 2;
+
+  // A score immediately respawns its snake one cell inside the base, while a
+  // predicted cue can still be painted over the scoring snake's old crossing
+  // body. Put the number diagonally beside both: field-facing to clear the
+  // goal wall, and away from the centre lanes along the goal mouth. For a
+  // downward goal-mouth offset, reserve the entire future rise as well so the
+  // number never drifts back through the snake on its way up.
+  const goalMouthIsHorizontal = frame.rotation === 90 || frame.rotation === 270;
+  const offsetDirectionX = goalMouthIsHorizontal
+    ? waveCenterX < canvasWidth / 2
+      ? -1
+      : waveCenterX > canvasWidth / 2
+        ? 1
+        : activation.teamId === 0 ? -1 : 1
+    : frame.rotation === 180
+      ? activation.teamId === 0 ? -1 : 1
+      : activation.teamId === 0 ? 1 : -1;
+  const snakeClearance =
+    frame.cellSize * (READOUT_SNAKE_RADIUS_CELLS + READOUT_SNAKE_GAP_CELLS) +
+    READOUT_BOOST_OUTLINE_PX;
+  const respawnLaneClearance =
+    frame.cellSize * READOUT_2V2_RESPAWN_LANE_SPREAD_CELLS;
+  const entryAxisClearance = snakeClearance +
+    frame.cellSize * READOUT_CROSSING_NECK_CELLS;
+  const offset = peakPaintedHalfWidth +
+    (goalMouthIsHorizontal
+      ? snakeClearance + respawnLaneClearance
+      : entryAxisClearance);
+  const horizontalGoalVerticalOffset = goalMouthIsHorizontal
+    ? peakPaintedHalfHeight + entryAxisClearance
+    : 0;
+  const sideGoalDirectionY = waveCenterY < canvasHeight / 2
+    ? -1
+    : waveCenterY > canvasHeight / 2
+      ? 1
+      : activation.teamId === 0 ? -1 : 1;
+  const maximumRise = frame.reducedMotion ? 0 : frame.cellSize * READOUT_RISE_CELLS;
+  const sideGoalVerticalOffset = !goalMouthIsHorizontal
+    ? peakPaintedHalfHeight + snakeClearance + respawnLaneClearance +
+      (sideGoalDirectionY > 0 ? maximumRise : 0)
+    : 0;
+  const rawCenterX = waveCenterX + offsetDirectionX * offset;
+  const rawCenterY = goalMouthIsHorizontal
+    ? waveCenterY - horizontalGoalVerticalOffset - rise
+    : waveCenterY + sideGoalDirectionY * sideGoalVerticalOffset - rise;
 
   return {
     text,
     centerX: clamp(
       rawCenterX,
-      Math.min(halfWidth, canvasWidth / 2),
-      Math.max(canvasWidth - halfWidth, canvasWidth / 2),
+      Math.min(peakPaintedHalfWidth, canvasWidth / 2),
+      Math.max(canvasWidth - peakPaintedHalfWidth, canvasWidth / 2),
     ),
     centerY: clamp(
       rawCenterY,
-      Math.min(halfHeight, canvasHeight / 2),
-      Math.max(canvasHeight - halfHeight, canvasHeight / 2),
+      Math.min(peakPaintedHalfHeight, canvasHeight / 2),
+      Math.max(canvasHeight - peakPaintedHalfHeight, canvasHeight / 2),
     ),
     fontSize,
     scale,
@@ -563,17 +631,20 @@ export const goalImpactWaveRenderer: ScoreEffectRenderer = {
       const inset = clamp(frame.cellSize * 0.08, 0.5, 1.25);
       const drawSize = Math.max(0, frame.cellSize - inset * 2);
       context.save();
-      context.fillStyle = teamColor;
-      for (const cell of cells) {
-        context.globalAlpha = cell.opacity;
-        context.fillRect(
-          CANVAS_PADDING_PX + cell.position.x * frame.cellSize + inset,
-          CANVAS_PADDING_PX + cell.position.y * frame.cellSize + inset,
-          drawSize,
-          drawSize,
-        );
+      try {
+        context.fillStyle = teamColor;
+        for (const cell of cells) {
+          context.globalAlpha = cell.opacity;
+          context.fillRect(
+            CANVAS_PADDING_PX + cell.position.x * frame.cellSize + inset,
+            CANVAS_PADDING_PX + cell.position.y * frame.cellSize + inset,
+            drawSize,
+            drawSize,
+          );
+        }
+      } finally {
+        context.restore();
       }
-      context.restore();
     }
 
     const readout = sampleScoreReadout(activation, frame);
@@ -582,25 +653,28 @@ export const goalImpactWaveRenderer: ScoreEffectRenderer = {
     }
 
     context.save();
-    context.globalAlpha = readout.opacity;
-    context.translate(readout.centerX, readout.centerY);
-    context.scale(readout.scale, readout.scale);
-    context.textAlign = 'center';
-    context.textBaseline = 'middle';
-    context.font = `italic 900 ${readout.fontSize}px Impact, 'Arial Black', sans-serif`;
-    // A white halo keeps the readout legible over the tinted end zones and
-    // over snakes without dimming the team colour.
-    context.lineWidth = Math.max(2, readout.fontSize * 0.18);
-    context.lineJoin = 'round';
-    context.miterLimit = 2;
-    context.strokeStyle = '#ffffff';
-    context.strokeText(readout.text, 0, 0);
-    context.fillStyle = getScoreReadoutColor(
-      activation.teamId,
-      frame.localTeamId,
-    );
-    context.fillText(readout.text, 0, 0);
-    context.restore();
+    try {
+      context.globalAlpha = readout.opacity;
+      context.translate(readout.centerX, readout.centerY);
+      context.scale(readout.scale, readout.scale);
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.font = `italic 900 ${readout.fontSize}px Impact, 'Arial Black', sans-serif`;
+      // A white halo keeps the readout legible over tinted end zones and the
+      // fading cell wave without dimming the team colour.
+      context.lineWidth = Math.max(2, readout.fontSize * 0.18);
+      context.lineJoin = 'round';
+      context.miterLimit = 2;
+      context.strokeStyle = '#ffffff';
+      context.strokeText(readout.text, 0, 0);
+      context.fillStyle = getScoreReadoutColor(
+        activation.teamId,
+        frame.localTeamId,
+      );
+      context.fillText(readout.text, 0, 0);
+    } finally {
+      context.restore();
+    }
   },
 };
 
@@ -649,6 +723,22 @@ export const drawScoreEffects = (
     registry,
   );
   for (const activation of runtime.active) {
-    registry.resolve(activation.effectId)?.draw(context, activation, frame);
+    const renderer = registry.resolve(activation.effectId);
+    if (!renderer) {
+      continue;
+    }
+    context.save();
+    try {
+      renderer.draw(context, activation, frame);
+    } catch (error) {
+      // Score effects are cosmetic and execute in the middle of the gameplay
+      // render. Keep a bad swappable renderer from suppressing snakes/walls.
+      console.error('Score celebration renderer failed', error);
+    } finally {
+      // A swappable renderer may fail after changing compositing, filters,
+      // shadows, or transforms. Isolate every invocation so both subsequent
+      // effects and the gameplay layers receive the caller's original state.
+      context.restore();
+    }
   }
 };
