@@ -1,22 +1,41 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { getWasm, initWasm } from '../wasm';
 
 export interface TutorialSceneCanvasProps {
   /** Scene id from `tutorialSceneIds()` in the WASM module. */
   scene: string;
+  /** Increment to replay the scene without changing tutorial steps. */
+  replayToken?: number;
 }
 
+const FRAME_QUANTUM_MS = 50;
+
 /**
- * Draws one tutorial illustration using the real game renderer.
- *
- * The frame is produced by the same Rust function that paints the arena during
- * play, from a real `GameState`, so these are not screenshots and cannot drift
- * from the game — they render identically on every platform and stay correct
- * when the renderer changes. Sizing follows the arena canvas convention: the
- * backing store is device pixels, so the illustration is crisp on HiDPI.
+ * Plays one focused tutorial beat through the production Rust arena renderer.
+ * The WASM player owns a reusable full-arena scratch canvas; this component
+ * only sizes the visible crop and schedules real 50ms game-style frames.
  */
-const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({ scene }) => {
+const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
+  scene,
+  replayToken = 0,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [reducedMotion, setReducedMotion] = useState(() => (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  ));
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') {
+      return undefined;
+    }
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const handleChange = () => setReducedMotion(query.matches);
+    handleChange();
+    query.addEventListener('change', handleChange);
+    return () => query.removeEventListener('change', handleChange);
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -26,19 +45,19 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({ scene }) => {
 
     let disposed = false;
     let animationFrame = 0;
+    let player: InstanceType<
+      NonNullable<ReturnType<typeof getWasm>>['TutorialScenePlayer']
+    > | null = null;
+    let startedAt = 0;
+    let elapsedMs = 0;
+    let lastFrameMs = -1;
+    let forceDraw = true;
+    let renderFailed = false;
 
-    const draw = () => {
-      animationFrame = 0;
-      if (disposed) {
-        return;
-      }
-      const wasm = getWasm();
-      if (!wasm) {
-        return;
-      }
+    const sizeCanvas = () => {
       const bounds = canvas.getBoundingClientRect();
       if (bounds.width <= 0 || bounds.height <= 0) {
-        return;
+        return false;
       }
       const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
       const width = Math.round(bounds.width * pixelRatio);
@@ -46,45 +65,98 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({ scene }) => {
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width;
         canvas.height = height;
+        forceDraw = true;
       }
-      try {
-        wasm.renderTutorialScene(scene, canvas);
-      } catch (error) {
-        // A missing scene must not take the arena down with it: the bullet
-        // still reads fine without its picture.
-        console.error('Failed to render tutorial scene', scene, error);
+      return true;
+    };
+
+    const schedule = () => {
+      if (!disposed && !animationFrame) {
+        animationFrame = window.requestAnimationFrame(draw);
       }
     };
 
-    const scheduleDraw = () => {
-      if (animationFrame) {
+    const draw = (now: number) => {
+      animationFrame = 0;
+      if (disposed || renderFailed || !player || document.hidden || !sizeCanvas()) {
         return;
       }
-      animationFrame = window.requestAnimationFrame(draw);
+
+      const durationMs = player.durationMs();
+      elapsedMs = reducedMotion
+        ? player.posterMs()
+        : Math.min(durationMs, Math.max(0, now - startedAt));
+      const quantizedMs = reducedMotion
+        ? elapsedMs
+        : Math.min(durationMs, Math.floor(elapsedMs / FRAME_QUANTUM_MS) * FRAME_QUANTUM_MS);
+
+      if (forceDraw || quantizedMs !== lastFrameMs) {
+        try {
+          player.renderFrame(quantizedMs, canvas);
+        } catch (error) {
+          renderFailed = true;
+          canvas.dataset.playback = 'error';
+          console.error('Failed to render tutorial scene', scene, error);
+          return;
+        }
+        lastFrameMs = quantizedMs;
+        forceDraw = false;
+      }
+
+      if (!reducedMotion && elapsedMs < durationMs) {
+        canvas.dataset.playback = 'playing';
+        schedule();
+      } else {
+        canvas.dataset.playback = 'complete';
+      }
     };
 
-    // The modal can open before the WASM module has finished loading on a cold
-    // page load, so wait for it rather than rendering nothing.
-    void initWasm().then(scheduleDraw).catch(() => {});
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        startedAt = performance.now() - elapsedMs;
+        forceDraw = true;
+        schedule();
+      }
+    };
 
-    const observer = new ResizeObserver(scheduleDraw);
+    const observer = new ResizeObserver(() => {
+      forceDraw = true;
+      schedule();
+    });
     observer.observe(canvas);
-    scheduleDraw();
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    void initWasm().then((wasm) => {
+      if (disposed) {
+        return;
+      }
+      player = new wasm.TutorialScenePlayer(scene);
+      startedAt = performance.now();
+      canvas.dataset.playback = reducedMotion ? 'complete' : 'playing';
+      schedule();
+    }).catch((error) => {
+      canvas.dataset.playback = 'error';
+      console.error('Failed to initialize tutorial scene', scene, error);
+    });
 
     return () => {
       disposed = true;
       observer.disconnect();
+      document.removeEventListener('visibilitychange', handleVisibility);
       if (animationFrame) {
         window.cancelAnimationFrame(animationFrame);
       }
+      player?.free();
     };
-  }, [scene]);
+  }, [reducedMotion, replayToken, scene]);
 
   return (
     <canvas
       ref={canvasRef}
       className="tutorial-scene-canvas"
       data-scene={scene}
+      data-motion={reducedMotion ? 'reduced' : 'animated'}
+      data-testid="tutorial-scene-canvas"
       aria-hidden="true"
     />
   );

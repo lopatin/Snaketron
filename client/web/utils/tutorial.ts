@@ -1,4 +1,5 @@
 import type { GameState, GameType, QueueMode } from '../types';
+import type { BoostInputMode } from './boostInput';
 
 /**
  * One tutorial exists per (game mode x ranked/unranked) combination. There are
@@ -12,18 +13,23 @@ import type { GameState, GameType, QueueMode } from '../types';
 export type TutorialMode = 'duel' | '2v2' | 'ffa' | 'solo';
 export type TutorialKey = `${TutorialMode}:${'ranked' | 'casual'}`;
 
-export interface TutorialBullet {
-  /** Scene id understood by `renderTutorialScene` in the WASM renderer. */
+export interface TutorialStep {
+  /** Scene id understood by `TutorialScenePlayer` in the WASM renderer. */
   scene: string;
-  text: string;
+  /** Short action-led heading shown above the instruction. */
+  title: string;
+  /** One focused gameplay instruction. */
+  body: string;
+  /** Describes the meaningful motion in the scene without relying on colour. */
+  visualLabel: string;
 }
 
 export interface TutorialContent {
   key: TutorialKey;
   title: string;
-  /** Short qualifier under the title, e.g. "Ranked". */
+  /** Queue vocabulary already used elsewhere in the app. */
   kicker: string;
-  bullets: [TutorialBullet, TutorialBullet, TutorialBullet];
+  steps: [TutorialStep, TutorialStep, TutorialStep];
 }
 
 const MODE_LABELS: Record<TutorialMode, string> = {
@@ -58,7 +64,7 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
   `${mode}:${queueMode === 'Competitive' ? 'ranked' : 'casual'}`;
 
 /**
- * Bullet copy is written from the engine's actual rules, not from the design
+ * Step copy is written from the engine's actual rules, not from the design
  * specs — several of which describe mechanics that were never implemented.
  * Load-bearing facts, with their sources:
  *
@@ -83,64 +89,93 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  *   duel, 2v2 and FFA it also selects the ranked MMR pool; Solo affects neither
  *   rules nor rating, so the Solo copy never claims a rank is at stake.
  */
-const teamBullets = (
+const collectibleBoostStep = (inputMode: BoostInputMode): TutorialStep => ({
+  scene: 'team-boost',
+  title: 'BOOST',
+  body:
+    inputMode === 'toggle'
+      ? 'Collect NOS, then press Space to toggle boost.'
+      : 'Collect NOS, then hold Space to boost.',
+  visualLabel: 'A snake collects NOS; its fuel fills and it accelerates.',
+});
+
+const teamSteps = (
   mode: 'duel' | '2v2',
   ranked: boolean,
   scoreLimit: number | null,
-): [TutorialBullet, TutorialBullet, TutorialBullet] => {
+  inputMode: BoostInputMode,
+): [TutorialStep, TutorialStep, TutorialStep] => {
   // There is no clock to fall back on, so a match whose state somehow carries
   // no target gets the shape of the rule without inventing a number.
-  const race = scoreLimit === null ? 'First to the score target wins' : `First to ${scoreLimit} wins`;
+  const race =
+    scoreLimit === null ? 'Reach the score target first' : `First to ${scoreLimit} wins`;
   return [
     {
       scene: 'team-carry',
-      text:
+      title: mode === 'duel' ? 'BANK POINTS' : 'SCORE TOGETHER',
+      body:
         mode === 'duel'
-          ? 'Eat food out in the field, then carry it home through your own gate to bank the points.'
-          : 'Eat food out in the field, then carry it home through your gate. Your partner banks into the same base.',
+          ? 'Eat, then return through your gate to bank points.'
+          : 'Eat, then return through your gate. Your team shares the score.',
+      visualLabel:
+        mode === 'duel'
+          ? 'A snake returns through the gate labeled YOU; the team score increases.'
+          : 'A teammate returns through the gate labeled YOU; the shared team score increases.',
     },
-    {
-      scene: 'team-boost',
-      text: 'Drive over NOS canisters to fill your tank, then hold Space for a burst of speed.',
-    },
+    collectibleBoostStep(inputMode),
     {
       scene: 'team-danger',
-      text: ranked
-        ? `Never enter the enemy base — it kills you. ${race}, and your rank moves with it.`
-        : `Never enter the enemy base — it kills you. ${race}. No clock.`,
+      title: 'WIN',
+      body: `${race}—no clock. Entering the enemy base kills you.${
+        ranked ? ' This match affects your rank.' : ''
+      }`,
+      visualLabel: 'A snake enters the base labeled RIVAL and crashes.',
     },
   ];
 };
 
-const ffaBullets = (ranked: boolean): [TutorialBullet, TutorialBullet, TutorialBullet] => [
+const ffaSteps = (
+  ranked: boolean,
+  inputMode: BoostInputMode,
+): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'ffa-food',
-    text: 'Eat food to grow — the field is packed with it. Every bite is worth two points.',
+    title: 'GROW',
+    body: 'Eat food. Each bite adds 2 points.',
+    visualLabel: 'A snake eats food, grows two segments, and gains two points.',
   },
-  {
-    scene: 'ffa-boost',
-    text: 'Drive over NOS canisters to fill your tank, then hold Space for a burst of speed.',
-  },
+  { ...collectibleBoostStep(inputMode), scene: 'ffa-boost' },
   {
     scene: 'ffa-crash',
-    text: ranked
-      ? 'One life. Hit a wall, a rival, or your own tail and you are out. The match ends when every snake falls. Highest score wins, and your rank moves with it.'
-      : 'One life. Hit a wall, a rival, or your own tail and you are out. The match ends when every snake falls. Highest score wins.',
+    title: 'ONE LIFE',
+    body: `Crash and you’re out. When all snakes are out, highest score wins.${
+      ranked ? ' This match affects your rank.' : ''
+    }`,
+    visualLabel: 'A snake hits a rival and is eliminated.',
   },
 ];
 
-const soloBullets = (): [TutorialBullet, TutorialBullet, TutorialBullet] => [
+const soloSteps = (inputMode: BoostInputMode): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'solo-food',
-    text: 'Steer with the arrow keys and eat food to grow. Every bite is worth two points.',
+    title: 'MOVE & GROW',
+    body: 'Steer with the arrow keys. Each bite adds 2 points.',
+    visualLabel: 'The solo snake turns toward food and grows.',
   },
   {
     scene: 'solo-boost',
-    text: 'Hold Space to boost. On a solo run the tank never empties, so use it as much as you like.',
+    title: 'UNLIMITED BOOST',
+    body:
+      inputMode === 'toggle'
+        ? 'Press Space to toggle boost. Your tank never runs out.'
+        : 'Hold Space to boost. Your tank never runs out.',
+    visualLabel: 'The solo snake boosts while its full fuel meter stays full.',
   },
   {
     scene: 'solo-run',
-    text: 'No clock and no rivals — the run only ends when you crash. Beat your own best.',
+    title: 'BEAT YOUR BEST',
+    body: 'No clock. Your run ends when you crash.',
+    visualLabel: 'The solo snake hits its tail, ending the run.',
   },
 ];
 
@@ -157,42 +192,47 @@ export const tutorialContent = (
   mode: TutorialMode,
   queueMode: QueueMode,
   facts: TutorialFacts = { scoreLimit: null },
+  inputMode: BoostInputMode = 'hold',
 ): TutorialContent => {
   const ranked = queueMode === 'Competitive';
   const key = tutorialKey(mode, queueMode);
-  const bullets =
+  const steps =
     mode === 'solo'
-      ? soloBullets()
+      ? soloSteps(inputMode)
       : mode === 'ffa'
-        ? ffaBullets(ranked)
-        : teamBullets(mode, ranked, facts.scoreLimit);
+        ? ffaSteps(ranked, inputMode)
+        : teamSteps(mode, ranked, facts.scoreLimit, inputMode);
 
   return {
     key,
     title: MODE_LABELS[mode],
-    // Solo never touches MMR in either queue, so calling it "Ranked" would be
-    // a lie the player could check.
-    kicker: ranked && mode !== 'solo' ? 'Ranked' : 'Casual',
-    bullets,
+    // Solo records a high score in either queue and never touches MMR, so
+    // calling Competitive Solo ranked would be a lie the player could check.
+    kicker: mode === 'solo' ? 'HIGH SCORE' : ranked ? 'COMPETITIVE' : 'QUICK MATCH',
+    steps,
   };
 };
 
 export const tutorialContentForGame = (
   gameState: Pick<GameState, 'game_type' | 'queue_mode' | 'properties'>,
+  inputMode: BoostInputMode = 'hold',
 ): TutorialContent | null => {
   const mode = tutorialModeForGameType(gameState.game_type);
   return mode === null
     ? null
-    : tutorialContent(mode, gameState.queue_mode, {
-        scoreLimit: gameState.properties.score_limit,
-      });
+    : tutorialContent(
+        mode,
+        gameState.queue_mode,
+        { scoreLimit: gameState.properties.score_limit },
+        inputMode,
+      );
 };
 
 /**
- * Mirrors the `SCENES` registry in `client/src/tutorial.rs`. Kept here so a
- * renamed scene is caught by the unit test rather than by a blank illustration
- * in production; `TutorialSceneCanvas` also logs loudly if the WASM module
- * rejects an id at runtime.
+ * TypeScript-side contract for the `SCENES` registry in
+ * `client/src/tutorial.rs`. Unit tests keep every content step inside this set;
+ * the Rust registry has its own ID/uniqueness test, and the canvas marks a
+ * mismatched WASM constructor call as an error at runtime.
  */
 export const TUTORIAL_SCENE_IDS = [
   'team-carry',

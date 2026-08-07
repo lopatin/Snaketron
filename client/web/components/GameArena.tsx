@@ -852,8 +852,13 @@ export default function GameArena() {
   // state here rather than off anything chosen at queue time.
   const readinessState = committedState ?? gameState;
   const tutorial = useMemo(
-    () => (readinessState ? tutorialContentForGame(readinessState) : null),
-    [readinessState?.game_type, readinessState?.queue_mode],
+    () => (readinessState ? tutorialContentForGame(readinessState, boostInputMode) : null),
+    [
+      boostInputMode,
+      readinessState?.game_type,
+      readinessState?.properties.score_limit,
+      readinessState?.queue_mode,
+    ],
   );
   // Spectators have no snake and the server will not accept a confirmation
   // from them, so showing them a Ready button would be a control that can

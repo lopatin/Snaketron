@@ -171,6 +171,21 @@ const completedBoostSnapshot = (streamSequence, tick = 7) => {
   return frame;
 };
 
+const tutorialSnapshot = (streamSequence = 10) => {
+  const frame = completedBoostSnapshot(streamSequence, 0);
+  const state = frame.GameEvent.event.Snapshot.game_state;
+  const now = Date.now();
+  state.tick = 0;
+  state.status = { Started: { server_id: 1 } };
+  state.start_ms = now;
+  state.readiness = { deadline_ms: now + 15_000, ready_user_ids: [] };
+  state.simulation_epoch_ms = null;
+  state.scores = { 0: 0, 1: 0 };
+  state.team_scores = { 0: 0, 1: 0 };
+  frame.GameEvent.tick = 0;
+  return frame;
+};
+
 const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
   const frame = completedBoostSnapshot(streamSequence, tick);
   const state = frame.GameEvent.event.Snapshot.game_state;
@@ -560,6 +575,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('token', 'drain-test-token');
+    localStorage.removeItem('snaketron:tutorial-seen:v1');
     localStorage.setItem('snaketron:lastLobby', JSON.stringify({ id: 1, code: 'LOBBY1' }));
     localStorage.setItem('snaketron_selected_region', JSON.stringify({
       regionId: 'test-region',
@@ -721,6 +737,98 @@ test('logout explicitly leaves the lobby before retiring the authenticated socke
       typeof message === 'object' &&
       ('Authenticate' in message || 'JoinLobby' in message)
     )).length, socketCountBeforeLogout)).toBe(0);
+});
+
+test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {
+  const socketIndex = await establishActiveGame(page, tutorialSnapshot());
+  const modal = page.getByTestId('tutorial-modal');
+  const canvas = page.getByTestId('tutorial-scene-canvas');
+
+  await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-step', '1');
+  await expect(modal.getByRole('heading', { name: 'Duel' })).toBeVisible();
+  await expect(modal.getByRole('heading', { name: 'BANK POINTS' })).toBeVisible();
+  await expect(modal).toContainText('Eat, then return through your gate to bank points.');
+  await expect(page.getByTestId('tutorial-visual')).toHaveAccessibleName(
+    'A snake returns through the gate labeled YOU; the team score increases.',
+  );
+  await expect(canvas).toHaveCount(1);
+  await expect(canvas).toHaveAttribute('data-scene', 'team-carry');
+  await expect(canvas).toHaveAttribute('data-motion', 'animated');
+  await expect.poll(() => canvas.evaluate((element) => (
+    element.width > 1 && element.height > 1 && element.dataset.playback
+  ))).toMatch(/playing|complete/);
+
+  // The scene is a deterministic gameplay-renderer timeline, not a CSS pan of
+  // a still. Replay it and verify that the canvas pixels actually change.
+  await modal.getByRole('button', { name: /Replay bank points animation/i }).click();
+  await page.waitForTimeout(100);
+  const earlyFrame = await canvas.evaluate((element) => element.toDataURL());
+  await page.waitForTimeout(650);
+  const laterFrame = await canvas.evaluate((element) => element.toDataURL());
+  expect(laterFrame).not.toBe(earlyFrame);
+
+  await page.keyboard.press('Escape');
+  await expect(modal).toBeVisible();
+
+  await modal.getByRole('button', { name: 'Next' }).click();
+  await expect(modal).toHaveAttribute('data-step', '2');
+  await expect(modal.getByRole('heading', { name: 'BOOST' })).toBeVisible();
+  await expect(canvas).toHaveCount(1);
+  await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
+
+  // Arrow navigation belongs to the guide while it is open and must not leak
+  // a turn or a Boost edge into the match beneath it.
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect(modal.getByRole('heading', { name: 'WIN' })).toBeVisible();
+  await page.keyboard.press('Space');
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(0);
+
+  await page.getByTestId('tutorial-ready').click();
+  await expect(page.getByTestId('tutorial-ready')).toBeDisabled();
+  await expect(page.getByTestId('tutorial-status')).toContainText('Waiting for 1 player');
+  await page.keyboard.press('Tab');
+  await expect.poll(() => page.evaluate(() => {
+    const tutorialModal = document.querySelector('[data-testid="tutorial-modal"]');
+    return Boolean(tutorialModal?.contains(document.activeElement));
+  })).toBe(true);
+  await expect.poll(() => socketMessages(page, socketIndex, 'PlayerReady')).toHaveLength(1);
+  await expect.poll(() => page.evaluate(() => (
+    JSON.parse(localStorage.getItem('snaketron:tutorial-seen:v1') || '{}')['duel:casual']
+  ))).toBe(true);
+});
+
+test('reduced motion holds tutorial scenes on their authored poster frame', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await establishActiveGame(page, tutorialSnapshot());
+
+  const modal = page.getByTestId('tutorial-modal');
+  const canvas = page.getByTestId('tutorial-scene-canvas');
+  await expect(modal).toBeVisible();
+  await expect(canvas).toHaveAttribute('data-motion', 'reduced');
+  await expect(canvas).toHaveAttribute('data-playback', 'complete');
+  await expect(modal.locator('.tutorial-replay')).toBeHidden();
+  const poster = await canvas.evaluate((element) => element.toDataURL());
+  await page.waitForTimeout(350);
+  expect(await canvas.evaluate((element) => element.toDataURL())).toBe(poster);
+
+  const bounds = await modal.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return {
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      left: rect.left,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(bounds.top).toBeGreaterThanOrEqual(0);
+  expect(bounds.left).toBeGreaterThanOrEqual(0);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth);
+  expect(bounds.bottom).toBeLessThanOrEqual(bounds.viewportHeight);
 });
 
 test('planned drain keeps the old game socket usable until the replacement is fully ready', async ({ page }) => {

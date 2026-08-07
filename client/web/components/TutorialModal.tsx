@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useRef } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { TutorialContent } from '../utils/tutorial';
 import TutorialSceneCanvas from './TutorialSceneCanvas';
 
@@ -13,8 +13,7 @@ export interface TutorialModalProps {
   content: TutorialContent;
   /**
    * Briefing mode gates the match start and shows the readiness roster.
-   * Reference mode is the same screen re-opened from the help control during
-   * play; it dismisses instead of confirming.
+   * Reference mode reopens the same guide during play.
    */
   variant: 'briefing' | 'reference';
   /** Seconds until everyone is readied automatically. Briefing mode only. */
@@ -38,12 +37,31 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
   onClose,
 }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
-  const primaryRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
   const titleId = useId();
-  const listId = useId();
+  const stepTitleId = useId();
+  const stepBodyId = useId();
+  const [activeStep, setActiveStep] = useState(0);
+  const [replayToken, setReplayToken] = useState(0);
+
+  const lastStepIndex = content.steps.length - 1;
+  const step = content.steps[activeStep] ?? content.steps[0];
+  const isBriefing = variant === 'briefing';
+  const waitingOnOthers = isBriefing && isReady;
 
   onCloseRef.current = onClose;
+
+  const showStep = useCallback((nextStep: number) => {
+    setActiveStep(Math.max(0, Math.min(lastStepIndex, nextStep)));
+    setReplayToken(0);
+  }, [lastStepIndex]);
+
+  useEffect(() => {
+    if (open) {
+      setActiveStep(0);
+      setReplayToken(0);
+    }
+  }, [content.key, open]);
 
   useEffect(() => {
     if (!open) {
@@ -54,18 +72,28 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    const focusFrame = window.requestAnimationFrame(() => {
-      (primaryRef.current ?? dialogRef.current)?.focus();
-    });
+    const focusFrame = window.requestAnimationFrame(() => dialogRef.current?.focus());
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      // A briefing is not dismissible: closing it would leave the player
-      // staring at a match they cannot start. The reference variant is.
       if (event.key === 'Escape' && variant === 'reference') {
         event.preventDefault();
         onCloseRef.current();
         return;
       }
+
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        setActiveStep((current) => Math.max(0, current - 1));
+        setReplayToken(0);
+        return;
+      }
+      if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        setActiveStep((current) => Math.min(lastStepIndex, current + 1));
+        setReplayToken(0);
+        return;
+      }
+
       if (event.key !== 'Tab' || !dialogRef.current) {
         return;
       }
@@ -80,13 +108,27 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
       }
       const first = controls[0];
       const last = controls[controls.length - 1];
+      const activeControl =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      if (
+        activeControl !== dialogRef.current &&
+        (
+          !activeControl ||
+          !dialogRef.current.contains(activeControl) ||
+          !controls.includes(activeControl)
+        )
+      ) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (
         event.shiftKey &&
-        (document.activeElement === first || document.activeElement === dialogRef.current)
+        (activeControl === first || activeControl === dialogRef.current)
       ) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      } else if (!event.shiftKey && activeControl === last) {
         event.preventDefault();
         first.focus();
       }
@@ -101,14 +143,11 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
         previouslyFocused.focus();
       }
     };
-  }, [open, variant]);
+  }, [lastStepIndex, open, variant]);
 
-  if (!open) {
+  if (!open || !step) {
     return null;
   }
-
-  const isBriefing = variant === 'briefing';
-  const waitingOnOthers = isBriefing && isReady;
 
   return (
     <div className="tutorial-backdrop" data-testid="tutorial-backdrop">
@@ -118,70 +157,149 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        aria-describedby={listId}
+        aria-describedby={stepBodyId}
         tabIndex={-1}
         data-testid="tutorial-modal"
         data-tutorial-key={content.key}
         data-variant={variant}
+        data-step={activeStep + 1}
       >
         <header className="tutorial-header">
-          <p className="tutorial-kicker">{content.kicker}</p>
-          <h2 className="tutorial-title" id={titleId}>
-            {content.title}
-          </h2>
+          <div className="tutorial-heading">
+            <p className="tutorial-kicker">{content.kicker}</p>
+            <h2 className="tutorial-title" id={titleId}>
+              {content.title}
+            </h2>
+          </div>
+          {variant === 'reference' && (
+            <button
+              type="button"
+              className="game-over-close tutorial-close-button"
+              onClick={onClose}
+              aria-label="Back to the game"
+              data-testid="tutorial-header-close"
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          )}
         </header>
 
-        <ol className="tutorial-bullets" id={listId}>
-          {content.bullets.map((bullet, index) => (
-            <li className="tutorial-bullet" key={bullet.scene}>
-              <span className="tutorial-bullet-index" aria-hidden="true">
-                {index + 1}
-              </span>
-              <span className="tutorial-bullet-art">
-                <TutorialSceneCanvas scene={bullet.scene} />
-              </span>
-              <p className="tutorial-bullet-text">{bullet.text}</p>
-            </li>
+        <nav className="tutorial-progress" aria-label="Tutorial steps">
+          {content.steps.map((tutorialStep, index) => (
+            <button
+              type="button"
+              className={`tutorial-progress-segment${index === activeStep ? ' is-active' : ''}${index < activeStep ? ' is-complete' : ''}`}
+              onClick={() => showStep(index)}
+              aria-current={index === activeStep ? 'step' : undefined}
+              aria-label={`Step ${index + 1} of ${content.steps.length}: ${tutorialStep.title}`}
+              key={tutorialStep.scene}
+            />
           ))}
-        </ol>
+        </nav>
+
+        <div className="tutorial-step" data-testid="tutorial-step">
+          <div className="tutorial-visual-shell">
+            <div
+              className="tutorial-visual"
+              role="img"
+              aria-label={step.visualLabel}
+              data-testid="tutorial-visual"
+            >
+              <TutorialSceneCanvas scene={step.scene} replayToken={replayToken} />
+            </div>
+            <button
+              type="button"
+              className="tutorial-replay"
+              onClick={() => setReplayToken((token) => token + 1)}
+              aria-label={`Replay ${step.title.toLowerCase()} animation`}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M13.2 4.9A5.8 5.8 0 1 0 14 8h-1.7a4.15 4.15 0 1 1-1.05-2.76L9.4 7.1H15V1.5l-1.8 1.8v1.6Z" />
+              </svg>
+              Replay
+            </button>
+          </div>
+
+          <div className="tutorial-copy" aria-live="polite" aria-atomic="true">
+            <p className="tutorial-step-index">
+              Step {String(activeStep + 1).padStart(2, '0')}
+              <span aria-hidden="true"> / {String(content.steps.length).padStart(2, '0')}</span>
+            </p>
+            <h3 className="tutorial-step-title" id={stepTitleId}>
+              {step.title}
+            </h3>
+            <p className="tutorial-step-body" id={stepBodyId}>
+              {step.body}
+            </p>
+          </div>
+
+          <div className="tutorial-step-navigation">
+            <button
+              type="button"
+              className="tutorial-step-button is-back"
+              onClick={() => showStep(activeStep - 1)}
+              disabled={activeStep === 0}
+            >
+              <span aria-hidden="true">←</span> Back
+            </button>
+            <span className="tutorial-step-position" aria-hidden="true">
+              {activeStep + 1} / {content.steps.length}
+            </span>
+            <button
+              type="button"
+              className="tutorial-step-button is-next"
+              onClick={() => showStep(activeStep + 1)}
+              disabled={activeStep === lastStepIndex}
+            >
+              Next <span aria-hidden="true">→</span>
+            </button>
+          </div>
+        </div>
 
         <footer className="tutorial-footer">
+          <div className="tutorial-status" data-testid="tutorial-status">
+            {isBriefing ? (
+              waitingOnOthers ? (
+                <span role="status">
+                  {pendingCount > 0
+                    ? `Waiting for ${pendingCount} ${pendingCount === 1 ? 'player' : 'players'}`
+                    : 'All players ready'}
+                </span>
+              ) : autoReadySeconds !== null ? (
+                <>
+                  <span aria-hidden="true">Match starts in {autoReadySeconds}s</span>
+                  <span className="sr-only">The match will start automatically soon.</span>
+                </>
+              ) : (
+                <span>Review at your pace</span>
+              )
+            ) : (
+              <span>Use ← and → to move between steps</span>
+            )}
+          </div>
+
           {isBriefing ? (
-            <>
-              <button
-                type="button"
-                ref={primaryRef}
-                className="tutorial-ready-button"
-                onClick={onReady}
-                disabled={isReady}
-                data-testid="tutorial-ready"
-              >
-                Ready
-                {isReady && (
-                  <span className="tutorial-ready-check" aria-hidden="true">
-                    ✓
-                  </span>
-                )}
-              </button>
-              <p className="tutorial-status" role="status" data-testid="tutorial-status">
-                {waitingOnOthers
-                  ? pendingCount > 0
-                    ? `Waiting for ${pendingCount} more ${pendingCount === 1 ? 'player' : 'players'}…`
-                    : 'Everyone is ready.'
-                  : autoReadySeconds !== null
-                    ? `Starting automatically in ${autoReadySeconds}s`
-                    : 'Take your time.'}
-              </p>
-            </>
+            <button
+              type="button"
+              className="game-shell-button is-primary tutorial-ready-button"
+              onClick={() => {
+                dialogRef.current?.focus();
+                onReady();
+              }}
+              disabled={isReady}
+              data-testid="tutorial-ready"
+            >
+              <span>Ready</span>
+              {isReady && <span className="tutorial-ready-check" aria-hidden="true">✓</span>}
+            </button>
           ) : (
             <button
               type="button"
-              ref={primaryRef}
-              className="tutorial-ready-button"
+              className="game-shell-button is-primary tutorial-ready-button"
               onClick={onClose}
               data-testid="tutorial-close"
             >
-              Back to the game
+              Back to game
             </button>
           )}
         </footer>

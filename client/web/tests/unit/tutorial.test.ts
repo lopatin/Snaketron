@@ -22,10 +22,12 @@ test('every mode x ranked combination has its own tutorial, and there are eight'
     for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
       const content = tutorialContent(mode, queueMode);
       assert.equal(content.key, tutorialKey(mode, queueMode));
-      assert.equal(content.bullets.length, 3, `${content.key} must have three bullets`);
-      for (const bullet of content.bullets) {
-        assert.ok(bullet.text.length > 0);
-        assert.ok(bullet.scene.length > 0);
+      assert.equal(content.steps.length, 3, `${content.key} must have three steps`);
+      for (const step of content.steps) {
+        assert.ok(step.title.length > 0);
+        assert.ok(step.body.length > 0);
+        assert.ok(step.visualLabel.length > 0);
+        assert.ok(step.scene.length > 0);
       }
       assert.ok(!seen.has(content.key));
       seen.add(content.key);
@@ -71,21 +73,51 @@ test('every mode names the boost key, and only collectible modes mention NOS', (
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
     // Every matchmade mode has Boost on the same key.
     for (const mode of ['duel', '2v2', 'ffa', 'solo'] as const) {
-      const text = tutorialContent(mode, queueMode).bullets.map((b) => b.text).join(' ');
+      const text = tutorialContent(mode, queueMode).steps.map((step) => step.body).join(' ');
       assert.match(text, /Space/, `${mode} must name the boost key`);
     }
     // The three contested modes fuel from pickups on the map...
     for (const mode of ['duel', '2v2', 'ffa'] as const) {
-      const text = tutorialContent(mode, queueMode).bullets.map((b) => b.text).join(' ');
+      const text = tutorialContent(mode, queueMode).steps.map((step) => step.body).join(' ');
       assert.match(text, /NOS/, `${mode} must explain NOS`);
     }
     // ...but a solo tank never empties and has nothing to collect, so telling
     // a solo player to look for canisters would send them hunting for
     // objectives the map does not contain.
-    const solo = tutorialContent('solo', queueMode).bullets.map((b) => b.text).join(' ');
+    const solo = tutorialContent('solo', queueMode).steps.map((step) => step.body).join(' ');
     assert.doesNotMatch(solo, /NOS|canister/i, 'solo has no boost pickups');
     assert.match(solo, /never empties|never runs out/i, 'solo must say the tank is unlimited');
   }
+});
+
+test('Boost instructions follow the configured hold or toggle input mode', () => {
+  for (const mode of MODES) {
+    const hold = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold')
+      .steps.map((step) => step.body)
+      .join(' ');
+    assert.match(hold, /hold Space to boost/i);
+    assert.doesNotMatch(hold, /toggle boost/);
+
+    const toggle = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'toggle')
+      .steps.map((step) => step.body)
+      .join(' ');
+    assert.match(toggle, /press Space to toggle boost/i);
+    assert.doesNotMatch(toggle, /hold Space to boost/i);
+  }
+
+  const toggleGame = tutorialContentForGame(
+    {
+      game_type: 'Solo',
+      queue_mode: 'Quickmatch',
+      properties: { score_limit: null },
+    } as GameState,
+    'toggle',
+  );
+  assert.ok(toggleGame);
+  assert.match(
+    toggleGame.steps.map((step) => step.body).join(' '),
+    /press Space to toggle boost/i,
+  );
 });
 
 test('no mode claims a clock, because no mode has one', () => {
@@ -94,7 +126,7 @@ test('no mode claims a clock, because no mode has one', () => {
     const content = tutorialContent(mode, rank === 'ranked' ? 'Competitive' : 'Quickmatch', {
       scoreLimit: 25,
     });
-    const text = content.bullets.map((b) => b.text).join(' ');
+    const text = content.steps.map((step) => step.body).join(' ');
     assert.doesNotMatch(
       text,
       /\d+\s*seconds|time limit|time runs out/i,
@@ -105,8 +137,8 @@ test('no mode claims a clock, because no mode has one', () => {
 
 test('FFA teaches its score-based result rather than a last-survivor win', () => {
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
-    const text = tutorialContent('ffa', queueMode).bullets.map((b) => b.text).join(' ');
-    assert.match(text, /match ends when every snake falls/i);
+    const text = tutorialContent('ffa', queueMode).steps.map((step) => step.body).join(' ');
+    assert.match(text, /when all snakes are out/i);
     assert.match(text, /highest score wins/i);
     assert.doesNotMatch(text, /last snake standing/i);
   }
@@ -124,7 +156,7 @@ test('team copy races to the score limit it is handed, never a baked-in number',
       ['Quickmatch', 7],
     ] as const) {
       const text = tutorialContent(mode, queueMode, { scoreLimit: limit })
-        .bullets.map((b) => b.text)
+        .steps.map((step) => step.body)
         .join(' ');
       assert.match(text, new RegExp(`First to ${limit}\\b`));
       assert.match(text, /enemy base/);
@@ -141,7 +173,7 @@ test('team copy races to the score limit it is handed, never a baked-in number',
 
 test('a team match with no score limit describes the rule without inventing a number', () => {
   const text = tutorialContent('duel', 'Quickmatch', { scoreLimit: null })
-    .bullets.map((b) => b.text)
+    .steps.map((step) => step.body)
     .join(' ');
   assert.doesNotMatch(text, /\b\d+\b/);
   assert.match(text, /score target/i);
@@ -150,37 +182,62 @@ test('a team match with no score limit describes the rule without inventing a nu
 test('ranked copy claims a rank is at stake only where one actually is', () => {
   for (const mode of ['duel', '2v2', 'ffa'] as const) {
     const ranked = tutorialContent(mode, 'Competitive');
-    assert.equal(ranked.kicker, 'Ranked');
-    assert.match(ranked.bullets.map((b) => b.text).join(' '), /rank/);
+    assert.equal(ranked.kicker, 'COMPETITIVE');
+    assert.match(ranked.steps.map((step) => step.body).join(' '), /rank/);
 
     const casual = tutorialContent(mode, 'Quickmatch');
-    assert.equal(casual.kicker, 'Casual');
-    assert.doesNotMatch(casual.bullets.map((b) => b.text).join(' '), /rank/);
+    assert.equal(casual.kicker, 'QUICK MATCH');
+    assert.doesNotMatch(casual.steps.map((step) => step.body).join(' '), /rank/);
   }
 
   // Solo never touches MMR in either queue mode, so competitive Solo must not
   // be dressed up as ranked.
   const rankedSolo = tutorialContent('solo', 'Competitive');
-  assert.equal(rankedSolo.kicker, 'Casual');
-  assert.doesNotMatch(rankedSolo.bullets.map((b) => b.text).join(' '), /rank/);
+  assert.equal(rankedSolo.kicker, 'HIGH SCORE');
+  assert.doesNotMatch(rankedSolo.steps.map((step) => step.body).join(' '), /rank/);
+  assert.equal(tutorialContent('solo', 'Quickmatch').kicker, 'HIGH SCORE');
 });
 
-test('every bullet points at a scene the renderer can actually draw', () => {
+test('every step points at a scene the renderer can actually draw', () => {
   const known = new Set<string>(TUTORIAL_SCENE_IDS);
   const used = new Set<string>();
   for (const mode of MODES) {
     for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
-      for (const bullet of tutorialContent(mode, queueMode).bullets) {
+      for (const step of tutorialContent(mode, queueMode).steps) {
         assert.ok(
-          known.has(bullet.scene),
-          `${bullet.scene} is not in the renderer's scene registry`,
+          known.has(step.scene),
+          `${step.scene} is not in the renderer's scene registry`,
         );
-        used.add(bullet.scene);
+        used.add(step.scene);
       }
     }
   }
   // A scene nobody references is dead weight in the WASM binary.
   assert.deepEqual([...used].sort(), [...known].sort());
+});
+
+test('progressive steps stay concise enough to scan one at a time', () => {
+  const wordCount = (text: string): number => text.trim().split(/\s+/).filter(Boolean).length;
+
+  for (const mode of MODES) {
+    for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
+      const scoreLimit = queueMode === 'Competitive' ? 50 : 25;
+      const content = tutorialContent(mode, queueMode, { scoreLimit });
+      const totalBodyWords = content.steps.reduce(
+        (total, step) => total + wordCount(step.body),
+        0,
+      );
+
+      assert.ok(totalBodyWords <= 34, `${content.key} has ${totalBodyWords} body words`);
+      for (const step of content.steps) {
+        assert.ok(wordCount(step.title) <= 3, `${content.key}/${step.title} title is too long`);
+        assert.ok(
+          wordCount(step.body) <= 17,
+          `${content.key}/${step.title} has ${wordCount(step.body)} body words`,
+        );
+      }
+    }
+  }
 });
 
 test('the persistence key distinguishes ranked from casual for the same mode', () => {
