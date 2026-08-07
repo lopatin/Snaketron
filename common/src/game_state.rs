@@ -1810,10 +1810,7 @@ impl GameState {
             self.calculate_starting_positions(player_count)
         };
 
-        let snake_length = match &self.game_type {
-            GameType::Custom { settings } => settings.snake_start_length as usize,
-            _ => DEFAULT_SNAKE_LENGTH,
-        };
+        let snake_length = self.starting_snake_length();
 
         for (snake_id, snake) in self.arena.snakes.iter_mut().enumerate() {
             if let Some((head_pos, direction)) = starting_positions.get(snake_id) {
@@ -1847,6 +1844,19 @@ impl GameState {
             GameType::Custom { settings } => settings.snake_start_length as usize,
             _ => DEFAULT_SNAKE_LENGTH,
         }
+    }
+
+    /// Food this snake would bank if it reached its own base right now.
+    ///
+    /// Each eaten food credits two segments (`GameEvent::FoodEaten`). Those
+    /// segments sit in `snake.food` until `step_forward` extrudes them past
+    /// the starting length, so counting both halves keeps the total stable
+    /// across the ticks a snake spends growing. This is the one definition
+    /// behind team scoring, AI base-return decisions, and the carried-food
+    /// readout the client renders on each snake.
+    pub fn carried_food(&self, snake: &Snake) -> u32 {
+        let extra_segments = snake.length().saturating_sub(self.starting_snake_length());
+        ((extra_segments + snake.food as usize) / 2) as u32
     }
 
     fn respawn_event_for_snake(&self, snake_id: u32) -> Option<GameEvent> {
@@ -2371,7 +2381,6 @@ impl GameState {
             {
                 let mut team_score_deltas: HashMap<TeamId, u32> = HashMap::new();
                 let mut respawns: Vec<u32> = Vec::new();
-                let starting_length = self.starting_snake_length();
 
                 for (snake_id, snake) in self.iter_snakes() {
                     if !snake.is_alive {
@@ -2390,10 +2399,7 @@ impl GameState {
                         continue;
                     }
 
-                    let snake_length = snake.length();
-                    let extra_segments = snake_length.saturating_sub(starting_length);
-                    let carried_segments = extra_segments + snake.food as usize;
-                    let carried_food = (carried_segments / 2) as u32;
+                    let carried_food = self.carried_food(snake);
 
                     if carried_food == 0 {
                         continue;
@@ -3552,6 +3558,69 @@ mod tests {
             snake.food, 0,
             "snake should not keep carried food after respawn"
         );
+    }
+
+    /// `carried_food` is the one definition behind team scoring, the AI's
+    /// base-return decision, and the number the client draws on each snake, so
+    /// it is pinned directly rather than only through the scoring path.
+    #[test]
+    fn carried_food_counts_queued_and_extruded_growth_as_one_total() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(4242),
+            0,
+        );
+        game.add_player(1, Some("Player1".to_string()))
+            .expect("add player 1");
+        game.add_player(2, Some("Player2".to_string()))
+            .expect("add player 2");
+
+        let starting_length = game.starting_snake_length() as i16;
+        let at_starting_length = |food: u32| {
+            Snake::new(
+                vec![
+                    Position { x: 20, y: 10 },
+                    Position {
+                        x: 20 - (starting_length - 1),
+                        y: 10,
+                    },
+                ],
+                Direction::Right,
+                true,
+                food,
+                Some(TeamId(0)),
+            )
+        };
+
+        // Two segments make one food, and it does not matter whether they are
+        // still queued in `food` or already extruded into the body: a snake
+        // shows the same total across every tick it spends growing.
+        assert_eq!(game.carried_food(&at_starting_length(0)), 0);
+        assert_eq!(game.carried_food(&at_starting_length(1)), 0);
+        assert_eq!(game.carried_food(&at_starting_length(2)), 1);
+        assert_eq!(game.carried_food(&at_starting_length(5)), 2);
+
+        let mut half_grown = at_starting_length(1);
+        half_grown.body[1].x -= 1; // one segment already extruded
+        assert_eq!(
+            game.carried_food(&half_grown),
+            1,
+            "one queued plus one extruded segment is still one food"
+        );
+
+        // A snake shorter than the starting length floors at zero instead of
+        // underflowing; reachable in Custom games with a long start length.
+        let stub = Snake::new(
+            vec![Position { x: 20, y: 10 }, Position { x: 19, y: 10 }],
+            Direction::Right,
+            true,
+            0,
+            Some(TeamId(0)),
+        );
+        assert_eq!(game.carried_food(&stub), 0);
     }
 
     #[test]

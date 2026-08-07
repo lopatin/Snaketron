@@ -1,4 +1,4 @@
-use common::{BoostPad, GameState};
+use common::{BoostPad, GameState, Position};
 use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
@@ -493,6 +493,150 @@ fn snake_palette(
             _ => ("#f7b731", "#a87d1f"),
         }
     }
+}
+
+/// How far behind the head the carried-food number is anchored. The head wears
+/// a `#333` disc of radius `cell_size * 0.38`, so a number centered on the head
+/// — or on cell 1, once it reaches two digits — would sit dark-on-dark. Two
+/// cells back clears the disc entirely while still reading as "at the head".
+const CARRIED_LABEL_OFFSET_CELLS: usize = 2;
+/// Near-black core over a white halo. No single flat ink clears every body
+/// fill: the palette runs from `#556270` gray up to `#f7b731` yellow, and the
+/// head gradient lightens the top of that range further. Dark ink is the half
+/// of the pair that a white halo can rescue on the dark end; the inverse
+/// (white core, dark halo) has no rescue on the light end and turns to mush.
+const CARRIED_LABEL_FILL: &str = "#111111";
+const CARRIED_LABEL_HALO: &str = "#ffffff";
+/// The arena canvas is not devicePixelRatio-scaled, so these are physical
+/// pixels. `GameArena.tsx` walks `cell_size` down through the integers 15..=5,
+/// and the floor keeps the number readable at the small end rather than
+/// letting it shrink with the cell into illegibility.
+const CARRIED_LABEL_MIN_PX: f64 = 7.0;
+const CARRIED_LABEL_MAX_PX: f64 = 14.0;
+/// Canvas strokes straddle the glyph outline, so the halo eats half its width
+/// inward. Keep it well under the team-zone convention's `size * 0.35`, which
+/// would swallow a 900-weight stem at the 7px floor and leave the number
+/// reading as its own halo.
+const CARRIED_LABEL_HALO_RATIO: f64 = 0.20;
+/// Room a number gets when it runs *along* the body: many cells of snake, so
+/// nothing has to give. Across the body it gets the painted band instead —
+/// `cell_size` of fill plus the ordinary contour — which is the width the
+/// snake actually occupies on screen.
+const CARRIED_LABEL_ALONG_BODY_CELLS: f64 = 2.0;
+const CARRIED_LABEL_ACROSS_BODY_BLEED_PX: f64 = ORDINARY_OUTLINE_EXTRA;
+/// Advance width of one Arial Black digit, in em. Used to pick a font size the
+/// number fits at, rather than squashing glyphs horizontally into the band:
+/// team arenas render rotated, so most snakes read screen-vertical and the
+/// across-body case is the common one, not the fallback. A uniformly smaller
+/// number stays a number; a 50%-condensed one becomes vertical bars.
+const CARRIED_LABEL_DIGIT_ADVANCE_EM: f64 = 0.667;
+
+/// A cell of snake body, and the axis of the straight run it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BodyAnchor {
+    cell: Position,
+    /// Axis in *grid* space, before any arena rotation is applied.
+    run_is_horizontal: bool,
+}
+
+/// The grid cell `cells_back` steps behind the head, walking the *compressed*
+/// body (head, turns, tail — see `common/src/snake.rs`). Consecutive body
+/// points are always axis-aligned, so a segment spans `|dx| + |dy|` cells and
+/// shares its first cell with the previous segment, matching `Snake::length`.
+/// Clamps to the tail for a snake shorter than `cells_back`; returns `None`
+/// only for an empty body.
+///
+/// The axis of the run the cell landed on is reported alongside it. Taking it
+/// from the segment rather than from the head-to-cell chord matters: for one
+/// step after every turn that chord is diagonal, and guessing from it picks
+/// the wrong orientation on half of all turns.
+fn body_cell_behind_head(body: &[Position], cells_back: usize) -> Option<BodyAnchor> {
+    let head = *body.first()?;
+    let mut remaining = cells_back;
+
+    for window in body.windows(2) {
+        let (p1, p2) = (window[0], window[1]);
+        let (dx, dy) = (p2.x - p1.x, p2.y - p1.y);
+        let span = (dx.abs() + dy.abs()) as usize;
+        if span == 0 {
+            continue;
+        }
+        if remaining <= span {
+            let step = remaining as i16;
+            return Some(BodyAnchor {
+                cell: Position {
+                    x: p1.x + dx.signum() * step,
+                    y: p1.y + dy.signum() * step,
+                },
+                run_is_horizontal: dx != 0,
+            });
+        }
+        remaining -= span;
+    }
+
+    // Shorter than `cells_back` (or a body with no extent at all): clamp to
+    // the tail, keeping the last real run's axis where there was one.
+    let last_run_is_horizontal = body
+        .windows(2)
+        .rev()
+        .find(|w| w[0] != w[1])
+        .map(|w| w[1].x != w[0].x)
+        .unwrap_or(true);
+    Some(BodyAnchor {
+        cell: body.last().copied().unwrap_or(head),
+        run_is_horizontal: last_run_is_horizontal,
+    })
+}
+
+/// Whether a grid-space run reads horizontally *on screen*. The 90 and 270
+/// rotations swap the axes; 0 and 180 preserve them. Team matches default to
+/// 270/90, so a snake driving down the field is screen-vertical — getting this
+/// backwards would pick the wrong width allowance in the primary game mode.
+fn anchor_run_is_horizontal_on_screen(run_is_horizontal: bool, rotation: i32) -> bool {
+    match rotation {
+        90 | 270 => !run_is_horizontal,
+        _ => run_is_horizontal,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CarriedFoodLabelLayout {
+    font_px: f64,
+    halo_px: f64,
+}
+
+/// Text metrics for the carried-food readout. The glyph tracks the cell size
+/// between the legibility floor and the ceiling that stops the number from
+/// dominating the snake at full zoom, then shrinks *uniformly* until its
+/// natural width fits the room the body gives it. Nothing is condensed, so a
+/// number never degrades into bars; at the 7px floor a wide value simply
+/// overhangs the band by a pixel or so onto the white arena, where the halo
+/// keeps it readable.
+fn carried_food_label_layout(
+    cell_size: f64,
+    digits: usize,
+    horizontal_on_screen: bool,
+) -> CarriedFoodLabelLayout {
+    let available = if horizontal_on_screen {
+        cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
+    } else {
+        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+    };
+    let per_digit = CARRIED_LABEL_DIGIT_ADVANCE_EM * digits.max(1) as f64;
+    let font_px = cell_size
+        .min(available / per_digit)
+        .clamp(CARRIED_LABEL_MIN_PX, CARRIED_LABEL_MAX_PX);
+
+    CarriedFoodLabelLayout {
+        font_px,
+        halo_px: font_px * CARRIED_LABEL_HALO_RATIO,
+    }
+}
+
+/// Deliberately not shared with `nos_wordmark_font`: the pickup wordmark and
+/// the gameplay readout should be free to diverge.
+fn carried_food_label_font(size: f64) -> String {
+    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
 }
 
 /// Map a screen-relative input direction to the game-coordinate direction for a
@@ -1050,6 +1194,9 @@ pub fn render_game_state(
 
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;
+    // (center_x, center_y, text, horizontal_on_screen), painted after every
+    // snake and the walls so nothing can overdraw a readout.
+    let mut carried_food_labels: Vec<(f64, f64, String, bool)> = Vec::new();
     for (index, snake) in snakes.iter().enumerate() {
         let is_alive = snake.is_alive;
 
@@ -1477,6 +1624,32 @@ pub fn render_game_state(
                 2.0 * std::f64::consts::PI,
             )?;
             ctx.fill();
+
+            // Queue the carried-food readout rather than stamping it now: a
+            // later snake's white dot-mask, or the wall pass, would paint over
+            // it. It rides a couple of cells behind the head, clear of the dark
+            // head disc and on the stretch of body the white gradient overlay
+            // lightens most — which is where dark ink reads best. A snake
+            // carrying nothing queues nothing.
+            let carried_food = state.carried_food(snake);
+            if carried_food > 0
+                && let Some(anchor) = body_cell_behind_head(body, CARRIED_LABEL_OFFSET_CELLS)
+                && anchor.cell != *head
+            {
+                let (anchor_tx, anchor_ty) = transform_coords(
+                    anchor.cell.x as f64,
+                    anchor.cell.y as f64,
+                    game_width,
+                    game_height,
+                    rotation_int,
+                );
+                carried_food_labels.push((
+                    anchor_tx * cell_size + cell_size / 2.0,
+                    anchor_ty * cell_size + cell_size / 2.0,
+                    carried_food.to_string(),
+                    anchor_run_is_horizontal_on_screen(anchor.run_is_horizontal, rotation_int),
+                ));
+            }
         } else {
             // Render dead snake with faint solid color
             let color = "#f0f0f0"; // Light gray for dead snakes
@@ -1959,6 +2132,28 @@ pub fn render_game_state(
         }
     }
 
+    // Carried-food readouts, painted after every snake and the walls so a
+    // neighbouring snake's mask or a goal wall cannot cut into a number.
+    // `font`, `textAlign`, `textBaseline` and `lineJoin` are the one class of
+    // canvas state nothing else in this file resets, so the pass is wrapped to
+    // keep it from moving unrelated text.
+    if !carried_food_labels.is_empty() {
+        ctx.save();
+        ctx.set_text_align("center");
+        ctx.set_text_baseline("middle");
+        ctx.set_line_join("round");
+        for (label_x, label_y, text, horizontal_on_screen) in &carried_food_labels {
+            let layout = carried_food_label_layout(cell_size, text.len(), *horizontal_on_screen);
+            ctx.set_font(&carried_food_label_font(layout.font_px));
+            ctx.set_line_width(layout.halo_px);
+            ctx.set_stroke_style_str(CARRIED_LABEL_HALO);
+            ctx.stroke_text(text, *label_x, *label_y)?;
+            ctx.set_fill_style_str(CARRIED_LABEL_FILL);
+            ctx.fill_text(text, *label_x, *label_y)?;
+        }
+        ctx.restore();
+    }
+
     // Draw game info
     ctx.set_fill_style_str("#333");
     ctx.set_font("16px monospace");
@@ -1973,6 +2168,189 @@ pub fn render_game_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Head at (10,5), three cells left to the turn at (7,5), three cells down
+    /// to the tail at (7,8). Seven cells long, stored as three points.
+    fn l_shaped_body() -> Vec<Position> {
+        vec![
+            Position { x: 10, y: 5 },
+            Position { x: 7, y: 5 },
+            Position { x: 7, y: 8 },
+        ]
+    }
+
+    #[test]
+    fn carried_label_anchor_walks_the_compressed_body_cell_by_cell() {
+        let body = l_shaped_body();
+        let cell_at = |back| {
+            body_cell_behind_head(&body, back)
+                .expect("body is not empty")
+                .cell
+        };
+
+        // Every step is one grid cell even though the body stores only three
+        // points, and the walk turns the corner without skipping or repeating.
+        assert_eq!(cell_at(0), Position { x: 10, y: 5 });
+        assert_eq!(cell_at(1), Position { x: 9, y: 5 });
+        assert_eq!(cell_at(2), Position { x: 8, y: 5 });
+        assert_eq!(cell_at(3), Position { x: 7, y: 5 });
+        assert_eq!(cell_at(4), Position { x: 7, y: 6 });
+        assert_eq!(cell_at(6), Position { x: 7, y: 8 });
+
+        // The walk visits exactly `Snake::length` distinct cells.
+        let cells: HashSet<_> = (0..7).map(cell_at).collect();
+        assert_eq!(cells.len(), 7);
+    }
+
+    #[test]
+    fn carried_label_anchor_reports_the_axis_of_the_run_it_landed_on() {
+        let body = l_shaped_body();
+        let horizontal_at = |back| {
+            body_cell_behind_head(&body, back)
+                .expect("body is not empty")
+                .run_is_horizontal
+        };
+
+        // Cells 0..=3 sit on the horizontal run out of the head; 4 onward sit
+        // on the vertical run past the turn. The axis must come from the run
+        // the cell is on, not from the head-to-cell chord.
+        for back in 0..=3 {
+            assert!(horizontal_at(back), "cell {back} is on the horizontal run");
+        }
+        for back in 4..=6 {
+            assert!(!horizontal_at(back), "cell {back} is on the vertical run");
+        }
+    }
+
+    /// A snake that turned one cell ago has a diagonal head-to-anchor chord,
+    /// so any orientation guessed from that chord is wrong for half of all
+    /// turns. The anchor's own run is the only reliable source.
+    #[test]
+    fn carried_label_axis_is_correct_on_the_step_right_after_a_turn() {
+        // Head at (10,5): one cell left of the turn at (9,5), then straight
+        // down. The anchor two cells back is (9,6) — on the VERTICAL run —
+        // while the head-to-anchor chord is diagonal.
+        let body = vec![
+            Position { x: 10, y: 5 },
+            Position { x: 9, y: 5 },
+            Position { x: 9, y: 9 },
+        ];
+        let anchor = body_cell_behind_head(&body, 2).expect("body is not empty");
+
+        assert_eq!(anchor.cell, Position { x: 9, y: 6 });
+        assert!(
+            !anchor.run_is_horizontal,
+            "the cell behind a fresh turn lies on the vertical run"
+        );
+        // Unrotated that run is screen-vertical; the rotated team arenas
+        // flip it. Both must follow the run, not the diagonal chord.
+        assert!(!anchor_run_is_horizontal_on_screen(
+            anchor.run_is_horizontal,
+            0
+        ));
+        assert!(anchor_run_is_horizontal_on_screen(
+            anchor.run_is_horizontal,
+            270
+        ));
+    }
+
+    #[test]
+    fn carried_label_anchor_clamps_to_the_tail_and_rejects_an_empty_body() {
+        let body = l_shaped_body();
+
+        // A snake shorter than the offset clamps instead of wrapping or panicking.
+        for back in [7, 99] {
+            let anchor = body_cell_behind_head(&body, back).expect("body is not empty");
+            assert_eq!(anchor.cell, Position { x: 7, y: 8 });
+            assert!(!anchor.run_is_horizontal, "the tail run is vertical");
+        }
+        assert_eq!(body_cell_behind_head(&[], CARRIED_LABEL_OFFSET_CELLS), None);
+
+        // A zero-extent body resolves to the head, which the draw pass skips
+        // via its `anchor.cell != *head` guard rather than stamping the number
+        // on top of the dark head disc.
+        let degenerate = vec![Position { x: 3, y: 3 }, Position { x: 3, y: 3 }];
+        assert_eq!(
+            body_cell_behind_head(&degenerate, CARRIED_LABEL_OFFSET_CELLS)
+                .expect("body is not empty")
+                .cell,
+            Position { x: 3, y: 3 }
+        );
+    }
+
+    #[test]
+    fn carried_label_orientation_follows_every_arena_rotation() {
+        // Grid-horizontal stays horizontal only in the unrotated orientations;
+        // team matches default to 270/90, where the same run is screen-vertical.
+        for rotation in [0, 180] {
+            assert!(anchor_run_is_horizontal_on_screen(true, rotation));
+            assert!(!anchor_run_is_horizontal_on_screen(false, rotation));
+        }
+        for rotation in [90, 270] {
+            assert!(!anchor_run_is_horizontal_on_screen(true, rotation));
+            assert!(anchor_run_is_horizontal_on_screen(false, rotation));
+        }
+    }
+
+    #[test]
+    fn carried_label_layout_never_condenses_and_stays_within_its_clamp() {
+        // GameArena.tsx walks cell size down through the integers 15..=5, and
+        // the arena canvas is not devicePixelRatio-scaled, so these are
+        // physical pixels.
+        for cell_size in 5..=15 {
+            let cell_size = f64::from(cell_size);
+            for digits in 1..=4 {
+                for horizontal in [true, false] {
+                    let layout = carried_food_label_layout(cell_size, digits, horizontal);
+
+                    assert!(layout.font_px >= CARRIED_LABEL_MIN_PX);
+                    assert!(layout.font_px <= CARRIED_LABEL_MAX_PX);
+                    assert!(layout.font_px <= cell_size.max(CARRIED_LABEL_MIN_PX));
+                    // The halo must never eat a whole stem of a 900-weight glyph.
+                    assert!(layout.halo_px < layout.font_px * 0.25);
+
+                    // Either the number fits the room it was given, or the
+                    // legibility floor is what stopped it shrinking further.
+                    let available = if horizontal {
+                        cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
+                    } else {
+                        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+                    };
+                    let natural = layout.font_px * CARRIED_LABEL_DIGIT_ADVANCE_EM * digits as f64;
+                    assert!(
+                        natural <= available + 1e-9 || layout.font_px == CARRIED_LABEL_MIN_PX,
+                        "{digits} digits at cell {cell_size} (horizontal={horizontal}) \
+                         overflow without hitting the floor"
+                    );
+                }
+            }
+        }
+
+        // A wider number shrinks rather than condensing, and the tighter
+        // across-body room shrinks it at least as much as the roomy along-body
+        // case — which is the orientation most team-match snakes are in.
+        let one = carried_food_label_layout(10.0, 1, false);
+        let two = carried_food_label_layout(10.0, 2, false);
+        let three = carried_food_label_layout(10.0, 3, false);
+        assert!(two.font_px < one.font_px);
+        assert!(three.font_px <= two.font_px);
+        assert!(
+            carried_food_label_layout(10.0, 2, false).font_px
+                <= carried_food_label_layout(10.0, 2, true).font_px
+        );
+
+        // A single digit never shrinks at a comfortable cell size.
+        assert_eq!(carried_food_label_layout(12.0, 1, false).font_px, 12.0);
+    }
+
+    #[test]
+    fn carried_label_font_declares_the_requested_size_and_black_weight() {
+        let font = carried_food_label_font(9.0);
+
+        assert!(font.starts_with("900 9px "));
+        assert!(font.contains("Arial Black"));
+        assert!(!font.to_ascii_lowercase().contains("italic"));
+    }
 
     #[test]
     fn team_palette_distinguishes_teammates_without_crossing_team_hues() {
