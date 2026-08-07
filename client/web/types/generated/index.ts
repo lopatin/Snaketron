@@ -40,6 +40,7 @@ export * from './Snake';
 export * from './SnakeBoost';
 export * from './SnakeCrash';
 export * from './SyncStatus';
+export * from './TeamGoal';
 export * from './TeamId';
 export * from './TeamZoneConfig';
 export * from './UserInfo';

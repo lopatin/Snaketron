@@ -649,9 +649,123 @@ fn boost_sync_state() -> GameState {
     state
 }
 
+/// A team-0 snake four movement steps outside its own goal mouth, carrying
+/// three points' worth of food. Food spawning is disabled so the carried
+/// amount, and therefore the goal's value, is fixed.
+fn goal_sync_state() -> GameState {
+    let mut state = GameState::new(
+        60,
+        40,
+        GameType::TeamMatch { per_team: 1 },
+        QueueMode::Quickmatch,
+        Some(0x60A1),
+        0,
+    );
+    state
+        .add_player(1, Some("alice".to_string()))
+        .expect("add player 1");
+    state
+        .add_player(2, Some("bob".to_string()))
+        .expect("add player 2");
+    state.status = GameStatus::Started { server_id: 7 };
+    state.properties.available_food_target = 0;
+    state.arena.food.clear();
+
+    // Team 0 banks through the goal mouth at x = 9, inside the opening.
+    state.arena.snakes[0].body = vec![Position { x: 13, y: 20 }, Position { x: 16, y: 20 }];
+    state.arena.snakes[0].direction = Direction::Left;
+    state.arena.snakes[0].food = 6;
+
+    // Team 1 waits harmlessly deep in its own half.
+    state.arena.snakes[1].body = vec![Position { x: 46, y: 20 }, Position { x: 49, y: 20 }];
+    state.arena.snakes[1].direction = Direction::Left;
+
+    state
+        .validate_boost_invariants()
+        .expect("positioned state remains valid");
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Scoring is the one place where the server's full tick and a client's
+/// `movement_only` catch-up diverge structurally: the server simulates the
+/// score, death and respawn, while the client applies all three from the
+/// transport. Both sides must nonetheless agree on the state AND on the
+/// cosmetic goal cue that drives the score celebration.
+#[tokio::test]
+async fn scoring_a_goal_keeps_client_and_server_in_sync() -> Result<()> {
+    with_timeout(async {
+        let mut world = SimWorld::from_state(goal_sync_state(), TransportConfig::lossless());
+
+        // Sample while the cue is inside its retention window on both sides.
+        let mut server_cue: Option<Vec<common::TeamGoal>> = None;
+        let mut client_cue: Option<Vec<common::TeamGoal>> = None;
+        for _ in 0..40 {
+            world.run_for(100);
+            if server_cue.is_none() {
+                let goals = &world.server.committed_state().recent_goals;
+                if !goals.is_empty() {
+                    server_cue = Some(goals.clone());
+                }
+            }
+            if client_cue.is_none() {
+                let goals = &world.client().committed_state().recent_goals;
+                if !goals.is_empty() {
+                    client_cue = Some(goals.clone());
+                }
+            }
+        }
+        world.drain_and_probe();
+
+        let server_cue = server_cue.expect("the server must have recorded the goal cue");
+        assert_eq!(
+            server_cue.len(),
+            1,
+            "exactly one goal was scored: {server_cue:?}"
+        );
+        assert_eq!(server_cue[0].team_id, common::TeamId(0));
+        assert_eq!(server_cue[0].snake_id, 0);
+        assert_eq!(server_cue[0].points, 3);
+        assert_eq!(server_cue[0].position, Position { x: 9, y: 20 });
+        assert_eq!(
+            client_cue.expect("the client must have recorded the same goal cue"),
+            server_cue,
+            "movement-only catch-up must reproduce the server's cue exactly"
+        );
+
+        let status = world.client().sync_status();
+        assert!(
+            status.total_probes > 0,
+            "expected fingerprint probes to run"
+        );
+        assert_eq!(
+            status.total_mismatches, 0,
+            "scoring must not diverge; probe log: {:?}",
+            world.probe_log
+        );
+        assert!(!status.needs_resync);
+        assert_eq!(
+            world.client().committed_sync_hash(),
+            world.server.committed_sync_hash(),
+            "committed states must be identical across a goal"
+        );
+        assert_eq!(
+            world
+                .server
+                .committed_state()
+                .team_scores
+                .as_ref()
+                .and_then(|scores| scores.get(&common::TeamId(0)).copied()),
+            Some(3),
+            "the authoritative team score must match the cue's points"
+        );
+        Ok(())
+    })
+    .await
+}
 
 #[tokio::test]
 async fn lossless_transport_stays_in_sync() -> Result<()> {
