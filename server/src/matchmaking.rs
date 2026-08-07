@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::{
-    BoostConfig, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS, GameState,
-    GameType,
+    BoostConfig, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS,
+    GAME_START_COUNTDOWN_MS, GameState, GameType, MATCH_READY_WINDOW_MS,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,10 @@ use crate::matchmaking_manager::{
 use crate::matchmaking_pool::MatchmakingPool;
 
 // --- Configuration Constants ---
-const GAME_START_DELAY_MS: i64 = 3000; // 3 second countdown before game starts
+/// Anchors `GameState::start_ms`, which is the match's durable runtime
+/// identity as well as the ungated countdown origin. The readiness gate does
+/// not move it — it stamps a separate simulation epoch instead.
+const GAME_START_DELAY_MS: i64 = GAME_START_COUNTDOWN_MS;
 const FFA_MAX_RECURSION_DEPTH: usize = 8;
 const GAME_CREATED_OUTBOX_LANE_CAPACITY: usize = 1;
 
@@ -1400,6 +1403,17 @@ async fn prepare_game_from_lobbies(
     }
 
     game_state.spawn_initial_food();
+
+    // Hold the match until every player has confirmed the pre-match briefing,
+    // or the window lapses. The gate is armed here — before the state is ever
+    // published — so no code path can retro-fit one onto a running match.
+    //
+    // Synthetic load-test games are exempt: their drivers have no briefing to
+    // confirm, and making every stress match idle out the readiness window
+    // would measure the gate rather than the runtime.
+    if !game_state.is_stress_test {
+        game_state.arm_readiness_gate(Utc::now().timestamp_millis() + MATCH_READY_WINDOW_MS);
+    }
 
     let mut lobby_codes: Vec<String> = combination
         .lobbies

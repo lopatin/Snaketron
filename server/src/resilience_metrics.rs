@@ -2250,9 +2250,14 @@ mod tests {
     #[test]
     fn bounded_checkpoint_metadata_preserves_serialized_identity_and_age() {
         let prefix = expected_recovery_prefix(7, 127);
+        // Built from the live constants rather than a literal: this test pins
+        // the serialized field *order* that the bounded metadata script scans
+        // for, not the protocol version, which is expected to move.
         assert_eq!(
             prefix,
-            "{\"schema_version\":3,\"executor_protocol_version\":5,\"game_id\":127,\"partition_id\":7,"
+            format!(
+                "{{\"schema_version\":{RECOVERY_SCHEMA_VERSION},\"executor_protocol_version\":{EXECUTOR_PROTOCOL_VERSION},\"game_id\":127,\"partition_id\":7,"
+            )
         );
 
         let envelope = RecoveryEnvelopeV2::new(

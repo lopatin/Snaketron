@@ -404,6 +404,50 @@ impl GameBus {
         {
             anyhow::bail!("completed-game command gate identity mismatch");
         }
+        self.publish_unless_completed(namespace, partition_id, game_id, command)
+            .await
+    }
+
+    /// Publishes a pre-match readiness confirmation under the same
+    /// completed-game gate as gameplay commands. Readiness can only matter
+    /// before the first tick, so a confirmation racing a completion record is
+    /// pure noise and must not be appended behind it.
+    pub async fn publish_player_ready_unless_completed(
+        &self,
+        namespace: &ClusterNamespace,
+        partition_id: u32,
+        game_id: u32,
+        command: &StreamEvent,
+    ) -> Result<bool> {
+        if game_id % PARTITION_COUNT != partition_id {
+            anyhow::bail!("readiness confirmation does not belong to its target partition");
+        }
+        let StreamEvent::PlayerReadySubmitted {
+            game_id: payload_game_id,
+            ..
+        } = command
+        else {
+            anyhow::bail!("readiness gate accepts only readiness confirmations");
+        };
+        if *payload_game_id != game_id {
+            anyhow::bail!("readiness confirmation identity mismatch");
+        }
+        self.publish_unless_completed(namespace, partition_id, game_id, command)
+            .await
+    }
+
+    /// Append to the partition command stream unless the game already has an
+    /// immutable completion record. The completion key and the stream share
+    /// the partition hash slot, so one atomic Valkey transaction orders
+    /// completion against ingress even when the WebSocket and the executor
+    /// live on different ECS tasks.
+    async fn publish_unless_completed(
+        &self,
+        namespace: &ClusterNamespace,
+        partition_id: u32,
+        game_id: u32,
+        command: &StreamEvent,
+    ) -> Result<bool> {
         let payload = serde_json::to_vec(command).context("Failed to serialize game command")?;
         let mut redis = self.partition_connection(partition_id)?;
         let script = redis::Script::new(

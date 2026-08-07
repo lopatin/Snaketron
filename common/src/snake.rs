@@ -1,4 +1,7 @@
-use crate::{BOOST_TICK_INTERVAL_MS, MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, TeamId};
+use crate::{
+    BOOST_TICK_INTERVAL_MS, DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_SPEED_MILLI,
+    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, TeamId,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +111,45 @@ impl Snake {
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
             boost: SnakeBoost::default(),
+        }
+    }
+
+    /// Build a snake already posed in a given visual state, for rendering
+    /// something that is not a live match — tutorial illustrations, previews.
+    ///
+    /// This is deliberately separate from [`Snake::new`]: gameplay may only
+    /// reach a boosting state by going through the crate-private Boost
+    /// lifecycle, and that stays true. Nothing here is ever stepped, ticked,
+    /// or published, so the charge is set to a full configured tank purely so
+    /// the renderer draws the active-Boost contour.
+    pub fn for_illustration(
+        body: Vec<Position>,
+        direction: Direction,
+        team_id: Option<TeamId>,
+        food: u32,
+        is_alive: bool,
+        boost_active: bool,
+    ) -> Self {
+        Self {
+            body,
+            direction,
+            is_alive,
+            food,
+            team_id,
+            speed_milli: if boost_active {
+                DEFAULT_BOOST_SPEED_MILLI
+            } else {
+                NORMAL_SNAKE_SPEED_MILLI
+            },
+            movement_credit: 0,
+            boost: SnakeBoost {
+                charge_ms: if boost_active {
+                    DEFAULT_BOOST_CAPACITY_MS
+                } else {
+                    0
+                },
+                active: boost_active,
+            },
         }
     }
 

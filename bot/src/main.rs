@@ -514,6 +514,9 @@ where
             info!("Bot {} matched to game {}", idx + 1, id);
             *game_id = Some(id);
             send_ws(ws_writer, WSMessage::JoinGame(id)).await?;
+            // A bot has no briefing to read, and a human waiting on it would
+            // sit through the whole readiness window for nothing.
+            send_ws(ws_writer, WSMessage::PlayerReady { game_id: id }).await?;
             send_status(
                 status_tx,
                 game_idx,
@@ -525,6 +528,7 @@ where
             info!("Bot {} received MatchFound {}", idx + 1, found_id);
             *game_id = Some(found_id);
             send_ws(ws_writer, WSMessage::JoinGame(found_id)).await?;
+            send_ws(ws_writer, WSMessage::PlayerReady { game_id: found_id }).await?;
             send_status(
                 status_tx,
                 game_idx,

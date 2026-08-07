@@ -593,3 +593,251 @@
     transition: none;
   }
 }
+
+/* --- Pre-match briefing ---------------------------------------------------
+   Sits above the scoreboard (45), the game-over card (80) and the lobby modal
+   (100): while the gate holds a match, nothing else may take the screen. */
+.tutorial-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  padding: 20px;
+  animation: tutorial-backdrop-in 180ms ease-out both;
+  background: rgb(63 63 65 / 38%);
+  place-items: center;
+}
+
+.tutorial-card {
+  width: min(620px, 100%);
+  max-height: min(760px, calc(100dvh - 40px));
+  overflow: auto;
+  padding: 26px 26px 22px;
+  border: 1px solid rgb(63 63 65 / 52%);
+  border-radius: 7px;
+  animation: tutorial-card-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  background: #fff;
+  box-shadow: 0 18px 48px rgb(31 41 55 / 24%);
+}
+
+.tutorial-card:focus {
+  outline: none;
+}
+
+.tutorial-header {
+  margin-bottom: 20px;
+}
+
+.tutorial-kicker {
+  margin: 0 0 2px;
+  color: rgb(23 32 51 / 55%);
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.tutorial-title {
+  margin: 0;
+  color: #172033;
+  font-size: 30px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  line-height: 1.05;
+  text-transform: uppercase;
+}
+
+.tutorial-bullets {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  gap: 14px;
+  list-style: none;
+}
+
+.tutorial-bullet {
+  display: grid;
+  align-items: center;
+  gap: 14px;
+  grid-template-columns: 22px 150px minmax(0, 1fr);
+}
+
+.tutorial-bullet-index {
+  color: rgb(23 32 51 / 45%);
+  font-size: 19px;
+  font-style: italic;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.tutorial-bullet-art {
+  overflow: hidden;
+  height: 96px;
+  border: 1px solid rgb(63 63 65 / 22%);
+  border-radius: 4px;
+  background: #fff;
+}
+
+.tutorial-scene-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.tutorial-bullet-text {
+  margin: 0;
+  color: #172033;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.tutorial-footer {
+  display: flex;
+  align-items: center;
+  margin-top: 22px;
+  gap: 14px;
+}
+
+.tutorial-ready-button {
+  display: inline-flex;
+  min-width: 132px;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 22px;
+  border: 1px solid #172033;
+  border-radius: 5px;
+  background: #172033;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-style: italic;
+  font-weight: 900;
+  gap: 8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.tutorial-ready-button:hover:not(:disabled) {
+  background: #2a3a5c;
+}
+
+.tutorial-ready-button:disabled {
+  background: #fff;
+  color: #172033;
+  cursor: default;
+}
+
+.tutorial-ready-check {
+  font-style: normal;
+}
+
+.tutorial-status {
+  margin: 0;
+  color: rgb(23 32 51 / 62%);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Readiness marks in the live roster. The check rides on the snake glyph so
+   the roster stays a single row at the arena's narrowest widths. */
+.game-roster-player {
+  position: relative;
+}
+
+.game-roster-ready-mark {
+  position: absolute;
+  top: -2px;
+  right: 2px;
+  display: grid;
+  width: 13px;
+  height: 13px;
+  border: 1px solid rgb(63 63 65 / 34%);
+  border-radius: 999px;
+  background: #fff;
+  color: #1f8a4c;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  place-items: center;
+}
+
+.game-roster-player.is-awaiting-ready {
+  opacity: 0.55;
+}
+
+.game-controls-hint__group.is-help {
+  margin-left: auto;
+  pointer-events: auto;
+}
+
+.game-controls-hint__help {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  font-style: italic;
+  font-weight: 900;
+  line-height: 1;
+  place-items: center;
+}
+
+.game-controls-hint__help:hover {
+  border-color: #172033;
+  color: #172033;
+}
+
+@keyframes tutorial-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes tutorial-card-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (width <= 720px) {
+  .tutorial-card {
+    padding: 18px 16px 16px;
+  }
+
+  .tutorial-title {
+    font-size: 23px;
+  }
+
+  .tutorial-bullet {
+    grid-template-columns: 18px 108px minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .tutorial-bullet-art {
+    height: 70px;
+  }
+
+  .tutorial-bullet-text {
+    font-size: 13px;
+  }
+
+  .tutorial-footer {
+    flex-wrap: wrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tutorial-backdrop,
+  .tutorial-card {
+    animation: none;
+  }
+}

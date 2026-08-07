@@ -9,6 +9,13 @@ import { getWasm } from '../wasm';
 import GameHudShell from './GameHudShell';
 import GameControlsHint from './GameControlsHint';
 import LoadingScreen from './LoadingScreen';
+import TutorialModal from './TutorialModal';
+import { simulationStartMs } from '../utils/gamePresentation';
+import {
+  hasSeenTutorial,
+  markTutorialSeen,
+  tutorialContentForGame,
+} from '../utils/tutorial';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 import {
@@ -132,6 +139,10 @@ export default function GameArena() {
   const lastCrashVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
+  // The gameplay key listeners are installed once for the arena's lifetime, so
+  // they read modal ownership through a ref rather than being torn down and
+  // rebuilt every time the briefing opens or closes.
+  const isModalOwningInputRef = useRef(false);
   
   const {
     connected,
@@ -149,6 +160,7 @@ export default function GameArena() {
     queueForMatchMulti,
     isJoiningGame,
     sendRequestResync,
+    sendPlayerReady,
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
@@ -521,11 +533,14 @@ export default function GameArena() {
       
       if (
         !gameState ||
-        !isGameInteractionActive
+        !isGameInteractionActive ||
+        // A briefing owns the screen; steering commands queued behind it would
+        // fire the instant the match starts, before the player is looking.
+        isModalOwningInputRef.current
       ) {
         return;
       }
-      
+
       const status = gameState.status;
       if ((typeof status === 'object' && 'Complete' in status) || status === 'Stopped') {
         return;
@@ -748,23 +763,144 @@ export default function GameArena() {
     })();
   }, [gameEventSignal, takeGameEvents, processServerEvent, acknowledgeGameSnapshot]);
   
-  // Update countdown display
+  // Update countdown display. The clock runs off the resolved simulation
+  // epoch, not `start_ms`: with a readiness gate the two differ, and `start_ms`
+  // is already in the past by the time everyone has confirmed.
   useEffect(() => {
     const state = gameState ?? committedState;
     if (!state) return;
-    
+
+    // While the gate is pending there is no epoch yet, but the briefing shows
+    // its own auto-ready countdown, so keep re-rendering for that instead.
     const intervalId = setInterval(() => {
-      const timeLeft = state.start_ms - Date.now();
-      if (timeLeft <= 0) {
+      const epochMs = simulationStartMs(state);
+      if (epochMs !== null && epochMs - Date.now() <= 0) {
         clearInterval(intervalId);
       } else {
         // Force re-render to update countdown
         forceUpdate();
       }
     }, 100); // Update every 100ms for smooth countdown
-    
+
     return () => clearInterval(intervalId);
   }, [gameState, committedState, forceUpdate]);
+
+  // --- Pre-match briefing and readiness -----------------------------------
+  //
+  // The match a player lands in is only known once it exists (they can queue
+  // for several modes at once), so the briefing is keyed off authoritative
+  // state here rather than off anything chosen at queue time.
+  const readinessState = committedState ?? gameState;
+  const tutorial = useMemo(
+    () => (readinessState ? tutorialContentForGame(readinessState) : null),
+    [readinessState?.game_type, readinessState?.queue_mode],
+  );
+  // Spectators have no snake and the server will not accept a confirmation
+  // from them, so showing them a Ready button would be a control that can
+  // never do anything. They watch the roster fill in instead.
+  const isLocalUserPlaying = Boolean(
+    user?.id !== undefined && readinessState?.players?.[user.id],
+  );
+  const isAwaitingReadiness = readinessState?.readiness != null;
+  const localUserIsReady = Boolean(
+    user?.id !== undefined &&
+    readinessState?.readiness?.ready_user_ids.includes(user.id),
+  );
+  const readyDeadlineMs = readinessState?.readiness?.deadline_ms ?? null;
+  const pendingReadyCount = readinessState?.readiness
+    ? Object.keys(readinessState.players ?? {}).filter(
+        (userId) => !readinessState.readiness!.ready_user_ids.includes(Number(userId)),
+      ).length
+    : 0;
+
+  // Local intent, distinct from the server's record of it. A dropped
+  // confirmation or a mid-gate resync would otherwise leave a player who
+  // already pressed Ready staring at the briefing again.
+  const [readyPressedForGameId, setReadyPressedForGameId] = useState<string | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const hasPressedReady = readyPressedForGameId === gameId;
+
+  useEffect(() => {
+    setReadyPressedForGameId((pressed) => (pressed === gameId ? pressed : null));
+    setHelpOpen(false);
+  }, [gameId]);
+
+  const confirmReady = useCallback(() => {
+    setReadyPressedForGameId(gameId);
+    if (tutorial) {
+      markTutorialSeen(tutorial.key);
+    }
+    sendPlayerReady(gameId);
+  }, [gameId, sendPlayerReady, tutorial]);
+
+  // A player who has already seen this mode's briefing is readied for them, so
+  // veterans never wait on a screen they have read before. The gate still runs
+  // for every match, which is what makes the roster checkmarks meaningful.
+  useEffect(() => {
+    if (
+      !isGameInteractionActive ||
+      !isAwaitingReadiness ||
+      !isLocalUserPlaying ||
+      !tutorial ||
+      hasPressedReady ||
+      localUserIsReady ||
+      !hasSeenTutorial(tutorial.key)
+    ) {
+      return;
+    }
+    confirmReady();
+  }, [
+    confirmReady,
+    hasPressedReady,
+    isAwaitingReadiness,
+    isGameInteractionActive,
+    isLocalUserPlaying,
+    localUserIsReady,
+    tutorial,
+  ]);
+
+  // Self-healing resend: the server drops a readiness it has already recorded,
+  // so re-asserting a local press the authoritative state does not reflect is
+  // safe and closes the gap left by a lost message or a snapshot resync.
+  useEffect(() => {
+    if (
+      !isGameInteractionActive ||
+      !isAwaitingReadiness ||
+      !isLocalUserPlaying ||
+      !hasPressedReady ||
+      localUserIsReady
+    ) {
+      return undefined;
+    }
+    const resend = window.setInterval(() => sendPlayerReady(gameId), 2000);
+    return () => window.clearInterval(resend);
+  }, [
+    gameId,
+    hasPressedReady,
+    isAwaitingReadiness,
+    isGameInteractionActive,
+    isLocalUserPlaying,
+    localUserIsReady,
+    sendPlayerReady,
+  ]);
+
+  const showBriefing = Boolean(
+    tutorial &&
+    isAwaitingReadiness &&
+    isLocalUserPlaying &&
+    isGameInteractionActive &&
+    !gameOver,
+  );
+  const showHelp = Boolean(tutorial && helpOpen && !showBriefing);
+
+  // A briefing supersedes the help screen rather than hiding it. Without this
+  // the suppressed help modal would spring back over live gameplay the moment
+  // the gate resolved, blocking input with no obvious cause.
+  useEffect(() => {
+    if (showBriefing && helpOpen) {
+      setHelpOpen(false);
+    }
+  }, [showBriefing, helpOpen]);
 
   const handleSendGameChat = useCallback((message: string) => {
     if (!isGameInteractionActive) {
@@ -785,10 +921,13 @@ export default function GameArena() {
       : isJoiningGame || isAwaitingCurrentSnapshot
         ? 'Joining game...'
         : 'Preparing arena...';
-  let timeUntilStart = countdownState ? countdownState.start_ms - Date.now() : 0;
+  const countdownEpochMs = countdownState ? simulationStartMs(countdownState) : null;
+  const timeUntilStart = countdownEpochMs === null ? 0 : countdownEpochMs - Date.now();
 
-  const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
-  const showCountdown = countdownState ? countdownSeconds > 0 : false;
+  const countdownSeconds = countdownEpochMs === null ? 0 : Math.ceil(timeUntilStart / 1000);
+  // A match still held by the readiness gate has no countdown to show — the
+  // briefing owns the screen until it resolves.
+  const showCountdown = countdownSeconds > 0;
 
   // HUD state is read from predicted Rust state so Space/touch activation is
   // immediate and still retracts naturally if the authoritative server
@@ -808,6 +947,9 @@ export default function GameArena() {
     currentStatus === 'Stopped' ||
     (typeof currentStatus === 'object' && currentStatus !== null && 'Complete' in currentStatus),
   );
+  // A modal owns the screen: Space belongs to its Ready button, not to Boost.
+  const isModalOwningInput = showBriefing || showHelp;
+  isModalOwningInputRef.current = isModalOwningInput;
   const boostInputContext: BoostInputContext = {
     active: Boolean(localSnake?.boost.active),
     canActivate: Boolean(
@@ -816,12 +958,14 @@ export default function GameArena() {
       localSnake.boost.charge_ms > 0 &&
       !localSnake.boost.active &&
       isGameInteractionActive &&
+      !isModalOwningInput &&
       !isBoostGameTerminal
     ),
     interactionActive: Boolean(
       boostConfig &&
       localSnake?.is_alive &&
       isGameInteractionActive &&
+      !isModalOwningInput &&
       !isBoostGameTerminal
     ),
     gameOver: isBoostGameTerminal,
@@ -1284,10 +1428,27 @@ export default function GameArena() {
             showBoost={Boolean(boostConfig)}
             boostInputMode={boostInputMode}
             onBoostInputModeChange={handleBoostInputModeChange}
+            onOpenHelp={tutorial ? () => setHelpOpen(true) : undefined}
           />
         </div>
 
       </>
+      {tutorial && (
+        <TutorialModal
+          open={showBriefing || showHelp}
+          content={tutorial}
+          variant={showBriefing ? 'briefing' : 'reference'}
+          autoReadySeconds={
+            showBriefing && readyDeadlineMs !== null
+              ? Math.max(0, Math.ceil((readyDeadlineMs - Date.now()) / 1000))
+              : null
+          }
+          pendingCount={pendingReadyCount}
+          isReady={localUserIsReady || hasPressedReady}
+          onReady={confirmReady}
+          onClose={() => setHelpOpen(false)}
+        />
+      )}
       <ChatPanel
         title="Game Chat"
         messages={gameChatMessages}

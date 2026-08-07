@@ -253,6 +253,36 @@ impl GameEngine {
         self.predicted_state.as_ref()
     }
 
+    /// Apply a pre-match readiness transition to the authoritative committed
+    /// state. The owning executor calls this as the local half of the event it
+    /// is about to publish, so its own state and every replica converge on one
+    /// implementation of the transition.
+    ///
+    /// Deliberately narrow: readiness is the only state the executor mutates
+    /// outside the simulation, and it can only do so before tick 1. Anything
+    /// else must go through `run_until`.
+    pub fn apply_pre_match_readiness_event(&mut self, event: GameEvent) -> Result<()> {
+        if !matches!(
+            event,
+            GameEvent::PlayerReady { .. } | GameEvent::MatchStartScheduled { .. }
+        ) {
+            return Err(anyhow::anyhow!(
+                "only readiness transitions may be applied outside the simulation"
+            ));
+        }
+        if self.committed_state.current_tick() != 0 {
+            return Err(anyhow::anyhow!(
+                "the readiness gate cannot be touched after the simulation has started"
+            ));
+        }
+
+        self.committed_state.apply_event(event, None);
+        // The epoch this state starts from may have just changed, so any
+        // prediction built against the old one is stale.
+        self.prediction_needs_rebuild = true;
+        Ok(())
+    }
+
     /// Process a local command with client-side prediction
     pub fn process_local_command(&mut self, command: GameCommand) -> Result<GameCommandMessage> {
         let Some(player_id) = self.local_player_id else {
@@ -451,8 +481,14 @@ impl GameEngine {
 
     /// Rebuild predicted state from committed state and advance to current time
     pub fn rebuild_predicted_state(&mut self, current_ts: i64) -> Result<()> {
-        // Handle pre-start case: if current time is before start time, don't advance
-        let elapsed_ms = current_ts - self.committed_state.start_ms;
+        // Handle pre-start case: if current time is before start time, don't
+        // advance. `simulation_start_ms` returns None while the pre-match
+        // readiness gate holds the match, which parks prediction here exactly
+        // as a not-yet-reached start time does.
+        let elapsed_ms = match self.committed_state.simulation_start_ms() {
+            Some(epoch) => current_ts - epoch,
+            None => -1,
+        };
         if elapsed_ms < 0 {
             if self.prediction_needs_rebuild {
                 let mut new_predicted_state = self.committed_state.clone();
@@ -526,8 +562,14 @@ impl GameEngine {
     ) -> Result<Vec<(u32, u64, GameEvent)>> {
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms;
 
-        // Handle pre-start case: if current time is before start time, don't advance
-        let elapsed_ms = ts_ms - self.committed_state.start_ms;
+        // Handle pre-start case: if current time is before start time, don't
+        // advance. A match still held by the readiness gate has no simulation
+        // epoch at all and is treated identically — no ticks, no events — on
+        // the authoritative executor and in every client engine alike.
+        let Some(simulation_epoch_ms) = self.committed_state.simulation_start_ms() else {
+            return Ok(Vec::new());
+        };
+        let elapsed_ms = ts_ms - simulation_epoch_ms;
         if elapsed_ms < 0 {
             return Ok(Vec::new());
         }
@@ -585,12 +627,17 @@ impl GameEngine {
     /// engine's intentional committed-state lag window is applied. A terminal
     /// or not-yet-started game has no scheduler lag.
     pub fn authoritative_scheduler_lag_ms(&self, ts_ms: i64) -> u64 {
-        if self.committed_state.is_complete() || ts_ms < self.committed_state.start_ms {
+        // A match still held by the readiness gate has no simulation epoch, so
+        // it is "not yet started" and by definition cannot be running late.
+        let Some(simulation_epoch_ms) = self.committed_state.simulation_start_ms() else {
+            return 0;
+        };
+        if self.committed_state.is_complete() || ts_ms < simulation_epoch_ms {
             return 0;
         }
 
         let tick_duration_ms = self.committed_state.properties.tick_duration_ms.max(1);
-        let elapsed_ms = ts_ms.saturating_sub(self.committed_state.start_ms);
+        let elapsed_ms = ts_ms.saturating_sub(simulation_epoch_ms);
         let wallclock_target_tick =
             u32::try_from(elapsed_ms / i64::from(tick_duration_ms)).unwrap_or(u32::MAX);
         let lagged_target_tick =

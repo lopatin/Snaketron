@@ -1,4 +1,5 @@
 mod render;
+mod tutorial;
 
 use common::{Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState};
 use wasm_bindgen::prelude::*;

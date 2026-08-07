@@ -249,6 +249,16 @@ impl ServerReplay {
                     advance(&mut engine, *ts_ms, &mut emitted)?;
                     match &msg.event {
                         GameEvent::Snapshot { .. } => {}
+                        // Readiness is authored by the executor out of band,
+                        // not derived by the engine, so there is nothing to
+                        // compare it against. Apply it instead: a trace of a
+                        // gated match anchors on a held state, and without the
+                        // recorded release the replayed engine would never
+                        // reach its first tick and every trace would read as
+                        // engine nondeterminism.
+                        GameEvent::PlayerReady { .. } | GameEvent::MatchStartScheduled { .. } => {
+                            engine.apply_pre_match_readiness_event(msg.event.clone())?;
+                        }
                         GameEvent::TickHash { hash, .. } => {
                             events_compared += 1;
                             if engine.current_tick() != msg.tick {

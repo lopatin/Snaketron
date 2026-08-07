@@ -34,5 +34,16 @@ pub const DEFAULT_FOOD_TARGET: usize = 10;
 /// Default time limit for team games in milliseconds (1 minute 30 seconds)
 pub const DEFAULT_TEAM_TIME_LIMIT_MS: u32 = 90_000;
 
+/// Countdown between the moment a match is cleared to begin and its first
+/// simulated tick. Matchmaking uses it to anchor `GameState::start_ms`, and the
+/// executor reuses it when the pre-match readiness gate resolves, so both
+/// paths present the same "Starting in 3..." countdown to players.
+pub const GAME_START_COUNTDOWN_MS: i64 = 3_000;
+
+/// How long the pre-match readiness gate waits for every player to confirm
+/// before starting anyway. A player who never answers — closed tab, lost
+/// focus, walked away — must not be able to hold a match hostage.
+pub const MATCH_READY_WINDOW_MS: i64 = 15_000;
+
 /// Quickmatch time limit for team games in milliseconds (1 minute 30 seconds)
 pub const DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS: u32 = 90_000;

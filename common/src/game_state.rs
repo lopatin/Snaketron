@@ -208,6 +208,21 @@ pub enum GameEvent {
     StatusUpdated {
         status: GameStatus,
     },
+    /// A player confirmed they have read the pre-match briefing and are ready.
+    /// Idempotent: re-delivery of an already-recorded readiness is a no-op, so
+    /// the at-least-once transport cannot corrupt the gate.
+    PlayerReady {
+        user_id: u32,
+    },
+    /// The pre-match readiness gate resolved — every player confirmed, or the
+    /// deadline lapsed — and the simulation is now scheduled to begin at
+    /// `simulation_epoch_ms`. `start_ms` is deliberately left untouched: it is
+    /// the durable runtime game identity that join authorization compares
+    /// against, so it must never move once a match exists.
+    MatchStartScheduled {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+        simulation_epoch_ms: i64,
+    },
     ScoreUpdated {
         snake_id: u32,
         score: u32,
@@ -982,6 +997,38 @@ pub struct GameState {
     /// never inflate this metric.
     #[serde(default)]
     pub player_action_counts: HashMap<u32, u32>,
+
+    /// Pre-match readiness gate. Present from match creation until every
+    /// player has confirmed or the deadline lapses, then cleared for good.
+    /// `None` also covers matches created before this protocol existed, which
+    /// therefore start straight off `start_ms` exactly as they used to.
+    #[serde(default)]
+    pub readiness: Option<MatchReadiness>,
+
+    /// Wall clock at which simulation actually begins, once the readiness gate
+    /// has resolved. `None` means "use `start_ms`" — either the gate is still
+    /// holding the match (in which case nothing may advance at all) or the
+    /// match never had a gate.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(type = "number | null"))]
+    pub simulation_epoch_ms: Option<i64>,
+}
+
+/// The pre-match readiness gate: who still has to confirm, and when the match
+/// gives up waiting.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct MatchReadiness {
+    /// Absolute wall clock after which the gate resolves regardless of who is
+    /// still missing.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub deadline_ms: i64,
+    /// Users who have confirmed. Serialized sorted so two servers holding the
+    /// same logical state produce byte-identical snapshots.
+    #[serde(default, serialize_with = "sorted_hash_set::serialize")]
+    #[cfg_attr(feature = "ts-gen", ts(type = "Array<number>"))]
+    pub ready_user_ids: HashSet<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -1154,6 +1201,8 @@ impl GameState {
 
             player_xp: HashMap::new(),
             player_action_counts: HashMap::new(),
+            readiness: None,
+            simulation_epoch_ms: None,
         };
 
         // `new` predates fallible match construction. Keep its API stable but
@@ -1532,9 +1581,21 @@ impl GameState {
                 }
                 Ok(())
             }
+            // A replicated readiness confirmation must name a real player of
+            // this match. Accepting an arbitrary user id would let a corrupted
+            // or spoofed delta pad the ready set and release the gate early.
+            GameEvent::PlayerReady { user_id } => {
+                if !self.players.contains_key(user_id) {
+                    return Err(anyhow::anyhow!(
+                        "replicated readiness references user {user_id}, who is not a player"
+                    ));
+                }
+                Ok(())
+            }
             GameEvent::FoodSpawned { .. }
             | GameEvent::CommandRejected { .. }
             | GameEvent::StatusUpdated { .. }
+            | GameEvent::MatchStartScheduled { .. }
             | GameEvent::XPAwarded { .. }
             | GameEvent::TickHash { .. } => Ok(()),
         }
@@ -1943,6 +2004,77 @@ impl GameState {
 
     pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
         self.add_player_with_team(user_id, username, None)
+    }
+
+    /// Arm the pre-match readiness gate. Called once at match creation, before
+    /// the state is ever published, so no caller can retro-fit a gate onto a
+    /// running match.
+    pub fn arm_readiness_gate(&mut self, deadline_ms: i64) {
+        self.readiness = Some(MatchReadiness {
+            deadline_ms,
+            ready_user_ids: HashSet::new(),
+        });
+        self.simulation_epoch_ms = None;
+    }
+
+    /// Wall clock at which the simulation starts, or `None` while the
+    /// readiness gate still holds the match. Both the authoritative executor
+    /// and every client engine read the epoch through this one accessor, so a
+    /// held match cannot advance on one side and not the other.
+    pub fn simulation_start_ms(&self) -> Option<i64> {
+        if self.readiness.is_some() {
+            return None;
+        }
+        Some(self.simulation_epoch_ms.unwrap_or(self.start_ms))
+    }
+
+    /// Whether the match is still waiting on the readiness gate.
+    pub fn is_awaiting_readiness(&self) -> bool {
+        self.readiness.is_some()
+    }
+
+    /// Whether `user_id` has confirmed readiness. Always false once the gate
+    /// has resolved — readiness is a pre-match concept and is not retained.
+    pub fn is_user_ready(&self, user_id: u32) -> bool {
+        self.readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.ready_user_ids.contains(&user_id))
+    }
+
+    /// Players who have not yet confirmed. Spectators are never included: they
+    /// have no snake and must not be able to hold a match.
+    pub fn players_pending_ready(&self) -> Vec<u32> {
+        let Some(readiness) = self.readiness.as_ref() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<u32> = self
+            .players
+            .keys()
+            .copied()
+            .filter(|user_id| !readiness.ready_user_ids.contains(user_id))
+            .collect();
+        pending.sort_unstable();
+        pending
+    }
+
+    /// Whether the gate may resolve now: everyone confirmed, the deadline
+    /// lapsed, or (defensively) the match somehow has no players at all.
+    pub fn readiness_gate_resolves_at(&self, now_ms: i64) -> bool {
+        match self.readiness.as_ref() {
+            None => false,
+            Some(readiness) => {
+                now_ms >= readiness.deadline_ms || self.players_pending_ready().is_empty()
+            }
+        }
+    }
+
+    /// Whether recording `user_id` as ready would change anything. Guards the
+    /// executor against republishing an event for a duplicate delivery.
+    pub fn accepts_ready_from(&self, user_id: u32) -> bool {
+        self.readiness
+            .as_ref()
+            .is_some_and(|readiness| !readiness.ready_user_ids.contains(&user_id))
+            && self.players.contains_key(&user_id)
     }
 
     pub fn add_spectator(&mut self, user_id: u32, username: Option<String>) {
@@ -2737,6 +2869,25 @@ impl GameState {
                 self.status = status;
             }
 
+            // Both readiness events are idempotent by construction: inserting
+            // into a set and clearing an `Option`. A duplicate delivery from
+            // the at-least-once transport therefore cannot corrupt the gate,
+            // and a late one cannot reopen a match that already started.
+            GameEvent::PlayerReady { user_id } => {
+                if let Some(readiness) = self.readiness.as_mut() {
+                    readiness.ready_user_ids.insert(user_id);
+                }
+            }
+
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms,
+            } => {
+                if self.readiness.is_some() {
+                    self.readiness = None;
+                    self.simulation_epoch_ms = Some(simulation_epoch_ms);
+                }
+            }
+
             GameEvent::ScoreUpdated { snake_id, score } => {
                 self.scores.insert(snake_id, score);
             }
@@ -2793,6 +2944,205 @@ impl GameState {
             // Pure observability signal; state is never mutated by it.
             GameEvent::TickHash { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    const DEADLINE_MS: i64 = 10_000;
+
+    fn gated_duel(player_count: u32) -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            1_000,
+        );
+        for user_id in 1..=player_count {
+            state
+                .add_player(user_id, Some(format!("player-{user_id}")))
+                .expect("add player");
+        }
+        state.arm_readiness_gate(DEADLINE_MS);
+        state
+    }
+
+    #[test]
+    fn an_ungated_match_starts_off_its_immutable_start_ms() {
+        let state = gated_duel(0);
+        let mut ungated = state.clone();
+        ungated.readiness = None;
+
+        assert_eq!(ungated.simulation_start_ms(), Some(ungated.start_ms));
+        assert!(!ungated.is_awaiting_readiness());
+    }
+
+    #[test]
+    fn a_gated_match_has_no_simulation_epoch_until_the_gate_resolves() {
+        let mut state = gated_duel(2);
+
+        assert!(state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), None);
+        assert_eq!(state.players_pending_ready(), vec![1, 2]);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(state.is_user_ready(1));
+        assert_eq!(state.players_pending_ready(), vec![2]);
+        assert_eq!(state.simulation_start_ms(), None);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        assert!(state.players_pending_ready().is_empty());
+        // Everyone has confirmed, but the epoch is stamped by the executor's
+        // explicit MatchStartScheduled — never inferred by a replica.
+        assert_eq!(state.simulation_start_ms(), None);
+
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 25_000,
+            },
+            None,
+        );
+        assert!(!state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), Some(25_000));
+    }
+
+    /// `start_ms` is the durable runtime game identity: join authorization
+    /// denies a game whose `start_ms` moved, and completion records key off
+    /// it. Releasing the gate must therefore never touch it.
+    #[test]
+    fn resolving_the_gate_leaves_start_ms_untouched() {
+        let mut state = gated_duel(1);
+        let original_start_ms = state.start_ms;
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: original_start_ms + 60_000,
+            },
+            None,
+        );
+
+        assert_eq!(state.start_ms, original_start_ms);
+        assert_eq!(
+            state.simulation_start_ms(),
+            Some(original_start_ms + 60_000)
+        );
+    }
+
+    #[test]
+    fn readiness_events_are_idempotent_under_at_least_once_delivery() {
+        let mut state = gated_duel(2);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert_eq!(state.players_pending_ready(), vec![2]);
+        assert!(!state.accepts_ready_from(1));
+        assert!(state.accepts_ready_from(2));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 30_000,
+            },
+            None,
+        );
+        // A late duplicate must not reopen a match that already started.
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 90_000,
+            },
+            None,
+        );
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+
+        assert!(!state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), Some(30_000));
+    }
+
+    #[test]
+    fn the_deadline_resolves_the_gate_even_with_players_still_missing() {
+        let state = gated_duel(2);
+
+        assert!(!state.readiness_gate_resolves_at(DEADLINE_MS - 1));
+        assert!(state.readiness_gate_resolves_at(DEADLINE_MS));
+        assert!(state.readiness_gate_resolves_at(DEADLINE_MS + 5_000));
+    }
+
+    #[test]
+    fn the_gate_resolves_early_once_every_player_confirms() {
+        let mut state = gated_duel(2);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(!state.readiness_gate_resolves_at(0));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        assert!(state.readiness_gate_resolves_at(0));
+    }
+
+    /// Spectators have no snake. Letting one confirm — or, worse, counting one
+    /// as pending — would either be meaningless or would hold every match
+    /// containing a spectator until the deadline lapsed.
+    #[test]
+    fn spectators_neither_hold_nor_release_the_gate() {
+        let mut state = gated_duel(1);
+        state.add_spectator(99, Some("watcher".into()));
+
+        assert_eq!(state.players_pending_ready(), vec![1]);
+        assert!(!state.accepts_ready_from(99));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(state.readiness_gate_resolves_at(0));
+    }
+
+    #[test]
+    fn a_replicated_readiness_for_a_non_player_is_rejected() {
+        let mut state = gated_duel(1);
+
+        assert!(
+            state
+                .try_apply_replicated_event(GameEvent::PlayerReady { user_id: 1 })
+                .is_ok()
+        );
+        let error = state
+            .try_apply_replicated_event(GameEvent::PlayerReady { user_id: 4_242 })
+            .expect_err("a non-player must not be able to pad the ready set");
+        assert!(error.to_string().contains("not a player"));
+        assert!(state.is_awaiting_readiness());
+    }
+
+    /// Games persisted before this protocol existed deserialize with no gate
+    /// and must keep starting exactly as they did.
+    #[test]
+    fn states_without_readiness_fields_deserialize_ungated() {
+        let mut state = gated_duel(1);
+        state.readiness = None;
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("readiness");
+        object.remove("simulation_epoch_ms");
+
+        let restored: GameState = serde_json::from_value(json).unwrap();
+        assert!(!restored.is_awaiting_readiness());
+        assert_eq!(restored.simulation_start_ms(), Some(restored.start_ms));
+    }
+
+    #[test]
+    fn the_ready_set_serializes_in_a_stable_order() {
+        let mut state = gated_duel(3);
+        for user_id in [3, 1, 2] {
+            state.apply_event(GameEvent::PlayerReady { user_id }, None);
+        }
+
+        let json = serde_json::to_string(&state.readiness).unwrap();
+        assert!(
+            json.contains("[1,2,3]"),
+            "ready set must serialize sorted so replicas agree byte-for-byte: {json}"
+        );
     }
 }
 

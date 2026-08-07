@@ -29,6 +29,7 @@ export * from './LeaderboardResponse';
 export * from './LobbyChatBroadcast';
 export * from './LobbyMember';
 export * from './LobbyPreferences';
+export * from './MatchReadiness';
 export * from './MatchmakingPool';
 export * from './Player';
 export * from './Position';

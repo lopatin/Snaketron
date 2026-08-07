@@ -160,6 +160,13 @@ pub enum WSMessage {
         #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         socket_generation: u64,
     },
+    /// Client -> server: this player has read the pre-match briefing and is
+    /// ready. `game_id` is echoed back for client-side routing only — the
+    /// gateway canonicalizes it, and the player's identity, from the
+    /// authenticated connection before publishing anything.
+    PlayerReady {
+        game_id: u32,
+    },
     /// Client -> server: the client detected message loss or state divergence
     /// (stream_seq gap, repeated TickHash mismatch, or a silent feed) and
     /// needs its event subscription restarted with a fresh snapshot.
@@ -4186,6 +4193,63 @@ async fn process_ws_message(
                         };
                         let json_msg = serde_json::to_string(&response)?;
                         ws_tx.send(Message::Text(json_msg.into())).await?;
+                    }
+
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+                WSMessage::PlayerReady {
+                    game_id: claimed_game_id,
+                } => {
+                    // `game_id: Some(g)` on this connection means
+                    // `authorize_game_join` already proved this user belongs to
+                    // game g. The claimed id is logged and discarded; whether
+                    // the user is a *player* rather than a spectator is decided
+                    // by the executor, which holds the authoritative state.
+                    if let Some(game_id) = game_id {
+                        let user_id = metadata.user_id as u32;
+                        if claimed_game_id != game_id {
+                            warn!(
+                                claimed_game_id,
+                                authenticated_game_id = game_id,
+                                user_id,
+                                "Discarding untrusted game id on a readiness confirmation"
+                            );
+                        }
+                        let partition_id = game_id % PARTITION_COUNT;
+                        let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
+                        // A dropped confirmation costs the player nothing worse
+                        // than waiting out the readiness deadline, so unlike a
+                        // gameplay command this must not tear down the socket.
+                        match game_bus
+                            .publish_player_ready_unless_completed(
+                                cluster_namespace,
+                                partition_id,
+                                game_id,
+                                &event,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(
+                                    game_id,
+                                    user_id, "Readiness arrived after the game completed"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
+                            }
+                        }
+                    } else {
+                        warn!(
+                            user_id = metadata.user_id,
+                            claimed_game_id, "Readiness confirmation outside a joined game"
+                        );
                     }
 
                     Ok(ConnectionState::Authenticated {

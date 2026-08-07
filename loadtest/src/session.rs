@@ -2915,6 +2915,13 @@ async fn play_session_inner(
         .await
     {
         Ok(()) => {
+            // Synthetic sessions have no pre-match briefing to read. Stress
+            // pool games are not gated at all, but a load test pointed at the
+            // ordinary pool would otherwise idle out the readiness window
+            // before every match and measure the gate instead of the runtime.
+            let _ = session
+                .send_cancellable(WSMessage::PlayerReady { game_id }, cancellation)
+                .await;
             wait_for_game_snapshot(session, game_id, settings.queue_timeout, cancellation).await
         }
         Err(error) => Err(SnapshotWaitError::Retryable(

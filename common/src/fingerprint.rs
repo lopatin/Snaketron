@@ -16,6 +16,12 @@
 //!   differently by design.
 //! - `usernames`, `spectators`, `game_code`, `host_user_id`, `start_ms`:
 //!   cosmetic or static; not gameplay state.
+//! - `readiness` and `simulation_epoch_ms`: the pre-match readiness gate.
+//!   Both resolve before tick 1, so hashing them would compare states across
+//!   the window where a `PlayerReady` event is legitimately still in flight
+//!   and report divergence for ordinary transport latency. A gate that did
+//!   genuinely disagree is still caught, because `tick` is hashed and the two
+//!   sides would start simulating at different times.
 
 use crate::game_state::{GameCommand, GameState, GameStatus};
 

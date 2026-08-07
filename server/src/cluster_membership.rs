@@ -15,7 +15,13 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 5;
+/// Bumped for the pre-match readiness gate. `GameState::readiness` and
+/// `simulation_epoch_ms` both default to `None`, so a previous-version
+/// executor would deserialize a *held* checkpoint as an ungated match and
+/// simulate the entire elapsed gate window in one burst. The version gate
+/// makes it refuse the envelope instead, and keeps mixed-version executors
+/// from co-owning partitions during a rolling deploy.
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 6;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);

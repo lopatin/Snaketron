@@ -3,6 +3,7 @@ import type { Arena } from "./Arena";
 import type { GameProperties } from "./GameProperties";
 import type { GameStatus } from "./GameStatus";
 import type { GameType } from "./GameType";
+import type { MatchReadiness } from "./MatchReadiness";
 import type { Player } from "./Player";
 import type { QueueMode } from "./QueueMode";
 import type { SnakeCrash } from "./SnakeCrash";
@@ -20,4 +21,18 @@ is_stress_test: boolean, properties: GameProperties, players: { [key in number]?
  * Transport retries, rejected commands, and gameplay no-ops therefore
  * never inflate this metric.
  */
-player_action_counts: { [key in number]?: number }, };
+player_action_counts: { [key in number]?: number },
+/**
+ * Pre-match readiness gate. Present from match creation until every
+ * player has confirmed or the deadline lapses, then cleared for good.
+ * `None` also covers matches created before this protocol existed, which
+ * therefore start straight off `start_ms` exactly as they used to.
+ */
+readiness: MatchReadiness | null,
+/**
+ * Wall clock at which simulation actually begins, once the readiness gate
+ * has resolved. `None` means "use `start_ms`" — either the gate is still
+ * holding the match (in which case nothing may advance at all) or the
+ * match never had a gate.
+ */
+simulation_epoch_ms: number | null, };
