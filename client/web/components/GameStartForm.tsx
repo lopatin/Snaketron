@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
+import { PlayersOnline } from './PlayersOnline';
 import { LobbyPreferences, LobbyGameMode } from '../types';
 import {
   DEFAULT_LOBBY_PREFERENCES,
@@ -38,6 +39,8 @@ interface GameStartFormProps {
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
   errorMessage?: string | null;
+  /** Live global player population; `null` while it is still unknown. */
+  playersOnline?: number | null;
 }
 
 export const GameStartForm: React.FC<GameStartFormProps> = ({
@@ -49,6 +52,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   lobbyPreferences,
   onPreferencesChange,
   errorMessage = null,
+  playersOnline = null,
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
@@ -223,8 +227,9 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
-      {/* Logo */}
-      <div className="flex flex-col items-center mb-8">
+      {/* Logo. No bottom margin: the panel's own top padding is the whole gap
+          above the indicator, so it matches the indicator's bottom margin. */}
+      <div className="flex flex-col items-center">
         <img src="/SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
         <p className="mt-3 text-xs font-bold italic uppercase tracking-1 text-gray-500">
           Competitive multiplayer Snake
@@ -232,6 +237,9 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       </div>
 
       <div className="p-8">
+        {/* Live population, inset into the rule that divides identity from input */}
+        <PlayersOnline count={playersOnline} />
+
         {/* Nickname Input */}
         <div className="mb-8 relative">
           <input
