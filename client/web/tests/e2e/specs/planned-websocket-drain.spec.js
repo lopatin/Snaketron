@@ -446,8 +446,12 @@ async function expectOldSocketUsableWithoutOverlay(page, oldSocketIndex) {
   });
 }
 
-async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
-  await page.goto('/play/42');
+async function establishActiveGame(
+  page,
+  initialFrame = snapshot(10, 5),
+  route = '/play/42',
+) {
+  await page.goto(route);
   await expect.poll(() => page.evaluate(() => (
     window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
   ))).toBeGreaterThanOrEqual(0);
@@ -745,6 +749,8 @@ test('the pre-match guide reveals one animated real-arena step at a time', async
   const canvas = page.getByTestId('tutorial-scene-canvas');
 
   await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-prototype', 'lens');
+  await expect(page.getByTestId('tutorial-prototype-switch')).toHaveCount(0);
   await expect(modal).toHaveAttribute('data-step', '1');
   await expect(modal.getByRole('heading', { name: 'Duel' })).toBeVisible();
   await expect(modal.getByRole('heading', { name: 'BANK POINTS' })).toBeVisible();
@@ -829,6 +835,141 @@ test('reduced motion holds tutorial scenes on their authored poster frame', asyn
   expect(bounds.left).toBeGreaterThanOrEqual(0);
   expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth);
   expect(bounds.bottom).toBeLessThanOrEqual(bounds.viewportHeight);
+});
+
+test('review URLs compare three tutorial prototypes without changing gameplay state', async ({ page }) => {
+  const socketIndex = await establishActiveGame(
+    page,
+    tutorialSnapshot(),
+    '/play/42?tutorial-prototype=manual',
+  );
+  const modal = page.getByTestId('tutorial-modal');
+  const switcher = page.getByTestId('tutorial-prototype-switch');
+  const joinGameCount = (await socketMessages(page, socketIndex, 'JoinGame')).length;
+
+  await expect(modal).toHaveAttribute('data-prototype', 'manual');
+  await expect(modal).toHaveAttribute('data-step', '1');
+  await expect(modal).toHaveAttribute('data-revealed', '1');
+  await expect(switcher).toBeVisible();
+  await expect(modal.locator('.tutorial-manual-lesson')).toHaveCount(3);
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(1);
+  await expect(modal.locator('[data-playback-mode="play"]')).toHaveCount(1);
+
+  await modal.getByRole('button', { name: 'Reveal BOOST' }).click();
+  await expect(modal).toHaveAttribute('data-step', '2');
+  await expect(modal).toHaveAttribute('data-revealed', '2');
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('1');
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(2);
+  await expect(modal.locator('[data-playback-mode="play"]')).toHaveCount(1);
+  await expect(modal.locator('[data-playback-mode="poster"]')).toHaveCount(1);
+  await expect(modal.locator('[data-playback-mode="poster"]')).toHaveAttribute(
+    'data-playback',
+    'complete',
+  );
+
+  // Prototype controls own their focused arrow keys instead of moving the
+  // lesson or leaking a turn into gameplay.
+  await switcher.getByRole('button', { name: 'Field manual' }).focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-step', '2');
+
+  await switcher.getByRole('button', { name: 'Coach rail' }).click();
+  await expect(modal).toHaveAttribute('data-prototype', 'coach');
+  await expect(modal).toHaveAttribute('data-step', '2');
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(1);
+  await expect.poll(() => new URL(page.url()).searchParams.get('tutorial-prototype'))
+    .toBe('coach');
+
+  await modal.getByRole('button', { name: 'Step 3: WIN' }).click();
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('2');
+
+  // Manual must synchronously reveal the lesson selected in another layout;
+  // there should be no blank intermediate paint while its effect catches up.
+  await switcher.getByRole('button', { name: 'Field manual' }).click();
+  await expect(modal).toHaveAttribute('data-prototype', 'manual');
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect(modal).toHaveAttribute('data-revealed', '3');
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(3);
+  await expect(modal.locator('[data-playback-mode="play"]')).toHaveCount(1);
+  await expect(modal.locator('[data-playback-mode="poster"]')).toHaveCount(2);
+
+  await switcher.getByRole('button', { name: 'Arena lens' }).click();
+  await expect(modal).toHaveAttribute('data-prototype', 'lens');
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(1);
+
+  await switcher.getByRole('button', { name: 'Field manual' }).click();
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect(modal).toHaveAttribute('data-revealed', '3');
+  await expect(modal.getByTestId('tutorial-scene-canvas')).toHaveCount(3);
+  await expect(modal.locator('[data-playback-mode="play"]')).toHaveCount(1);
+  await expect(modal.locator('[data-playback-mode="poster"]')).toHaveCount(2);
+
+  await expect.poll(() => socketMessages(page, socketIndex, 'PlayerReady')).toHaveLength(0);
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(0);
+  await expect.poll(() => socketMessages(page, socketIndex, 'JoinGame'))
+    .toHaveLength(joinGameCount);
+});
+
+test('prototype layouts keep focus and motion contained on a compact reduced-motion screen', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.setViewportSize({ width: 320, height: 568 });
+  await establishActiveGame(
+    page,
+    tutorialSnapshot(),
+    '/play/42?tutorial-prototype=manual',
+  );
+
+  const modal = page.getByTestId('tutorial-modal');
+  const switcher = page.getByTestId('tutorial-prototype-switch');
+  await modal.getByRole('button', { name: 'Reveal BOOST' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('1');
+  await expect(modal.locator('.tutorial-replay')).toBeHidden();
+  await expect(modal.getByTestId('tutorial-ready')).toBeVisible();
+
+  const manualCanvases = modal.getByTestId('tutorial-scene-canvas');
+  await expect(manualCanvases).toHaveCount(2);
+  const visibleManualCanvas = modal.locator('[data-testid="tutorial-scene-canvas"]:visible');
+  await expect(visibleManualCanvas).toHaveCount(1);
+  await expect(visibleManualCanvas).toHaveAttribute('data-playback', 'complete');
+  const posterFrame = await visibleManualCanvas.evaluate((canvas) => canvas.toDataURL());
+  await page.waitForTimeout(250);
+  expect(await visibleManualCanvas.evaluate((canvas) => canvas.toDataURL()))
+    .toBe(posterFrame);
+
+  await switcher.getByRole('button', { name: 'Coach rail' }).click();
+  await modal.getByRole('button', { name: 'Step 3: WIN' }).click();
+  await expect(modal).toHaveAttribute('data-step', '3');
+  const visual = page.getByTestId('tutorial-visual');
+  await expect.poll(() => visual.evaluate((element) => element === document.activeElement))
+    .toBe(true);
+  const compactBounds = await modal.evaluate((element) => {
+    const modalRect = element.getBoundingClientRect();
+    const visualRect = element.querySelector('[data-testid="tutorial-visual"]')
+      .getBoundingClientRect();
+    const footerRect = element.querySelector('.tutorial-footer').getBoundingClientRect();
+    return {
+      modalTop: modalRect.top,
+      modalBottom: modalRect.bottom,
+      visualTop: visualRect.top,
+      visualBottom: visualRect.bottom,
+      footerTop: footerRect.top,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(compactBounds.modalTop).toBeGreaterThanOrEqual(0);
+  expect(compactBounds.modalBottom).toBeLessThanOrEqual(compactBounds.viewportHeight);
+  expect(compactBounds.visualTop).toBeGreaterThanOrEqual(compactBounds.modalTop);
+  expect(compactBounds.visualBottom).toBeLessThanOrEqual(compactBounds.footerTop);
+  await expect(modal.locator('.tutorial-replay')).toBeHidden();
+  await expect(modal.getByTestId('tutorial-ready')).toBeVisible();
 });
 
 test('planned drain keeps the old game socket usable until the replacement is fully ready', async ({ page }) => {

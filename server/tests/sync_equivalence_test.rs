@@ -703,8 +703,9 @@ fn boost_sync_state() -> GameState {
 }
 
 /// A team-0 snake four movement steps outside its own goal mouth, carrying
-/// three points' worth of food. Food spawning is disabled so the carried
-/// amount, and therefore the goal's value, is fixed.
+/// three points' worth of food. The RNG is removed so food spawning is
+/// disabled without violating the mode's authoritative food-target contract;
+/// the carried amount, and therefore the goal's value, stays fixed.
 fn goal_sync_state() -> GameState {
     let mut state = GameState::new(
         60,
@@ -721,7 +722,7 @@ fn goal_sync_state() -> GameState {
         .add_player(2, Some("bob".to_string()))
         .expect("add player 2");
     state.status = GameStatus::Started { server_id: 7 };
-    state.properties.available_food_target = 0;
+    state.rng = None;
     state.arena.food.clear();
 
     // Team 0 banks through the goal mouth at x = 9, inside the opening.

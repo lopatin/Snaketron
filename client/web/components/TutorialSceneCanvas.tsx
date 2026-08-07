@@ -6,6 +6,8 @@ export interface TutorialSceneCanvasProps {
   scene: string;
   /** Increment to replay the scene without changing tutorial steps. */
   replayToken?: number;
+  /** Play the authored timeline, or render only its authored poster frame. */
+  playback?: 'play' | 'poster';
 }
 
 const FRAME_QUANTUM_MS = 50;
@@ -18,6 +20,7 @@ const FRAME_QUANTUM_MS = 50;
 const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
   scene,
   replayToken = 0,
+  playback = 'play',
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [reducedMotion, setReducedMotion] = useState(() => (
@@ -53,6 +56,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
     let lastFrameMs = -1;
     let forceDraw = true;
     let renderFailed = false;
+    canvas.dataset.playback = 'loading';
 
     const sizeCanvas = () => {
       const bounds = canvas.getBoundingClientRect();
@@ -83,10 +87,11 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       }
 
       const durationMs = player.durationMs();
-      elapsedMs = reducedMotion
+      const showPoster = playback === 'poster' || reducedMotion;
+      elapsedMs = showPoster
         ? player.posterMs()
         : Math.min(durationMs, Math.max(0, now - startedAt));
-      const quantizedMs = reducedMotion
+      const quantizedMs = showPoster
         ? elapsedMs
         : Math.min(durationMs, Math.floor(elapsedMs / FRAME_QUANTUM_MS) * FRAME_QUANTUM_MS);
 
@@ -103,7 +108,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
         forceDraw = false;
       }
 
-      if (!reducedMotion && elapsedMs < durationMs) {
+      if (!showPoster && elapsedMs < durationMs) {
         canvas.dataset.playback = 'playing';
         schedule();
       } else {
@@ -132,7 +137,6 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       }
       player = new wasm.TutorialScenePlayer(scene);
       startedAt = performance.now();
-      canvas.dataset.playback = reducedMotion ? 'complete' : 'playing';
       schedule();
     }).catch((error) => {
       canvas.dataset.playback = 'error';
@@ -148,7 +152,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       }
       player?.free();
     };
-  }, [reducedMotion, replayToken, scene]);
+  }, [playback, reducedMotion, replayToken, scene]);
 
   return (
     <canvas
@@ -156,6 +160,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       className="tutorial-scene-canvas"
       data-scene={scene}
       data-motion={reducedMotion ? 'reduced' : 'animated'}
+      data-playback-mode={playback}
       data-testid="tutorial-scene-canvas"
       aria-hidden="true"
     />

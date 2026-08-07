@@ -26,6 +26,11 @@ import {
   markTutorialSeen,
   tutorialContentForGame,
 } from '../utils/tutorial';
+import {
+  TUTORIAL_PROTOTYPE_QUERY_PARAM,
+  parseTutorialPrototype,
+  type TutorialPrototypeId,
+} from '../utils/tutorialPrototype';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 import {
@@ -154,6 +159,15 @@ export default function GameArena() {
   const routeGameId = parseU32GameId(gameId);
 
   const navigate = useNavigate();
+  const [tutorialPrototype, setTutorialPrototype] = useState<TutorialPrototypeId | null>(() => (
+    parseTutorialPrototype(window.location.search)
+  ));
+  useEffect(() => {
+    // GameArena is reused when Play Again changes only the game id. Re-read the
+    // real URL so an opt-in prototype never leaks into a later match whose URL
+    // does not explicitly request the comparison lab.
+    setTutorialPrototype(parseTutorialPrototype(window.location.search));
+  }, [gameId]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const joinedGameIdRef = useRef<string | null>(null);
@@ -170,6 +184,17 @@ export default function GameArena() {
   // they read modal ownership through a ref rather than being torn down and
   // rebuilt every time the briefing opens or closes.
   const isModalOwningInputRef = useRef(false);
+
+  const selectTutorialPrototype = useCallback((prototype: TutorialPrototypeId) => {
+    setTutorialPrototype(prototype);
+    const url = new URL(window.location.href);
+    url.searchParams.set(TUTORIAL_PROTOTYPE_QUERY_PARAM, prototype);
+    window.history.replaceState(
+      window.history.state,
+      '',
+      `${url.pathname}${url.search}${url.hash}`,
+    );
+  }, []);
   
   const {
     connected,
@@ -1496,6 +1521,10 @@ export default function GameArena() {
           open={showBriefing || showHelp}
           content={tutorial}
           variant={showBriefing ? 'briefing' : 'reference'}
+          prototypeLab={tutorialPrototype === null ? undefined : {
+            value: tutorialPrototype,
+            onChange: selectTutorialPrototype,
+          }}
           autoReadySeconds={
             showBriefing && readyDeadlineMs !== null
               ? Math.max(0, Math.ceil((readyDeadlineMs - Date.now()) / 1000))
