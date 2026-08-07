@@ -1,12 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
 
 /**
- * Live global presence readout: a hairline rule with the current player
- * population inset into its centre, sitting between the logo block and the
- * nickname field so it doubles as the divider between identity and input.
+ * Live global presence readout: a tag notched into a break in the nickname
+ * field's top border, the way a legend sits in a fieldset, binding the current
+ * player population to the form as a single object.
+ *
+ * Renders inside the field's positioned wrapper and is absolutely placed, so
+ * it costs the stack no vertical space.
  *
  * `count` is `null` while the population is still unknown (regions loading or
- * unreachable); the row keeps its height so the composition never jumps.
+ * unreachable); the tag keeps its footprint so nothing shifts when it lands.
  */
 interface PlayersOnlineProps {
   count: number | null;
@@ -106,7 +109,6 @@ export const PlayersOnline: React.FC<PlayersOnlineProps> = ({ count }) => {
 
   return (
     <div className={rootClass} role="status" aria-live="polite">
-      <span className="players-online-rule is-left" aria-hidden="true" />
       <span className="players-online-readout">
         <span className="players-online-dot" aria-hidden="true" />
         {isLive ? (
@@ -123,7 +125,6 @@ export const PlayersOnline: React.FC<PlayersOnlineProps> = ({ count }) => {
         )}
         {isLive ? <span className="sr-only">{`${count} ${noun} online`}</span> : null}
       </span>
-      <span className="players-online-rule is-right" aria-hidden="true" />
     </div>
   );
 };

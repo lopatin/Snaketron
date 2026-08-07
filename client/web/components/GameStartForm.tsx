@@ -227,9 +227,8 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
-      {/* Logo. No bottom margin: the panel's own top padding is the whole gap
-          above the indicator, so it matches the indicator's bottom margin. */}
-      <div className="flex flex-col items-center">
+      {/* Logo */}
+      <div className="flex flex-col items-center mb-8">
         <img src="/SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
         <p className="mt-3 text-xs font-bold italic uppercase tracking-1 text-gray-500">
           Competitive multiplayer Snake
@@ -237,11 +236,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       </div>
 
       <div className="p-8">
-        {/* Live population, inset into the rule that divides identity from input */}
-        <PlayersOnline count={playersOnline} />
-
-        {/* Nickname Input */}
+        {/* Nickname Input. The live population tag is notched into this field's
+            top border, so it renders inside the field's positioned wrapper. */}
         <div className="mb-8 relative">
+          <PlayersOnline count={playersOnline} />
           <input
             ref={nicknameInputRef}
             type="text"

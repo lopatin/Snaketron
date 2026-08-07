@@ -3177,39 +3177,22 @@ a.home-social-icon:hover {
   }
 }
 
-/* Players-online dateline ---------------------------------------------------
-   A hairline rule inset with the live population, sitting between the logo
-   block and the nickname field. The rule spans the form's inner content width
-   so it lines up exactly with the input below it, doing double duty as the
-   structural divider between identity and input. */
+/* Players-online tag --------------------------------------------------------
+   A tag notched into a break in the nickname field's top border, the way a
+   legend sits in a fieldset, binding the live population to the form as one
+   object. Its white ground is what breaks the border beneath it.
+
+   Absolutely positioned inside the field's wrapper, so it costs the stack no
+   vertical space and the logo-to-field gap is whatever the panel padding says. */
 .players-online {
+  position: absolute;
+  z-index: 1;
+  top: -9px;
+  right: 14px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  min-height: 18px;
-  /* Matches the panel's 32px top padding above it, and the 32px rhythm of the
-     stacked blocks below it, so the row sits on even air. */
-  margin-bottom: 32px;
-  gap: 12px;
-}
-
-.players-online-rule {
-  height: 1px;
-  min-width: 0;
-  flex: 1 1 0;
-  animation: players-online-rule-in 700ms cubic-bezier(0.16, 1, 0.3, 1) 120ms both;
-}
-
-/* Each half fades to nothing at its outer end so the rule dissolves into the
-   page rather than stopping at a hard terminal. */
-.players-online-rule.is-left {
-  background: linear-gradient(to right, rgba(17, 24, 39, 0), rgba(17, 24, 39, 0.16));
-  transform-origin: right center;
-}
-
-.players-online-rule.is-right {
-  background: linear-gradient(to left, rgba(17, 24, 39, 0), rgba(17, 24, 39, 0.16));
-  transform-origin: left center;
+  padding: 0 7px;
+  background: #fff;
 }
 
 .players-online-readout {
@@ -3279,15 +3262,6 @@ a.home-social-icon:hover {
   font-weight: 700;
   letter-spacing: 0.45px;
   text-transform: uppercase;
-}
-
-@keyframes players-online-rule-in {
-  from {
-    transform: scaleX(0);
-  }
-  to {
-    transform: scaleX(1);
-  }
 }
 
 @keyframes players-online-ping {
@@ -3539,7 +3513,6 @@ a.home-social-icon:hover {
   .home-account-trigger svg,
   .home-status-dot,
   .home-status-spinner,
-  .players-online-rule,
   .players-online-readout,
   .players-online-dot,
   .players-online-dot::after,
