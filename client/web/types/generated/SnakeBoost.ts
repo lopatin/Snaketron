@@ -7,4 +7,15 @@
  * mutated through the crate-visible lifecycle methods on [`Snake`], keeping
  * speed changes coupled to Boost activation and depletion.
  */
-export type SnakeBoost = { charge_ms: number, active: boolean, };
+export type SnakeBoost = { charge_ms: number, active: boolean,
+/**
+ * Latched player intent: "the Boost control is held (or toggled on)".
+ *
+ * Boost is a *level*, not an edge. `active` is derived by converging
+ * toward this every quantum, so an intent that arrives while boosting is
+ * impossible — empty meter, dead snake, mid-respawn — is honored the
+ * moment it becomes possible instead of being silently dropped. Without
+ * this, holding the control through an empty meter required the player
+ * to release and re-press once fuel arrived.
+ */
+intent: boolean, };

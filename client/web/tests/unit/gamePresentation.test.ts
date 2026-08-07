@@ -39,7 +39,8 @@ const duelState = (): GameState => ({
   properties: {
     available_food_target: 3,
     tick_duration_ms: 50,
-    time_limit_ms: 90_000,
+    time_limit_ms: null,
+    score_limit: 50,
     boost: null,
   },
   players: {
@@ -98,7 +99,11 @@ test('a teammate winning produces Victory and retains the current player XP/stat
   assert.equal(presentation.currentPlayer?.score, 3);
   assert.equal(presentation.currentPlayer?.finalLength, 5);
   assert.equal(presentation.currentPlayer?.actionCount, 3);
-  assert.equal(presentation.timeValue, '01:30');
+  // Team matches race to a score: the clock counts up from zero and the
+  // caption carries the target instead of a countdown.
+  assert.equal(presentation.timeValue, '00:00');
+  assert.equal(presentation.timeLabel, 'First to 50');
+  assert.equal(presentation.scoreLimit, 50);
   assert.equal(presentation.timeTaken, '00:00');
   assert.equal(formatPerMinuteRate(presentation.pointsPerMinute), '600.0');
   assert.equal(formatPerMinuteRate(presentation.actionsPerMinute), '600.0');

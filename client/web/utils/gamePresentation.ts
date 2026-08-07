@@ -69,8 +69,15 @@ export interface MatchPresentation {
   isTeamGame: boolean;
   isSoloGame: boolean;
   isComplete: boolean;
-  timeLabel: 'Time' | 'Time left';
+  /**
+   * The caption above the match clock. Team matches race to a score with no
+   * clock, so the caption carries the target ("First to 25") and the clock
+   * below it simply counts up.
+   */
+  timeLabel: string;
   timeValue: string;
+  /** Banked team score that wins the match, when the mode races to one. */
+  scoreLimit: number | null;
   elapsedMs: number;
   timeTaken: string;
   pointsPerMinute: number;
@@ -258,6 +265,7 @@ export const buildMatchPresentation = (
 
   const elapsedMs = gameState.tick * gameState.properties.tick_duration_ms;
   const timeLimitMs = gameState.properties.time_limit_ms;
+  const scoreLimit = gameState.properties.score_limit;
   const timeValue = timeLimitMs === null
     ? formatMatchClock(elapsedMs)
     : formatMatchClock(timeLimitMs - elapsedMs, true);
@@ -276,13 +284,13 @@ export const buildMatchPresentation = (
     resultArtwork = 'jade-fracture';
   } else if (winningSnakeId === null) {
     resultTitle = 'Draw';
-    resultSummary = 'Nothing separated the field at the horn.';
+    resultSummary = 'Neither side could pull ahead.';
     resultTone = 'draw';
     resultArtwork = 'topaz-cut';
   } else if (currentPlayer) {
     const didWin = currentPlayer.isWinner;
     resultTitle = didWin ? 'Victory' : 'Defeat';
-    resultSummary = didWin ? 'Your side controlled the finish.' : 'The other side took this one.';
+    resultSummary = didWin ? 'Your side got there first.' : 'The other side got there first.';
     resultTone = didWin ? 'victory' : 'defeat';
     resultArtwork = didWin ? 'azure-cut' : 'ruby-shatter';
   } else {
@@ -295,8 +303,11 @@ export const buildMatchPresentation = (
     isTeamGame: mode.isTeam,
     isSoloGame: mode.isSolo,
     isComplete: isCompleteGameState(gameState),
-    timeLabel: timeLimitMs === null ? 'Time' : 'Time left',
+    timeLabel: scoreLimit !== null
+      ? `First to ${scoreLimit}`
+      : timeLimitMs === null ? 'Time' : 'Time left',
     timeValue,
+    scoreLimit,
     elapsedMs,
     timeTaken: formatMatchClock(elapsedMs),
     pointsPerMinute,

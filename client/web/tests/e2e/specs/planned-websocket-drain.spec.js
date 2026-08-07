@@ -103,7 +103,10 @@ const boostSnapshot = (streamSequence, tick = 5) => {
   state.properties = {
     available_food_target: 1,
     tick_duration_ms: 50,
-    time_limit_ms: 90_000,
+    // Team matches are raced to a score, never against a clock; the target
+    // must match the queue this snapshot claims (Quickmatch).
+    time_limit_ms: null,
+    score_limit: 25,
     boost: {
       speed_milli: 1500,
       capacity_ms: 3000,

@@ -20,7 +20,7 @@ import {
   BoostInputController,
   loadBoostInputMode,
   persistBoostInputMode,
-  targetOwnsGameplayKeys,
+  targetOwnsArrowKeys,
   type BoostInputCommand,
   type BoostInputContext,
   type BoostInputDecision,
@@ -197,7 +197,7 @@ export default function GameArena() {
   }
   const boostInputContextRef = useRef<BoostInputContext>({
     active: false,
-    canActivate: false,
+    intent: false,
     interactionActive: false,
     gameOver: false,
   });
@@ -511,7 +511,10 @@ export default function GameArena() {
     const handleKeyPress = (e: KeyboardEvent) => {
       // Once the match is complete, the score card owns Space (including the
       // native activation behavior of its focused Play Again button).
-      if (gameOver || targetOwnsGameplayKeys(e.target)) {
+      // Arrow keys use the narrower owner set: a button that happens to hold
+      // focus after a click does nothing with arrows, and letting it swallow
+      // them left the snake unsteerable until focus moved.
+      if (gameOver || targetOwnsArrowKeys(e.target)) {
         return;
       }
 
@@ -810,14 +813,10 @@ export default function GameArena() {
   );
   const boostInputContext: BoostInputContext = {
     active: Boolean(localSnake?.boost.active),
-    canActivate: Boolean(
-      boostConfig &&
-      localSnake?.is_alive &&
-      localSnake.boost.charge_ms > 0 &&
-      !localSnake.boost.active &&
-      isGameInteractionActive &&
-      !isBoostGameTerminal
-    ),
+    // The engine's latched copy of what this player asked for. Reconciliation
+    // compares against this, never against fuel: an empty meter defers Boost,
+    // it does not cancel the request.
+    intent: Boolean(localSnake?.boost.intent),
     interactionActive: Boolean(
       boostConfig &&
       localSnake?.is_alive &&
@@ -877,10 +876,10 @@ export default function GameArena() {
     if (decision.preventDefault) {
       event.preventDefault();
     }
-    if (!boostInputContextRef.current.interactionActive || boostInputContextRef.current.gameOver) {
-      return;
-    }
 
+    // Always claim the pointer, even while commands cannot be sent. The press
+    // is a physical fact the controller has already recorded, and skipping this
+    // would drop the matching release and leave the hold latched on forever.
     boostPointerIdRef.current = event.pointerId;
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -986,9 +985,11 @@ export default function GameArena() {
     };
   }, []);
 
-  // Reconcile predictions and clean up any held state as the route or socket
-  // lifecycle changes. A disconnected release is deferred until commands can
-  // be sent again, avoiding a permanently active Hold boost after reconnect.
+  // Republish Boost intent whenever the engine's latched copy disagrees with
+  // what the player is doing. Losing interaction is deliberately NOT treated as
+  // a release: the key is still physically held, so wiping that here would make
+  // a brief disconnect require a fresh press. `reconcile` simply publishes
+  // nothing until commands can be delivered again.
   useEffect(() => {
     const controller = boostInputControllerRef.current;
     if (!controller) {
@@ -1006,14 +1007,11 @@ export default function GameArena() {
       return;
     }
 
-    const decision = boostInputContext.interactionActive
-      ? controller.reconcile(boostInputContext)
-      : controller.releaseHeld(boostInputContext);
-    sendBoostDecision(decision);
+    sendBoostDecision(controller.reconcile(boostInputContext));
   }, [
     gameId,
     boostInputContext.active,
-    boostInputContext.canActivate,
+    boostInputContext.intent,
     boostInputContext.interactionActive,
     boostInputContext.gameOver,
     sendBoostDecision,

@@ -31,8 +31,8 @@ pub const DEFAULT_CUSTOM_GAME_TICK_MS: u32 = 100;
 /// Default available food target
 pub const DEFAULT_FOOD_TARGET: usize = 10;
 
-/// Default time limit for team games in milliseconds (1 minute 30 seconds)
-pub const DEFAULT_TEAM_TIME_LIMIT_MS: u32 = 90_000;
-
-/// Quickmatch time limit for team games in milliseconds (1 minute 30 seconds)
-pub const DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS: u32 = 90_000;
+/// Team matches are raced to a score rather than played against a clock, so
+/// they have no time limit and no maximum duration; the match clock counts up.
+/// A team wins the moment its banked score reaches its queue's target.
+pub const DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT: u32 = 25;
+pub const DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT: u32 = 50;
