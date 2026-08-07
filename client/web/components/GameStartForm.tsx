@@ -38,6 +38,7 @@ interface GameStartFormProps {
   isLobbyQueued?: boolean;
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
+  onSignInClick?: () => void;
   errorMessage?: string | null;
   /** Live global player population; `null` while it is still unknown. */
   playersOnline?: number | null;
@@ -51,6 +52,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   isLobbyQueued = false,
   lobbyPreferences,
   onPreferencesChange,
+  onSignInClick,
   errorMessage = null,
   playersOnline = null,
 }) => {
@@ -238,7 +240,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       <div className="p-8">
         {/* Nickname Input. The live population tag is notched into this field's
             top border, so it renders inside the field's positioned wrapper. */}
-        <div className="mb-8 relative">
+        <div className="mb-7 relative">
           <PlayersOnline count={playersOnline} />
           <input
             ref={nicknameInputRef}
@@ -256,9 +258,33 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             required
             readOnly={isAuthenticated}
           />
-          {/* Error message with absolute positioning and fade animation */}
+
+          {/* Guest notice + sign-in link. Hidden entirely once the player has
+              a real account, since neither half applies to them. */}
+          {!isAuthenticated && (
+            <div className="mt-2 px-1 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+              <span className="text-[13px] text-gray-500 whitespace-nowrap">
+                Playing as guest
+              </span>
+              <button
+                type="button"
+                onClick={onSignInClick}
+                className="
+                  text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
+                  hover:underline focus-visible:underline
+                "
+              >
+                Sign in or create account
+              </button>
+            </div>
+          )}
+
+          {/* Error message with absolute positioning and fade animation. It is
+              anchored to the bottom of the whole block so it clears the guest
+              row when that is present, and sits right under the input when it
+              is not. */}
           <div className={`
-            absolute left-0 right-0 top-[calc(100%+4px)]
+            absolute left-0 right-0 top-[calc(100%+4px)] px-1
             transition-opacity duration-200
             ${showNicknameError ? 'opacity-100' : 'opacity-0 pointer-events-none'}
           `}>

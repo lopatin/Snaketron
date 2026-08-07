@@ -294,42 +294,20 @@
 }
 
 .boost-input-mode {
-  display: grid;
+  display: inline-flex;
+  align-items: center;
   min-inline-size: 0;
-  gap: 4px;
-  margin: 0 0 0 -2px;
+  gap: 5px;
+  margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--game-graphite, #172033);
+  cursor: pointer;
   pointer-events: auto;
 }
 
-.boost-input-mode > legend {
-  width: 100%;
-  padding: 0;
-  color: rgb(23 32 51 / 55%);
-  font-size: 8px;
-  font-style: normal;
-  font-weight: 850;
-  letter-spacing: 0.1em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.boost-input-mode__choices {
-  display: inline-flex;
-  align-items: stretch;
-  gap: 4px;
-}
-
-.boost-input-mode__option {
-  position: relative;
-  display: block;
-  cursor: pointer;
-}
-
-.boost-input-mode__option input {
+.boost-input-mode input {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -340,78 +318,58 @@
   white-space: nowrap;
 }
 
-.boost-input-mode__option span {
+.boost-input-mode__box {
   position: relative;
-  display: grid;
-  min-width: 78px;
-  min-height: 30px;
-  grid-template-columns: 10px auto;
-  grid-template-rows: auto auto;
-  align-content: center;
-  align-items: center;
-  column-gap: 6px;
-  padding: 4px 8px;
-  border: 1px solid rgb(23 32 51 / 30%);
-  border-radius: 3px;
+  display: block;
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 1px solid rgb(23 32 51 / 43%);
+  border-radius: 2px;
   background: rgb(255 255 255 / 84%);
-  color: var(--game-graphite, #172033);
-  text-align: left;
   transition: border-color 130ms ease, background-color 130ms ease;
 }
 
-.boost-input-mode__option span::before {
-  width: 10px;
-  height: 10px;
-  grid-row: 1 / span 2;
-  border: 1px solid rgb(23 32 51 / 43%);
-  border-radius: 50%;
-  background: #fff;
+.boost-input-mode__box::after {
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 3px;
+  height: 6px;
+  border-right: 2px solid #fff;
+  border-bottom: 2px solid #fff;
   content: "";
+  opacity: 0;
+  transform: rotate(42deg);
 }
 
-.boost-input-mode__option strong,
-.boost-input-mode__option small {
-  display: block;
+.boost-input-mode__text {
+  font-size: 8.5px;
   font-style: normal;
+  font-weight: 850;
+  letter-spacing: 0.07em;
   line-height: 1;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
-.boost-input-mode__option strong {
-  font-size: 8.5px;
-  font-weight: 900;
-  letter-spacing: 0.07em;
-}
-
-.boost-input-mode__option small {
-  margin-top: 2px;
-  color: rgb(23 32 51 / 58%);
-  font-size: 7.5px;
-  font-weight: 750;
-  letter-spacing: 0.045em;
-}
-
-.boost-input-mode__option input:checked + span {
-  border-color: var(--game-blue, #3b82f6);
-  background: #eff6ff;
-  box-shadow: inset 0 0 0 1px rgb(59 130 246 / 8%);
-}
-
-.boost-input-mode__option input:checked + span::before {
+.boost-input-mode input:checked + .boost-input-mode__box {
   border-color: var(--game-blue, #3b82f6);
   background: var(--game-blue, #3b82f6);
-  box-shadow: inset 0 0 0 2px #eff6ff;
 }
 
-.boost-input-mode__option:hover span {
-  background: #eff6ff;
+.boost-input-mode input:checked + .boost-input-mode__box::after {
+  opacity: 1;
 }
 
-.boost-input-mode__option input:focus-visible + span {
-  position: relative;
+.boost-input-mode:hover .boost-input-mode__box {
+  border-color: var(--game-blue, #3b82f6);
+}
+
+.boost-input-mode input:focus-visible + .boost-input-mode__box {
   z-index: 1;
   outline: 2px solid var(--game-blue, #3b82f6);
-  outline-offset: -2px;
+  outline-offset: 2px;
 }
 
 @media (max-width: 760px) {
@@ -487,36 +445,22 @@
   }
 
   .boost-input-mode {
-    margin-left: -2px;
+    gap: 4px;
   }
 
-  .boost-input-mode > legend {
-    font-size: 7px;
+  .boost-input-mode__box {
+    width: 9px;
+    height: 9px;
   }
 
-  .boost-input-mode__choices {
-    gap: 2px;
+  .boost-input-mode__box::after {
+    left: 2px;
+    width: 3px;
+    height: 5px;
   }
 
-  .boost-input-mode__option span {
-    min-width: 57px;
-    min-height: 26px;
-    grid-template-columns: 8px auto;
-    column-gap: 4px;
-    padding: 3px 5px;
-  }
-
-  .boost-input-mode__option span::before {
-    width: 8px;
-    height: 8px;
-  }
-
-  .boost-input-mode__option strong {
+  .boost-input-mode__text {
     font-size: 7.5px;
-  }
-
-  .boost-input-mode__option small {
-    font-size: 6.5px;
   }
 }
 
@@ -582,7 +526,6 @@
 
   .game-controls-hint__group.is-boost > .boost-input-mode {
     grid-area: mode;
-    margin-left: 0;
   }
 }
 

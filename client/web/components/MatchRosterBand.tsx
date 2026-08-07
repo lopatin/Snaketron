@@ -16,8 +16,7 @@ const StaredownSnake: React.FC<{
 }> = ({ player, faces }) => (
   <RosterSnakeCanvas
     name={player.name}
-    fill={player.color}
-    outline={player.outlineColor}
+    skin={player.skin}
     facing={faces}
   />
 );
