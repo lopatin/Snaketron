@@ -3,49 +3,60 @@ import test from 'node:test';
 
 import {
   DEFAULT_SCORE_EFFECT_ID,
+  GOAL_CUE_RETRACTION_WINDOW_MS,
   MAX_ACTIVE_SCORE_EFFECTS,
+  REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS,
   REDUCED_MOTION_SCORE_WAVE_DURATION_MS,
+  SCORE_CELEBRATION_DURATION_MS,
   SCORE_WAVE_DURATION_MS,
   createScoreEffectRegistry,
   createScoreEffectRuntime,
   drawScoreEffects,
-  getScoringGoalOrigin,
+  getScoreEffectTeamColor,
+  getScoreReadoutColor,
   pruneExpiredScoreEffects,
   resetScoreEffects,
+  sampleScoreReadout,
   sampleScoreWaveCells,
   smoothstep,
-  syncScoreEffects,
+  syncPredictedScoreEffects,
   transformScoreEffectPosition,
 } from '../../utils/scoreEffects.ts';
 import type {
+  PredictedGoalCue,
+  PredictedScoreVisualState,
   ScoreEffectActivation,
-  ScoreEffectObservation,
   ScoreEffectRenderer,
 } from '../../utils/scoreEffects.ts';
 
-const observation = (
-  teamScores: Record<number, number> | null,
-  overrides: Partial<ScoreEffectObservation> = {},
-): ScoreEffectObservation => ({
-  gameId: '42',
-  engineEpoch: 1,
+const goalCue = (overrides: Partial<PredictedGoalCue> = {}): PredictedGoalCue => ({
   tick: 10,
-  teamScores,
-  arenaWidth: 60,
-  arenaHeight: 40,
-  endZoneDepth: 10,
-  nowMs: 1_000,
+  team_id: 0,
+  snake_id: 1,
+  position: { x: 9, y: 12 },
+  points: 12,
+  ...overrides,
+});
+
+const visualState = (
+  goals: readonly PredictedGoalCue[],
+  overrides: Partial<PredictedScoreVisualState> = {},
+): PredictedScoreVisualState => ({
+  predicted_tick: 10,
+  committed_tick: 6,
+  tick_duration_ms: 50,
+  goals,
   ...overrides,
 });
 
 const activation: ScoreEffectActivation = {
-  eventId: '42:1:11:0:1',
+  eventId: '42:goal:10:0:1:9:12:12',
   effectId: DEFAULT_SCORE_EFFECT_ID,
   teamId: 0,
-  previousScore: 0,
-  score: 1,
-  tick: 11,
-  origin: { x: 9, y: 20 },
+  snakeId: 1,
+  points: 12,
+  tick: 10,
+  origin: { x: 9, y: 12 },
   startedAtMs: 1_000,
 };
 
@@ -66,11 +77,218 @@ test('score cells use the same four rotation transforms as the Rust renderer', (
   assert.deepEqual(transformScoreEffectPosition(position, 60, 40, 270), { x: 7, y: 54 });
 });
 
-test('score origins sit at each home-zone goal boundary and arena center', () => {
-  assert.deepEqual(getScoringGoalOrigin(0, 60, 40, 10), { x: 9, y: 20 });
-  assert.deepEqual(getScoringGoalOrigin(1, 60, 40, 10), { x: 50, y: 20 });
-  assert.equal(getScoringGoalOrigin(2, 60, 40, 10), null);
-  assert.equal(getScoringGoalOrigin(0, 20, 40, 10), null);
+test('a predicted goal cue starts a celebration at the cell it was scored on', () => {
+  const runtime = createScoreEffectRuntime();
+
+  const result = syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([goalCue()], { predicted_tick: 14 }),
+    10_000,
+  );
+
+  assert.deepEqual(result, { started: 1, cancelled: 0 });
+  assert.equal(runtime.active.length, 1);
+  const [started] = runtime.active;
+  assert.deepEqual(started.origin, { x: 9, y: 12 });
+  assert.equal(started.points, 12);
+  assert.equal(started.teamId, 0);
+  assert.equal(started.snakeId, 1);
+  // Four ticks of 50ms already elapsed inside prediction, so the celebration
+  // resumes at its true phase rather than restarting from zero.
+  assert.equal(started.startedAtMs, 9_800);
+});
+
+test('normal forward history retention neither cancels nor restarts a celebration', () => {
+  const runtime = createScoreEffectRuntime();
+  const cue = goalCue();
+
+  syncPredictedScoreEffects(runtime, '42', visualState([cue]), 1_000);
+  const original = runtime.active[0];
+
+  const result = syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([cue], { predicted_tick: 14, committed_tick: 12 }),
+    1_200,
+  );
+
+  assert.deepEqual(result, { started: 0, cancelled: 0 });
+  assert.equal(runtime.active.length, 1);
+  assert.equal(runtime.active[0], original);
+});
+
+test('a reconciliation that drops the cue retracts the celebration immediately', () => {
+  const runtime = createScoreEffectRuntime();
+  syncPredictedScoreEffects(runtime, '42', visualState([goalCue()]), 1_000);
+  assert.equal(runtime.active.length, 1);
+
+  const result = syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([], { predicted_tick: 11 }),
+    1_050,
+  );
+
+  assert.deepEqual(result, { started: 0, cancelled: 1 });
+  assert.equal(runtime.active.length, 0);
+  assert.equal(runtime.seenEventIds.size, 0, 'a retracted identity may replay');
+
+  // The same goal predicted again after a rollback plays once more.
+  const replay = syncPredictedScoreEffects(runtime, '42', visualState([goalCue()]), 1_100);
+  assert.deepEqual(replay, { started: 1, cancelled: 0 });
+});
+
+test('a cue relocated by replay retracts the old celebration and starts the new one', () => {
+  const runtime = createScoreEffectRuntime();
+  syncPredictedScoreEffects(runtime, '42', visualState([goalCue()]), 1_000);
+
+  const result = syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([goalCue({ position: { x: 9, y: 16 }, points: 4 })]),
+    1_000,
+  );
+
+  assert.deepEqual(result, { started: 1, cancelled: 1 });
+  assert.equal(runtime.active.length, 1);
+  assert.deepEqual(runtime.active[0].origin, { x: 9, y: 16 });
+  assert.equal(runtime.active[0].points, 4);
+});
+
+test('stale, empty, and baseline cues never start a celebration', () => {
+  const runtime = createScoreEffectRuntime();
+
+  // Older than the whole celebration.
+  const staleTicks = Math.ceil(SCORE_CELEBRATION_DURATION_MS / 50);
+  assert.deepEqual(
+    syncPredictedScoreEffects(
+      runtime,
+      '42',
+      visualState([goalCue()], { predicted_tick: 10 + staleTicks }),
+      1_000,
+    ),
+    { started: 0, cancelled: 0 },
+  );
+
+  // A pointless cue cannot produce a "+0".
+  assert.deepEqual(
+    syncPredictedScoreEffects(
+      runtime,
+      '42',
+      visualState([goalCue({ tick: 11, points: 0 })]),
+      1_000,
+    ),
+    { started: 0, cancelled: 0 },
+  );
+
+  // Snapshot baseline history is not a fresh visual event.
+  assert.deepEqual(
+    syncPredictedScoreEffects(
+      runtime,
+      '42',
+      visualState([goalCue({ tick: 9 })], { predicted_tick: 10 }),
+      1_000,
+      9,
+    ),
+    { started: 0, cancelled: 0 },
+  );
+  assert.equal(runtime.active.length, 0);
+
+  // A cue past the baseline in the same replay still plays.
+  assert.deepEqual(
+    syncPredictedScoreEffects(
+      runtime,
+      '42',
+      visualState([goalCue({ tick: 9 }), goalCue({ tick: 10, snake_id: 3 })], {
+        predicted_tick: 10,
+      }),
+      1_000,
+      9,
+    ),
+    { started: 1, cancelled: 0 },
+  );
+});
+
+test('a visual state without goals is inert and leaves crash-only payloads alone', () => {
+  const runtime = createScoreEffectRuntime();
+
+  assert.deepEqual(
+    syncPredictedScoreEffects(
+      runtime,
+      '42',
+      { predicted_tick: 10, committed_tick: 6, tick_duration_ms: 50 },
+      1_000,
+    ),
+    { started: 0, cancelled: 0 },
+  );
+  assert.equal(runtime.active.length, 0);
+});
+
+test('active celebrations remain bounded and a dropped one never restarts', () => {
+  const runtime = createScoreEffectRuntime();
+  const cues: PredictedGoalCue[] = [];
+
+  for (let index = 0; index < MAX_ACTIVE_SCORE_EFFECTS + 3; index += 1) {
+    cues.push(goalCue({ snake_id: index, position: { x: 9, y: 12 + index } }));
+    const result = syncPredictedScoreEffects(runtime, '42', visualState(cues), 1_000);
+    // Each round re-presents every earlier cue; only the new one may start.
+    assert.deepEqual(
+      result,
+      { started: 1, cancelled: 0 },
+      `round ${index} must start exactly one celebration`,
+    );
+  }
+
+  assert.equal(runtime.active.length, MAX_ACTIVE_SCORE_EFFECTS);
+  assert.equal(runtime.active.at(-1)?.snakeId, MAX_ACTIVE_SCORE_EFFECTS + 2);
+
+  // The three that lost their slot keep their dedupe entries, so replaying the
+  // same cue set cannot resurrect them.
+  const replay = syncPredictedScoreEffects(runtime, '42', visualState(cues), 1_000);
+  assert.deepEqual(replay, { started: 0, cancelled: 0 });
+  assert.equal(runtime.active.length, MAX_ACTIVE_SCORE_EFFECTS);
+});
+
+test('a cue that ages out of engine retention never retracts a live celebration', () => {
+  const runtime = createScoreEffectRuntime();
+  syncPredictedScoreEffects(runtime, '42', visualState([goalCue()]), 1_000);
+  assert.equal(runtime.active.length, 1);
+
+  // Retention in common/src/game_state.rs is wider than the celebration, so a
+  // cue disappearing this late is an ordinary expiry, not a rollback.
+  const late = syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([], { predicted_tick: 60 }),
+    1_000 + GOAL_CUE_RETRACTION_WINDOW_MS,
+  );
+
+  assert.deepEqual(late, { started: 0, cancelled: 0 });
+  assert.equal(runtime.active.length, 1);
+  assert.ok(
+    runtime.seenEventIds.has(runtime.active[0].eventId),
+    'a still-running celebration keeps its identity so it cannot be enqueued twice',
+  );
+});
+
+test('the retraction window outlives the celebration it guards', () => {
+  // If this ever inverts, a rollback late in the animation would stop being
+  // retractable. If GOAL_CUE_RETRACTION_WINDOW_MS ever exceeds the Rust-side
+  // RECENT_GOAL_RETENTION_MS, ordinary expiry would start popping effects.
+  assert.ok(GOAL_CUE_RETRACTION_WINDOW_MS >= SCORE_CELEBRATION_DURATION_MS);
+  assert.ok(GOAL_CUE_RETRACTION_WINDOW_MS < 1_800);
+});
+
+test('resetting clears both live celebrations and their dedupe identities', () => {
+  const runtime = createScoreEffectRuntime();
+  syncPredictedScoreEffects(runtime, '42', visualState([goalCue()]), 1_000);
+  assert.equal(runtime.active.length, 1);
+
+  resetScoreEffects(runtime);
+
+  assert.equal(runtime.active.length, 0);
+  assert.equal(runtime.seenEventIds.size, 0);
 });
 
 test('wave sampling is deterministic, bounded, and expires from timestamp alone', () => {
@@ -96,7 +314,7 @@ test('wave sampling is deterministic, bounded, and expires from timestamp alone'
   );
 });
 
-test('the sampled origin follows every rotation', () => {
+test('the wave is centered on the scoring cell under every rotation', () => {
   for (const rotation of [0, 90, 180, 270] as const) {
     const cells = sampleScoreWaveCells(activation, {
       nowMs: activation.startedAtMs,
@@ -116,46 +334,6 @@ test('the sampled origin follows every rotation', () => {
       cell.position.y === transformedOrigin.y
     )));
   }
-});
-
-test('the default renderer paints rotated, inset grid cells with balanced canvas state', () => {
-  const runtime = createScoreEffectRuntime();
-  resetScoreEffects(runtime, observation({ 0: 0, 1: 0 }));
-  syncScoreEffects(runtime, observation({ 0: 1, 1: 0 }, { tick: 11 }));
-
-  const fills: Array<[number, number, number, number]> = [];
-  let saves = 0;
-  let restores = 0;
-  const context = {
-    fillStyle: '',
-    globalAlpha: 1,
-    save() { saves += 1; },
-    restore() { restores += 1; },
-    fillRect(x: number, y: number, width: number, height: number) {
-      fills.push([x, y, width, height]);
-    },
-  } as unknown as CanvasRenderingContext2D;
-
-  drawScoreEffects(context, runtime, {
-    nowMs: 1_000,
-    cellSize: 10,
-    arenaWidth: 60,
-    arenaHeight: 40,
-    rotation: 90,
-    localTeamId: 0,
-    reducedMotion: false,
-  });
-
-  // Team 0 origin (9, 20) rotates to (19, 9); canvas padding is 1px and
-  // the 10px cell receives a restrained 0.8px inset on every edge.
-  assert.ok(fills.some(([x, y, width, height]) => (
-    Math.abs(x - 191.8) < 1e-9 &&
-    Math.abs(y - 91.8) < 1e-9 &&
-    Math.abs(width - 8.4) < 1e-9 &&
-    Math.abs(height - 8.4) < 1e-9
-  )));
-  assert.equal(saves, 1);
-  assert.equal(restores, 1);
 });
 
 test('reduced motion is a brief stationary goal wash, not a travelling wave', () => {
@@ -186,78 +364,205 @@ test('reduced motion is a brief stationary goal wash, not a travelling wave', ()
   );
 });
 
-test('only authoritative score increases start effects', () => {
-  const runtime = createScoreEffectRuntime();
+test('the points readout rises from the scoring cell, fades out, and outlives the wave', () => {
+  const frame = {
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 0 as const,
+    reducedMotion: false,
+  };
 
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 0, 1: 0 })),
-    { started: 0, reset: true },
-  );
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 3, 1: 0 }, { tick: 11, nowMs: 1_100 })),
-    { started: 1, reset: false },
-  );
-  assert.equal(runtime.active.length, 1);
-  assert.equal(runtime.active[0].previousScore, 0);
-  assert.equal(runtime.active[0].score, 3);
-  assert.deepEqual(runtime.active[0].origin, { x: 9, y: 20 });
+  const start = sampleScoreReadout(activation, { ...frame, nowMs: 1_000 });
+  assert.ok(start);
+  assert.equal(start.text, '+12');
+  // Origin (9, 12) with a 10px cell and 1px canvas padding.
+  assert.equal(start.centerX, 96);
+  assert.equal(start.centerY, 126);
+  assert.equal(start.opacity, 1, 'a goal must never lose a frame to a fade-in');
+  assert.ok(start.scale < 1, 'and pops in from a smaller scale instead');
 
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 3, 1: 0 }, { tick: 12, nowMs: 1_200 })),
-    { started: 0, reset: false },
+  const mid = sampleScoreReadout(activation, { ...frame, nowMs: 1_300 });
+  assert.ok(mid);
+  assert.ok(mid.centerY < start.centerY, 'the readout must travel upward');
+  assert.equal(mid.centerX, start.centerX, 'and only upward');
+  assert.ok(mid.opacity > 0.9);
+
+  const late = sampleScoreReadout(activation, { ...frame, nowMs: 1_950 });
+  assert.ok(late);
+  assert.ok(late.centerY < mid.centerY);
+  assert.ok(late.opacity > 0 && late.opacity < mid.opacity, 'it must fade as it rises');
+
+  // "Fades upward" means still climbing while fading, not rising to a stop and
+  // then fading in place. An ease-out rise spends ~90% of its travel before the
+  // fade begins; a substantial share must remain.
+  const end = sampleScoreReadout(activation, {
+    ...frame,
+    nowMs: 1_000 + SCORE_CELEBRATION_DURATION_MS - 1,
+  });
+  assert.ok(end);
+  const totalRise = start.centerY - end.centerY;
+  const fadeStart = sampleScoreReadout(activation, {
+    ...frame,
+    nowMs: 1_000 + SCORE_CELEBRATION_DURATION_MS * 0.55,
+  });
+  assert.ok(fadeStart);
+  const riseDuringFade = fadeStart.centerY - end.centerY;
+  assert.ok(
+    riseDuringFade / totalRise > 0.35,
+    `only ${((riseDuringFade / totalRise) * 100).toFixed(0)}% of the rise happens while fading`,
   );
-  assert.equal(runtime.active.length, 1);
+
+  // The wave is gone well before the number is.
+  assert.deepEqual(
+    sampleScoreWaveCells(activation, { ...frame, nowMs: 1_950, arenaWidth: 60 }),
+    [],
+  );
+  assert.equal(
+    sampleScoreReadout(activation, {
+      ...frame,
+      nowMs: 1_000 + SCORE_CELEBRATION_DURATION_MS,
+    }),
+    null,
+  );
 });
 
-test('a resync, game change, tick rewind, or score correction resets without replay', () => {
-  const runtime = createScoreEffectRuntime();
-  syncScoreEffects(runtime, observation({ 0: 0, 1: 0 }));
-  syncScoreEffects(runtime, observation({ 0: 1, 1: 0 }, { tick: 11 }));
-  assert.equal(runtime.active.length, 1);
+test('the readout follows the rotated cell and stays inside the canvas', () => {
+  const topEdge: ScoreEffectActivation = {
+    ...activation,
+    origin: { x: 9, y: 0 },
+  };
+  const readout = sampleScoreReadout(topEdge, {
+    nowMs: 1_900,
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 0,
+    reducedMotion: false,
+  });
 
-  const resync = syncScoreEffects(
+  assert.ok(readout);
+  assert.ok(readout.centerY >= (readout.fontSize * readout.scale) / 2 - 1e-9);
+
+  // Rotated 90°, cell (9, 12) renders at (27, 9) on a 40x60 cell canvas.
+  const rotated = sampleScoreReadout(activation, {
+    nowMs: 1_000,
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 90,
+    reducedMotion: false,
+  });
+  assert.ok(rotated);
+  assert.equal(rotated.centerX, 1 + 27 * 10 + 5);
+  assert.equal(rotated.centerY, 1 + 9 * 10 + 5);
+});
+
+test('reduced motion holds the readout in place and shortens the celebration', () => {
+  const frame = {
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 0 as const,
+    reducedMotion: true,
+  };
+
+  const early = sampleScoreReadout(activation, { ...frame, nowMs: 1_050 });
+  const later = sampleScoreReadout(activation, { ...frame, nowMs: 1_400 });
+  assert.ok(early && later);
+  assert.equal(early.centerY, later.centerY, 'reduced motion must not travel');
+  assert.equal(early.scale, 1);
+  assert.ok(later.opacity < early.opacity);
+  assert.equal(
+    sampleScoreReadout(activation, {
+      ...frame,
+      nowMs: 1_000 + REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS,
+    }),
+    null,
+  );
+});
+
+test('the default renderer paints rotated inset cells and a stroked readout', () => {
+  const runtime = createScoreEffectRuntime();
+  syncPredictedScoreEffects(
     runtime,
-    observation({ 0: 2, 1: 0 }, { engineEpoch: 2, tick: 20 }),
-  );
-  assert.deepEqual(resync, { started: 0, reset: true });
-  assert.equal(runtime.active.length, 0);
-  assert.equal(runtime.scores[0], 2);
-
-  syncScoreEffects(runtime, observation({ 0: 3, 1: 0 }, { engineEpoch: 2, tick: 21 }));
-  assert.equal(runtime.active.length, 1);
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 0, 1: 0 }, { gameId: '43', tick: 1 })),
-    { started: 0, reset: true },
-  );
-  assert.equal(runtime.active.length, 0);
-
-  syncScoreEffects(runtime, observation({ 0: 1, 1: 0 }, { gameId: '43', tick: 2 }));
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 1, 1: 0 }, { gameId: '43', tick: 1 })),
-    { started: 0, reset: true },
+    '42',
+    visualState([goalCue()], { predicted_tick: 10 }),
+    1_000,
   );
 
-  syncScoreEffects(runtime, observation({ 0: 2, 1: 0 }, { gameId: '43', tick: 3 }));
-  assert.deepEqual(
-    syncScoreEffects(runtime, observation({ 0: 1, 1: 0 }, { gameId: '43', tick: 4 })),
-    { started: 0, reset: true },
+  const fills: Array<[number, number, number, number]> = [];
+  const translations: Array<[number, number]> = [];
+  const scales: Array<[number, number]> = [];
+  const strokedText: Array<[string, number, number, string]> = [];
+  const filledText: Array<[string, number, number, string]> = [];
+  let saves = 0;
+  let restores = 0;
+  const context = {
+    fillStyle: '',
+    strokeStyle: '',
+    globalAlpha: 1,
+    font: '',
+    lineWidth: 0,
+    lineJoin: 'miter',
+    miterLimit: 10,
+    textAlign: 'start',
+    textBaseline: 'alphabetic',
+    save() { saves += 1; },
+    restore() { restores += 1; },
+    translate(x: number, y: number) { translations.push([x, y]); },
+    scale(x: number, y: number) { scales.push([x, y]); },
+    fillRect(x: number, y: number, width: number, height: number) {
+      fills.push([x, y, width, height]);
+    },
+    strokeText(text: string, x: number, y: number) {
+      strokedText.push([text, x, y, this.strokeStyle as string]);
+    },
+    fillText(text: string, x: number, y: number) {
+      filledText.push([text, x, y, this.fillStyle as string]);
+    },
+  } as unknown as CanvasRenderingContext2D;
+
+  drawScoreEffects(context, runtime, {
+    nowMs: 1_100,
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 90,
+    localTeamId: 0,
+    reducedMotion: false,
+  });
+
+  // Origin (9, 12) rotates to (27, 9); canvas padding is 1px and the 10px cell
+  // receives a restrained 0.8px inset on every edge.
+  assert.ok(fills.some(([x, y, width, height]) => (
+    Math.abs(x - 271.8) < 1e-9 &&
+    Math.abs(y - 91.8) < 1e-9 &&
+    Math.abs(width - 8.4) < 1e-9 &&
+    Math.abs(height - 8.4) < 1e-9
+  )));
+  // The readout is stroked before it is filled, so the halo never covers it,
+  // and it uses the deeper team tone rather than the wave's lighter colour.
+  const readout = sampleScoreReadout(runtime.active[0], {
+    nowMs: 1_100,
+    cellSize: 10,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 90,
+    reducedMotion: false,
+  });
+  assert.ok(readout);
+  assert.deepEqual(translations, [[readout.centerX, readout.centerY]]);
+  assert.deepEqual(scales, [[readout.scale, readout.scale]]);
+  assert.deepEqual(strokedText, [['+12', 0, 0, '#ffffff']]);
+  assert.deepEqual(filledText, [['+12', 0, 0, getScoreReadoutColor(0, 0)]]);
+  assert.notEqual(
+    getScoreReadoutColor(0, 0),
+    getScoreEffectTeamColor(0, 0),
+    'the readout must be darker than the wave to stay legible on a tinted end zone',
   );
-  assert.equal(runtime.active.length, 0);
-});
-
-test('active score effects remain bounded during repeated scoring', () => {
-  const runtime = createScoreEffectRuntime();
-  syncScoreEffects(runtime, observation({ 0: 0, 1: 0 }));
-
-  for (let score = 1; score <= MAX_ACTIVE_SCORE_EFFECTS + 3; score += 1) {
-    syncScoreEffects(runtime, observation(
-      { 0: score, 1: 0 },
-      { tick: 10 + score, nowMs: 1_000 + score },
-    ));
-  }
-
-  assert.equal(runtime.active.length, MAX_ACTIVE_SCORE_EFFECTS);
-  assert.equal(runtime.active.at(-1)?.score, MAX_ACTIVE_SCORE_EFFECTS + 3);
+  assert.equal(saves, 2);
+  assert.equal(restores, 2);
 });
 
 test('the registry supports a swapped renderer and owns lifecycle expiry', () => {
@@ -269,11 +574,14 @@ test('the registry supports a swapped renderer and owns lifecycle expiry', () =>
   };
   const registry = createScoreEffectRegistry([renderer]);
   const runtime = createScoreEffectRuntime();
-  resetScoreEffects(runtime, observation({ 0: 0, 1: 0 }));
-  syncScoreEffects(runtime, observation(
-    { 0: 1, 1: 0 },
-    { tick: 11, effectId: renderer.id },
-  ));
+  syncPredictedScoreEffects(
+    runtime,
+    '42',
+    visualState([goalCue()], { predicted_tick: 10 }),
+    1_000,
+    undefined,
+    renderer.id,
+  );
 
   assert.equal(registry.resolve(renderer.id), renderer);
   assert.equal(pruneExpiredScoreEffects(runtime, 1_049, false, registry), 0);

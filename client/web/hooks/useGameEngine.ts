@@ -24,8 +24,8 @@ interface UseGameEngineReturn {
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
   /** Render the engine's current predicted state to a canvas (no JSON round-trip). */
   renderTo: (canvas: HTMLCanvasElement, cellSize: number, rotation: number, localUserId: number | undefined) => void;
-  /** Read compact crash history from the same predicted state used by renderTo. */
-  readPredictedCrashVisualState: () => {
+  /** Read compact crash and goal history from the same predicted state used by renderTo. */
+  readPredictedVisualState: () => {
     engineEpoch: number;
     baselineTick: number;
     json: string;
@@ -318,7 +318,7 @@ export const useGameEngine = ({
     [],
   );
 
-  const readPredictedCrashVisualState = useCallback(() => {
+  const readPredictedVisualState = useCallback(() => {
     const engine = engineRef.current;
     if (!engine) {
       return null;
@@ -326,7 +326,7 @@ export const useGameEngine = ({
     return {
       engineEpoch: engineEpochRef.current,
       baselineTick: engineBaselineTickRef.current,
-      json: engine.getPredictedCrashVisualStateJson(),
+      json: engine.getPredictedVisualStateJson(),
     };
   }, []);
 
@@ -556,7 +556,7 @@ export const useGameEngine = ({
     sendCommand,
     processServerEvent,
     renderTo,
-    readPredictedCrashVisualState,
+    readPredictedVisualState,
     stopEngine,
   };
 };

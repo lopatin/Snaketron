@@ -1,8 +1,25 @@
 import type { ArenaRotation, Position } from '../types';
 
 export const DEFAULT_SCORE_EFFECT_ID = 'goal-impact-wave';
+/**
+ * The full celebration: an impact wave that resolves early and a floating
+ * points readout that outlives it. Cue retention in `GameState`
+ * (`RECENT_GOAL_RETENTION_MS`) is deliberately wider than this, so a cue
+ * expiring never looks like a rollback retraction.
+ */
+export const SCORE_CELEBRATION_DURATION_MS = 1200;
+export const REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS = 600;
+/**
+ * Mirrors `RECENT_GOAL_RETENTION_MS` in common/src/game_state.rs, less a margin
+ * for prediction lead and clock skew. Beyond this age a cue has legitimately
+ * aged out of the engine's history, so its absence no longer means "rolled
+ * back" and must not retract a celebration that is still on screen. This keeps
+ * the two durations independent: raising the celebration past the retention
+ * window degrades to "not retractable near the end", never to a visible pop.
+ */
+export const GOAL_CUE_RETRACTION_WINDOW_MS = 1500;
 export const SCORE_WAVE_DURATION_MS = 900;
-export const REDUCED_MOTION_SCORE_WAVE_DURATION_MS = 160;
+export const REDUCED_MOTION_SCORE_WAVE_DURATION_MS = 220;
 export const MAX_ACTIVE_SCORE_EFFECTS = 6;
 
 const CANVAS_PADDING_PX = 1;
@@ -12,40 +29,49 @@ const WAVE_RADIUS_ARENA_FRACTION = 0.2;
 const WAVE_THICKNESS_CELLS = 1.35;
 const MIN_VISIBLE_OPACITY = 0.012;
 
+const READOUT_RISE_CELLS = 3.4;
+const READOUT_MIN_FONT_PX = 15;
+const READOUT_MAX_FONT_PX = 40;
+const READOUT_FONT_CELL_FRACTION = 2.4;
+/** Conservative advance-per-character for `Impact`-class faces, used to keep
+ *  the readout inside the canvas without measuring text in the pure sampler. */
+const READOUT_GLYPH_ADVANCE_EM = 0.62;
+
 export interface ScoreEffectActivation {
   eventId: string;
   effectId: string;
   teamId: number;
-  previousScore: number;
-  score: number;
+  snakeId: number;
+  points: number;
   tick: number;
   origin: Position;
   startedAtMs: number;
 }
 
 export interface ScoreEffectRuntime {
-  gameId: string | null;
-  engineEpoch: number | null;
-  lastTick: number | null;
-  scores: Record<number, number>;
   active: ScoreEffectActivation[];
+  seenEventIds: Set<string>;
 }
 
-export interface ScoreEffectObservation {
-  gameId: string;
-  engineEpoch: number;
+/** One predicted goal, mirroring `common::game_state::TeamGoal`. */
+export interface PredictedGoalCue {
   tick: number;
-  teamScores: Record<number, number> | null;
-  arenaWidth: number;
-  arenaHeight: number;
-  endZoneDepth: number | null;
-  nowMs: number;
-  effectId?: string;
+  team_id: number;
+  snake_id: number;
+  position: Position;
+  points: number;
+}
+
+export interface PredictedScoreVisualState {
+  predicted_tick: number;
+  committed_tick: number;
+  tick_duration_ms: number;
+  goals?: readonly PredictedGoalCue[];
 }
 
 export interface ScoreEffectSyncResult {
   started: number;
-  reset: boolean;
+  cancelled: number;
 }
 
 export interface ScoreEffectFrame {
@@ -63,10 +89,19 @@ export interface ScoreWaveCell {
   opacity: number;
 }
 
+export interface ScoreReadoutRenderState {
+  text: string;
+  centerX: number;
+  centerY: number;
+  fontSize: number;
+  scale: number;
+  opacity: number;
+}
+
 /**
  * A renderer is intentionally smaller than the lifecycle that invokes it.
- * Future score treatments can be registered without changing score detection,
- * resync cancellation, rotation, or the bounded active-effect queue.
+ * Future score treatments can be registered without changing cue detection,
+ * rollback retraction, rotation, or the bounded active-effect queue.
  */
 export interface ScoreEffectRenderer {
   readonly id: string;
@@ -140,154 +175,132 @@ export const transformScoreEffectPosition = (
   }
 };
 
-/** The same home-goal boundary and vertical center used by Arena::goal_bounds. */
-export const getScoringGoalOrigin = (
-  teamId: number,
-  arenaWidth: number,
-  arenaHeight: number,
-  endZoneDepth: number | null,
-): Position | null => {
-  if (
-    (teamId !== 0 && teamId !== 1) ||
-    !Number.isInteger(arenaWidth) ||
-    !Number.isInteger(arenaHeight) ||
-    !Number.isInteger(endZoneDepth) ||
-    arenaWidth <= 0 ||
-    arenaHeight <= 0 ||
-    endZoneDepth === null ||
-    endZoneDepth <= 0 ||
-    endZoneDepth * 2 >= arenaWidth
-  ) {
-    return null;
-  }
-
-  return {
-    x: teamId === 0 ? endZoneDepth - 1 : arenaWidth - endZoneDepth,
-    y: Math.floor(arenaHeight / 2),
-  };
-};
-
-const normalizeScores = (
-  teamScores: Record<number, number> | null,
-): Record<number, number> => {
-  const normalized: Record<number, number> = {};
-  if (!teamScores) {
-    return normalized;
-  }
-
-  for (const [rawTeamId, rawScore] of Object.entries(teamScores)) {
-    const teamId = Number(rawTeamId);
-    if (
-      Number.isInteger(teamId) &&
-      teamId >= 0 &&
-      Number.isFinite(rawScore) &&
-      rawScore >= 0
-    ) {
-      normalized[teamId] = Math.floor(rawScore);
-    }
-  }
-  return normalized;
-};
-
 export const createScoreEffectRuntime = (): ScoreEffectRuntime => ({
-  gameId: null,
-  engineEpoch: null,
-  lastTick: null,
-  scores: {},
   active: [],
+  seenEventIds: new Set<string>(),
 });
 
-export const resetScoreEffects = (
-  runtime: ScoreEffectRuntime,
-  baseline?: Pick<
-    ScoreEffectObservation,
-    'gameId' | 'engineEpoch' | 'tick' | 'teamScores'
-  >,
-): void => {
+export const resetScoreEffects = (runtime: ScoreEffectRuntime): void => {
   runtime.active.length = 0;
-  runtime.gameId = baseline?.gameId ?? null;
-  runtime.engineEpoch = baseline?.engineEpoch ?? null;
-  runtime.lastTick = baseline?.tick ?? null;
-  runtime.scores = normalizeScores(baseline?.teamScores ?? null);
+  runtime.seenEventIds.clear();
 };
 
+const goalEventId = (gameId: string, cue: PredictedGoalCue): string =>
+  `${gameId}:goal:${cue.tick}:${cue.team_id}:${cue.snake_id}:${cue.position.x}:${cue.position.y}:${cue.points}`;
+
 /**
- * Observe authoritative/committed scores. The first observation after a game
- * change or engine snapshot is a baseline, never a replayed celebration.
+ * Starts celebrations from rollback-visible predicted goal history, so a goal
+ * plays the moment prediction simulates it instead of waiting for committed
+ * state to catch up. A prediction replay supplies the complete recent cue set,
+ * so an absent identity is an actual correction — the rare case where the goal
+ * never happened — and the celebration is retracted immediately.
  */
-export const syncScoreEffects = (
+export const syncPredictedScoreEffects = (
   runtime: ScoreEffectRuntime,
-  observation: ScoreEffectObservation,
+  gameId: string,
+  visualState: PredictedScoreVisualState,
+  nowMs: number,
+  suppressStartsAtOrBeforeTick?: number,
+  effectId: string = DEFAULT_SCORE_EFFECT_ID,
 ): ScoreEffectSyncResult => {
-  const nextScores = normalizeScores(observation.teamScores);
-  const changedAnchor =
-    runtime.gameId !== observation.gameId ||
-    runtime.engineEpoch !== observation.engineEpoch;
-  const tickRewound =
-    runtime.lastTick !== null && observation.tick < runtime.lastTick;
-  const scoreRegressed = Object.entries(runtime.scores).some(
-    ([rawTeamId, score]) => (nextScores[Number(rawTeamId)] ?? 0) < score,
-  );
-
-  if (changedAnchor || tickRewound || scoreRegressed) {
-    resetScoreEffects(runtime, observation);
-    return { started: 0, reset: true };
-  }
-
+  const currentCueIds = new Set<string>();
   let started = 0;
-  const effectId = observation.effectId ?? DEFAULT_SCORE_EFFECT_ID;
-  const orderedScores = Object.entries(nextScores).sort(
-    ([left], [right]) => Number(left) - Number(right),
-  );
+  let cancelled = 0;
 
-  for (const [rawTeamId, score] of orderedScores) {
-    const teamId = Number(rawTeamId);
-    const previousScore = runtime.scores[teamId];
-    // A key first appearing is baseline data, not proof of a score event.
-    if (previousScore === undefined || score <= previousScore) {
-      continue;
-    }
-
-    const origin = getScoringGoalOrigin(
-      teamId,
-      observation.arenaWidth,
-      observation.arenaHeight,
-      observation.endZoneDepth,
+  const tickDurationMs = Math.max(1, visualState.tick_duration_ms);
+  for (const cue of visualState.goals ?? []) {
+    const eventId = goalEventId(gameId, cue);
+    currentCueIds.add(eventId);
+    const elapsedMs = Math.max(
+      0,
+      (visualState.predicted_tick - cue.tick) * tickDurationMs,
     );
-    if (!origin || !Number.isFinite(observation.nowMs)) {
+
+    // A new engine epoch begins from an authoritative snapshot. Baseline cues
+    // at or before that committed tick are history, not a new visual event;
+    // speculative cues produced while catching up beyond it still play.
+    if (
+      runtime.seenEventIds.has(eventId) ||
+      elapsedMs >= SCORE_CELEBRATION_DURATION_MS ||
+      cue.points <= 0 ||
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(cue.position.x) ||
+      !Number.isFinite(cue.position.y) ||
+      (suppressStartsAtOrBeforeTick !== undefined &&
+        cue.tick <= suppressStartsAtOrBeforeTick)
+    ) {
+      runtime.seenEventIds.add(eventId);
       continue;
     }
 
+    runtime.seenEventIds.add(eventId);
     runtime.active.push({
-      eventId: `${observation.gameId}:${observation.engineEpoch}:${observation.tick}:${teamId}:${score}`,
+      eventId,
       effectId,
-      teamId,
-      previousScore,
-      score,
-      tick: observation.tick,
-      origin,
-      startedAtMs: observation.nowMs,
+      teamId: cue.team_id,
+      snakeId: cue.snake_id,
+      points: cue.points,
+      tick: cue.tick,
+      origin: { ...cue.position },
+      startedAtMs: nowMs - elapsedMs,
     });
     started += 1;
   }
 
-  if (runtime.active.length > MAX_ACTIVE_SCORE_EFFECTS) {
-    runtime.active.splice(
-      0,
-      runtime.active.length - MAX_ACTIVE_SCORE_EFFECTS,
-    );
+  // Retract before trimming, so a rolled-back celebration can never hold a
+  // slot that a real one is then evicted from.
+  for (let index = runtime.active.length - 1; index >= 0; index -= 1) {
+    const activation = runtime.active[index];
+    if (currentCueIds.has(activation.eventId)) {
+      continue;
+    }
+    // Absence only proves a rollback while the engine is still retaining the
+    // cue. Past that window the cue aged out on its own, and retracting here
+    // would pop a celebration of a goal that really happened.
+    if (nowMs - activation.startedAtMs >= GOAL_CUE_RETRACTION_WINDOW_MS) {
+      continue;
+    }
+
+    runtime.active.splice(index, 1);
+    runtime.seenEventIds.delete(activation.eventId);
+    cancelled += 1;
   }
-  runtime.gameId = observation.gameId;
-  runtime.engineEpoch = observation.engineEpoch;
-  runtime.lastTick = observation.tick;
-  runtime.scores = nextScores;
-  return { started, reset: false };
+
+  // Oldest survivors lose their slot first. Their dedupe entries stay, so a
+  // dropped celebration is not restarted by the next frame's cue set.
+  if (runtime.active.length > MAX_ACTIVE_SCORE_EFFECTS) {
+    runtime.active.splice(0, runtime.active.length - MAX_ACTIVE_SCORE_EFFECTS);
+  }
+
+  // Effects remove themselves when their time elapses. Release dedupe entries
+  // once a cue also leaves prediction history so a genuine rollback-and-replay
+  // can trigger the same deterministic identity again. An identity still held
+  // by a running effect keeps its entry, so a cue that ages out mid-animation
+  // and later reappears cannot enqueue the same celebration twice.
+  const goalPrefix = `${gameId}:goal:`;
+  const liveEventIds = new Set(runtime.active.map(effect => effect.eventId));
+  for (const eventId of runtime.seenEventIds) {
+    if (
+      eventId.startsWith(goalPrefix) &&
+      !currentCueIds.has(eventId) &&
+      !liveEventIds.has(eventId)
+    ) {
+      runtime.seenEventIds.delete(eventId);
+    }
+  }
+
+  return { started, cancelled };
 };
 
 const scoreWaveDuration = (reducedMotion: boolean): number =>
   reducedMotion
     ? REDUCED_MOTION_SCORE_WAVE_DURATION_MS
     : SCORE_WAVE_DURATION_MS;
+
+const scoreCelebrationDuration = (reducedMotion: boolean): number =>
+  reducedMotion
+    ? REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS
+    : SCORE_CELEBRATION_DURATION_MS;
 
 /** Pure timestamp-driven sampler used by both the canvas renderer and tests. */
 export const sampleScoreWaveCells = (
@@ -378,6 +391,107 @@ export const sampleScoreWaveCells = (
   return cells;
 };
 
+/**
+ * The floating points readout: it pops in over the cell the goal was scored
+ * on, rises, and fades. Sampled purely from the activation timestamp so the
+ * renderer and its tests agree exactly, and clamped to the canvas so a goal
+ * near an edge still shows its number.
+ */
+export const sampleScoreReadout = (
+  activation: ScoreEffectActivation,
+  frame: Pick<
+    ScoreEffectFrame,
+    | 'nowMs'
+    | 'cellSize'
+    | 'arenaWidth'
+    | 'arenaHeight'
+    | 'rotation'
+    | 'reducedMotion'
+  >,
+): ScoreReadoutRenderState | null => {
+  const durationMs = scoreCelebrationDuration(frame.reducedMotion);
+  const elapsedMs = frame.nowMs - activation.startedAtMs;
+  if (
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs < 0 ||
+    elapsedMs >= durationMs ||
+    activation.points <= 0 ||
+    frame.cellSize <= 0 ||
+    frame.arenaWidth <= 0 ||
+    frame.arenaHeight <= 0
+  ) {
+    return null;
+  }
+
+  // The readout snaps in at full opacity — the scale pop below carries the
+  // "appear" — so a goal never loses a frame to a zero-alpha ramp-in.
+  const progress = clamp(elapsedMs / durationMs, 0, 1);
+  const opacity = 1 - smoothstep(0.55, 1, progress);
+  if (opacity <= 0) {
+    return null;
+  }
+
+  const isVertical = frame.rotation === 90 || frame.rotation === 270;
+  const screenColumns = isVertical ? frame.arenaHeight : frame.arenaWidth;
+  const screenRows = isVertical ? frame.arenaWidth : frame.arenaHeight;
+  const transformed = transformScoreEffectPosition(
+    activation.origin,
+    frame.arenaWidth,
+    frame.arenaHeight,
+    frame.rotation,
+  );
+
+  const fontSize = clamp(
+    frame.cellSize * READOUT_FONT_CELL_FRACTION,
+    READOUT_MIN_FONT_PX,
+    READOUT_MAX_FONT_PX,
+  );
+  // The rise is deliberately linear. An ease-out would spend ~90% of its
+  // travel before the fade begins at 0.55, so the number would rise and then
+  // fade in place; constant drift keeps it visibly climbing as it fades out.
+  // Reduced motion keeps it still instead, fading without travelling.
+  const rise = frame.reducedMotion
+    ? 0
+    : frame.cellSize * READOUT_RISE_CELLS * progress;
+  const scale = frame.reducedMotion
+    ? 1
+    : 0.55 +
+      0.62 * smoothstep(0, 0.14, progress) -
+      0.17 * smoothstep(0.14, 0.4, progress);
+
+  const text = `+${activation.points}`;
+  const halfWidth =
+    (fontSize * scale * READOUT_GLYPH_ADVANCE_EM * text.length) / 2;
+  const halfHeight = (fontSize * scale) / 2;
+  const canvasWidth = CANVAS_PADDING_PX * 2 + screenColumns * frame.cellSize;
+  const canvasHeight = CANVAS_PADDING_PX * 2 + screenRows * frame.cellSize;
+
+  const rawCenterX =
+    CANVAS_PADDING_PX + transformed.x * frame.cellSize + frame.cellSize / 2;
+  const rawCenterY =
+    CANVAS_PADDING_PX +
+    transformed.y * frame.cellSize +
+    frame.cellSize / 2 -
+    rise;
+
+  return {
+    text,
+    centerX: clamp(
+      rawCenterX,
+      Math.min(halfWidth, canvasWidth / 2),
+      Math.max(canvasWidth - halfWidth, canvasWidth / 2),
+    ),
+    centerY: clamp(
+      rawCenterY,
+      Math.min(halfHeight, canvasHeight / 2),
+      Math.max(canvasHeight - halfHeight, canvasHeight / 2),
+    ),
+    fontSize,
+    scale,
+    opacity,
+  };
+};
+
 export const getScoreEffectTeamColor = (
   teamId: number,
   localTeamId: number | null,
@@ -386,32 +500,75 @@ export const getScoreEffectTeamColor = (
   return isBlue ? '#5299bb' : '#d45454';
 };
 
+/**
+ * A deeper team tone for the points readout. The wave stays restrained, but a
+ * goal is always scored inside a tinted end zone, where the wave's colour is
+ * only ~2.8:1 against the background — too weak for text even with a halo.
+ */
+export const getScoreReadoutColor = (
+  teamId: number,
+  localTeamId: number | null,
+): string => {
+  const isBlue = localTeamId === null ? teamId === 0 : teamId === localTeamId;
+  return isBlue ? '#2b6f8c' : '#a83232';
+};
+
 export const goalImpactWaveRenderer: ScoreEffectRenderer = {
   id: DEFAULT_SCORE_EFFECT_ID,
-  durationMs: SCORE_WAVE_DURATION_MS,
-  reducedMotionDurationMs: REDUCED_MOTION_SCORE_WAVE_DURATION_MS,
+  durationMs: SCORE_CELEBRATION_DURATION_MS,
+  reducedMotionDurationMs: REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS,
   draw(context, activation, frame) {
-    const cells = sampleScoreWaveCells(activation, frame);
-    if (cells.length === 0 || frame.cellSize <= 0) {
+    if (frame.cellSize <= 0) {
       return;
     }
 
-    const inset = clamp(frame.cellSize * 0.08, 0.5, 1.25);
-    const drawSize = Math.max(0, frame.cellSize - inset * 2);
-    context.save();
-    context.fillStyle = getScoreEffectTeamColor(
+    const teamColor = getScoreEffectTeamColor(
       activation.teamId,
       frame.localTeamId,
     );
-    for (const cell of cells) {
-      context.globalAlpha = cell.opacity;
-      context.fillRect(
-        CANVAS_PADDING_PX + cell.position.x * frame.cellSize + inset,
-        CANVAS_PADDING_PX + cell.position.y * frame.cellSize + inset,
-        drawSize,
-        drawSize,
-      );
+    const cells = sampleScoreWaveCells(activation, frame);
+
+    if (cells.length > 0) {
+      const inset = clamp(frame.cellSize * 0.08, 0.5, 1.25);
+      const drawSize = Math.max(0, frame.cellSize - inset * 2);
+      context.save();
+      context.fillStyle = teamColor;
+      for (const cell of cells) {
+        context.globalAlpha = cell.opacity;
+        context.fillRect(
+          CANVAS_PADDING_PX + cell.position.x * frame.cellSize + inset,
+          CANVAS_PADDING_PX + cell.position.y * frame.cellSize + inset,
+          drawSize,
+          drawSize,
+        );
+      }
+      context.restore();
     }
+
+    const readout = sampleScoreReadout(activation, frame);
+    if (!readout) {
+      return;
+    }
+
+    context.save();
+    context.globalAlpha = readout.opacity;
+    context.translate(readout.centerX, readout.centerY);
+    context.scale(readout.scale, readout.scale);
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.font = `italic 900 ${readout.fontSize}px Impact, 'Arial Black', sans-serif`;
+    // A white halo keeps the readout legible over the tinted end zones and
+    // over snakes without dimming the team colour.
+    context.lineWidth = Math.max(2, readout.fontSize * 0.18);
+    context.lineJoin = 'round';
+    context.miterLimit = 2;
+    context.strokeStyle = '#ffffff';
+    context.strokeText(readout.text, 0, 0);
+    context.fillStyle = getScoreReadoutColor(
+      activation.teamId,
+      frame.localTeamId,
+    );
+    context.fillText(readout.text, 0, 0);
     context.restore();
   },
 };
