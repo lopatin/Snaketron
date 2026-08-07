@@ -16,9 +16,23 @@ interface BoostKeyboardEventLike {
   target: EventTarget | null;
 }
 
+/**
+ * What the controller is allowed to know.
+ *
+ * Deliberately absent: anything about whether Boost is *currently possible*
+ * (fuel level, cooldown, respawn timing). The original bug — hold Space on an
+ * empty meter, collect a packet, and stay slow until you release and press
+ * again — came from gating the player's intent on a transient condition, which
+ * threw the intent away instead of deferring it. The engine now latches intent
+ * and starts Boost the moment it can, so the client only has to publish the
+ * level. Keeping fuel out of this type makes the old mistake unstateable.
+ */
 export interface BoostInputContext {
+  /** Predicted/authoritative: is the snake boosting right now? */
   active: boolean;
-  canActivate: boolean;
+  /** The engine's latched copy of what this player last asked for. */
+  intent: boolean;
+  /** Commands for this game can reach the server right now. */
   interactionActive: boolean;
   gameOver: boolean;
 }
@@ -133,6 +147,65 @@ export function targetOwnsGameplayKeys(target: EventTarget | null): boolean {
   );
 }
 
+const ARROW_NAVIGABLE_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="textbox"]',
+  '[role="combobox"]',
+  '[role="listbox"]',
+  '[role="radio"]',
+  '[role="radiogroup"]',
+  '[role="slider"]',
+  '[role="spinbutton"]',
+  '[role="menu"]',
+  '[role="menuitem"]',
+  '[role="tablist"]',
+  '[role="tree"]',
+].join(',');
+
+/**
+ * Arrow keys have a narrower owner set than Space.
+ *
+ * A focused plain button or link does nothing with arrow keys, but clicking one
+ * — Boost, Menu, Play Again — leaves it focused, and treating it as an owner
+ * silently killed every turn until focus moved elsewhere. Text entry and
+ * arrow-navigable widgets (the Hold/Press radios, selects, sliders) genuinely
+ * own arrows and keep them.
+ */
+export function targetOwnsArrowKeys(target: EventTarget | null): boolean {
+  if (!target || typeof target !== 'object') {
+    return false;
+  }
+
+  const element = target as EventTarget & {
+    tagName?: unknown;
+    isContentEditable?: unknown;
+    closest?: unknown;
+  };
+  const tagName = typeof element.tagName === 'string'
+    ? element.tagName.toUpperCase()
+    : '';
+
+  if (
+    ['INPUT', 'TEXTAREA', 'SELECT'].includes(tagName) ||
+    element.isContentEditable === true
+  ) {
+    return true;
+  }
+
+  if (typeof element.closest !== 'function') {
+    return false;
+  }
+
+  try {
+    return Boolean(element.closest(ARROW_NAVIGABLE_SELECTOR));
+  } catch {
+    return false;
+  }
+}
+
 /** Kept as the narrower public helper used by existing shortcut tests. */
 export function isTextEntryTarget(target: EventTarget | null): boolean {
   if (!target || typeof target !== 'object') {
@@ -168,17 +241,25 @@ export function getBoostKeyAction(event: BoostKeyboardEventLike): BoostKeyAction
 }
 
 /**
- * Pure mutable input controller. It tracks physical Space edges separately
- * from predicted Boost state, which makes keyup-after-focus-change and rapid
- * Toggle presses deterministic without waiting for React's next paint.
+ * Pure mutable input controller.
+ *
+ * The controller holds only *physical* facts — is the key down, is the pointer
+ * down, is the Toggle latched — and derives a single desired level from them.
+ * Every entry point funnels through `sync`, which publishes a command only when
+ * the desired level disagrees with the engine's latched intent. There is no
+ * path that inspects fuel, and therefore no path that can silently discard what
+ * the player asked for.
  */
 export class BoostInputController {
   private mode: BoostInputMode;
   private physicalSpaceDown = false;
   private physicalPointerDown = false;
-  private desiredTarget: boolean | null = null;
-  private lastSentTarget: boolean | null = null;
-  private releasePending = false;
+  /** Toggle mode's durable latch. Hold mode derives its level from the edges. */
+  private toggleLatched = false;
+  /** The level already published and not yet echoed back by the engine. */
+  private pendingLevel: boolean | null = null;
+  /** Edge detector for reconnects, which are when a resend is worthwhile. */
+  private interactionWasActive = false;
 
   constructor(mode: BoostInputMode = DEFAULT_BOOST_INPUT_MODE) {
     this.mode = mode;
@@ -192,14 +273,67 @@ export class BoostInputController {
     return this.physicalSpaceDown;
   }
 
-  private issue(target: boolean): BoostInputCommand | null {
-    if (this.lastSentTarget === target) {
+  /** The one definition of what the player is currently asking for. */
+  private desiredLevel(): boolean {
+    return this.mode === 'hold'
+      ? this.physicalSpaceDown || this.physicalPointerDown
+      : this.toggleLatched;
+  }
+
+  /**
+   * Publish the desired level if the engine does not already hold it.
+   *
+   * `force` is for arena teardown, which must get a release out while the
+   * socket still knows which game it belongs to even though the next route has
+   * already made interaction inactive.
+   */
+  private sync(context: BoostInputContext, force = false): BoostInputCommand | null {
+    const reconnected = context.interactionActive && !this.interactionWasActive;
+    this.interactionWasActive = context.interactionActive;
+
+    if (context.gameOver) {
+      this.pendingLevel = null;
       return null;
     }
 
-    this.lastSentTarget = target;
-    this.desiredTarget = target;
-    return target ? 'ActivateBoost' : 'DeactivateBoost';
+    // Interaction resuming is the one moment a resend is worth it: whatever we
+    // last published may never have reached the engine. Forgetting it here
+    // makes the comparison below republish the level if it still disagrees.
+    if (reconnected) {
+      this.pendingLevel = null;
+    }
+
+    if (!context.interactionActive && !force) {
+      // Hold the intent rather than dropping it: whatever the player wants is
+      // still true, and the next sync after reconnect publishes it.
+      return null;
+    }
+
+    // The engine has caught up with our last request; stop tracking it.
+    if (this.pendingLevel !== null && context.intent === this.pendingLevel) {
+      this.pendingLevel = null;
+    }
+
+    // Compare against what the engine will hold once anything in flight lands,
+    // not against what it holds right now. A press and a quick release inside
+    // one round trip would otherwise look like "already correct" and cancel
+    // into silence, stranding the engine on the press.
+    const desired = this.desiredLevel();
+    const effective = this.pendingLevel ?? context.intent;
+    if (effective === desired) {
+      return null;
+    }
+
+    this.pendingLevel = desired;
+    return desired ? 'ActivateBoost' : 'DeactivateBoost';
+  }
+
+  private decide(
+    context: BoostInputContext,
+    preventDefault: boolean,
+    force = false,
+  ): BoostInputDecision {
+    return { preventDefault, command: this.sync(context, force) };
   }
 
   handleKeyDown(
@@ -218,38 +352,15 @@ export class BoostInputController {
       return SUPPRESS_DECISION;
     }
 
-    if (!context.interactionActive) {
-      return SUPPRESS_DECISION;
-    }
-
+    // The key is down whether or not the game can act on it yet. Recording it
+    // unconditionally is what lets a press made during a countdown, a respawn,
+    // or a reconnect take effect the moment play resumes.
     this.physicalSpaceDown = true;
-
-    if (this.mode === 'hold') {
-      if (context.active) {
-        this.desiredTarget = true;
-        return SUPPRESS_DECISION;
-      }
-      if (!context.canActivate) {
-        this.desiredTarget = false;
-        return SUPPRESS_DECISION;
-      }
-      return {
-        preventDefault: true,
-        command: this.issue(true),
-      };
+    if (this.mode === 'toggle') {
+      this.toggleLatched = !this.toggleLatched;
     }
 
-    const currentlyDesired = this.desiredTarget ?? context.active;
-    const nextTarget = !currentlyDesired;
-    if (nextTarget && !context.canActivate) {
-      this.desiredTarget = false;
-      return SUPPRESS_DECISION;
-    }
-
-    return {
-      preventDefault: true,
-      command: this.issue(nextTarget),
-    };
+    return this.decide(context, true);
   }
 
   handleKeyUp(
@@ -268,68 +379,31 @@ export class BoostInputController {
     }
 
     this.physicalSpaceDown = false;
-    if (this.mode === 'toggle') {
-      return SUPPRESS_DECISION;
-    }
-
-    const shouldStop = this.desiredTarget === true;
-    this.desiredTarget = false;
-    if (!shouldStop) {
-      return SUPPRESS_DECISION;
-    }
-
-    if (!context.interactionActive || context.gameOver) {
-      this.releasePending = !context.gameOver;
-      return SUPPRESS_DECISION;
-    }
-
-    return {
-      preventDefault: true,
-      command: this.issue(false),
-    };
+    return this.decide(context, true);
   }
 
   handleButtonPress(context: BoostInputContext): BoostInputDecision {
     // In Hold mode pointer edges own activation. The click synthesized after
     // pointerup must not turn a momentary hold into a latch.
-    if (this.mode !== 'toggle' || !context.interactionActive || context.gameOver) {
+    if (this.mode !== 'toggle' || context.gameOver) {
       return IGNORE_DECISION;
     }
 
-    const currentlyDesired = this.desiredTarget ?? context.active;
-    if (!currentlyDesired && !context.canActivate) {
-      return IGNORE_DECISION;
-    }
-
-    return {
-      preventDefault: false,
-      command: this.issue(!currentlyDesired),
-    };
+    this.toggleLatched = !this.toggleLatched;
+    return this.decide(context, false);
   }
 
   handlePointerDown(context: BoostInputContext): BoostInputDecision {
-    if (this.mode !== 'hold' || !context.interactionActive || context.gameOver) {
+    if (this.mode !== 'hold' || context.gameOver) {
       return IGNORE_DECISION;
     }
 
     if (this.physicalPointerDown) {
       return SUPPRESS_DECISION;
     }
+
     this.physicalPointerDown = true;
-
-    if (context.active) {
-      this.desiredTarget = true;
-      return SUPPRESS_DECISION;
-    }
-    if (!context.canActivate) {
-      this.desiredTarget = false;
-      return SUPPRESS_DECISION;
-    }
-
-    return {
-      preventDefault: true,
-      command: this.issue(true),
-    };
+    return this.decide(context, true);
   }
 
   handlePointerUp(context: BoostInputContext): BoostInputDecision {
@@ -338,160 +412,52 @@ export class BoostInputController {
     }
 
     this.physicalPointerDown = false;
-    const shouldStop = this.desiredTarget === true;
-    this.desiredTarget = false;
-    if (!shouldStop) {
-      return SUPPRESS_DECISION;
-    }
-
-    if (!context.interactionActive || context.gameOver) {
-      this.releasePending = !context.gameOver;
-      return SUPPRESS_DECISION;
-    }
-
-    return {
-      preventDefault: true,
-      command: this.issue(false),
-    };
+    return this.decide(context, true);
   }
 
   /**
-   * Safety release for loss of physical-key ownership. Hold stops; Toggle
-   * keeps its explicit latched intent but clears the physical key edge so the
-   * next press is accepted even when the browser swallowed keyup.
+   * Safety release for loss of physical-key ownership (blur, tab hidden).
+   * Hold stops because the key edges are gone; Toggle keeps its explicit
+   * latched intent but clears the physical edge so the next press is accepted
+   * even when the browser swallowed keyup.
    */
   releaseHeld(context: BoostInputContext): BoostInputDecision {
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
-    if (this.mode === 'toggle') {
-      return IGNORE_DECISION;
-    }
-
-    return this.cleanup(context);
+    return this.decide(context, false);
   }
 
   /** Stop either mode's current intent during explicit arena teardown. */
   cleanup(context: BoostInputContext): BoostInputDecision {
-    const shouldStop = this.desiredTarget === true;
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
-    this.desiredTarget = false;
-
-    if (!shouldStop || context.gameOver) {
-      this.releasePending = false;
-      return IGNORE_DECISION;
-    }
-
-    if (!context.interactionActive) {
-      this.releasePending = true;
-      return IGNORE_DECISION;
-    }
-
-    this.releasePending = false;
-    return {
-      preventDefault: false,
-      command: this.issue(false),
-    };
+    this.toggleLatched = false;
+    return this.decide(context, false);
   }
 
-  /** Explicit route/arena teardown stops authoritative or pending Boost before
-   * LeaveGame clears the command channel's game identity. */
+  /**
+   * Explicit route/arena teardown. Route transitions render with the next
+   * route identity before effects tear down the old arena, so
+   * `interactionActive` may already be false while the old socket still has a
+   * valid game identity; this is the last safe moment to publish the stop
+   * before LeaveGame clears it.
+   */
   teardown(context: BoostInputContext): BoostInputDecision {
-    const shouldStop = (
-      this.desiredTarget === true ||
-      this.lastSentTarget === true ||
-      this.releasePending ||
-      context.active
-    );
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
-    this.desiredTarget = false;
-    this.releasePending = false;
-
-    // Route transitions render with the next route identity before effects
-    // tear down the old arena, so `interactionActive` may already be false
-    // while the old socket still has a valid game identity. Teardown is the
-    // last safe opportunity to publish the stop before LeaveGame clears it.
-    if (!shouldStop || context.gameOver) {
-      return IGNORE_DECISION;
-    }
-
-    return {
-      preventDefault: false,
-      command: this.issue(false),
-    };
+    this.toggleLatched = false;
+    return this.decide(context, false, true);
   }
 
+  /**
+   * Called on every render. This is the whole recovery story: any disagreement
+   * between what the player is doing and what the engine has latched — a lost
+   * command, a reconnect, a snapshot from before the press — is republished
+   * here, and depletion/refuel needs no client involvement at all because the
+   * engine resumes a still-held Boost by itself.
+   */
   reconcile(context: BoostInputContext): BoostInputDecision {
-    if (this.lastSentTarget !== null && context.active === this.lastSentTarget) {
-      this.lastSentTarget = null;
-    }
-
-    if (this.mode === 'toggle' && this.lastSentTarget === null) {
-      this.desiredTarget = context.active;
-    }
-
-    const physicalHoldContinues = this.physicalSpaceDown || this.physicalPointerDown;
-    const depletedHoldIntent = (
-      this.mode === 'hold' &&
-      physicalHoldContinues &&
-      this.desiredTarget === true &&
-      !context.active &&
-      context.interactionActive &&
-      !context.gameOver
-    );
-
-    // Depletion ends the current activation, not the physical Hold intent. A
-    // render may skip the final active frame for a one-quantum tank, so clear a
-    // still-pending start once the held snake is observably inactive and empty.
-    // This lets a later packet collection create one fresh activation edge.
-    if (depletedHoldIntent && !context.canActivate && this.lastSentTarget === true) {
-      this.lastSentTarget = null;
-    }
-
-    if (depletedHoldIntent && context.canActivate) {
-      return {
-        preventDefault: false,
-        command: this.issue(true),
-      };
-    }
-
-    // Hold has no durable on-state. If a fresh/reconnected snapshot says the
-    // snake is active while no physical hold or pending activation owns it,
-    // repair the missed release immediately.
-    if (
-      this.mode === 'hold' &&
-      context.active &&
-      !this.physicalSpaceDown &&
-      this.desiredTarget !== true &&
-      !this.releasePending &&
-      context.interactionActive &&
-      !context.gameOver
-    ) {
-      return {
-        preventDefault: false,
-        command: this.issue(false),
-      };
-    }
-
-    if (!this.releasePending) {
-      return IGNORE_DECISION;
-    }
-
-    if (!context.active) {
-      this.releasePending = false;
-      return IGNORE_DECISION;
-    }
-
-    if (!context.interactionActive || context.gameOver) {
-      return IGNORE_DECISION;
-    }
-
-    this.releasePending = false;
-    return {
-      preventDefault: false,
-      command: this.issue(false),
-    };
+    return this.decide(context, false);
   }
 
   setMode(mode: BoostInputMode, context: BoostInputContext): BoostInputDecision {
@@ -504,11 +470,12 @@ export class BoostInputController {
     return decision;
   }
 
+  /** Drop all local state, e.g. when the arena switches to a different game. */
   reset(): void {
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
-    this.desiredTarget = null;
-    this.lastSentTarget = null;
-    this.releasePending = false;
+    this.toggleLatched = false;
+    this.pendingLevel = null;
+    this.interactionWasActive = false;
   }
 }

@@ -7,6 +7,7 @@ import {
   isTextEntryTarget,
   loadBoostInputMode,
   persistBoostInputMode,
+  targetOwnsArrowKeys,
   targetOwnsGameplayKeys,
   type BoostInputContext,
 } from '../../utils/boostInput.ts';
@@ -31,7 +32,7 @@ const context = (
   overrides: Partial<BoostInputContext> = {},
 ): BoostInputContext => ({
   active: false,
-  canActivate: true,
+  intent: false,
   interactionActive: true,
   gameOver: false,
   ...overrides,
@@ -78,6 +79,34 @@ test('text and interactive controls retain Space and arrow-key ownership', () =>
   assert.equal(getBoostKeyAction(key('ArrowUp')), 'ignore');
 });
 
+// Clicking Boost, Menu, or Play Again leaves that button focused. Buttons do
+// nothing with arrow keys, so they must not swallow turns — but text entry and
+// arrow-navigable widgets still own them.
+test('arrow keys survive a focused button but yield to text entry and radios', () => {
+  const targetWithRole = (role: string): EventTarget => ({
+    tagName: 'div',
+    isContentEditable: false,
+    closest: (selector: string) => selector.includes(`[role="${role}"]`) ? {} : null,
+  }) as unknown as EventTarget;
+
+  for (const tagName of ['button', 'A']) {
+    const focused = target(tagName);
+    assert.equal(targetOwnsGameplayKeys(focused), true, 'Space still yields');
+    assert.equal(targetOwnsArrowKeys(focused), false, 'arrows must not yield');
+  }
+
+  for (const tagName of ['input', 'TEXTAREA', 'Select']) {
+    assert.equal(targetOwnsArrowKeys(target(tagName)), true);
+  }
+  assert.equal(targetOwnsArrowKeys(target('span', true)), true);
+  assert.equal(targetOwnsArrowKeys(targetWithRole('radio')), true);
+  assert.equal(targetOwnsArrowKeys(targetWithRole('slider')), true);
+  assert.equal(targetOwnsArrowKeys(targetWithRole('combobox')), true);
+  assert.equal(targetOwnsArrowKeys(targetWithRole('button')), false);
+  assert.equal(targetOwnsArrowKeys(target('canvas')), false);
+  assert.equal(targetOwnsArrowKeys(null), false);
+});
+
 test('Hold starts on keydown, suppresses repeats, and stops on keyup', () => {
   const controller = new BoostInputController();
 
@@ -86,11 +115,11 @@ test('Hold starts on keydown, suppresses repeats, and stops on keyup', () => {
     command: 'ActivateBoost',
   });
   assert.equal(controller.isSpaceDown(), true);
-  assert.deepEqual(controller.handleKeyDown(key('Space', true), context({ active: true })), {
+  assert.deepEqual(controller.handleKeyDown(key('Space', true), context({ intent: true })), {
     preventDefault: true,
     command: null,
   });
-  assert.deepEqual(controller.handleKeyUp(key(), context({ active: true })), {
+  assert.deepEqual(controller.handleKeyUp(key(), context({ intent: true, active: true })), {
     preventDefault: true,
     command: 'DeactivateBoost',
   });
@@ -107,98 +136,163 @@ test('Hold release is honored after focus moves and can cancel pending activatio
 
   const focusedInput = target('input');
   assert.equal(
-    controller.handleKeyUp(key('Space', false, focusedInput), context()).command,
+    controller.handleKeyUp(key('Space', false, focusedInput), context({ intent: true })).command,
     'DeactivateBoost',
   );
 });
 
-test('Hold at zero charge has no latent activation or unnecessary release command', () => {
+// The reported bug, at the layer that caused it: an empty meter must not stop
+// the press from being published, because the engine is what decides when the
+// held Boost can start.
+test('Hold on an empty meter still publishes intent so fuel starts Boost', () => {
   const controller = new BoostInputController('hold');
-  assert.deepEqual(controller.handleKeyDown(key(), context({ canActivate: false })), {
+
+  assert.deepEqual(controller.handleKeyDown(key(), context()), {
     preventDefault: true,
-    command: null,
+    command: 'ActivateBoost',
   });
-  assert.deepEqual(controller.handleKeyUp(key(), context({ canActivate: false })), {
-    preventDefault: true,
-    command: null,
-  });
+
+  // The engine has the intent and is simply waiting for fuel. The client sends
+  // nothing further, and in particular never retracts the request.
+  assert.equal(
+    controller.reconcile(context({ intent: true, active: false })).command,
+    null,
+  );
+  assert.equal(
+    controller.reconcile(context({ intent: true, active: true })).command,
+    null,
+  );
 });
 
-test('continuous Space Hold resumes Boost when depleted charge is replenished', () => {
+test('depletion and refuel while held need no client commands at all', () => {
   const controller = new BoostInputController('hold');
+  controller.handleKeyDown(key(), context());
 
-  assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
-  assert.equal(
-    controller.reconcile(context({ active: true, canActivate: false })).command,
-    null,
-  );
-  assert.equal(
-    controller.reconcile(context({ active: false, canActivate: false })).command,
-    null,
-  );
-  assert.equal(
-    controller.reconcile(context({ active: false, canActivate: true })).command,
-    'ActivateBoost',
-  );
-  assert.equal(
-    controller.reconcile(context({ active: false, canActivate: true })).command,
-    null,
-    'one replenishment must create only one activation edge',
-  );
+  // Boosting, then the tank runs dry, then a packet lands: the latch never
+  // moves, so the controller stays quiet throughout.
+  for (const active of [true, false, true]) {
+    assert.equal(
+      controller.reconcile(context({ intent: true, active })).command,
+      null,
+    );
+  }
 });
 
-test('continuous pointer Hold resumes Boost after depletion and recharge', () => {
-  const controller = new BoostInputController('hold');
-
-  assert.equal(controller.handlePointerDown(context()).command, 'ActivateBoost');
-  controller.reconcile(context({ active: true, canActivate: false }));
-  assert.equal(
-    controller.reconcile(context({ active: false, canActivate: false })).command,
-    null,
-  );
-  assert.equal(
-    controller.reconcile(context({ active: false, canActivate: true })).command,
-    'ActivateBoost',
-  );
-});
-
-test('releasing Hold while empty cancels intent before charge is replenished', () => {
+test('releasing Hold while empty retracts the intent', () => {
   const controller = new BoostInputController('hold');
 
   controller.handleKeyDown(key(), context());
-  controller.reconcile(context({ active: true, canActivate: false }));
-  controller.reconcile(context({ active: false, canActivate: false }));
+  controller.reconcile(context({ intent: true, active: false }));
   assert.equal(
-    controller.handleKeyUp(key(), context({ active: false, canActivate: false })).command,
+    controller.handleKeyUp(key(), context({ intent: true, active: false })).command,
     'DeactivateBoost',
   );
   assert.equal(
-    controller.reconcile(context({ active: false, canActivate: true })).command,
+    controller.reconcile(context({ intent: false, active: false })).command,
     null,
   );
 });
 
-test('Toggle changes target once per complete physical press', () => {
+// Losing the socket is not a release. The key is still down, so the level must
+// survive the outage and be republished, not require a fresh press.
+test('a hold survives a disconnect and is republished on reconnect', () => {
+  const controller = new BoostInputController('hold');
+  assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
+  controller.reconcile(context({ intent: true, active: true }));
+
+  assert.equal(
+    controller.reconcile(context({ intent: true, interactionActive: false })).command,
+    null,
+  );
+  assert.equal(controller.isSpaceDown(), true, 'the key is still physically down');
+
+  // The engine lost the intent across the outage; the still-held key restores it.
+  assert.equal(
+    controller.reconcile(context({ intent: false, interactionActive: true })).command,
+    'ActivateBoost',
+  );
+
+  // And the eventual release is still honored.
+  assert.equal(
+    controller.handleKeyUp(key(), context({ intent: true })).command,
+    'DeactivateBoost',
+  );
+});
+
+test('a press made before play starts is published once interaction opens', () => {
+  const controller = new BoostInputController('hold');
+
+  // Countdown, respawn, or a dropped socket: the key is still physically down.
+  assert.deepEqual(controller.handleKeyDown(key(), context({ interactionActive: false })), {
+    preventDefault: true,
+    command: null,
+  });
+  assert.equal(controller.isSpaceDown(), true);
+
+  assert.equal(
+    controller.reconcile(context({ interactionActive: true })).command,
+    'ActivateBoost',
+  );
+});
+
+test('an unacknowledged command is republished when interaction resumes', () => {
+  const controller = new BoostInputController('hold');
+  assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
+
+  // While the request is in flight the controller waits rather than spamming.
+  assert.equal(controller.reconcile(context({ intent: false })).command, null);
+  assert.equal(controller.reconcile(context({ intent: false })).command, null);
+
+  // A reconnect is the moment to doubt delivery and say it again.
+  assert.equal(controller.reconcile(context({ interactionActive: false })).command, null);
+  assert.equal(
+    controller.reconcile(context({ intent: false, interactionActive: true })).command,
+    'ActivateBoost',
+  );
+});
+
+// A tap can complete inside one round trip. The release must still be sent, or
+// the engine keeps the press forever and the snake boosts with nothing held.
+test('a press and release inside one round trip still publishes the release', () => {
+  const controller = new BoostInputController('hold');
+  assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
+
+  // Released before the engine has echoed the press back.
+  assert.equal(
+    controller.handleKeyUp(key(), context({ intent: false })).command,
+    'DeactivateBoost',
+  );
+
+  // Both echoes arrive in order and neither produces a spurious command.
+  assert.equal(controller.reconcile(context({ intent: true, active: true })).command, null);
+  assert.equal(controller.reconcile(context({ intent: false })).command, null);
+});
+
+test('Toggle changes level once per complete physical press', () => {
   const controller = new BoostInputController('toggle');
 
   assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
   assert.equal(controller.handleKeyDown(key('Space', true), context()).command, null);
-  assert.equal(controller.handleKeyUp(key(), context()).command, null);
+  assert.equal(controller.handleKeyUp(key(), context({ intent: true })).command, null);
 
-  // The second press uses the remembered target even before a React render
-  // publishes predicted active state.
-  assert.equal(controller.handleKeyDown(key(), context()).command, 'DeactivateBoost');
+  // The second press uses the remembered latch even before a React render
+  // publishes predicted state.
+  assert.equal(
+    controller.handleKeyDown(key(), context({ intent: true })).command,
+    'DeactivateBoost',
+  );
   assert.equal(controller.handleKeyUp(key(), context()).command, null);
 });
 
-test('Toggle does not arm future Boost while charge is unavailable', () => {
+test('Toggle arms Boost on an empty meter and keeps it armed', () => {
   const controller = new BoostInputController('toggle');
-  assert.equal(
-    controller.handleKeyDown(key(), context({ canActivate: false })).command,
-    null,
-  );
-  controller.handleKeyUp(key(), context({ canActivate: false }));
   assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
+  controller.handleKeyUp(key(), context({ intent: true }));
+  assert.equal(controller.reconcile(context({ intent: true, active: false })).command, null);
+  assert.equal(
+    controller.handleKeyDown(key(), context({ intent: true })).command,
+    'DeactivateBoost',
+  );
 });
 
 test('Hold pointer edges start and stop Boost while its synthesized click is inert', () => {
@@ -208,23 +302,42 @@ test('Hold pointer edges start and stop Boost while its synthesized click is ine
     preventDefault: true,
     command: 'ActivateBoost',
   });
-  assert.equal(controller.handlePointerDown(context()).command, null);
-  assert.equal(controller.handleButtonPress(context({ active: true })).command, null);
-  assert.deepEqual(controller.handlePointerUp(context({ active: true })), {
+  assert.equal(controller.handlePointerDown(context({ intent: true })).command, null);
+  assert.equal(controller.handleButtonPress(context({ intent: true, active: true })).command, null);
+  assert.deepEqual(controller.handlePointerUp(context({ intent: true, active: true })), {
     preventDefault: true,
     command: 'DeactivateBoost',
   });
   assert.equal(controller.handlePointerUp(context()).command, null);
 });
 
-test('Toggle pointer edges are inert and click changes the durable target', () => {
+// The pointer equivalent of the disconnect case: the press is recorded even
+// when it cannot be published, and the release is still honored afterwards.
+test('a pointer hold started while disconnected still releases cleanly', () => {
+  const controller = new BoostInputController('hold');
+
+  assert.deepEqual(controller.handlePointerDown(context({ interactionActive: false })), {
+    preventDefault: true,
+    command: null,
+  });
+  assert.equal(
+    controller.reconcile(context({ interactionActive: true })).command,
+    'ActivateBoost',
+  );
+  assert.equal(
+    controller.handlePointerUp(context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+});
+
+test('Toggle pointer edges are inert and click changes the durable level', () => {
   const controller = new BoostInputController('toggle');
 
   assert.equal(controller.handlePointerDown(context()).command, null);
   assert.equal(controller.handlePointerUp(context()).command, null);
   assert.equal(controller.handleButtonPress(context()).command, 'ActivateBoost');
   assert.equal(
-    controller.handleButtonPress(context({ active: true, canActivate: false })).command,
+    controller.handleButtonPress(context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
 });
@@ -232,46 +345,49 @@ test('Toggle pointer edges are inert and click changes the durable target', () =
 test('cleanup and mode changes stop once and clear the physical latch', () => {
   const controller = new BoostInputController('hold');
   controller.handleKeyDown(key(), context());
-  controller.reconcile(context({ active: true, canActivate: false }));
+  controller.reconcile(context({ intent: true, active: true }));
 
-  assert.equal(controller.cleanup(context({ active: true, canActivate: false })).command, 'DeactivateBoost');
-  assert.equal(controller.cleanup(context({ active: true, canActivate: false })).command, null);
+  assert.equal(
+    controller.cleanup(context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+  assert.equal(controller.cleanup(context({ intent: true, active: true })).command, null);
   assert.equal(controller.isSpaceDown(), false);
 
   controller.reconcile(context());
   controller.handleKeyDown(key(), context());
   assert.equal(
-    controller.setMode('toggle', context({ active: true, canActivate: false })).command,
+    controller.setMode('toggle', context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
   assert.equal(controller.getMode(), 'toggle');
   assert.equal(controller.isSpaceDown(), false);
 });
 
-test('explicit teardown stops an authoritative or pending Boost exactly once', () => {
+test('explicit teardown stops a latched Boost exactly once', () => {
   const authoritative = new BoostInputController('toggle');
   assert.equal(
-    authoritative.teardown(context({ active: true, canActivate: false })).command,
+    authoritative.teardown(context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
   assert.equal(
-    authoritative.teardown(context({ active: true, canActivate: false })).command,
+    authoritative.teardown(context({ intent: true, active: true })).command,
     null,
   );
 
   const pending = new BoostInputController('hold');
   pending.handlePointerDown(context());
   assert.equal(
-    pending.teardown(context({ interactionActive: false })).command,
+    pending.teardown(context({ intent: true, interactionActive: false })).command,
     'DeactivateBoost',
-    'route teardown must release pending Boost after the next route makes interaction inactive',
+    'route teardown must release Boost after the next route makes interaction inactive',
   );
 
   const deferredRelease = new BoostInputController('hold');
   deferredRelease.handlePointerDown(context());
-  deferredRelease.handlePointerUp(context({ interactionActive: false }));
+  deferredRelease.handlePointerUp(context({ intent: true, interactionActive: false }));
   assert.equal(
-    deferredRelease.teardown(context({ interactionActive: false })).command,
+    deferredRelease.teardown(context({ intent: true, interactionActive: false })).command,
     'DeactivateBoost',
     'teardown must flush a release deferred during route transition',
   );
@@ -280,15 +396,15 @@ test('explicit teardown stops an authoritative or pending Boost exactly once', (
 test('blur safety releases Hold without inventing intent from snapshot state', () => {
   const passive = new BoostInputController('hold');
   assert.equal(
-    passive.releaseHeld(context({ active: true, canActivate: false })).command,
+    passive.releaseHeld(context({ intent: false, active: false })).command,
     null,
   );
 
   const held = new BoostInputController('hold');
   held.handleKeyDown(key(), context());
-  held.reconcile(context({ active: true, canActivate: false }));
+  held.reconcile(context({ intent: true, active: true }));
   assert.equal(
-    held.releaseHeld(context({ active: true, canActivate: false })).command,
+    held.releaseHeld(context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
 });
@@ -296,15 +412,15 @@ test('blur safety releases Hold without inventing intent from snapshot state', (
 test('blur clears the physical Toggle edge without cancelling Toggle intent', () => {
   const controller = new BoostInputController('toggle');
   assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
-  controller.reconcile(context({ active: true, canActivate: false }));
+  controller.reconcile(context({ intent: true, active: true }));
 
   assert.equal(
-    controller.releaseHeld(context({ active: true, canActivate: false })).command,
+    controller.releaseHeld(context({ intent: true, active: true })).command,
     null,
   );
   assert.equal(controller.isSpaceDown(), false);
   assert.equal(
-    controller.handleKeyDown(key(), context({ active: true, canActivate: false })).command,
+    controller.handleKeyDown(key(), context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
 });
@@ -312,42 +428,42 @@ test('blur clears the physical Toggle edge without cancelling Toggle intent', ()
 test('changing from Toggle to Hold explicitly stops latched Toggle intent', () => {
   const controller = new BoostInputController('toggle');
   controller.handleKeyDown(key(), context());
-  controller.handleKeyUp(key(), context({ active: true, canActivate: false }));
-  controller.reconcile(context({ active: true, canActivate: false }));
+  controller.handleKeyUp(key(), context({ intent: true, active: true }));
+  controller.reconcile(context({ intent: true, active: true }));
 
   assert.equal(
-    controller.setMode('hold', context({ active: true, canActivate: false })).command,
+    controller.setMode('hold', context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
   assert.equal(controller.getMode(), 'hold');
 });
 
-test('fresh Hold state repairs an authoritative active Boost with no held key', () => {
+test('fresh Hold state repairs a latched Boost with no held key', () => {
   const controller = new BoostInputController('hold');
   assert.equal(
-    controller.reconcile(context({ active: true, canActivate: false })).command,
+    controller.reconcile(context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
   assert.equal(
-    controller.reconcile(context({ active: true, canActivate: false })).command,
+    controller.reconcile(context({ intent: true, active: true })).command,
     null,
   );
 });
 
-test('Toggle preserves its authoritative active state across blur and reconnect', () => {
+test('Toggle preserves its latched state across blur and reconnect', () => {
   const controller = new BoostInputController('toggle');
   controller.handleKeyDown(key(), context());
-  controller.handleKeyUp(key(), context({ active: true, canActivate: false }));
-  controller.reconcile(context({ active: true, canActivate: false }));
+  controller.handleKeyUp(key(), context({ intent: true, active: true }));
+  controller.reconcile(context({ intent: true, active: true }));
 
   assert.equal(controller.releaseHeld(context({
+    intent: true,
     active: true,
-    canActivate: false,
     interactionActive: false,
   })).command, null);
   assert.equal(controller.reconcile(context({
+    intent: true,
     active: true,
-    canActivate: false,
     interactionActive: true,
   })).command, null);
 });
@@ -355,21 +471,21 @@ test('Toggle preserves its authoritative active state across blur and reconnect'
 test('cleanup while disconnected defers one release until interaction resumes', () => {
   const controller = new BoostInputController('hold');
   controller.handleKeyDown(key(), context());
-  controller.reconcile(context({ active: true, canActivate: false }));
+  controller.reconcile(context({ intent: true, active: true }));
 
   assert.equal(controller.cleanup(context({
+    intent: true,
     active: true,
-    canActivate: false,
     interactionActive: false,
   })).command, null);
   assert.equal(controller.reconcile(context({
+    intent: true,
     active: true,
-    canActivate: false,
     interactionActive: true,
   })).command, 'DeactivateBoost');
   assert.equal(controller.reconcile(context({
-    active: true,
-    canActivate: false,
+    intent: false,
+    active: false,
     interactionActive: true,
   })).command, null);
 });
@@ -380,4 +496,14 @@ test('game-over Space is ignored so the score card keeps its shortcut', () => {
     preventDefault: false,
     command: null,
   });
+});
+
+test('reset drops every local fact so a new game starts clean', () => {
+  const controller = new BoostInputController('toggle');
+  controller.handleKeyDown(key(), context());
+  controller.reset();
+
+  assert.equal(controller.isSpaceDown(), false);
+  assert.equal(controller.reconcile(context({ intent: false })).command, null);
+  assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
 });

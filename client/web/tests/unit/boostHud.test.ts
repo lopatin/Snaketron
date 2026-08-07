@@ -32,7 +32,9 @@ test('Boost HUD reports empty, partial, and full predicted charge', () => {
     [empty.fillRatio, partial.fillRatio, full.fillRatio],
     [0, 1 / 3, 1],
   );
-  assert.equal(empty.buttonDisabled, true);
+  // An empty meter must leave the control usable: holding it on empty is how a
+  // player arms the next packet, so disabling it would swallow the press.
+  assert.equal(empty.buttonDisabled, false);
   assert.equal(empty.ready, false);
   assert.equal(partial.buttonDisabled, false);
   assert.equal(partial.ready, false);

@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::{
-    BoostConfig, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS, GameState,
-    GameType,
-};
+use common::{BoostConfig, GameState, GameType};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -1304,13 +1301,9 @@ async fn prepare_game_from_lobbies(
     )?;
     game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
-    // Apply queue-mode-specific time limits for team games
-    if matches!(game_type, GameType::TeamMatch { .. }) {
-        game_state.properties.time_limit_ms = Some(match queue_mode {
-            common::QueueMode::Quickmatch => DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS,
-            common::QueueMode::Competitive => DEFAULT_TEAM_TIME_LIMIT_MS,
-        });
-    }
+    // Team matches carry no time limit; their queue-specific score target is
+    // set during construction from the game's own queue mode, so there is no
+    // post-construction override to drift out of sync with snapshot validation.
 
     // Add players to game state with team assignments
     let mut all_players = Vec::new();

@@ -213,6 +213,9 @@ button.game-scoreboard-brand {
   letter-spacing: 0.075em;
   line-height: 1;
   text-transform: uppercase;
+  /* The team caption carries the score target ("First to 25"); keep it on one
+     line so it never wraps and pushes the clock out of alignment. */
+  white-space: nowrap;
 }
 
 .game-scoreboard-time time {

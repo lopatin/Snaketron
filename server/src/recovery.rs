@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub const RECOVERY_SCHEMA_VERSION: u16 = 3;
+/// Bumped to 4: team matches carry `score_limit` instead of `time_limit_ms`,
+/// and snakes carry a latched Boost intent. A checkpoint written before this
+/// change deserializes (both fields default) but no longer satisfies the team
+/// match invariants, so reject it here by version rather than letting recovery
+/// fail later with a confusing validation error.
+pub const RECOVERY_SCHEMA_VERSION: u16 = 4;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);
