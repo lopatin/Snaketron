@@ -112,7 +112,7 @@ const boostSnapshot = (streamSequence, tick = 5) => {
   // merely serializing a command against a pre-start fixture.
   state.start_ms = Date.now() - tick * 50;
   state.properties = {
-    available_food_target: 1,
+    available_food_target: 10,
     tick_duration_ms: 50,
     // Team matches are raced to a score, never against a clock; the target
     // must match the queue this snapshot claims (Quickmatch).
@@ -155,7 +155,7 @@ const completedBoostSnapshot = (streamSequence, tick = 7) => {
       team_id: 1,
       speed_milli: 1000,
       movement_credit: 0,
-      boost: { charge_ms: 0, active: false },
+      boost: { charge_ms: 0, active: false, intent: false },
     },
   ];
   state.players = {
@@ -182,7 +182,7 @@ const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
       7: { user_id: 7, snake_id: 1 },
       8: { user_id: 8, snake_id: 0 },
     };
-    state.arena.snakes[1].boost = { charge_ms: 1000, active: false };
+    state.arena.snakes[1].boost = { charge_ms: 1000, active: false, intent: false };
   }
 
   return frame;
@@ -191,6 +191,7 @@ const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
 const fourSnakeBoostState = (tick = 6) => {
   const state = boostSnapshot(1, tick).GameEvent.event.Snapshot.game_state;
   state.game_type = { TeamMatch: { per_team: 2 } };
+  state.properties.available_food_target = 20;
   state.properties.boost.speed_milli = 2000;
   state.start_ms = 0;
   state.arena.snakes = [
@@ -204,7 +205,7 @@ const fourSnakeBoostState = (tick = 6) => {
     food: 0,
     speed_milli: 2000,
     movement_credit: 0,
-    boost: { charge_ms: 3000, active: true },
+    boost: { charge_ms: 3000, active: true, intent: true },
   }));
   state.players = {
     7: { user_id: 7, snake_id: 0 },
@@ -1266,7 +1267,9 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   await expect(hud).toHaveAttribute('data-location', 'arena-bottom');
   await expect(hud).toHaveAttribute('data-ready', 'false');
   await expect(hud).not.toHaveClass(/is-ready/);
-  await expect(button).toBeDisabled();
+  // Empty charge still accepts held intent so the next NOS packet can resume
+  // Boost without requiring the player to release and press again.
+  await expect(button).toBeEnabled();
   await expect(button.locator('.game-boost-meter__canister-dock')).toHaveCount(1);
   await expect(bottle).toHaveAttribute('viewBox', '0 0 34 24');
   await expect(bottle).toHaveAttribute('aria-hidden', 'true');
@@ -1517,11 +1520,16 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
     });
   }
 
+  // Toggle mode must own the active state this visual fixture is about; an
+  // unsolicited active snapshot is correctly repaired back to the local
+  // toggle latch instead of remaining active by accident.
+  await button.click();
+  await page.mouse.move(0, 0);
   const activeFrame = boostSnapshot(13, 8);
   const activeState = activeFrame.GameEvent.event.Snapshot.game_state;
   activeState.properties.boost.speed_milli = 2000;
   activeState.arena.snakes[0].speed_milli = 2000;
-  activeState.arena.snakes[0].boost = { charge_ms: 3000, active: true };
+  activeState.arena.snakes[0].boost = { charge_ms: 3000, active: true, intent: true };
   await emitServerMessage(page, socketIndex, activeFrame);
   await expect(hud).toHaveClass(/is-active/);
   await expect(hud).not.toHaveClass(/is-ready/);
@@ -2245,9 +2253,10 @@ test('Snaketron game shell restores the original scoreboard language and free-fl
   await page.mouse.move(0, 0);
   // Programmatic focus verifies the same visible keyboard treatment without
   // depending on the host OS's WebKit full-keyboard-access preference.
+  await page.keyboard.press('Tab');
   await menuButton.focus();
   await expect(menuButton).toBeFocused();
-  expect(await menuButton.evaluate((button) => {
+  await expect.poll(() => menuButton.evaluate((button) => {
     const style = getComputedStyle(button);
     return [style.backgroundColor, style.borderTopColor, style.fontStyle];
   })).toEqual(['rgb(239, 246, 255)', 'rgb(59, 130, 246)', 'normal']);
@@ -3267,12 +3276,14 @@ test('actual WASM admits only legacy-compatible completed TeamMatch snapshots', 
     const legacyState = legacyFrame.GameEvent.event.Snapshot.game_state;
     legacyState.status = { Complete: { winning_snake_id: 0 } };
     legacyState.properties.tick_duration_ms = 100;
+    legacyState.properties.time_limit_ms = 90_000;
+    legacyState.properties.score_limit = null;
     legacyState.properties.boost = null;
     legacyState.arena.boost_pads = [];
     for (const snake of legacyState.arena.snakes) {
       snake.speed_milli = 1000;
       snake.movement_credit = 0;
-      snake.boost = { charge_ms: 0, active: false };
+      snake.boost = { charge_ms: 0, active: false, intent: false };
     }
 
     const completed = window.wasm.GameClient.newFromSnapshotFrame(
@@ -3411,6 +3422,8 @@ test('a rejected predicted Boost activation retracts immediately to authoritativ
       speed_milli: snake.speed_milli,
     };
   })).toEqual({ active: false, charge_ms: 1000, speed_milli: 1000 });
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2'))
+    .toHaveLength(1);
   await expect(page.getByTestId('boost-hud')).toContainText('33%');
   await expect(page.getByTestId('boost-button')).toBeEnabled();
 });
@@ -3475,6 +3488,7 @@ test('an uninterrupted Space Hold resumes Boost after depletion and recharge', a
   active.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 50,
     active: true,
+    intent: true,
   };
   active.GameEvent.event.Snapshot.game_state.arena.snakes[0].speed_milli = 1500;
   await emitServerMessage(page, socketIndex, active);
@@ -3483,30 +3497,33 @@ test('an uninterrupted Space Hold resumes Boost after depletion and recharge', a
   depleted.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 0,
     active: false,
+    intent: true,
   };
   await emitServerMessage(page, socketIndex, depleted);
-  await expect(page.getByTestId('boost-button')).toBeDisabled();
+  await expect(page.getByTestId('boost-button')).toBeEnabled();
   expect(await logicalBoostCommands()).toHaveLength(1);
 
   const recharged = boostSnapshot(14, 9);
   recharged.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 750,
-    active: false,
+    active: true,
+    intent: true,
   };
+  recharged.GameEvent.event.Snapshot.game_state.arena.snakes[0].speed_milli = 1500;
   await emitServerMessage(page, socketIndex, recharged);
 
+  // Intent is latched in the engine across depletion, so recharge resumes
+  // without another activation edge from the browser.
   await expect.poll(logicalBoostCommands)
-    .toHaveLength(2);
+    .toHaveLength(1);
   expect(await logicalBoostCommands()).toEqual([
-    { ActivateBoost: { snake_id: 0 } },
     { ActivateBoost: { snake_id: 0 } },
   ]);
 
   await page.keyboard.up('Space');
   await expect.poll(logicalBoostCommands)
-    .toHaveLength(3);
+    .toHaveLength(2);
   expect(await logicalBoostCommands()).toEqual([
-    { ActivateBoost: { snake_id: 0 } },
     { ActivateBoost: { snake_id: 0 } },
     { DeactivateBoost: { snake_id: 0 } },
   ]);

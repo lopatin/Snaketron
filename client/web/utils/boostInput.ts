@@ -260,6 +260,8 @@ export class BoostInputController {
   private pendingLevel: boolean | null = null;
   /** Edge detector for reconnects, which are when a resend is worthwhile. */
   private interactionWasActive = false;
+  /** A terminal server rejection must wait for a fresh physical input edge. */
+  private reconciliationSuppressed = false;
 
   constructor(mode: BoostInputMode = DEFAULT_BOOST_INPUT_MODE) {
     this.mode = mode;
@@ -293,6 +295,10 @@ export class BoostInputController {
 
     if (context.gameOver) {
       this.pendingLevel = null;
+      return null;
+    }
+
+    if (this.reconciliationSuppressed && !force) {
       return null;
     }
 
@@ -352,6 +358,7 @@ export class BoostInputController {
       return SUPPRESS_DECISION;
     }
 
+    this.reconciliationSuppressed = false;
     // The key is down whether or not the game can act on it yet. Recording it
     // unconditionally is what lets a press made during a countdown, a respawn,
     // or a reconnect take effect the moment play resumes.
@@ -393,6 +400,7 @@ export class BoostInputController {
       return IGNORE_DECISION;
     }
 
+    this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
     return this.decide(context, true);
   }
@@ -404,6 +412,7 @@ export class BoostInputController {
       return IGNORE_DECISION;
     }
 
+    this.reconciliationSuppressed = false;
     this.toggleLatched = !this.toggleLatched;
     return this.decide(context, false);
   }
@@ -417,6 +426,7 @@ export class BoostInputController {
       return SUPPRESS_DECISION;
     }
 
+    this.reconciliationSuppressed = false;
     this.physicalPointerDown = true;
     return this.decide(context, true);
   }
@@ -426,6 +436,7 @@ export class BoostInputController {
       return IGNORE_DECISION;
     }
 
+    this.reconciliationSuppressed = false;
     this.physicalPointerDown = false;
     return this.decide(context, true);
   }
@@ -437,6 +448,7 @@ export class BoostInputController {
    * even when the browser swallowed keyup.
    */
   releaseHeld(context: BoostInputContext): BoostInputDecision {
+    this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
     return this.decide(context, false);
@@ -444,6 +456,7 @@ export class BoostInputController {
 
   /** Stop either mode's current intent during explicit arena teardown. */
   cleanup(context: BoostInputContext): BoostInputDecision {
+    this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
     this.toggleLatched = false;
@@ -458,6 +471,7 @@ export class BoostInputController {
    * before LeaveGame clears it.
    */
   teardown(context: BoostInputContext): BoostInputDecision {
+    this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
     this.physicalPointerDown = false;
     this.toggleLatched = false;
@@ -473,6 +487,20 @@ export class BoostInputController {
    */
   reconcile(context: BoostInputContext): BoostInputDecision {
     return this.decide(context, false);
+  }
+
+  /**
+   * A semantic rejection is terminal for that input edge. Adopt the level the
+   * server retained and suppress automatic reconciliation until the player
+   * supplies a new edge; otherwise the render loop immediately resends the
+   * command the server just rejected.
+   */
+  handleRejectedCommand(command: BoostInputCommand): void {
+    this.physicalSpaceDown = false;
+    this.physicalPointerDown = false;
+    this.toggleLatched = command === 'DeactivateBoost';
+    this.pendingLevel = null;
+    this.reconciliationSuppressed = true;
   }
 
   setMode(mode: BoostInputMode, context: BoostInputContext): BoostInputDecision {
@@ -492,5 +520,6 @@ export class BoostInputController {
     this.toggleLatched = false;
     this.pendingLevel = null;
     this.interactionWasActive = false;
+    this.reconciliationSuppressed = false;
   }
 }

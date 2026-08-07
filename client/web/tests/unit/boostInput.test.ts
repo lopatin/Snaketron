@@ -319,6 +319,27 @@ test('Toggle arms Boost on an empty meter and keeps it armed', () => {
   );
 });
 
+test('a rejected Boost edge is not resent until the player supplies a new edge', () => {
+  const activation = new BoostInputController('toggle');
+  assert.equal(activation.handleKeyDown(key(), context()).command, 'ActivateBoost');
+  activation.handleRejectedCommand('ActivateBoost');
+  assert.equal(activation.reconcile(context()).command, null);
+  assert.equal(activation.handleKeyUp(key(), context()).command, null);
+  assert.equal(activation.handleKeyDown(key(), context()).command, 'ActivateBoost');
+
+  const deactivation = new BoostInputController('toggle');
+  deactivation.handleKeyDown(key(), context());
+  deactivation.handleKeyUp(key(), context({ intent: true, active: true }));
+  assert.equal(
+    deactivation.handleKeyDown(key(), context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+  deactivation.handleRejectedCommand('DeactivateBoost');
+  assert.equal(deactivation.reconcile(context({ intent: true, active: true })).command, null);
+  assert.equal(deactivation.handleKeyDown(key(), context({ intent: true, active: true })).command,
+    'DeactivateBoost');
+});
+
 test('Hold pointer edges start and stop Boost while its synthesized click is inert', () => {
   const controller = new BoostInputController('hold');
 

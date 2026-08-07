@@ -4,7 +4,17 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode, GameLoadFailure } from '../types';
+import {
+  GameState,
+  CanvasRef,
+  ArenaRotation,
+  GameType,
+  LobbyGameMode,
+  QueueMode,
+  GameLoadFailure,
+  type CommandId,
+  type GameCommandMessage,
+} from '../types';
 import { getWasm } from '../wasm';
 import GameHudShell from './GameHudShell';
 import GameControlsHint from './GameControlsHint';
@@ -119,6 +129,22 @@ function BoostCanisterMark() {
   );
 }
 
+const commandIdKey = (commandId: CommandId): string => (
+  `${commandId.tick}:${commandId.user_id}:${commandId.sequence_number}`
+);
+
+const boostCommandFromMessage = (
+  commandMessage: GameCommandMessage,
+): BoostInputCommand | null => {
+  if ('ActivateBoost' in commandMessage.command) {
+    return 'ActivateBoost';
+  }
+  if ('DeactivateBoost' in commandMessage.command) {
+    return 'DeactivateBoost';
+  }
+  return null;
+};
+
 export default function GameArena() {
   const { gameId } = useParams();
   if (!gameId) {
@@ -175,6 +201,18 @@ export default function GameArena() {
   } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
+  const pendingBoostCommandsRef = useRef<Map<string, BoostInputCommand>>(new Map());
+
+  const handleCommandReady = useCallback((commandMessage: GameCommandMessage) => {
+    const boostCommand = boostCommandFromMessage(commandMessage);
+    if (boostCommand) {
+      pendingBoostCommandsRef.current.set(
+        commandIdKey(commandMessage.command_id_client),
+        boostCommand,
+      );
+    }
+    sendGameCommand(commandMessage);
+  }, [sendGameCommand]);
 
   const handleRequestResync = useCallback(() => {
     sendRequestResync(gameId);
@@ -196,7 +234,7 @@ export default function GameArena() {
   } = useGameEngine({
     gameId,
     playerId,
-    onCommandReady: sendGameCommand,
+    onCommandReady: handleCommandReady,
     onRequestResync: handleRequestResync,
     latencyMs
   });
@@ -277,6 +315,7 @@ export default function GameArena() {
       boostInputControllerRef.current?.reset();
     }
 
+    pendingBoostCommandsRef.current.clear();
     previousGameIdRef.current = gameId;
     joinedGameIdRef.current = null;
   }, [gameId]);
@@ -750,7 +789,25 @@ export default function GameArena() {
         while (events.length > 0) {
           for (const queued of events) {
             const processed = await processServerEvent(queued);
-            if (processed && 'Snapshot' in queued.message.event) {
+            const event = queued.message.event;
+            if (processed) {
+              const outcomeCommandId = 'CommandScheduledV2' in event
+                ? event.CommandScheduledV2.command_message.command_id_client
+                : 'CommandScheduled' in event
+                  ? event.CommandScheduled.command_message.command_id_client
+                  : 'CommandRejected' in event
+                    ? event.CommandRejected.command_id_client
+                    : null;
+              if (outcomeCommandId) {
+                const key = commandIdKey(outcomeCommandId);
+                const boostCommand = pendingBoostCommandsRef.current.get(key);
+                pendingBoostCommandsRef.current.delete(key);
+                if (boostCommand && 'CommandRejected' in event) {
+                  boostInputControllerRef.current?.handleRejectedCommand(boostCommand);
+                }
+              }
+            }
+            if (processed && 'Snapshot' in event) {
               const snapshotGameId = parseU32GameId(queued.message.game_id);
               if (snapshotGameId !== null) {
                 acknowledgeGameSnapshot(snapshotGameId);
