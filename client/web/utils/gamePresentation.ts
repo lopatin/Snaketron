@@ -1,4 +1,5 @@
 import type { GameState, QueueMode } from '../types';
+import type { SnakeSkinInputs } from './snakeSkin';
 
 export const GAME_SHELL_COLORS = {
   graphite: '#172033',
@@ -9,25 +10,6 @@ export const GAME_SHELL_COLORS = {
   boost: '#F8C84A',
 } as const;
 
-// Must mirror client/src/render.rs. The hues preserve team ownership while a
-// restrained second shade makes the 2v2 roster a real snake-to-player legend.
-export const TEAM_SNAKE_COLORS = {
-  blue: ['#70bfe3', '#3c8dde'],
-  red: ['#ff6b6b', '#e34e5b'],
-} as const;
-
-export const TEAM_SNAKE_OUTLINE_COLORS = {
-  blue: ['#5299bb', '#286eae'],
-  red: ['#b84444', '#a92f3a'],
-} as const;
-
-const FIELD_SNAKE_SKINS = [
-  { color: '#70bfe3', outlineColor: '#5299bb' },
-  { color: '#ff6b6b', outlineColor: '#b84444' },
-  { color: '#556270', outlineColor: '#353c47' },
-  { color: '#f7b731', outlineColor: '#a87d1f' },
-] as const;
-
 export interface MatchPlayerPresentation {
   snakeId: number;
   userId: number | null;
@@ -35,8 +17,12 @@ export interface MatchPlayerPresentation {
   isCurrentPlayer: boolean;
   isAlive: boolean;
   teamId: number | null;
-  color: string;
-  outlineColor: string;
+  /**
+   * The inputs the shared Rust renderer needs to paint this snake. Carrying
+   * the selectors rather than resolved hex values is what lets the roster draw
+   * a player's real skin instead of a copy that has to be kept in sync.
+   */
+  skin: SnakeSkinInputs;
   score: number;
   finalLength: number;
   foodHeld: number;
@@ -189,34 +175,26 @@ export const buildMatchPresentation = (
     ? null
     : gameState.arena.snakes[winningSnakeId]?.team_id ?? null;
 
+  // The renderer keys team shades off how many earlier snakes share a team, and
+  // decides blue-vs-red from the viewer's own team, so both are passed through
+  // verbatim rather than being re-derived into colours here.
+  const isTeamSkin = gameState.arena.team_zone_config !== null;
+
   const players: MatchPlayerPresentation[] = gameState.arena.snakes.map((snake, snakeId) => {
     const userId = playerBySnake.get(snakeId) ?? null;
     const isCurrentPlayer = userId !== null && userId === currentUserId;
-    const teamDisplayIndex = snake.team_id === null
-      ? -1
-      : Math.max(0, orderedTeamIds.indexOf(snake.team_id));
-    const teamMemberSlot = gameState.arena.snakes
-      .slice(0, snakeId)
-      .filter((candidate) => candidate.team_id === snake.team_id)
-      .length % 2;
-    const fieldSkin = isCurrentPlayer
-      ? FIELD_SNAKE_SKINS[0]
-      : gameState.arena.snakes.length === 2
-        ? FIELD_SNAKE_SKINS[1]
-        : currentSnakeId === null
-          ? FIELD_SNAKE_SKINS[snakeId % FIELD_SNAKE_SKINS.length]
-          : snakeId % 4 === 1
-            ? FIELD_SNAKE_SKINS[1]
-            : snakeId % 4 === 2
-              ? FIELD_SNAKE_SKINS[2]
-              : FIELD_SNAKE_SKINS[3];
-    const teamTone = teamDisplayIndex === 0 ? 'blue' : 'red';
-    const skin = mode.isTeam
-      ? {
-          color: TEAM_SNAKE_COLORS[teamTone][teamMemberSlot],
-          outlineColor: TEAM_SNAKE_OUTLINE_COLORS[teamTone][teamMemberSlot],
-        }
-      : fieldSkin;
+    const skin: SnakeSkinInputs = {
+      snake_index: snakeId,
+      team_id: snake.team_id,
+      team_member_slot: gameState.arena.snakes
+        .slice(0, snakeId)
+        .filter((candidate) => candidate.team_id === snake.team_id)
+        .length,
+      snake_count: gameState.arena.snakes.length,
+      is_team_game: isTeamSkin,
+      local_snake_id: currentSnakeId,
+      local_team_id: currentTeamId,
+    };
     const score = valueAt(gameState.scores, snakeId);
     const isWinner = mode.isTeam && winningTeamId !== null
       ? snake.team_id === winningTeamId
@@ -231,8 +209,7 @@ export const buildMatchPresentation = (
       isCurrentPlayer,
       isAlive: snake.is_alive,
       teamId: snake.team_id,
-      color: skin.color,
-      outlineColor: skin.outlineColor,
+      skin,
       score,
       finalLength: score + 2,
       foodHeld: snake.food,
