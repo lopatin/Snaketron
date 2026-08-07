@@ -5,6 +5,8 @@ import {
   DEFAULT_SCORE_EFFECT_ID,
   GOAL_CUE_RETRACTION_WINDOW_MS,
   MAX_ACTIVE_SCORE_EFFECTS,
+  MAX_SCORE_MAGNITUDE,
+  MIN_SCORE_MAGNITUDE,
   REDUCED_MOTION_SCORE_CELEBRATION_DURATION_MS,
   REDUCED_MOTION_SCORE_WAVE_DURATION_MS,
   SCORE_CELEBRATION_DURATION_MS,
@@ -18,6 +20,7 @@ import {
   resetScoreEffects,
   sampleScoreReadout,
   sampleScoreWaveCells,
+  scoreEffectMagnitude,
   smoothstep,
   syncPredictedScoreEffects,
   transformScoreEffectPosition,
@@ -362,6 +365,89 @@ test('reduced motion is a brief stationary goal wash, not a travelling wave', ()
     }),
     [],
   );
+});
+
+test('effect magnitude grows with the points banked, sub-linearly and clamped', () => {
+  const magnitudes = [1, 2, 4, 8, 12].map(scoreEffectMagnitude);
+  for (let i = 1; i < magnitudes.length; i += 1) {
+    assert.ok(
+      magnitudes[i] >= magnitudes[i - 1],
+      'a bigger goal must never render smaller than a smaller one',
+    );
+  }
+
+  assert.equal(scoreEffectMagnitude(4), 1, 'the reference goal renders nominally');
+  // Twelve points is three times four, but must not be three times the size.
+  assert.ok(scoreEffectMagnitude(12) < 3 * scoreEffectMagnitude(4));
+
+  assert.equal(scoreEffectMagnitude(1), MIN_SCORE_MAGNITUDE);
+  assert.equal(scoreEffectMagnitude(500), MAX_SCORE_MAGNITUDE);
+  // The scale must not saturate before the goals players actually score: a
+  // twelve-point bank has to still out-size a nine-point one.
+  assert.ok(scoreEffectMagnitude(12) > scoreEffectMagnitude(9));
+  // Degenerate input can never produce a zero-size or NaN celebration.
+  assert.equal(scoreEffectMagnitude(0), MIN_SCORE_MAGNITUDE);
+  assert.equal(scoreEffectMagnitude(-3), MIN_SCORE_MAGNITUDE);
+  assert.equal(scoreEffectMagnitude(Number.NaN), MIN_SCORE_MAGNITUDE);
+});
+
+test('a bigger goal paints a wider wave and a larger number', () => {
+  const frame = {
+    nowMs: 1_400,
+    cellSize: 12,
+    arenaWidth: 60,
+    arenaHeight: 40,
+    rotation: 0 as const,
+    reducedMotion: false,
+  };
+  const at = (points: number): ScoreEffectActivation => ({
+    ...activation,
+    points,
+    origin: { x: 30, y: 20 },
+  });
+
+  const spread = (points: number): number => {
+    const cells = sampleScoreWaveCells(at(points), frame);
+    assert.ok(cells.length > 0, `expected a wave for +${points}`);
+    return Math.max(...cells.map(cell => Math.hypot(cell.position.x - 30, cell.position.y - 20)));
+  };
+  const fontSize = (points: number): number => {
+    const readout = sampleScoreReadout(at(points), frame);
+    assert.ok(readout);
+    return readout.fontSize;
+  };
+
+  assert.ok(spread(1) < spread(4), 'a one-point tap must ripple less than a four-point goal');
+  assert.ok(spread(4) < spread(12), 'a twelve-point bank must ripple further still');
+  assert.ok(fontSize(1) < fontSize(4));
+  assert.ok(fontSize(4) < fontSize(12));
+
+  // The readout still tracks cell size, so the scaling composes rather than
+  // replacing the existing responsive sizing.
+  const small = sampleScoreReadout(at(4), { ...frame, cellSize: 6 });
+  assert.ok(small);
+  assert.ok(small.fontSize < fontSize(4));
+});
+
+test('even the largest goal keeps the wave bounded and off the whole arena', () => {
+  const cells = sampleScoreWaveCells(
+    { ...activation, points: 999, origin: { x: 30, y: 20 } },
+    {
+      nowMs: 1_600,
+      arenaWidth: 60,
+      arenaHeight: 40,
+      rotation: 0,
+      reducedMotion: false,
+    },
+  );
+
+  assert.ok(cells.length > 0);
+  assert.ok(cells.length < 60 * 40 * 0.5, 'a wave must never wash half the arena');
+  assert.ok(cells.every(cell => cell.opacity > 0 && cell.opacity <= 0.34));
+  assert.ok(cells.every(cell => (
+    cell.position.x >= 0 && cell.position.x < 60 &&
+    cell.position.y >= 0 && cell.position.y < 40
+  )));
 });
 
 test('the points readout rises from the scoring cell, fades out, and outlives the wave', () => {

@@ -23,16 +23,26 @@ export const REDUCED_MOTION_SCORE_WAVE_DURATION_MS = 220;
 export const MAX_ACTIVE_SCORE_EFFECTS = 6;
 
 const CANVAS_PADDING_PX = 1;
-const MAX_WAVE_RADIUS_CELLS = 12;
-const MIN_WAVE_RADIUS_CELLS = 5;
-const WAVE_RADIUS_ARENA_FRACTION = 0.2;
+const MAX_WAVE_RADIUS_CELLS = 20;
+const MIN_WAVE_RADIUS_CELLS = 4;
+const WAVE_RADIUS_ARENA_FRACTION = 0.155;
 const WAVE_THICKNESS_CELLS = 1.35;
 const MIN_VISIBLE_OPACITY = 0.012;
 
 const READOUT_RISE_CELLS = 3.4;
-const READOUT_MIN_FONT_PX = 15;
-const READOUT_MAX_FONT_PX = 40;
+const READOUT_MIN_FONT_PX = 14;
+const READOUT_MAX_FONT_PX = 62;
 const READOUT_FONT_CELL_FRACTION = 2.4;
+
+/**
+ * Points at which a goal renders at its nominal size. Goals worth less are
+ * scaled down from here, goals worth more scaled up.
+ */
+const SCORE_MAGNITUDE_REFERENCE_POINTS = 4;
+export const MIN_SCORE_MAGNITUDE = 0.6;
+/** Saturates just above a twelve-point bank, so the biggest goals a player
+ *  realistically lands still read as distinct from a merely large one. */
+export const MAX_SCORE_MAGNITUDE = 1.7;
 /** Conservative advance-per-character for `Impact`-class faces, used to keep
  *  the readout inside the canvas without measuring text in the pure sampler. */
 const READOUT_GLYPH_ADVANCE_EM = 0.62;
@@ -139,6 +149,24 @@ export const createScoreEffectRegistry = (
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
+
+/**
+ * How large a goal renders, relative to its nominal size, given what it was
+ * worth. Deliberately sub-linear: banking twelve points should look clearly
+ * bigger than banking one without swamping the arena, and the clamp keeps an
+ * unusually large haul from running off the end zone entirely.
+ */
+export const scoreEffectMagnitude = (points: number): number => {
+  if (!Number.isFinite(points) || points <= 0) {
+    return MIN_SCORE_MAGNITUDE;
+  }
+
+  return clamp(
+    Math.sqrt(points / SCORE_MAGNITUDE_REFERENCE_POINTS),
+    MIN_SCORE_MAGNITUDE,
+    MAX_SCORE_MAGNITUDE,
+  );
+};
 
 export const smoothstep = (
   edge0: number,
@@ -329,7 +357,8 @@ export const sampleScoreWaveCells = (
   const progress = clamp(elapsedMs / durationMs, 0, 1);
   const maxRadius = clamp(
     Math.hypot(frame.arenaWidth, frame.arenaHeight) *
-      WAVE_RADIUS_ARENA_FRACTION,
+      WAVE_RADIUS_ARENA_FRACTION *
+      scoreEffectMagnitude(activation.points),
     MIN_WAVE_RADIUS_CELLS,
     MAX_WAVE_RADIUS_CELLS,
   );
@@ -442,7 +471,9 @@ export const sampleScoreReadout = (
   );
 
   const fontSize = clamp(
-    frame.cellSize * READOUT_FONT_CELL_FRACTION,
+    frame.cellSize *
+      READOUT_FONT_CELL_FRACTION *
+      scoreEffectMagnitude(activation.points),
     READOUT_MIN_FONT_PX,
     READOUT_MAX_FONT_PX,
   );
