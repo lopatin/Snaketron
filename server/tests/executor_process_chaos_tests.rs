@@ -448,28 +448,32 @@ async fn read_incumbent_command(
     store: &PartitionLeaseStore,
     guard: &PartitionLeaseGuard,
 ) -> Result<CommandDelivery> {
-    let deadline = tokio::time::Instant::now() + PROCESS_TIMEOUT;
     let mut renew = tokio::time::interval(RENEW_INTERVAL);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let deadline = tokio::time::sleep(PROCESS_TIMEOUT);
+    tokio::pin!(deadline);
+
+    // XREADGROUP assigns an entry to this consumer before its response reaches
+    // the future. Keep the exact future alive while lease renewals run; dropping
+    // it would strand the command in this consumer's PEL and make later `>`
+    // reads wait forever for an entry that is no longer new.
+    let read = consumer.read_new_blocking();
+    tokio::pin!(read);
     loop {
         tokio::select! {
-            deliveries = consumer.read_new_now() => {
-                if let Some(delivery) = deliveries?.into_iter().next() {
-                    return Ok(delivery);
-                }
-                // Production's blocking-style executor reader performs this
-                // wait locally. Mirror it here instead of flooding one shared
-                // dispatcher with an unbounded empty-read loop.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            deliveries = &mut read => {
+                return deliveries?
+                    .into_iter()
+                    .next()
+                    .context("incumbent command reader ended without a delivery");
             }
             _ = renew.tick() => {
                 ensure!(store.renew(guard).await?, "incumbent lost its lease before fault injection");
             }
+            _ = &mut deadline => {
+                bail!("incumbent did not receive the command before timeout");
+            }
         }
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "incumbent did not receive the command before timeout"
-        );
     }
 }
 
