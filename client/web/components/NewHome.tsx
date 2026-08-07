@@ -263,6 +263,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
               isLobbyQueued={isLobbyQueued}
               lobbyPreferences={lobbyPreferences}
               onPreferencesChange={updateLobbyPreferences}
+              onSignInClick={onOpenAuth}
               errorMessage={startError}
             />
             <SocialFooter />
