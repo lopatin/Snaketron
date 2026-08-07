@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::{
-    BoostConfig, DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS, DEFAULT_TEAM_TIME_LIMIT_MS,
-    GAME_START_COUNTDOWN_MS, GameState, GameType, MATCH_READY_WINDOW_MS,
+    BoostConfig, GAME_START_COUNTDOWN_MS, GameState, GameType, MATCH_READY_WINDOW_MS,
+    boost_config_for,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -1307,13 +1307,9 @@ async fn prepare_game_from_lobbies(
     )?;
     game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
-    // Apply queue-mode-specific time limits for team games
-    if matches!(game_type, GameType::TeamMatch { .. }) {
-        game_state.properties.time_limit_ms = Some(match queue_mode {
-            common::QueueMode::Quickmatch => DEFAULT_QUICKMATCH_TEAM_TIME_LIMIT_MS,
-            common::QueueMode::Competitive => DEFAULT_TEAM_TIME_LIMIT_MS,
-        });
-    }
+    // Team matches carry no time limit; their queue-specific score target is
+    // set during construction from the game's own queue mode, so there is no
+    // post-construction override to drift out of sync with snapshot validation.
 
     // Add players to game state with team assignments
     let mut all_players = Vec::new();
@@ -1451,7 +1447,16 @@ fn build_match_game_state(
     start_ms: i64,
     boost_config: &BoostConfig,
 ) -> Result<GameState> {
-    if matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+    if let Some(mut mode_config) = boost_config_for(&game_type, width, height) {
+        // Startup configuration owns balance. The mode owns its fuel model and
+        // layout: FFA uses the canonical field pads while Solo is unlimited
+        // and has no pads. Copying only balance fields prevents a team-shaped
+        // environment config from silently disabling those mode contracts.
+        mode_config.speed_milli = boost_config.speed_milli;
+        mode_config.capacity_ms = boost_config.capacity_ms;
+        mode_config.packet_charge_ms = boost_config.packet_charge_ms;
+        mode_config.pad_respawn_ms = boost_config.pad_respawn_ms;
+        mode_config.rules_version = boost_config.rules_version;
         GameState::new_with_boost_config(
             width,
             height,
@@ -1459,7 +1464,7 @@ fn build_match_game_state(
             queue_mode,
             rng_seed,
             start_ms,
-            boost_config.clone(),
+            mode_config,
         )
     } else {
         Ok(GameState::new(
@@ -1584,29 +1589,45 @@ mod tests {
     }
 
     #[test]
-    fn configured_fractional_boost_is_snapshotted_into_duel_and_two_v_two() -> Result<()> {
+    fn configured_fractional_boost_is_snapshotted_into_every_eligible_mode() -> Result<()> {
         let boost_config = BoostConfig {
             speed_milli: 1_750,
             ..BoostConfig::default()
         };
 
-        for per_team in [1, 2] {
+        let cases = [
+            (60, 40, GameType::TeamMatch { per_team: 1 }, 2, 3, false),
+            (60, 40, GameType::TeamMatch { per_team: 2 }, 4, 3, false),
+            (40, 40, GameType::FreeForAll { max_players: 4 }, 4, 4, false),
+            (40, 40, GameType::Solo, 1, 0, true),
+        ];
+        for (width, height, game_type, player_count, layout_version, unlimited) in cases {
             for queue_mode in [QueueMode::Quickmatch, QueueMode::Competitive] {
                 let mut state = build_match_game_state(
-                    60,
-                    40,
-                    GameType::TeamMatch { per_team },
+                    width,
+                    height,
+                    game_type.clone(),
                     queue_mode,
                     Some(7),
                     123,
                     &boost_config,
                 )?;
-                for user_id in 1..=u32::from(per_team) * 2 {
+                for user_id in 1..=player_count {
                     state.add_player(user_id, None)?;
                 }
 
-                assert_eq!(state.properties.boost.as_ref(), Some(&boost_config));
-                assert_eq!(state.properties.boost.as_ref().unwrap().speed_milli, 1_750);
+                let resolved = state
+                    .properties
+                    .boost
+                    .as_ref()
+                    .expect("eligible Boost mode");
+                assert_eq!(resolved.speed_milli, 1_750);
+                assert_eq!(resolved.capacity_ms, boost_config.capacity_ms);
+                assert_eq!(resolved.packet_charge_ms, boost_config.packet_charge_ms);
+                assert_eq!(resolved.pad_respawn_ms, boost_config.pad_respawn_ms);
+                assert_eq!(resolved.rules_version, boost_config.rules_version);
+                assert_eq!(resolved.spot_layout_version, layout_version);
+                assert_eq!(resolved.unlimited, unlimited);
                 assert!(
                     state
                         .arena
@@ -1614,6 +1635,14 @@ mod tests {
                         .iter()
                         .all(|snake| snake.speed_milli() == 1_000)
                 );
+                assert!(state.arena.snakes.iter().all(|snake| {
+                    snake.boost().charge_ms
+                        == if unlimited {
+                            boost_config.capacity_ms
+                        } else {
+                            0
+                        }
+                }));
                 state.validate_boost_invariants()?;
             }
         }

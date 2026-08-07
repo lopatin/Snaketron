@@ -124,6 +124,7 @@ impl GameState {
             h.write_u32(snake.movement_credit);
             h.write_u32(snake.boost.charge_ms);
             h.write_u8(snake.boost.active as u8);
+            h.write_u8(snake.boost.intent as u8);
             match snake.team_id {
                 Some(team) => {
                     h.write_u8(1);
@@ -230,6 +231,13 @@ impl GameState {
             }
             None => h.write_u8(0),
         }
+        match self.properties.score_limit {
+            Some(limit) => {
+                h.write_u8(1);
+                h.write_u32(limit);
+            }
+            None => h.write_u8(0),
+        }
         match &self.properties.boost {
             Some(boost) => {
                 h.write_u8(1);
@@ -239,6 +247,7 @@ impl GameState {
                 h.write_u32(boost.pad_respawn_ms);
                 h.write_u16(boost.spot_layout_version);
                 h.write_u16(boost.rules_version);
+                h.write_u8(boost.unlimited as u8);
             }
             None => h.write_u8(0),
         }
@@ -404,6 +413,7 @@ mod tests {
             1_u8, // movement credit
             2_u8, // charge
             3_u8, // active flag
+            4_u8, // latched player intent
         ] {
             let mut changed = baseline.clone();
             let snake = &mut changed.arena.snakes[0];
@@ -412,6 +422,7 @@ mod tests {
                 1 => snake.movement_credit = 50_000,
                 2 => snake.boost.charge_ms = 1_000,
                 3 => snake.boost.active = true,
+                4 => snake.boost.intent = true,
                 _ => unreachable!(),
             }
             assert_ne!(baseline.sync_hash(), changed.sync_hash());

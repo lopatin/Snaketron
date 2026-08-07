@@ -17,18 +17,18 @@ const gameState = (tick = 5) => ({
   tick,
   status: { Started: { server_id: 1 } },
   arena: {
-    width: 10,
-    height: 10,
+    width: 40,
+    height: 40,
     snakes: [
       {
-        body: [{ x: 5, y: 5 }, { x: 4, y: 5 }],
+        body: [{ x: 20, y: 20 }, { x: 19, y: 20 }],
         direction: 'Right',
         is_alive: true,
         food: 0,
         team_id: null,
         speed_milli: 1000,
         movement_credit: 0,
-        boost: { charge_ms: 0, active: false },
+        boost: { charge_ms: 3000, active: false, intent: false },
       },
     ],
     food: [],
@@ -38,10 +38,19 @@ const gameState = (tick = 5) => ({
   game_type: 'Solo',
   queue_mode: 'Quickmatch',
   properties: {
-    available_food_target: 1,
-    tick_duration_ms: 100,
+    available_food_target: 10,
+    tick_duration_ms: 50,
     time_limit_ms: null,
-    boost: null,
+    score_limit: null,
+    boost: {
+      speed_milli: 1500,
+      capacity_ms: 3000,
+      packet_charge_ms: 750,
+      pad_respawn_ms: 8000,
+      spot_layout_version: 0,
+      rules_version: 2,
+      unlimited: true,
+    },
   },
   command_queue: {
     queue: [],
@@ -60,6 +69,8 @@ const gameState = (tick = 5) => ({
   team_scores: null,
   player_xp: { 7: 0 },
   player_action_counts: { 7: 0 },
+  readiness: null,
+  simulation_epoch_ms: null,
 });
 
 const snapshot = (streamSequence, tick = 5) => ({
@@ -103,7 +114,10 @@ const boostSnapshot = (streamSequence, tick = 5) => {
   state.properties = {
     available_food_target: 1,
     tick_duration_ms: 50,
-    time_limit_ms: 90_000,
+    // Team matches are raced to a score, never against a clock; the target
+    // must match the queue this snapshot claims (Quickmatch).
+    time_limit_ms: null,
+    score_limit: 25,
     boost: {
       speed_milli: 1500,
       capacity_ms: 3000,
@@ -111,6 +125,7 @@ const boostSnapshot = (streamSequence, tick = 5) => {
       pad_respawn_ms: 8000,
       spot_layout_version: 3,
       rules_version: 2,
+      unlimited: false,
     },
   };
 
@@ -428,7 +443,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -480,7 +495,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -532,7 +547,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -1005,7 +1020,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -2398,7 +2413,6 @@ test('game report uses the four specified jewel designs for their exact outcomes
         state.team_scores = null;
         state.player_xp = { 7: 110 };
         state.player_action_counts = { 7: 36 };
-        state.properties.boost = null;
         state.status = { Complete: { winning_snake_id: 0 } };
       },
     },
@@ -2414,6 +2428,9 @@ test('game report uses the four specified jewel designs for their exact outcomes
       soloInitial.GameEvent.event.Snapshot.game_state.status = { Started: { server_id: 1 } };
       matchStart = soloInitial.GameEvent.event.Snapshot.game_state.start_ms;
       socketIndex = await establishActiveGame(page, soloInitial);
+      await expect(page.getByTestId('boost-hud').locator('.game-boost-meter__value'))
+        .toHaveText('∞');
+      await expect(page.getByTestId('boost-button')).toHaveAccessibleName(/unlimited/i);
       await expect(page.getByTestId('game-roster-band').locator('.game-roster-field-label'))
         .toHaveCount(0);
       await expect(page.getByTestId('game-roster-band')
@@ -3230,13 +3247,13 @@ test('actual WASM round-trips every authoritative Boost field from a snapshot', 
   expect(result.snake).toEqual({
     speed_milli: 1000,
     movement_credit: 0,
-    boost: { charge_ms: 1000, active: false },
+    boost: { charge_ms: 1000, active: false, intent: false },
   });
   expect(result.activation).toEqual({ ActivateBoost: { snake_id: 0 } });
   expect(result.activeSnake).toEqual({
     speed_milli: 1500,
     movement_credit: 75000,
-    boost: { charge_ms: 950, active: true },
+    boost: { charge_ms: 950, active: true, intent: true },
   });
   expect(result.activeHashAgain).toBe(result.activeHash);
 });
@@ -3624,7 +3641,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -3664,7 +3681,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -3792,7 +3809,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 5,
+      protocol_version: 6,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

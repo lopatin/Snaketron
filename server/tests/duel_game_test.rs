@@ -2,7 +2,7 @@ mod common;
 
 use crate::common::{TestClient, TestEnvironment};
 use ::common::{
-    BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS, CommandId, DEFAULT_BOOST_CAPACITY_MS,
+    BOOST_SPOT_LAYOUT_VERSION_TEAM, BOOST_TICK_INTERVAL_MS, CommandId, DEFAULT_BOOST_CAPACITY_MS,
     DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS, DEFAULT_BOOST_SPEED_MILLI,
     Direction, GameCommand, GameCommandMessage, GameEvent, GameStatus, GameType, Position, TeamId,
 };
@@ -337,7 +337,7 @@ async fn test_duel_game() -> Result<()> {
                     assert_eq!(boost.capacity_ms, DEFAULT_BOOST_CAPACITY_MS);
                     assert_eq!(boost.packet_charge_ms, DEFAULT_BOOST_PACKET_CHARGE_MS);
                     assert_eq!(boost.pad_respawn_ms, DEFAULT_BOOST_PAD_RESPAWN_MS);
-                    assert_eq!(boost.spot_layout_version, BOOST_SPOT_LAYOUT_VERSION);
+                    assert_eq!(boost.spot_layout_version, BOOST_SPOT_LAYOUT_VERSION_TEAM);
                     assert_eq!(
                         state1
                             .arena

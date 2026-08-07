@@ -1,10 +1,11 @@
 use crate::util::PseudoRandom;
 use crate::{
-    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS,
+    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION_FIELD, BOOST_SPOT_LAYOUT_VERSION_NONE,
+    BOOST_SPOT_LAYOUT_VERSION_TEAM, BOOST_TICK_INTERVAL_MS, BoostResolution,
     DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS,
-    DEFAULT_BOOST_SPEED_MILLI, DEFAULT_CUSTOM_GAME_TICK_MS, DEFAULT_FOOD_TARGET,
-    DEFAULT_TEAM_TIME_LIMIT_MS, DEFAULT_TICK_INTERVAL_MS, Direction, MAX_BOOST_SPEED_MILLI,
-    NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake,
+    DEFAULT_BOOST_SPEED_MILLI, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, DEFAULT_CUSTOM_GAME_TICK_MS,
+    DEFAULT_FOOD_TARGET, DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
+    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake, SnakeBoost,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -294,6 +295,14 @@ pub struct BoostConfig {
     pub pad_respawn_ms: u32,
     pub spot_layout_version: u16,
     pub rules_version: u16,
+    /// A tank that never empties: no pickups are placed, the meter starts and
+    /// stays full, and a funded quantum costs nothing. Solo runs use it so a
+    /// lone player can hold Boost freely with nothing to contest.
+    ///
+    /// This is the only Boost fuel model that does not require a pad layout,
+    /// so it pairs with `BOOST_SPOT_LAYOUT_VERSION_NONE`.
+    #[serde(default)]
+    pub unlimited: bool,
 }
 
 /// An internal, authoritative Boost state transition produced while advancing
@@ -308,14 +317,36 @@ pub enum BoostLifecycleTransition {
 }
 
 impl Default for BoostConfig {
+    /// The collectible tank on the canonical team map.
     fn default() -> Self {
         Self {
             speed_milli: DEFAULT_BOOST_SPEED_MILLI,
             capacity_ms: DEFAULT_BOOST_CAPACITY_MS,
             packet_charge_ms: DEFAULT_BOOST_PACKET_CHARGE_MS,
             pad_respawn_ms: DEFAULT_BOOST_PAD_RESPAWN_MS,
-            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION,
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_TEAM,
             rules_version: BOOST_RULES_VERSION,
+            unlimited: false,
+        }
+    }
+}
+
+impl BoostConfig {
+    /// The collectible tank on the teamless free-for-all map. Same balance as
+    /// the team default; only the pad geometry differs.
+    pub fn field() -> Self {
+        Self {
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_FIELD,
+            ..Self::default()
+        }
+    }
+
+    /// A tank that never empties and has nothing to collect.
+    pub fn unlimited() -> Self {
+        Self {
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_NONE,
+            unlimited: true,
+            ..Self::default()
         }
     }
 }
@@ -349,11 +380,30 @@ impl BoostConfig {
                 BOOST_TICK_INTERVAL_MS
             ));
         }
-        if self.spot_layout_version != BOOST_SPOT_LAYOUT_VERSION {
+        let known_layout = matches!(
+            self.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_TEAM
+                | BOOST_SPOT_LAYOUT_VERSION_FIELD
+                | BOOST_SPOT_LAYOUT_VERSION_NONE
+        );
+        if !known_layout {
             return Err(anyhow::anyhow!(
-                "unsupported Boost spot layout version {}, expected {}",
+                "unsupported Boost spot layout version {}, expected one of {}, {} or {}",
                 self.spot_layout_version,
-                BOOST_SPOT_LAYOUT_VERSION
+                BOOST_SPOT_LAYOUT_VERSION_NONE,
+                BOOST_SPOT_LAYOUT_VERSION_TEAM,
+                BOOST_SPOT_LAYOUT_VERSION_FIELD
+            ));
+        }
+        // The padless layout and the unlimited tank imply one another: pickups
+        // with nothing to fill, or an unlimited tank with objectives that do
+        // nothing, are both states the renderer and the player would misread.
+        if self.unlimited != (self.spot_layout_version == BOOST_SPOT_LAYOUT_VERSION_NONE) {
+            return Err(anyhow::anyhow!(
+                "unlimited Boost requires spot layout {} and vice versa, got unlimited={} layout={}",
+                BOOST_SPOT_LAYOUT_VERSION_NONE,
+                self.unlimited,
+                self.spot_layout_version
             ));
         }
         if self.rules_version != BOOST_RULES_VERSION {
@@ -445,16 +495,50 @@ impl Arena {
         self.boost_pads.iter().any(|pad| pad.contains(position))
     }
 
-    fn v3_boost_pad_layout(&self, config: &BoostConfig) -> Vec<BoostPad> {
-        let Some((left, right)) = self.main_field_bounds() else {
-            return Vec::new();
-        };
-        // Layout v3 is a canonical-map contract. Eligible games on any other
-        // geometry fail closed during creation/validation rather than moving
-        // objectives or producing asymmetric footprints.
-        if self.width != 60 || self.height != 40 || (left, right) != (10, 49) {
+    /// The playable span a Boost layout is drawn inside, by layout version.
+    ///
+    /// Team layouts inset the field by the end zones so no pad can sit in a
+    /// goal; the free-for-all layout has no zones and uses the whole arena.
+    /// `None` means this arena cannot host the requested layout, and callers
+    /// treat that as "no pads" — validation then rejects it loudly.
+    fn boost_field_bounds(&self, spot_layout_version: u16) -> Option<(i16, i16)> {
+        match spot_layout_version {
+            BOOST_SPOT_LAYOUT_VERSION_TEAM => {
+                let (left, right) = self.main_field_bounds()?;
+                // Layout v3 is a canonical-map contract. Eligible games on any
+                // other geometry fail closed during creation/validation rather
+                // than moving objectives or producing asymmetric footprints.
+                (self.width == 60 && self.height == 40 && (left, right) == (10, 49))
+                    .then_some((left, right))
+            }
+            BOOST_SPOT_LAYOUT_VERSION_FIELD => {
+                // The teamless layout is the same geometry drawn on the whole
+                // arena. It is deliberately restricted to the square canonical
+                // free-for-all map: the ring's quarter-turn symmetry only
+                // closes when the field is square, and an asymmetric map would
+                // hand one spawn a shorter path to a full tank.
+                (self.team_zone_config.is_none() && self.width == 40 && self.height == 40)
+                    .then_some((0, self.width as i16 - 1))
+            }
+            _ => None,
+        }
+    }
+
+    /// Pad geometry for a config, dispatched on its layout version.
+    ///
+    /// The arithmetic below is written against `(left, right)` and `height`
+    /// alone, so the canonical 40-cell team field and the 40x40 free-for-all
+    /// arena produce the same shape from the same code — the inset, octagon
+    /// radius and bevel are all field-relative fractions.
+    fn boost_pad_layout(&self, config: &BoostConfig) -> Vec<BoostPad> {
+        if config.unlimited {
+            // An unlimited tank is never refuelled, so placing pickups would
+            // put objectives on the map that do nothing.
             return Vec::new();
         }
+        let Some((left, right)) = self.boost_field_bounds(config.spot_layout_version) else {
+            return Vec::new();
+        };
 
         let field_width = right - left + 1;
         let arena_bottom = self.height as i16 - 1;
@@ -706,6 +790,11 @@ pub struct GameProperties {
     pub available_food_target: usize,
     pub tick_duration_ms: u32,
     pub time_limit_ms: Option<u32>,
+    /// Banked team score that ends a team match. `None` means the mode has no
+    /// score target. Team matches set this instead of `time_limit_ms`: they run
+    /// until a team gets there, with no clock and no maximum duration.
+    #[serde(default)]
+    pub score_limit: Option<u32>,
     #[serde(default)]
     pub boost: Option<BoostConfig>,
 }
@@ -756,6 +845,54 @@ pub enum GameMode {
 pub enum QueueMode {
     Quickmatch,  // Quick casual matches
     Competitive, // Ranked competitive matches
+}
+
+/// The banked score a team must reach to win, by queue. This is the single
+/// source of truth: match construction and snapshot validation both read it, so
+/// they cannot drift the way the old post-construction time-limit override did.
+pub fn team_score_limit(queue_mode: &QueueMode) -> u32 {
+    match queue_mode {
+        QueueMode::Quickmatch => DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT,
+        QueueMode::Competitive => DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT,
+    }
+}
+
+/// Which Boost fuel model a mode gets on a given map, if any.
+///
+/// The two collectible models place a fixed pad geometry, and a geometry only
+/// exists for that mode's canonical map — so a match on any other size gets no
+/// Boost rather than a half-drawn one. That keeps `GameState::new` total: it is
+/// called with arbitrary dimensions by tests, previews and Custom games, and
+/// none of those should fail to construct.
+///
+/// Solo is unlimited because a lone runner has nobody to contest pads with, so
+/// a meter would only ration a mechanic that exists to feel fast. Needing no
+/// geometry, it works on every map.
+pub fn boost_config_for(game_type: &GameType, width: u16, height: u16) -> Option<BoostConfig> {
+    match game_type {
+        GameType::TeamMatch { per_team: 1 | 2 } if (width, height) == (60, 40) => {
+            Some(BoostConfig::default())
+        }
+        GameType::FreeForAll { .. } if (width, height) == (40, 40) => Some(BoostConfig::field()),
+        GameType::Solo => Some(BoostConfig::unlimited()),
+        _ => None,
+    }
+}
+
+/// How much food a mode keeps on the field. The crowded modes — 2v2 and
+/// free-for-all — carry double, because four snakes competing over one
+/// ten-pellet field spend most of the match travelling rather than eating.
+/// Duel and Solo keep the baseline: two snakes, or one, do not need the help.
+///
+/// Read by construction and by the fingerprint, so this is the only place the
+/// per-mode value is decided.
+pub fn food_target_for(game_type: &GameType) -> usize {
+    match game_type {
+        GameType::TeamMatch { per_team: 2 } | GameType::FreeForAll { .. } => {
+            DEFAULT_FOOD_TARGET * 2
+        }
+        _ => DEFAULT_FOOD_TARGET,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1109,31 +1246,35 @@ impl GameState {
         rng_seed: Option<u64>,
         start_ms: i64,
     ) -> Self {
-        let boost = if matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
-            let config = BoostConfig::default();
-            debug_assert!(config.validate().is_ok());
-            Some(config)
-        } else {
-            None
-        };
+        let boost = boost_config_for(&game_type, width, height);
+        debug_assert!(boost.as_ref().is_none_or(|c| c.validate().is_ok()));
 
-        let (tick_duration_ms, time_limit_ms) = match &game_type {
-            GameType::Custom { settings } => (settings.tick_duration_ms, None),
-            GameType::TeamMatch { .. } => (
-                if boost.is_some() {
-                    BOOST_TICK_INTERVAL_MS
-                } else {
-                    DEFAULT_TICK_INTERVAL_MS
-                },
-                Some(DEFAULT_TEAM_TIME_LIMIT_MS),
-            ),
-            _ => (DEFAULT_TICK_INTERVAL_MS, None),
+        // Team matches are raced to a score, never against a clock: no time
+        // limit, no maximum duration, and the target depends on the queue.
+        // Boost needs the 50ms quantum in every mode that has it: at a 100ms
+        // tick a boosted snake would earn two moves in one quantum, which
+        // `accrue_movement_credit` refuses. Snakes still cross a cell every
+        // 100ms at normal speed — only the simulation granularity changes.
+        let boost_tick_ms = if boost.is_some() {
+            BOOST_TICK_INTERVAL_MS
+        } else {
+            DEFAULT_TICK_INTERVAL_MS
+        };
+        let (tick_duration_ms, time_limit_ms, score_limit) = match &game_type {
+            GameType::Custom { settings } => (settings.tick_duration_ms, None, None),
+            GameType::TeamMatch { .. } => {
+                (boost_tick_ms, None, Some(team_score_limit(&queue_mode)))
+            }
+            // Solo and free-for-all run until every snake is dead: no clock,
+            // and no score target to race to.
+            _ => (boost_tick_ms, None, None),
         };
 
         let properties = GameProperties {
-            available_food_target: DEFAULT_FOOD_TARGET,
+            available_food_target: food_target_for(&game_type),
             tick_duration_ms,
             time_limit_ms,
+            score_limit,
             boost,
         };
 
@@ -1175,7 +1316,7 @@ impl GameState {
             team_zone_config,
         };
         if let Some(config) = properties.boost.as_ref() {
-            arena.boost_pads = arena.v3_boost_pad_layout(config);
+            arena.boost_pads = arena.boost_pad_layout(config);
         }
 
         let state = GameState {
@@ -1247,10 +1388,10 @@ impl GameState {
         }
     }
 
-    /// Construct an eligible team match with an explicitly resolved,
-    /// snapshotted Boost balance. This is the configuration seam for staging,
-    /// soak tests, and future server-side balance selection; active games never
-    /// re-read live configuration.
+    /// Construct an eligible match with an explicitly resolved, snapshotted
+    /// Boost balance. This is the configuration seam for staging, soak tests,
+    /// and future server-side balance selection; active games never re-read
+    /// live configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_boost_config(
         width: u16,
@@ -1262,15 +1403,12 @@ impl GameState {
         boost_config: BoostConfig,
     ) -> Result<Self> {
         boost_config.validate()?;
-        if !matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+        if !matches!(
+            &game_type,
+            GameType::TeamMatch { per_team: 1 | 2 } | GameType::FreeForAll { .. } | GameType::Solo
+        ) {
             return Err(anyhow::anyhow!(
-                "explicit Boost configuration requires duel or 2v2 TeamMatch"
-            ));
-        }
-        if width != 60 || height != 40 {
-            return Err(anyhow::anyhow!(
-                "Boost layout v{} requires the canonical 60x40 arena",
-                BOOST_SPOT_LAYOUT_VERSION
+                "explicit Boost configuration requires duel, 2v2, free-for-all or Solo"
             ));
         }
 
@@ -1278,28 +1416,76 @@ impl GameState {
         state.properties.boost = Some(boost_config);
         state.arena.boost_pads = state
             .arena
-            .v3_boost_pad_layout(state.properties.boost.as_ref().expect("Boost config"));
+            .boost_pad_layout(state.properties.boost.as_ref().expect("Boost config"));
         state.validate_boost_invariants()?;
         Ok(state)
     }
 
-    /// Whether this is the one persisted pre-Boost terminal shape retained
-    /// for durable history compatibility. Every active or current-protocol
-    /// snapshot must satisfy the strict Boost invariants instead.
-    pub fn is_legacy_completed_team_snapshot(&self) -> bool {
-        matches!(self.status, GameStatus::Complete { .. })
-            && matches!(self.game_type, GameType::TeamMatch { per_team: 1 | 2 })
-            && self.arena.width == 60
-            && self.arena.height == 40
-            && self.properties.tick_duration_ms == DEFAULT_TICK_INTERVAL_MS
-            && self.properties.boost.is_none()
-            && self.arena.boost_pads.is_empty()
-            && self.arena.snakes.iter().all(|snake| {
-                snake.speed_milli() == NORMAL_SNAKE_SPEED_MILLI
-                    && snake.movement_credit() == 0
-                    && snake.boost().charge_ms == 0
-                    && !snake.boost().active
-            })
+    /// Whether this is an immutable terminal snapshot from either gameplay
+    /// generation immediately preceding the current rules.
+    ///
+    /// Completed history remains viewable across the coordinated cutover, but
+    /// active recovery stays fail-closed. Two exact historical shapes exist:
+    ///
+    /// - boostless 100ms duel/2v2/Solo/FFA games from before those modes gained
+    ///   their current Boost model; and
+    /// - 50ms Boost team games that ended on the old 90-second clock before
+    ///   team matches changed to a score race.
+    ///
+    /// Current-protocol snapshots and every nonterminal state must satisfy the
+    /// strict invariants instead of entering through this compatibility seam.
+    pub fn is_legacy_completed_snapshot(&self) -> bool {
+        if !matches!(self.status, GameStatus::Complete { .. }) {
+            return false;
+        }
+
+        if self.properties.boost.is_none() {
+            let legacy_time_limit_ms = match &self.game_type {
+                GameType::TeamMatch { per_team: 1 | 2 } => Some(90_000),
+                GameType::Solo | GameType::FreeForAll { .. } => None,
+                _ => return false,
+            };
+            return boost_config_for(&self.game_type, self.arena.width, self.arena.height)
+                .is_some()
+                && self.properties.available_food_target == DEFAULT_FOOD_TARGET
+                && self.properties.tick_duration_ms == DEFAULT_TICK_INTERVAL_MS
+                && self.properties.time_limit_ms == legacy_time_limit_ms
+                && self.properties.score_limit.is_none()
+                && self.arena.boost_pads.is_empty()
+                && self.arena.snakes.iter().all(|snake| {
+                    snake.speed_milli() == NORMAL_SNAKE_SPEED_MILLI
+                        && snake.movement_credit() == 0
+                        && snake.boost() == &SnakeBoost::default()
+                });
+        }
+
+        if !matches!(self.game_type, GameType::TeamMatch { per_team: 1 | 2 })
+            || self.properties.time_limit_ms != Some(90_000)
+            || self.properties.score_limit.is_some()
+        {
+            return false;
+        }
+
+        // The previous Boost-team state is otherwise byte-for-byte governed
+        // by today's strict invariants. Rewrite only its obsolete completion
+        // condition on a clone, then reuse that validator rather than growing
+        // a second, weaker copy of the pad/snake rules.
+        let mut migrated = self.clone();
+        migrated.properties.available_food_target = food_target_for(&migrated.game_type);
+        migrated.properties.time_limit_ms = None;
+        migrated.properties.score_limit = Some(team_score_limit(&migrated.queue_mode));
+        migrated.validate_boost_invariants().is_ok()
+    }
+
+    /// The tank size to hand a snake starting a new life, in modes whose Boost
+    /// never empties. `None` everywhere else, where a new life starts dry and
+    /// the player refuels from the map.
+    fn unlimited_boost_capacity_ms(&self) -> Option<u32> {
+        self.properties
+            .boost
+            .as_ref()
+            .filter(|config| config.unlimited)
+            .map(|config| config.capacity_ms)
     }
 
     /// Validate every cross-field Boost invariant at a serialized tick
@@ -1307,7 +1493,23 @@ impl GameState {
     /// creation, preventing malformed state from producing permanent speed or
     /// movement divergence.
     pub fn validate_boost_invariants(&self) -> Result<()> {
-        let eligible = matches!(&self.game_type, GameType::TeamMatch { per_team: 1 | 2 });
+        // A mode is Boost-eligible only on a map that can host its layout, so
+        // this asks exactly the question construction answered. Custom games
+        // are player-defined and never carry Boost.
+        let expected_config =
+            boost_config_for(&self.game_type, self.arena.width, self.arena.height);
+        let eligible = expected_config.is_some();
+        if !matches!(self.game_type, GameType::Custom { .. }) {
+            let expected_food_target = food_target_for(&self.game_type);
+            if self.properties.available_food_target != expected_food_target {
+                return Err(anyhow::anyhow!(
+                    "{:?} requires food target {}, got {}",
+                    self.game_type,
+                    expected_food_target,
+                    self.properties.available_food_target
+                ));
+            }
+        }
         let normal_interval_ms = self.normal_movement_interval_ms();
         let movement_threshold =
             u64::from(NORMAL_SNAKE_SPEED_MILLI) * u64::from(normal_interval_ms);
@@ -1316,10 +1518,24 @@ impl GameState {
             Some(config) => {
                 if !eligible {
                     return Err(anyhow::anyhow!(
-                        "Boost configuration is only valid for duel and 2v2 TeamMatch"
+                        "Boost configuration is only valid for duel, 2v2, free-for-all and Solo"
                     ));
                 }
                 config.validate()?;
+                // The fuel model is a property of the mode, so a state cannot
+                // claim (say) an unlimited tank in a contested match.
+                let expected_layout_version = expected_config
+                    .as_ref()
+                    .map(|expected| expected.spot_layout_version)
+                    .unwrap_or(BOOST_SPOT_LAYOUT_VERSION_NONE);
+                if config.spot_layout_version != expected_layout_version {
+                    return Err(anyhow::anyhow!(
+                        "{:?} requires Boost spot layout {}, got {}",
+                        self.game_type,
+                        expected_layout_version,
+                        config.spot_layout_version
+                    ));
+                }
                 if self.properties.tick_duration_ms != BOOST_TICK_INTERVAL_MS {
                     return Err(anyhow::anyhow!(
                         "Boost match tick must be {}ms, got {}ms",
@@ -1327,15 +1543,30 @@ impl GameState {
                         self.properties.tick_duration_ms
                     ));
                 }
-                if self.properties.time_limit_ms != Some(DEFAULT_TEAM_TIME_LIMIT_MS) {
+                if self.properties.time_limit_ms.is_some() {
                     return Err(anyhow::anyhow!(
-                        "Boost match time limit must be exactly {}ms, got {:?}",
-                        DEFAULT_TEAM_TIME_LIMIT_MS,
+                        "Boost matches are raced to a score and must not carry a time limit, got {:?}",
                         self.properties.time_limit_ms
                     ));
                 }
+                // Only team matches race to a score. Solo and free-for-all end
+                // when every snake is dead, so a target there would be a win
+                // condition nothing in the engine ever tests.
+                let expected_score_limit = match &self.game_type {
+                    GameType::TeamMatch { .. } => Some(team_score_limit(&self.queue_mode)),
+                    _ => None,
+                };
+                if self.properties.score_limit != expected_score_limit {
+                    return Err(anyhow::anyhow!(
+                        "Boost match score limit must be exactly {:?} for {:?} in {:?}, got {:?}",
+                        expected_score_limit,
+                        self.game_type,
+                        self.queue_mode,
+                        self.properties.score_limit
+                    ));
+                }
 
-                let expected_layout = self.arena.v3_boost_pad_layout(config);
+                let expected_layout = self.arena.boost_pad_layout(config);
                 let expected: Vec<(u8, Position, u32, u8)> = expected_layout
                     .iter()
                     .map(|pad| (pad.id, pad.position, pad.charge_ms, pad.size_cells))
@@ -1346,17 +1577,37 @@ impl GameState {
                     .iter()
                     .map(|pad| (pad.id, pad.position, pad.charge_ms, pad.size_cells))
                     .collect();
-                if expected.len() != 12 || actual != expected {
+                // An unlimited tank places no pads; every collectible layout
+                // places exactly the canonical twelve.
+                let expected_pad_count = if config.unlimited { 0 } else { 12 };
+                if expected.len() != expected_pad_count || actual != expected {
                     return Err(anyhow::anyhow!(
-                        "Boost layout v{} requires twelve canonical value/footprint pads",
-                        config.spot_layout_version
+                        "Boost layout v{} requires {} canonical value/footprint pads, got {} (expected geometry produced {})",
+                        config.spot_layout_version,
+                        expected_pad_count,
+                        actual.len(),
+                        expected.len()
                     ));
                 }
 
                 let mut pad_ids = HashSet::new();
                 let mut footprint_cells = HashSet::new();
-                let Some((field_left, field_right)) = self.arena.main_field_bounds() else {
-                    return Err(anyhow::anyhow!("Boost pads require team main-field bounds"));
+                // Pads must stay inside the span their own layout is drawn in:
+                // the end-zone-inset field for team maps, the whole arena for
+                // the teamless one. An unlimited config has no pads to place,
+                // so it needs no span.
+                let field_bounds = self.arena.boost_field_bounds(config.spot_layout_version);
+                let (field_left, field_right) = match field_bounds {
+                    Some(bounds) => bounds,
+                    None if config.unlimited => (0, self.arena.width as i16 - 1),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Boost layout v{} is not drawable on this {}x{} arena",
+                            config.spot_layout_version,
+                            self.arena.width,
+                            self.arena.height
+                        ));
+                    }
                 };
                 for pad in &self.arena.boost_pads {
                     if !pad_ids.insert(pad.id) {
@@ -1368,7 +1619,7 @@ impl GameState {
                         || !pad.charge_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS)
                     {
                         return Err(anyhow::anyhow!(
-                            "Boost pad footprint and charge must satisfy layout v3"
+                            "Boost pad footprint and charge must satisfy the configured layout"
                         ));
                     }
                     let cells = pad.footprint_cells();
@@ -1424,11 +1675,27 @@ impl GameState {
                     } else if snake.speed_milli != NORMAL_SNAKE_SPEED_MILLI {
                         return Err(anyhow::anyhow!("inactive snake must have normal speed"));
                     }
-                    if !snake.is_alive
-                        && (snake.boost != Default::default() || snake.movement_credit != 0)
+                    if config.unlimited
+                        && snake.is_alive
+                        && snake.boost.charge_ms != config.capacity_ms
                     {
                         return Err(anyhow::anyhow!(
-                            "dead snake must have cleared Boost and movement credit"
+                            "living snake in an unlimited Boost match must retain full charge"
+                        ));
+                    }
+                    // Latched intent is deliberately excluded: it describes what
+                    // the player is physically doing, not simulation state, and
+                    // it survives death by design so a held control resumes on
+                    // the new life without a re-press. Comparing the whole
+                    // struct against `Default` would reject every snapshot taken
+                    // while somebody is holding Boost through a death.
+                    if !snake.is_alive
+                        && (snake.boost.charge_ms != 0
+                            || snake.boost.active
+                            || snake.movement_credit != 0)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "dead snake must have cleared Boost charge, activation and movement credit"
                         ));
                     }
                     if u64::from(snake.movement_credit) >= movement_threshold {
@@ -1441,7 +1708,10 @@ impl GameState {
             None => {
                 if eligible {
                     return Err(anyhow::anyhow!(
-                        "duel and 2v2 TeamMatch require Boost configuration"
+                        "{:?} on a {}x{} arena requires Boost configuration",
+                        self.game_type,
+                        self.arena.width,
+                        self.arena.height
                     ));
                 }
                 if !self.arena.boost_pads.is_empty() {
@@ -1732,7 +2002,12 @@ impl GameState {
 
                 // Calculate vertical spacing
                 let vertical_margin = 2;
-                let usable_height = arena_height - 2 * vertical_margin;
+                // Coordinates run through `height - 1`. Subtracting from the
+                // dimension itself put the lower row at y=38 on a 40-cell map
+                // while the upper row was y=2, giving bottom spawns a longer
+                // path to their mirrored Boost pad. Use the inclusive span so
+                // the rows are exactly mirrored (2 and 37).
+                let usable_height = arena_height - 1 - 2 * vertical_margin;
 
                 // Left column (facing right) - use main field boundaries
                 let x_left = left_boundary + snake_length;
@@ -1988,7 +2263,12 @@ impl GameState {
             team_id,
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
-            boost: Default::default(),
+            // A mode whose tank never empties has no pickups, so a snake that
+            // spawned dry could never boost at all.
+            boost: SnakeBoost {
+                charge_ms: self.unlimited_boost_capacity_ms().unwrap_or(0),
+                ..Default::default()
+            },
         };
 
         let snake_id = self.arena.add_snake(snake)?;
@@ -2205,44 +2485,49 @@ impl GameState {
             match command_message.command {
                 GameCommand::Turn { .. } => due_turn_commands.push(command_message),
                 command => {
-                    let boost_request = match &command {
-                        GameCommand::ActivateBoost { snake_id } => Some((*snake_id, true)),
-                        GameCommand::DeactivateBoost { snake_id } => Some((*snake_id, false)),
-                        _ => None,
-                    };
-                    let was_active = boost_request.is_some_and(|(snake_id, _)| {
-                        self.arena
-                            .snakes
-                            .get(snake_id as usize)
-                            .is_some_and(|snake| snake.boost.active)
-                    });
                     if let Ok(events) = self.exec_command(command) {
                         out.extend(events);
-                        if let Some((snake_id, requested_active)) = boost_request {
-                            let is_active = self
-                                .arena
-                                .snakes
-                                .get(snake_id as usize)
-                                .is_some_and(|snake| snake.boost.active);
-                            match (was_active, is_active, requested_active) {
-                                (false, true, true) => {
-                                    observer(BoostLifecycleTransition::Activated { snake_id });
-                                }
-                                (true, false, false) => {
-                                    observer(BoostLifecycleTransition::ManuallyStopped {
-                                        snake_id,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
                     }
                 }
             }
         }
 
+        // Converge Boost toward each snake's latched intent. This runs every
+        // quantum rather than only on the command edge, which is what makes a
+        // held control robust: intent latched while the meter was empty (or
+        // while the snake was dead) activates on the first quantum it becomes
+        // affordable, with no second press.
+        if let Some(config) = self
+            .properties
+            .boost
+            .as_ref()
+            .map(|config| (config.speed_milli, config.capacity_ms))
+        {
+            let (speed_milli, capacity_ms) = config;
+            for snake_id in 0..self.arena.snakes.len() {
+                match self.arena.snakes[snake_id].resolve_boost(speed_milli, capacity_ms) {
+                    Some(BoostResolution::Activated) => {
+                        observer(BoostLifecycleTransition::Activated {
+                            snake_id: snake_id as u32,
+                        });
+                    }
+                    Some(BoostResolution::Deactivated) => {
+                        observer(BoostLifecycleTransition::ManuallyStopped {
+                            snake_id: snake_id as u32,
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let unlimited_boost = self
+            .properties
+            .boost
+            .as_ref()
+            .is_some_and(|config| config.unlimited);
         for snake in &mut self.arena.snakes {
-            snake.reserve_boost_quantum();
+            snake.reserve_boost_quantum(unlimited_boost);
         }
 
         let normal_movement_interval_ms = self.normal_movement_interval_ms();
@@ -2574,10 +2859,18 @@ impl GameState {
             if matches!(self.status, GameStatus::Started { .. }) {
                 match &self.game_type {
                     GameType::TeamMatch { .. } => {
-                        if let Some(limit_ms) = self.properties.time_limit_ms {
-                            let elapsed_ms = (self.tick.saturating_add(1) as i64)
-                                * (self.properties.tick_duration_ms as i64);
-                            if elapsed_ms >= limit_ms as i64 {
+                        // The match runs until a team banks the target score.
+                        // Scoring for this tick has already been applied above,
+                        // so the comparison sees the crossing on the tick it
+                        // happens. A single bank can carry several points and
+                        // both teams can bank on the same tick, so the test is
+                        // `>=` and the winner is the higher score among those
+                        // that crossed — equal scores at the target are a draw.
+                        if let Some(score_limit) = self.properties.score_limit {
+                            let reached = self.team_scores.as_ref().is_some_and(|scores| {
+                                scores.values().any(|score| *score >= score_limit)
+                            });
+                            if reached {
                                 let winning_team = self.team_scores.as_ref().and_then(|scores| {
                                     let max_score = scores.values().copied().max()?;
                                     let mut leaders = scores
@@ -2675,6 +2968,25 @@ impl GameState {
         Ok(out)
     }
 
+    /// Latch a Boost request, counting it as a player action only when it
+    /// actually changes what the player is asking for. Matches without Boost
+    /// configured ignore the request outright; that is a fixed property of the
+    /// match rather than a transient condition, so nothing is lost by it.
+    fn set_boost_intent(&mut self, snake_id: u32, wants_boost: bool) {
+        if self.properties.boost.is_none() {
+            return;
+        }
+
+        let changed = self
+            .arena
+            .snakes
+            .get_mut(snake_id as usize)
+            .is_some_and(|snake| snake.set_boost_intent(wants_boost));
+        if changed {
+            self.record_player_action_for_snake(snake_id);
+        }
+    }
+
     fn exec_command(&mut self, command: GameCommand) -> Result<Vec<(u64, GameEvent)>> {
         // debug!("exec_command: Entering with command {:?}", command);
         // eprintln!("COMMON DEBUG: exec_command called with {:?}", command);
@@ -2739,27 +3051,15 @@ impl GameState {
                     }
                 }
             }
+            // Boost commands only latch what the player is asking for. They
+            // deliberately do not consult fuel or liveness, so a request made
+            // at an impossible moment is remembered rather than dropped;
+            // `tick_forward_observing_boost` converges toward it every quantum.
             GameCommand::ActivateBoost { snake_id } => {
-                let activated = if let Some(config) = self.properties.boost.clone()
-                    && let Some(snake) = self.arena.snakes.get_mut(snake_id as usize)
-                {
-                    snake.try_activate_boost(config.speed_milli, config.capacity_ms)
-                } else {
-                    false
-                };
-                if activated {
-                    self.record_player_action_for_snake(snake_id);
-                }
+                self.set_boost_intent(snake_id, true);
             }
             GameCommand::DeactivateBoost { snake_id } => {
-                let deactivated = self
-                    .arena
-                    .snakes
-                    .get_mut(snake_id as usize)
-                    .is_some_and(Snake::try_deactivate_boost);
-                if deactivated {
-                    self.record_player_action_for_snake(snake_id);
-                }
+                self.set_boost_intent(snake_id, false);
             }
             GameCommand::UpdateStatus { .. } => {
                 // debug!("exec_command: Processing UpdateStatus command");
@@ -2792,9 +3092,12 @@ impl GameState {
             }
 
             GameEvent::SnakeDied { snake_id } => {
+                // A dead snake holds nothing — the invariants require a cleared
+                // meter. An unlimited tank is refilled by the *respawn*, which
+                // is where a new life actually begins.
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.is_alive = false;
-                    snake.reset_boost_and_movement();
+                    snake.reset_boost_and_movement(None);
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -2926,12 +3229,13 @@ impl GameState {
                 };
 
                 // Now update the snake
+                let refill = self.unlimited_boost_capacity_ms();
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.body = vec![position, tail_pos];
                     snake.direction = direction;
                     snake.is_alive = true;
                     snake.food = 0;
-                    snake.reset_boost_and_movement();
+                    snake.reset_boost_and_movement(refill);
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -3149,6 +3453,7 @@ mod readiness_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SnakeBoost;
     use std::collections::BinaryHeap;
 
     fn create_command_id(tick: u32, user_id: u32, seq: u32) -> CommandId {
@@ -3237,9 +3542,19 @@ mod tests {
             boost: Default::default(),
         });
 
-        let events = game
-            .tick_forward(true)
-            .expect("tick_forward should succeed");
+        // Solo runs a 50ms quantum, so the wall is reached on the quantum that
+        // actually moves the snake rather than on the first one.
+        let mut events = Vec::new();
+        let crash_tick = loop {
+            events.extend(
+                game.tick_forward(true)
+                    .expect("tick_forward should succeed"),
+            );
+            if !game.arena.snakes[0].is_alive {
+                break game.current_tick();
+            }
+            assert!(game.current_tick() < 8, "snake should have hit the wall");
+        };
 
         assert!(
             events
@@ -3250,13 +3565,16 @@ mod tests {
         assert_eq!(
             game.recent_crashes,
             vec![SnakeCrash {
-                tick: 1,
+                tick: crash_tick,
                 snake_id: 0,
                 position: Position { x: 0, y: 5 },
             }]
         );
 
-        while game.current_tick() < 12 {
+        // Retention is wall-clock, not tick-counted, so the boundary is derived
+        // from the mode's own quantum and holds at either simulation rate.
+        let retention_ticks = RECENT_CRASH_RETENTION_MS / game.properties.tick_duration_ms;
+        while game.current_tick() <= crash_tick + retention_ticks {
             game.tick_forward(true).expect("advance crash history");
         }
         assert_eq!(
@@ -3327,8 +3645,8 @@ mod tests {
         let snake_id = player.snake_id;
 
         // Let the snake travel for a couple of ticks.
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3351,7 +3669,7 @@ mod tests {
         }
 
         // Tick 1: only the first turn applies; the second is deferred.
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive, "snake must survive a same-tick double turn");
@@ -3366,7 +3684,7 @@ mod tests {
         );
 
         // Tick 2: the deferred second turn applies — intent preserved.
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive, "snake must survive the deferred turn");
@@ -3394,8 +3712,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3421,7 +3739,7 @@ mod tests {
         }
 
         for turn in turns {
-            game.tick_forward(true).expect("tick");
+            advance_one_cell(&mut game);
             expected_head = step(expected_head, turn);
             let snake = &game.arena.snakes[snake_id as usize];
             assert!(snake.is_alive, "snake must survive the maneuver");
@@ -3444,8 +3762,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3476,7 +3794,7 @@ mod tests {
         }
 
         for turn in turns {
-            game.tick_forward(true).expect("tick");
+            advance_one_cell(&mut game);
             expected_head = step(expected_head, turn);
             let snake = &game.arena.snakes[snake_id as usize];
             assert!(snake.is_alive, "snake must survive the maneuver");
@@ -3485,6 +3803,23 @@ mod tests {
                 "input order must be preserved across deferrals"
             );
             assert_eq!(*snake.head().expect("head"), expected_head);
+        }
+    }
+
+    /// Advance exactly one cell of normal-speed travel, whatever the mode's
+    /// simulation quantum is.
+    ///
+    /// Boost modes run a 50ms quantum but still move a snake every 100ms, so
+    /// in tests about *turn* semantics a "step" means a movement, not a tick.
+    /// At a 100ms quantum this is a single `tick_forward`, so the tests read
+    /// identically in modes that have no Boost.
+    fn advance_one_cell(game: &mut GameState) {
+        let quanta = game
+            .normal_movement_interval_ms()
+            .div_ceil(game.properties.tick_duration_ms.max(1))
+            .max(1);
+        for _ in 0..quanta {
+            game.tick_forward(true).expect("tick");
         }
     }
 
@@ -3498,8 +3833,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3520,8 +3855,8 @@ mod tests {
             });
         }
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive);
@@ -3545,8 +3880,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3567,7 +3902,7 @@ mod tests {
             });
         }
 
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive);
@@ -4249,6 +4584,7 @@ mod tests {
     }
 
     fn make_active_mover(snake: &mut Snake, speed_milli: u16) {
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = speed_milli;
@@ -4332,34 +4668,50 @@ mod tests {
         let mut team = boost_test_game(1);
         let snake_id = team.players[&1].snake_id;
 
+        // Boost commands latch a level. Pressing on an empty meter is a real
+        // action with a lasting effect — it is what makes the snake boost the
+        // moment fuel arrives — so it counts, while a repeat of the level
+        // the player already asked for does not.
         team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("execute empty-charge no-op");
-        assert_eq!(team.player_action_count(1), 0);
-
-        let capacity_ms = team
-            .properties
-            .boost
-            .as_ref()
-            .expect("Boost config")
-            .capacity_ms;
-        team.arena.snakes[snake_id as usize].boost.charge_ms = capacity_ms;
-        team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("activate charged Boost");
-        assert!(team.arena.snakes[snake_id as usize].boost.active);
-        assert_eq!(team.player_action_count(1), 1);
-
-        team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("execute already-active no-op");
-        assert_eq!(team.player_action_count(1), 1);
-
-        team.exec_command(GameCommand::DeactivateBoost { snake_id })
-            .expect("deactivate active Boost");
+            .expect("latch Boost on an empty meter");
+        assert!(team.arena.snakes[snake_id as usize].boost.intent);
         assert!(!team.arena.snakes[snake_id as usize].boost.active);
+        assert_eq!(team.player_action_count(1), 1);
+
+        team.exec_command(GameCommand::ActivateBoost { snake_id })
+            .expect("execute already-held no-op");
+        assert_eq!(team.player_action_count(1), 1);
+
+        team.exec_command(GameCommand::DeactivateBoost { snake_id })
+            .expect("release the held control");
+        assert!(!team.arena.snakes[snake_id as usize].boost.intent);
         assert_eq!(team.player_action_count(1), 2);
 
         team.exec_command(GameCommand::DeactivateBoost { snake_id })
-            .expect("execute already-inactive no-op");
+            .expect("execute already-released no-op");
         assert_eq!(team.player_action_count(1), 2);
+
+        // A match without Boost configured discards the request entirely; that
+        // is a fixed property of the match, not a transient condition. Every
+        // matchmade mode now carries Boost, so the boostless case is a Custom
+        // game, which is player-defined and never does.
+        let mut solo_boostless = GameState::new(
+            30,
+            30,
+            GameType::Custom {
+                settings: CustomGameSettings::default(),
+            },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let boostless_player = solo_boostless.add_player(7, None).expect("add player");
+        solo_boostless
+            .exec_command(GameCommand::ActivateBoost {
+                snake_id: boostless_player.snake_id,
+            })
+            .expect("boostless activate");
+        assert_eq!(solo_boostless.player_action_count(7), 0);
 
         let round_trip: GameState =
             serde_json::from_value(serde_json::to_value(&team).unwrap()).unwrap();
@@ -4500,11 +4852,23 @@ mod tests {
             }
         }
 
+        // Solo carries an unlimited tank: nothing to collect, so no pads, but
+        // it is still a Boost match and still runs the 50ms quantum.
         let solo = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
-        assert!(solo.properties.boost.is_none());
+        let solo_boost = solo.properties.boost.as_ref().expect("solo Boost config");
+        assert!(solo_boost.unlimited);
+        assert_eq!(
+            solo_boost.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_NONE
+        );
         assert!(solo.arena.boost_pads.is_empty());
-        assert_eq!(solo.properties.tick_duration_ms, DEFAULT_TICK_INTERVAL_MS);
+        assert_eq!(solo.properties.tick_duration_ms, BOOST_TICK_INTERVAL_MS);
+        assert_eq!(solo.properties.score_limit, None);
+        assert_eq!(solo.properties.available_food_target, DEFAULT_FOOD_TARGET);
+        solo.validate_boost_invariants()
+            .expect("solo Boost invariants");
 
+        // Free-for-all collects from the teamless layout on its own square map.
         let free_for_all = GameState::new(
             40,
             40,
@@ -4513,8 +4877,126 @@ mod tests {
             None,
             0,
         );
-        assert!(free_for_all.properties.boost.is_none());
-        assert!(free_for_all.arena.boost_pads.is_empty());
+        let ffa_boost = free_for_all
+            .properties
+            .boost
+            .as_ref()
+            .expect("free-for-all Boost config");
+        assert!(!ffa_boost.unlimited);
+        assert_eq!(
+            ffa_boost.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_FIELD
+        );
+        assert_eq!(free_for_all.arena.boost_pads.len(), 12);
+        assert_eq!(free_for_all.properties.score_limit, None);
+        assert_eq!(
+            free_for_all.properties.available_food_target,
+            DEFAULT_FOOD_TARGET * 2,
+            "the crowded modes carry double food"
+        );
+        free_for_all
+            .validate_boost_invariants()
+            .expect("free-for-all Boost invariants");
+
+        // The teamless layout keeps the same four-fold symmetry the team map
+        // has, measured on the full 40x40 arena rather than an inset field.
+        // Nothing about a free-for-all spawn quadrant may reach a richer pad.
+        let ffa_footprint: HashSet<Position> = free_for_all
+            .arena
+            .boost_pads
+            .iter()
+            .flat_map(|pad| pad.footprint_cells())
+            .collect();
+        assert_eq!(ffa_footprint.len(), 24);
+        assert!(ffa_footprint.iter().all(|cell| {
+            ffa_footprint.contains(&Position {
+                x: 39 - cell.x,
+                y: cell.y,
+            }) && ffa_footprint.contains(&Position {
+                x: cell.x,
+                y: 39 - cell.y,
+            }) && ffa_footprint.contains(&Position {
+                x: 39 - cell.y,
+                y: cell.x,
+            })
+        }));
+
+        let mut spawned_ffa = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 4 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        for user_id in 1..=4 {
+            spawned_ffa.add_player(user_id, None).unwrap();
+        }
+        let heads: HashSet<Position> = spawned_ffa
+            .arena
+            .snakes
+            .iter()
+            .map(|snake| snake.body[0])
+            .collect();
+        assert_eq!(
+            heads,
+            HashSet::from([
+                Position { x: 4, y: 2 },
+                Position { x: 4, y: 37 },
+                Position { x: 35, y: 2 },
+                Position { x: 35, y: 37 },
+            ]),
+            "FFA starts must mirror across both arena axes"
+        );
+        let nearest_pad_distances: HashSet<u16> = spawned_ffa
+            .arena
+            .snakes
+            .iter()
+            .map(|snake| {
+                let head = snake.body[0];
+                spawned_ffa
+                    .arena
+                    .boost_pads
+                    .iter()
+                    .flat_map(BoostPad::footprint_cells)
+                    .map(|cell| head.x.abs_diff(cell.x) + head.y.abs_diff(cell.y))
+                    .min()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            nearest_pad_distances,
+            HashSet::from([2]),
+            "no stable player slot may start closer to a full-tank pad"
+        );
+
+        // A 2v2 also carries double food; a duel does not.
+        for (per_team, expected_food) in [(1, DEFAULT_FOOD_TARGET), (2, DEFAULT_FOOD_TARGET * 2)] {
+            let team = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team },
+                QueueMode::Quickmatch,
+                None,
+                0,
+            );
+            assert_eq!(team.properties.available_food_target, expected_food);
+        }
+
+        // Off-canonical maps get no Boost rather than a half-drawn layout, so
+        // `GameState::new` stays total for previews, tests and Custom games.
+        for (width, height, game_type) in [
+            (20, 20, GameType::FreeForAll { max_players: 4 }),
+            (60, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::TeamMatch { per_team: 1 }),
+        ] {
+            let odd = GameState::new(width, height, game_type, QueueMode::Quickmatch, None, 0);
+            assert!(odd.properties.boost.is_none());
+            assert!(odd.arena.boost_pads.is_empty());
+            assert_eq!(odd.properties.tick_duration_ms, DEFAULT_TICK_INTERVAL_MS);
+            odd.validate_boost_invariants()
+                .expect("a boostless off-canonical map is valid");
+        }
 
         let unsupported_team = GameState::new(
             60,
@@ -4732,11 +5214,11 @@ mod tests {
                 ..BoostConfig::default()
             },
             BoostConfig {
-                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION - 1,
+                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_TEAM - 1,
                 ..BoostConfig::default()
             },
             BoostConfig {
-                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION + 1,
+                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_FIELD + 1,
                 ..BoostConfig::default()
             },
             BoostConfig {
@@ -4888,6 +5370,9 @@ mod tests {
 
         game.arena.boost_pads[pad_index].respawn_at_tick = None;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        // Release the held control first: the latched intent from the press
+        // above would otherwise spend the meter this quantum and make room.
+        snake.set_boost_intent(false);
         snake.boost.charge_ms = DEFAULT_BOOST_CAPACITY_MS;
         snake.movement_credit = 0;
         snake.body[0] = pad.position;
@@ -5039,7 +5524,11 @@ mod tests {
         let snake = &mut game.arena.snakes[snake_id as usize];
         snake.boost.charge_ms = 1_000;
         snake.movement_credit = 25_000;
-        assert!(snake.try_activate_boost(DEFAULT_BOOST_SPEED_MILLI, 3_000));
+        snake.set_boost_intent(true);
+        assert_eq!(
+            snake.resolve_boost(DEFAULT_BOOST_SPEED_MILLI, 3_000),
+            Some(BoostResolution::Activated)
+        );
 
         schedule_deactivation(&mut game, 1, snake_id, 0, 1);
         let mut transitions = Vec::new();
@@ -5087,15 +5576,147 @@ mod tests {
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(!snake.boost.active);
+        assert!(!snake.boost.intent);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.boost.charge_ms, 1_000);
         assert_eq!(snake.movement_credit, 50_000);
+        // Boost is a level, not a pair of edges: a press and its release inside
+        // one quantum collapse to "not held" with no speed change to report.
+        assert_eq!(transitions, vec![]);
+    }
+
+    /// The reported bug: press and hold Boost with an empty meter, pick up
+    /// fuel, and nothing happens until you release and press again. Intent is
+    /// a level, so the press must still be in force when the fuel lands.
+    #[test]
+    fn boost_held_through_an_empty_meter_starts_as_soon_as_fuel_arrives() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        for _ in 0..4 {
+            game.tick_forward(true).expect("held quantum with no fuel");
+            let snake = &game.arena.snakes[snake_id as usize];
+            assert!(!snake.boost.active, "cannot boost on an empty meter");
+            assert!(snake.boost.intent, "the press must stay latched");
+            assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        }
+
+        // Fuel arrives with the control still held and no new command sent.
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+
+        let mut transitions = Vec::new();
+        game.tick_forward_observing_boost(true, &mut |transition| transitions.push(transition))
+            .expect("first funded quantum");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.boost.active, "held Boost must start on its own");
+        assert_eq!(snake.speed_milli, DEFAULT_BOOST_SPEED_MILLI);
         assert_eq!(
             transitions,
-            vec![
-                BoostLifecycleTransition::Activated { snake_id },
-                BoostLifecycleTransition::ManuallyStopped { snake_id },
-            ]
+            vec![BoostLifecycleTransition::Activated { snake_id }]
+        );
+    }
+
+    /// Running the tank dry mid-hold must not silently unlatch the control:
+    /// the next packet has to resume Boost without another press.
+    #[test]
+    fn boost_held_through_depletion_resumes_on_the_next_packet() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(2 * BOOST_TICK_INTERVAL_MS, capacity_ms);
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        game.tick_forward(true).expect("first funded quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+
+        game.tick_forward(true).expect("quantum that runs dry");
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active, "an empty meter stops Boost");
+        assert!(snake.boost.intent, "but the control is still held");
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("refuelled quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+    }
+
+    /// A player holding Boost across a death keeps holding it: the new life
+    /// boosts on its own fuel with no second press.
+    #[test]
+    fn boost_held_across_a_death_resumes_on_the_new_life() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        game.tick_forward(true).expect("latch the held control");
+        assert!(game.arena.snakes[snake_id as usize].boost.intent);
+
+        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        let respawn = game
+            .respawn_event_for_snake(snake_id)
+            .expect("respawn event");
+        game.apply_event(respawn, None);
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive);
+        assert_eq!(snake.boost.charge_ms, 0, "a new life starts empty");
+        assert!(snake.boost.intent, "the control is still held");
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("first funded quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+    }
+
+    /// Releasing while the meter is empty must clear the latch, so fuel picked
+    /// up later does not start a Boost nobody asked for.
+    #[test]
+    fn releasing_an_empty_held_control_does_not_boost_on_later_fuel() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        schedule_deactivation(&mut game, 1, snake_id, 1, 2);
+        game.tick_forward(true).expect("press");
+        game.tick_forward(true).expect("release");
+        assert!(!game.arena.snakes[snake_id as usize].boost.intent);
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("fuelled but unheld quantum");
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.boost.charge_ms, DEFAULT_BOOST_PACKET_CHARGE_MS);
+    }
+
+    /// A snapshot that claims Boost is running with nobody holding the control
+    /// (a lost release, or a stale replica) heals itself within one quantum.
+    #[test]
+    fn active_boost_without_intent_is_stopped_on_the_next_quantum() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.active = true;
+        snake.boost.charge_ms = 1_000;
+        snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
+
+        let mut transitions = Vec::new();
+        game.tick_forward_observing_boost(true, &mut |transition| transitions.push(transition))
+            .expect("self-healing quantum");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.boost.charge_ms, 1_000, "unspent fuel is kept");
+        assert_eq!(
+            transitions,
+            vec![BoostLifecycleTransition::ManuallyStopped { snake_id }]
         );
     }
 
@@ -5116,6 +5737,7 @@ mod tests {
             },
         ];
         snake.direction = Direction::Right;
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = BOOST_TICK_INTERVAL_MS;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5155,6 +5777,7 @@ mod tests {
             let fast = &mut game.arena.snakes[fast_id as usize];
             fast.body = vec![Position { x: 20, y: 12 }, Position { x: 17, y: 12 }];
             fast.direction = Direction::Right;
+            fast.boost.intent = true;
             fast.boost.active = true;
             fast.boost.charge_ms = 1_000;
             fast.speed_milli = MAX_BOOST_SPEED_MILLI;
@@ -5333,9 +5956,15 @@ mod tests {
             event,
             GameEvent::SnakeDied { snake_id } if *snake_id == wall_snake_id
         )));
+        // Death drains fuel and stops Boost, but the player is still holding
+        // the control, so their latched intent survives into the next life.
         assert_eq!(
             wall_game.arena.snakes[wall_snake_id as usize].boost,
-            Default::default()
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
         );
 
         // Crossing the open enemy goal into its base remains lethal.
@@ -5367,7 +5996,14 @@ mod tests {
             .expect("boosted scoring movement");
         assert_eq!(score_game.team_scores.as_ref().unwrap()[&TeamId(0)], 1);
         let score_snake = &score_game.arena.snakes[score_snake_id as usize];
-        assert_eq!(score_snake.boost, Default::default());
+        assert_eq!(
+            score_snake.boost,
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
+        );
         assert_eq!(score_snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(score_snake.movement_credit, 0);
     }
@@ -5377,6 +6013,7 @@ mod tests {
         let mut game = boost_test_game(1);
         let snake_id = game.players[&1].snake_id;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5398,7 +6035,16 @@ mod tests {
         assert!(!snake.is_alive);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit, 0);
-        assert_eq!(snake.boost, Default::default());
+        // Fuel and activation are cleared; the held control is not a thing the
+        // simulation may forget on the player's behalf.
+        assert_eq!(
+            snake.boost,
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
+        );
         assert!(!game.has_scheduled_commands(50));
     }
 
@@ -5407,6 +6053,7 @@ mod tests {
         let mut game = boost_test_game(1);
         let snake_id = game.players[&1].snake_id;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5421,49 +6068,107 @@ mod tests {
         assert_eq!(serde_json::to_value(&game).unwrap(), before);
     }
 
+    /// A team match ends on the tick a side reaches its target, and the side
+    /// that got there wins. Overshooting the target (a bank worth several
+    /// points) still ends the match on that tick.
     #[test]
-    fn team_timeout_uses_wall_clock_quantum_and_ties_are_draws() {
+    fn team_match_ends_when_a_side_reaches_the_score_limit() {
         let mut game = boost_test_game(2);
         game.status = GameStatus::Started { server_id: 7 };
-        game.properties.time_limit_ms = Some(2 * BOOST_TICK_INTERVAL_MS);
+        game.properties.score_limit = Some(3);
 
-        game.tick_forward(false).expect("first half of time limit");
+        game.apply_event(
+            GameEvent::TeamScoreUpdated {
+                team_id: TeamId(0),
+                score: 2,
+            },
+            None,
+        );
+        game.tick_forward(false).expect("below the target");
         assert!(!game.is_complete());
-        game.tick_forward(false).expect("exact timeout boundary");
+
+        game.apply_event(
+            GameEvent::TeamScoreUpdated {
+                team_id: TeamId(0),
+                score: 4,
+            },
+            None,
+        );
+        game.tick_forward(false).expect("target reached");
+        let GameStatus::Complete { winning_snake_id } = game.status else {
+            panic!("reaching the score limit must complete the match");
+        };
+        let winner = winning_snake_id.expect("the side that got there wins");
+        assert_eq!(
+            game.arena.snakes[winner as usize].team_id,
+            Some(TeamId(0)),
+            "the winning snake must belong to the winning team"
+        );
+    }
+
+    /// Both sides can bank on the same tick. Level at the target is a draw,
+    /// exactly as a tied clock finish used to be.
+    #[test]
+    fn simultaneous_arrival_at_the_score_limit_is_a_draw() {
+        let mut game = boost_test_game(2);
+        game.status = GameStatus::Started { server_id: 7 };
+        game.properties.score_limit = Some(3);
+
+        for team_id in [TeamId(0), TeamId(1)] {
+            game.apply_event(GameEvent::TeamScoreUpdated { team_id, score: 3 }, None);
+        }
+        game.tick_forward(false)
+            .expect("both sides arrive together");
         assert!(matches!(
             game.status,
             GameStatus::Complete {
                 winning_snake_id: None
             }
         ));
-        assert_eq!(game.tick, 2);
     }
 
+    /// No clock, and no maximum duration: a match with nobody scoring runs
+    /// indefinitely rather than being called at ninety seconds.
     #[test]
-    fn default_boost_team_match_completes_at_exactly_ninety_seconds() {
+    fn a_scoreless_team_match_never_ends_on_time() {
         let mut game = boost_test_game(2);
         game.status = GameStatus::Started { server_id: 7 };
         game.rng = None;
         game.properties.available_food_target = 0;
+        assert_eq!(game.properties.time_limit_ms, None);
 
-        let terminal_tick = DEFAULT_TEAM_TIME_LIMIT_MS / BOOST_TICK_INTERVAL_MS;
-        for _ in 0..terminal_tick - 1 {
-            game.tick_forward(false).expect("pre-timeout quantum");
-            assert!(!game.is_complete());
+        // Well past the ninety seconds the old rule would have ended this at.
+        for _ in 0..2_400 {
+            game.tick_forward(false).expect("untimed quantum");
+        }
+        assert!(!game.is_complete());
+        assert_eq!(game.tick, 2_400);
+    }
+
+    /// Each queue races to its own target, chosen once at construction from
+    /// the game's queue mode rather than patched in afterwards.
+    #[test]
+    fn team_score_limits_come_from_the_queue_mode() {
+        for (queue_mode, expected) in [
+            (QueueMode::Quickmatch, DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT),
+            (QueueMode::Competitive, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT),
+        ] {
+            let game = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                queue_mode.clone(),
+                Some(1234),
+                0,
+            );
+            assert_eq!(game.properties.score_limit, Some(expected));
+            assert_eq!(game.properties.time_limit_ms, None);
+            assert_eq!(team_score_limit(&queue_mode), expected);
+            game.validate_boost_invariants().unwrap();
         }
 
-        game.tick_forward(false).expect("timeout quantum");
-        assert_eq!(game.tick, terminal_tick);
-        assert_eq!(
-            game.tick * game.properties.tick_duration_ms,
-            DEFAULT_TEAM_TIME_LIMIT_MS
-        );
-        assert!(matches!(
-            game.status,
-            GameStatus::Complete {
-                winning_snake_id: None
-            }
-        ));
+        assert_eq!(DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, 25);
+        assert_eq!(DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, 50);
     }
 
     #[test]
@@ -5498,6 +6203,10 @@ mod tests {
         let baseline = boost_test_game(1);
 
         let mut invalid = baseline.clone();
+        invalid.properties.available_food_target += 1;
+        assert!(invalid.validate_boost_invariants().is_err());
+
+        let mut invalid = baseline.clone();
         invalid.properties.tick_duration_ms = DEFAULT_TICK_INTERVAL_MS;
         assert!(invalid.validate_boost_invariants().is_err());
 
@@ -5523,19 +6232,40 @@ mod tests {
         assert!(invalid.validate_boost_invariants().is_err());
 
         let mut invalid = baseline.clone();
+        invalid.arena.snakes[0].boost.intent = true;
         invalid.arena.snakes[0].boost.active = true;
         invalid.arena.snakes[0].boost.charge_ms = 25;
         invalid.arena.snakes[0].speed_milli = DEFAULT_BOOST_SPEED_MILLI;
         assert!(invalid.validate_boost_invariants().is_err());
 
+        // A team match must be raced to a score, never against a clock.
         let mut invalid = baseline.clone();
-        invalid.properties.time_limit_ms =
-            Some(DEFAULT_TEAM_TIME_LIMIT_MS - BOOST_TICK_INTERVAL_MS);
+        invalid.properties.time_limit_ms = Some(90_000);
         assert!(invalid.validate_boost_invariants().is_err());
 
-        let mut invalid = baseline;
-        invalid.properties.time_limit_ms = None;
+        let mut invalid = baseline.clone();
+        invalid.properties.score_limit = None;
         assert!(invalid.validate_boost_invariants().is_err());
+
+        // The target must match the queue the match was made for.
+        let mut invalid = baseline;
+        invalid.properties.score_limit = Some(DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT + 1);
+        assert!(invalid.validate_boost_invariants().is_err());
+    }
+
+    #[test]
+    fn unlimited_boost_requires_full_charge_for_every_living_snake() {
+        let mut solo = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let snake_id = solo.add_player(1, None).unwrap().snake_id as usize;
+        let capacity = solo.properties.boost.as_ref().unwrap().capacity_ms;
+        assert_eq!(solo.arena.snakes[snake_id].boost.charge_ms, capacity);
+
+        solo.arena.snakes[snake_id].boost.charge_ms = 0;
+        assert!(solo.validate_boost_invariants().is_err());
+
+        solo.arena.snakes[snake_id].is_alive = false;
+        solo.validate_boost_invariants()
+            .expect("a dead unlimited snake must be empty");
     }
 
     #[test]
@@ -5609,6 +6339,7 @@ mod tests {
     fn nonzero_boost_state_round_trips_and_validates() {
         let mut game = boost_test_game(1);
         let snake = &mut game.arena.snakes[0];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5646,6 +6377,11 @@ mod tests {
             .unwrap()
             .remove("player_action_counts");
         persisted["properties"]["tick_duration_ms"] = serde_json::json!(100);
+        persisted["properties"]["time_limit_ms"] = serde_json::json!(90_000);
+        persisted["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("score_limit");
         persisted["properties"]
             .as_object_mut()
             .unwrap()
@@ -5684,6 +6420,7 @@ mod tests {
         assert_eq!(snake.speed_milli(), NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit(), 0);
         assert_eq!(*snake.boost(), Default::default());
+        assert!(decoded.is_legacy_completed_snapshot());
 
         // The WebSocket completed-game path clones and serializes this state
         // directly, so prove the compatibility defaults also produce a full
@@ -5699,8 +6436,51 @@ mod tests {
         assert_eq!(current_wire["arena"]["snakes"][0]["movement_credit"], 0);
         assert_eq!(
             current_wire["arena"]["snakes"][0]["boost"],
-            serde_json::json!({ "charge_ms": 0, "active": false })
+            serde_json::json!({ "charge_ms": 0, "active": false, "intent": false })
         );
+    }
+
+    /// A player holding Boost when their snake dies keeps the latched intent —
+    /// that is what makes the control resume on the new life without a
+    /// re-press. Snapshot admission must therefore accept a dead snake whose
+    /// intent is still set, while still rejecting one that kept fuel, speed or
+    /// movement phase.
+    #[test]
+    fn a_dead_snake_may_keep_latched_intent_but_nothing_else() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = game.add_player(1, None).expect("add player").snake_id;
+        game.add_player(2, None).expect("add rival");
+
+        {
+            let snake = &mut game.arena.snakes[snake_id as usize];
+            snake.set_boost_intent(true);
+            snake.is_alive = false;
+            snake.reset_boost_and_movement(None);
+        }
+        assert!(game.arena.snakes[snake_id as usize].boost().intent);
+        game.validate_boost_invariants()
+            .expect("a dead snake holding the control is a legal state");
+
+        // Fuel, activation and movement phase are all still forbidden.
+        for corrupt in [
+            (|s: &mut Snake| s.boost.charge_ms = 1_000) as fn(&mut Snake),
+            |s: &mut Snake| s.boost.active = true,
+            |s: &mut Snake| s.movement_credit = 1,
+        ] {
+            let mut broken = game.clone();
+            corrupt(&mut broken.arena.snakes[snake_id as usize]);
+            assert!(
+                broken.validate_boost_invariants().is_err(),
+                "a dead snake must not retain fuel, activation or movement phase"
+            );
+        }
     }
 
     #[test]
@@ -5709,14 +6489,17 @@ mod tests {
         let decoded: GameState = serde_json::from_value(persisted).unwrap();
         let error = decoded.validate_boost_invariants().unwrap_err().to_string();
         assert!(
-            error.contains("require Boost configuration"),
+            error.contains("requires Boost configuration"),
             "unexpected fail-closed error: {error}"
         );
     }
 
     #[test]
     fn four_snake_two_x_saturated_command_stress_stays_within_quantum_budget() {
-        const QUANTA: u32 = DEFAULT_TEAM_TIME_LIMIT_MS / BOOST_TICK_INTERVAL_MS;
+        // 90 seconds of simulation at the Boost quantum: the historical
+        // match length, kept purely as this benchmark's workload budget now
+        // that matches end on score rather than on the clock.
+        const QUANTA: u32 = 90_000 / BOOST_TICK_INTERVAL_MS;
         let mut game = GameState::new_with_boost_config(
             60,
             40,
@@ -5734,11 +6517,11 @@ mod tests {
             game.add_player(user_id, None).expect("add stress player");
         }
         game.status = GameStatus::Started { server_id: 1 };
-        game.properties.available_food_target = 1;
+        game.rng = None;
         game.arena.food = vec![Position { x: 22, y: 20 }];
 
         // Four disjoint clockwise circuits keep ordinary movement, turn,
-        // compressed-body, collision, and timeout work active for 90 seconds.
+        // compressed-body, and collision work active for the whole run.
         let circuits = [
             (12, 19, 3, 8),
             (25, 32, 3, 8),
@@ -5755,7 +6538,7 @@ mod tests {
             ];
             snake.direction = Direction::Right;
             snake.food = 0;
-            snake.reset_boost_and_movement();
+            snake.reset_boost_and_movement(None);
         }
 
         let config = game.properties.boost.clone().unwrap();
@@ -5775,9 +6558,8 @@ mod tests {
                 .enumerate()
             {
                 snake.collect_boost_charge(config.capacity_ms, config.capacity_ms);
-                if !snake.boost.active {
-                    assert!(snake.try_activate_boost(config.speed_milli, config.capacity_ms));
-                }
+                snake.set_boost_intent(true);
+                snake.resolve_boost(config.speed_milli, config.capacity_ms);
                 assert_eq!(snake.speed_milli, MAX_BOOST_SPEED_MILLI);
                 assert!(snake.boost.active);
                 heads_before.push(*snake.head().unwrap());
@@ -5835,7 +6617,6 @@ mod tests {
         }
 
         assert_eq!(game.tick, QUANTA);
-        assert!(game.is_complete());
         game.validate_boost_invariants().unwrap();
         let run_duration = run_started.elapsed();
         quantum_durations.sort_unstable();

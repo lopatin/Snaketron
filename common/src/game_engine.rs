@@ -12,12 +12,12 @@ use serde::Serialize;
 pub const MAX_PREDICTION_AHEAD_MS: u32 = 1000;
 
 /// Client snapshot admission is strict for every live state and every current
-/// Boost snapshot. The sole compatibility exception is immutable pre-Boost
-/// team-match history after the server has supplied deserialization defaults.
+/// snapshot. The sole compatibility exception is immutable history from the
+/// immediately preceding gameplay generations after deserialization defaults.
 fn validate_client_snapshot_state(game_state: &GameState) -> Result<()> {
     match game_state.validate_boost_invariants() {
         Ok(()) => Ok(()),
-        Err(_strict_error) if game_state.is_legacy_completed_team_snapshot() => Ok(()),
+        Err(_strict_error) if game_state.is_legacy_completed_snapshot() => Ok(()),
         Err(strict_error) => Err(strict_error),
     }
 }
@@ -1002,27 +1002,53 @@ mod tests {
         assert!(GameEngine::try_new_from_state(99, state).is_err());
     }
 
-    fn legacy_team_snapshot(status: GameStatus) -> GameState {
+    fn legacy_boostless_snapshot(
+        width: u16,
+        height: u16,
+        game_type: GameType,
+        status: GameStatus,
+    ) -> GameState {
         let mut state = GameState::new(
-            60,
-            40,
-            GameType::TeamMatch { per_team: 1 },
+            width,
+            height,
+            game_type.clone(),
             QueueMode::Competitive,
             Some(17),
             0,
         );
-        state.add_player(7, Some("legacy-blue".into())).unwrap();
-        state.add_player(8, Some("legacy-red".into())).unwrap();
+        let player_count = match game_type {
+            GameType::Solo => 1,
+            GameType::TeamMatch { per_team } => u32::from(per_team) * 2,
+            GameType::FreeForAll { max_players } => u32::from(max_players),
+            GameType::Custom { .. } => unreachable!("custom games are not legacy Boost modes"),
+        };
+        for user_id in 1..=player_count {
+            state
+                .add_player(user_id, Some(format!("legacy-{user_id}")))
+                .unwrap();
+        }
         state.status = status;
 
-        // Recreate the durable pre-Boost JSON, then deserialize it through the
+        // Recreate durable pre-expansion JSON, then deserialize it through the
         // compatibility defaults exactly as the server's history path does.
         let mut persisted = serde_json::to_value(state).unwrap();
         persisted
             .as_object_mut()
             .unwrap()
             .remove("player_action_counts");
+        persisted["properties"]["available_food_target"] =
+            serde_json::json!(crate::DEFAULT_FOOD_TARGET);
         persisted["properties"]["tick_duration_ms"] = serde_json::json!(DEFAULT_TICK_INTERVAL_MS);
+        persisted["properties"]["time_limit_ms"] =
+            if matches!(game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+                serde_json::json!(90_000)
+            } else {
+                serde_json::Value::Null
+            };
+        persisted["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("score_limit");
         persisted["properties"]
             .as_object_mut()
             .unwrap()
@@ -1040,22 +1066,71 @@ mod tests {
         serde_json::from_value(persisted).unwrap()
     }
 
+    fn legacy_timed_boost_team_snapshot(status: GameStatus) -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            Some(17),
+            0,
+        );
+        state.add_player(7, Some("legacy-blue".into())).unwrap();
+        state.add_player(8, Some("legacy-red".into())).unwrap();
+        state.status = status;
+        state.properties.time_limit_ms = Some(90_000);
+        state.properties.score_limit = None;
+        state
+    }
+
     #[test]
     fn client_snapshot_admission_is_terminal_and_legacy_shape_only() {
-        let completed = legacy_team_snapshot(GameStatus::Complete {
+        let legacy_modes = [
+            (60, 40, GameType::TeamMatch { per_team: 1 }),
+            (40, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::Solo),
+        ];
+        for (width, height, game_type) in legacy_modes {
+            let completed = legacy_boostless_snapshot(
+                width,
+                height,
+                game_type.clone(),
+                GameStatus::Complete {
+                    winning_snake_id: Some(0),
+                },
+            );
+            assert!(completed.validate_boost_invariants().is_err());
+            assert!(GameEngine::try_new_from_state(99, completed.clone()).is_err());
+            let restored = GameEngine::try_new_from_snapshot_state(99, completed)
+                .expect("boostless completed history must remain viewable");
+            assert!(restored.committed_state().is_complete());
+
+            let nonterminal = legacy_boostless_snapshot(
+                width,
+                height,
+                game_type,
+                GameStatus::Started { server_id: 1 },
+            );
+            assert!(GameEngine::try_new_from_snapshot_state(99, nonterminal).is_err());
+        }
+
+        let completed = legacy_timed_boost_team_snapshot(GameStatus::Complete {
             winning_snake_id: Some(0),
         });
         assert!(completed.validate_boost_invariants().is_err());
-        assert!(GameEngine::try_new_from_state(99, completed.clone()).is_err());
-
-        let restored = GameEngine::try_new_from_snapshot_state(99, completed.clone())
-            .expect("pre-Boost completed history must remain viewable");
-        assert!(restored.committed_state().is_complete());
-
-        let nonterminal = legacy_team_snapshot(GameStatus::Started { server_id: 1 });
+        GameEngine::try_new_from_snapshot_state(99, completed.clone())
+            .expect("timed Boost-team history must remain viewable");
+        let nonterminal = legacy_timed_boost_team_snapshot(GameStatus::Started { server_id: 1 });
         assert!(GameEngine::try_new_from_snapshot_state(99, nonterminal).is_err());
 
-        let mut wrong_quantum = completed.clone();
+        let mut wrong_quantum = legacy_boostless_snapshot(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 4 },
+            GameStatus::Complete {
+                winning_snake_id: Some(0),
+            },
+        );
         wrong_quantum.properties.tick_duration_ms = BOOST_TICK_INTERVAL_MS;
         assert!(GameEngine::try_new_from_snapshot_state(99, wrong_quantum).is_err());
 
@@ -1087,7 +1162,7 @@ mod tests {
                     game_state: completed,
                 },
             })
-            .expect("terminal history snapshot must re-anchor a client");
+            .expect("timed terminal history snapshot must re-anchor a client");
         assert!(live_engine.committed_state().is_complete());
     }
 
@@ -1325,22 +1400,27 @@ mod tests {
     fn prediction_rebuild_retains_crash_cue_across_multi_tick_catch_up() {
         let (mut engine, snake_id, tick_ms) = engine_with_imminent_wall_crash();
 
-        // One rebuild crosses five simulation ticks. The snake hits the left
-        // wall on tick 2, so a one-tick-only cue would have been gone by the
-        // final state observed by the renderer.
+        // One rebuild crosses several simulation ticks. The snake is one cell
+        // from the left wall, so it crashes after two cells of travel — well
+        // before the horizon — and a one-tick-only cue would have been gone by
+        // the final state the renderer observes. Both the horizon and the
+        // crash tick are stated in milliseconds of travel so this holds at
+        // either simulation quantum.
+        let horizon_ms = 5 * DEFAULT_TICK_INTERVAL_MS as i64;
+        let crash_tick = (2 * DEFAULT_TICK_INTERVAL_MS as i64 / tick_ms) as u32;
         engine
-            .rebuild_predicted_state(tick_ms * 5)
+            .rebuild_predicted_state(horizon_ms)
             .expect("multi-tick prediction rebuild");
 
         let predicted = engine.predicted_state().expect("predicted state");
-        assert_eq!(predicted.current_tick(), 5);
+        assert_eq!(predicted.current_tick() as i64, horizon_ms / tick_ms);
         assert!(!predicted.arena.snakes[snake_id as usize].is_alive);
         assert!(
             predicted
                 .recent_crashes
                 .iter()
-                .any(|crash| crash.tick == 2 && crash.snake_id == snake_id),
-            "the tick-2 crash must remain visible after catching up through tick 5"
+                .any(|crash| crash.tick == crash_tick && crash.snake_id == snake_id),
+            "the tick-{crash_tick} crash must remain visible after catching up to {horizon_ms}ms"
         );
 
         let committed = engine.committed_state();
@@ -1355,7 +1435,9 @@ mod tests {
     #[test]
     fn authoritative_event_forces_same_target_prediction_reconciliation() {
         let (mut engine, snake_id, tick_ms) = engine_with_imminent_wall_crash();
-        let target_ts = tick_ms * 5;
+        // Far enough past the two cells of travel that reach the wall.
+        let target_ts = 5 * DEFAULT_TICK_INTERVAL_MS as i64;
+        let target_tick = (target_ts / tick_ms) as u32;
 
         engine
             .rebuild_predicted_state(target_ts)
@@ -1393,7 +1475,7 @@ mod tests {
             .expect("same-target reconciliation rebuild");
 
         let predicted = engine.predicted_state().expect("reconciled prediction");
-        assert_eq!(predicted.current_tick(), 5);
+        assert_eq!(predicted.current_tick(), target_tick);
         assert!(predicted.arena.snakes[snake_id as usize].is_alive);
         assert_eq!(
             predicted.arena.snakes[snake_id as usize].direction,
@@ -1421,9 +1503,11 @@ mod tests {
         let tick_ms = state.properties.tick_duration_ms as i64;
         let mut engine = GameEngine::new_from_state(1, state);
 
-        // Advance the committed state past a few ticks (run_until lags the
-        // wall-clock target by the 500 ms committed-lag window).
-        engine.run_until(tick_ms * 10).expect("run_until");
+        // Advance the committed state past a few ticks. `run_until` lags the
+        // wall-clock target by the 500 ms committed-lag window, so the target
+        // is that window plus the ticks we actually want committed — stated in
+        // milliseconds so it holds at either simulation quantum.
+        engine.run_until(500 + tick_ms * 10).expect("run_until");
         let committed_tick = engine.current_tick();
         assert!(committed_tick >= 2, "committed state should have advanced");
 
@@ -1460,9 +1544,14 @@ mod tests {
             );
         }
 
-        // Advance a few more ticks so the rebased pair executes (first turn
-        // at `committed_tick`, deferred second turn one tick later).
-        engine.run_until(tick_ms * 13).expect("run_until");
+        // Advance far enough for the rebased pair to execute *and* for the
+        // movements that apply them to land. The deferred turn is queued one
+        // tick later, but a turn only becomes visible in `direction` when the
+        // snake actually steps — and at a 50ms quantum a step is every other
+        // tick. Four normal movement intervals covers both rates.
+        engine
+            .run_until(500 + tick_ms * 10 + 4 * DEFAULT_TICK_INTERVAL_MS as i64)
+            .expect("run_until");
         assert!(engine.current_tick() > committed_tick + 1);
 
         let snake = &engine.committed_state().arena.snakes[snake_id as usize];

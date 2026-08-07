@@ -62,68 +62,81 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  * specs — several of which describe mechanics that were never implemented.
  * Load-bearing facts, with their sources:
  *
- * - Team matches end on a 90-second clock and the higher team score wins; a
- *   tie is a draw. There is no score target in any mode
- *   (`common/src/game_state.rs`, the `TeamMatch` completion branch).
+ * - Team matches are raced to a banked score with no clock and no maximum
+ *   duration; both sides level at the target is a draw
+ *   (`common/src/game_state.rs`, the `TeamMatch` completion branch). The
+ *   target is 25 in Quickmatch and 50 in Competitive, but the copy never
+ *   hardcodes either: it reads `properties.score_limit` off the same state the
+ *   engine completes against, so the briefing cannot outlive a rule change.
  * - Banking is `carried_segments / 2`, so one food eaten is one team point,
  *   and the snake respawns at starting length afterwards.
  * - Entering the *enemy* end zone kills you; it is not a scoring move.
  * - Food adds two body segments, and personal score is length minus two.
- * - Boost exists only in duel and 2v2. Space is the key; the default binding
- *   is hold-to-boost.
- * - Solo and FFA have no time limit and end only when every snake is dead.
- * - Competitive changes which MMR pool a result is written to, and nothing
- *   about the rules — except in Solo, where it changes nothing at all, so the
- *   Solo copy never claims a rank is at stake.
+ * - Every matchmade mode has Boost. Space is the key and the default binding
+ *   is hold-to-boost. Duel, 2v2 and FFA fill the tank from NOS pickups on the
+ *   map; Solo's tank never empties and has nothing to collect
+ *   (`boost_config_for` in `common/src/game_state.rs`).
+ * - 2v2 and FFA carry double food (`food_target_for`); duel and Solo do not.
+ * - Solo and FFA have no clock and no score target, and end only when every
+ *   snake is dead.
+ * - Competitive duel and 2v2 use the higher score target described above. In
+ *   duel, 2v2 and FFA it also selects the ranked MMR pool; Solo affects neither
+ *   rules nor rating, so the Solo copy never claims a rank is at stake.
  */
 const teamBullets = (
   mode: 'duel' | '2v2',
   ranked: boolean,
-): [TutorialBullet, TutorialBullet, TutorialBullet] => [
-  {
-    scene: 'team-carry',
-    text:
-      mode === 'duel'
-        ? 'Eat food out in the field, then carry it home through your own gate to bank the points.'
-        : 'Eat food out in the field, then carry it home through your gate. Your partner banks into the same base.',
-  },
-  {
-    scene: 'team-boost',
-    text: 'Drive over NOS canisters to fill your tank, then hold Space for a burst of speed.',
-  },
-  {
-    scene: 'team-danger',
-    text: ranked
-      ? 'Never enter the enemy base — it kills you. Highest team score after 90 seconds wins, and your rank moves with it.'
-      : 'Never enter the enemy base — it kills you. Highest team score after 90 seconds wins.',
-  },
-];
+  scoreLimit: number | null,
+): [TutorialBullet, TutorialBullet, TutorialBullet] => {
+  // There is no clock to fall back on, so a match whose state somehow carries
+  // no target gets the shape of the rule without inventing a number.
+  const race = scoreLimit === null ? 'First to the score target wins' : `First to ${scoreLimit} wins`;
+  return [
+    {
+      scene: 'team-carry',
+      text:
+        mode === 'duel'
+          ? 'Eat food out in the field, then carry it home through your own gate to bank the points.'
+          : 'Eat food out in the field, then carry it home through your gate. Your partner banks into the same base.',
+    },
+    {
+      scene: 'team-boost',
+      text: 'Drive over NOS canisters to fill your tank, then hold Space for a burst of speed.',
+    },
+    {
+      scene: 'team-danger',
+      text: ranked
+        ? `Never enter the enemy base — it kills you. ${race}, and your rank moves with it.`
+        : `Never enter the enemy base — it kills you. ${race}. No clock.`,
+    },
+  ];
+};
 
 const ffaBullets = (ranked: boolean): [TutorialBullet, TutorialBullet, TutorialBullet] => [
   {
     scene: 'ffa-food',
-    text: 'Eat food to grow. Every bite is worth two points.',
+    text: 'Eat food to grow — the field is packed with it. Every bite is worth two points.',
+  },
+  {
+    scene: 'ffa-boost',
+    text: 'Drive over NOS canisters to fill your tank, then hold Space for a burst of speed.',
   },
   {
     scene: 'ffa-crash',
-    text: 'One life. Hitting a wall, a rival, or your own tail ends your run for good.',
-  },
-  {
-    scene: 'ffa-rivals',
     text: ranked
-      ? 'The match ends when the last snake falls. Highest score takes it, and your rank moves with it.'
-      : 'The match ends when the last snake falls. Highest score takes it.',
+      ? 'One life. Hit a wall, a rival, or your own tail and you are out. The match ends when every snake falls. Highest score wins, and your rank moves with it.'
+      : 'One life. Hit a wall, a rival, or your own tail and you are out. The match ends when every snake falls. Highest score wins.',
   },
 ];
 
 const soloBullets = (): [TutorialBullet, TutorialBullet, TutorialBullet] => [
   {
     scene: 'solo-food',
-    text: 'Eat food to grow. Every bite is worth two points.',
+    text: 'Steer with the arrow keys and eat food to grow. Every bite is worth two points.',
   },
   {
-    scene: 'solo-steer',
-    text: 'Steer with the arrow keys. You can turn left or right, never straight back on yourself.',
+    scene: 'solo-boost',
+    text: 'Hold Space to boost. On a solo run the tank never empties, so use it as much as you like.',
   },
   {
     scene: 'solo-run',
@@ -131,9 +144,19 @@ const soloBullets = (): [TutorialBullet, TutorialBullet, TutorialBullet] => [
   },
 ];
 
+/**
+ * Rule values the copy interpolates. Everything here is read off authoritative
+ * state rather than assumed, so a rule change moves the briefing with it.
+ */
+export interface TutorialFacts {
+  /** `properties.score_limit` — the banked team score that ends the match. */
+  scoreLimit: number | null;
+}
+
 export const tutorialContent = (
   mode: TutorialMode,
   queueMode: QueueMode,
+  facts: TutorialFacts = { scoreLimit: null },
 ): TutorialContent => {
   const ranked = queueMode === 'Competitive';
   const key = tutorialKey(mode, queueMode);
@@ -142,7 +165,7 @@ export const tutorialContent = (
       ? soloBullets()
       : mode === 'ffa'
         ? ffaBullets(ranked)
-        : teamBullets(mode, ranked);
+        : teamBullets(mode, ranked, facts.scoreLimit);
 
   return {
     key,
@@ -155,10 +178,14 @@ export const tutorialContent = (
 };
 
 export const tutorialContentForGame = (
-  gameState: Pick<GameState, 'game_type' | 'queue_mode'>,
+  gameState: Pick<GameState, 'game_type' | 'queue_mode' | 'properties'>,
 ): TutorialContent | null => {
   const mode = tutorialModeForGameType(gameState.game_type);
-  return mode === null ? null : tutorialContent(mode, gameState.queue_mode);
+  return mode === null
+    ? null
+    : tutorialContent(mode, gameState.queue_mode, {
+        scoreLimit: gameState.properties.score_limit,
+      });
 };
 
 /**
@@ -172,10 +199,10 @@ export const TUTORIAL_SCENE_IDS = [
   'team-boost',
   'team-danger',
   'ffa-food',
+  'ffa-boost',
   'ffa-crash',
-  'ffa-rivals',
   'solo-food',
-  'solo-steer',
+  'solo-boost',
   'solo-run',
 ] as const;
 

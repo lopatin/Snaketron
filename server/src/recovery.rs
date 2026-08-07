@@ -9,7 +9,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub const RECOVERY_SCHEMA_VERSION: u16 = 3;
+/// Bumped to 5: Solo and free-for-all now carry Boost, which moves them to the
+/// 50ms simulation quantum, and 2v2/free-for-all carry double food. A
+/// checkpoint written before this change deserializes cleanly — `boost` and
+/// `unlimited` both default — but describes a match the current invariants
+/// reject, and its `tick_duration_ms` would silently halve the simulation rate
+/// of a match already in flight. Reject by version here rather than letting
+/// recovery fail later with a confusing validation error.
+///
+/// (4 was: team matches carry `score_limit` instead of `time_limit_ms`, and
+/// snakes carry a latched Boost intent.)
+pub const RECOVERY_SCHEMA_VERSION: u16 = 5;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);
@@ -1065,7 +1075,7 @@ mod tests {
             start_ms,
         );
         state.status = common::GameStatus::Started { server_id: 7 };
-        state.properties.available_food_target = 0;
+        state.rng = None;
         let snake_id = state
             .add_player(9, Some("boost-player".into()))
             .unwrap()

@@ -406,17 +406,24 @@ mod tests {
         (state, snake_id)
     }
 
-    fn legacy_completed_duel_state() -> GameState {
+    fn legacy_completed_boostless_state(width: u16, height: u16, game_type: GameType) -> GameState {
         let mut state = GameState::new(
-            60,
-            40,
-            GameType::TeamMatch { per_team: 1 },
+            width,
+            height,
+            game_type.clone(),
             QueueMode::Competitive,
             Some(91),
             0,
         );
-        state.add_player(7, Some("legacy-blue".into())).unwrap();
-        state.add_player(8, Some("legacy-red".into())).unwrap();
+        let player_count = match &game_type {
+            GameType::Solo => 1,
+            GameType::TeamMatch { per_team } => u32::from(*per_team) * 2,
+            GameType::FreeForAll { max_players } => u32::from(*max_players),
+            GameType::Custom { .. } => unreachable!("custom is not a legacy Boost mode"),
+        };
+        for user_id in 1..=player_count {
+            state.add_player(user_id, None).unwrap();
+        }
         state.status = GameStatus::Complete {
             winning_snake_id: Some(0),
         };
@@ -426,7 +433,19 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("player_action_counts");
+        persisted["properties"]["available_food_target"] =
+            serde_json::json!(common::DEFAULT_FOOD_TARGET);
         persisted["properties"]["tick_duration_ms"] = serde_json::json!(DEFAULT_TICK_INTERVAL_MS);
+        persisted["properties"]["time_limit_ms"] =
+            if matches!(game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+                serde_json::json!(90_000)
+            } else {
+                serde_json::Value::Null
+            };
+        persisted["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("score_limit");
         persisted["properties"]
             .as_object_mut()
             .unwrap()
@@ -442,6 +461,25 @@ mod tests {
             snake.remove("boost");
         }
         serde_json::from_value(persisted).unwrap()
+    }
+
+    fn legacy_timed_boost_duel_state() -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            Some(91),
+            0,
+        );
+        state.add_player(7, Some("legacy-blue".into())).unwrap();
+        state.add_player(8, Some("legacy-red".into())).unwrap();
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(0),
+        };
+        state.properties.time_limit_ms = Some(90_000);
+        state.properties.score_limit = None;
+        state
     }
 
     fn snapshot_frame(game_id: u32, state: &GameState) -> String {
@@ -483,19 +521,31 @@ mod tests {
     }
 
     #[test]
-    fn wasm_snapshot_boundary_renders_only_legacy_compatible_completed_team_history() {
-        let completed = legacy_completed_duel_state();
-        let frame = snapshot_frame(42, &completed);
-        let client = game_client_from_snapshot_frame(42, &frame)
-            .expect("legacy completed snapshot frame must render");
-        let rendered = client.engine.predicted_state().unwrap();
-        assert!(matches!(rendered.status, GameStatus::Complete { .. }));
-        assert_eq!(rendered.properties.boost, None);
-        assert!(rendered.arena.boost_pads.is_empty());
+    fn wasm_snapshot_boundary_renders_only_compatible_completed_history() {
+        for (width, height, game_type) in [
+            (60, 40, GameType::TeamMatch { per_team: 1 }),
+            (40, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::Solo),
+        ] {
+            let completed = legacy_completed_boostless_state(width, height, game_type);
+            let frame = snapshot_frame(42, &completed);
+            let client = game_client_from_snapshot_frame(42, &frame)
+                .expect("legacy completed snapshot frame must render");
+            let rendered = client.engine.predicted_state().unwrap();
+            assert!(matches!(rendered.status, GameStatus::Complete { .. }));
+            assert_eq!(rendered.properties.boost, None);
+            assert!(rendered.arena.boost_pads.is_empty());
 
-        let mut nonterminal = completed.clone();
-        nonterminal.status = GameStatus::Started { server_id: 1 };
-        assert!(game_client_from_snapshot_frame(42, &snapshot_frame(42, &nonterminal)).is_err());
+            let mut nonterminal = completed;
+            nonterminal.status = GameStatus::Started { server_id: 1 };
+            assert!(
+                game_client_from_snapshot_frame(42, &snapshot_frame(42, &nonterminal)).is_err()
+            );
+        }
+
+        let completed = legacy_timed_boost_duel_state();
+        game_client_from_snapshot_frame(42, &snapshot_frame(42, &completed))
+            .expect("timed Boost-team completion must remain renderable");
 
         let mut malformed_current = GameState::new(
             60,

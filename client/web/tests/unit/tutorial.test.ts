@@ -67,42 +67,84 @@ test('custom games get no tutorial rather than a wrong one', () => {
   );
 });
 
-test('only boost-enabled modes mention NOS and Space', () => {
+test('every mode names the boost key, and only collectible modes mention NOS', () => {
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
-    for (const mode of ['duel', '2v2'] as const) {
+    // Every matchmade mode has Boost on the same key.
+    for (const mode of ['duel', '2v2', 'ffa', 'solo'] as const) {
       const text = tutorialContent(mode, queueMode).bullets.map((b) => b.text).join(' ');
-      assert.match(text, /NOS/, `${mode} must explain NOS`);
       assert.match(text, /Space/, `${mode} must name the boost key`);
     }
-    // Boost only exists for duel and 2v2 in the engine; promising it anywhere
-    // else would be a rule the player could check and find false.
-    for (const mode of ['ffa', 'solo'] as const) {
+    // The three contested modes fuel from pickups on the map...
+    for (const mode of ['duel', '2v2', 'ffa'] as const) {
       const text = tutorialContent(mode, queueMode).bullets.map((b) => b.text).join(' ');
-      assert.doesNotMatch(text, /NOS/, `${mode} has no boost`);
-      assert.doesNotMatch(text, /Space/, `${mode} has no boost key`);
+      assert.match(text, /NOS/, `${mode} must explain NOS`);
     }
+    // ...but a solo tank never empties and has nothing to collect, so telling
+    // a solo player to look for canisters would send them hunting for
+    // objectives the map does not contain.
+    const solo = tutorialContent('solo', queueMode).bullets.map((b) => b.text).join(' ');
+    assert.doesNotMatch(solo, /NOS|canister/i, 'solo has no boost pickups');
+    assert.match(solo, /never empties|never runs out/i, 'solo must say the tank is unlimited');
   }
 });
 
-test('no mode claims a score target, because the engine has none', () => {
+test('no mode claims a clock, because no mode has one', () => {
   for (const key of ALL_TUTORIAL_KEYS) {
     const [mode, rank] = key.split(':') as [TutorialMode, 'ranked' | 'casual'];
-    const content = tutorialContent(mode, rank === 'ranked' ? 'Competitive' : 'Quickmatch');
+    const content = tutorialContent(mode, rank === 'ranked' ? 'Competitive' : 'Quickmatch', {
+      scoreLimit: 25,
+    });
     const text = content.bullets.map((b) => b.text).join(' ');
     assert.doesNotMatch(
       text,
-      /first to \d+/i,
-      `${key} must not promise a first-to-N win condition`,
+      /\d+\s*seconds|time limit|time runs out/i,
+      `${key} must not promise a timed finish — team matches race to a score and the rest run until everyone is dead`,
     );
   }
 });
 
-test('team modes state the real 90-second win condition', () => {
-  for (const mode of ['duel', '2v2'] as const) {
-    const text = tutorialContent(mode, 'Quickmatch').bullets.map((b) => b.text).join(' ');
-    assert.match(text, /90 seconds/);
-    assert.match(text, /enemy base/);
+test('FFA teaches its score-based result rather than a last-survivor win', () => {
+  for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
+    const text = tutorialContent('ffa', queueMode).bullets.map((b) => b.text).join(' ');
+    assert.match(text, /match ends when every snake falls/i);
+    assert.match(text, /highest score wins/i);
+    assert.doesNotMatch(text, /last snake standing/i);
   }
+});
+
+test('team copy races to the score limit it is handed, never a baked-in number', () => {
+  // The engine's real targets are 25 Quickmatch / 50 Competitive
+  // (`team_score_limit` in common/src/game_state.rs). The invariant that
+  // actually protects the player is that the briefing prints whatever the
+  // match carries, so an engine-side change cannot leave stale copy behind.
+  for (const mode of ['duel', '2v2'] as const) {
+    for (const [queueMode, limit] of [
+      ['Quickmatch', 25],
+      ['Competitive', 50],
+      ['Quickmatch', 7],
+    ] as const) {
+      const text = tutorialContent(mode, queueMode, { scoreLimit: limit })
+        .bullets.map((b) => b.text)
+        .join(' ');
+      assert.match(text, new RegExp(`First to ${limit}\\b`));
+      assert.match(text, /enemy base/);
+      // No other target may appear alongside it.
+      const numbers = text.match(/\b\d+\b/g) ?? [];
+      assert.deepEqual(
+        numbers.filter((n) => n !== String(limit)),
+        [],
+        `${mode}/${queueMode} leaked a number that is not the score limit`,
+      );
+    }
+  }
+});
+
+test('a team match with no score limit describes the rule without inventing a number', () => {
+  const text = tutorialContent('duel', 'Quickmatch', { scoreLimit: null })
+    .bullets.map((b) => b.text)
+    .join(' ');
+  assert.doesNotMatch(text, /\b\d+\b/);
+  assert.match(text, /score target/i);
 });
 
 test('ranked copy claims a rank is at stake only where one actually is', () => {

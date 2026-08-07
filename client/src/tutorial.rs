@@ -75,7 +75,10 @@ fn team_scene_state() -> GameState {
     state
 }
 
-/// A 40x40 open field: no end zones, no goal, no NOS — matching Solo and FFA.
+/// A 40x40 open field: no end zones and no goal, matching Solo and FFA. A
+/// free-for-all also gets the teamless NOS layout here, because `GameState::new`
+/// places it — which is the point of building scenes through the real
+/// constructor rather than posing them by hand.
 fn field_scene_state(game_type: GameType) -> GameState {
     let mut state = GameState::new(
         FIELD_ARENA_SIZE,
@@ -225,7 +228,7 @@ fn scene_field_crash(game_type: GameType) -> Scene {
     let mut state = field_scene_state(game_type);
     // Live snake, head one cell short of the rival body ahead of it.
     state.arena.snakes.push(Snake::for_illustration(
-        vec![position(17, 16), position(9, 16)],
+        vec![position(17, 15), position(9, 15)],
         Direction::Right,
         None,
         0,
@@ -263,59 +266,6 @@ fn scene_field_crash(game_type: GameType) -> Scene {
     }
 }
 
-/// FFA bullet 3 — a contested field of rivals.
-fn scene_field_rivals() -> Scene {
-    let mut state = field_scene_state(GameType::FreeForAll { max_players: 4 });
-    state.arena.snakes.push(Snake::for_illustration(
-        vec![position(12, 12), position(6, 12)],
-        Direction::Right,
-        None,
-        0,
-        true,
-        false,
-    ));
-    state.arena.snakes.push(Snake::for_illustration(
-        vec![position(27, 16), position(33, 16)],
-        Direction::Left,
-        None,
-        0,
-        true,
-        false,
-    ));
-    state.arena.snakes.push(Snake::for_illustration(
-        vec![position(16, 30), position(16, 24)],
-        Direction::Down,
-        None,
-        0,
-        true,
-        false,
-    ));
-    state.arena.snakes.push(Snake::for_illustration(
-        vec![position(30, 26), position(24, 26), position(24, 31)],
-        Direction::Right,
-        None,
-        0,
-        false,
-        false,
-    ));
-    state.arena.food = vec![
-        position(20, 9),
-        position(9, 20),
-        position(30, 21),
-        position(21, 33),
-    ];
-
-    Scene {
-        state,
-        camera: Camera {
-            x: 4.0,
-            y: 7.0,
-            width: 32.0,
-            height: 28.0,
-        },
-    }
-}
-
 /// Solo bullet 3 — one long survivor, no rivals.
 fn scene_solo_run() -> Scene {
     let mut state = field_scene_state(GameType::Solo);
@@ -346,35 +296,67 @@ fn scene_solo_run() -> Scene {
     }
 }
 
-/// Steering bullet — a snake mid-turn, showing that direction is relative to
-/// what the player sees.
-fn scene_field_steer(game_type: GameType) -> Scene {
-    let mut state = field_scene_state(game_type);
+type SceneBuilder = fn() -> Scene;
+
+/// The single scene registry. Lookup and enumeration both read this table, so
+/// the published id list cannot drift from what is actually drawable.
+/// Open-field bullet — collectible Boost on the free-for-all map.
+///
+/// Frames the top-left 2x2 full tank at (4,4) together with two 1x1 quarter
+/// packets from the inner ring at (16,12) and (23,12), so both pickup sizes
+/// the renderer draws are on screen at thumbnail size. The pads themselves
+/// come from the real layout: `field_scene_state` builds a 40x40 free-for-all,
+/// which is exactly the map the teamless layout is drawn on.
+fn scene_field_boost() -> Scene {
+    let mut state = field_scene_state(GameType::FreeForAll { max_players: 4 });
     state.arena.snakes.push(Snake::for_illustration(
-        vec![position(22, 13), position(22, 22), position(12, 22)],
-        Direction::Up,
+        vec![position(13, 12), position(4, 12)],
+        Direction::Right,
         None,
         0,
         true,
-        false,
+        true,
     ));
-    state.arena.food = vec![position(22, 9), position(28, 18)];
+
+    Scene {
+        state,
+        camera: Camera {
+            x: 2.0,
+            y: 2.0,
+            width: 24.0,
+            height: 16.0,
+        },
+    }
+}
+
+/// Solo bullet — Boost that never runs out.
+///
+/// A solo map carries no pickups at all, which is the point: there is nothing
+/// to frame except the boosting snake itself. The renderer paints the
+/// active-Boost contour, so a long snake mid-burst is what carries the idea.
+fn scene_solo_boost() -> Scene {
+    let mut state = field_scene_state(GameType::Solo);
+    state.arena.snakes.push(Snake::for_illustration(
+        vec![position(27, 18), position(9, 18)],
+        Direction::Right,
+        None,
+        0,
+        true,
+        true,
+    ));
+    state.arena.food = vec![position(31, 18)];
 
     Scene {
         state,
         camera: Camera {
             x: 6.0,
-            y: 6.0,
-            width: 24.0,
-            height: 21.0,
+            y: 11.0,
+            width: 28.0,
+            height: 15.0,
         },
     }
 }
 
-type SceneBuilder = fn() -> Scene;
-
-/// The single scene registry. Lookup and enumeration both read this table, so
-/// the published id list cannot drift from what is actually drawable.
 const SCENES: &[(&str, SceneBuilder)] = &[
     ("team-carry", scene_team_carry),
     ("team-boost", scene_team_boost),
@@ -385,9 +367,9 @@ const SCENES: &[(&str, SceneBuilder)] = &[
     ("ffa-crash", || {
         scene_field_crash(GameType::FreeForAll { max_players: 4 })
     }),
-    ("ffa-rivals", scene_field_rivals),
+    ("ffa-boost", scene_field_boost),
     ("solo-food", || scene_field_food(GameType::Solo)),
-    ("solo-steer", || scene_field_steer(GameType::Solo)),
+    ("solo-boost", scene_solo_boost),
     ("solo-run", scene_solo_run),
 ];
 

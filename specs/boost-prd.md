@@ -1,12 +1,12 @@
-# PRD: Boost packets for team matches
+# PRD: Boost for matchmade modes
 
 | Field | Value |
 | --- | --- |
 | Status | Implemented and under release validation |
 | Product | Snaketron gameplay |
-| Scope | Duel and 2v2, Quickmatch and Competitive |
+| Scope | Duel, 2v2, Free-for-All, and Solo; Quickmatch and Competitive |
 | Owners | Product / Gameplay / Client / Server |
-| Last updated | 2026-08-06 |
+| Last updated | 2026-08-07 |
 
 ## 1. Executive decision
 
@@ -14,17 +14,17 @@ Boost is feasible. It is a shared-engine timing feature, not just a visual effec
 
 The proposed design is:
 
-- Add twelve fixed, symmetric Boost pads to canonical duel and 2v2 team maps: four outer 2x2 full-tank packets and eight inner 1x1 quarter-tank packets. Each pad holds a packet or is cooling down.
+- Add twelve fixed, symmetric Boost pads to canonical duel, 2v2, and 40x40 Free-for-All maps: four outer 2x2 full-tank packets and eight inner 1x1 quarter-tank packets. Solo has an unlimited full tank and no inert pickups.
 - Give every snake a stored Boost meter. Packets add charge up to 100%; collecting a packet never activates Boost.
 - Hold Space is the default input mode: keydown sends a predicted, server-authoritative `ActivateBoost` command and keyup sends `DeactivateBoost`. A continuous physical hold survives fuel depletion and issues one fresh activation when charge returns. A compact control beside the key hints lets the player choose Hold or Toggle. This preference is client-local and persisted; the mode-agnostic server processes the same explicit, idempotent start/stop commands in either mode.
 - Give every snake an authoritative `speed_milli` property. `1000` is 1.0x and `2000` is 2.0x. Only internal Boost-state transitions may change speed after snake construction. Movement reads speed; collision and other gameplay logic never branch on Boost.
 - Support a configurable total speed from 1.0x through 2.0x, with a recommended launch value of 1.5x.
-- Use one fixed 50 ms simulation quantum for every Boost-enabled team match. The quantum never changes when a player activates Boost.
+- Use one fixed 50 ms simulation quantum for every Boost-enabled match. The quantum never changes when a player activates Boost.
 - Resolve at most one cell of movement per snake per quantum. Integer movement credit converts each snake's own speed into movement opportunities.
 - Keep movement derived in the shared Rust engine. Do not send per-cell network events.
-- Release with a coordinated maintenance cutover. Terminate active games, deploy the server and client together on gameplay protocol v5, and reopen Quickmatch and Competitive together. There is no staged production rollout, mixed-version operation, or active-game migration.
+- Release with a coordinated maintenance cutover. Terminate active games, deploy the server and client together on gameplay protocol v6, and reopen Quickmatch and Competitive together. There is no staged production rollout, mixed-version operation, or active-game migration.
 
-Performance impact is bounded but real. Boost team matches run 20 simulation quanta per second instead of 10, so server and replica step frequency approximately doubles. The browser's current rebuild-style prediction can do roughly 4x today's tick-replay work because both target frequency and lag-window ticks double. With at most four snakes and compressed bodies, this is feasible, subject to server and low-end-client performance gates.
+Performance impact is bounded but real. Boost-enabled matchmade modes run 20 simulation quanta per second instead of 10, so server and replica step frequency approximately doubles. The browser's current rebuild-style prediction can do roughly 4x today's tick-replay work because both target frequency and lag-window ticks double. With at most four snakes and compressed bodies, this is feasible, subject to server and low-end-client performance gates.
 
 Two existing engine changes are prerequisites:
 
@@ -40,7 +40,7 @@ Players need predictable map objectives that they can collect, save, and activat
 - change a teammate's or opponent's speed;
 - activate merely because a packet was collected;
 - let a snake jump through an intermediate collision;
-- change the 90-second match clock;
+- change how a match ends (team matches race to a score, with no clock);
 - let a client claim charge, speed, or pad state;
 - fork native-server and WASM-client simulation; or
 - require per-movement WebSocket or Valkey messages.
@@ -49,7 +49,7 @@ Players need predictable map objectives that they can collect, save, and activat
 
 ### 3.1 Goals
 
-1. Add Boost packets to canonical `GameType::TeamMatch { per_team: 1 | 2 }` games in Quickmatch and Competitive.
+1. Add collectible Boost packets to canonical `GameType::TeamMatch { per_team: 1 | 2 }` and 40x40 `FreeForAll` games, plus unlimited Boost without pickups in Solo.
 2. Make packet locations fixed, symmetric, visible, and learnable.
 3. Let each snake store packet charge up to a clearly displayed 100% capacity.
 4. Let the owning player activate and stop Boost with Space, defaulting to hold-to-boost, with immediate local prediction subject to server reconciliation and uninterrupted physical-hold intent across depletion/refill.
@@ -62,7 +62,7 @@ Players need predictable map objectives that they can collect, save, and activat
 
 ### 3.2 Non-goals
 
-- Boost in Solo, Free-for-All, or `GameType::Custom` in v1.
+- Boost in `GameType::Custom` or unsupported future team sizes.
 - Host-controlled Boost settings in the current custom-game UI.
 - Random pad locations, strengths other than the full/quarter layout contract, offensive power-ups, or speeds below 1.0x or above 2.0x.
 - Server-side storage, negotiation, or interpretation of a player's Hold/Toggle input preference. Input mode is client-local policy over explicit start/stop commands.
@@ -88,12 +88,9 @@ The current repository provides a strong base and several constraints:
 
 ### 5.1 Eligible games
 
-After the cutover, Boost is present when:
+After the cutover, Boost is present for canonical 60x40 `TeamMatch { per_team: 1 | 2 }`, canonical 40x40 `FreeForAll`, and Solo. Team and FFA use their mode-specific twelve-pad layouts; Solo uses an unlimited full tank with layout version 0 and no pads.
 
-- the game is `GameType::TeamMatch`; and
-- `per_team` is exactly `1` or `2`.
-
-Both Quickmatch and Competitive use the same resolved Boost rules. `GameProperties.boost: Option<BoostConfig>` is the source of truth; an additional `enabled` flag would create an unnecessary contradictory state. Solo, Free-for-All, Custom, and unsupported future team sizes have `None` and no pads.
+Both Quickmatch and Competitive use the same resolved balance rules. `GameProperties.boost: Option<BoostConfig>` is the source of truth; an additional `enabled` flag would create an unnecessary contradictory state. Custom, off-canonical collectible maps, and unsupported future team sizes have `None` and no pads.
 
 ### 5.2 Recommended configuration
 
@@ -106,7 +103,7 @@ Both Quickmatch and Competitive use the same resolved Boost rules. `GameProperti
 | Pad cooldown | 8,000 ms | Positive and divisible by 50 ms |
 | Pad count | 12 | Four outer 2x2 plus eight inner 1x1; layout-version controlled |
 | Normal movement interval | 100 ms | Engine constant |
-| Simulation quantum | 50 ms | Fixed for Boost team matches |
+| Simulation quantum | 50 ms | Fixed for every Boost-enabled match |
 
 An inner packet fills one quarter of an empty meter; an outer packet fills it completely. Charge is expressed as milliseconds of active runtime so the configured speed does not alter how long a full tank lasts. A partially full snake may consume either strength, charge caps at 100%, and overflow is discarded under the ordinary collection rule.
 
@@ -238,11 +235,11 @@ Snapshots and event application validate these invariants. Speed is authoritativ
 
 ### 7.2 Fixed 50 ms match quantum
 
-Every Boost-enabled duel and 2v2 match stores `50` in `GameProperties.tick_duration_ms` at creation and keeps it through completion. Canonical non-custom modes retain their current 100 ms timing; Custom retains its configured `settings.tick_duration_ms`.
+Every Boost-enabled duel, 2v2, FFA, and Solo match stores `50` in `GameProperties.tick_duration_ms` at creation and keeps it through completion. Boostless/off-canonical modes retain 100 ms; Custom retains its configured `settings.tick_duration_ms`.
 
 The fixed 50 ms value is the only timing mode introduced by Boost. It gives a 2.0x snake one cell per quantum and a normal snake one cell every two quanta. A Space start or stop changes only the owning snake's speed through Boost state; it never changes the match quantum.
 
-The recommended capacity, packet charge, cooldown, 90-second match limit, 500 ms committed lag, and 1,000 ms prediction bound all divide exactly into 50 ms quanta.
+The recommended capacity, packet charge, cooldown, 500 ms committed lag, and 1,000 ms prediction bound all divide exactly into 50 ms quanta. Team matches have no time limit at all: they end when a team reaches the queue's score target (25 Quickmatch, 50 Competitive).
 
 ### 7.3 Movement credit
 
@@ -320,6 +317,7 @@ struct BoostConfig {
     pad_respawn_ms: u32,       // launch: 8000
     spot_layout_version: u16,  // launch: 3
     rules_version: u16,        // launch: 2
+    unlimited: bool,           // Solo only; full meter and no pads
 }
 
 struct BoostPad {
@@ -333,6 +331,7 @@ struct BoostPad {
 struct SnakeBoost {
     charge_ms: u32,
     active: bool,
+    intent: bool,
 }
 
 struct Snake {
@@ -346,11 +345,11 @@ struct Snake {
 Recommended placement:
 
 - `GameProperties.boost: Option<BoostConfig>` contains immutable per-match rules.
-- `GameProperties.tick_duration_ms` is `50` for Boost team matches.
+- `GameProperties.tick_duration_ms` is `50` for every Boost-enabled match.
 - `Arena.boost_pads: Vec<BoostPad>` contains fixed top-left positions, per-pad charge, footprint size, and live availability.
 - Every `Snake` contains its speed, residual credit, and stored/active Boost state.
 
-All fields are mandatory in the new live gameplay protocol. The maintenance cutover terminates old active games, so cross-version active recovery is not supported: a pre-Boost duel or 2v2 snapshot must fail Boost invariant validation. Deserialization-only defaults remain on the new fields so immutable pre-Boost **completed** games stay readable from durable history; those defaults produce normal speed, zero movement credit, empty/inactive charge, no pads, and no Boost config. Client snapshot admission has one terminal-history exception for that exact canonical 60x40, 100 ms pre-Boost shape. Nonterminal legacy snapshots, stripped 50 ms Boost snapshots, and malformed current Boost completions remain rejected. Constructors must still initialize non-Boost snakes to the same values.
+All fields are mandatory in gameplay protocol v6. The maintenance cutover terminates old active games, so cross-version active recovery is not supported. Deserialization-only defaults keep immutable completed history readable for two exact prior shapes: boostless 100 ms team/Solo/FFA results, and 50 ms Boost team results that used the old 90-second clock. Nonterminal legacy snapshots, stripped current snapshots, and malformed current completions remain rejected. Constructors must still initialize non-Boost snakes to normal speed, zero credit, and empty Boost state.
 
 ### 8.1 Command
 
@@ -393,19 +392,19 @@ No wall-clock-only cosmetic timestamp belongs in the fingerprint.
 
 ### 9.1 Match creation
 
-The team match builder must:
+The match builder must:
 
-1. allowlist only `TeamMatch { per_team: 1 | 2 }`;
+1. allowlist canonical `TeamMatch { per_team: 1 | 2 }`, 40x40 FFA, and Solo;
 2. resolve and validate one `BoostConfig`;
 3. store the fixed 50 ms Boost quantum in game properties;
-4. require capacity, packet charge, cooldown, and time-limit values to be divisible by 50 ms;
+4. require capacity, packet charge, and cooldown values to be divisible by 50 ms;
 5. generate and validate the versioned symmetric pad layout;
-6. initialize every snake at normal speed with zero credit and empty charge; and
+6. initialize every snake at normal speed with zero credit and empty charge, except Solo's full unlimited tank; and
 7. create pads before initial food and permanently exclude their cells from food placement.
 
 The server never re-reads multiplier, capacity, packet charge, cooldown, or layout configuration during an active match.
 
-At process startup, `SNAKETRON_BOOST_SPEED_MULTIPLIER` optionally overrides the default `1.500` multiplier. It accepts deterministic milli-speed precision from `1.000` through `2.000` (for example `1.25` or `1.750`). Invalid or out-of-range values fail server startup. The resolved and validated `BoostConfig` is stored on the matchmaking manager and cloned into both duel and 2v2 game properties at creation time.
+At process startup, `SNAKETRON_BOOST_SPEED_MULTIPLIER` optionally overrides the default `1.500` multiplier. It accepts deterministic milli-speed precision from `1.000` through `2.000` (for example `1.25` or `1.750`). Invalid or out-of-range values fail server startup. The resolved and validated balance is stored on the matchmaking manager and copied into every eligible mode while preserving that mode's layout and unlimited-fuel contract.
 
 ### 9.2 Command authorization and execution
 
@@ -439,7 +438,7 @@ Fix this before Boost. A delayed 50 ms game may catch up several quanta at once;
 
 Audit every tick-coupled behavior and preserve its wall-clock cadence, including:
 
-- the 90-second team clock and countdown;
+- the team match clock, which counts up and never ends the match;
 - approximately one-second checkpoints and hashes;
 - food refill opportunities;
 - liveness and reconnect watchdogs;
@@ -529,7 +528,7 @@ Keep an `every-quantum` load-test profile as an intentional worst case, includin
 
 ### 11.1 Release model
 
-Production uses one coordinated maintenance cutover to gameplay protocol v5. There is no disabled foundation deployment, capability cohort, regional canary, Quickmatch-first phase, Competitive delay, or mixed old/new engine period. CI, staging, soak, and load testing still occur before the maintenance window; they are release gates, not production rollout stages.
+Production uses one coordinated maintenance cutover to gameplay protocol v6. There is no disabled foundation deployment, capability cohort, regional canary, Quickmatch-first phase, Competitive delay, or mixed old/new engine period. CI, staging, soak, and load testing still occur before the maintenance window; they are release gates, not production rollout stages.
 
 ### 11.2 Maintenance cutover
 
@@ -539,7 +538,7 @@ Production uses one coordinated maintenance cutover to gameplay protocol v5. The
 4. Remove only ephemeral active-game streams, ownership leases, pending commands, recovery checkpoints, replica state, matchmaking entries, lobby/party reservations, join tokens, assignments, and active-game directory indexes. Preserve accounts, ratings, configuration history, and completed-game data.
 5. Deploy and restart gateways, executors, replicas, the common engine, Rust/WASM bundle, generated TypeScript types, web client, bots, and load clients as one tested version.
 6. Require one exact gameplay protocol version during authentication. Reject a stale tab with a global “client update required”/reload response. This is a single equality check, not per-feature capability negotiation or lobby state.
-7. While queues remain closed, smoke-test a complete duel and 2v2 game, Hold-mode keydown start/key-up stop, Toggle-mode start/stop, partial-charge preservation, packet collection at 2.0x, reconnect, TickHash, and snapshot resync.
+7. While queues remain closed, smoke-test complete duel, 2v2, FFA, and Solo games; Hold-mode keydown start/key-up stop; Toggle-mode start/stop; partial and unlimited charge; packet collection at 2.0x; reconnect; TickHash; and snapshot resync.
 8. Reopen only after every gateway, executor, and replica reports the exact version and healthy readiness; stale queues/indexes are empty; protocol mismatch rejection works; and all smoke tests pass. Then reopen Quickmatch and Competitive simultaneously with the same rules version. Any failure keeps admission closed and triggers rollback.
 
 No pre-cutover active snapshot or old WASM client is admitted after reopening.
@@ -615,7 +614,7 @@ Performance will suffer relative to today's engine, but the fixed 50 ms scope bo
 
 ### 14.2 Release gates
 
-- Run duel and 2v2 tests with every snake continuously active at 2.0x, saturated turns and explicit Boost start/stop commands, and ordinary food/scoring work.
+- Run duel, 2v2, FFA, and Solo tests with every snake continuously active at 2.0x, saturated turns and explicit Boost start/stop commands, and ordinary food/scoring work.
 - At certified concurrent-team-game load, no game remains more than one 50 ms quantum behind its intended 500 ms-lagged target for over one second.
 - Actor advance p99 is below 25 ms, with no sustained checkpoint or command backlog.
 - On the agreed low-end mobile target, engine plus required state publication stays below 8 ms p95 and gameplay sustains at least 50 rendered frames/sec p95 with four active 2.0x snakes.
@@ -632,7 +631,7 @@ If a gate fails, optimize prediction, state publication, actor scheduling, or co
 
 - Prove every snake starts at speed `1000`, and only internal Boost lifecycle transitions can modify it.
 - Validate range boundaries at `999`, `1000`, representative fractional milli-speeds, `2000`, and `2001`.
-- Prove Boost team games always use 50 ms, other modes retain their existing/configured timing, and non-divisible charge/cooldown configuration is rejected.
+- Prove every Boost-enabled matchmade mode uses 50 ms, Boostless/Custom modes retain their configured timing, and non-divisible charge/cooldown configuration is rejected.
 - Assert exact long-run cell counts and residual credit at 1.0x, 1.25x, 1.5x, 1.75x, and 2.0x.
 - Assert no snake moves more than one cell in a quantum at any valid speed.
 - Prove packet collection changes charge but never active state or speed.
@@ -648,9 +647,9 @@ If a gate fails, optimize prediction, state publication, actor scheduling, or co
 
 ### 15.2 Layout and mode tests
 
-- Generate identical symmetric pad IDs, top-left positions, charges, and footprints for every 60x40 duel and 2v2 game under layout v3.
+- Generate identical symmetric pad IDs, top-left positions, charges, and footprints for every 60x40 duel/2v2 game under layout v3 and every 40x40 FFA under layout v4.
 - Prove all 24 footprint cells are unique, in the main field, and never overlap walls, goals, starts, respawns, or food, including while cooling.
-- Prove Solo, Free-for-All, Custom, and unsupported team sizes have no Boost config or pads; canonical non-custom modes remain 100 ms and Custom retains its configured timing.
+- Prove FFA uses the symmetric collectible field layout, Solo uses a full unlimited tank without pads, and Custom/unsupported/off-canonical collectible modes remain Boostless at their configured timing.
 - Sample deterministic food placement at scale: Duel/2v2 must be center-biased only on the goal-to-goal axis and uniform cross-field; Solo/FFA must be uniform on both axes. Exercise both initial spawn and refill through the same sampler while preserving end-zone, snake, food, and pad exclusions.
 - Run the same Boost rules in Quickmatch and Competitive.
 
@@ -680,7 +679,7 @@ If a gate fails, optimize prediction, state publication, actor scheduling, or co
 
 ### 15.5 End-to-end, cutover, and performance tests
 
-- Play complete duel and 2v2 games at speed-range boundaries and representative fractional speeds under injected latency in both Hold and Toggle modes.
+- Play complete duel, 2v2, FFA, and Solo games at speed-range boundaries and representative fractional speeds under injected latency in both Hold and Toggle modes.
 - Run four snakes at 2.0x with continuous fuel, `every-quantum` commands, executor delay, and stream loss/recovery.
 - Exercise background/suspended-tab catch-up, graceful handoff, abrupt executor failure, gateway reconnect, and resync.
 - Compare CPU, actor p95/p99, scheduler lateness, catch-up size, Valkey/WS traffic, snapshot size, browser engine time, serialization, React commits, frame time, and long tasks against baseline.
@@ -690,7 +689,7 @@ If a gate fails, optimize prediction, state publication, actor scheduling, or co
 
 Boost v1 is complete when:
 
-1. Every canonical duel and 2v2 game receives the versioned symmetric twelve-pad layout—four outer 2x2 full packets and eight inner 1x1 quarter packets; unsupported modes do not.
+1. Every canonical duel, 2v2, and FFA game receives its versioned symmetric twelve-pad layout—four outer 2x2 full packets and eight inner 1x1 quarter packets—while Solo receives unlimited Boost without pads and unsupported modes remain Boostless.
 2. Packets add snake-owned charge up to 100% and never activate or directly alter speed.
 3. Hold Space is the default: keydown sends one authorized, predicted `ActivateBoost`, keyup sends `DeactivateBoost`, stopping preserves unused charge and movement credit, and an uninterrupted physical hold automatically issues one fresh activation when charge returns after depletion. A compact persisted client-local control selects Hold or Toggle; Toggle alternates the same explicit commands, while the server remains mode-agnostic.
 4. Every snake has authoritative `speed_milli`; only internal Boost lifecycle transitions modify it after construction.
@@ -698,12 +697,12 @@ Boost v1 is complete when:
 6. No snake moves more than one cell per quantum, so intermediate collisions cannot be skipped at 2.0x.
 7. Collision, food, scoring, and turn logic contains no Boost/no-Boost branch; collision operates on generic movers and ordinary snake state.
 8. Charge consumption, manual stop/restart, refill, depletion, death/reset, disconnect, reconnect, cleanup release, and final-funded-quantum behavior match this PRD.
-9. Match duration remains exactly 90 seconds of game wall time with the 50 ms Boost quantum.
+9. Team matches have no time limit or maximum duration; they complete on the tick a team reaches its queue's score target (25 Quickmatch, 50 Competitive).
 10. Server, replica, WASM, replay, snapshot, resync, and failover produce equivalent fingerprints.
 11. Catch-up events preserve originating tick and engine sequence, and TickHash arrives approximately once per wall-clock second.
 12. All four-snake 2.0x server/client performance gates pass; prediction/state-publication optimization is implemented if profiling requires it.
 13. No per-cell movement or per-quantum fuel events are sent.
-14. The rehearsed maintenance cutover deploys exact gameplay protocol v5 and reopens Quickmatch and Competitive together, with no active-game migration or staged production cohort.
+14. The rehearsed maintenance cutover deploys exact gameplay protocol v6 and reopens Quickmatch and Competitive together, with no active-game migration or staged production cohort.
 15. Team food remains center-biased only along the goal-to-goal axis and uniform cross-field; Solo and FFA food is uniform on both axes for both initial spawn and refill.
 16. Roster snakes are rendered by a responsive Canvas path with player names fitted inside the body near the head, and the arena-docked Boost panel presents icon plus percent only on a low-contrast empty surface with full-width yellow charge fill.
 

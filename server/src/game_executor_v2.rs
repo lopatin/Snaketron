@@ -1472,15 +1472,17 @@ impl GameActor {
             return Ok(());
         }
 
-        self.record_readiness_transition(GameEvent::MatchStartScheduled {
+        let event = GameEvent::MatchStartScheduled {
             simulation_epoch_ms: now_ms + GAME_START_COUNTDOWN_MS,
-        })
-        .await?;
-        // Persist the resolved epoch before anything else. A crash between the
-        // event and the next periodic checkpoint would otherwise let the
-        // recovering actor resolve the gate a second time and start simulating
-        // from an epoch no client ever saw.
+        };
+        self.engine.apply_pre_match_readiness_event(event.clone())?;
+        // Persist the resolved epoch before making it visible. `checkpoint`
+        // owns the bounded retry loop, so a transient write failure keeps this
+        // event unpublished until the same epoch is durable. If authority is
+        // lost instead, recovery still sees the older held gate and may safely
+        // choose a new epoch because no client ever observed this one.
         self.checkpoint().await?;
+        self.publish_event(event).await?;
         // Everyone joining from here on — including a player who reconnects
         // mid-countdown — must see the resolved epoch even if they missed the
         // event, so anchor a fresh snapshot to it.
@@ -5038,7 +5040,7 @@ mod tests {
                 state.add_player(user_id, Some(format!("player-{user_id}")))?;
             }
             state.status = GameStatus::Started { server_id: 1 };
-            state.properties.available_food_target = 0;
+            state.rng = None;
             state.arena.food.clear();
 
             // Tick 1: snake 1 is stationary on a packet and collects it.
@@ -6931,6 +6933,90 @@ mod tests {
                 .context("test actor did not stop after cancellation")?
                 .context("test actor task panicked")??;
 
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_release_is_checkpointed_before_publication_and_retries_once() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("readiness-release-durability").await?;
+            let mut baseline = harness.recovery().await?;
+            baseline
+                .game_state
+                .arm_readiness_gate(chrono::Utc::now().timestamp_millis() - 1);
+            baseline.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(&harness.guard, &baseline, &[], Duration::from_secs(60))
+                .await?;
+
+            let mut actor = harness.actor(baseline, harness.guard.clone());
+            actor.live = true;
+            // The first write fails transiently. The actor must keep the chosen
+            // epoch private while `checkpoint` retries, then publish it once.
+            harness.bus.fail_next_checkpoints(1);
+            let (checkpoint_entered, release_checkpoint) = harness.bus.gate_next_checkpoint();
+            let release_task = tokio::spawn(async move {
+                actor.resolve_readiness_gate_if_due().await?;
+                Result::<GameActor>::Ok(actor)
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), checkpoint_entered.notified())
+                .await
+                .context("readiness release did not enter its durability checkpoint")?;
+            assert!(
+                read_game_events(&mut harness.raw, harness.partition)
+                    .await?
+                    .is_empty(),
+                "readiness epoch became visible before its checkpoint was durable"
+            );
+            release_checkpoint.notify_one();
+            let actor = tokio::time::timeout(Duration::from_secs(2), release_task)
+                .await
+                .context("readiness release did not finish after checkpoint retry")?
+                .context("readiness release task panicked")??;
+
+            let recovered = harness.recovery().await?;
+            let durable_epoch = recovered
+                .game_state
+                .simulation_epoch_ms
+                .context("resolved readiness epoch was not checkpointed")?;
+            assert!(!recovered.game_state.is_awaiting_readiness());
+            assert_eq!(
+                actor.engine.get_committed_state().simulation_epoch_ms,
+                Some(durable_epoch)
+            );
+
+            let events = read_game_events(&mut harness.raw, harness.partition).await?;
+            let released_epochs: Vec<i64> = events
+                .iter()
+                .filter_map(|message| match &message.event {
+                    GameEvent::MatchStartScheduled {
+                        simulation_epoch_ms,
+                    } => Some(*simulation_epoch_ms),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                released_epochs,
+                vec![durable_epoch],
+                "checkpoint retry must publish exactly the durable readiness epoch"
+            );
+            assert!(events.iter().any(|message| {
+                matches!(
+                    &message.event,
+                    GameEvent::Snapshot { game_state }
+                        if game_state.simulation_epoch_ms == Some(durable_epoch)
+                            && !game_state.is_awaiting_readiness()
+                )
+            }));
+
+            drop(actor);
             let live_guard = harness.guard.clone();
             harness.cleanup(&live_guard).await?;
             Result::<()>::Ok(())

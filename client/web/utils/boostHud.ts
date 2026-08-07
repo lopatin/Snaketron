@@ -1,6 +1,7 @@
 interface BoostConfigView {
   speed_milli: number;
   capacity_ms: number;
+  unlimited: boolean;
 }
 
 interface BoostSnakeView {
@@ -19,6 +20,12 @@ export interface BoostHudView {
   ready: boolean;
   multiplier: number;
   buttonDisabled: boolean;
+  /**
+   * The match's tank never empties, so the meter is a state indicator rather
+   * than a resource gauge. The bar stays full and the readout says so instead
+   * of showing a percentage that can never move.
+   */
+  unlimited: boolean;
 }
 
 /** Build the local HUD from predicted engine state; no client countdown. */
@@ -39,19 +46,22 @@ export function buildBoostHudView(
       ? 100
       : Math.min(99, Math.max(0, Math.round(fillRatio * 100)));
   const active = snake.boost.active;
-  const ready = capacityMs > 0 && chargeMs === capacityMs && !active;
+  const unlimited = config.unlimited === true;
+  // An unlimited tank is always "ready" while it is not already running: there
+  // is nothing to wait for.
+  const ready = !active && (unlimited || (capacityMs > 0 && chargeMs === capacityMs));
 
   return {
     chargeMs,
-    percent,
-    fillRatio,
+    percent: unlimited ? 100 : percent,
+    fillRatio: unlimited ? 1 : fillRatio,
     active,
     ready,
+    unlimited,
     multiplier: Number((config.speed_milli / 1000).toFixed(2)),
-    buttonDisabled:
-      !interactionActive ||
-      !snake.is_alive ||
-      (!active && chargeMs <= 0) ||
-      gameOver,
+    // An empty meter must not disable the control. Boost is a held level, and
+    // holding it on empty is how a player arms the next packet — disabling the
+    // button would swallow the press exactly like the old input bug did.
+    buttonDisabled: !interactionActive || !snake.is_alive || gameOver,
   };
 }
