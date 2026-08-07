@@ -678,6 +678,7 @@ fn render_scene(
     scene: &Scene,
     scratch: &web_sys::HtmlCanvasElement,
     target: &web_sys::HtmlCanvasElement,
+    draw_celebration: &js_sys::Function,
 ) -> Result<(), JsValue> {
     let target_width = target.width() as f64;
     let target_height = target.height() as f64;
@@ -706,7 +707,14 @@ fn render_scene(
         scratch.set_height(frame_height);
     }
 
-    render::render_game_state(&scene.state, scratch, cell_size, Some(1), 0)?;
+    render::render_game_state(
+        &scene.state,
+        scratch,
+        cell_size,
+        Some(1),
+        0,
+        draw_celebration,
+    )?;
 
     let context = target
         .get_context("2d")?
@@ -745,6 +753,7 @@ fn render_scene(
 pub struct TutorialScenePlayer {
     scene_index: usize,
     scratch: web_sys::HtmlCanvasElement,
+    draw_celebration: Closure<dyn FnMut()>,
 }
 
 #[wasm_bindgen]
@@ -756,6 +765,11 @@ impl TutorialScenePlayer {
         Ok(Self {
             scene_index,
             scratch: create_scratch_canvas()?,
+            // Tutorial timelines never emit score celebrations, but the shared
+            // renderer accepts the live game's cosmetic callback. Keep one
+            // inert callback with the player so rendering stays allocation-free
+            // and does not rely on `Function` construction/eval under CSP.
+            draw_celebration: Closure::new(|| {}),
         })
     }
 
@@ -776,7 +790,12 @@ impl TutorialScenePlayer {
         target: &web_sys::HtmlCanvasElement,
     ) -> Result<(), JsValue> {
         let scene = SCENES[self.scene_index].frame(elapsed_ms);
-        render_scene(&scene, &self.scratch, target)
+        render_scene(
+            &scene,
+            &self.scratch,
+            target,
+            self.draw_celebration.as_ref().unchecked_ref(),
+        )
     }
 }
 
