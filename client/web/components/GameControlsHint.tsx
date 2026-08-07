@@ -38,37 +38,21 @@ export function GameControlsHint({
           <kbd className="control-key control-key--space" aria-label="Space key">
             <span aria-hidden="true" />
           </kbd>
-          <fieldset
+          <label
             className="boost-input-mode"
-            role="radiogroup"
-            aria-labelledby="boost-input-mode-label"
             data-testid="boost-input-mode"
+            title="Checked: boost while Space is held. Unchecked: press Space to start or stop Boost."
           >
-            <legend id="boost-input-mode-label">Space behavior</legend>
-            <div className="boost-input-mode__choices">
-              {(['hold', 'toggle'] as const).map((mode) => (
-                <label
-                  key={mode}
-                  className="boost-input-mode__option"
-                  title={mode === 'hold'
-                    ? 'Boost while the Space key is held'
-                    : 'Press the Space key to start or stop Boost'}
-                >
-                  <input
-                    type="radio"
-                    name="boost-input-mode"
-                    value={mode}
-                    checked={boostInputMode === mode}
-                    onChange={() => onBoostInputModeChange(mode)}
-                  />
-                  <span>
-                    <strong>{mode === 'hold' ? 'Hold' : 'Press'}</strong>
-                    <small>{mode === 'hold' ? 'to boost' : 'to toggle'}</small>
-                  </span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
+            <input
+              type="checkbox"
+              name="boost-input-mode"
+              checked={boostInputMode === 'hold'}
+              onChange={(event) =>
+                onBoostInputModeChange(event.target.checked ? 'hold' : 'toggle')}
+            />
+            <span className="boost-input-mode__box" aria-hidden="true" />
+            <span className="boost-input-mode__text">Hold to boost</span>
+          </label>
           <span className="sr-only">
             {boostInputMode === 'hold'
               ? 'Hold the Space key to boost'
