@@ -59,6 +59,23 @@ pub struct Player {
 pub struct SnakeBoost {
     pub charge_ms: u32,
     pub active: bool,
+    /// Latched player intent: "the Boost control is held (or toggled on)".
+    ///
+    /// Boost is a *level*, not an edge. `active` is derived by converging
+    /// toward this every quantum, so an intent that arrives while boosting is
+    /// impossible — empty meter, dead snake, mid-respawn — is honored the
+    /// moment it becomes possible instead of being silently dropped. Without
+    /// this, holding the control through an empty meter required the player
+    /// to release and re-press once fuel arrived.
+    #[serde(default)]
+    pub intent: bool,
+}
+
+/// The observable edge produced by converging `active` toward `intent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoostResolution {
+    Activated,
+    Deactivated,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -144,15 +161,48 @@ impl Snake {
         Some(self.boost.charge_ms)
     }
 
+    /// Latch what the player is asking for. Returns whether intent changed.
+    ///
+    /// This is the *only* thing a Boost command does. It never inspects fuel,
+    /// liveness, or activation state, so a request can never be lost by
+    /// arriving at an inconvenient moment; [`Snake::resolve_boost`] decides
+    /// when the request can actually be honored.
+    pub(crate) fn set_boost_intent(&mut self, wants_boost: bool) -> bool {
+        if self.boost.intent == wants_boost {
+            return false;
+        }
+
+        self.boost.intent = wants_boost;
+        true
+    }
+
+    /// Converge `active` toward the latched intent for one quantum.
+    ///
+    /// Called every simulation quantum, which is what makes Boost robust: an
+    /// intent latched while the meter was empty activates on the first quantum
+    /// after fuel arrives, and a released control stops Boost even if the
+    /// release raced a depletion or respawn. Returns the edge, if any, for
+    /// lifecycle telemetry.
+    pub(crate) fn resolve_boost(
+        &mut self,
+        configured_speed_milli: u16,
+        capacity_ms: u32,
+    ) -> Option<BoostResolution> {
+        if !self.boost.intent || !self.is_alive {
+            return self
+                .try_deactivate_boost()
+                .then_some(BoostResolution::Deactivated);
+        }
+
+        self.try_activate_boost(configured_speed_milli, capacity_ms)
+            .then_some(BoostResolution::Activated)
+    }
+
     /// Activate stored Boost using immutable, validated match configuration.
     ///
     /// The command is a deterministic no-op unless this is a living, inactive
     /// snake with a whole-quantum charge inside the configured capacity.
-    pub(crate) fn try_activate_boost(
-        &mut self,
-        configured_speed_milli: u16,
-        capacity_ms: u32,
-    ) -> bool {
+    fn try_activate_boost(&mut self, configured_speed_milli: u16, capacity_ms: u32) -> bool {
         let valid_config = (NORMAL_SNAKE_SPEED_MILLI..=MAX_BOOST_SPEED_MILLI)
             .contains(&configured_speed_milli)
             && capacity_ms > 0
@@ -179,8 +229,8 @@ impl Snake {
     ///
     /// This is the authoritative release edge for hold-to-Boost controls. The
     /// transition is deliberately idempotent so retries cannot invert state.
-    pub(crate) fn try_deactivate_boost(&mut self) -> bool {
-        if !self.is_alive || !self.boost.active {
+    fn try_deactivate_boost(&mut self) -> bool {
+        if !self.boost.active {
             return false;
         }
 
@@ -256,10 +306,18 @@ impl Snake {
     }
 
     /// Clear all fuel and movement phase when the snake gets a new life.
+    ///
+    /// Latched intent deliberately survives: it describes what the player is
+    /// physically doing right now, not simulation state, and a player still
+    /// holding the control across a death must boost again on their own fuel
+    /// without re-pressing.
     pub(crate) fn reset_boost_and_movement(&mut self) {
         self.speed_milli = NORMAL_SNAKE_SPEED_MILLI;
         self.movement_credit = 0;
-        self.boost = SnakeBoost::default();
+        self.boost = SnakeBoost {
+            intent: self.boost.intent,
+            ..SnakeBoost::default()
+        };
     }
 
     pub fn head(&self) -> Result<&Position> {
@@ -527,10 +585,74 @@ mod tests {
         }
     }
 
+    /// Intent is latched unconditionally; only resolution consults the world.
+    /// This is what stops a request from being lost by arriving too early.
+    #[test]
+    fn intent_latches_regardless_of_whether_boost_is_currently_possible() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+
+        assert!(snake.set_boost_intent(true));
+        assert!(snake.boost.intent);
+        assert!(!snake.set_boost_intent(true), "repeat is not a change");
+
+        // Empty meter: the intent stands but nothing activates yet.
+        assert_eq!(snake.resolve_boost(1_500, 3_000), None);
+        assert!(!snake.boost.active);
+        assert!(snake.boost.intent);
+
+        // Fuel arrives with no new command; resolution starts Boost.
+        snake.collect_boost_charge(1_000, 3_000);
+        assert_eq!(
+            snake.resolve_boost(1_500, 3_000),
+            Some(BoostResolution::Activated)
+        );
+        assert_eq!(snake.speed_milli, 1_500);
+        assert_eq!(snake.resolve_boost(1_500, 3_000), None, "idempotent");
+
+        assert!(snake.set_boost_intent(false));
+        assert_eq!(
+            snake.resolve_boost(1_500, 3_000),
+            Some(BoostResolution::Deactivated)
+        );
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.boost.charge_ms, 1_000, "release keeps unspent fuel");
+    }
+
+    /// A dead snake never moves fast, and resolution is the single place that
+    /// enforces it — so a lost release cannot strand Boost on a corpse.
+    #[test]
+    fn resolution_stops_boost_for_a_dead_snake_but_keeps_the_latch() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+        snake.collect_boost_charge(1_000, 3_000);
+        snake.set_boost_intent(true);
+        assert_eq!(
+            snake.resolve_boost(1_500, 3_000),
+            Some(BoostResolution::Activated)
+        );
+
+        snake.is_alive = false;
+        assert_eq!(
+            snake.resolve_boost(1_500, 3_000),
+            Some(BoostResolution::Deactivated)
+        );
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert!(
+            snake.boost.intent,
+            "the player is still holding the control"
+        );
+
+        snake.is_alive = true;
+        assert_eq!(
+            snake.resolve_boost(1_500, 3_000),
+            Some(BoostResolution::Activated)
+        );
+    }
+
     #[test]
     fn reset_clears_boost_and_movement_phase() {
         let mut snake = snake_with_body(vec![], Direction::Right);
         snake.collect_boost_charge(1_000, 3_000);
+        snake.set_boost_intent(true);
         assert!(snake.try_activate_boost(1_500, 3_000));
         snake.movement_credit = 42_000;
 
@@ -538,6 +660,19 @@ mod tests {
 
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit, 0);
+        // Fuel and activation are simulation state and are cleared; the held
+        // control is the player's, and survives into the next life.
+        assert_eq!(
+            snake.boost,
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
+        );
+
+        snake.set_boost_intent(false);
+        snake.reset_boost_and_movement();
         assert_eq!(snake.boost, SnakeBoost::default());
     }
 

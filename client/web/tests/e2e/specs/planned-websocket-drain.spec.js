@@ -103,7 +103,10 @@ const boostSnapshot = (streamSequence, tick = 5) => {
   state.properties = {
     available_food_target: 1,
     tick_duration_ms: 50,
-    time_limit_ms: 90_000,
+    // Team matches are raced to a score, never against a clock; the target
+    // must match the queue this snapshot claims (Quickmatch).
+    time_limit_ms: null,
+    score_limit: 25,
     boost: {
       speed_milli: 1500,
       capacity_ms: 3000,
@@ -1590,9 +1593,8 @@ test('Snaketron game shell restores the original scoreboard language and free-fl
   await expect(page.getByTestId('game-controls-hint')).toContainText('Boost');
   await expect(page.locator('.arrow-key-cluster kbd')).toHaveCount(4);
   await expect(page.locator('.control-key--space')).toHaveCount(1);
-  await expect(page.getByRole('radiogroup', { name: 'Space behavior' })).toBeVisible();
-  await expect(page.getByRole('radio', { name: 'Hold to boost' })).toBeChecked();
-  await expect(page.getByRole('radio', { name: 'Press to toggle' })).not.toBeChecked();
+  await expect(page.getByRole('checkbox', { name: 'Hold to boost' })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Hold to boost' })).toBeChecked();
   await expect(page.getByTestId('boost-hud')).not.toContainText('Space');
   await page.waitForTimeout(240);
 
@@ -3502,7 +3504,7 @@ test('persisted Toggle starts and stops Boost on successive Space presses', asyn
   const socketIndex = await establishActiveGame(page);
   await emitServerMessage(page, socketIndex, boostSnapshot(11, 6));
 
-  await expect(page.getByRole('radio', { name: 'Press to toggle' })).toBeChecked();
+  await expect(page.getByRole('checkbox', { name: 'Hold to boost' })).not.toBeChecked();
   await page.keyboard.press('Space');
   await page.keyboard.press('Space');
 

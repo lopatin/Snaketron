@@ -22,7 +22,7 @@ Upgrade the bot AI to make intelligent decisions about when to return to base in
 - **Scoring**: Points locked in when snake returns to own base with food
 - **Food Value**: Each food = 2 segments, 2 segments = 1 point when scored
 - **Respawn**: Snake resets to initial length after scoring
-- **Time Limit**: 90 seconds per game
+- **Match End**: No time limit; first team to the queue's score target wins (25 Quickmatch, 50 Competitive)
 - **Death Penalty**: Lose all carried food on death
 
 ## Implementation Plan

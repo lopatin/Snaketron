@@ -38,10 +38,8 @@ pub fn calculate_ai_move(
     let target = if is_team_game(game_state)
         && let Some(team_id) = snake.team_id
     {
-        let starting_length = get_starting_snake_length(&game_state.game_type);
-
         // Decide whether to return to base or collect more food
-        if should_return_to_base(game_state, snake, team_id, starting_length) {
+        if should_return_to_base(game_state, snake, team_id) {
             // RETURN_TO_BASE mode: Navigate to goal
             find_path_to_base(game_state, head, team_id, arena_width, arena_height)?
         } else {
@@ -222,45 +220,45 @@ fn count_escape_routes(game_state: &GameState, pos: &Position, width: i16, heigh
 // TEAM GAME AI HELPERS
 // ============================================================================
 
-const DEFAULT_SNAKE_LENGTH: usize = 4;
-
-/// Get the starting snake length for a given game type
-fn get_starting_snake_length(game_type: &GameType) -> usize {
-    match game_type {
-        GameType::Custom { settings } => settings.snake_start_length as usize,
-        _ => DEFAULT_SNAKE_LENGTH,
-    }
-}
-
 /// Check if the current game is a team match
 fn is_team_game(game_state: &GameState) -> bool {
     matches!(game_state.game_type, GameType::TeamMatch { .. })
 }
 
-/// Calculate time remaining in milliseconds
-/// Note: This is an approximation since we don't have access to current time in AI
-/// We use the game's time_limit_ms from properties
-fn calculate_time_remaining_ms(game_state: &GameState) -> i64 {
-    // Use the time limit from game properties if available
-    if let Some(time_limit_ms) = game_state.properties.time_limit_ms {
-        let tick_duration_ms = game_state.properties.tick_duration_ms as i64;
-        let elapsed_ms = game_state.tick as i64 * tick_duration_ms;
-        let remaining_ms = time_limit_ms as i64 - elapsed_ms;
-        remaining_ms.max(0)
-    } else {
-        // No time limit or unknown, assume plenty of time remaining
-        i64::MAX
+/// A team is this close to the target before its next bank is treated as
+/// match-winning by opponents deciding whether to cash in what they carry.
+const MATCH_POINT_MARGIN: u32 = 3;
+
+/// Urgency from the score race.
+///
+/// Team matches have no clock, so endgame pressure comes from the standings
+/// rather than from time remaining: banking is worth everything when it wins
+/// the match outright, and nearly as much when the other side is one bank from
+/// winning and carried points are about to become worthless.
+fn score_race_pressure(game_state: &GameState, team_id: TeamId, carried_points: u32) -> i32 {
+    let Some(score_limit) = game_state.properties.score_limit else {
+        return 0;
+    };
+    let Some(team_scores) = game_state.team_scores.as_ref() else {
+        return 0;
+    };
+
+    let our_score = team_scores.get(&team_id).copied().unwrap_or(0);
+    if our_score + carried_points >= score_limit {
+        return 100; // Banking ends the match in our favour right now.
     }
-}
 
-/// Calculate how many points the snake is currently carrying
-fn calculate_carried_points(snake: &Snake, starting_length: usize) -> u32 {
-    let current_length = snake.length();
-    let extra_segments = current_length.saturating_sub(starting_length);
-    let total_carried_segments = extra_segments + snake.food as usize;
+    let best_opponent = team_scores
+        .iter()
+        .filter(|(other, _)| **other != team_id)
+        .map(|(_, score)| *score)
+        .max()
+        .unwrap_or(0);
+    if best_opponent + MATCH_POINT_MARGIN >= score_limit {
+        return 100; // Cash in before the match can end without these points.
+    }
 
-    // 2 segments = 1 point
-    (total_carried_segments / 2) as u32
+    0
 }
 
 /// Get the score differential for this team (positive = winning, negative = losing)
@@ -326,13 +324,8 @@ fn find_path_to_base(
 }
 
 /// Determine if the snake should return to base to score points
-fn should_return_to_base(
-    game_state: &GameState,
-    snake: &Snake,
-    team_id: TeamId,
-    starting_length: usize,
-) -> bool {
-    let carried_points = calculate_carried_points(snake, starting_length);
+fn should_return_to_base(game_state: &GameState, snake: &Snake, team_id: TeamId) -> bool {
+    let carried_points = game_state.carried_food(snake);
 
     // Don't return if not carrying any points
     if carried_points == 0 {
@@ -349,13 +342,9 @@ fn should_return_to_base(
     // Calculate return score based on multiple factors
     let base_food_score = carried_points * 10;
 
-    // Time pressure: strong incentive when <20 seconds remaining
-    let time_remaining_ms = calculate_time_remaining_ms(game_state);
-    let time_pressure_score = if time_remaining_ms < 20_000 {
-        100 // High urgency
-    } else {
-        0
-    };
+    // Race pressure: strong incentive when this bank wins, or when the other
+    // side is about to win and unbanked points are about to be lost.
+    let race_pressure_score = score_race_pressure(game_state, team_id, carried_points);
 
     // Score differential: take more risk if losing badly
     let score_diff = get_score_differential(game_state, team_id);
@@ -366,7 +355,7 @@ fn should_return_to_base(
     };
 
     let total_return_score =
-        base_food_score as i32 + time_pressure_score + score_differential_bonus;
+        base_food_score as i32 + race_pressure_score + score_differential_bonus;
 
     // Decision threshold: >= 40 means return to base
     total_return_score >= 40

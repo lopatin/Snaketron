@@ -1,10 +1,10 @@
 use crate::util::PseudoRandom;
 use crate::{
-    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS,
+    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS, BoostResolution,
     DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS,
-    DEFAULT_BOOST_SPEED_MILLI, DEFAULT_CUSTOM_GAME_TICK_MS, DEFAULT_FOOD_TARGET,
-    DEFAULT_TEAM_TIME_LIMIT_MS, DEFAULT_TICK_INTERVAL_MS, Direction, MAX_BOOST_SPEED_MILLI,
-    NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake,
+    DEFAULT_BOOST_SPEED_MILLI, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, DEFAULT_CUSTOM_GAME_TICK_MS,
+    DEFAULT_FOOD_TARGET, DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
+    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -717,6 +717,11 @@ pub struct GameProperties {
     pub available_food_target: usize,
     pub tick_duration_ms: u32,
     pub time_limit_ms: Option<u32>,
+    /// Banked team score that ends a team match. `None` means the mode has no
+    /// score target. Team matches set this instead of `time_limit_ms`: they run
+    /// until a team gets there, with no clock and no maximum duration.
+    #[serde(default)]
+    pub score_limit: Option<u32>,
     #[serde(default)]
     pub boost: Option<BoostConfig>,
 }
@@ -767,6 +772,16 @@ pub enum GameMode {
 pub enum QueueMode {
     Quickmatch,  // Quick casual matches
     Competitive, // Ranked competitive matches
+}
+
+/// The banked score a team must reach to win, by queue. This is the single
+/// source of truth: match construction and snapshot validation both read it, so
+/// they cannot drift the way the old post-construction time-limit override did.
+pub fn team_score_limit(queue_mode: &QueueMode) -> u32 {
+    match queue_mode {
+        QueueMode::Quickmatch => DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT,
+        QueueMode::Competitive => DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1098,23 +1113,27 @@ impl GameState {
             None
         };
 
-        let (tick_duration_ms, time_limit_ms) = match &game_type {
-            GameType::Custom { settings } => (settings.tick_duration_ms, None),
+        // Team matches are raced to a score, never against a clock: no time
+        // limit, no maximum duration, and the target depends on the queue.
+        let (tick_duration_ms, time_limit_ms, score_limit) = match &game_type {
+            GameType::Custom { settings } => (settings.tick_duration_ms, None, None),
             GameType::TeamMatch { .. } => (
                 if boost.is_some() {
                     BOOST_TICK_INTERVAL_MS
                 } else {
                     DEFAULT_TICK_INTERVAL_MS
                 },
-                Some(DEFAULT_TEAM_TIME_LIMIT_MS),
+                None,
+                Some(team_score_limit(&queue_mode)),
             ),
-            _ => (DEFAULT_TICK_INTERVAL_MS, None),
+            _ => (DEFAULT_TICK_INTERVAL_MS, None, None),
         };
 
         let properties = GameProperties {
             available_food_target: DEFAULT_FOOD_TARGET,
             tick_duration_ms,
             time_limit_ms,
+            score_limit,
             boost,
         };
 
@@ -1307,11 +1326,19 @@ impl GameState {
                         self.properties.tick_duration_ms
                     ));
                 }
-                if self.properties.time_limit_ms != Some(DEFAULT_TEAM_TIME_LIMIT_MS) {
+                if self.properties.time_limit_ms.is_some() {
                     return Err(anyhow::anyhow!(
-                        "Boost match time limit must be exactly {}ms, got {:?}",
-                        DEFAULT_TEAM_TIME_LIMIT_MS,
+                        "Boost matches are raced to a score and must not carry a time limit, got {:?}",
                         self.properties.time_limit_ms
+                    ));
+                }
+                let expected_score_limit = team_score_limit(&self.queue_mode);
+                if self.properties.score_limit != Some(expected_score_limit) {
+                    return Err(anyhow::anyhow!(
+                        "Boost match score limit must be exactly {} for {:?}, got {:?}",
+                        expected_score_limit,
+                        self.queue_mode,
+                        self.properties.score_limit
                     ));
                 }
 
@@ -1839,10 +1866,7 @@ impl GameState {
             self.calculate_starting_positions(player_count)
         };
 
-        let snake_length = match &self.game_type {
-            GameType::Custom { settings } => settings.snake_start_length as usize,
-            _ => DEFAULT_SNAKE_LENGTH,
-        };
+        let snake_length = self.starting_snake_length();
 
         for (snake_id, snake) in self.arena.snakes.iter_mut().enumerate() {
             if let Some((head_pos, direction)) = starting_positions.get(snake_id) {
@@ -1876,6 +1900,19 @@ impl GameState {
             GameType::Custom { settings } => settings.snake_start_length as usize,
             _ => DEFAULT_SNAKE_LENGTH,
         }
+    }
+
+    /// Food this snake would bank if it reached its own base right now.
+    ///
+    /// Each eaten food credits two segments (`GameEvent::FoodEaten`). Those
+    /// segments sit in `snake.food` until `step_forward` extrudes them past
+    /// the starting length, so counting both halves keeps the total stable
+    /// across the ticks a snake spends growing. This is the one definition
+    /// behind team scoring, AI base-return decisions, and the carried-food
+    /// readout the client renders on each snake.
+    pub fn carried_food(&self, snake: &Snake) -> u32 {
+        let extra_segments = snake.length().saturating_sub(self.starting_snake_length());
+        ((extra_segments + snake.food as usize) / 2) as u32
     }
 
     fn respawn_event_for_snake(&self, snake_id: u32) -> Option<GameEvent> {
@@ -2108,38 +2145,38 @@ impl GameState {
             match command_message.command {
                 GameCommand::Turn { .. } => due_turn_commands.push(command_message),
                 command => {
-                    let boost_request = match &command {
-                        GameCommand::ActivateBoost { snake_id } => Some((*snake_id, true)),
-                        GameCommand::DeactivateBoost { snake_id } => Some((*snake_id, false)),
-                        _ => None,
-                    };
-                    let was_active = boost_request.is_some_and(|(snake_id, _)| {
-                        self.arena
-                            .snakes
-                            .get(snake_id as usize)
-                            .is_some_and(|snake| snake.boost.active)
-                    });
                     if let Ok(events) = self.exec_command(command) {
                         out.extend(events);
-                        if let Some((snake_id, requested_active)) = boost_request {
-                            let is_active = self
-                                .arena
-                                .snakes
-                                .get(snake_id as usize)
-                                .is_some_and(|snake| snake.boost.active);
-                            match (was_active, is_active, requested_active) {
-                                (false, true, true) => {
-                                    observer(BoostLifecycleTransition::Activated { snake_id });
-                                }
-                                (true, false, false) => {
-                                    observer(BoostLifecycleTransition::ManuallyStopped {
-                                        snake_id,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
                     }
+                }
+            }
+        }
+
+        // Converge Boost toward each snake's latched intent. This runs every
+        // quantum rather than only on the command edge, which is what makes a
+        // held control robust: intent latched while the meter was empty (or
+        // while the snake was dead) activates on the first quantum it becomes
+        // affordable, with no second press.
+        if let Some(config) = self
+            .properties
+            .boost
+            .as_ref()
+            .map(|config| (config.speed_milli, config.capacity_ms))
+        {
+            let (speed_milli, capacity_ms) = config;
+            for snake_id in 0..self.arena.snakes.len() {
+                match self.arena.snakes[snake_id].resolve_boost(speed_milli, capacity_ms) {
+                    Some(BoostResolution::Activated) => {
+                        observer(BoostLifecycleTransition::Activated {
+                            snake_id: snake_id as u32,
+                        });
+                    }
+                    Some(BoostResolution::Deactivated) => {
+                        observer(BoostLifecycleTransition::ManuallyStopped {
+                            snake_id: snake_id as u32,
+                        });
+                    }
+                    None => {}
                 }
             }
         }
@@ -2386,7 +2423,6 @@ impl GameState {
         // crossed the goal line.
         if matches!(&self.game_type, GameType::TeamMatch { .. }) && self.team_scores.is_some() {
             let goal_tick = self.tick.saturating_add(1);
-            let starting_length = self.starting_snake_length();
             let mut goal_cues: Vec<TeamGoal> = Vec::new();
 
             for (snake_id, snake) in self.iter_snakes() {
@@ -2412,10 +2448,9 @@ impl GameState {
                     continue;
                 }
 
-                // The same carried-food arithmetic the scoring block applies.
-                let carried_segments =
-                    snake.length().saturating_sub(starting_length) + snake.food as usize;
-                let points = (carried_segments / 2) as u32;
+                // Keep the cosmetic cue on the same single source of truth as
+                // authoritative scoring and the snake's carried-food readout.
+                let points = self.carried_food(snake);
                 if points == 0 {
                     continue;
                 }
@@ -2475,7 +2510,6 @@ impl GameState {
             {
                 let mut team_score_deltas: HashMap<TeamId, u32> = HashMap::new();
                 let mut respawns: Vec<u32> = Vec::new();
-                let starting_length = self.starting_snake_length();
 
                 for (snake_id, snake) in self.iter_snakes() {
                     if !snake.is_alive {
@@ -2494,10 +2528,7 @@ impl GameState {
                         continue;
                     }
 
-                    let snake_length = snake.length();
-                    let extra_segments = snake_length.saturating_sub(starting_length);
-                    let carried_segments = extra_segments + snake.food as usize;
-                    let carried_food = (carried_segments / 2) as u32;
+                    let carried_food = self.carried_food(snake);
 
                     if carried_food == 0 {
                         continue;
@@ -2546,10 +2577,18 @@ impl GameState {
             if matches!(self.status, GameStatus::Started { .. }) {
                 match &self.game_type {
                     GameType::TeamMatch { .. } => {
-                        if let Some(limit_ms) = self.properties.time_limit_ms {
-                            let elapsed_ms = (self.tick.saturating_add(1) as i64)
-                                * (self.properties.tick_duration_ms as i64);
-                            if elapsed_ms >= limit_ms as i64 {
+                        // The match runs until a team banks the target score.
+                        // Scoring for this tick has already been applied above,
+                        // so the comparison sees the crossing on the tick it
+                        // happens. A single bank can carry several points and
+                        // both teams can bank on the same tick, so the test is
+                        // `>=` and the winner is the higher score among those
+                        // that crossed — equal scores at the target are a draw.
+                        if let Some(score_limit) = self.properties.score_limit {
+                            let reached = self.team_scores.as_ref().is_some_and(|scores| {
+                                scores.values().any(|score| *score >= score_limit)
+                            });
+                            if reached {
                                 let winning_team = self.team_scores.as_ref().and_then(|scores| {
                                     let max_score = scores.values().copied().max()?;
                                     let mut leaders = scores
@@ -2647,6 +2686,25 @@ impl GameState {
         Ok(out)
     }
 
+    /// Latch a Boost request, counting it as a player action only when it
+    /// actually changes what the player is asking for. Matches without Boost
+    /// configured ignore the request outright; that is a fixed property of the
+    /// match rather than a transient condition, so nothing is lost by it.
+    fn set_boost_intent(&mut self, snake_id: u32, wants_boost: bool) {
+        if self.properties.boost.is_none() {
+            return;
+        }
+
+        let changed = self
+            .arena
+            .snakes
+            .get_mut(snake_id as usize)
+            .is_some_and(|snake| snake.set_boost_intent(wants_boost));
+        if changed {
+            self.record_player_action_for_snake(snake_id);
+        }
+    }
+
     fn exec_command(&mut self, command: GameCommand) -> Result<Vec<(u64, GameEvent)>> {
         // debug!("exec_command: Entering with command {:?}", command);
         // eprintln!("COMMON DEBUG: exec_command called with {:?}", command);
@@ -2711,27 +2769,15 @@ impl GameState {
                     }
                 }
             }
+            // Boost commands only latch what the player is asking for. They
+            // deliberately do not consult fuel or liveness, so a request made
+            // at an impossible moment is remembered rather than dropped;
+            // `tick_forward_observing_boost` converges toward it every quantum.
             GameCommand::ActivateBoost { snake_id } => {
-                let activated = if let Some(config) = self.properties.boost.clone()
-                    && let Some(snake) = self.arena.snakes.get_mut(snake_id as usize)
-                {
-                    snake.try_activate_boost(config.speed_milli, config.capacity_ms)
-                } else {
-                    false
-                };
-                if activated {
-                    self.record_player_action_for_snake(snake_id);
-                }
+                self.set_boost_intent(snake_id, true);
             }
             GameCommand::DeactivateBoost { snake_id } => {
-                let deactivated = self
-                    .arena
-                    .snakes
-                    .get_mut(snake_id as usize)
-                    .is_some_and(Snake::try_deactivate_boost);
-                if deactivated {
-                    self.record_player_action_for_snake(snake_id);
-                }
+                self.set_boost_intent(snake_id, false);
             }
             GameCommand::UpdateStatus { .. } => {
                 // debug!("exec_command: Processing UpdateStatus command");
@@ -2903,6 +2949,7 @@ impl GameState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SnakeBoost;
     use std::collections::BinaryHeap;
 
     fn create_command_id(tick: u32, user_id: u32, seq: u32) -> CommandId {
@@ -3822,6 +3869,69 @@ mod tests {
         assert!(restored.recent_goals.is_empty());
     }
 
+    /// `carried_food` is the one definition behind team scoring, the AI's
+    /// base-return decision, and the number the client draws on each snake, so
+    /// it is pinned directly rather than only through the scoring path.
+    #[test]
+    fn carried_food_counts_queued_and_extruded_growth_as_one_total() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(4242),
+            0,
+        );
+        game.add_player(1, Some("Player1".to_string()))
+            .expect("add player 1");
+        game.add_player(2, Some("Player2".to_string()))
+            .expect("add player 2");
+
+        let starting_length = game.starting_snake_length() as i16;
+        let at_starting_length = |food: u32| {
+            Snake::new(
+                vec![
+                    Position { x: 20, y: 10 },
+                    Position {
+                        x: 20 - (starting_length - 1),
+                        y: 10,
+                    },
+                ],
+                Direction::Right,
+                true,
+                food,
+                Some(TeamId(0)),
+            )
+        };
+
+        // Two segments make one food, and it does not matter whether they are
+        // still queued in `food` or already extruded into the body: a snake
+        // shows the same total across every tick it spends growing.
+        assert_eq!(game.carried_food(&at_starting_length(0)), 0);
+        assert_eq!(game.carried_food(&at_starting_length(1)), 0);
+        assert_eq!(game.carried_food(&at_starting_length(2)), 1);
+        assert_eq!(game.carried_food(&at_starting_length(5)), 2);
+
+        let mut half_grown = at_starting_length(1);
+        half_grown.body[1].x -= 1; // one segment already extruded
+        assert_eq!(
+            game.carried_food(&half_grown),
+            1,
+            "one queued plus one extruded segment is still one food"
+        );
+
+        // A snake shorter than the starting length floors at zero instead of
+        // underflowing; reachable in Custom games with a long start length.
+        let stub = Snake::new(
+            vec![Position { x: 20, y: 10 }, Position { x: 19, y: 10 }],
+            Direction::Right,
+            true,
+            0,
+            Some(TeamId(0)),
+        );
+        assert_eq!(game.carried_food(&stub), 0);
+    }
+
     #[test]
     fn snake_dies_on_enemy_base_contact() {
         let mut game = GameState::new(
@@ -4167,6 +4277,7 @@ mod tests {
     }
 
     fn make_active_mover(snake: &mut Snake, speed_milli: u16) {
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = speed_milli;
@@ -4250,34 +4361,40 @@ mod tests {
         let mut team = boost_test_game(1);
         let snake_id = team.players[&1].snake_id;
 
+        // Boost commands latch a level. Pressing on an empty meter is a real
+        // action with a lasting effect — it is what makes the snake boost the
+        // moment fuel arrives — so it counts, while a repeat of the level
+        // the player already asked for does not.
         team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("execute empty-charge no-op");
-        assert_eq!(team.player_action_count(1), 0);
-
-        let capacity_ms = team
-            .properties
-            .boost
-            .as_ref()
-            .expect("Boost config")
-            .capacity_ms;
-        team.arena.snakes[snake_id as usize].boost.charge_ms = capacity_ms;
-        team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("activate charged Boost");
-        assert!(team.arena.snakes[snake_id as usize].boost.active);
-        assert_eq!(team.player_action_count(1), 1);
-
-        team.exec_command(GameCommand::ActivateBoost { snake_id })
-            .expect("execute already-active no-op");
-        assert_eq!(team.player_action_count(1), 1);
-
-        team.exec_command(GameCommand::DeactivateBoost { snake_id })
-            .expect("deactivate active Boost");
+            .expect("latch Boost on an empty meter");
+        assert!(team.arena.snakes[snake_id as usize].boost.intent);
         assert!(!team.arena.snakes[snake_id as usize].boost.active);
+        assert_eq!(team.player_action_count(1), 1);
+
+        team.exec_command(GameCommand::ActivateBoost { snake_id })
+            .expect("execute already-held no-op");
+        assert_eq!(team.player_action_count(1), 1);
+
+        team.exec_command(GameCommand::DeactivateBoost { snake_id })
+            .expect("release the held control");
+        assert!(!team.arena.snakes[snake_id as usize].boost.intent);
         assert_eq!(team.player_action_count(1), 2);
 
         team.exec_command(GameCommand::DeactivateBoost { snake_id })
-            .expect("execute already-inactive no-op");
+            .expect("execute already-released no-op");
         assert_eq!(team.player_action_count(1), 2);
+
+        // A match without Boost configured discards the request entirely; that
+        // is a fixed property of the match, not a transient condition.
+        let mut solo_boostless =
+            GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let boostless_player = solo_boostless.add_player(7, None).expect("add player");
+        solo_boostless
+            .exec_command(GameCommand::ActivateBoost {
+                snake_id: boostless_player.snake_id,
+            })
+            .expect("boostless activate");
+        assert_eq!(solo_boostless.player_action_count(7), 0);
 
         let round_trip: GameState =
             serde_json::from_value(serde_json::to_value(&team).unwrap()).unwrap();
@@ -4806,6 +4923,9 @@ mod tests {
 
         game.arena.boost_pads[pad_index].respawn_at_tick = None;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        // Release the held control first: the latched intent from the press
+        // above would otherwise spend the meter this quantum and make room.
+        snake.set_boost_intent(false);
         snake.boost.charge_ms = DEFAULT_BOOST_CAPACITY_MS;
         snake.movement_credit = 0;
         snake.body[0] = pad.position;
@@ -4957,7 +5077,11 @@ mod tests {
         let snake = &mut game.arena.snakes[snake_id as usize];
         snake.boost.charge_ms = 1_000;
         snake.movement_credit = 25_000;
-        assert!(snake.try_activate_boost(DEFAULT_BOOST_SPEED_MILLI, 3_000));
+        snake.set_boost_intent(true);
+        assert_eq!(
+            snake.resolve_boost(DEFAULT_BOOST_SPEED_MILLI, 3_000),
+            Some(BoostResolution::Activated)
+        );
 
         schedule_deactivation(&mut game, 1, snake_id, 0, 1);
         let mut transitions = Vec::new();
@@ -5005,15 +5129,147 @@ mod tests {
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(!snake.boost.active);
+        assert!(!snake.boost.intent);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.boost.charge_ms, 1_000);
         assert_eq!(snake.movement_credit, 50_000);
+        // Boost is a level, not a pair of edges: a press and its release inside
+        // one quantum collapse to "not held" with no speed change to report.
+        assert_eq!(transitions, vec![]);
+    }
+
+    /// The reported bug: press and hold Boost with an empty meter, pick up
+    /// fuel, and nothing happens until you release and press again. Intent is
+    /// a level, so the press must still be in force when the fuel lands.
+    #[test]
+    fn boost_held_through_an_empty_meter_starts_as_soon_as_fuel_arrives() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        for _ in 0..4 {
+            game.tick_forward(true).expect("held quantum with no fuel");
+            let snake = &game.arena.snakes[snake_id as usize];
+            assert!(!snake.boost.active, "cannot boost on an empty meter");
+            assert!(snake.boost.intent, "the press must stay latched");
+            assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        }
+
+        // Fuel arrives with the control still held and no new command sent.
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+
+        let mut transitions = Vec::new();
+        game.tick_forward_observing_boost(true, &mut |transition| transitions.push(transition))
+            .expect("first funded quantum");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.boost.active, "held Boost must start on its own");
+        assert_eq!(snake.speed_milli, DEFAULT_BOOST_SPEED_MILLI);
         assert_eq!(
             transitions,
-            vec![
-                BoostLifecycleTransition::Activated { snake_id },
-                BoostLifecycleTransition::ManuallyStopped { snake_id },
-            ]
+            vec![BoostLifecycleTransition::Activated { snake_id }]
+        );
+    }
+
+    /// Running the tank dry mid-hold must not silently unlatch the control:
+    /// the next packet has to resume Boost without another press.
+    #[test]
+    fn boost_held_through_depletion_resumes_on_the_next_packet() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(2 * BOOST_TICK_INTERVAL_MS, capacity_ms);
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        game.tick_forward(true).expect("first funded quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+
+        game.tick_forward(true).expect("quantum that runs dry");
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active, "an empty meter stops Boost");
+        assert!(snake.boost.intent, "but the control is still held");
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("refuelled quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+    }
+
+    /// A player holding Boost across a death keeps holding it: the new life
+    /// boosts on its own fuel with no second press.
+    #[test]
+    fn boost_held_across_a_death_resumes_on_the_new_life() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        game.tick_forward(true).expect("latch the held control");
+        assert!(game.arena.snakes[snake_id as usize].boost.intent);
+
+        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        let respawn = game
+            .respawn_event_for_snake(snake_id)
+            .expect("respawn event");
+        game.apply_event(respawn, None);
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(snake.is_alive);
+        assert_eq!(snake.boost.charge_ms, 0, "a new life starts empty");
+        assert!(snake.boost.intent, "the control is still held");
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("first funded quantum");
+        assert!(game.arena.snakes[snake_id as usize].boost.active);
+    }
+
+    /// Releasing while the meter is empty must clear the latch, so fuel picked
+    /// up later does not start a Boost nobody asked for.
+    #[test]
+    fn releasing_an_empty_held_control_does_not_boost_on_later_fuel() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let capacity_ms = game.properties.boost.as_ref().unwrap().capacity_ms;
+
+        schedule_activation(&mut game, 1, snake_id, 0, 1);
+        schedule_deactivation(&mut game, 1, snake_id, 1, 2);
+        game.tick_forward(true).expect("press");
+        game.tick_forward(true).expect("release");
+        assert!(!game.arena.snakes[snake_id as usize].boost.intent);
+
+        game.arena.snakes[snake_id as usize]
+            .collect_boost_charge(DEFAULT_BOOST_PACKET_CHARGE_MS, capacity_ms);
+        game.tick_forward(true).expect("fuelled but unheld quantum");
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.boost.charge_ms, DEFAULT_BOOST_PACKET_CHARGE_MS);
+    }
+
+    /// A snapshot that claims Boost is running with nobody holding the control
+    /// (a lost release, or a stale replica) heals itself within one quantum.
+    #[test]
+    fn active_boost_without_intent_is_stopped_on_the_next_quantum() {
+        let mut game = boost_test_game(1);
+        let snake_id = game.players[&1].snake_id;
+        let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.active = true;
+        snake.boost.charge_ms = 1_000;
+        snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
+
+        let mut transitions = Vec::new();
+        game.tick_forward_observing_boost(true, &mut |transition| transitions.push(transition))
+            .expect("self-healing quantum");
+
+        let snake = &game.arena.snakes[snake_id as usize];
+        assert!(!snake.boost.active);
+        assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
+        assert_eq!(snake.boost.charge_ms, 1_000, "unspent fuel is kept");
+        assert_eq!(
+            transitions,
+            vec![BoostLifecycleTransition::ManuallyStopped { snake_id }]
         );
     }
 
@@ -5034,6 +5290,7 @@ mod tests {
             },
         ];
         snake.direction = Direction::Right;
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = BOOST_TICK_INTERVAL_MS;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5073,6 +5330,7 @@ mod tests {
             let fast = &mut game.arena.snakes[fast_id as usize];
             fast.body = vec![Position { x: 20, y: 12 }, Position { x: 17, y: 12 }];
             fast.direction = Direction::Right;
+            fast.boost.intent = true;
             fast.boost.active = true;
             fast.boost.charge_ms = 1_000;
             fast.speed_milli = MAX_BOOST_SPEED_MILLI;
@@ -5251,9 +5509,15 @@ mod tests {
             event,
             GameEvent::SnakeDied { snake_id } if *snake_id == wall_snake_id
         )));
+        // Death drains fuel and stops Boost, but the player is still holding
+        // the control, so their latched intent survives into the next life.
         assert_eq!(
             wall_game.arena.snakes[wall_snake_id as usize].boost,
-            Default::default()
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
         );
 
         // Crossing the open enemy goal into its base remains lethal.
@@ -5285,7 +5549,14 @@ mod tests {
             .expect("boosted scoring movement");
         assert_eq!(score_game.team_scores.as_ref().unwrap()[&TeamId(0)], 1);
         let score_snake = &score_game.arena.snakes[score_snake_id as usize];
-        assert_eq!(score_snake.boost, Default::default());
+        assert_eq!(
+            score_snake.boost,
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
+        );
         assert_eq!(score_snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(score_snake.movement_credit, 0);
     }
@@ -5295,6 +5566,7 @@ mod tests {
         let mut game = boost_test_game(1);
         let snake_id = game.players[&1].snake_id;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5316,7 +5588,16 @@ mod tests {
         assert!(!snake.is_alive);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit, 0);
-        assert_eq!(snake.boost, Default::default());
+        // Fuel and activation are cleared; the held control is not a thing the
+        // simulation may forget on the player's behalf.
+        assert_eq!(
+            snake.boost,
+            SnakeBoost {
+                charge_ms: 0,
+                active: false,
+                intent: true,
+            }
+        );
         assert!(!game.has_scheduled_commands(50));
     }
 
@@ -5325,6 +5606,7 @@ mod tests {
         let mut game = boost_test_game(1);
         let snake_id = game.players[&1].snake_id;
         let snake = &mut game.arena.snakes[snake_id as usize];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5339,49 +5621,107 @@ mod tests {
         assert_eq!(serde_json::to_value(&game).unwrap(), before);
     }
 
+    /// A team match ends on the tick a side reaches its target, and the side
+    /// that got there wins. Overshooting the target (a bank worth several
+    /// points) still ends the match on that tick.
     #[test]
-    fn team_timeout_uses_wall_clock_quantum_and_ties_are_draws() {
+    fn team_match_ends_when_a_side_reaches_the_score_limit() {
         let mut game = boost_test_game(2);
         game.status = GameStatus::Started { server_id: 7 };
-        game.properties.time_limit_ms = Some(2 * BOOST_TICK_INTERVAL_MS);
+        game.properties.score_limit = Some(3);
 
-        game.tick_forward(false).expect("first half of time limit");
+        game.apply_event(
+            GameEvent::TeamScoreUpdated {
+                team_id: TeamId(0),
+                score: 2,
+            },
+            None,
+        );
+        game.tick_forward(false).expect("below the target");
         assert!(!game.is_complete());
-        game.tick_forward(false).expect("exact timeout boundary");
+
+        game.apply_event(
+            GameEvent::TeamScoreUpdated {
+                team_id: TeamId(0),
+                score: 4,
+            },
+            None,
+        );
+        game.tick_forward(false).expect("target reached");
+        let GameStatus::Complete { winning_snake_id } = game.status else {
+            panic!("reaching the score limit must complete the match");
+        };
+        let winner = winning_snake_id.expect("the side that got there wins");
+        assert_eq!(
+            game.arena.snakes[winner as usize].team_id,
+            Some(TeamId(0)),
+            "the winning snake must belong to the winning team"
+        );
+    }
+
+    /// Both sides can bank on the same tick. Level at the target is a draw,
+    /// exactly as a tied clock finish used to be.
+    #[test]
+    fn simultaneous_arrival_at_the_score_limit_is_a_draw() {
+        let mut game = boost_test_game(2);
+        game.status = GameStatus::Started { server_id: 7 };
+        game.properties.score_limit = Some(3);
+
+        for team_id in [TeamId(0), TeamId(1)] {
+            game.apply_event(GameEvent::TeamScoreUpdated { team_id, score: 3 }, None);
+        }
+        game.tick_forward(false)
+            .expect("both sides arrive together");
         assert!(matches!(
             game.status,
             GameStatus::Complete {
                 winning_snake_id: None
             }
         ));
-        assert_eq!(game.tick, 2);
     }
 
+    /// No clock, and no maximum duration: a match with nobody scoring runs
+    /// indefinitely rather than being called at ninety seconds.
     #[test]
-    fn default_boost_team_match_completes_at_exactly_ninety_seconds() {
+    fn a_scoreless_team_match_never_ends_on_time() {
         let mut game = boost_test_game(2);
         game.status = GameStatus::Started { server_id: 7 };
         game.rng = None;
         game.properties.available_food_target = 0;
+        assert_eq!(game.properties.time_limit_ms, None);
 
-        let terminal_tick = DEFAULT_TEAM_TIME_LIMIT_MS / BOOST_TICK_INTERVAL_MS;
-        for _ in 0..terminal_tick - 1 {
-            game.tick_forward(false).expect("pre-timeout quantum");
-            assert!(!game.is_complete());
+        // Well past the ninety seconds the old rule would have ended this at.
+        for _ in 0..2_400 {
+            game.tick_forward(false).expect("untimed quantum");
+        }
+        assert!(!game.is_complete());
+        assert_eq!(game.tick, 2_400);
+    }
+
+    /// Each queue races to its own target, chosen once at construction from
+    /// the game's queue mode rather than patched in afterwards.
+    #[test]
+    fn team_score_limits_come_from_the_queue_mode() {
+        for (queue_mode, expected) in [
+            (QueueMode::Quickmatch, DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT),
+            (QueueMode::Competitive, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT),
+        ] {
+            let game = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                queue_mode.clone(),
+                Some(1234),
+                0,
+            );
+            assert_eq!(game.properties.score_limit, Some(expected));
+            assert_eq!(game.properties.time_limit_ms, None);
+            assert_eq!(team_score_limit(&queue_mode), expected);
+            game.validate_boost_invariants().unwrap();
         }
 
-        game.tick_forward(false).expect("timeout quantum");
-        assert_eq!(game.tick, terminal_tick);
-        assert_eq!(
-            game.tick * game.properties.tick_duration_ms,
-            DEFAULT_TEAM_TIME_LIMIT_MS
-        );
-        assert!(matches!(
-            game.status,
-            GameStatus::Complete {
-                winning_snake_id: None
-            }
-        ));
+        assert_eq!(DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, 25);
+        assert_eq!(DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, 50);
     }
 
     #[test]
@@ -5441,18 +5781,24 @@ mod tests {
         assert!(invalid.validate_boost_invariants().is_err());
 
         let mut invalid = baseline.clone();
+        invalid.arena.snakes[0].boost.intent = true;
         invalid.arena.snakes[0].boost.active = true;
         invalid.arena.snakes[0].boost.charge_ms = 25;
         invalid.arena.snakes[0].speed_milli = DEFAULT_BOOST_SPEED_MILLI;
         assert!(invalid.validate_boost_invariants().is_err());
 
+        // A team match must be raced to a score, never against a clock.
         let mut invalid = baseline.clone();
-        invalid.properties.time_limit_ms =
-            Some(DEFAULT_TEAM_TIME_LIMIT_MS - BOOST_TICK_INTERVAL_MS);
+        invalid.properties.time_limit_ms = Some(90_000);
         assert!(invalid.validate_boost_invariants().is_err());
 
+        let mut invalid = baseline.clone();
+        invalid.properties.score_limit = None;
+        assert!(invalid.validate_boost_invariants().is_err());
+
+        // The target must match the queue the match was made for.
         let mut invalid = baseline;
-        invalid.properties.time_limit_ms = None;
+        invalid.properties.score_limit = Some(DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT + 1);
         assert!(invalid.validate_boost_invariants().is_err());
     }
 
@@ -5527,6 +5873,7 @@ mod tests {
     fn nonzero_boost_state_round_trips_and_validates() {
         let mut game = boost_test_game(1);
         let snake = &mut game.arena.snakes[0];
+        snake.boost.intent = true;
         snake.boost.active = true;
         snake.boost.charge_ms = 1_000;
         snake.speed_milli = DEFAULT_BOOST_SPEED_MILLI;
@@ -5617,7 +5964,7 @@ mod tests {
         assert_eq!(current_wire["arena"]["snakes"][0]["movement_credit"], 0);
         assert_eq!(
             current_wire["arena"]["snakes"][0]["boost"],
-            serde_json::json!({ "charge_ms": 0, "active": false })
+            serde_json::json!({ "charge_ms": 0, "active": false, "intent": false })
         );
     }
 
@@ -5634,7 +5981,10 @@ mod tests {
 
     #[test]
     fn four_snake_two_x_saturated_command_stress_stays_within_quantum_budget() {
-        const QUANTA: u32 = DEFAULT_TEAM_TIME_LIMIT_MS / BOOST_TICK_INTERVAL_MS;
+        // 90 seconds of simulation at the Boost quantum: the historical
+        // match length, kept purely as this benchmark's workload budget now
+        // that matches end on score rather than on the clock.
+        const QUANTA: u32 = 90_000 / BOOST_TICK_INTERVAL_MS;
         let mut game = GameState::new_with_boost_config(
             60,
             40,
@@ -5656,7 +6006,7 @@ mod tests {
         game.arena.food = vec![Position { x: 22, y: 20 }];
 
         // Four disjoint clockwise circuits keep ordinary movement, turn,
-        // compressed-body, collision, and timeout work active for 90 seconds.
+        // compressed-body, and collision work active for the whole run.
         let circuits = [
             (12, 19, 3, 8),
             (25, 32, 3, 8),
@@ -5693,9 +6043,8 @@ mod tests {
                 .enumerate()
             {
                 snake.collect_boost_charge(config.capacity_ms, config.capacity_ms);
-                if !snake.boost.active {
-                    assert!(snake.try_activate_boost(config.speed_milli, config.capacity_ms));
-                }
+                snake.set_boost_intent(true);
+                snake.resolve_boost(config.speed_milli, config.capacity_ms);
                 assert_eq!(snake.speed_milli, MAX_BOOST_SPEED_MILLI);
                 assert!(snake.boost.active);
                 heads_before.push(*snake.head().unwrap());
@@ -5753,7 +6102,6 @@ mod tests {
         }
 
         assert_eq!(game.tick, QUANTA);
-        assert!(game.is_complete());
         game.validate_boost_invariants().unwrap();
         let run_duration = run_started.elapsed();
         quantum_durations.sort_unstable();

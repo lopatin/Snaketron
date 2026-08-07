@@ -7,8 +7,6 @@ import {
   formatMatchClock,
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
-  TEAM_SNAKE_COLORS,
-  TEAM_SNAKE_OUTLINE_COLORS,
 } from '../../utils/gamePresentation.ts';
 
 const snake = (teamId: number, alive = true) => ({
@@ -39,7 +37,8 @@ const duelState = (): GameState => ({
   properties: {
     available_food_target: 3,
     tick_duration_ms: 50,
-    time_limit_ms: 90_000,
+    time_limit_ms: null,
+    score_limit: 50,
     boost: null,
   },
   players: {
@@ -60,7 +59,7 @@ const duelState = (): GameState => ({
   player_action_counts: { 7: 3, 8: 2, 9: 4, 10: 1 },
 });
 
-test('team presentation puts the local side first and colors its roster like the arena', () => {
+test('team presentation puts the local side first and hands the renderer real skin selectors', () => {
   const presentation = buildMatchPresentation(duelState(), 7, 'Competitive');
 
   assert.equal(presentation.modeLabel, 'Competitive 2v2');
@@ -68,24 +67,56 @@ test('team presentation puts the local side first and colors its roster like the
   assert.equal(presentation.sides[0].score, 4);
   assert.equal(presentation.sides[1].score, 2);
   assert.equal(presentation.spectatorCount, 2);
+
+  // Snake colours are resolved by snake_palette in client/src/render.rs, which
+  // is also what paints the arena. What this layer owes the renderer is the
+  // viewer's own snake and team (blue-vs-red is drawn from the viewer's
+  // perspective) plus each snake's within-team slot (the two team shades).
+  const base = {
+    snake_count: 4,
+    is_team_game: true,
+    local_snake_id: 0,
+    local_team_id: 0,
+  };
   assert.deepEqual(
-    presentation.sides[0].players.map((player) => [
-      player.name,
-      player.color,
-      player.outlineColor,
-    ]),
+    presentation.sides[0].players.map((player) => [player.name, player.skin]),
     [
-      ['You', TEAM_SNAKE_COLORS.blue[0], TEAM_SNAKE_OUTLINE_COLORS.blue[0]],
-      ['Wing', TEAM_SNAKE_COLORS.blue[1], TEAM_SNAKE_OUTLINE_COLORS.blue[1]],
+      ['You', { snake_index: 0, team_id: 0, team_member_slot: 0, ...base }],
+      ['Wing', { snake_index: 2, team_id: 0, team_member_slot: 1, ...base }],
     ],
   );
   assert.deepEqual(
-    presentation.sides[1].players.map((player) => [player.color, player.outlineColor]),
+    presentation.sides[1].players.map((player) => player.skin),
     [
-      [TEAM_SNAKE_COLORS.red[0], TEAM_SNAKE_OUTLINE_COLORS.red[0]],
-      [TEAM_SNAKE_COLORS.red[1], TEAM_SNAKE_OUTLINE_COLORS.red[1]],
+      { snake_index: 1, team_id: 1, team_member_slot: 0, ...base },
+      { snake_index: 3, team_id: 1, team_member_slot: 1, ...base },
     ],
   );
+});
+
+test('a spectator reports no local snake so the renderer falls back to canonical team colours', () => {
+  const spectator = buildMatchPresentation(duelState());
+
+  assert.deepEqual(spectator.players.map((player) => player.skin.local_snake_id), [
+    null, null, null, null,
+  ]);
+  assert.deepEqual(spectator.players.map((player) => player.skin.local_team_id), [
+    null, null, null, null,
+  ]);
+});
+
+test('a field game reports no team zone, which is how the renderer picks field skins', () => {
+  const state = duelState();
+  state.arena.team_zone_config = null;
+  state.arena.snakes = state.arena.snakes.map((entry) => ({ ...entry, team_id: null }));
+  const presentation = buildMatchPresentation(state, 7);
+
+  assert.deepEqual(presentation.players.map((player) => player.skin), [
+    { snake_index: 0, team_id: null, team_member_slot: 0, snake_count: 4, is_team_game: false, local_snake_id: 0, local_team_id: null },
+    { snake_index: 1, team_id: null, team_member_slot: 1, snake_count: 4, is_team_game: false, local_snake_id: 0, local_team_id: null },
+    { snake_index: 2, team_id: null, team_member_slot: 2, snake_count: 4, is_team_game: false, local_snake_id: 0, local_team_id: null },
+    { snake_index: 3, team_id: null, team_member_slot: 3, snake_count: 4, is_team_game: false, local_snake_id: 0, local_team_id: null },
+  ]);
 });
 
 test('a teammate winning produces Victory and retains the current player XP/stat line', () => {
@@ -98,7 +129,11 @@ test('a teammate winning produces Victory and retains the current player XP/stat
   assert.equal(presentation.currentPlayer?.score, 3);
   assert.equal(presentation.currentPlayer?.finalLength, 5);
   assert.equal(presentation.currentPlayer?.actionCount, 3);
-  assert.equal(presentation.timeValue, '01:30');
+  // Team matches race to a score: the clock counts up from zero and the
+  // caption carries the target instead of a countdown.
+  assert.equal(presentation.timeValue, '00:00');
+  assert.equal(presentation.timeLabel, 'First to 50');
+  assert.equal(presentation.scoreLimit, 50);
   assert.equal(presentation.timeTaken, '00:00');
   assert.equal(formatPerMinuteRate(presentation.pointsPerMinute), '600.0');
   assert.equal(formatPerMinuteRate(presentation.actionsPerMinute), '600.0');

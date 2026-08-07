@@ -48,10 +48,9 @@ export function buildBoostHudView(
     active,
     ready,
     multiplier: Number((config.speed_milli / 1000).toFixed(2)),
-    buttonDisabled:
-      !interactionActive ||
-      !snake.is_alive ||
-      (!active && chargeMs <= 0) ||
-      gameOver,
+    // An empty meter must not disable the control. Boost is a held level, and
+    // holding it on empty is how a player arms the next packet — disabling the
+    // button would swallow the press exactly like the old input bug did.
+    buttonDisabled: !interactionActive || !snake.is_alive || gameOver,
   };
 }

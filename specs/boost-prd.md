@@ -40,7 +40,7 @@ Players need predictable map objectives that they can collect, save, and activat
 - change a teammate's or opponent's speed;
 - activate merely because a packet was collected;
 - let a snake jump through an intermediate collision;
-- change the 90-second match clock;
+- change how a match ends (team matches race to a score, with no clock);
 - let a client claim charge, speed, or pad state;
 - fork native-server and WASM-client simulation; or
 - require per-movement WebSocket or Valkey messages.
@@ -242,7 +242,7 @@ Every Boost-enabled duel and 2v2 match stores `50` in `GameProperties.tick_durat
 
 The fixed 50 ms value is the only timing mode introduced by Boost. It gives a 2.0x snake one cell per quantum and a normal snake one cell every two quanta. A Space start or stop changes only the owning snake's speed through Boost state; it never changes the match quantum.
 
-The recommended capacity, packet charge, cooldown, 90-second match limit, 500 ms committed lag, and 1,000 ms prediction bound all divide exactly into 50 ms quanta.
+The recommended capacity, packet charge, cooldown, 500 ms committed lag, and 1,000 ms prediction bound all divide exactly into 50 ms quanta. Team matches have no time limit at all: they end when a team reaches the queue's score target (25 Quickmatch, 50 Competitive).
 
 ### 7.3 Movement credit
 
@@ -439,7 +439,7 @@ Fix this before Boost. A delayed 50 ms game may catch up several quanta at once;
 
 Audit every tick-coupled behavior and preserve its wall-clock cadence, including:
 
-- the 90-second team clock and countdown;
+- the team match clock, which counts up and never ends the match;
 - approximately one-second checkpoints and hashes;
 - food refill opportunities;
 - liveness and reconnect watchdogs;
@@ -698,7 +698,7 @@ Boost v1 is complete when:
 6. No snake moves more than one cell per quantum, so intermediate collisions cannot be skipped at 2.0x.
 7. Collision, food, scoring, and turn logic contains no Boost/no-Boost branch; collision operates on generic movers and ordinary snake state.
 8. Charge consumption, manual stop/restart, refill, depletion, death/reset, disconnect, reconnect, cleanup release, and final-funded-quantum behavior match this PRD.
-9. Match duration remains exactly 90 seconds of game wall time with the 50 ms Boost quantum.
+9. Team matches have no time limit or maximum duration; they complete on the tick a team reaches its queue's score target (25 Quickmatch, 50 Competitive).
 10. Server, replica, WASM, replay, snapshot, resync, and failover produce equivalent fingerprints.
 11. Catch-up events preserve originating tick and engine sequence, and TickHash arrives approximately once per wall-clock second.
 12. All four-snake 2.0x server/client performance gates pass; prediction/state-publication optimization is implemented if profiling requires it.
