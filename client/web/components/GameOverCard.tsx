@@ -4,6 +4,7 @@ import {
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
 } from '../utils/gamePresentation';
+import { resolveSnakeSkinColors } from '../utils/snakeSkin';
 import GameOverJewel from './GameOverJewel';
 
 const FOCUSABLE_SELECTOR = [
@@ -263,7 +264,9 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             >
               <span
                 className="game-roster-swatch"
-                style={{ '--snake-color': player.color } as React.CSSProperties}
+                style={{
+                  '--snake-color': resolveSnakeSkinColors(player.skin)?.fill,
+                } as React.CSSProperties}
                 aria-hidden="true"
               />
               <span className="game-over-player-name">
