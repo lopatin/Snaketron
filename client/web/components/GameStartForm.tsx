@@ -264,10 +264,8 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                 type="button"
                 onClick={onSignInClick}
                 className="
-                  text-[13px] whitespace-nowrap
-                  text-blue-500 underline underline-offset-2 decoration-blue-500/30
-                  transition-colors cursor-pointer
-                  hover:text-blue-600 hover:decoration-blue-600
+                  text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
+                  hover:underline focus-visible:underline
                 "
               >
                 Sign in or create account
