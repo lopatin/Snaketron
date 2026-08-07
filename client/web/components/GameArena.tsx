@@ -48,12 +48,13 @@ import {
   createScoreEffectRuntime,
   drawScoreEffects,
   resetScoreEffects,
-  syncScoreEffects,
+  syncPredictedScoreEffects,
 } from '../utils/scoreEffects';
 import type {
   CrashExplosion,
   PredictedCrashVisualState,
 } from '../utils/crashExplosion';
+import type { PredictedScoreVisualState } from '../utils/scoreEffects';
 import './GameArena.css';
 
 function BoostCanisterMark() {
@@ -161,8 +162,8 @@ export default function GameArena() {
   const crashExplosionSpriteRef = useRef<HTMLImageElement | null>(null);
   const crashExplosionsRef = useRef<CrashExplosion[]>([]);
   const seenCrashEventIdsRef = useRef<Set<string>>(new Set());
-  const crashVisualEpochRef = useRef<number | null>(null);
-  const lastCrashVisualJsonRef = useRef<string | null>(null);
+  const visualEpochRef = useRef<number | null>(null);
+  const lastVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
   // The gameplay key listeners are installed once for the arena's lifetime, so
@@ -229,7 +230,7 @@ export default function GameArena() {
     sendCommand,
     processServerEvent,
     renderTo,
-    readPredictedCrashVisualState,
+    readPredictedVisualState,
     stopEngine
   } = useGameEngine({
     gameId,
@@ -309,8 +310,8 @@ export default function GameArena() {
       setGameOver(false);
       crashExplosionsRef.current.length = 0;
       seenCrashEventIdsRef.current.clear();
-      crashVisualEpochRef.current = null;
-      lastCrashVisualJsonRef.current = null;
+      visualEpochRef.current = null;
+      lastVisualJsonRef.current = null;
       resetScoreEffects(scoreEffectsRef.current);
       boostInputControllerRef.current?.reset();
     }
@@ -405,8 +406,8 @@ export default function GameArena() {
       crashExplosionSpriteRef.current = null;
       crashExplosionsRef.current.length = 0;
       seenCrashEventIdsRef.current.clear();
-      crashVisualEpochRef.current = null;
-      lastCrashVisualJsonRef.current = null;
+      visualEpochRef.current = null;
+      lastVisualJsonRef.current = null;
       resetScoreEffects(scoreEffectsRef.current);
     };
   }, []);
@@ -646,40 +647,19 @@ export default function GameArena() {
     ? renderState?.arena.snakes?.[renderLocalPlayer.snake_id]?.team_id ?? null
     : null;
 
-  // Score celebrations follow committed state only: prediction can make
-  // movement feel immediate, but it must never create a duplicate score cue.
-  // The engine epoch changes on every authoritative snapshot rebuild, making
-  // the snapshot state a fresh baseline rather than replaying old points.
-  useEffect(() => {
-    if (!committedState) {
-      return;
-    }
-
-    const visualSnapshot = readPredictedCrashVisualState();
-    if (!visualSnapshot) {
-      return;
-    }
-
-    syncScoreEffects(scoreEffectsRef.current, {
-      gameId,
-      engineEpoch: visualSnapshot.engineEpoch,
-      tick: committedState.tick,
-      teamScores: committedState.team_scores,
-      arenaWidth: committedState.arena.width,
-      arenaHeight: committedState.arena.height,
-      endZoneDepth: committedState.arena.team_zone_config?.end_zone_depth ?? null,
-      nowMs: performance.now(),
-    });
-  }, [gameId, committedState, readPredictedCrashVisualState]);
-
   // Render game state. Rendering reads the engine's predicted state directly in
   // Rust via renderTo -> GameClient.render, so there is no per-frame JSON
   // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
   // usernames and teams are resolved inside the renderer from the typed state.
-  // Cosmetic effects are painted immediately afterwards in this same loop
-  // because the Rust renderer clears the canvas at the start of each frame.
-  // Rust currently paints field and snakes atomically, so the restrained cell
-  // wave overlays that complete frame; crash effects remain the topmost layer.
+  // The Rust renderer clears the canvas at the start of each frame, paints the
+  // field, invokes our score-effect callback, and then paints snakes and walls.
+  // This keeps celebrations behind gameplay actors while crash effects remain
+  // the intentionally topmost layer.
+  //
+  // Both crash and score cues are driven from the same predicted visual state,
+  // read here rather than from React committed state, so a celebration starts
+  // in the frame prediction simulates the goal and is retracted in the frame a
+  // reconciliation replay drops it.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!hasRenderableGameState || !canvas || renderArenaWidth <= 0 || renderArenaHeight <= 0) {
@@ -696,48 +676,55 @@ export default function GameArena() {
     let animationId = 0;
     const render = (now: number) => {
       try {
-        renderTo(canvas, cellSize, rotation, user?.id ?? undefined);
-        const crashSnapshot = readPredictedCrashVisualState();
-        // Cancel in the first possible visual frame of a resync, before the
-        // React committed-state effect establishes the new score baseline.
-        if (
-          crashSnapshot &&
-          scoreEffectsRef.current.engineEpoch !== null &&
-          scoreEffectsRef.current.engineEpoch !== crashSnapshot.engineEpoch
-        ) {
-          resetScoreEffects(scoreEffectsRef.current);
-        }
-        drawScoreEffects(context, scoreEffectsRef.current, {
-          nowMs: now,
-          cellSize,
-          arenaWidth: renderArenaWidth,
-          arenaHeight: renderArenaHeight,
-          rotation,
-          localTeamId: renderLocalTeamId,
-          reducedMotion: prefersReducedMotionRef.current,
-        });
-        if (crashSnapshot) {
+        const visualSnapshot = readPredictedVisualState();
+        if (visualSnapshot) {
           // Suppress durable history only on this arena's first snapshot. On a
           // later resync, a recent unseen cue may be the very prediction frame
           // being reconciled, so it must remain eligible to render.
-          const isInitialCrashBaseline = crashVisualEpochRef.current === null;
-          const epochChanged = crashVisualEpochRef.current !== crashSnapshot.engineEpoch;
-          if (epochChanged || lastCrashVisualJsonRef.current !== crashSnapshot.json) {
-            const visualState = JSON.parse(
-              crashSnapshot.json,
-            ) as PredictedCrashVisualState;
+          const isInitialBaseline = visualEpochRef.current === null;
+          const epochChanged = visualEpochRef.current !== visualSnapshot.engineEpoch;
+          if (epochChanged || lastVisualJsonRef.current !== visualSnapshot.json) {
+            const visualState = JSON.parse(visualSnapshot.json) as
+              PredictedCrashVisualState & PredictedScoreVisualState;
+            const baselineTick = isInitialBaseline
+              ? visualSnapshot.baselineTick
+              : undefined;
             syncPredictedCrashExplosions(
               crashExplosionsRef.current,
               seenCrashEventIdsRef.current,
               gameId,
               visualState,
               now,
-              isInitialCrashBaseline ? crashSnapshot.baselineTick : undefined,
+              baselineTick,
             );
-            crashVisualEpochRef.current = crashSnapshot.engineEpoch;
-            lastCrashVisualJsonRef.current = crashSnapshot.json;
+            syncPredictedScoreEffects(
+              scoreEffectsRef.current,
+              gameId,
+              visualState,
+              now,
+              baselineTick,
+            );
+            visualEpochRef.current = visualSnapshot.engineEpoch;
+            lastVisualJsonRef.current = visualSnapshot.json;
           }
         }
+        renderTo(
+          canvas,
+          cellSize,
+          rotation,
+          user?.id ?? undefined,
+          () => {
+            drawScoreEffects(context, scoreEffectsRef.current, {
+              nowMs: now,
+              cellSize,
+              arenaWidth: renderArenaWidth,
+              arenaHeight: renderArenaHeight,
+              rotation,
+              localTeamId: renderLocalTeamId,
+              reducedMotion: prefersReducedMotionRef.current,
+            });
+          },
+        );
         drawCrashExplosions(
           context,
           crashExplosionSpriteRef.current,
@@ -766,7 +753,7 @@ export default function GameArena() {
     rotation,
     user?.id,
     renderTo,
-    readPredictedCrashVisualState,
+    readPredictedVisualState,
     renderArenaWidth,
     renderArenaHeight,
     renderLocalTeamId,

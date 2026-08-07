@@ -1449,6 +1449,7 @@ pub fn render_game_state(
     cell_size: f64,
     local_user_id: Option<u32>,
     rotation_int: i32,
+    draw_celebration: &js_sys::Function,
 ) -> Result<(), JsValue> {
     let context = canvas
         .get_context("2d")
@@ -1962,6 +1963,30 @@ pub fn render_game_state(
             draw_regular_nos_canister(&ctx, left, top, cell_size)?;
         }
     }
+
+    // JavaScript owns score-effect animation, but the scoring snake must stay
+    // above it. Temporarily return the canvas to its public, un-translated
+    // coordinate system so the callback can use the same 1px-padded positions
+    // it used when effects were painted after the complete Rust frame. Restore
+    // our field transform afterwards before drawing snakes and walls.
+    ctx.restore();
+    ctx.save();
+    let celebration_result = draw_celebration.call0(&JsValue::NULL);
+    ctx.restore();
+    if let Err(error) = celebration_result {
+        // A cosmetic renderer must never suppress gameplay. The web-side
+        // renderer also isolates each swappable effect in `finally` blocks;
+        // this callback-level save/restore and the explicit resets below are
+        // defense in depth for any error that still crosses the WASM boundary.
+        web_sys::console::error_2(
+            &JsValue::from_str("Score celebration callback failed"),
+            &error,
+        );
+    }
+    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+    ctx.set_global_alpha(1.0);
+    ctx.save();
+    ctx.translate(padding, padding)?;
 
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;

@@ -275,6 +275,32 @@ pub struct SnakeCrash {
 /// same rollback-visible window without allowing unbounded snapshot growth.
 const RECENT_CRASH_RETENTION_MS: u32 = 1_000;
 
+/// A team goal produced by simulation: a snake carrying at least one point's
+/// worth of food entered its own base. Like [`SnakeCrash`], recent cues stay in
+/// `GameState` for a short, bounded window so a renderer cannot miss one when
+/// prediction catches up by several ticks in a single frame, and so a
+/// prediction replay can retract a celebration that never actually happened.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct TeamGoal {
+    pub tick: u32,
+    pub team_id: TeamId,
+    pub snake_id: u32,
+    /// The scoring snake's head on the tick it entered its base — the exact
+    /// cell a celebration is centered on, not the middle of the goal mouth.
+    pub position: Position,
+    /// Points this single snake added to its team's score.
+    pub points: u32,
+}
+
+/// Cosmetic goal history outlives the web celebration for the same reason as
+/// `RECENT_CRASH_RETENTION_MS`. The floating score readout runs longer than a
+/// crash animation, so this window is correspondingly wider: a cue must stay
+/// visible to prediction for the whole time its effect can be on screen, or a
+/// natural expiry would look like a rollback retraction.
+const RECENT_GOAL_RETENTION_MS: u32 = 1_800;
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
@@ -1091,6 +1117,8 @@ pub struct GameState {
     pub arena: Arena,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_crashes: Vec<SnakeCrash>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_goals: Vec<TeamGoal>,
     pub game_type: GameType,
     pub queue_mode: QueueMode,
     /// Server-attested synthetic game marker. Stress games exercise the full
@@ -1324,6 +1352,7 @@ impl GameState {
             status: GameStatus::Stopped,
             arena,
             recent_crashes: Vec::new(),
+            recent_goals: Vec::new(),
             game_type: game_type.clone(),
             queue_mode,
             is_stress_test: false,
@@ -2462,6 +2491,12 @@ impl GameState {
                 .saturating_mul(tick_duration_ms)
                 <= RECENT_CRASH_RETENTION_MS
         });
+        self.recent_goals.retain(|goal| {
+            self.tick
+                .saturating_sub(goal.tick)
+                .saturating_mul(tick_duration_ms)
+                <= RECENT_GOAL_RETENTION_MS
+        });
 
         // Emit snapshot on first tick
         if self.tick == 0 {
@@ -2753,6 +2788,73 @@ impl GameState {
                     self.apply_event(GameEvent::FoodSpawned { position }, Some(&mut out));
                 }
             }
+        }
+
+        // Cosmetic goal cues are recorded here, in the movement path, rather
+        // than inside the authoritative scoring block below. A client advances
+        // its committed state with `movement_only` and receives the score and
+        // respawn events from the transport, so a cue emitted only under the
+        // scoring gate would vanish from committed state the moment it caught
+        // up to the goal tick — retracting a celebration that really happened.
+        // Recording it here mirrors `recent_crashes` and keeps the cue visible
+        // to every prediction rebuild for its full retention window.
+        //
+        // The trigger is the entry edge (a snake that moved this step and whose
+        // pre-step head was outside its own base) so the cue fires exactly once
+        // per goal even where the follow-up respawn is applied from the
+        // transport a few ticks later instead of being simulated locally.
+        //
+        // The edge is equivalent to the scoring block's "in own base carrying
+        // food" test because carried food cannot change while a snake is inside
+        // its base: `sample_food_position` never places food in an end zone
+        // (pinned by `team_food_never_spawns_inside_an_end_zone`), and growth
+        // moves segments between `food` and `length` without altering their
+        // sum. A snake in its base with points to bank therefore always just
+        // crossed the goal line.
+        if matches!(&self.game_type, GameType::TeamMatch { .. }) && self.team_scores.is_some() {
+            let goal_tick = self.tick.saturating_add(1);
+            let mut goal_cues: Vec<TeamGoal> = Vec::new();
+
+            for (snake_id, snake) in self.iter_snakes() {
+                if !snake.is_alive || !movers.contains(&snake_id) {
+                    continue;
+                }
+                let Some(team_id) = snake.team_id else {
+                    continue;
+                };
+                let Ok(head) = snake.head() else {
+                    continue;
+                };
+                if !self.arena.is_in_team_base(head, team_id) {
+                    continue;
+                }
+                let entered_this_step = old_snakes
+                    .get(snake_id as usize)
+                    .and_then(|previous| previous.head().ok().copied())
+                    .is_none_or(|previous_head| {
+                        !self.arena.is_in_team_base(&previous_head, team_id)
+                    });
+                if !entered_this_step {
+                    continue;
+                }
+
+                // Keep the cosmetic cue on the same single source of truth as
+                // authoritative scoring and the snake's carried-food readout.
+                let points = self.carried_food(snake);
+                if points == 0 {
+                    continue;
+                }
+
+                goal_cues.push(TeamGoal {
+                    tick: goal_tick,
+                    team_id,
+                    snake_id,
+                    position: *head,
+                    points,
+                });
+            }
+
+            self.recent_goals.extend(goal_cues);
         }
 
         // Calculate and update scores
@@ -4243,6 +4345,170 @@ mod tests {
             snake.food, 0,
             "snake should not keep carried food after respawn"
         );
+    }
+
+    /// A team snake one cell outside its own goal mouth, carrying `points`
+    /// worth of food and travelling Left into the opening. Boost team games
+    /// run a 50 ms quantum with a 100 ms movement interval, so the crossing
+    /// step happens on the second quantum.
+    fn game_approaching_own_goal(points: u32) -> GameState {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        game.add_player(1, Some("Player1".to_string()))
+            .expect("add player 1");
+        game.add_player(2, Some("Player2".to_string()))
+            .expect("add player 2");
+
+        let snake = &mut game.arena.snakes[0];
+        snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
+        snake.direction = Direction::Left;
+        snake.is_alive = true;
+        snake.food = points * 2;
+        game
+    }
+
+    /// The cue must land on the cell the snake crossed into its base at (the
+    /// goal mouth at the crossing row), not the middle of the goal, and must
+    /// carry the exact points that goal was worth.
+    #[test]
+    fn scoring_records_a_goal_cue_at_the_crossing_cell() {
+        let mut game = game_approaching_own_goal(3);
+        // Start the team on a non-zero score so the cue's per-goal `points`
+        // cannot be confused with `TeamScoreUpdated`'s cumulative total.
+        game.team_scores
+            .as_mut()
+            .expect("team scores")
+            .insert(TeamId(0), 5);
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            events.extend(game.tick_forward(false).expect("tick_forward should work"));
+        }
+
+        assert_eq!(
+            game.recent_goals,
+            vec![TeamGoal {
+                tick: 2,
+                team_id: TeamId(0),
+                snake_id: 0,
+                position: Position { x: 9, y: 18 },
+                points: 3,
+            }],
+            "the cue must sit on the goal-mouth cell the snake crossed"
+        );
+        // The event carries the running total (5 + 3); the cue carries what
+        // this one goal was worth, which is what the floating readout shows.
+        assert!(
+            events.iter().any(|(_, event)| matches!(
+                event,
+                GameEvent::TeamScoreUpdated { team_id, score: 8 } if *team_id == TeamId(0)
+            )),
+            "the cue's points must be this goal's delta, not the team total"
+        );
+
+        // The retention window covers the whole celebration and then releases.
+        while game.current_tick() < 39 {
+            game.tick_forward(false).expect("advance goal history");
+        }
+        assert_eq!(
+            game.recent_goals.len(),
+            1,
+            "history must outlive the celebration and its reconciliation window"
+        );
+        game.tick_forward(false).expect("prune goal history");
+        assert!(
+            game.recent_goals.is_empty(),
+            "goal history must remain bounded"
+        );
+    }
+
+    /// A client advances its committed state with `movement_only` and applies
+    /// the score and respawn from the transport. The cue therefore has to be
+    /// produced by movement alone, exactly once, even though the snake keeps
+    /// sitting in its own base until the server's respawn arrives.
+    #[test]
+    fn goal_cues_are_recorded_once_during_movement_only_catch_up() {
+        let mut game = game_approaching_own_goal(1);
+
+        for _ in 0..2 {
+            game.tick_forward(true).expect("movement-only catch-up");
+        }
+        assert_eq!(
+            game.recent_goals,
+            vec![TeamGoal {
+                tick: 2,
+                team_id: TeamId(0),
+                snake_id: 0,
+                position: Position { x: 9, y: 18 },
+                points: 1,
+            }]
+        );
+        assert_eq!(
+            game.team_scores
+                .as_ref()
+                .and_then(|scores| scores.get(&TeamId(0)).copied()),
+            Some(0),
+            "movement-only catch-up must leave scoring to the transport"
+        );
+
+        // Still alive, still carrying, still inside its base: no repeat cue.
+        for _ in 0..8 {
+            game.tick_forward(true).expect("stay inside the base");
+        }
+        assert!(game.arena.snakes[0].is_alive);
+        assert!(
+            game.arena
+                .is_in_team_base(game.arena.snakes[0].head().expect("head"), TeamId(0))
+        );
+        assert_eq!(
+            game.recent_goals.len(),
+            1,
+            "a snake lingering in its base must not restart the celebration"
+        );
+    }
+
+    /// Load-bearing for the goal cue's entry-edge trigger: if food could spawn
+    /// inside an end zone, a snake already parked in its own base could cross
+    /// the scoring threshold without an entry edge, and the authoritative score
+    /// would fire with no celebration.
+    #[test]
+    fn team_food_never_spawns_inside_an_end_zone() {
+        let game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(31_337),
+            0,
+        );
+        let mut rng = PseudoRandom::new(31_337);
+
+        for _ in 0..5_000 {
+            let position = sample_food_position(&mut rng, &game.game_type, &game.arena);
+            assert!(
+                !game.arena.is_in_team_base(&position, TeamId(0))
+                    && !game.arena.is_in_team_base(&position, TeamId(1)),
+                "food must stay on the main field, got {position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshots_without_recent_goals_remain_compatible() {
+        let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut json = serde_json::to_value(state).expect("serialize state");
+        json.as_object_mut()
+            .expect("state object")
+            .remove("recent_goals");
+
+        let restored: GameState = serde_json::from_value(json).expect("deserialize old snapshot");
+        assert!(restored.recent_goals.is_empty());
     }
 
     /// `carried_food` is the one definition behind team scoring, the AI's

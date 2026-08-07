@@ -236,18 +236,20 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// A compact rollback-visible view of recent predicted collisions. The web
-    /// renderer reads this beside the canvas render so crash effects start (or
-    /// retract) in the exact frame the predicted visual state changes, without
-    /// waiting for React state propagation or serializing the full game state.
-    #[wasm_bindgen(js_name = getPredictedCrashVisualStateJson)]
-    pub fn get_predicted_crash_visual_state_json(&self) -> Result<String, JsValue> {
+    /// A compact rollback-visible view of the recent predicted cosmetic events:
+    /// collisions and team goals. The web renderer reads this beside the canvas
+    /// render so crash and celebration effects start (or retract) in the exact
+    /// frame the predicted visual state changes, without waiting for React
+    /// state propagation or serializing the full game state.
+    #[wasm_bindgen(js_name = getPredictedVisualStateJson)]
+    pub fn get_predicted_visual_state_json(&self) -> Result<String, JsValue> {
         let state = self.render_state();
         serde_json::to_string(&serde_json::json!({
             "predicted_tick": state.current_tick(),
             "committed_tick": self.engine.current_tick(),
             "tick_duration_ms": state.properties.tick_duration_ms,
             "cues": &state.recent_crashes,
+            "goals": &state.recent_goals,
         }))
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -328,9 +330,9 @@ impl GameClient {
     }
 
     /// Render the engine's current predicted state directly to a canvas — no
-    /// JSON round-trip. Replaces the free `render_game(json, ...)` export, which
-    /// re-parsed the engine's own state from a string into `serde_json::Value`
-    /// every frame.
+    /// JSON round-trip. `draw_celebration` is invoked after the field and pickups
+    /// but before snakes, so JavaScript-owned cosmetic effects can share this
+    /// canvas without covering gameplay actors.
     #[wasm_bindgen(js_name = render)]
     pub fn render(
         &self,
@@ -338,6 +340,7 @@ impl GameClient {
         cell_size: f64,
         rotation: f64,
         local_user_id: Option<u32>,
+        draw_celebration: &js_sys::Function,
     ) -> Result<(), JsValue> {
         render::render_game_state(
             self.render_state(),
@@ -345,6 +348,7 @@ impl GameClient {
             cell_size,
             local_user_id,
             rotation as i32,
+            draw_celebration,
         )
     }
 }
@@ -604,6 +608,59 @@ mod tests {
             }
             other => panic!("expected BoostPacketCollected, got {other:?}"),
         }
+    }
+
+    /// The one line that makes score celebrations predicted rather than
+    /// delayed: the visual-state payload the web renderer polls every frame
+    /// must expose goal cues from the PREDICTED state, which runs ahead of the
+    /// committed state the client receives from the transport.
+    #[test]
+    fn predicted_visual_state_exposes_goal_cues_ahead_of_committed_state() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        state.add_player(1, None).unwrap();
+        state.add_player(2, None).unwrap();
+        {
+            // One movement step outside its own goal mouth, carrying 2 points.
+            let snake = &mut state.arena.snakes[0];
+            snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
+            snake.direction = Direction::Left;
+            snake.is_alive = true;
+            snake.food = 4;
+        }
+        let tick_ms = i64::from(state.properties.tick_duration_ms);
+
+        let mut client = GameClient {
+            engine: GameEngine::try_new_from_state(42, state).unwrap(),
+        };
+        client.rebuild_predicted_state(tick_ms * 4).unwrap();
+
+        let visual: serde_json::Value =
+            serde_json::from_str(&client.get_predicted_visual_state_json().unwrap()).unwrap();
+
+        assert_eq!(visual["committed_tick"], 0);
+        assert!(visual["predicted_tick"].as_u64().unwrap() >= 2);
+        assert_eq!(
+            visual["goals"],
+            serde_json::json!([{
+                "tick": 2,
+                "team_id": 0,
+                "snake_id": 0,
+                "position": { "x": 9, "y": 18 },
+                "points": 2,
+            }]),
+            "the payload must carry predicted goal cues under the `goals` key"
+        );
+        assert!(
+            client.engine.committed_state().recent_goals.is_empty(),
+            "committed state has not reached the goal, so reading it would delay the celebration"
+        );
     }
 
     #[test]

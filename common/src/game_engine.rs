@@ -794,6 +794,173 @@ mod tests {
         (GameEngine::new_from_state(1, state), snake_id, tick_ms)
     }
 
+    /// A team snake one movement step outside its own goal mouth, carrying two
+    /// points' worth of food.
+    fn engine_with_imminent_goal() -> (GameEngine, i64) {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        state.add_player(1, None).expect("add player 1");
+        state.add_player(2, None).expect("add player 2");
+        let snake = &mut state.arena.snakes[0];
+        snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
+        snake.direction = Direction::Left;
+        snake.is_alive = true;
+        snake.food = 4;
+
+        let tick_ms = state.properties.tick_duration_ms as i64;
+        (GameEngine::new_from_state(1, state), tick_ms)
+    }
+
+    /// Score celebrations run off prediction, so the cue has to be visible in
+    /// predicted state while the committed state still trails behind it.
+    #[test]
+    fn prediction_exposes_the_goal_cue_before_committed_state_reaches_it() {
+        let (mut engine, tick_ms) = engine_with_imminent_goal();
+
+        engine
+            .rebuild_predicted_state(tick_ms * 4)
+            .expect("prediction rebuild");
+
+        let predicted = engine.predicted_state().expect("predicted state");
+        assert_eq!(
+            predicted.recent_goals.len(),
+            1,
+            "prediction must surface the goal it simulated"
+        );
+        let cue = &predicted.recent_goals[0];
+        assert_eq!(cue.tick, 2);
+        assert_eq!(cue.snake_id, 0);
+        assert_eq!(cue.team_id.0, 0);
+        assert_eq!(cue.points, 2);
+        assert_eq!(cue.position, Position { x: 9, y: 18 });
+
+        assert_eq!(engine.committed_state().current_tick(), 0);
+        assert!(
+            engine.committed_state().recent_goals.is_empty(),
+            "prediction must expose the goal before committed state reaches it"
+        );
+    }
+
+    /// The composite the cue's placement in the movement path exists for.
+    ///
+    /// A client's committed state advances under `movement_only`, which skips
+    /// the authoritative scoring block entirely — it receives the score and
+    /// respawn from the transport instead. Prediction is rebuilt from that
+    /// committed state every frame, so if the cue were only produced under the
+    /// scoring gate it would vanish from prediction the moment committed state
+    /// passed the goal tick, retracting a celebration of a real goal. Emitting
+    /// it during movement keeps it visible on both sides of the catch-up.
+    #[test]
+    fn a_real_goal_cue_survives_committed_catch_up_past_the_goal_tick() {
+        let (mut engine, tick_ms) = engine_with_imminent_goal();
+
+        engine
+            .rebuild_predicted_state(tick_ms * 4)
+            .expect("prediction rebuild");
+        let predicted_cue = engine
+            .predicted_state()
+            .expect("predicted state")
+            .recent_goals
+            .first()
+            .cloned()
+            .expect("test setup must first predict the goal");
+
+        // Drive committed state past the goal tick exactly as the transport
+        // does: `process_server_event` fast-forwards with `tick_forward(true)`
+        // before applying each authoritative event.
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 1,
+                tick: 6,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::TeamScoreUpdated {
+                    team_id: predicted_cue.team_id,
+                    score: predicted_cue.points,
+                },
+            })
+            .expect("authoritative score");
+
+        let committed = engine.committed_state();
+        assert!(
+            committed.current_tick() > predicted_cue.tick,
+            "committed state must have advanced past the goal tick"
+        );
+        assert_eq!(
+            committed.recent_goals,
+            vec![predicted_cue.clone()],
+            "movement-only catch-up must retain the cue the server also recorded"
+        );
+
+        engine
+            .rebuild_predicted_state(tick_ms * 8)
+            .expect("post-catch-up prediction rebuild");
+        assert!(
+            engine
+                .predicted_state()
+                .expect("predicted state")
+                .recent_goals
+                .contains(&predicted_cue),
+            "a rebuild from the caught-up committed state must not retract a real goal"
+        );
+    }
+
+    /// The mirror of the crash-cue retraction: if authoritative input turns the
+    /// snake away from its goal, the replayed prediction must drop the cue so
+    /// the celebration can be shut off instead of finishing on a phantom goal.
+    #[test]
+    fn same_target_reconciliation_retracts_an_invalid_goal_cue() {
+        let (mut engine, tick_ms) = engine_with_imminent_goal();
+        let target_ts = tick_ms * 4;
+
+        engine
+            .rebuild_predicted_state(target_ts)
+            .expect("initial prediction rebuild");
+        assert_eq!(
+            engine
+                .predicted_state()
+                .expect("predicted state")
+                .recent_goals
+                .len(),
+            1,
+            "test setup must first predict the goal"
+        );
+
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 1,
+                tick: 0,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: Some(1),
+                event: GameEvent::SnakeTurned {
+                    snake_id: 0,
+                    direction: Direction::Up,
+                },
+            })
+            .expect("authoritative turn");
+
+        engine
+            .rebuild_predicted_state(target_ts)
+            .expect("same-target reconciliation rebuild");
+
+        assert!(
+            engine
+                .predicted_state()
+                .expect("reconciled prediction")
+                .recent_goals
+                .is_empty(),
+            "same-target replay must retract the invalid predicted goal cue"
+        );
+    }
+
     fn clockwise(direction: Direction) -> Direction {
         match direction {
             Direction::Up => Direction::Right,
