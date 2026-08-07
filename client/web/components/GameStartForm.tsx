@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
+import { PlayersOnline } from './PlayersOnline';
 import { LobbyPreferences, LobbyGameMode } from '../types';
 import {
   DEFAULT_LOBBY_PREFERENCES,
@@ -39,6 +40,8 @@ interface GameStartFormProps {
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
   onSignInClick?: () => void;
   errorMessage?: string | null;
+  /** Live global player population; `null` while it is still unknown. */
+  playersOnline?: number | null;
 }
 
 export const GameStartForm: React.FC<GameStartFormProps> = ({
@@ -51,6 +54,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   onPreferencesChange,
   onSignInClick,
   errorMessage = null,
+  playersOnline = null,
 }) => {
   const [nickname, setNickname] = useState(currentUsername || '');
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
@@ -234,8 +238,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       </div>
 
       <div className="p-8">
-        {/* Nickname Input */}
+        {/* Nickname Input. The live population tag is notched into this field's
+            top border, so it renders inside the field's positioned wrapper. */}
         <div className="mb-7 relative">
+          <PlayersOnline count={playersOnline} />
           <input
             ref={nicknameInputRef}
             type="text"

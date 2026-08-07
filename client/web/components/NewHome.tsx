@@ -58,6 +58,12 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     onMessage,
   });
   const currentRegionId = selectedRegion?.id ?? regions[0]?.id ?? '';
+  // Global population is the sum of the per-region counts the regions hook
+  // already tracks (seeded over HTTP, then kept live by `UserCountUpdate`).
+  // `null` until the first counts land so the indicator can stay quiet.
+  const playersOnline = regions.length > 0
+    ? regions.reduce((total, region) => total + region.userCount, 0)
+    : null;
   const isLobbyQueued = isQueued || currentLobby?.state === 'queued';
 
   // Connect to selected region when it changes
@@ -265,6 +271,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
               onPreferencesChange={updateLobbyPreferences}
               onSignInClick={onOpenAuth}
               errorMessage={startError}
+              playersOnline={playersOnline}
             />
             <SocialFooter />
           </div>
