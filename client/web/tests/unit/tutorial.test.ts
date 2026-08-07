@@ -159,7 +159,7 @@ test('team copy races to the score limit it is handed, never a baked-in number',
         .steps.map((step) => step.body)
         .join(' ');
       assert.match(text, new RegExp(`First to ${limit}\\b`));
-      assert.match(text, /enemy base/);
+      assert.match(text, /rival base/);
       // No other target may appear alongside it.
       const numbers = text.match(/\b\d+\b/g) ?? [];
       assert.deepEqual(
@@ -179,11 +179,11 @@ test('a team match with no score limit describes the rule without inventing a nu
   assert.match(text, /score target/i);
 });
 
-test('ranked copy claims a rank is at stake only where one actually is', () => {
+test('queue context stays in the kicker instead of repeating in step copy', () => {
   for (const mode of ['duel', '2v2', 'ffa'] as const) {
-    const ranked = tutorialContent(mode, 'Competitive');
-    assert.equal(ranked.kicker, 'COMPETITIVE');
-    assert.match(ranked.steps.map((step) => step.body).join(' '), /rank/);
+    const competitive = tutorialContent(mode, 'Competitive');
+    assert.equal(competitive.kicker, 'COMPETITIVE');
+    assert.doesNotMatch(competitive.steps.map((step) => step.body).join(' '), /rank/);
 
     const casual = tutorialContent(mode, 'Quickmatch');
     assert.equal(casual.kicker, 'QUICK MATCH');
@@ -192,9 +192,9 @@ test('ranked copy claims a rank is at stake only where one actually is', () => {
 
   // Solo never touches MMR in either queue mode, so competitive Solo must not
   // be dressed up as ranked.
-  const rankedSolo = tutorialContent('solo', 'Competitive');
-  assert.equal(rankedSolo.kicker, 'HIGH SCORE');
-  assert.doesNotMatch(rankedSolo.steps.map((step) => step.body).join(' '), /rank/);
+  const competitiveSolo = tutorialContent('solo', 'Competitive');
+  assert.equal(competitiveSolo.kicker, 'HIGH SCORE');
+  assert.doesNotMatch(competitiveSolo.steps.map((step) => step.body).join(' '), /rank/);
   assert.equal(tutorialContent('solo', 'Quickmatch').kicker, 'HIGH SCORE');
 });
 

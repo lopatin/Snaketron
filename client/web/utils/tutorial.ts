@@ -85,9 +85,9 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  * - 2v2 and FFA carry double food (`food_target_for`); duel and Solo do not.
  * - Solo and FFA have no clock and no score target, and end only when every
  *   snake is dead.
- * - Competitive duel and 2v2 use the higher score target described above. In
- *   duel, 2v2 and FFA it also selects the ranked MMR pool; Solo affects neither
- *   rules nor rating, so the Solo copy never claims a rank is at stake.
+ * - Competitive duel and 2v2 use the higher score target described above. The
+ *   queue context is already named by the tutorial kicker, so step copy stays
+ *   focused on what the player needs to do.
  */
 const collectibleBoostStep = (inputMode: BoostInputMode): TutorialStep => ({
   scene: 'team-boost',
@@ -101,7 +101,6 @@ const collectibleBoostStep = (inputMode: BoostInputMode): TutorialStep => ({
 
 const teamSteps = (
   mode: 'duel' | '2v2',
-  ranked: boolean,
   scoreLimit: number | null,
   inputMode: BoostInputMode,
 ): [TutorialStep, TutorialStep, TutorialStep] => {
@@ -125,17 +124,14 @@ const teamSteps = (
     collectibleBoostStep(inputMode),
     {
       scene: 'team-danger',
-      title: 'WIN',
-      body: `${race}—no clock. Entering the enemy base kills you.${
-        ranked ? ' This match affects your rank.' : ''
-      }`,
+      title: 'STAY OUT',
+      body: `${race}—no clock. The rival base kills you.`,
       visualLabel: 'A snake enters the base labeled RIVAL and crashes.',
     },
   ];
 };
 
 const ffaSteps = (
-  ranked: boolean,
   inputMode: BoostInputMode,
 ): [TutorialStep, TutorialStep, TutorialStep] => [
   {
@@ -148,9 +144,7 @@ const ffaSteps = (
   {
     scene: 'ffa-crash',
     title: 'ONE LIFE',
-    body: `Crash and you’re out. When all snakes are out, highest score wins.${
-      ranked ? ' This match affects your rank.' : ''
-    }`,
+    body: 'Crash and you’re out. Highest score wins when all snakes are out.',
     visualLabel: 'A snake hits a rival and is eliminated.',
   },
 ];
@@ -200,8 +194,8 @@ export const tutorialContent = (
     mode === 'solo'
       ? soloSteps(inputMode)
       : mode === 'ffa'
-        ? ffaSteps(ranked, inputMode)
-        : teamSteps(mode, ranked, facts.scoreLimit, inputMode);
+        ? ffaSteps(inputMode)
+        : teamSteps(mode, facts.scoreLimit, inputMode);
 
   return {
     key,

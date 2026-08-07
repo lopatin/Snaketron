@@ -6,8 +6,6 @@ export interface TutorialSceneCanvasProps {
   scene: string;
   /** Increment to replay the scene without changing tutorial steps. */
   replayToken?: number;
-  /** Play the authored timeline, or render only its authored poster frame. */
-  playback?: 'play' | 'poster';
 }
 
 const FRAME_QUANTUM_MS = 50;
@@ -20,7 +18,6 @@ const FRAME_QUANTUM_MS = 50;
 const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
   scene,
   replayToken = 0,
-  playback = 'play',
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [reducedMotion, setReducedMotion] = useState(() => (
@@ -87,11 +84,10 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       }
 
       const durationMs = player.durationMs();
-      const showPoster = playback === 'poster' || reducedMotion;
-      elapsedMs = showPoster
+      elapsedMs = reducedMotion
         ? player.posterMs()
         : Math.min(durationMs, Math.max(0, now - startedAt));
-      const quantizedMs = showPoster
+      const quantizedMs = reducedMotion
         ? elapsedMs
         : Math.min(durationMs, Math.floor(elapsedMs / FRAME_QUANTUM_MS) * FRAME_QUANTUM_MS);
 
@@ -108,7 +104,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
         forceDraw = false;
       }
 
-      if (!showPoster && elapsedMs < durationMs) {
+      if (!reducedMotion && elapsedMs < durationMs) {
         canvas.dataset.playback = 'playing';
         schedule();
       } else {
@@ -152,7 +148,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       }
       player?.free();
     };
-  }, [playback, reducedMotion, replayToken, scene]);
+  }, [reducedMotion, replayToken, scene]);
 
   return (
     <canvas
@@ -160,7 +156,6 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
       className="tutorial-scene-canvas"
       data-scene={scene}
       data-motion={reducedMotion ? 'reduced' : 'animated'}
-      data-playback-mode={playback}
       data-testid="tutorial-scene-canvas"
       aria-hidden="true"
     />

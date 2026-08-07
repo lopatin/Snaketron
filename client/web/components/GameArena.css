@@ -672,11 +672,14 @@
 
 .tutorial-step {
   padding: 0 22px 18px;
-  animation: tutorial-step-in 160ms ease-out both;
 }
 
 .tutorial-visual-shell {
   position: relative;
+  width: min(500px, 100%);
+  margin-right: auto;
+  margin-left: auto;
+  animation: tutorial-step-in 160ms ease-out both;
 }
 
 .tutorial-visual {
@@ -686,12 +689,6 @@
   border-radius: 6px;
   aspect-ratio: 16 / 10;
   background: var(--game-paper);
-}
-
-.tutorial-visual:focus-visible {
-  border-color: var(--game-blue);
-  outline: 3px solid var(--game-blue);
-  outline-offset: 2px;
 }
 
 .tutorial-scene-canvas {
@@ -742,6 +739,10 @@
 .tutorial-copy {
   min-height: 94px;
   padding-top: 17px;
+}
+
+.tutorial-copy-inner {
+  animation: tutorial-step-in 160ms ease-out both;
 }
 
 .tutorial-step-index {
@@ -829,11 +830,7 @@
 
 .tutorial-step-button:disabled {
   cursor: default;
-  opacity: 0.28;
-}
-
-.tutorial-step-position {
-  display: none;
+  visibility: hidden;
 }
 
 .tutorial-footer {
@@ -874,467 +871,6 @@
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;
   line-height: 1.35;
-}
-
-/* Prototype review controls -------------------------------------------------
-   These controls only exist in the opt-in presentation lab. They borrow the
-   compact segmented-control language already used by the game shell, so the
-   comparison tool never becomes louder than the tutorial being compared. */
-.tutorial-card[data-prototype] .tutorial-prototype-switch {
-  display: grid;
-  min-height: 34px;
-  flex: 0 0 auto;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-  margin: 0 22px 12px;
-  padding: 3px;
-  border: 1px solid var(--game-rule);
-  border-radius: 6px;
-  background: #fafafa;
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-label {
-  padding-left: 7px;
-  color: var(--game-muted);
-  font-size: 8px;
-  font-style: normal;
-  font-weight: 900;
-  letter-spacing: 0.13em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-options {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 2px;
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-option {
-  min-width: 0;
-  min-height: 26px;
-  overflow: hidden;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 4px;
-  appearance: none;
-  background: transparent;
-  color: var(--game-muted);
-  cursor: pointer;
-  font-size: 9px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.055em;
-  line-height: 1;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  transition: background-color 140ms ease, color 140ms ease;
-  white-space: nowrap;
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-option:hover {
-  background: #eff6ff;
-  color: var(--game-blue);
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-option[aria-pressed="true"] {
-  background: var(--game-blue);
-  color: var(--game-paper);
-}
-
-.tutorial-card[data-prototype] .tutorial-prototype-option:focus-visible {
-  position: relative;
-  z-index: 1;
-  outline: 3px solid rgb(59 130 246 / 34%);
-  outline-offset: 1px;
-}
-
-/* The review switch adds one compact row above Lens. Keep its arena focused
-   and fully visible so the ordinary navigation never slips under the footer;
-   the production Lens (which has no switch) retains its original scale. */
-.tutorial-card[data-prototype="lens"]:has(.tutorial-prototype-switch)
-  .tutorial-lens-step
-  .tutorial-visual-shell {
-  width: min(500px, 100%);
-  margin-right: auto;
-  margin-left: auto;
-}
-
-/* Field Manual --------------------------------------------------------------
-   A progressively assembled field guide. Desktop treats the three lessons as
-   a single storyboard; completed frames recede like reviewed contact sheets,
-   while the live frame keeps full colour and the only replay control. */
-.tutorial-card[data-prototype="manual"] {
-  width: min(900px, 100%);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-content {
-  padding: 0 22px 18px;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-lessons {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  align-items: start;
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-lesson {
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid var(--game-rule);
-  border-radius: 6px;
-  background: var(--game-paper);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-lesson[data-state="active"] {
-  border-color: var(--game-blue);
-  box-shadow: 0 0 0 1px rgb(59 130 246 / 16%);
-  animation: tutorial-manual-reveal 180ms ease-out both;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-lesson[data-state="revealed"] {
-  animation: tutorial-manual-reveal 180ms ease-out both;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-lesson[data-state="upcoming"] {
-  align-self: start;
-  background: #fafafa;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-heading {
-  margin: 0;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-select {
-  display: grid;
-  width: 100%;
-  min-height: 48px;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 10px;
-  border: 0;
-  appearance: none;
-  background: transparent;
-  color: var(--game-graphite);
-  cursor: pointer;
-  text-align: left;
-  transition: background-color 140ms ease, color 140ms ease;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-select:hover:not(:disabled) {
-  background: #eff6ff;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-select:focus-visible {
-  position: relative;
-  z-index: 2;
-  outline: 3px solid var(--game-blue);
-  outline-offset: -3px;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-select:disabled {
-  color: var(--game-muted);
-  cursor: default;
-  opacity: 0.45;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="active"]
-  .tutorial-manual-select {
-  border-bottom: 1px solid rgb(59 130 246 / 24%);
-  background: #eff6ff;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="revealed"]
-  .tutorial-manual-select {
-  border-bottom: 1px solid var(--game-rule);
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="upcoming"]
-  .tutorial-manual-select:not(:disabled) {
-  color: var(--game-blue);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-index,
-.tutorial-card[data-prototype="manual"] .tutorial-manual-state {
-  color: var(--game-muted);
-  font-size: 8px;
-  font-style: normal;
-  font-weight: 900;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.1em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="active"]
-  .tutorial-manual-index,
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="active"]
-  .tutorial-manual-state {
-  color: var(--game-blue);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-title {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 13px;
-  font-style: italic;
-  font-weight: 950;
-  letter-spacing: -0.01em;
-  line-height: 1.05;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-detail {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px;
-  animation: tutorial-manual-detail-in 180ms ease-out both;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-detail[hidden] {
-  display: none;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="revealed"]
-  .tutorial-visual-shell.is-compact {
-  filter: saturate(0.55);
-  opacity: 0.5;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="revealed"]
-  .tutorial-visual {
-  border-color: var(--game-rule);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-body {
-  min-height: 3.4em;
-  margin: 0;
-  color: var(--game-graphite);
-  font-size: 12px;
-  font-style: normal;
-  font-weight: 500;
-  line-height: 1.42;
-}
-
-.tutorial-card[data-prototype="manual"]
-  .tutorial-manual-lesson[data-state="revealed"]
-  .tutorial-manual-body {
-  color: var(--game-muted);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-next {
-  display: inline-flex;
-  min-height: 32px;
-  align-items: center;
-  justify-content: center;
-  align-self: stretch;
-  margin-top: auto;
-  padding: 0 10px;
-  border: 1px solid var(--game-blue);
-  border-radius: 5px;
-  appearance: none;
-  background: var(--game-paper);
-  color: var(--game-blue);
-  cursor: pointer;
-  font-size: 9px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.065em;
-  line-height: 1;
-  text-transform: uppercase;
-  transition: background-color 140ms ease, color 140ms ease;
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-next:hover {
-  background: var(--game-blue);
-  color: var(--game-paper);
-}
-
-.tutorial-card[data-prototype="manual"] .tutorial-manual-next:focus-visible {
-  outline: 3px solid rgb(59 130 246 / 34%);
-  outline-offset: 2px;
-}
-
-/* Coach Rail ---------------------------------------------------------------
-   The active arena stays singular and large; the rail names the whole route
-   without reintroducing three competing illustrations. */
-.tutorial-card[data-prototype="coach"] {
-  width: min(780px, 100%);
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-content {
-  padding: 0 22px 18px;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach {
-  display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(220px, 0.72fr);
-  align-items: stretch;
-  gap: 14px;
-  padding: 0;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-stage {
-  min-width: 0;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-rail {
-  display: flex;
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid var(--game-rule);
-  border-radius: 6px;
-  background: #fafafa;
-  flex-direction: column;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-lessons {
-  display: flex;
-  min-height: 0;
-  flex: 1 1 auto;
-  margin: 0;
-  padding: 0;
-  flex-direction: column;
-  list-style: none;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-lesson {
-  position: relative;
-  border-bottom: 1px solid var(--game-rule);
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-lesson[data-state="active"] {
-  flex: 1 1 auto;
-  background: var(--game-paper);
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-select {
-  display: grid;
-  width: 100%;
-  min-height: 51px;
-  grid-template-areas:
-    "index check"
-    "title check";
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 3px 8px;
-  padding: 9px 11px;
-  border: 0;
-  appearance: none;
-  background: transparent;
-  color: var(--game-graphite);
-  cursor: pointer;
-  text-align: left;
-  transition: background-color 140ms ease, color 140ms ease;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-select:hover {
-  background: #eff6ff;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-select:focus-visible {
-  position: relative;
-  z-index: 2;
-  outline: 3px solid var(--game-blue);
-  outline-offset: -3px;
-}
-
-.tutorial-card[data-prototype="coach"]
-  .tutorial-coach-lesson[data-state="active"]
-  .tutorial-coach-select {
-  background: var(--game-paper);
-  box-shadow: inset 3px 0 0 var(--game-blue);
-  color: var(--game-blue);
-}
-
-.tutorial-card[data-prototype="coach"]
-  .tutorial-coach-lesson[data-state="upcoming"]
-  .tutorial-coach-select {
-  color: var(--game-muted);
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-index {
-  grid-area: index;
-  color: currentColor;
-  font-size: 8px;
-  font-style: normal;
-  font-weight: 900;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.1em;
-  line-height: 1;
-  opacity: 0.72;
-  text-transform: uppercase;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-title {
-  grid-area: title;
-  min-width: 0;
-  overflow: hidden;
-  font-size: 13px;
-  font-style: italic;
-  font-weight: 950;
-  letter-spacing: -0.01em;
-  line-height: 1.05;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-check {
-  grid-area: check;
-  color: #1f8a4c;
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 900;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-body {
-  margin: -1px 11px 11px;
-  padding-left: 3px;
-  color: var(--game-graphite);
-  font-size: 12px;
-  font-style: normal;
-  font-weight: 500;
-  line-height: 1.42;
-}
-
-.tutorial-card[data-prototype="coach"] .tutorial-coach-navigation {
-  display: flex;
-  min-height: 40px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: auto;
-  padding: 5px 11px;
-  background: var(--game-paper);
-}
-
-@keyframes tutorial-manual-reveal {
-  from { opacity: 0; transform: translateY(5px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes tutorial-manual-detail-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
 }
 
 /* Readiness marks in the live roster. The check rides on the snake glyph so
@@ -1553,277 +1089,15 @@
   }
 }
 
-/* The storyboard becomes a true accordion below the width where three real
-   arena crops can remain legible. Revealed lessons retain their short copy,
-   but only the active lesson keeps a visual on screen. Coach keeps the same
-   information hierarchy and simply moves its rail below the shared stage. */
-@media (width <= 720px) {
-  .tutorial-card[data-prototype] .tutorial-prototype-switch {
-    gap: 7px;
-    margin-right: 16px;
-    margin-bottom: 10px;
-    margin-left: 16px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-label {
-    padding-left: 5px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-option {
-    padding-right: 5px;
-    padding-left: 5px;
-    font-size: 8px;
-  }
-
-  .tutorial-card[data-prototype="manual"],
-  .tutorial-card[data-prototype="coach"] {
-    width: min(600px, 100%);
-  }
-
-  .tutorial-card[data-prototype="lens"]:has(.tutorial-prototype-switch)
-    .tutorial-lens-step
-    .tutorial-visual-shell {
-    width: 100%;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-content,
-  .tutorial-card[data-prototype="coach"] .tutorial-content {
-    padding: 0 16px 14px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-lessons {
-    display: flex;
-    gap: 8px;
-    flex-direction: column;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-lesson,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-lesson[data-state="upcoming"] {
-    width: 100%;
-    align-self: stretch;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-select {
-    min-height: 43px;
-    padding: 8px 10px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-detail {
-    gap: 9px;
-    padding: 9px 10px 10px;
-  }
-
-  .tutorial-card[data-prototype="manual"]
-    .tutorial-manual-lesson:not([data-state="active"])
-    .tutorial-visual-shell {
-    display: none;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-body {
-    min-height: 0;
-    font-size: 12px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-next {
-    min-height: 30px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach {
-    display: flex;
-    gap: 10px;
-    padding: 0;
-    flex-direction: column;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-rail {
-    flex: 0 0 auto;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-lessons {
-    flex: 0 0 auto;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-lesson[data-state="active"] {
-    flex: 0 0 auto;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-select {
-    min-height: 43px;
-    padding: 7px 10px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-body {
-    margin: -1px 10px 9px;
-    font-size: 12px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-navigation {
-    min-height: 36px;
-    padding: 3px 10px;
-  }
-}
-
-@media (width <= 480px) {
-  .tutorial-card[data-prototype] .tutorial-prototype-switch {
-    min-height: 32px;
-    margin-bottom: 9px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-label {
-    font-size: 7px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-option {
-    min-height: 24px;
-    letter-spacing: 0.035em;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-content,
-  .tutorial-card[data-prototype="coach"] .tutorial-content {
-    padding-right: 12px;
-    padding-bottom: 12px;
-    padding-left: 12px;
-  }
-}
-
-/* Short landscape uses the existing compact Lens split. The wider prototypes
-   retain their desktop structures above 720px; narrower devices keep the
-   accordion/stack, cap the stage width, and let only `.tutorial-content`
-   scroll while the readiness action remains visible. */
-@media (height <= 600px) and (width >= 640px) {
-  .tutorial-card[data-prototype] .tutorial-prototype-switch {
-    min-height: 30px;
-    margin: 0 18px 6px;
-    padding: 2px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-option {
-    min-height: 24px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-content,
-  .tutorial-card[data-prototype="coach"] .tutorial-content {
-    padding: 0 18px 8px;
-  }
-
-  .tutorial-card[data-prototype="manual"] {
-    width: min(900px, 100%);
-  }
-
-  .tutorial-card[data-prototype="coach"] {
-    width: min(780px, 100%);
-  }
-
-  /* At the 640–720px overlap, width-based mobile rules would otherwise stack
-     a full 16:10 stage inside a very short viewport. Restore the compact
-     landscape compositions here so all three lessons and Ready stay close. */
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-lessons {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .tutorial-card[data-prototype="manual"]
-    .tutorial-manual-lesson:not([data-state="active"])
-    .tutorial-visual-shell {
-    display: block;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-select {
-    min-height: 40px;
-    padding: 6px 8px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-title {
-    font-size: 11px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-detail {
-    gap: 6px;
-    padding: 7px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-body {
-    min-height: 2.7em;
-    font-size: 10px;
-    line-height: 1.32;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-next {
-    min-height: 26px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach {
-    display: grid;
-    grid-template-columns: minmax(0, 1.4fr) minmax(210px, 0.72fr);
-    grid-template-rows: auto;
-    gap: 10px;
-    padding: 0;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-rail {
-    flex: 1 1 auto;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-lessons,
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-lesson[data-state="active"] {
-    flex: 1 1 auto;
-  }
-}
-
-@media (height <= 600px) and (width >= 721px) {
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-detail {
-    gap: 7px;
-    padding: 8px;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-body {
-    min-height: 2.9em;
-    font-size: 11px;
-    line-height: 1.35;
-  }
-
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-next {
-    min-height: 28px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach {
-    display: grid;
-    grid-template-columns: minmax(0, 1.55fr) minmax(210px, 0.72fr);
-    grid-template-rows: auto;
-    gap: 12px;
-    padding: 0;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-select {
-    min-height: 44px;
-    padding: 6px 10px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-body {
-    margin-bottom: 8px;
-    font-size: 11px;
-  }
-
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-navigation {
-    min-height: 34px;
-    padding-top: 2px;
-    padding-bottom: 2px;
-  }
-}
-
 @media (pointer: coarse) {
-  .tutorial-card[data-prototype] .tutorial-prototype-switch {
-    min-height: 50px;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-option,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-select,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-next,
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-select,
+  .tutorial-progress-segment,
   .tutorial-step-button,
   .tutorial-ready-button {
     min-height: 44px;
+  }
+
+  .tutorial-progress-segment::before {
+    inset: 20px 0;
   }
 
   .tutorial-replay {
@@ -1832,10 +1106,50 @@
   }
 }
 
+@media (pointer: coarse) and (height <= 600px) and (width >= 640px) {
+  .tutorial-progress {
+    position: relative;
+    z-index: 2;
+  }
+
+  .tutorial-progress-segment {
+    height: 12px;
+    min-height: 12px;
+  }
+
+  .tutorial-progress-segment::before {
+    inset: 5px 0;
+  }
+
+  .tutorial-progress-segment::after {
+    position: absolute;
+    inset: -16px 0;
+    content: "";
+  }
+
+  .tutorial-step-button {
+    position: relative;
+    min-height: 28px;
+  }
+
+  .tutorial-step-button::after {
+    position: absolute;
+    inset: -8px;
+    content: "";
+  }
+
+  .tutorial-footer {
+    min-height: 50px;
+    padding-top: 3px;
+    padding-bottom: 3px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tutorial-backdrop,
   .tutorial-card,
-  .tutorial-step {
+  .tutorial-visual-shell,
+  .tutorial-copy-inner {
     animation: none;
   }
 
@@ -1846,16 +1160,6 @@
   .tutorial-progress-segment::before,
   .tutorial-step-button,
   .tutorial-ready-button {
-    transition: none;
-  }
-
-  .tutorial-card[data-prototype] .tutorial-prototype-option,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-lesson,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-detail,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-select,
-  .tutorial-card[data-prototype="manual"] .tutorial-manual-next,
-  .tutorial-card[data-prototype="coach"] .tutorial-coach-select {
-    animation: none;
     transition: none;
   }
 }
