@@ -38,10 +38,8 @@ pub fn calculate_ai_move(
     let target = if is_team_game(game_state)
         && let Some(team_id) = snake.team_id
     {
-        let starting_length = get_starting_snake_length(&game_state.game_type);
-
         // Decide whether to return to base or collect more food
-        if should_return_to_base(game_state, snake, team_id, starting_length) {
+        if should_return_to_base(game_state, snake, team_id) {
             // RETURN_TO_BASE mode: Navigate to goal
             find_path_to_base(game_state, head, team_id, arena_width, arena_height)?
         } else {
@@ -222,16 +220,6 @@ fn count_escape_routes(game_state: &GameState, pos: &Position, width: i16, heigh
 // TEAM GAME AI HELPERS
 // ============================================================================
 
-const DEFAULT_SNAKE_LENGTH: usize = 4;
-
-/// Get the starting snake length for a given game type
-fn get_starting_snake_length(game_type: &GameType) -> usize {
-    match game_type {
-        GameType::Custom { settings } => settings.snake_start_length as usize,
-        _ => DEFAULT_SNAKE_LENGTH,
-    }
-}
-
 /// Check if the current game is a team match
 fn is_team_game(game_state: &GameState) -> bool {
     matches!(game_state.game_type, GameType::TeamMatch { .. })
@@ -251,16 +239,6 @@ fn calculate_time_remaining_ms(game_state: &GameState) -> i64 {
         // No time limit or unknown, assume plenty of time remaining
         i64::MAX
     }
-}
-
-/// Calculate how many points the snake is currently carrying
-fn calculate_carried_points(snake: &Snake, starting_length: usize) -> u32 {
-    let current_length = snake.length();
-    let extra_segments = current_length.saturating_sub(starting_length);
-    let total_carried_segments = extra_segments + snake.food as usize;
-
-    // 2 segments = 1 point
-    (total_carried_segments / 2) as u32
 }
 
 /// Get the score differential for this team (positive = winning, negative = losing)
@@ -326,13 +304,8 @@ fn find_path_to_base(
 }
 
 /// Determine if the snake should return to base to score points
-fn should_return_to_base(
-    game_state: &GameState,
-    snake: &Snake,
-    team_id: TeamId,
-    starting_length: usize,
-) -> bool {
-    let carried_points = calculate_carried_points(snake, starting_length);
+fn should_return_to_base(game_state: &GameState, snake: &Snake, team_id: TeamId) -> bool {
+    let carried_points = game_state.carried_food(snake);
 
     // Don't return if not carrying any points
     if carried_points == 0 {
