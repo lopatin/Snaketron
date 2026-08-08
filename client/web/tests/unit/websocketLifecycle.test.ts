@@ -60,7 +60,10 @@ test('matchmaking admission retries stop after the bounded delay schedule', () =
   assert.equal(matchmakingAdmissionRetryDelayMs(0.5), null);
 });
 
-test('the current websocket protocol fails closed when a capability is absent', () => {
+// Reports which capabilities a server did not advertise. The caller only warns
+// on the result — a missing capability never blocks the player, because a
+// shipped build cannot update itself to satisfy it.
+test('the current websocket protocol names each absent capability', () => {
   const current = [
     'explicit-auth-v1',
     'planned-drain-v1',
