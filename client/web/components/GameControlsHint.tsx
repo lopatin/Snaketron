@@ -5,6 +5,8 @@ interface GameControlsHintProps {
   showBoost: boolean;
   boostInputMode: BoostInputMode;
   onBoostInputModeChange: (mode: BoostInputMode) => void;
+  /** Re-opens this mode's pre-match briefing. Omitted when there isn't one. */
+  onOpenHelp?: () => void;
 }
 
 /**
@@ -15,6 +17,7 @@ export function GameControlsHint({
   showBoost,
   boostInputMode,
   onBoostInputModeChange,
+  onOpenHelp,
 }: GameControlsHintProps) {
   return (
     <aside className="game-controls-hint" aria-label="Game controls" data-testid="game-controls-hint">
@@ -55,6 +58,21 @@ export function GameControlsHint({
               ? 'Hold the Space key to boost'
               : 'Press the Space key to start or stop boost'}
           </span>
+        </div>
+      )}
+
+      {onOpenHelp && (
+        <div className="game-controls-hint__group is-help">
+          <button
+            type="button"
+            className="game-controls-hint__help"
+            onClick={onOpenHelp}
+            aria-label="How this mode works"
+            title="How this mode works"
+            data-testid="tutorial-help-button"
+          >
+            <span aria-hidden="true">?</span>
+          </button>
         </div>
       )}
     </aside>

@@ -18,22 +18,32 @@ const StaredownSnake: React.FC<{
     name={player.name}
     skin={player.skin}
     facing={faces}
+    isReady={player.isReady === true}
   />
 );
 
 const PlayerLegend: React.FC<{
   player: MatchPlayerPresentation;
   side?: 'left' | 'right';
-}> = ({ player, side = 'right' }) => (
-  <span
-    className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}`}
-    role="img"
-    aria-label={`${player.name}${player.isAlive ? '' : ', out'}`}
-    title={player.name}
-  >
-    <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
-  </span>
-);
+}> = ({ player, side = 'right' }) => {
+  // `isReady` is null once the gate has resolved, which is how the roster
+  // knows to stop showing readiness rather than showing everyone as unready.
+  const readyState =
+    player.isReady === null ? '' : player.isReady ? ' is-ready' : ' is-awaiting-ready';
+  const readyLabel =
+    player.isReady === null ? '' : player.isReady ? ', ready' : ', not ready yet';
+
+  return (
+    <span
+      className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${readyState}`}
+      role="img"
+      aria-label={`${player.name}${readyLabel}${player.isAlive ? '' : ', out'}`}
+      title={player.name}
+    >
+      <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
+    </span>
+  );
+};
 
 const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   presentation,

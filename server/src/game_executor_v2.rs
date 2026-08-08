@@ -11,8 +11,8 @@ use crate::recovery::{
 };
 use anyhow::{Context, Result, bail};
 use common::{
-    ClientCommandIdentityV2, CommandId, EXECUTOR_POLL_INTERVAL_MS, GameCommand, GameCommandMessage,
-    GameEngine, GameEvent, GameEventMessage, GameStatus,
+    ClientCommandIdentityV2, CommandId, EXECUTOR_POLL_INTERVAL_MS, GAME_START_COUNTDOWN_MS,
+    GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameStatus,
 };
 use futures_util::FutureExt;
 use std::collections::{HashMap, VecDeque};
@@ -528,6 +528,9 @@ struct GameActor {
     snapshot_requested: bool,
     snapshot_waiters: Vec<oneshot::Sender<Result<()>>>,
     live: bool,
+    /// Readiness confirmations that arrived before activation. Published once
+    /// the actor is live so nothing precedes the initial snapshot.
+    deferred_ready_user_ids: Vec<u32>,
     start_event_pending: bool,
     completion_committed: bool,
     pending_completion: Option<CompletionRecordV1>,
@@ -649,6 +652,7 @@ impl GameActor {
             snapshot_requested: false,
             snapshot_waiters: Vec::new(),
             live: false,
+            deferred_ready_user_ids: Vec::new(),
             start_event_pending,
             completion_committed: false,
             pending_completion: None,
@@ -883,6 +887,38 @@ impl GameActor {
                     V2Incorporation::Quarantine(reason) => {
                         return Ok(DeliveryDisposition::Quarantine { reason });
                     }
+                }
+            }
+            CommandDeliveryPayload::Command(StreamEvent::PlayerReadySubmitted {
+                game_id,
+                user_id,
+            }) => {
+                if decision.is_some() {
+                    bail!("command decision journal was attached to a readiness confirmation");
+                }
+                if game_id != self.game_id {
+                    bail!("readiness confirmation routed to the wrong actor");
+                }
+                // Readiness is a set insert with no gameplay side effects, so
+                // a duplicate needs no durable decision record: the executor
+                // simply publishes nothing the second time. `accepts_ready_from`
+                // also rejects spectators and any user who is not a player.
+                //
+                // Nothing may be published or checkpointed before activation:
+                // `activate` owns the first StatusUpdated/Snapshot pair and the
+                // planned-handoff watermark merge, so publishing ahead of it
+                // would put replicas in front of the authority and a checkpoint
+                // would retire a watermark that has not been merged yet. Buffer
+                // instead, and drain once the actor is live.
+                if self.live {
+                    self.apply_readiness_confirmation(user_id).await?;
+                } else if self
+                    .engine
+                    .get_committed_state()
+                    .accepts_ready_from(user_id)
+                    && !self.deferred_ready_user_ids.contains(&user_id)
+                {
+                    self.deferred_ready_user_ids.push(user_id);
                 }
             }
             CommandDeliveryPayload::Command(StreamEvent::StatusUpdated { .. }) => {
@@ -1365,6 +1401,7 @@ impl GameActor {
         })
         .await?;
         self.live = true;
+        self.drain_deferred_readiness().await?;
         Ok(())
     }
 
@@ -1382,7 +1419,86 @@ impl GameActor {
         .await
     }
 
+    /// Apply a readiness transition locally and publish the matching event, in
+    /// that order. Publishing first would let a replica observe a transition
+    /// the authority has not yet made, and a mid-sequence failure would leave
+    /// this actor behind its own stream.
+    async fn record_readiness_transition(&mut self, event: GameEvent) -> Result<()> {
+        self.engine.apply_pre_match_readiness_event(event.clone())?;
+        self.publish_event(event).await
+    }
+
+    /// Record one player's confirmation and release the gate if that was the
+    /// last one outstanding. Only valid once the actor is live.
+    async fn apply_readiness_confirmation(&mut self, user_id: u32) -> Result<()> {
+        if !self
+            .engine
+            .get_committed_state()
+            .accepts_ready_from(user_id)
+        {
+            return Ok(());
+        }
+        self.record_readiness_transition(GameEvent::PlayerReady { user_id })
+            .await?;
+        self.resolve_readiness_gate_if_due().await
+    }
+
+    /// Publish confirmations that arrived before this actor was live. Ordered
+    /// after `activate`'s snapshot so every replica sees them against a state
+    /// it already holds.
+    async fn drain_deferred_readiness(&mut self) -> Result<()> {
+        if self.deferred_ready_user_ids.is_empty() {
+            return Ok(());
+        }
+        for user_id in std::mem::take(&mut self.deferred_ready_user_ids) {
+            self.apply_readiness_confirmation(user_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Release the pre-match gate once every player has confirmed or the
+    /// deadline lapses, scheduling the simulation one countdown from now.
+    ///
+    /// `start_ms` is deliberately not touched: it is the durable runtime game
+    /// identity that join authorization compares against, so moving it would
+    /// lock every player out of the match they are waiting to start.
+    async fn resolve_readiness_gate_if_due(&mut self) -> Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if !self
+            .engine
+            .get_committed_state()
+            .readiness_gate_resolves_at(now_ms)
+        {
+            return Ok(());
+        }
+
+        let event = GameEvent::MatchStartScheduled {
+            simulation_epoch_ms: now_ms + GAME_START_COUNTDOWN_MS,
+        };
+        self.engine.apply_pre_match_readiness_event(event.clone())?;
+        // Persist the resolved epoch before making it visible. `checkpoint`
+        // owns the bounded retry loop, so a transient write failure keeps this
+        // event unpublished until the same epoch is durable. If authority is
+        // lost instead, recovery still sees the older held gate and may safely
+        // choose a new epoch because no client ever observed this one.
+        self.checkpoint().await?;
+        self.publish_event(event).await?;
+        // Everyone joining from here on — including a player who reconnects
+        // mid-countdown — must see the resolved epoch even if they missed the
+        // event, so anchor a fresh snapshot to it.
+        self.publish_event(GameEvent::Snapshot {
+            game_state: self.engine.get_committed_state().clone(),
+        })
+        .await
+    }
+
     async fn advance_live(&mut self) -> Result<()> {
+        // The deadline half of the readiness gate has no inbound trigger, so
+        // the poll loop is what notices it has lapsed.
+        if self.engine.get_committed_state().is_awaiting_readiness() {
+            self.resolve_readiness_gate_if_due().await?;
+        }
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         let before_tick = self.engine.get_committed_state().tick;
         let scheduler_lag_ms = self.engine.authoritative_scheduler_lag_ms(now_ms);
@@ -2112,6 +2228,7 @@ fn is_parallel_actor_delivery(payload: &CommandDeliveryPayload) -> bool {
     matches!(
         payload,
         CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 { .. })
+            | CommandDeliveryPayload::Command(StreamEvent::PlayerReadySubmitted { .. })
     )
 }
 
@@ -2122,6 +2239,7 @@ fn delivery_game_id(payload: &CommandDeliveryPayload) -> Option<u32> {
         | CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
             game_id, ..
         })
+        | CommandDeliveryPayload::Command(StreamEvent::PlayerReadySubmitted { game_id, .. })
         | CommandDeliveryPayload::Command(StreamEvent::StatusUpdated { game_id, .. }) => {
             Some(*game_id)
         }
@@ -2386,6 +2504,9 @@ async fn dispatch_batch(
             | CommandDeliveryPayload::Command(StreamEvent::GameCommandSubmittedV2 {
                 game_id,
                 ..
+            })
+            | CommandDeliveryPayload::Command(StreamEvent::PlayerReadySubmitted {
+                game_id, ..
             })
             | CommandDeliveryPayload::Command(StreamEvent::StatusUpdated { game_id, .. }) => {
                 *game_id
@@ -4919,7 +5040,7 @@ mod tests {
                 state.add_player(user_id, Some(format!("player-{user_id}")))?;
             }
             state.status = GameStatus::Started { server_id: 1 };
-            state.properties.available_food_target = 0;
+            state.rng = None;
             state.arena.food.clear();
 
             // Tick 1: snake 1 is stationary on a packet and collects it.
@@ -6812,6 +6933,90 @@ mod tests {
                 .context("test actor did not stop after cancellation")?
                 .context("test actor task panicked")??;
 
+            let live_guard = harness.guard.clone();
+            harness.cleanup(&live_guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_release_is_checkpointed_before_publication_and_retries_once() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("readiness-release-durability").await?;
+            let mut baseline = harness.recovery().await?;
+            baseline
+                .game_state
+                .arm_readiness_gate(chrono::Utc::now().timestamp_millis() - 1);
+            baseline.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(&harness.guard, &baseline, &[], Duration::from_secs(60))
+                .await?;
+
+            let mut actor = harness.actor(baseline, harness.guard.clone());
+            actor.live = true;
+            // The first write fails transiently. The actor must keep the chosen
+            // epoch private while `checkpoint` retries, then publish it once.
+            harness.bus.fail_next_checkpoints(1);
+            let (checkpoint_entered, release_checkpoint) = harness.bus.gate_next_checkpoint();
+            let release_task = tokio::spawn(async move {
+                actor.resolve_readiness_gate_if_due().await?;
+                Result::<GameActor>::Ok(actor)
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), checkpoint_entered.notified())
+                .await
+                .context("readiness release did not enter its durability checkpoint")?;
+            assert!(
+                read_game_events(&mut harness.raw, harness.partition)
+                    .await?
+                    .is_empty(),
+                "readiness epoch became visible before its checkpoint was durable"
+            );
+            release_checkpoint.notify_one();
+            let actor = tokio::time::timeout(Duration::from_secs(2), release_task)
+                .await
+                .context("readiness release did not finish after checkpoint retry")?
+                .context("readiness release task panicked")??;
+
+            let recovered = harness.recovery().await?;
+            let durable_epoch = recovered
+                .game_state
+                .simulation_epoch_ms
+                .context("resolved readiness epoch was not checkpointed")?;
+            assert!(!recovered.game_state.is_awaiting_readiness());
+            assert_eq!(
+                actor.engine.get_committed_state().simulation_epoch_ms,
+                Some(durable_epoch)
+            );
+
+            let events = read_game_events(&mut harness.raw, harness.partition).await?;
+            let released_epochs: Vec<i64> = events
+                .iter()
+                .filter_map(|message| match &message.event {
+                    GameEvent::MatchStartScheduled {
+                        simulation_epoch_ms,
+                    } => Some(*simulation_epoch_ms),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                released_epochs,
+                vec![durable_epoch],
+                "checkpoint retry must publish exactly the durable readiness epoch"
+            );
+            assert!(events.iter().any(|message| {
+                matches!(
+                    &message.event,
+                    GameEvent::Snapshot { game_state }
+                        if game_state.simulation_epoch_ms == Some(durable_epoch)
+                            && !game_state.is_awaiting_readiness()
+                )
+            }));
+
+            drop(actor);
             let live_guard = harness.guard.clone();
             harness.cleanup(&live_guard).await?;
             Result::<()>::Ok(())

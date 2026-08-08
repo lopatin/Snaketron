@@ -102,8 +102,24 @@ impl TestClient {
         }
     }
 
+    /// Acknowledge a match and confirm the pre-match briefing, which is what a
+    /// real client does on arriving in the arena. Matches are held by the
+    /// readiness gate until every player confirms, so a test that only joins
+    /// waits out the whole readiness window before anything simulates.
+    ///
+    /// Use [`TestClient::join_game_without_readiness`] when the gate itself is
+    /// under test.
     pub async fn join_game(&mut self, game_id: u32) -> Result<()> {
+        self.join_game_without_readiness(game_id).await?;
+        self.confirm_ready(game_id).await
+    }
+
+    pub async fn join_game_without_readiness(&mut self, game_id: u32) -> Result<()> {
         self.send_message(WSMessage::JoinGame(game_id)).await
+    }
+
+    pub async fn confirm_ready(&mut self, game_id: u32) -> Result<()> {
+        self.send_message(WSMessage::PlayerReady { game_id }).await
     }
 
     pub async fn send_game_command(

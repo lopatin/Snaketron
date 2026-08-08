@@ -29,6 +29,13 @@ export interface MatchPlayerPresentation {
   xpGained: number;
   actionCount: number;
   isWinner: boolean;
+  /**
+   * Pre-match readiness. `null` once the gate has resolved (and for matches
+   * that never had one), which is what distinguishes "not ready yet" from
+   * "readiness no longer applies" — the roster only draws a check while a
+   * gate is actually pending.
+   */
+  isReady: boolean | null;
 }
 
 export interface MatchSidePresentation {
@@ -77,7 +84,31 @@ export interface MatchPresentation {
   resultSummary: string;
   resultTone: MatchResultTone;
   resultArtwork: MatchResultArtwork;
+  /** True while the pre-match readiness gate is still holding the match. */
+  isAwaitingReadiness: boolean;
+  /** Wall clock the gate gives up waiting, or null when it is not pending. */
+  readyDeadlineMs: number | null;
+  /** Players who still have to confirm, including the local one. */
+  pendingReadyCount: number;
 }
+
+/**
+ * Wall clock the simulation starts at, mirroring `GameState::simulation_start_ms`
+ * in Rust. `null` means the readiness gate still holds the match, so there is
+ * no countdown to show yet.
+ *
+ * `start_ms` is deliberately not used once a gate has resolved: it is the
+ * match's durable identity and never moves, so it would keep pointing at a
+ * moment that has already passed.
+ */
+export const simulationStartMs = (
+  gameState: Pick<GameState, 'readiness' | 'simulation_epoch_ms' | 'start_ms'>,
+): number | null => {
+  if (gameState.readiness) {
+    return null;
+  }
+  return gameState.simulation_epoch_ms ?? gameState.start_ms;
+};
 
 const valueAt = (
   values: { [key: number]: number | undefined } | null | undefined,
@@ -177,6 +208,9 @@ export const buildMatchPresentation = (
   const orderedTeamIds = mode.isTeam && currentTeamId !== null
     ? [currentTeamId, ...teamIds.filter((teamId) => teamId !== currentTeamId)]
     : teamIds;
+  const readyUserIds = gameState.readiness
+    ? new Set(gameState.readiness.ready_user_ids)
+    : null;
   const winningSnakeId = getWinningSnakeId(gameState);
   const winningTeamId = winningSnakeId === null
     ? null
@@ -223,6 +257,9 @@ export const buildMatchPresentation = (
       xpGained: userId === null ? 0 : valueAt(gameState.player_xp, userId),
       actionCount: userId === null ? 0 : valueAt(gameState.player_action_counts, userId),
       isWinner,
+      isReady: readyUserIds === null || userId === null
+        ? null
+        : readyUserIds.has(userId),
     };
   });
 
@@ -298,6 +335,11 @@ export const buildMatchPresentation = (
     resultSummary,
     resultTone,
     resultArtwork,
+    isAwaitingReadiness: gameState.readiness !== null,
+    readyDeadlineMs: gameState.readiness?.deadline_ms ?? null,
+    pendingReadyCount: players.filter(
+      (player) => player.userId !== null && player.isReady === false,
+    ).length,
   };
 };
 

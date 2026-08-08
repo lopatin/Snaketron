@@ -23,11 +23,19 @@ fn test_initial_food_spawning() -> Result<()> {
     // Spawn initial food
     game_state.spawn_initial_food();
 
-    // Verify food was spawned to target amount (should be 10 by default)
+    // Four-snake FFA keeps twice the baseline food target on the field.
     assert_eq!(
         game_state.arena.food.len(),
-        10,
-        "Should spawn exactly 10 food items initially"
+        20,
+        "Should spawn exactly 20 food items initially"
+    );
+    assert!(
+        game_state
+            .arena
+            .food
+            .iter()
+            .all(|position| { !game_state.arena.is_boost_pad_position(position) }),
+        "food must never overlap an FFA Boost-pad footprint"
     );
 
     println!(

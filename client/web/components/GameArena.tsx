@@ -4,11 +4,28 @@ import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { useGameEngine } from '../hooks/useGameEngine';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode, GameLoadFailure } from '../types';
+import {
+  GameState,
+  CanvasRef,
+  ArenaRotation,
+  GameType,
+  LobbyGameMode,
+  QueueMode,
+  GameLoadFailure,
+  type CommandId,
+  type GameCommandMessage,
+} from '../types';
 import { getWasm } from '../wasm';
 import GameHudShell from './GameHudShell';
 import GameControlsHint from './GameControlsHint';
 import LoadingScreen from './LoadingScreen';
+import TutorialModal from './TutorialModal';
+import { simulationStartMs } from '../utils/gamePresentation';
+import {
+  hasSeenTutorial,
+  markTutorialSeen,
+  tutorialContentForGame,
+} from '../utils/tutorial';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
 import {
@@ -113,6 +130,22 @@ function BoostCanisterMark() {
   );
 }
 
+const commandIdKey = (commandId: CommandId): string => (
+  `${commandId.tick}:${commandId.user_id}:${commandId.sequence_number}`
+);
+
+const boostCommandFromMessage = (
+  commandMessage: GameCommandMessage,
+): BoostInputCommand | null => {
+  if ('ActivateBoost' in commandMessage.command) {
+    return 'ActivateBoost';
+  }
+  if ('DeactivateBoost' in commandMessage.command) {
+    return 'DeactivateBoost';
+  }
+  return null;
+};
+
 export default function GameArena() {
   const { gameId } = useParams();
   if (!gameId) {
@@ -133,6 +166,10 @@ export default function GameArena() {
   const lastVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
+  // The gameplay key listeners are installed once for the arena's lifetime, so
+  // they read modal ownership through a ref rather than being torn down and
+  // rebuilt every time the briefing opens or closes.
+  const isModalOwningInputRef = useRef(false);
   
   const {
     connected,
@@ -150,6 +187,7 @@ export default function GameArena() {
     queueForMatchMulti,
     isJoiningGame,
     sendRequestResync,
+    sendPlayerReady,
   } = useGameWebSocket();
 
   const { user, loading: authLoading } = useAuth();
@@ -164,6 +202,18 @@ export default function GameArena() {
   } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
+  const pendingBoostCommandsRef = useRef<Map<string, BoostInputCommand>>(new Map());
+
+  const handleCommandReady = useCallback((commandMessage: GameCommandMessage) => {
+    const boostCommand = boostCommandFromMessage(commandMessage);
+    if (boostCommand) {
+      pendingBoostCommandsRef.current.set(
+        commandIdKey(commandMessage.command_id_client),
+        boostCommand,
+      );
+    }
+    sendGameCommand(commandMessage);
+  }, [sendGameCommand]);
 
   const handleRequestResync = useCallback(() => {
     sendRequestResync(gameId);
@@ -185,7 +235,7 @@ export default function GameArena() {
   } = useGameEngine({
     gameId,
     playerId,
-    onCommandReady: sendGameCommand,
+    onCommandReady: handleCommandReady,
     onRequestResync: handleRequestResync,
     latencyMs
   });
@@ -266,6 +316,7 @@ export default function GameArena() {
       boostInputControllerRef.current?.reset();
     }
 
+    pendingBoostCommandsRef.current.clear();
     previousGameIdRef.current = gameId;
     joinedGameIdRef.current = null;
   }, [gameId]);
@@ -525,11 +576,14 @@ export default function GameArena() {
       
       if (
         !gameState ||
-        !isGameInteractionActive
+        !isGameInteractionActive ||
+        // A briefing owns the screen; steering commands queued behind it would
+        // fire the instant the match starts, before the player is looking.
+        isModalOwningInputRef.current
       ) {
         return;
       }
-      
+
       const status = gameState.status;
       if ((typeof status === 'object' && 'Complete' in status) || status === 'Stopped') {
         return;
@@ -722,7 +776,25 @@ export default function GameArena() {
         while (events.length > 0) {
           for (const queued of events) {
             const processed = await processServerEvent(queued);
-            if (processed && 'Snapshot' in queued.message.event) {
+            const event = queued.message.event;
+            if (processed) {
+              const outcomeCommandId = 'CommandScheduledV2' in event
+                ? event.CommandScheduledV2.command_message.command_id_client
+                : 'CommandScheduled' in event
+                  ? event.CommandScheduled.command_message.command_id_client
+                  : 'CommandRejected' in event
+                    ? event.CommandRejected.command_id_client
+                    : null;
+              if (outcomeCommandId) {
+                const key = commandIdKey(outcomeCommandId);
+                const boostCommand = pendingBoostCommandsRef.current.get(key);
+                pendingBoostCommandsRef.current.delete(key);
+                if (boostCommand && 'CommandRejected' in event) {
+                  boostInputControllerRef.current?.handleRejectedCommand(boostCommand);
+                }
+              }
+            }
+            if (processed && 'Snapshot' in event) {
               const snapshotGameId = parseU32GameId(queued.message.game_id);
               if (snapshotGameId !== null) {
                 acknowledgeGameSnapshot(snapshotGameId);
@@ -738,23 +810,157 @@ export default function GameArena() {
     })();
   }, [gameEventSignal, takeGameEvents, processServerEvent, acknowledgeGameSnapshot]);
   
-  // Update countdown display
+  // Update countdown display. The clock runs off the resolved simulation
+  // epoch, not `start_ms`: with a readiness gate the two differ, and `start_ms`
+  // is already in the past by the time everyone has confirmed.
   useEffect(() => {
     const state = gameState ?? committedState;
     if (!state) return;
-    
+
+    // While the gate is pending there is no epoch yet, but the briefing shows
+    // its own auto-ready countdown, so keep re-rendering for that instead.
     const intervalId = setInterval(() => {
-      const timeLeft = state.start_ms - Date.now();
-      if (timeLeft <= 0) {
+      const epochMs = simulationStartMs(state);
+      if (epochMs !== null && epochMs - Date.now() <= 0) {
         clearInterval(intervalId);
       } else {
         // Force re-render to update countdown
         forceUpdate();
       }
     }, 100); // Update every 100ms for smooth countdown
-    
+
     return () => clearInterval(intervalId);
   }, [gameState, committedState, forceUpdate]);
+
+  // --- Pre-match briefing and readiness -----------------------------------
+  //
+  // The match a player lands in is only known once it exists (they can queue
+  // for several modes at once), so the briefing is keyed off authoritative
+  // state here rather than off anything chosen at queue time.
+  const readinessState = committedState ?? gameState;
+  const tutorial = useMemo(
+    () => (readinessState ? tutorialContentForGame(readinessState, boostInputMode) : null),
+    [
+      boostInputMode,
+      readinessState?.game_type,
+      readinessState?.properties.score_limit,
+      readinessState?.queue_mode,
+    ],
+  );
+  // Spectators have no snake and the server will not accept a confirmation
+  // from them, so showing them a Ready button would be a control that can
+  // never do anything. They watch the roster fill in instead.
+  const isLocalUserPlaying = Boolean(
+    user?.id !== undefined && readinessState?.players?.[user.id],
+  );
+  const isAwaitingReadiness = readinessState?.readiness != null;
+  const localUserIsReady = Boolean(
+    user?.id !== undefined &&
+    readinessState?.readiness?.ready_user_ids.includes(user.id),
+  );
+  const readyDeadlineMs = readinessState?.readiness?.deadline_ms ?? null;
+  const authoritativePendingReadyCount = readinessState?.readiness
+    ? Object.keys(readinessState.players ?? {}).filter(
+        (userId) => !readinessState.readiness!.ready_user_ids.includes(Number(userId)),
+      ).length
+    : 0;
+
+  // Local intent, distinct from the server's record of it. A dropped
+  // confirmation or a mid-gate resync would otherwise leave a player who
+  // already pressed Ready staring at the briefing again.
+  const [readyPressedForGameId, setReadyPressedForGameId] = useState<string | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const hasPressedReady = readyPressedForGameId === gameId;
+  // Treat the local click as ready immediately instead of briefly counting the
+  // player among the people they are now waiting for while the server echoes it.
+  const pendingReadyCount = Math.max(
+    0,
+    authoritativePendingReadyCount - (
+      hasPressedReady && isLocalUserPlaying && !localUserIsReady ? 1 : 0
+    ),
+  );
+
+  useEffect(() => {
+    setReadyPressedForGameId((pressed) => (pressed === gameId ? pressed : null));
+    setHelpOpen(false);
+  }, [gameId]);
+
+  const confirmReady = useCallback(() => {
+    setReadyPressedForGameId(gameId);
+    if (tutorial) {
+      markTutorialSeen(tutorial.key);
+    }
+    sendPlayerReady(gameId);
+  }, [gameId, sendPlayerReady, tutorial]);
+
+  // A player who has already seen this mode's briefing is readied for them, so
+  // veterans never wait on a screen they have read before. The gate still runs
+  // for every match, which is what makes the roster checkmarks meaningful.
+  useEffect(() => {
+    if (
+      !isGameInteractionActive ||
+      !isAwaitingReadiness ||
+      !isLocalUserPlaying ||
+      !tutorial ||
+      hasPressedReady ||
+      localUserIsReady ||
+      !hasSeenTutorial(tutorial.key)
+    ) {
+      return;
+    }
+    confirmReady();
+  }, [
+    confirmReady,
+    hasPressedReady,
+    isAwaitingReadiness,
+    isGameInteractionActive,
+    isLocalUserPlaying,
+    localUserIsReady,
+    tutorial,
+  ]);
+
+  // Self-healing resend: the server drops a readiness it has already recorded,
+  // so re-asserting a local press the authoritative state does not reflect is
+  // safe and closes the gap left by a lost message or a snapshot resync.
+  useEffect(() => {
+    if (
+      !isGameInteractionActive ||
+      !isAwaitingReadiness ||
+      !isLocalUserPlaying ||
+      !hasPressedReady ||
+      localUserIsReady
+    ) {
+      return undefined;
+    }
+    const resend = window.setInterval(() => sendPlayerReady(gameId), 2000);
+    return () => window.clearInterval(resend);
+  }, [
+    gameId,
+    hasPressedReady,
+    isAwaitingReadiness,
+    isGameInteractionActive,
+    isLocalUserPlaying,
+    localUserIsReady,
+    sendPlayerReady,
+  ]);
+
+  const showBriefing = Boolean(
+    tutorial &&
+    isAwaitingReadiness &&
+    isLocalUserPlaying &&
+    isGameInteractionActive &&
+    !gameOver,
+  );
+  const showHelp = Boolean(tutorial && helpOpen && !showBriefing);
+
+  // A briefing supersedes the help screen rather than hiding it. Without this
+  // the suppressed help modal would spring back over live gameplay the moment
+  // the gate resolved, blocking input with no obvious cause.
+  useEffect(() => {
+    if (showBriefing && helpOpen) {
+      setHelpOpen(false);
+    }
+  }, [showBriefing, helpOpen]);
 
   const handleSendGameChat = useCallback((message: string) => {
     if (!isGameInteractionActive) {
@@ -775,10 +981,13 @@ export default function GameArena() {
       : isJoiningGame || isAwaitingCurrentSnapshot
         ? 'Joining game...'
         : 'Preparing arena...';
-  let timeUntilStart = countdownState ? countdownState.start_ms - Date.now() : 0;
+  const countdownEpochMs = countdownState ? simulationStartMs(countdownState) : null;
+  const timeUntilStart = countdownEpochMs === null ? 0 : countdownEpochMs - Date.now();
 
-  const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
-  const showCountdown = countdownState ? countdownSeconds > 0 : false;
+  const countdownSeconds = countdownEpochMs === null ? 0 : Math.ceil(timeUntilStart / 1000);
+  // A match still held by the readiness gate has no countdown to show — the
+  // briefing owns the screen until it resolves.
+  const showCountdown = countdownSeconds > 0;
 
   // HUD state is read from predicted Rust state so Space/touch activation is
   // immediate and still retracts naturally if the authoritative server
@@ -798,6 +1007,9 @@ export default function GameArena() {
     currentStatus === 'Stopped' ||
     (typeof currentStatus === 'object' && currentStatus !== null && 'Complete' in currentStatus),
   );
+  // A modal owns the screen: Space belongs to its Ready button, not to Boost.
+  const isModalOwningInput = showBriefing || showHelp;
+  isModalOwningInputRef.current = isModalOwningInput;
   const boostInputContext: BoostInputContext = {
     active: Boolean(localSnake?.boost.active),
     // The engine's latched copy of what this player asked for. Reconciliation
@@ -808,6 +1020,7 @@ export default function GameArena() {
       boostConfig &&
       localSnake?.is_alive &&
       isGameInteractionActive &&
+      !isModalOwningInput &&
       !isBoostGameTerminal
     ),
     gameOver: isBoostGameTerminal,
@@ -925,11 +1138,11 @@ export default function GameArena() {
       }
     };
     const handleBoostKeyDown = (event: KeyboardEvent) => {
+      const controller = boostInputControllerRef.current!;
       dispatch(
-        boostInputControllerRef.current!.handleKeyDown(
-          event,
-          boostInputContextRef.current,
-        ),
+        isModalOwningInputRef.current
+          ? controller.suppressModalKeyDown(event)
+          : controller.handleKeyDown(event, boostInputContextRef.current),
         event,
       );
     };
@@ -1093,7 +1306,11 @@ export default function GameArena() {
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={boostHud.percent}
-        aria-valuetext={`${boostHud.percent}%${boostHud.active ? ', active' : ''}`}
+        aria-valuetext={
+          boostHud.unlimited
+            ? `Unlimited${boostHud.active ? ', active' : ''}`
+            : `${boostHud.percent}%${boostHud.active ? ', active' : ''}`
+        }
       >
         <span
           className="game-boost-meter__fill"
@@ -1111,11 +1328,11 @@ export default function GameArena() {
         disabled={boostButtonDisabled}
         aria-label={boostInputMode === 'hold'
           ? (boostHud.active
-              ? `Release Boost, ${boostHud.percent}% remaining`
-              : `Hold to Boost, ${boostHud.percent}% charged`)
+              ? `Release Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
+              : `Hold to Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)
           : (boostHud.active
-              ? `Stop Boost, ${boostHud.percent}% remaining`
-              : `Activate Boost, ${boostHud.percent}% charged`)}
+              ? `Stop Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
+              : `Activate Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)}
         aria-keyshortcuts="Space"
         className="game-boost-meter"
         data-testid="boost-button"
@@ -1125,7 +1342,7 @@ export default function GameArena() {
         </span>
         <span className="game-boost-meter__reservoir" aria-hidden="true" />
         <strong className="game-boost-meter__value">
-          {boostHud.percent}%
+          {boostHud.unlimited ? '∞' : `${boostHud.percent}%`}
         </strong>
       </button>
     </div>
@@ -1247,7 +1464,12 @@ export default function GameArena() {
 
               {/* Countdown Overlay */}
               {showCountdown && countdownState && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
+                <div
+                  className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
                   <div className="text-white font-bold text-3xl mb-4" style={{
                     textShadow: '0 2px 4px rgba(0,0,0,0.5)'
                   }}>
@@ -1269,10 +1491,27 @@ export default function GameArena() {
             showBoost={Boolean(boostConfig)}
             boostInputMode={boostInputMode}
             onBoostInputModeChange={handleBoostInputModeChange}
+            onOpenHelp={tutorial ? () => setHelpOpen(true) : undefined}
           />
         </div>
 
       </>
+      {tutorial && (
+        <TutorialModal
+          open={showBriefing || showHelp}
+          content={tutorial}
+          variant={showBriefing ? 'briefing' : 'reference'}
+          autoReadySeconds={
+            showBriefing && readyDeadlineMs !== null
+              ? Math.max(0, Math.ceil((readyDeadlineMs - Date.now()) / 1000))
+              : null
+          }
+          pendingCount={pendingReadyCount}
+          isReady={localUserIsReady || hasPressedReady}
+          onReady={confirmReady}
+          onClose={() => setHelpOpen(false)}
+        />
+      )}
       <ChatPanel
         title="Game Chat"
         messages={gameChatMessages}

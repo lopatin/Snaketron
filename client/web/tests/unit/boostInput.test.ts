@@ -235,6 +235,30 @@ test('a press made before play starts is published once interaction opens', () =
   );
 });
 
+test('modal-owned Space cannot queue Boost for when the briefing closes', () => {
+  for (const mode of ['hold', 'toggle'] as const) {
+    const controller = new BoostInputController(mode);
+
+    assert.deepEqual(
+      controller.suppressModalKeyDown(key('Space', false, target('div'))),
+      { preventDefault: true, command: null },
+    );
+    assert.equal(controller.isSpaceDown(), false);
+    assert.equal(
+      controller.reconcile(context({ interactionActive: true })).command,
+      null,
+      `${mode} must stay off when modal ownership ends`,
+    );
+
+    // The Ready button retains native keyboard activation, but still does not
+    // enter the gameplay controller.
+    assert.deepEqual(
+      controller.suppressModalKeyDown(key('Space', false, target('button'))),
+      { preventDefault: false, command: null },
+    );
+  }
+});
+
 test('an unacknowledged command is republished when interaction resumes', () => {
   const controller = new BoostInputController('hold');
   assert.equal(controller.handleKeyDown(key(), context()).command, 'ActivateBoost');
@@ -293,6 +317,27 @@ test('Toggle arms Boost on an empty meter and keeps it armed', () => {
     controller.handleKeyDown(key(), context({ intent: true })).command,
     'DeactivateBoost',
   );
+});
+
+test('a rejected Boost edge is not resent until the player supplies a new edge', () => {
+  const activation = new BoostInputController('toggle');
+  assert.equal(activation.handleKeyDown(key(), context()).command, 'ActivateBoost');
+  activation.handleRejectedCommand('ActivateBoost');
+  assert.equal(activation.reconcile(context()).command, null);
+  assert.equal(activation.handleKeyUp(key(), context()).command, null);
+  assert.equal(activation.handleKeyDown(key(), context()).command, 'ActivateBoost');
+
+  const deactivation = new BoostInputController('toggle');
+  deactivation.handleKeyDown(key(), context());
+  deactivation.handleKeyUp(key(), context({ intent: true, active: true }));
+  assert.equal(
+    deactivation.handleKeyDown(key(), context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+  deactivation.handleRejectedCommand('DeactivateBoost');
+  assert.equal(deactivation.reconcile(context({ intent: true, active: true })).command, null);
+  assert.equal(deactivation.handleKeyDown(key(), context({ intent: true, active: true })).command,
+    'DeactivateBoost');
 });
 
 test('Hold pointer edges start and stop Boost while its synthesized click is inert', () => {

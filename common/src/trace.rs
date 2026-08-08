@@ -16,7 +16,9 @@
 use crate::{GameCommandMessage, GameEventMessage, GameState};
 use serde::{Deserialize, Serialize};
 
-pub const TRACE_FORMAT_VERSION: u32 = 1;
+/// Version 2 fingerprints the readiness, score-race, latched-intent and
+/// mode-specific Boost fields added by the current gameplay generation.
+pub const TRACE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceSide {

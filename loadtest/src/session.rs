@@ -39,7 +39,7 @@ type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SocketSink = SplitSink<RawSocket, Message>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-const CLIENT_PROTOCOL_VERSION: u16 = 5;
+const CLIENT_PROTOCOL_VERSION: u16 = 6;
 const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 const READER_WAKE_SENTINEL_INTERVAL: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -2915,6 +2915,13 @@ async fn play_session_inner(
         .await
     {
         Ok(()) => {
+            // Synthetic sessions have no pre-match briefing to read. Stress
+            // pool games are not gated at all, but a load test pointed at the
+            // ordinary pool would otherwise idle out the readiness window
+            // before every match and measure the gate instead of the runtime.
+            let _ = session
+                .send_cancellable(WSMessage::PlayerReady { game_id }, cancellation)
+                .await;
             wait_for_game_snapshot(session, game_id, settings.queue_timeout, cancellation).await
         }
         Err(error) => Err(SnapshotWaitError::Retryable(
@@ -6473,8 +6480,16 @@ mod tests {
 
     #[test]
     fn non_boost_command_profile_cadence_is_preserved() {
-        let mut non_boost_game =
-            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut non_boost_game = GameState::new(
+            40,
+            40,
+            GameType::Custom {
+                settings: common::CustomGameSettings::default(),
+            },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
         non_boost_game.properties.tick_duration_ms = 50;
         for profile in [CommandProfile::Realistic, CommandProfile::EveryTick] {
             assert_eq!(ai_decision_interval_ms(&non_boost_game, profile), 50);

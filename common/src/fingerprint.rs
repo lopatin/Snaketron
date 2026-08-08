@@ -16,6 +16,12 @@
 //!   differently by design.
 //! - `usernames`, `spectators`, `game_code`, `host_user_id`, `start_ms`:
 //!   cosmetic or static; not gameplay state.
+//! - `readiness` and `simulation_epoch_ms`: the pre-match readiness gate.
+//!   Both resolve before tick 1, so hashing them would compare states across
+//!   the window where a `PlayerReady` event is legitimately still in flight
+//!   and report divergence for ordinary transport latency. A gate that did
+//!   genuinely disagree is still caught, because `tick` is hashed and the two
+//!   sides would start simulating at different times.
 
 use crate::game_state::{GameCommand, GameState, GameStatus};
 
@@ -241,6 +247,7 @@ impl GameState {
                 h.write_u32(boost.pad_respawn_ms);
                 h.write_u16(boost.spot_layout_version);
                 h.write_u16(boost.rules_version);
+                h.write_u8(boost.unlimited as u8);
             }
             None => h.write_u8(0),
         }

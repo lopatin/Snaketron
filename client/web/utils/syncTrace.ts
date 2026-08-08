@@ -10,7 +10,7 @@
 import { api } from '../services/api';
 import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 
-export const TRACE_FORMAT_VERSION = 1;
+export const TRACE_FORMAT_VERSION = 2;
 const MAX_RECORDS = 20000;
 
 export type TraceRecord =

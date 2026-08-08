@@ -14,7 +14,7 @@
 //!   mismatch, command wire latency and rescheduling, clock drift, and a
 //!   root-cause [`DivergenceReport::verdict`].
 
-use crate::trace::{TraceRecord, TraceSide};
+use crate::trace::{TRACE_FORMAT_VERSION, TraceRecord, TraceSide};
 use crate::{
     CommandId, DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameEngine, GameEvent,
     GameEventMessage, GameState,
@@ -97,6 +97,22 @@ pub fn trace_side(records: &[TraceRecord]) -> Option<TraceSide> {
     })
 }
 
+fn require_current_trace_format(records: &[TraceRecord]) -> Result<()> {
+    let version = records
+        .iter()
+        .find_map(|record| match record {
+            TraceRecord::Meta { version, .. } => Some(*version),
+            _ => None,
+        })
+        .context("trace has no Meta record")?;
+    if version != TRACE_FORMAT_VERSION {
+        bail!(
+            "trace format version {version} is incompatible with fingerprint format {TRACE_FORMAT_VERSION}"
+        );
+    }
+    Ok(())
+}
+
 fn event_value(event: &GameEvent) -> serde_json::Value {
     serde_json::to_value(event).unwrap_or(serde_json::Value::Null)
 }
@@ -144,6 +160,7 @@ pub struct ServerReplay {
 
 impl ServerReplay {
     pub fn from_records(records: Vec<TraceRecord>) -> Result<ServerReplay> {
+        require_current_trace_format(&records)?;
         let side = trace_side(&records).context("trace has no Meta record")?;
         if side != TraceSide::Server {
             bail!("trace Meta.side is {:?}, expected Server", side);
@@ -249,6 +266,16 @@ impl ServerReplay {
                     advance(&mut engine, *ts_ms, &mut emitted)?;
                     match &msg.event {
                         GameEvent::Snapshot { .. } => {}
+                        // Readiness is authored by the executor out of band,
+                        // not derived by the engine, so there is nothing to
+                        // compare it against. Apply it instead: a trace of a
+                        // gated match anchors on a held state, and without the
+                        // recorded release the replayed engine would never
+                        // reach its first tick and every trace would read as
+                        // engine nondeterminism.
+                        GameEvent::PlayerReady { .. } | GameEvent::MatchStartScheduled { .. } => {
+                            engine.apply_pre_match_readiness_event(msg.event.clone())?;
+                        }
                         GameEvent::TickHash { hash, .. } => {
                             events_compared += 1;
                             if engine.current_tick() != msg.tick {
@@ -363,6 +390,7 @@ pub struct ClientReplay {
 
 impl ClientReplay {
     pub fn from_records(records: Vec<TraceRecord>) -> Result<ClientReplay> {
+        require_current_trace_format(&records)?;
         let side = trace_side(&records).context("trace has no Meta record")?;
         if side != TraceSide::Client {
             bail!("trace Meta.side is {:?}, expected Client", side);
@@ -1086,6 +1114,32 @@ mod tests {
         );
         assert!(outcome.ticks_replayed >= 25);
         assert!(outcome.events_compared > 4);
+    }
+
+    #[test]
+    fn replay_rejects_an_obsolete_fingerprint_format() {
+        let server_records = build_synthetic_server_trace();
+        let client_records = build_matching_client_trace(&server_records);
+
+        for (mut records, side) in [
+            (server_records, TraceSide::Server),
+            (client_records, TraceSide::Client),
+        ] {
+            let TraceRecord::Meta { version, .. } = &mut records[0] else {
+                panic!("synthetic trace must begin with Meta");
+            };
+            *version = TRACE_FORMAT_VERSION - 1;
+
+            let error = match side {
+                TraceSide::Server => ServerReplay::from_records(records).err(),
+                TraceSide::Client => ClientReplay::from_records(records).err(),
+            }
+            .expect("obsolete trace must be rejected");
+            assert!(
+                error.to_string().contains("trace format version"),
+                "unexpected rejection: {error}"
+            );
+        }
     }
 
     #[test]

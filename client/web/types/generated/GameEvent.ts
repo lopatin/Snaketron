@@ -25,4 +25,4 @@ command_id_client?: CommandId | null,
  * or above this sequence have the same terminal rejection. Exact
  * outcomes and the contiguous resolved watermark take precedence.
  */
-session_rejected_from?: number, } } | { "StatusUpdated": { status: GameStatus, } } | { "ScoreUpdated": { snake_id: number, score: number, } } | { "TeamScoreUpdated": { team_id: TeamId, score: number, } } | { "SnakeRespawned": { snake_id: number, position: Position, direction: Direction, } } | { "XPAwarded": { player_xp: { [key in number]?: number }, } } | { "TickHash": { hash: number, server_ts_ms: number, } };
+session_rejected_from?: number, } } | { "StatusUpdated": { status: GameStatus, } } | { "PlayerReady": { user_id: number, } } | { "MatchStartScheduled": { simulation_epoch_ms: number, } } | { "ScoreUpdated": { snake_id: number, score: number, } } | { "TeamScoreUpdated": { team_id: TeamId, score: number, } } | { "SnakeRespawned": { snake_id: number, position: Position, direction: Direction, } } | { "XPAwarded": { player_xp: { [key in number]?: number }, } } | { "TickHash": { hash: number, server_ts_ms: number, } };

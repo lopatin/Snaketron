@@ -1,4 +1,7 @@
-use crate::{BOOST_TICK_INTERVAL_MS, MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, TeamId};
+use crate::{
+    BOOST_TICK_INTERVAL_MS, DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_SPEED_MILLI,
+    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, TeamId,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +131,49 @@ impl Snake {
         }
     }
 
+    /// Build a snake already posed in a given visual state, for rendering
+    /// something that is not a live match — tutorial illustrations, previews.
+    ///
+    /// This is deliberately separate from [`Snake::new`]: gameplay may only
+    /// reach a boosting state by going through the crate-private Boost
+    /// lifecycle, and that stays true. Nothing here is ever stepped, ticked,
+    /// or published, so the charge is set to a full configured tank purely so
+    /// the renderer draws the active-Boost contour.
+    pub fn for_illustration(
+        body: Vec<Position>,
+        direction: Direction,
+        team_id: Option<TeamId>,
+        food: u32,
+        is_alive: bool,
+        boost_active: bool,
+    ) -> Self {
+        Self {
+            body,
+            direction,
+            is_alive,
+            food,
+            team_id,
+            speed_milli: if boost_active {
+                DEFAULT_BOOST_SPEED_MILLI
+            } else {
+                NORMAL_SNAKE_SPEED_MILLI
+            },
+            movement_credit: 0,
+            boost: SnakeBoost {
+                charge_ms: if boost_active {
+                    DEFAULT_BOOST_CAPACITY_MS
+                } else {
+                    0
+                },
+                active: boost_active,
+                // A boosting illustration depicts a player mid-hold, so the
+                // latched intent matches the active level. Nothing here is
+                // ever resolved, so the two can never drift apart.
+                intent: boost_active,
+            },
+        }
+    }
+
     pub fn speed_milli(&self) -> u16 {
         self.speed_milli
     }
@@ -244,12 +290,20 @@ impl Snake {
     /// Depletion is finalized only after movement and packet collection, so a
     /// snake that lands on a packet during its final funded quantum continues
     /// Boost seamlessly.
-    pub(crate) fn reserve_boost_quantum(&mut self) -> bool {
+    ///
+    /// An unlimited tank still has to be *funded* — the snake must be alive and
+    /// boosting — but the quantum costs nothing, so the meter never reaches the
+    /// zero that `finalize_boost_depletion` acts on. Keeping the charge pinned
+    /// at capacity rather than special-casing depletion means every downstream
+    /// invariant ("active Boost requires funded charge") holds unchanged.
+    pub(crate) fn reserve_boost_quantum(&mut self, unlimited: bool) -> bool {
         if !self.is_alive || !self.boost.active || self.boost.charge_ms < BOOST_TICK_INTERVAL_MS {
             return false;
         }
 
-        self.boost.charge_ms -= BOOST_TICK_INTERVAL_MS;
+        if !unlimited {
+            self.boost.charge_ms -= BOOST_TICK_INTERVAL_MS;
+        }
         true
     }
 
@@ -305,17 +359,23 @@ impl Snake {
         moves
     }
 
-    /// Clear all fuel and movement phase when the snake gets a new life.
+    /// Clear movement phase and restore the mode's starting fuel when the
+    /// snake gets a new life.
     ///
-    /// Latched intent deliberately survives: it describes what the player is
-    /// physically doing right now, not simulation state, and a player still
-    /// holding the control across a death must boost again on their own fuel
-    /// without re-pressing.
-    pub(crate) fn reset_boost_and_movement(&mut self) {
+    /// `unlimited_capacity_ms` is `Some` only where the tank never empties. A
+    /// new life starts full there, because such a map has no pickups: an empty
+    /// unlimited tank would be permanently unusable rather than merely spent.
+    ///
+    /// Latched intent deliberately survives either way: it describes what the
+    /// player is physically doing right now, not simulation state, and a player
+    /// still holding the control across a death must boost again on their own
+    /// fuel without re-pressing.
+    pub(crate) fn reset_boost_and_movement(&mut self, unlimited_capacity_ms: Option<u32>) {
         self.speed_milli = NORMAL_SNAKE_SPEED_MILLI;
         self.movement_credit = 0;
         self.boost = SnakeBoost {
             intent: self.boost.intent,
+            charge_ms: unlimited_capacity_ms.unwrap_or(0),
             ..SnakeBoost::default()
         };
     }
@@ -531,7 +591,7 @@ mod tests {
         snake.collect_boost_charge(BOOST_TICK_INTERVAL_MS, 100);
         assert!(snake.try_activate_boost(1_500, 100));
 
-        assert!(snake.reserve_boost_quantum());
+        assert!(snake.reserve_boost_quantum(false));
         assert_eq!(snake.boost.charge_ms, 0);
         assert!(snake.boost.active);
         assert_eq!(snake.speed_milli, 1_500);
@@ -543,7 +603,7 @@ mod tests {
         assert!(!snake.finalize_boost_depletion());
         assert!(snake.boost.active);
 
-        assert!(snake.reserve_boost_quantum());
+        assert!(snake.reserve_boost_quantum(false));
         assert!(snake.finalize_boost_depletion());
         assert!(!snake.boost.active);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
@@ -656,7 +716,7 @@ mod tests {
         assert!(snake.try_activate_boost(1_500, 3_000));
         snake.movement_credit = 42_000;
 
-        snake.reset_boost_and_movement();
+        snake.reset_boost_and_movement(None);
 
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit, 0);
@@ -672,7 +732,7 @@ mod tests {
         );
 
         snake.set_boost_intent(false);
-        snake.reset_boost_and_movement();
+        snake.reset_boost_and_movement(None);
         assert_eq!(snake.boost, SnakeBoost::default());
     }
 

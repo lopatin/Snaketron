@@ -860,7 +860,7 @@ fn draw_alive_snake_skin(
 const ROSTER_LABEL_DARK_INK: &str = "#0f172a";
 const ROSTER_LABEL_LIGHT_INK: &str = "#ffffff";
 /// Clearance between the dark head core and the name, as a fraction of a cell.
-const ROSTER_LABEL_HEAD_GAP_RATIO: f64 = 0.10;
+const ROSTER_LABEL_HEAD_GAP_RATIO: f64 = 0.20;
 /// How far past the tail's centre the name may run. The tail cap is a solid
 /// half-cell, so this stays inside the body.
 const ROSTER_LABEL_TAIL_OVERHANG_RATIO: f64 = 0.30;
@@ -952,6 +952,8 @@ struct RosterSnakeRequest {
     font_family: Option<String>,
     #[serde(default)]
     boost_active: bool,
+    #[serde(default)]
+    is_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -971,6 +973,14 @@ impl RosterSnakeLayout {
             RosterFacing::Right => [(last, 0.0), (0.0, 0.0)],
             RosterFacing::Left => [(0.0, 0.0), (last, 0.0)],
         }
+    }
+
+    fn head_center(self, facing: RosterFacing) -> (f64, f64) {
+        let (head_x, head_y) = self.body_cells(facing)[0];
+        (
+            head_x * self.cell_size + self.cell_size / 2.0,
+            head_y * self.cell_size + self.cell_size / 2.0,
+        )
     }
 }
 
@@ -1154,6 +1164,31 @@ fn draw_roster_label(
     Ok(())
 }
 
+/// Put readiness on the same visual anchor as identity: the dark core of the
+/// snake's actual head. A stroked path stays crisp at both roster breakpoints
+/// and mirrors automatically with the renderer's facing-aware head geometry.
+fn draw_roster_ready_check(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    layout: RosterSnakeLayout,
+    facing: RosterFacing,
+) -> Result<(), JsValue> {
+    let (center_x, center_y) = layout.head_center(facing);
+    let cell = layout.cell_size;
+
+    ctx.save();
+    ctx.set_stroke_style_str("#ffffff");
+    ctx.set_line_width((cell * 0.14).clamp(1.5, 2.4));
+    ctx.set_line_cap("round");
+    ctx.set_line_join("round");
+    ctx.begin_path();
+    ctx.move_to(center_x - cell * 0.22, center_y);
+    ctx.line_to(center_x - cell * 0.06, center_y + cell * 0.17);
+    ctx.line_to(center_x + cell * 0.24, center_y - cell * 0.19);
+    ctx.stroke();
+    ctx.restore();
+    Ok(())
+}
+
 /// Paint one roster snake onto its own canvas.
 ///
 /// `request_json` carries the palette inputs (see `SnakeSkinInputs`) plus the
@@ -1223,6 +1258,9 @@ pub fn render_roster_snake(
         request.boost_active,
         None,
     )?;
+    if request.is_ready {
+        draw_roster_ready_check(&ctx, layout, request.facing)?;
+    }
     draw_roster_label(
         &ctx,
         layout,
@@ -1971,7 +2009,13 @@ pub fn render_game_state(
     // our field transform afterwards before drawing snakes and walls.
     ctx.restore();
     ctx.save();
-    let celebration_result = draw_celebration.call0(&JsValue::NULL);
+    // Canvas and cell size are supplied for focused renderers such as the
+    // tutorial crop. Existing live callbacks intentionally ignore arguments.
+    let celebration_result = draw_celebration.call2(
+        &JsValue::NULL,
+        canvas.as_ref(),
+        &JsValue::from_f64(cell_size),
+    );
     ctx.restore();
     if let Err(error) = celebration_result {
         // A cosmetic renderer must never suppress gameplay. The web-side
@@ -2900,8 +2944,9 @@ mod tests {
         let head_center_x = (layout.cells - 1) as f64 * cell + cell / 2.0;
         assert_eq!(right.align, "right");
         assert!(
-            head_center_x - right.x > core_radius,
-            "the name must end clear of the head core"
+            (head_center_x - right.x - core_radius - cell * ROSTER_LABEL_HEAD_GAP_RATIO).abs()
+                < 1e-9,
+            "the name must keep the authored gap beyond the head core"
         );
         assert!((right.y - (cell / 2.0 + ROSTER_LABEL_BASELINE_NUDGE)).abs() < 1e-9);
         assert_eq!(right.font_size, 8.5);
@@ -2914,8 +2959,8 @@ mod tests {
         let left = roster_label_layout(layout, RosterFacing::Left);
         assert_eq!(left.align, "left");
         assert!(
-            left.x - cell / 2.0 > core_radius,
-            "the name must start clear of the head core"
+            (left.x - cell / 2.0 - core_radius - cell * ROSTER_LABEL_HEAD_GAP_RATIO).abs() < 1e-9,
+            "the mirrored name must keep the same head clearance"
         );
 
         // Both facings are exact mirrors of one another about the body span.
@@ -2924,6 +2969,11 @@ mod tests {
         assert!((left.max_width - right.max_width).abs() < 1e-9);
         assert_eq!(left.font_size, right.font_size);
         assert_eq!(left.y, right.y);
+
+        let left_head = layout.head_center(RosterFacing::Left);
+        let right_head = layout.head_center(RosterFacing::Right);
+        assert_eq!(left_head.1, right_head.1);
+        assert!((left_head.0 - (span - right_head.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -2992,11 +3042,25 @@ mod tests {
         assert_eq!(request.facing, RosterFacing::Right);
         assert_eq!(request.name, "Troncat33");
         assert!(!request.boost_active);
+        assert!(!request.is_ready);
         assert_eq!(request.font_family, None);
         assert_eq!(
             request.skin.colors(),
             snake_palette(2, Some(0), 1, 4, true, Some(0), Some(0))
         );
+
+        let ready: RosterSnakeRequest = serde_json::from_str(
+            r#"{
+                "snake_index": 1,
+                "team_id": 1,
+                "snake_count": 2,
+                "is_team_game": true,
+                "facing": "left",
+                "is_ready": true
+            }"#,
+        )
+        .expect("ready roster request must parse");
+        assert!(ready.is_ready);
 
         // Spectators (no local snake) still resolve a valid palette.
         let spectator: SnakeSkinInputs = serde_json::from_str(
