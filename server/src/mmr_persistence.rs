@@ -480,12 +480,18 @@ async fn calculate_ffa_mmr_deltas(
                     // The terminal winner is always alone in first even when
                     // a kicked player has the same or a higher score.
                     rank = 2;
-                } else if game_state.is_player_idle_kicked(player_scores[index].0)
-                    != game_state.is_player_idle_kicked(player_scores[index - 1].0)
-                {
-                    rank = index + 1;
-                } else if player_scores[index].1 < player_scores[index - 1].1 {
-                    rank = index + 1;
+                } else {
+                    // Two independent reasons to open a new placement tier:
+                    // crossing the boundary between removed and remaining
+                    // players, or a genuine score drop. Players who are on the
+                    // same side of that boundary and scored the same tie.
+                    let crosses_removal_boundary = game_state
+                        .is_player_idle_kicked(player_scores[index].0)
+                        != game_state.is_player_idle_kicked(player_scores[index - 1].0);
+                    let scored_less = player_scores[index].1 < player_scores[index - 1].1;
+                    if crosses_removal_boundary || scored_less {
+                        rank = index + 1;
+                    }
                 }
             }
             (team.as_slice(), MultiTeamOutcome::new(rank))
