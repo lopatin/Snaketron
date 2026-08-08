@@ -25,6 +25,7 @@ services:
       - ./client:/usr/src/app/client:delegated
       - ./terminal:/usr/src/app/terminal:delegated
       - ./bot:/usr/src/app/bot:delegated
+      - ./loadtest:/usr/src/app/loadtest:delegated
       - ./Cargo.toml:/usr/src/app/Cargo.toml:delegated
       - ./Cargo.lock:/usr/src/app/Cargo.lock:delegated
       # Named volume for target directory to avoid rebuilding dependencies

@@ -2,11 +2,22 @@
 
 A competitive online multiplayer Snake game built with Rust (backend + WebAssembly frontend).
 
+## Features
+
+- **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
+- **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with chat and invite links
+- **Boost**: hold-to-boost speed bursts fueled by collectible Boost pads (unlimited fuel in Solo)
+- **Accounts**: register/login with JWT auth, or play instantly as a guest
+- **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP
+- **Smooth multiplayer**: the game engine is shared between server and client, enabling client-side prediction with server authority
+
 ## Architecture
 
-- **Backend**: Rust server with WebSocket connections, gRPC for inter-server communication, and Raft consensus
-- **Frontend**: React + WebAssembly (compiled from Rust)
-- **Database**: PostgreSQL with automatic migrations
+- **Backend**: Rust server (Tokio + axum) serving the REST API and WebSocket connections on a single HTTP port
+- **Cluster coordination**: Redis (Valkey) — server membership and heartbeats, partition assignment with fenced leases, and Redis Streams as the game event/command bus. The server running a game's loop is not necessarily the WebSocket server its players are connected to.
+- **Persistence**: AWS DynamoDB — a single-table-style main table with GSIs, plus small auxiliary tables for username uniqueness and game codes; LocalStack stands in for it in local development
+- **Frontend**: React + TypeScript consuming a Rust game engine compiled to WebAssembly (wasm-pack), bundled with webpack
+- **Shared game logic**: the `common/` crate compiles to both native (server) and WASM (client)
 - **Infrastructure**: Docker containers, designed for AWS Fargate deployment
 
 ## Quick Start
@@ -15,7 +26,7 @@ A competitive online multiplayer Snake game built with Rust (backend + WebAssemb
 
 #### For Development (with hot reloading):
 ```bash
-# Start database and server with auto-reload on code changes
+# Start LocalStack (DynamoDB), Valkey (Redis), and the server with auto-reload on code changes
 ./dev.sh
 
 # In another terminal, build and start the client
@@ -28,26 +39,26 @@ npm start
 
 #### For Production-like environment:
 ```bash
-# Start database and server (rebuilds on each change)
+# Start LocalStack (DynamoDB), Valkey (Redis), and the server (full rebuild each time)
 docker-compose up --build
 ```
 
 The game will be available at:
 - Frontend: http://localhost:3000 (webpack dev server)
-- WebSocket Server: ws://localhost:8080 (Docker container)
-- gRPC Server: localhost:50051 (Docker container)
-- Database: localhost:5432 (Docker container)
+- HTTP API + WebSocket: localhost:8080 (WebSocket endpoint at ws://localhost:8080/ws)
+- DynamoDB (LocalStack): http://localhost:4566
+- Redis (Valkey): localhost:6379
 
 ### Manual Setup
 
-1. Start PostgreSQL:
+1. Start the data services (LocalStack + Redis) and create the DynamoDB tables:
    ```bash
-   docker-compose up -d db
+   ./test-deps.sh
    ```
 
-2. Run the server:
+2. Run the server (`.cargo/config.toml` supplies the LocalStack/Redis defaults; only the region must be set explicitly):
    ```bash
-   cargo run --bin server
+   SNAKETRON_REGION=us cargo run --bin server
    ```
 
 3. Build and run the client:
@@ -63,14 +74,57 @@ The game will be available at:
 
 ### Running Tests
 
+Server integration tests need Redis and LocalStack DynamoDB running — start them with `./test-deps.sh` first (it also creates the DynamoDB tables).
+
 ```bash
-# Run all tests
+# Run all Rust tests
 cargo test
 
 # Run server tests with logging
 RUST_LOG=info cargo test -p server -- --nocapture
+
+# Curated serial suites (set up their own env, run single-threaded)
+./run_matchmaking_tests.sh
+./run_quickmatch_tests.sh
 ```
 
+Client tests and checks:
+
+```bash
+cd client/web
+npm test            # Playwright end-to-end tests
+npm run test:unit   # Node unit tests
+npm run type-check  # TypeScript type check
+```
+
+### Code Quality
+
+CI requires formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+### Generated TypeScript Types
+
+TypeScript types for everything crossing the WebSocket are generated from the Rust source of truth with ts-rs. After changing any wire type, regenerate them and commit the diff:
+
+```bash
+./scripts/gen-types.sh
+```
+
+### Game Replays
+
+The repo includes replay-recording infrastructure (`server/src/replay/`) and sample `.replay` captures in `replays/`, though recording is not currently wired into the running server. Play the samples back in the terminal viewer:
+
+```bash
+cargo run --bin snaketron -- replays/
+```
+
+### itch.io Build
+
+`ITCH_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle suitable for uploading to itch.io.
 
 ### Run a coordinated autoscaling load test
 ```bash
@@ -87,11 +141,22 @@ The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-pa
 ### Project Structure
 
 - `common/` - Shared game logic (compiled to both native and WASM)
-- `server/` - Game server with WebSocket and gRPC support
-- `client/` - WebAssembly client module
+- `server/` - Game server: WebSocket sessions, matchmaking, game executors, persistence
+- `client/` - WebAssembly client module and the React/TypeScript web app (`client/web/`)
+- `bot/` - CLI that runs one or more AI bots against a live server over WebSocket
+- `macros/` - Proc-macro crate (`serde_wasm_bindgen` attribute for Rust-to-WASM bindings)
 - `terminal/` - Terminal-based game viewer and replay player
 - `loadtest/` - Coordinated AI load generator and aggregate reporting
-- `specs/` - TLA+ specifications for distributed systems design
+- `replays/` - Sample `.replay` game captures for the terminal viewer
+- `scripts/` - Development helpers (type generation, DynamoDB init, test dependencies)
+- `specs/` - Design documents and PRDs (matchmaking, Boost, autoscaling resilience, ...)
+- `tla_specs/` - TLA+ specifications (checked with `tla2tools.jar` at the repo root)
+- `docs/` - Screenshots and assets referenced from pull-request descriptions
+
+### Further Documentation
+
+- [DEBUGGING.md](DEBUGGING.md) - Runbook for diagnosing state-synchronization bugs (traces, TickHash, replaying to a local repro)
+- [loadtest/README.md](loadtest/README.md) - Load test profiles, safety controls, and report semantics
 
 ## Production Deployment
 
