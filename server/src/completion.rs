@@ -176,6 +176,13 @@ impl CompletionRecordV1 {
         if self.final_state.is_stress_test {
             return Ok(());
         }
+        let inactivity_abandoned = self.final_state.completed_by_inactivity
+            && matches!(
+                self.final_state.status,
+                GameStatus::Complete {
+                    winning_snake_id: None
+                }
+            );
         for user_id in self.final_state.players.keys() {
             let xp_count = self
                 .effects
@@ -223,6 +230,12 @@ impl CompletionRecordV1 {
                 if mmr_count != 0 || ranking_count != 0 || high_score_count != 1 {
                     return Err(anyhow!(
                         "completion has an incomplete solo effect set for user {user_id}"
+                    ));
+                }
+            } else if inactivity_abandoned {
+                if mmr_count != 0 || ranking_count != 0 || high_score_count != 0 {
+                    return Err(anyhow!(
+                        "abandoned inactivity completion cannot contain player progression effects"
                     ));
                 }
             } else if mmr_count != 1 || ranking_count != 1 || high_score_count != 0 {

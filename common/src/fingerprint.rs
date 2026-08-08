@@ -216,6 +216,24 @@ impl GameState {
             h.write_u32(count);
         }
 
+        let mut activity_ticks: Vec<(u32, u32)> = self
+            .player_last_activity_ticks
+            .iter()
+            .map(|(user_id, tick)| (*user_id, *tick))
+            .collect();
+        activity_ticks.sort_unstable();
+        h.write_u32(activity_ticks.len() as u32);
+        for (user_id, tick) in activity_ticks {
+            h.write_u32(user_id);
+            h.write_u32(tick);
+        }
+
+        h.write_u32(self.idle_kicked_user_ids.len() as u32);
+        for user_id in &self.idle_kicked_user_ids {
+            h.write_u32(*user_id);
+        }
+        h.write_u8(self.completed_by_inactivity as u8);
+
         h.write_u64(self.properties.available_food_target as u64);
         h.write_u32(self.properties.tick_duration_ms);
         match self.properties.time_limit_ms {
@@ -244,6 +262,8 @@ impl GameState {
             }
             None => h.write_u8(0),
         }
+        h.write_u32(self.properties.player_idle_timeout_ms);
+        h.write_u32(self.properties.player_idle_warning_ms);
 
         let commands = self.command_queue.authoritative_commands();
         h.write_u32(commands.len() as u32);
@@ -270,6 +290,10 @@ impl GameState {
                 }
                 GameCommand::DeactivateBoost { snake_id } => {
                     h.write_u8(2);
+                    h.write_u32(snake_id);
+                }
+                GameCommand::PlayerActivity { snake_id } => {
+                    h.write_u8(3);
                     h.write_u32(snake_id);
                 }
                 GameCommand::UpdateStatus { .. } => {

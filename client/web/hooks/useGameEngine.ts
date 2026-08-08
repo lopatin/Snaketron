@@ -9,7 +9,7 @@ import type { QueuedGameEvent } from './useGameWebSocket';
 interface UseGameEngineProps {
   gameId: string;
   playerId: number;
-  onCommandReady?: (commandMessage: GameCommandMessage) => void;
+  onCommandReady?: (commandMessage: GameCommandMessage) => boolean;
   onRequestResync?: () => void;
   latencyMs?: number;
 }
@@ -20,7 +20,7 @@ interface UseGameEngineReturn {
   committedState: GameState | null;
   isGameComplete: boolean;
   connectionStale: boolean;
-  sendCommand: (command: Command) => void;
+  sendCommand: (command: Command) => boolean;
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
   /** Render predicted state, injecting score effects between field and snakes. */
   renderTo: (
@@ -362,20 +362,20 @@ export const useGameEngine = ({
     
     if (!engineRef.current || playerId === undefined) {
       console.error('Cannot send command - engine:', !!engineRef.current, 'playerId:', playerId);
-      return;
+      return false;
     }
 
+    let commandMessageJson: string | null = null;
     try {
       // Look up the snake ID for the current player from the game state
       const snakeId = engineRef.current.getSnakeIdForUser(playerId);
       
       if (snakeId === undefined || snakeId === null) {
         console.error('Cannot find snake for player ID:', playerId);
-        return;
+        return false;
       }
 
       // Process command based on type
-      let commandMessageJson: string;
       if (typeof command === 'object' && 'Turn' in command) {
         console.log('Processing turn command:', command.Turn.direction, 'at', Date.now());
         commandMessageJson = engineRef.current.processTurn(snakeId, command.Turn.direction);
@@ -384,12 +384,14 @@ export const useGameEngine = ({
         commandMessageJson = engineRef.current.processActivateBoost(snakeId);
       } else if (command === 'DeactivateBoost') {
         commandMessageJson = engineRef.current.processDeactivateBoost(snakeId);
+      } else if (command === 'PlayerActivity') {
+        commandMessageJson = engineRef.current.processPlayerActivity(snakeId);
       } else if (command === 'Respawn') {
         console.error('Respawn command not implemented yet');
-        return;
+        return false;
       } else {
         console.error('Unsupported command type:', command);
-        return;
+        return false;
       }
 
       // Parse and send to server. The command envelope contains only u32
@@ -397,6 +399,13 @@ export const useGameEngine = ({
       // lossless here — unlike the inbound event path with its u64 hashes.
       const commandMessage: GameCommandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
+
+      const admitted = onCommandReady?.(commandMessage) ?? false;
+      if (!admitted) {
+        engineRef.current.discardLocalCommand(commandMessageJson);
+        console.warn('Command prediction retracted because durable delivery admission failed');
+        return false;
+      }
 
       recordTrace({
         CmdOut: {
@@ -406,10 +415,18 @@ export const useGameEngine = ({
         }
       });
 
-      onCommandReady?.(commandMessage);
       console.log('Command sent to server at', Date.now());
+      return true;
     } catch (error) {
+      if (commandMessageJson && engineRef.current) {
+        try {
+          engineRef.current.discardLocalCommand(commandMessageJson);
+        } catch (discardError) {
+          console.error('Failed to retract unsent command prediction:', discardError);
+        }
+      }
       console.error('Failed to process command:', error);
+      return false;
     }
   }, [playerId, onCommandReady]);
 

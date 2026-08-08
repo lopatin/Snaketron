@@ -163,6 +163,7 @@ export type Command =
   | { Turn: { direction: Direction } }
   | 'ActivateBoost'
   | 'DeactivateBoost'
+  | 'PlayerActivity'
   | 'Respawn';
 
 // Command-protocol helper types for the v2 at-least-once command path. The

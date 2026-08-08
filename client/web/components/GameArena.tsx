@@ -8,6 +8,8 @@ import { GameState, CanvasRef, ArenaRotation, GameType, LobbyGameMode, QueueMode
 import { getWasm } from '../wasm';
 import GameHudShell from './GameHudShell';
 import GameControlsHint from './GameControlsHint';
+import IdleKickDialog from './IdleKickDialog';
+import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import { LobbyChat as ChatPanel } from './LobbyChat';
 import { INVALID_GAME_ID_REASON, parseU32GameId } from '../utils/gameId';
@@ -27,6 +29,7 @@ import {
   type BoostInputMode,
 } from '../utils/boostInput';
 import { buildBoostHudView } from '../utils/boostHud';
+import { buildPlayerIdlePresentation } from '../utils/idlePresentation';
 import {
   createScoreEffectRuntime,
   drawScoreEffects,
@@ -161,6 +164,7 @@ export default function GameArena() {
     lobbyPreferences,
     isSessionAuthenticated,
     createLobby,
+    leaveLobby,
   } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
@@ -308,7 +312,9 @@ export default function GameArena() {
   const isRequestForCurrentRoute =
     routeGameId !== null && currentGameId === routeGameId.toString();
   const isAwaitingCurrentSnapshot = awaitingGameSnapshotForId === gameId;
-  const isGameInteractionActive =
+  const committedLocalIdle = buildPlayerIdlePresentation(committedState, user?.id);
+  const localWasIdleKicked = committedLocalIdle.isKicked;
+  const isGameObservationActive =
     connected &&
     isSessionAuthenticated &&
     isRequestForCurrentRoute &&
@@ -316,6 +322,7 @@ export default function GameArena() {
     !isAwaitingCurrentSnapshot &&
     !currentGameLoadFailure &&
     gameState !== null;
+  const isGameInteractionActive = isGameObservationActive && !localWasIdleKicked;
 
   useEffect(() => {
     if (currentGameLoadFailure) {
@@ -325,10 +332,10 @@ export default function GameArena() {
   }, [currentGameLoadFailure]);
 
   useEffect(() => {
-    if (!isGameInteractionActive) {
+    if (!isGameObservationActive) {
       stopEngine();
     }
-  }, [isGameInteractionActive, stopEngine]);
+  }, [isGameObservationActive, stopEngine]);
 
   // Preload and decode the atlas before gameplay starts. The arena countdown
   // gives this a generous head start, while the render loop safely tolerates a
@@ -766,7 +773,7 @@ export default function GameArena() {
   // Calculate countdown from game start time or round start time
   const countdownState = gameState ?? committedState;
   const isWaitingForSnapshot =
-    !isGameInteractionActive ||
+    !isGameObservationActive ||
     !gameState;
   const waitingMessage = !connected
     ? 'Reconnecting...'
@@ -779,6 +786,14 @@ export default function GameArena() {
 
   const countdownSeconds = countdownState ? Math.ceil(timeUntilStart / 1000) : 0;
   const showCountdown = countdownState ? countdownSeconds > 0 : false;
+  const localIdle = buildPlayerIdlePresentation(gameState ?? committedState, user?.id);
+  const idleWarning =
+    isGameInteractionActive &&
+    !connectionStale &&
+    !gameOver
+      ? localIdle.warning
+      : null;
+  const showIdleKickDialog = localWasIdleKicked && !isGameComplete && !gameOver;
 
   // HUD state is read from predicted Rust state so Space/touch activation is
   // immediate and still retracts naturally if the authoritative server
@@ -818,6 +833,13 @@ export default function GameArena() {
     sendCommand(command);
   }, [sendCommand]);
   sendBoostCommandRef.current = sendBoostInputCommand;
+
+  const handleConfirmActivity = useCallback(() => {
+    if (!isGameInteractionActive || gameOver || localWasIdleKicked) {
+      return;
+    }
+    sendCommand('PlayerActivity');
+  }, [gameOver, isGameInteractionActive, localWasIdleKicked, sendCommand]);
 
   const sendBoostDecision = useCallback((decision: BoostInputDecision) => {
     if (decision.command) {
@@ -1024,6 +1046,18 @@ export default function GameArena() {
   const handleBackToMenu = () => {
     // Keep the stop ordered before LeaveGame clears the command channel.
     teardownGameSession();
+    navigate('/');
+  };
+
+  const handleIdleKickToMenu = async () => {
+    teardownGameSession();
+    if (currentLobby) {
+      try {
+        await leaveLobby();
+      } catch (error) {
+        console.warn('Failed to leave lobby after inactivity removal:', error);
+      }
+    }
     navigate('/');
   };
 
@@ -1245,6 +1279,14 @@ export default function GameArena() {
                 </div>
               )}
 
+              {idleWarning && (
+                <IdleWarningBanner
+                  key={`${gameId}:${idleWarning.deadlineTick}`}
+                  warning={idleWarning}
+                  onConfirmActivity={handleConfirmActivity}
+                />
+              )}
+
               {/* Countdown Overlay */}
               {showCountdown && countdownState && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
@@ -1279,10 +1321,13 @@ export default function GameArena() {
         onSendMessage={handleSendGameChat}
         currentUsername={user?.username}
         isActive={isGameInteractionActive}
-        inactiveMessage="Game chat unavailable while the game is synchronizing"
+        inactiveMessage={localWasIdleKicked
+          ? 'Game chat unavailable after removal for inactivity'
+          : 'Game chat unavailable while the game is synchronizing'}
         initialExpanded={true}
         autoOpenEligible={false}
       />
+      <IdleKickDialog open={showIdleKickDialog} onMenu={handleIdleKickToMenu} />
     </div>
   );
 }

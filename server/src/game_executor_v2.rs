@@ -8,6 +8,7 @@ use crate::partition_lease::{PartitionLeaseGuard, PartitionLeaseStore};
 use crate::recovery::{
     CommandDecisionV1, CommandOutcome, RecoveryConfig, RecoveryEnvelopeV2, ResolvedCommandState,
     SPARSE_COMMAND_WINDOW_REJECTION_REASON, stream_id_leq, validate_client_command_identity,
+    validate_stream_id,
 };
 use anyhow::{Context, Result, bail};
 use common::{
@@ -15,7 +16,7 @@ use common::{
     GameEngine, GameEvent, GameEventMessage, GameStatus,
 };
 use futures_util::FutureExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc,
@@ -37,6 +38,7 @@ const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const COMPLETION_MATERIALIZATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_MAPPING_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const TICK_HASH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep cross-game work concurrent without turning one large XREADGROUP reply
 // into an unbounded handoff obligation. Accepted deliveries are still ordered
@@ -532,6 +534,8 @@ struct GameActor {
     completion_committed: bool,
     pending_completion: Option<CompletionRecordV1>,
     completion_materialization_retry_at: Option<Instant>,
+    idle_mapping_cleanup_complete: HashSet<u32>,
+    idle_mapping_cleanup_retry_at: Option<Instant>,
     last_checkpoint_success: Instant,
     next_tick_hash_at: Instant,
     bus: Arc<GameBus>,
@@ -653,6 +657,8 @@ impl GameActor {
             completion_committed: false,
             pending_completion: None,
             completion_materialization_retry_at: None,
+            idle_mapping_cleanup_complete: HashSet::new(),
+            idle_mapping_cleanup_retry_at: None,
             last_checkpoint_success,
             next_tick_hash_at: now + TICK_HASH_INTERVAL,
             bus,
@@ -987,6 +993,36 @@ impl GameActor {
             return Ok(V2Incorporation::Quarantine(error.to_string()));
         }
 
+        if !self.live {
+            // An undecided command can arrive while no actor owns the game and
+            // sit behind an older checkpoint. Advance only to its durable Redis
+            // submission time before accepting it; recording activity on the
+            // stale checkpoint would shorten its grace period during activate(),
+            // while advancing straight to takeover time could expire input that
+            // was actually submitted before the deadline.
+            let (submitted_at_ms, _) = validate_stream_id(stream_id)?;
+            let submitted_at_ms = i64::try_from(submitted_at_ms)
+                .context("command stream timestamp exceeds signed milliseconds")?;
+            let _ = self.engine.run_until(submitted_at_ms)?;
+            if self.engine.get_committed_state().is_complete() {
+                // Catch-up can discover terminal state only after the outer
+                // delivery check. Give this accepted stream entry a durable
+                // negative outcome so the completion transaction can cover
+                // and ACK it atomically; quarantining here would strand the
+                // command outside the actor's pending completion set.
+                self.resolved.record(
+                    &identity,
+                    CommandOutcome::Rejected {
+                        reason: "command targets a completed game".to_string(),
+                        command_id_client: Some(submitted_command_id),
+                    },
+                    self.config.max_recorded_outcomes_per_session,
+                )?;
+                crate::resilience_metrics::record_command_rejections(1);
+                return Ok(V2Incorporation::Incorporated);
+            }
+        }
+
         if let Some(snake_id) = activation_snake_id {
             crate::resilience_metrics::record_boost_activation_attempt(
                 self.engine.get_committed_state(),
@@ -1080,7 +1116,8 @@ impl GameActor {
             self.resolved
                 .can_record(identity, self.config.max_recorded_outcomes_per_session)?;
             if let CommandOutcome::Scheduled { command } = &outcome {
-                self.engine.replay_scheduled_command(command.clone())?;
+                self.engine
+                    .replay_scheduled_command(command.clone(), decision.event.tick)?;
             }
             self.resolved.record(
                 identity,
@@ -1327,6 +1364,52 @@ impl GameActor {
         Ok(())
     }
 
+    /// A continuing multiplayer game must release each removed user's durable
+    /// matchmaking slot. Keep this game-local and retryable: a transient global
+    /// Redis error must not cancel the partition or roll back the authoritative
+    /// kick, and compare-delete makes takeover retries harmless.
+    async fn cleanup_idle_player_matchmaking(&mut self) {
+        if self.engine.get_committed_state().is_complete()
+            || self
+                .idle_mapping_cleanup_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return;
+        }
+
+        let pending: Vec<u32> = self
+            .engine
+            .get_committed_state()
+            .idle_kicked_user_ids
+            .iter()
+            .copied()
+            .filter(|user_id| !self.idle_mapping_cleanup_complete.contains(user_id))
+            .collect();
+        for user_id in pending {
+            match self
+                .bus
+                .cleanup_matchmaking_for_idle_player(self.game_id, user_id)
+                .await
+            {
+                Ok(_) => {
+                    self.idle_mapping_cleanup_complete.insert(user_id);
+                }
+                Err(error) => {
+                    warn!(
+                        game_id = self.game_id,
+                        user_id,
+                        error = ?error,
+                        "idle-player matchmaking cleanup will retry"
+                    );
+                    self.idle_mapping_cleanup_retry_at =
+                        Some(Instant::now() + IDLE_MAPPING_CLEANUP_RETRY_INTERVAL);
+                    return;
+                }
+            }
+        }
+        self.idle_mapping_cleanup_retry_at = None;
+    }
+
     async fn activate(&mut self) -> Result<()> {
         // Backlog is incorporated before this call. Catch-up mutations are
         // intentionally not emitted as deltas; one fresh snapshot reanchors all
@@ -1364,6 +1447,11 @@ impl GameActor {
             game_state: self.engine.get_committed_state().clone(),
         })
         .await?;
+        // Catch-up can derive a non-terminal idle removal. Publish its durable
+        // recovery anchor before releasing any global matchmaking slot: if
+        // this actor disappears after cleanup, a successor must never be able
+        // to restore a pre-kick checkpoint with the player's slot missing.
+        self.cleanup_idle_player_matchmaking().await;
         self.live = true;
         Ok(())
     }
@@ -1385,6 +1473,13 @@ impl GameActor {
     async fn advance_live(&mut self) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let before_tick = self.engine.get_committed_state().tick;
+        let idle_kicked_before: HashSet<u32> = self
+            .engine
+            .get_committed_state()
+            .idle_kicked_user_ids
+            .iter()
+            .copied()
+            .collect();
         let scheduler_lag_ms = self.engine.authoritative_scheduler_lag_ms(now_ms);
         let cooling_pads = self
             .engine
@@ -1425,6 +1520,10 @@ impl GameActor {
                 transition,
             );
         }
+        let has_new_idle_kick = advanced_state
+            .idle_kicked_user_ids
+            .iter()
+            .any(|user_id| !idle_kicked_before.contains(user_id));
         if self.terminal_pending() {
             // A replica fast-forwarding to any event from the terminal tick can
             // derive Complete even if the explicit status event is withheld.
@@ -1433,10 +1532,19 @@ impl GameActor {
             self.commit_completion_until_handoff().await?;
             return Ok(());
         }
+        // A continuing game exposes an idle removal outside the terminal
+        // completion transaction. Persist that state before its event or any
+        // global slot deletion becomes visible. Existing recovered removals
+        // are already covered by their checkpoint and can retry cleanup below
+        // without forcing another write on every actor pass.
+        if has_new_idle_kick {
+            self.checkpoint().await?;
+        }
         for (event_tick, event_sequence, event) in events {
             self.publish_event_at(event_tick, event_sequence, event)
                 .await?;
         }
+        self.cleanup_idle_player_matchmaking().await;
         self.publish_tick_hash_if_due(Instant::now(), chrono::Utc::now().timestamp_millis())
             .await
     }
@@ -5909,6 +6017,441 @@ mod tests {
 
             let guard = harness.guard.clone();
             harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_duplicate_player_activity_does_not_renew_the_idle_deadline() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("duplicate-idle-activity").await?;
+            let mut checkpoint = harness.recovery().await?;
+            let start_ms = chrono::Utc::now().timestamp_millis();
+            let mut state = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                QueueMode::Quickmatch,
+                Some(7),
+                start_ms,
+            );
+            let snake_id = state.add_player(77, Some("player-77".into()))?.snake_id;
+            state.add_player(88, Some("player-88".into()))?;
+            state.status = GameStatus::Started { server_id: 1 };
+            state.rng = None;
+            state.properties.available_food_target = 0;
+            checkpoint.game_state = state;
+            checkpoint.checkpointed_at_ms = start_ms;
+
+            let StreamEvent::GameCommandSubmittedV2 { command, .. } = &mut harness.command else {
+                unreachable!("harness command must be a player command");
+            };
+            command.command = GameCommand::PlayerActivity { snake_id };
+            command.command_id_client.tick = 1_000;
+
+            let mut events = harness
+                .bus
+                .subscribe_to_partition(harness.partition)
+                .await?;
+            let mut consumer = harness
+                .bus
+                .subscribe_executor_commands(harness.guard.clone())
+                .await?;
+            let mut original = harness.actor(checkpoint.clone(), harness.guard.clone());
+            original.live = true;
+
+            let first_stream_id = harness.append_command().await?;
+            let mut first_delivery = consumer.read_new_now().await?;
+            assert_eq!(first_delivery.len(), 1);
+            original.incorporate(first_delivery.remove(0)).await?;
+            let first_visible = tokio::time::timeout(Duration::from_secs(2), events.recv_event())
+                .await?
+                .context("first PlayerActivity outcome was not published")?;
+            assert!(matches!(
+                &first_visible.event,
+                GameEvent::CommandScheduledV2 {
+                    command_id,
+                    deduplicated_replay: false,
+                    ..
+                } if command_id == &harness.command_id
+            ));
+            let original_activity_tick = original
+                .engine
+                .get_committed_state()
+                .player_last_activity_ticks[&77];
+
+            original.engine.run_until(start_ms + 1_000)?;
+            let later_tick = original.engine.get_committed_state().tick;
+            assert!(later_tick > original_activity_tick);
+
+            let second_stream_id = harness.append_command().await?;
+            let mut duplicate_delivery = consumer.read_new_now().await?;
+            assert_eq!(duplicate_delivery.len(), 1);
+            original.incorporate(duplicate_delivery.remove(0)).await?;
+            let duplicate_visible =
+                tokio::time::timeout(Duration::from_secs(2), events.recv_event())
+                    .await?
+                    .context("deduplicated PlayerActivity outcome was not published")?;
+            assert!(matches!(
+                &duplicate_visible.event,
+                GameEvent::CommandScheduledV2 {
+                    command_id,
+                    deduplicated_replay: true,
+                    ..
+                } if command_id == &harness.command_id
+            ));
+            assert!(duplicate_visible.tick > first_visible.tick);
+            assert_eq!(
+                original
+                    .engine
+                    .get_committed_state()
+                    .player_last_activity_ticks[&77],
+                original_activity_tick,
+                "a live resend must not renew activity"
+            );
+            assert_eq!(original.engine.next_server_command_sequence(), 1);
+
+            let mut decisions = harness
+                .bus
+                .load_command_decisions_fenced(&harness.guard)
+                .await?;
+            let first_decision = decisions
+                .remove(&first_stream_id)
+                .context("first durable decision missing")?;
+            let duplicate_decision = decisions
+                .remove(&second_stream_id)
+                .context("duplicate durable decision missing")?;
+            assert!(decisions.is_empty());
+            drop(original);
+            drop(consumer);
+
+            let mut recovered = harness.actor(checkpoint, harness.guard.clone());
+            assert!(matches!(
+                recovered.incorporate_recorded_decision(&harness.command_id, &first_decision,)?,
+                V2Incorporation::Incorporated
+            ));
+            assert_eq!(
+                recovered
+                    .engine
+                    .get_committed_state()
+                    .player_last_activity_ticks[&77],
+                first_visible.tick
+            );
+            assert!(matches!(
+                recovered
+                    .incorporate_recorded_decision(&harness.command_id, &duplicate_decision,)?,
+                V2Incorporation::Incorporated
+            ));
+            let recovered_state = recovered.engine.get_committed_state();
+            assert_eq!(
+                recovered_state.player_last_activity_ticks[&77], first_visible.tick,
+                "durable replay of a deduplicated resend must not renew activity"
+            );
+            assert_eq!(recovered.engine.next_server_command_sequence(), 1);
+            recovered_state.validate_boost_invariants()?;
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_recovery_command_uses_its_stream_submission_time_for_activity() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("fresh-idle-activity").await?;
+            let start_ms = chrono::Utc::now().timestamp_millis() - 55_000;
+            let mut state = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                QueueMode::Quickmatch,
+                Some(7),
+                start_ms,
+            );
+            state.add_player(77, Some("player-77".into()))?;
+            state.add_player(88, Some("player-88".into()))?;
+            state.status = GameStatus::Started { server_id: 1 };
+            state.rng = None;
+            state.properties.available_food_target = 0;
+
+            let mut envelope = harness.recovery().await?;
+            envelope.game_state = state;
+            envelope.checkpointed_at_ms = chrono::Utc::now().timestamp_millis();
+            let mut actor = harness.actor(envelope, harness.guard.clone());
+            let stream_id = harness.append_command().await?;
+            let command = match harness.command.clone() {
+                StreamEvent::GameCommandSubmittedV2 { command, .. } => command,
+                _ => unreachable!("harness command must be a player command"),
+            };
+
+            let disposition = actor
+                .incorporate_v2_command(
+                    &stream_id,
+                    harness.command_id.clone(),
+                    command,
+                    None,
+                )
+                .await?;
+            assert!(matches!(disposition, V2Incorporation::Incorporated));
+            let accepted_tick = actor.engine.get_committed_state().tick;
+            let timeout_ticks = actor
+                .engine
+                .get_committed_state()
+                .properties
+                .player_idle_timeout_ms
+                / actor
+                    .engine
+                    .get_committed_state()
+                    .properties
+                    .tick_duration_ms;
+            assert!(
+                accepted_tick > timeout_ticks.saturating_sub(200)
+                    && accepted_tick < timeout_ticks,
+                "submission should land before the original 60-second deadline, got tick {accepted_tick}"
+            );
+            assert_eq!(
+                actor
+                    .engine
+                    .get_committed_state()
+                    .player_last_activity_ticks[&77],
+                accepted_tick
+            );
+
+            actor.engine.run_until(start_ms + 65_000)?;
+            let recovered = actor.engine.get_committed_state();
+            assert!(!recovered.is_player_idle_kicked(77));
+            assert!(recovered.is_player_idle_kicked(88));
+            assert!(matches!(
+                recovered.status,
+                GameStatus::Complete {
+                    winning_snake_id: Some(winner)
+                } if winner == recovered.players[&77].snake_id
+            ));
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonterminal_idle_kick_releases_only_its_matching_active_game_mapping() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("idle-mapping-cleanup").await?;
+            let mut envelope = harness.recovery().await?;
+            let user_id = 77;
+            let snake_id = envelope.game_state.players[&user_id].snake_id;
+            envelope.game_state.arena.snakes[snake_id as usize].is_alive = false;
+            envelope.game_state.idle_kicked_user_ids = vec![user_id];
+            let mapping_key = RedisKeys::matchmaking_user_active_game(user_id);
+            let _: () = harness
+                .raw
+                .set(&mapping_key, harness.game_id.to_string())
+                .await?;
+
+            let mut actor = harness.actor(envelope, harness.guard.clone());
+            actor.cleanup_idle_player_matchmaking().await;
+            let mapping: Option<String> = harness.raw.get(&mapping_key).await?;
+            assert_eq!(mapping, None);
+            assert!(actor.idle_mapping_cleanup_complete.contains(&user_id));
+
+            let newer_game_id = harness.game_id + PARTITION_COUNT;
+            let _: () = harness
+                .raw
+                .set(&mapping_key, newer_game_id.to_string())
+                .await?;
+            assert!(
+                !harness
+                    .bus
+                    .cleanup_matchmaking_for_idle_player(harness.game_id, user_id)
+                    .await?
+            );
+            let preserved: Option<String> = harness.raw.get(&mapping_key).await?;
+            assert_eq!(preserved, Some(newer_game_id.to_string()));
+
+            let _: usize = harness.raw.del(&mapping_key).await?;
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crash_before_idle_kick_checkpoint_preserves_slot_for_predeadline_activity()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut harness = CrashBoundaryHarness::new("idle-cleanup-crash-order").await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut state = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 2 },
+                QueueMode::Quickmatch,
+                Some(7),
+                0,
+            );
+            for user_id in [77, 88, 99, 111] {
+                state.add_player(user_id, Some(format!("player-{user_id}")))?;
+            }
+            state.status = GameStatus::Started { server_id: 1 };
+            state.rng = None;
+            state.properties.available_food_target = 0;
+
+            let tick_ms = state.properties.tick_duration_ms;
+            let timeout_ticks = state.properties.player_idle_timeout_ms / tick_ms;
+            let committed_lag_ticks = 500 / tick_ms;
+            let checkpoint_tick = timeout_ticks - 100;
+            let submitted_tick = timeout_ticks - 2;
+            let takeover_tick = timeout_ticks + 100;
+            state.start_ms = now_ms
+                - i64::from(
+                    takeover_tick
+                        .saturating_add(committed_lag_ticks)
+                        .saturating_mul(tick_ms),
+                );
+            state.tick = checkpoint_tick;
+            for user_id in state.players.keys().copied().collect::<Vec<_>>() {
+                state
+                    .player_last_activity_ticks
+                    .insert(user_id, checkpoint_tick);
+            }
+            state.player_last_activity_ticks.insert(77, 0);
+
+            let mut checkpoint = harness.recovery().await?;
+            checkpoint.game_state = state;
+            checkpoint.checkpointed_at_ms = now_ms;
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(
+                    &harness.guard,
+                    &checkpoint,
+                    &[],
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            let mapping_key = RedisKeys::matchmaking_user_active_game(77);
+            let _: () = harness
+                .raw
+                .set(&mapping_key, harness.game_id.to_string())
+                .await?;
+
+            let snake_id = checkpoint.game_state.players[&77].snake_id;
+            let StreamEvent::GameCommandSubmittedV2 { command, .. } = &mut harness.command else {
+                unreachable!("harness command must be a player command");
+            };
+            command.command_id_client.tick = submitted_tick;
+            command.command = GameCommand::PlayerActivity { snake_id };
+            let submitted_at_ms = checkpoint.game_state.start_ms
+                + i64::from(
+                    submitted_tick
+                        .saturating_add(committed_lag_ticks)
+                        .saturating_mul(tick_ms),
+                );
+            let submitted_stream_id = format!("{submitted_at_ms}-0");
+            let written_stream_id: String = harness
+                .raw
+                .xadd(
+                    RedisKeys::stream_commands(harness.partition),
+                    &submitted_stream_id,
+                    &[("data", serde_json::to_vec(&harness.command)?)],
+                )
+                .await?;
+            assert_eq!(written_stream_id, submitted_stream_id);
+
+            let (checkpoint_entered, _never_release_checkpoint) =
+                harness.bus.gate_next_checkpoint();
+            let mut original = harness.actor(checkpoint, harness.guard.clone());
+            original.live = true;
+            let advance = tokio::spawn(async move { original.advance_live().await });
+            tokio::time::timeout(Duration::from_secs(2), checkpoint_entered.notified())
+                .await
+                .context("nonterminal idle kick did not checkpoint before cleanup")?;
+
+            assert_eq!(
+                harness.raw.get::<_, Option<String>>(&mapping_key).await?,
+                Some(harness.game_id.to_string()),
+                "an uncheckpointed idle kick must not release the player's slot"
+            );
+            assert!(
+                harness
+                    .recovery()
+                    .await?
+                    .game_state
+                    .idle_kicked_user_ids
+                    .is_empty(),
+                "the deterministic gate must still expose the pre-kick checkpoint"
+            );
+            assert!(
+                read_game_events(&mut harness.raw, harness.partition)
+                    .await?
+                    .is_empty(),
+                "the kick event must not publish ahead of its recovery checkpoint"
+            );
+
+            advance.abort();
+            assert!(
+                advance
+                    .await
+                    .expect_err("blocked actor advance should abort")
+                    .is_cancelled()
+            );
+
+            let successor_guard = harness.takeover().await?;
+            let recovered = harness.recovery().await?;
+            let mut consumer = harness
+                .bus
+                .subscribe_executor_commands(successor_guard.clone())
+                .await?;
+            let mut deliveries = consumer.read_new_now().await?;
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].stream_id, submitted_stream_id);
+
+            let mut successor = harness.actor(recovered, successor_guard.clone());
+            assert!(matches!(
+                successor.incorporate(deliveries.remove(0)).await?,
+                DeliveryDisposition::Incorporated
+            ));
+            assert!(
+                !successor
+                    .engine
+                    .get_committed_state()
+                    .is_player_idle_kicked(77)
+            );
+            assert_eq!(
+                successor
+                    .engine
+                    .get_committed_state()
+                    .player_last_activity_ticks[&77],
+                submitted_tick,
+                "takeover must anchor the pending activity at its pre-deadline stream time"
+            );
+
+            successor.activate().await?;
+            assert!(
+                !successor
+                    .engine
+                    .get_committed_state()
+                    .is_player_idle_kicked(77)
+            );
+            assert_eq!(
+                harness.raw.get::<_, Option<String>>(&mapping_key).await?,
+                Some(harness.game_id.to_string()),
+                "a player saved by durable pre-deadline activity must retain the old game slot"
+            );
+
+            let _: usize = harness.raw.del(&mapping_key).await?;
+            drop(consumer);
+            harness.cleanup(&successor_guard).await?;
             Result::<()>::Ok(())
         })
         .await??;

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 const GAME_OVER_TIMEOUT: Duration = Duration::from_secs(120);
 const MATCHMAKING_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const CLIENT_PROTOCOL_VERSION: u16 = 5;
+const CLIENT_PROTOCOL_VERSION: u16 = 6;
 const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser, Debug)]

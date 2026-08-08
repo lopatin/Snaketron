@@ -2252,7 +2252,7 @@ mod tests {
         let prefix = expected_recovery_prefix(7, 127);
         assert_eq!(
             prefix,
-            "{\"schema_version\":4,\"executor_protocol_version\":5,\"game_id\":127,\"partition_id\":7,"
+            "{\"schema_version\":4,\"executor_protocol_version\":6,\"game_id\":127,\"partition_id\":7,"
         );
 
         let envelope = RecoveryEnvelopeV2::new(

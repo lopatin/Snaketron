@@ -17,7 +17,7 @@ const snake = (teamId: number, alive = true) => ({
   team_id: teamId,
   speed_milli: 1000,
   movement_credit: 0,
-  boost: { charge_ms: 0, active: false },
+  boost: { charge_ms: 0, active: false, intent: false },
 });
 
 const duelState = (): GameState => ({
@@ -40,6 +40,8 @@ const duelState = (): GameState => ({
     time_limit_ms: null,
     score_limit: 50,
     boost: null,
+    player_idle_timeout_ms: 60_000,
+    player_idle_warning_ms: 10_000,
   },
   players: {
     7: { user_id: 7, snake_id: 0 },
@@ -57,6 +59,9 @@ const duelState = (): GameState => ({
   team_scores: { 0: 4, 1: 2 },
   player_xp: { 7: 18, 8: 5, 9: 20, 10: 3 },
   player_action_counts: { 7: 3, 8: 2, 9: 4, 10: 1 },
+  player_last_activity_ticks: { 7: 6, 8: 6, 9: 6, 10: 6 },
+  idle_kicked_user_ids: [],
+  completed_by_inactivity: false,
 });
 
 test('team presentation puts the local side first and hands the renderer real skin selectors', () => {
@@ -162,6 +167,32 @@ test('result artwork is selected from outcome state rather than display copy', (
   const spectator = buildMatchPresentation(duelState());
   assert.equal(spectator.resultTitle, 'Match complete');
   assert.equal(spectator.resultArtwork, 'neutral');
+});
+
+test('inactivity completion explains removals and marks the final roster', () => {
+  const opponentRemoved = duelState();
+  opponentRemoved.idle_kicked_user_ids = [8, 10];
+  opponentRemoved.completed_by_inactivity = true;
+  const victory = buildMatchPresentation(opponentRemoved, 7);
+  assert.equal(victory.resultTitle, 'Victory');
+  assert.equal(victory.resultSummary, 'The other side was removed for inactivity.');
+  assert.equal(victory.players.find((player) => player.userId === 8)?.isIdleKicked, true);
+
+  const localRemoved = duelState();
+  localRemoved.idle_kicked_user_ids = [7];
+  localRemoved.completed_by_inactivity = true;
+  const removed = buildMatchPresentation(localRemoved, 7);
+  assert.equal(removed.resultTitle, 'Removed');
+  assert.equal(removed.resultSummary, 'You were removed for inactivity.');
+  assert.equal(removed.currentPlayer?.isWinner, false);
+
+  const allRemoved = duelState();
+  allRemoved.status = { Complete: { winning_snake_id: null } };
+  allRemoved.idle_kicked_user_ids = [7, 8, 9, 10];
+  allRemoved.completed_by_inactivity = true;
+  const ended = buildMatchPresentation(allRemoved);
+  assert.equal(ended.resultTitle, 'Match ended');
+  assert.equal(ended.resultSummary, 'Every active player was removed for inactivity.');
 });
 
 test('match clock clamps at zero and rounds remaining partial seconds up', () => {

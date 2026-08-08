@@ -7,4 +7,9 @@ export type GameProperties = { available_food_target: number, tick_duration_ms: 
  * score target. Team matches set this instead of `time_limit_ms`: they run
  * until a team gets there, with no clock and no maximum duration.
  */
-score_limit: number | null, boost: BoostConfig | null, };
+score_limit: number | null, boost: BoostConfig | null,
+/**
+ * Match inactivity policy, snapshotted with the game so every executor
+ * and client resolves the same deadline even across failover.
+ */
+player_idle_timeout_ms: number, player_idle_warning_ms: number, };

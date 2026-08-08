@@ -57,7 +57,7 @@ interface UseGameWebSocketReturn {
   updateCustomGameSettings: (settings: Partial<CustomGameSettings>) => void;
   startCustomGame: () => void;
   spectateGame: (gameId: string, gameCode?: string | null) => void;
-  sendGameCommand: (command: GameCommand) => void;
+  sendGameCommand: (command: GameCommand) => boolean;
   sendRequestResync: (gameId: string) => void;
   connected: boolean;
 }
@@ -630,27 +630,28 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
       !isGameSnapshotSynchronizedRef.current
     ) {
       console.warn('Ignoring game command while the game connection is not synchronized');
-      return;
+      return false;
     }
 
     const gameId = requestedGameRef.current?.gameId;
     if (gameId === undefined) {
       console.warn('Ignoring game command without an active game identity');
-      return;
+      return false;
     }
     if (!user) {
       console.warn('Ignoring game command without an authenticated user identity');
-      return;
+      return false;
     }
     let stableCommand: ReturnType<typeof enqueueGameCommandV2>;
     try {
       stableCommand = enqueueGameCommandV2(gameId, user.id, command);
     } catch (error) {
       console.error('Cannot queue game command safely:', error);
-      return;
+      return false;
     }
     console.log('Sending v2 game command:', stableCommand);
     sendMessage({ GameCommandV2: stableCommand });
+    return true;
   }, [isConnected, isSessionAuthenticated, sendMessage, serverCapabilities, user]);
 
   // Ask the game executor for a fresh snapshot when the engine detects

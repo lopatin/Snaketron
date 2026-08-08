@@ -39,7 +39,7 @@ type RawSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type SocketSink = SplitSink<RawSocket, Message>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-const CLIENT_PROTOCOL_VERSION: u16 = 5;
+const CLIENT_PROTOCOL_VERSION: u16 = 6;
 const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 const READER_WAKE_SENTINEL_INTERVAL: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);

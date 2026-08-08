@@ -28,6 +28,16 @@ pub const EXECUTOR_POLL_INTERVAL_MS: u64 = 10;
 /// Default tick duration for custom games in milliseconds
 pub const DEFAULT_CUSTOM_GAME_TICK_MS: u32 = 100;
 
+/// A player who sends no gameplay input for this long is removed from the
+/// match. Keeping this in authoritative simulation time makes the decision
+/// deterministic across executor failover and client prediction.
+pub const DEFAULT_PLAYER_IDLE_TIMEOUT_MS: u32 = 60_000;
+
+/// The local client begins warning a player this long before the authoritative
+/// inactivity deadline. The warning is derived from snapshotted match state,
+/// so it cannot drift away from the server's decision.
+pub const DEFAULT_PLAYER_IDLE_WARNING_MS: u32 = 10_000;
+
 /// Default available food target
 pub const DEFAULT_FOOD_TARGET: usize = 10;
 

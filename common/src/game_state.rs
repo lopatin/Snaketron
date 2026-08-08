@@ -3,7 +3,8 @@ use crate::{
     BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS, BoostResolution,
     DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS,
     DEFAULT_BOOST_SPEED_MILLI, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, DEFAULT_CUSTOM_GAME_TICK_MS,
-    DEFAULT_FOOD_TARGET, DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
+    DEFAULT_FOOD_TARGET, DEFAULT_PLAYER_IDLE_TIMEOUT_MS, DEFAULT_PLAYER_IDLE_WARNING_MS,
+    DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
     MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake,
 };
 use anyhow::{Context, Result};
@@ -100,16 +101,32 @@ fn sample_food_position(rng: &mut PseudoRandom, game_type: &GameType, arena: &Ar
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum GameCommand {
     // User command for movement
-    Turn { snake_id: u32, direction: Direction },
+    Turn {
+        snake_id: u32,
+        direction: Direction,
+    },
 
     // Player command for consuming snake-owned stored Boost charge.
-    ActivateBoost { snake_id: u32 },
+    ActivateBoost {
+        snake_id: u32,
+    },
 
     // System command for failover
-    UpdateStatus { status: GameStatus },
+    UpdateStatus {
+        status: GameStatus,
+    },
 
     // Player command for releasing active Boost while retaining stored fuel.
-    DeactivateBoost { snake_id: u32 },
+    DeactivateBoost {
+        snake_id: u32,
+    },
+
+    /// Explicit presence acknowledgement used by the inactivity warning UI.
+    /// It intentionally has no gameplay effect beyond resetting the player's
+    /// authoritative idle deadline.
+    PlayerActivity {
+        snake_id: u32,
+    },
 }
 
 /// Stable identity for the at-least-once command protocol. Unlike the engine's
@@ -158,6 +175,13 @@ pub enum GameEvent {
         direction: Direction,
     },
     SnakeDied {
+        snake_id: u32,
+    },
+    /// Authoritative inactivity removal. This is one atomic replicated state
+    /// transition so clients learn both why the player left and that their
+    /// snake is no longer active without waiting for a repair snapshot.
+    PlayerIdleKicked {
+        user_id: u32,
         snake_id: u32,
     },
     FoodSpawned {
@@ -724,6 +748,20 @@ pub struct GameProperties {
     pub score_limit: Option<u32>,
     #[serde(default)]
     pub boost: Option<BoostConfig>,
+    /// Match inactivity policy, snapshotted with the game so every executor
+    /// and client resolves the same deadline even across failover.
+    #[serde(default = "default_player_idle_timeout_ms")]
+    pub player_idle_timeout_ms: u32,
+    #[serde(default = "default_player_idle_warning_ms")]
+    pub player_idle_warning_ms: u32,
+}
+
+fn default_player_idle_timeout_ms() -> u32 {
+    DEFAULT_PLAYER_IDLE_TIMEOUT_MS
+}
+
+fn default_player_idle_warning_ms() -> u32 {
+    DEFAULT_PLAYER_IDLE_WARNING_MS
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -908,6 +946,7 @@ impl CommandQueue {
                         ..
                     } | GameCommand::ActivateBoost { snake_id: target }
                     | GameCommand::DeactivateBoost { snake_id: target }
+                    | GameCommand::PlayerActivity { snake_id: target }
                         if *target == snake_id
                 )
             })
@@ -941,6 +980,7 @@ impl CommandQueue {
                         GameCommand::Turn { .. }
                             | GameCommand::ActivateBoost { .. }
                             | GameCommand::DeactivateBoost { .. }
+                            | GameCommand::PlayerActivity { .. }
                     )
             })
             .map(|Reverse(message)| message.clone())
@@ -1025,6 +1065,24 @@ pub struct GameState {
     /// never inflate this metric.
     #[serde(default)]
     pub player_action_counts: HashMap<u32, u32>,
+
+    /// Tick of the most recent authenticated gameplay input for each player.
+    /// Unlike `player_action_counts`, legal no-op inputs count as activity: the
+    /// player is demonstrably present even when the requested state is already
+    /// active. Transport retries never reach this map twice because command
+    /// outcomes are deduplicated before scheduling.
+    #[serde(default)]
+    pub player_last_activity_ticks: HashMap<u32, u32>,
+
+    /// Players removed from this match for inactivity. They remain in the
+    /// roster so results, MMR, and spectators can explain what happened.
+    #[serde(default)]
+    pub idle_kicked_user_ids: Vec<u32>,
+
+    /// True only when inactivity, rather than the mode's ordinary score/death
+    /// condition, produced the terminal result.
+    #[serde(default)]
+    pub completed_by_inactivity: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -1135,6 +1193,8 @@ impl GameState {
             time_limit_ms,
             score_limit,
             boost,
+            player_idle_timeout_ms: DEFAULT_PLAYER_IDLE_TIMEOUT_MS,
+            player_idle_warning_ms: DEFAULT_PLAYER_IDLE_WARNING_MS,
         };
 
         // Set up team zones for team-based games
@@ -1202,6 +1262,9 @@ impl GameState {
 
             player_xp: HashMap::new(),
             player_action_counts: HashMap::new(),
+            player_last_activity_ticks: HashMap::new(),
+            idle_kicked_user_ids: Vec::new(),
+            completed_by_inactivity: false,
         };
 
         // `new` predates fallible match construction. Keep its API stable but
@@ -1225,6 +1288,43 @@ impl GameState {
             .get(&user_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    pub fn is_player_idle_kicked(&self, user_id: u32) -> bool {
+        self.idle_kicked_user_ids.binary_search(&user_id).is_ok()
+    }
+
+    /// Record presence only for an authenticated player's own gameplay
+    /// command. Callers invoke this at first scheduling, never at execution,
+    /// so deferred turns and transport retries cannot extend the deadline.
+    fn record_player_activity_for_command(
+        &mut self,
+        command_message: &GameCommandMessage,
+        activity_tick: u32,
+    ) {
+        let user_id = command_message
+            .command_id_server
+            .as_ref()
+            .map(|id| id.user_id)
+            .unwrap_or(command_message.command_id_client.user_id);
+        if self.is_player_idle_kicked(user_id) {
+            return;
+        }
+        let snake_id = match &command_message.command {
+            GameCommand::Turn { snake_id, .. }
+            | GameCommand::ActivateBoost { snake_id }
+            | GameCommand::DeactivateBoost { snake_id }
+            | GameCommand::PlayerActivity { snake_id } => *snake_id,
+            GameCommand::UpdateStatus { .. } => return,
+        };
+        if self
+            .players
+            .get(&user_id)
+            .is_some_and(|player| player.snake_id == snake_id)
+        {
+            self.player_last_activity_ticks
+                .insert(user_id, activity_tick);
+        }
     }
 
     fn record_player_action_for_snake(&mut self, snake_id: u32) {
@@ -1470,6 +1570,51 @@ impl GameState {
                 }
             }
         }
+
+        let timeout_ms = self.properties.player_idle_timeout_ms;
+        let warning_ms = self.properties.player_idle_warning_ms;
+        if timeout_ms == 0 || warning_ms == 0 || warning_ms >= timeout_ms {
+            return Err(anyhow::anyhow!(
+                "player inactivity warning must be positive and shorter than timeout"
+            ));
+        }
+        if self
+            .idle_kicked_user_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(anyhow::anyhow!(
+                "idle-kicked player IDs must be sorted and unique"
+            ));
+        }
+        for user_id in &self.idle_kicked_user_ids {
+            let player = self
+                .players
+                .get(user_id)
+                .with_context(|| format!("idle-kicked user {user_id} is not a player"))?;
+            let snake = self
+                .arena
+                .snakes
+                .get(player.snake_id as usize)
+                .with_context(|| format!("idle-kicked user {user_id} has no snake"))?;
+            if snake.is_alive {
+                return Err(anyhow::anyhow!(
+                    "idle-kicked user {user_id} must have a dead snake"
+                ));
+            }
+        }
+        for (user_id, activity_tick) in &self.player_last_activity_ticks {
+            if !self.players.contains_key(user_id) || *activity_tick > self.tick {
+                return Err(anyhow::anyhow!(
+                    "player activity tick must reference a current player at or before the snapshot tick"
+                ));
+            }
+        }
+        if self.completed_by_inactivity && !self.is_complete() {
+            return Err(anyhow::anyhow!(
+                "inactivity completion marker requires a terminal game"
+            ));
+        }
         Ok(())
     }
 
@@ -1494,6 +1639,25 @@ impl GameState {
             | GameEvent::ScoreUpdated { snake_id, .. }
             | GameEvent::SnakeRespawned { snake_id, .. } => {
                 require_snake(*snake_id)?;
+                Ok(())
+            }
+            GameEvent::PlayerIdleKicked { user_id, snake_id } => {
+                require_snake(*snake_id)?;
+                let player = self.players.get(user_id).with_context(|| {
+                    format!("idle-kick event references missing player {user_id}")
+                })?;
+                if player.snake_id != *snake_id {
+                    return Err(anyhow::anyhow!(
+                        "idle-kick event snake {snake_id} is not owned by player {user_id}"
+                    ));
+                }
+                if self.is_player_idle_kicked(*user_id)
+                    && self.arena.snakes[*snake_id as usize].is_alive
+                {
+                    return Err(anyhow::anyhow!(
+                        "idle-kick event conflicts with a live removed player {user_id}"
+                    ));
+                }
                 Ok(())
             }
             GameEvent::BoostPacketCollected {
@@ -1569,7 +1733,8 @@ impl GameState {
             } => {
                 if let GameCommand::Turn { snake_id, .. }
                 | GameCommand::ActivateBoost { snake_id }
-                | GameCommand::DeactivateBoost { snake_id } = &command_message.command
+                | GameCommand::DeactivateBoost { snake_id }
+                | GameCommand::PlayerActivity { snake_id } = &command_message.command
                 {
                     require_snake(*snake_id)?;
                 }
@@ -1999,6 +2164,7 @@ impl GameState {
         let snake_id = self.arena.add_snake(snake)?;
         let player = Player { user_id, snake_id };
         self.players.insert(user_id, player.clone());
+        self.player_last_activity_ticks.insert(user_id, self.tick);
 
         // Calculate starting positions for all players
         let player_count = self.players.len();
@@ -2056,6 +2222,7 @@ impl GameState {
             GameCommand::Turn { .. }
                 | GameCommand::ActivateBoost { .. }
                 | GameCommand::DeactivateBoost { .. }
+                | GameCommand::PlayerActivity { .. }
         ) {
             let issuing_user_id = command_message
                 .command_id_server
@@ -2063,17 +2230,15 @@ impl GameState {
                 .map(|id| id.user_id)
                 .unwrap_or(command_message.command_id_client.user_id);
 
-            if !self.players.contains_key(&issuing_user_id) {
+            if !self.players.contains_key(&issuing_user_id)
+                || self.is_player_idle_kicked(issuing_user_id)
+            {
                 return;
             }
         }
 
-        self.apply_event(
-            GameEvent::CommandScheduled {
-                command_message: command_message.clone(),
-            },
-            None,
-        );
+        self.record_player_activity_for_command(command_message, self.tick);
+        self.command_queue.push(command_message.clone());
     }
 
     pub fn has_scheduled_commands(&self, tick: u32) -> bool {
@@ -2081,6 +2246,170 @@ impl GameState {
     }
 
     pub fn join(&mut self, _user_id: u32) {}
+
+    fn ensure_player_idle_tracking(&mut self) {
+        // Active snapshots written before the inactivity policy existed have
+        // no entries. Give those players a full grace period from the first
+        // tick under the new executor rather than removing them immediately.
+        let current_tick = self.tick;
+        for user_id in self.players.keys().copied() {
+            self.player_last_activity_ticks
+                .entry(user_id)
+                .or_insert(current_tick);
+        }
+    }
+
+    fn player_is_idle_contender(&self, user_id: u32, player: &Player) -> bool {
+        if self.is_player_idle_kicked(user_id) {
+            return false;
+        }
+        if matches!(self.game_type, GameType::TeamMatch { .. }) || self.team_scores.is_some() {
+            return true;
+        }
+        self.arena
+            .snakes
+            .get(player.snake_id as usize)
+            .is_some_and(|snake| snake.is_alive)
+    }
+
+    fn inactivity_winning_snake_id(&self) -> Option<Option<u32>> {
+        let active_players: Vec<(u32, &Player)> = self
+            .players
+            .iter()
+            .filter(|(user_id, player)| self.player_is_idle_contender(**user_id, player))
+            .map(|(user_id, player)| (*user_id, player))
+            .collect();
+
+        if matches!(self.game_type, GameType::TeamMatch { .. }) || self.team_scores.is_some() {
+            let mut active_teams: Vec<TeamId> = active_players
+                .iter()
+                .filter_map(|(_, player)| {
+                    self.arena
+                        .snakes
+                        .get(player.snake_id as usize)
+                        .and_then(|snake| snake.team_id)
+                })
+                .collect();
+            active_teams.sort_unstable();
+            active_teams.dedup();
+            return match active_teams.as_slice() {
+                [] => Some(None),
+                [winning_team] => {
+                    let winning_snake_id = active_players
+                        .iter()
+                        .filter_map(|(user_id, player)| {
+                            let is_winning_team = self
+                                .arena
+                                .snakes
+                                .get(player.snake_id as usize)
+                                .is_some_and(|snake| snake.team_id == Some(*winning_team));
+                            is_winning_team.then_some((*user_id, player.snake_id))
+                        })
+                        .min_by_key(|(user_id, _)| *user_id)
+                        .map(|(_, snake_id)| snake_id);
+                    Some(winning_snake_id)
+                }
+                _ => None,
+            };
+        }
+
+        match active_players.as_slice() {
+            [] => Some(None),
+            [(_, player)] => Some(Some(player.snake_id)),
+            _ => None,
+        }
+    }
+
+    fn inactivity_xp_awards(&self, winning_snake_id: Option<u32>) -> HashMap<u32, u32> {
+        let winning_team = winning_snake_id.and_then(|snake_id| {
+            self.arena
+                .snakes
+                .get(snake_id as usize)
+                .and_then(|snake| snake.team_id)
+        });
+        self.players
+            .iter()
+            .map(|(user_id, player)| {
+                if self.is_player_idle_kicked(*user_id) {
+                    return (*user_id, 0);
+                }
+                let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
+                let player_team = self
+                    .arena
+                    .snakes
+                    .get(player.snake_id as usize)
+                    .and_then(|snake| snake.team_id);
+                let won = winning_snake_id.is_some_and(|winner| {
+                    player.snake_id == winner
+                        || winning_team.is_some() && player_team == winning_team
+                });
+                (
+                    *user_id,
+                    score.saturating_mul(10) + if won { 50 } else { 10 },
+                )
+            })
+            .collect()
+    }
+
+    /// Applies every deadline crossed on this simulation quantum as one
+    /// deterministic batch. Evaluating the whole batch before selecting a
+    /// winner is what makes simultaneous all-AFK expiry a draw rather than an
+    /// iteration-order-dependent win.
+    fn resolve_player_inactivity(
+        &mut self,
+        post_tick: u32,
+        out: &mut Vec<(u64, GameEvent)>,
+    ) -> bool {
+        if !matches!(self.status, GameStatus::Started { .. }) || self.players.len() < 2 {
+            return false;
+        }
+
+        self.ensure_player_idle_tracking();
+        let tick_duration_ms = self.properties.tick_duration_ms.max(1);
+        let timeout_ms = self.properties.player_idle_timeout_ms.max(tick_duration_ms);
+        let mut expired: Vec<(u32, u32)> = self
+            .players
+            .iter()
+            .filter(|(user_id, player)| self.player_is_idle_contender(**user_id, player))
+            .filter_map(|(user_id, player)| {
+                let last_tick = self
+                    .player_last_activity_ticks
+                    .get(user_id)
+                    .copied()
+                    .unwrap_or(self.tick);
+                let idle_ms = post_tick
+                    .saturating_sub(last_tick)
+                    .saturating_mul(tick_duration_ms);
+                (idle_ms >= timeout_ms).then_some((*user_id, player.snake_id))
+            })
+            .collect();
+        expired.sort_unstable_by_key(|(user_id, _)| *user_id);
+        if expired.is_empty() {
+            return false;
+        }
+
+        for (user_id, snake_id) in expired {
+            self.apply_event(GameEvent::PlayerIdleKicked { user_id, snake_id }, Some(out));
+        }
+
+        let Some(winning_snake_id) = self.inactivity_winning_snake_id() else {
+            return false;
+        };
+        self.completed_by_inactivity = true;
+        self.apply_event(
+            GameEvent::XPAwarded {
+                player_xp: self.inactivity_xp_awards(winning_snake_id),
+            },
+            Some(out),
+        );
+        self.apply_event(
+            GameEvent::StatusUpdated {
+                status: GameStatus::Complete { winning_snake_id },
+            },
+            Some(out),
+        );
+        true
+    }
 
     pub fn tick_forward(&mut self, movement_only: bool) -> Result<Vec<(u64, GameEvent)>> {
         self.tick_forward_observing_boost(movement_only, &mut |_| {})
@@ -2127,6 +2456,12 @@ impl GameState {
         // A cooldown ending at the post-step tick makes the packet available
         // for this quantum's movement and collection phase.
         let post_tick = self.tick.saturating_add(1);
+
+        if self.resolve_player_inactivity(post_tick, &mut out) {
+            self.tick = post_tick;
+            return Ok(out);
+        }
+
         for pad in &mut self.arena.boost_pads {
             if pad
                 .respawn_at_tick
@@ -2623,6 +2958,11 @@ impl GameState {
 
                                 let mut player_xp_awards = HashMap::new();
                                 for (user_id, player) in &self.players {
+                                    if self.is_player_idle_kicked(*user_id) {
+                                        player_xp_awards.insert(*user_id, 0);
+                                        continue;
+                                    }
+
                                     let score =
                                         self.scores.get(&player.snake_id).copied().unwrap_or(0);
                                     let snake = &self.arena.snakes[player.snake_id as usize];
@@ -2656,6 +2996,11 @@ impl GameState {
 
                             let mut player_xp_awards = HashMap::new();
                             for (user_id, player) in &self.players {
+                                if self.is_player_idle_kicked(*user_id) {
+                                    player_xp_awards.insert(*user_id, 0);
+                                    continue;
+                                }
+
                                 let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
                                 let base_xp = score * 10; // 10 XP per food eaten
                                 player_xp_awards.insert(*user_id, base_xp + 10);
@@ -2779,6 +3124,7 @@ impl GameState {
             GameCommand::DeactivateBoost { snake_id } => {
                 self.set_boost_intent(snake_id, false);
             }
+            GameCommand::PlayerActivity { .. } => {}
             GameCommand::UpdateStatus { .. } => {
                 // debug!("exec_command: Processing UpdateStatus command");
             }
@@ -2813,6 +3159,22 @@ impl GameState {
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.is_alive = false;
                     snake.reset_boost_and_movement();
+                }
+                self.command_queue
+                    .discard_player_commands_for_snake(snake_id);
+            }
+
+            GameEvent::PlayerIdleKicked { user_id, snake_id } => {
+                if let Err(index) = self.idle_kicked_user_ids.binary_search(&user_id) {
+                    self.idle_kicked_user_ids.insert(index, user_id);
+                }
+                if let Ok(snake) = self.get_snake_mut(snake_id) {
+                    snake.is_alive = false;
+                    snake.reset_boost_and_movement();
+                    // Ordinary team deaths preserve a physically-held Boost
+                    // intent for respawn. An idle removal is permanent, so no
+                    // input latch may survive on the dead snake.
+                    snake.boost = Default::default();
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -2859,6 +3221,7 @@ impl GameState {
             }
 
             GameEvent::CommandScheduled { command_message } => {
+                self.record_player_activity_for_command(&command_message, self.tick);
                 self.command_queue.push(command_message);
             }
 
@@ -2868,6 +3231,7 @@ impl GameState {
                 ..
             } => {
                 if !deduplicated_replay {
+                    self.record_player_activity_for_command(&command_message, self.tick);
                     self.command_queue.push(command_message);
                 }
             }
@@ -4276,6 +4640,73 @@ mod tests {
         boost_test_game_with_speed(player_count, DEFAULT_BOOST_SPEED_MILLI)
     }
 
+    fn started_inactivity_team_game(per_team: u8) -> GameState {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team },
+            QueueMode::Quickmatch,
+            Some(1234),
+            0,
+        );
+        for user_id in 1..=u32::from(per_team) * 2 {
+            game.add_player(user_id, Some(format!("Player{user_id}")))
+                .expect("add inactivity test player");
+        }
+        game.status = GameStatus::Started { server_id: 7 };
+        game.rng = None;
+        game.properties.available_food_target = 0;
+
+        // Pin the shipped policy as well as the lower-level tick behavior.
+        assert_eq!(game.properties.player_idle_timeout_ms, 60_000);
+        assert_eq!(game.properties.player_idle_warning_ms, 10_000);
+        game
+    }
+
+    fn started_inactivity_ffa_game(player_count: u8) -> GameState {
+        let mut game = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll {
+                max_players: player_count,
+            },
+            QueueMode::Quickmatch,
+            Some(4321),
+            0,
+        );
+        for user_id in 1..=u32::from(player_count) {
+            game.add_player(user_id, Some(format!("Player{user_id}")))
+                .expect("add FFA inactivity test player");
+        }
+        game.status = GameStatus::Started { server_id: 7 };
+        game.rng = None;
+        game.properties.available_food_target = 0;
+        game
+    }
+
+    fn inactivity_timeout_ticks(game: &GameState) -> u32 {
+        assert_eq!(
+            game.properties.player_idle_timeout_ms % game.properties.tick_duration_ms,
+            0,
+            "the inactivity deadline must land on an authoritative quantum"
+        );
+        game.properties.player_idle_timeout_ms / game.properties.tick_duration_ms
+    }
+
+    fn schedule_inactivity_test_command(
+        game: &mut GameState,
+        user_id: u32,
+        sequence_number: u32,
+        command: GameCommand,
+    ) {
+        let tick = game.tick;
+        game.schedule_command(&GameCommandMessage {
+            command_id_client: create_command_id(tick, user_id, sequence_number),
+            command_id_server: Some(create_command_id(tick, user_id, sequence_number)),
+            command,
+        });
+    }
+
     fn make_active_mover(snake: &mut Snake, speed_milli: u16) {
         snake.boost.intent = true;
         snake.boost.active = true;
@@ -5680,18 +6111,379 @@ mod tests {
         ));
     }
 
-    /// No clock, and no maximum duration: a match with nobody scoring runs
-    /// indefinitely rather than being called at ninety seconds.
     #[test]
-    fn a_scoreless_team_match_never_ends_on_time() {
-        let mut game = boost_test_game(2);
-        game.status = GameStatus::Started { server_id: 7 };
-        game.rng = None;
-        game.properties.available_food_target = 0;
-        assert_eq!(game.properties.time_limit_ms, None);
+    fn inactivity_fires_on_the_exact_authoritative_deadline() {
+        let mut game = started_inactivity_team_game(2);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        let idle_snake_id = game.players[&1].snake_id;
 
-        // Well past the ninety seconds the old rule would have ended this at.
+        game.tick = timeout_ticks - 2;
+        game.player_last_activity_ticks.insert(1, 0);
+        for user_id in [2, 3, 4] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+
+        let before_deadline = game.tick_forward(true).expect("deadline minus one");
+        assert_eq!(game.tick, timeout_ticks - 1);
+        assert!(game.idle_kicked_user_ids.is_empty());
+        assert!(game.arena.snakes[idle_snake_id as usize].is_alive);
+        assert!(!before_deadline.iter().any(|(_, event)| matches!(
+            event,
+            GameEvent::PlayerIdleKicked { user_id: 1, snake_id }
+                if *snake_id == idle_snake_id
+        )));
+
+        let at_deadline = game.tick_forward(true).expect("exact deadline");
+        assert_eq!(game.tick, timeout_ticks);
+        assert_eq!(game.idle_kicked_user_ids, vec![1]);
+        assert!(!game.arena.snakes[idle_snake_id as usize].is_alive);
+        assert!(matches!(game.status, GameStatus::Started { .. }));
+        assert!(at_deadline.iter().any(|(_, event)| matches!(
+            event,
+            GameEvent::PlayerIdleKicked { user_id: 1, snake_id }
+                if *snake_id == idle_snake_id
+        )));
+    }
+
+    #[test]
+    fn distinct_noop_and_player_activity_commands_reset_the_full_deadline() {
+        let mut game = started_inactivity_team_game(1);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        game.tick = timeout_ticks - 1;
+        for user_id in [1, 2] {
+            game.player_last_activity_ticks.insert(user_id, 0);
+        }
+
+        let first_snake_id = game.players[&1].snake_id;
+        let current_direction = game.arena.snakes[first_snake_id as usize].direction;
+        schedule_inactivity_test_command(
+            &mut game,
+            1,
+            1,
+            GameCommand::Turn {
+                snake_id: first_snake_id,
+                direction: current_direction,
+            },
+        );
+        let second_snake_id = game.players[&2].snake_id;
+        schedule_inactivity_test_command(
+            &mut game,
+            2,
+            1,
+            GameCommand::PlayerActivity {
+                snake_id: second_snake_id,
+            },
+        );
+
+        assert_eq!(game.player_last_activity_ticks[&1], timeout_ticks - 1);
+        assert_eq!(game.player_last_activity_ticks[&2], timeout_ticks - 1);
+        game.tick_forward(true)
+            .expect("both commands reset activity before expiry");
+        assert!(matches!(game.status, GameStatus::Started { .. }));
+        assert!(game.idle_kicked_user_ids.is_empty());
+
+        let renewed_deadline = (timeout_ticks - 1) + timeout_ticks;
+        game.tick = renewed_deadline - 2;
+        game.tick_forward(true).expect("renewed deadline minus one");
+        assert!(game.idle_kicked_user_ids.is_empty());
+        game.tick_forward(true).expect("renewed exact deadline");
+        assert_eq!(game.tick, renewed_deadline);
+        assert_eq!(game.idle_kicked_user_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn duel_inactivity_awards_the_forfeit_to_the_active_opponent() {
+        let mut game = started_inactivity_team_game(1);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        let active_snake_id = game.players[&1].snake_id;
+        let idle_snake_id = game.players[&2].snake_id;
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, game.tick);
+        game.player_last_activity_ticks.insert(2, 0);
+
+        let events = game.tick_forward(true).expect("duel forfeit");
+
+        assert_eq!(game.idle_kicked_user_ids, vec![2]);
+        assert!(game.completed_by_inactivity);
+        assert!(matches!(
+            game.status,
+            GameStatus::Complete {
+                winning_snake_id: Some(winner)
+            } if winner == active_snake_id
+        ));
+        assert!(game.arena.snakes[active_snake_id as usize].is_alive);
+        assert!(!game.arena.snakes[idle_snake_id as usize].is_alive);
+        assert!(events.iter().any(|(_, event)| matches!(
+            event,
+            GameEvent::StatusUpdated {
+                status: GameStatus::Complete {
+                    winning_snake_id: Some(winner)
+                }
+            } if *winner == active_snake_id
+        )));
+    }
+
+    #[test]
+    fn idle_kick_clears_held_boost_and_round_trips_as_a_valid_snapshot() {
+        let mut game = started_inactivity_team_game(2);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        let idle_snake_id = game.players[&1].snake_id;
+        game.arena.snakes[idle_snake_id as usize].boost.intent = true;
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        for user_id in [2, 3, 4] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+
+        game.tick_forward(true).expect("held-Boost idle removal");
+
+        let idle_snake = &game.arena.snakes[idle_snake_id as usize];
+        assert!(!idle_snake.is_alive);
+        assert_eq!(idle_snake.boost, Default::default());
+        game.validate_boost_invariants().unwrap();
+        let restored: GameState = serde_json::from_str(&serde_json::to_string(&game).unwrap())
+            .expect("idle-kicked snapshot round trip");
+        restored.validate_boost_invariants().unwrap();
+    }
+
+    #[test]
+    fn simultaneous_inactivity_expiry_is_an_atomic_draw() {
+        let mut game = started_inactivity_team_game(1);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        game.player_last_activity_ticks.insert(2, 0);
+        let snake_ids = [game.players[&1].snake_id, game.players[&2].snake_id];
+
+        let events = game.tick_forward(true).expect("simultaneous expiry");
+
+        assert_eq!(game.idle_kicked_user_ids, vec![1, 2]);
+        assert!(game.completed_by_inactivity);
+        assert!(matches!(
+            game.status,
+            GameStatus::Complete {
+                winning_snake_id: None
+            }
+        ));
+        assert!(
+            snake_ids
+                .iter()
+                .all(|snake_id| !game.arena.snakes[*snake_id as usize].is_alive)
+        );
+        let death_order: Vec<u32> = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                GameEvent::PlayerIdleKicked { snake_id, .. } => Some(*snake_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(death_order, snake_ids);
+    }
+
+    #[test]
+    fn ffa_removes_one_idle_player_then_awards_the_last_active_survivor() {
+        let mut game = started_inactivity_ffa_game(3);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        for user_id in [2, 3] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+
+        game.tick_forward(true).expect("first FFA idle removal");
+        assert_eq!(game.idle_kicked_user_ids, vec![1]);
+        assert!(matches!(game.status, GameStatus::Started { .. }));
+
+        let winner_snake_id = game.players[&3].snake_id;
+        let second_deadline = game.player_last_activity_ticks[&2] + timeout_ticks;
+        game.tick = second_deadline - 1;
+        game.player_last_activity_ticks.insert(3, game.tick);
+        game.tick_forward(true).expect("FFA survivor win");
+
+        assert_eq!(game.idle_kicked_user_ids, vec![1, 2]);
+        assert!(game.completed_by_inactivity);
+        assert!(matches!(
+            game.status,
+            GameStatus::Complete {
+                winning_snake_id: Some(winner)
+            } if winner == winner_snake_id
+        ));
+    }
+
+    #[test]
+    fn ffa_does_not_idle_kick_a_player_already_eliminated_by_gameplay() {
+        let mut game = started_inactivity_ffa_game(3);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        let eliminated_snake_id = game.players[&1].snake_id;
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: eliminated_snake_id,
+            },
+            None,
+        );
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        game.player_last_activity_ticks.insert(2, 0);
+        game.player_last_activity_ticks.insert(3, game.tick);
+        let winner_snake_id = game.players[&3].snake_id;
+
+        game.tick_forward(true).expect("remaining idle contender");
+
+        assert_eq!(game.idle_kicked_user_ids, vec![2]);
+        assert!(matches!(
+            game.status,
+            GameStatus::Complete {
+                winning_snake_id: Some(winner)
+            } if winner == winner_snake_id
+        ));
+    }
+
+    #[test]
+    fn legacy_active_snapshot_defaults_idle_policy_and_receives_full_grace() {
+        let mut game = started_inactivity_team_game(1);
+        game.tick = 123;
+        let mut json = serde_json::to_value(game).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("player_last_activity_ticks");
+        object.remove("idle_kicked_user_ids");
+        object.remove("completed_by_inactivity");
+        let properties = object["properties"].as_object_mut().unwrap();
+        properties.remove("player_idle_timeout_ms");
+        properties.remove("player_idle_warning_ms");
+
+        let mut restored: GameState = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            restored.properties.player_idle_timeout_ms,
+            DEFAULT_PLAYER_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(
+            restored.properties.player_idle_warning_ms,
+            DEFAULT_PLAYER_IDLE_WARNING_MS
+        );
+        assert!(restored.player_last_activity_ticks.is_empty());
+        restored.tick_forward(true).expect("legacy grace quantum");
+        assert!(restored.idle_kicked_user_ids.is_empty());
+        assert!(
+            restored
+                .player_last_activity_ticks
+                .values()
+                .all(|activity_tick| *activity_tick == 123)
+        );
+        restored.validate_boost_invariants().unwrap();
+    }
+
+    #[test]
+    fn two_on_two_kicks_one_player_then_forfeits_when_their_team_is_empty() {
+        let mut game = started_inactivity_team_game(2);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        let first_idle_snake_id = game.players[&1].snake_id;
+        let remaining_teammate_snake_id = game.players[&3].snake_id;
+        let winning_snake_id = game.players[&2].snake_id;
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        for user_id in [2, 3, 4] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+
+        game.tick_forward(true).expect("individual 2v2 removal");
+        assert_eq!(game.idle_kicked_user_ids, vec![1]);
+        assert!(matches!(game.status, GameStatus::Started { .. }));
+        assert!(!game.arena.snakes[first_idle_snake_id as usize].is_alive);
+        assert!(game.arena.snakes[remaining_teammate_snake_id as usize].is_alive);
+
+        let after_kick = game.tick_forward(true).expect("post-kick quantum");
+        assert!(!game.arena.snakes[first_idle_snake_id as usize].is_alive);
+        assert!(!after_kick.iter().any(|(_, event)| matches!(
+            event,
+            GameEvent::SnakeRespawned { snake_id, .. } if *snake_id == first_idle_snake_id
+        )));
+
+        let teammate_deadline = game.player_last_activity_ticks[&3] + timeout_ticks;
+        game.tick = teammate_deadline - 1;
+        for user_id in [2, 4] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+        game.tick_forward(true)
+            .expect("last teammate expires at their deadline");
+
+        assert_eq!(game.idle_kicked_user_ids, vec![1, 3]);
+        assert!(game.completed_by_inactivity);
+        assert!(matches!(
+            game.status,
+            GameStatus::Complete {
+                winning_snake_id: Some(winner)
+            } if winner == winning_snake_id
+        ));
+        assert!(!game.arena.snakes[first_idle_snake_id as usize].is_alive);
+        assert!(!game.arena.snakes[remaining_teammate_snake_id as usize].is_alive);
+    }
+
+    #[test]
+    fn player_kicked_mid_match_receives_no_xp_when_score_later_ends_match() {
+        let mut game = started_inactivity_team_game(2);
+        let timeout_ticks = inactivity_timeout_ticks(&game);
+        game.tick = timeout_ticks - 1;
+        game.player_last_activity_ticks.insert(1, 0);
+        for user_id in [2, 3, 4] {
+            game.player_last_activity_ticks.insert(user_id, game.tick);
+        }
+
+        game.tick_forward(true).expect("individual idle removal");
+        assert_eq!(game.idle_kicked_user_ids, vec![1]);
+        assert!(matches!(game.status, GameStatus::Started { .. }));
+
+        let winning_snake_id = game.players[&2].snake_id;
+        let winning_team = game.arena.snakes[winning_snake_id as usize]
+            .team_id
+            .expect("team assignment");
+        let score_limit = game.properties.score_limit.expect("team score limit");
+        game.apply_event(
+            GameEvent::TeamScoreUpdated {
+                team_id: winning_team,
+                score: score_limit,
+            },
+            None,
+        );
+        game.tick_forward(false)
+            .expect("score completion after kick");
+
+        assert!(game.is_complete());
+        assert!(!game.completed_by_inactivity);
+        assert_eq!(game.player_xp.get(&1), Some(&0));
+        let winner_score = game.scores.get(&winning_snake_id).copied().unwrap_or(0);
+        assert_eq!(game.player_xp.get(&2), Some(&(winner_score * 10 + 50)));
+    }
+
+    /// Player inactivity is separate from the score race: a scoreless match
+    /// whose players remain present still has no time-limit completion.
+    #[test]
+    fn an_active_scoreless_team_match_never_ends_on_time() {
+        let mut game = started_inactivity_team_game(1);
+        assert_eq!(game.properties.time_limit_ms, None);
+        let refresh_interval = inactivity_timeout_ticks(&game) - 1;
+        let players: Vec<(u32, u32)> = game
+            .players
+            .iter()
+            .map(|(user_id, player)| (*user_id, player.snake_id))
+            .collect();
+        let mut sequence_number = 1;
+
+        // Well past the old ninety-second clock, with explicit presence before
+        // each inactivity deadline.
         for _ in 0..2_400 {
+            if game.tick.is_multiple_of(refresh_interval) {
+                for (user_id, snake_id) in &players {
+                    schedule_inactivity_test_command(
+                        &mut game,
+                        *user_id,
+                        sequence_number,
+                        GameCommand::PlayerActivity {
+                            snake_id: *snake_id,
+                        },
+                    );
+                    sequence_number += 1;
+                }
+            }
             game.tick_forward(false).expect("untimed quantum");
         }
         assert!(!game.is_complete());
@@ -5910,11 +6702,20 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("player_action_counts");
+        for field in [
+            "player_last_activity_ticks",
+            "idle_kicked_user_ids",
+            "completed_by_inactivity",
+        ] {
+            persisted.as_object_mut().unwrap().remove(field);
+        }
         persisted["properties"]["tick_duration_ms"] = serde_json::json!(100);
-        persisted["properties"]
-            .as_object_mut()
-            .unwrap()
-            .remove("boost");
+        for field in ["boost", "player_idle_timeout_ms", "player_idle_warning_ms"] {
+            persisted["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
         persisted["arena"]
             .as_object_mut()
             .unwrap()
@@ -5945,6 +6746,17 @@ mod tests {
         assert_eq!(decoded.properties.boost, None);
         assert!(decoded.arena.boost_pads.is_empty());
         assert!(decoded.player_action_counts.is_empty());
+        assert!(decoded.player_last_activity_ticks.is_empty());
+        assert!(decoded.idle_kicked_user_ids.is_empty());
+        assert!(!decoded.completed_by_inactivity);
+        assert_eq!(
+            decoded.properties.player_idle_timeout_ms,
+            DEFAULT_PLAYER_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(
+            decoded.properties.player_idle_warning_ms,
+            DEFAULT_PLAYER_IDLE_WARNING_MS
+        );
         let snake = &decoded.arena.snakes[0];
         assert_eq!(snake.speed_milli(), NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit(), 0);

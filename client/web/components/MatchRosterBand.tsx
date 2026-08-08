@@ -26,12 +26,15 @@ const PlayerLegend: React.FC<{
   side?: 'left' | 'right';
 }> = ({ player, side = 'right' }) => (
   <span
-    className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}`}
+    className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${player.isIdleKicked ? ' is-idle-kicked' : ''}`}
     role="img"
-    aria-label={`${player.name}${player.isAlive ? '' : ', out'}`}
-    title={player.name}
+    aria-label={`${player.name}${player.isIdleKicked ? ', removed for inactivity' : player.isAlive ? '' : ', out'}`}
+    title={player.isIdleKicked ? `${player.name} — removed for inactivity` : player.name}
   >
     <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
+    {player.isIdleKicked && (
+      <span className="game-roster-idle-badge" aria-hidden="true">Idle</span>
+    )}
   </span>
 );
 
