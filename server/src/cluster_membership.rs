@@ -15,17 +15,20 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
-/// Bumped for the pre-match readiness gate and, on top of it, Boost in Solo
-/// and free-for-all.
+/// Bumped for the pre-match readiness gate, Boost in Solo and free-for-all,
+/// and the idle-kick system layered on top of both.
 ///
-/// Both changes are invisible to serde: `readiness`, `simulation_epoch_ms` and
-/// `BoostConfig::unlimited` all default, so a previous-version executor would
-/// deserialize a *held* checkpoint as an ungated match and simulate the whole
-/// elapsed gate window in one burst, and would run a Solo or free-for-all
-/// match at half its intended simulation rate. The version gate makes it
+/// Every one of those changes is invisible to serde: `readiness`,
+/// `simulation_epoch_ms`, `BoostConfig::unlimited`, `player_last_activity_ticks`,
+/// `idle_kicked_user_ids` and `completed_by_inactivity` all default. A
+/// previous-version executor would therefore deserialize a *held* checkpoint as
+/// an ungated match and simulate the whole elapsed gate window in one burst,
+/// would run a Solo or free-for-all match at half its intended simulation rate,
+/// and would resume an in-flight match with every player's idle clock reset to
+/// tick zero — silently re-arming or skipping kicks. The version gate makes it
 /// refuse the envelope instead, and keeps mixed-version executors from
 /// co-owning partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 7;
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 8;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);

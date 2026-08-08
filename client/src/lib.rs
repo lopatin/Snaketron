@@ -1,7 +1,9 @@
 mod render;
 mod tutorial;
 
-use common::{Direction, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState};
+use common::{
+    Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState,
+};
 use wasm_bindgen::prelude::*;
 
 /// The main client-side game interface exposed to JavaScript.
@@ -155,6 +157,30 @@ impl GameClient {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         serde_json::to_string(&command_message).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Acknowledge the arena inactivity warning without changing movement.
+    #[wasm_bindgen(js_name = processPlayerActivity)]
+    pub fn process_player_activity(&mut self, snake_id: u32) -> Result<String, JsValue> {
+        let command = GameCommand::PlayerActivity { snake_id };
+        let command_message = self
+            .engine
+            .process_local_command(command)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        serde_json::to_string(&command_message).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Drop prediction for a command that the browser could not admit to its
+    /// durable delivery outbox. The serialized envelope is the exact value
+    /// returned by the process* method, avoiding any lossy identity rebuild.
+    #[wasm_bindgen(js_name = discardLocalCommand)]
+    pub fn discard_local_command(&mut self, command_message_json: &str) -> Result<bool, JsValue> {
+        let command_message: GameCommandMessage = serde_json::from_str(command_message_json)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(self
+            .engine
+            .discard_local_command(&command_message.command_id_client))
     }
 
     /// Process a server event for reconciliation
@@ -370,9 +396,7 @@ pub use render::screen_direction_to_game;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{
-        DEFAULT_TICK_INTERVAL_MS, GameCommandMessage, GameStatus, GameType, Position, QueueMode,
-    };
+    use common::{DEFAULT_TICK_INTERVAL_MS, GameStatus, GameType, Position, QueueMode};
 
     fn charged_duel_state() -> (GameState, u32) {
         let mut state = GameState::new(
@@ -586,6 +610,79 @@ mod tests {
             serde_json::to_value(command).unwrap(),
             serde_json::json!({ "DeactivateBoost": { "snake_id": 17 } })
         );
+    }
+
+    #[test]
+    fn player_activity_boundary_serializes_the_local_players_snake() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.add_player(8, None).unwrap();
+        let mut client = GameClient {
+            engine: GameEngine::try_new_from_state(42, state).unwrap(),
+        };
+        client.set_local_player_id(7);
+
+        let command: GameCommandMessage =
+            serde_json::from_str(&client.process_player_activity(snake_id).unwrap()).unwrap();
+
+        assert_eq!(command.command_id_client.user_id, 7);
+        assert_eq!(command.command_id_server, None);
+        assert_eq!(command.command, GameCommand::PlayerActivity { snake_id });
+        assert_eq!(
+            serde_json::to_value(command.command).unwrap(),
+            serde_json::json!({ "PlayerActivity": { "snake_id": snake_id } })
+        );
+    }
+
+    #[test]
+    fn failed_outbox_admission_retracts_predicted_player_activity() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.add_player(8, None).unwrap();
+        state.status = GameStatus::Started { server_id: 1 };
+        state.tick = 550;
+        state.player_last_activity_ticks.insert(7, 0);
+        let mut client = GameClient {
+            engine: GameEngine::try_new_from_state(42, state).unwrap(),
+        };
+        client.set_local_player_id(7);
+
+        let command_json = client.process_player_activity(snake_id).unwrap();
+        assert_eq!(
+            client
+                .engine
+                .predicted_state()
+                .unwrap()
+                .player_last_activity_ticks[&7],
+            550
+        );
+
+        assert!(client.discard_local_command(&command_json).unwrap());
+        client.engine.rebuild_predicted_state(55_000).unwrap();
+        assert_eq!(
+            client
+                .engine
+                .predicted_state()
+                .unwrap()
+                .player_last_activity_ticks[&7],
+            0,
+            "an input that never entered the durable outbox must not hide the warning"
+        );
+        assert!(!client.discard_local_command(&command_json).unwrap());
     }
 
     #[test]

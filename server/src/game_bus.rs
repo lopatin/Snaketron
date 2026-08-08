@@ -1634,6 +1634,45 @@ impl GameBus {
         Ok(result == 1)
     }
 
+    /// Release one removed player's global matchmaking slot while the rest of
+    /// the game remains active. This key lives outside the partition's Redis
+    /// Cluster slot, so the operation cannot share the lease-fenced game-state
+    /// transaction. A compare-delete against the exact game ID makes retries
+    /// idempotent and prevents a delayed cleanup from erasing a newer match.
+    pub async fn cleanup_matchmaking_for_idle_player(
+        &self,
+        game_id: u32,
+        user_id: u32,
+    ) -> Result<bool> {
+        let key = RedisKeys::matchmaking_user_active_game(user_id);
+        let mut redis = self.redis.clone();
+        let operation = async {
+            redis::Script::new(
+                r#"
+                local value_type = redis.call('TYPE', KEYS[1])
+                if type(value_type) == 'table' then value_type = value_type.ok end
+                if value_type ~= 'none' and value_type ~= 'string' then return -1 end
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+                redis.call('DEL', KEYS[1])
+                return 1
+                "#,
+            )
+            .key(&key)
+            .arg(game_id)
+            .invoke_async(&mut redis)
+            .await
+        };
+        let result: i32 = tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+            .await
+            .context("idle-player matchmaking cleanup timed out")??;
+        match result {
+            1 => Ok(true),
+            0 => Ok(false),
+            -1 => anyhow::bail!("idle-player active-game mapping has the wrong Redis type"),
+            other => anyhow::bail!("unknown idle-player cleanup result {other}"),
+        }
+    }
+
     /// Generic immutable fenced record plus pending-index mutation used by
     /// completion/future executor effects. `SET NX` makes ambiguous retries
     /// converge without permitting a different second record.
@@ -2901,6 +2940,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("player_action_counts");
+        for field in [
+            "player_last_activity_ticks",
+            "idle_kicked_user_ids",
+            "completed_by_inactivity",
+        ] {
+            value.as_object_mut().unwrap().remove(field);
+        }
         value["properties"]["available_food_target"] = serde_json::json!(10);
         value["properties"]["tick_duration_ms"] = serde_json::json!(100);
         value["properties"]["time_limit_ms"] =
@@ -2909,11 +2955,14 @@ mod tests {
             } else {
                 serde_json::Value::Null
             };
-        value["properties"]
-            .as_object_mut()
-            .unwrap()
-            .remove("score_limit");
-        value["properties"].as_object_mut().unwrap().remove("boost");
+        for field in [
+            "score_limit",
+            "boost",
+            "player_idle_timeout_ms",
+            "player_idle_warning_ms",
+        ] {
+            value["properties"].as_object_mut().unwrap().remove(field);
+        }
         value["arena"].as_object_mut().unwrap().remove("boost_pads");
         serde_json::to_vec(&value).unwrap()
     }

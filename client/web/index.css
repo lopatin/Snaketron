@@ -403,6 +403,40 @@ button.game-scoreboard-brand {
   filter: grayscale(0.32);
 }
 
+.game-roster-player.is-idle-kicked {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.58;
+}
+
+.game-roster-player.is-idle-kicked .game-roster-snake {
+  width: clamp(72px, 10.5vw, 108px);
+}
+
+.game-roster-idle-badge,
+.game-over-idle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d49a00;
+  border-radius: 3px;
+  background: #fff8d9;
+  color: #8a5a00;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: 0.07em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.game-roster-idle-badge {
+  min-height: 15px;
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  font-size: 7px;
+}
+
 /* The results table still uses the compact legacy swatch; the live roster uses
    the more descriptive snake glyph below. */
 .game-roster-swatch {
@@ -1217,6 +1251,13 @@ button.game-scoreboard-brand {
   text-transform: uppercase;
 }
 
+.game-over-idle {
+  min-height: 17px;
+  margin-left: 7px;
+  padding: 2px 5px;
+  font-size: 8px;
+}
+
 .game-over-player > strong {
   font-size: 14px;
 }
@@ -1658,6 +1699,14 @@ button.game-scoreboard-brand {
 
   .game-over-kicker::before {
     background: CanvasText;
+  }
+
+  .game-roster-idle-badge,
+  .game-over-idle {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
   }
 }
 

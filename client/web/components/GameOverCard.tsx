@@ -272,6 +272,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
               <span className="game-over-player-name">
                 {player.name}
                 {player.isWinner && <span className="game-over-winner">Winner</span>}
+                {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
               </span>
               <strong>{player.score}</strong>
             </div>

@@ -32,15 +32,25 @@ const PlayerLegend: React.FC<{
     player.isReady === null ? '' : player.isReady ? ' is-ready' : ' is-awaiting-ready';
   const readyLabel =
     player.isReady === null ? '' : player.isReady ? ', ready' : ', not ready yet';
+  // An idle kick can only land after the gate has resolved, so readiness and
+  // inactivity never annotate the same player at the same time.
+  const statusLabel = player.isIdleKicked
+    ? ', removed for inactivity'
+    : player.isAlive
+      ? ''
+      : ', out';
 
   return (
     <span
-      className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${readyState}`}
+      className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${player.isIdleKicked ? ' is-idle-kicked' : ''}${readyState}`}
       role="img"
-      aria-label={`${player.name}${readyLabel}${player.isAlive ? '' : ', out'}`}
-      title={player.name}
+      aria-label={`${player.name}${readyLabel}${statusLabel}`}
+      title={player.isIdleKicked ? `${player.name} — removed for inactivity` : player.name}
     >
       <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
+      {player.isIdleKicked && (
+        <span className="game-roster-idle-badge" aria-hidden="true">Idle</span>
+      )}
     </span>
   );
 };

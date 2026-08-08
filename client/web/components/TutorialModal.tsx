@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { TutorialContent } from '../utils/tutorial';
+import { lockBodyScroll } from '../utils/bodyScrollLock';
 import TutorialSceneCanvas from './TutorialSceneCanvas';
 
 const FOCUSABLE_SELECTOR = [
@@ -160,8 +161,9 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
 
     const previouslyFocused =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    // Counted: the inactivity removal dialog is also modal and can be mounted
+    // in the same commit, and two save/restore pairs strand the lock.
+    const releaseBodyScroll = lockBodyScroll();
     const focusFrame = window.requestAnimationFrame(() => dialogRef.current?.focus());
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -226,7 +228,7 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
     return () => {
       window.cancelAnimationFrame(focusFrame);
       document.removeEventListener('keydown', handleKeyDown, true);
-      document.body.style.overflow = previousOverflow;
+      releaseBodyScroll();
       if (previouslyFocused?.isConnected) {
         previouslyFocused.focus();
       }

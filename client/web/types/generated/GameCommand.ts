@@ -2,4 +2,4 @@
 import type { Direction } from "./Direction";
 import type { GameStatus } from "./GameStatus";
 
-export type GameCommand = { "Turn": { snake_id: number, direction: Direction, } } | { "ActivateBoost": { snake_id: number, } } | { "UpdateStatus": { status: GameStatus, } } | { "DeactivateBoost": { snake_id: number, } };
+export type GameCommand = { "Turn": { snake_id: number, direction: Direction, } } | { "ActivateBoost": { snake_id: number, } } | { "UpdateStatus": { status: GameStatus, } } | { "DeactivateBoost": { snake_id: number, } } | { "PlayerActivity": { snake_id: number, } };

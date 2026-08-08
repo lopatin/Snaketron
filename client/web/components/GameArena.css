@@ -219,6 +219,257 @@
   background: rgb(255 255 255 / 28%);
 }
 
+/* Inactivity pit board ------------------------------------------------------
+   The strip borrows the arena's white-paper telemetry and the Boost reservoir
+   rather than covering the field with a generic warning modal. The board is
+   pointer-transparent except for its one deliberate presence control. */
+.game-idle-warning {
+  --game-idle-accent: var(--game-boost, #f8c84a);
+  --game-idle-accent-ink: #8a5a00;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  left: 10px;
+  z-index: 25;
+  display: grid;
+  min-height: 54px;
+  grid-template-columns: 30px minmax(0, 1fr) 54px auto;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  padding: 7px 8px 10px;
+  border: 1px solid rgb(63 63 65 / 72%);
+  border-radius: 5px;
+  background: rgb(255 255 255 / 96%);
+  box-shadow: 0 5px 16px rgb(23 32 51 / 16%);
+  color: var(--game-graphite, #3f3f41);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  animation: game-idle-warning-in 160ms ease-out both;
+}
+
+.game-idle-warning.is-urgent {
+  --game-idle-accent: var(--game-red, #ef4444);
+  --game-idle-accent-ink: #a51d2d;
+}
+
+.game-idle-warning__flag {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid rgb(63 63 65 / 32%);
+  border-radius: 3px;
+  background: var(--game-idle-accent);
+  color: #172033;
+  font-size: 17px;
+  font-style: italic;
+  font-weight: 950;
+  line-height: 1;
+}
+
+.game-idle-warning.is-urgent .game-idle-warning__flag {
+  color: #fff;
+}
+
+.game-idle-warning__copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.game-idle-warning__copy strong {
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: 0.095em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.game-idle-warning__copy > span {
+  overflow: hidden;
+  color: var(--game-muted, #667085);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.game-idle-warning__countdown {
+  color: var(--game-idle-accent-ink);
+  font-size: 25px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.game-idle-warning__countdown span {
+  margin-left: 1px;
+  font-size: 11px;
+  font-style: normal;
+  letter-spacing: 0;
+}
+
+.game-idle-warning__action {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgb(63 63 65 / 72%);
+  border-radius: 4px;
+  appearance: none;
+  background: #fff;
+  color: var(--game-graphite, #3f3f41);
+  font-size: 9px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: border-color 130ms ease, background-color 130ms ease;
+}
+
+.game-idle-warning__action:hover {
+  border-color: var(--game-idle-accent-ink);
+  background: color-mix(in srgb, var(--game-idle-accent) 16%, white);
+}
+
+.game-idle-warning__action:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 38%);
+  outline-offset: 2px;
+}
+
+.game-idle-warning__rail {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 4px;
+  overflow: hidden;
+  background: rgb(63 63 65 / 10%);
+}
+
+.game-idle-warning__rail > span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--game-idle-accent);
+  transform: scaleX(var(--game-idle-progress, 1));
+  transform-origin: left center;
+  transition: transform 100ms linear, background-color 140ms ease;
+}
+
+@keyframes game-idle-warning-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* A locally removed player cannot return to the field, so this explanation is
+   intentionally modal even when teammates continue the match. */
+.game-idle-kick-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 85;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(63 63 65 / 34%);
+  animation: game-idle-kick-backdrop-in 180ms ease-out both;
+}
+
+.game-idle-kick-dialog {
+  width: min(440px, 100%);
+  overflow: hidden;
+  border: 1px solid rgb(63 63 65 / 58%);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 18px 48px rgb(31 41 55 / 22%);
+  animation: game-idle-kick-dialog-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.game-idle-kick-dialog:focus {
+  outline: none;
+}
+
+.game-idle-kick-dialog__header {
+  position: relative;
+  padding: 19px 22px 17px 28px;
+  border-bottom: 1px solid #d8dbe0;
+  background: #fff;
+}
+
+.game-idle-kick-dialog__header::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 7px;
+  background: var(--game-red, #ef4444);
+  content: "";
+}
+
+.game-idle-kick-dialog__kicker {
+  color: var(--game-red, #ef4444);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.game-idle-kick-dialog h2 {
+  margin: 5px 0 0;
+  color: var(--game-graphite, #3f3f41);
+  font-size: clamp(26px, 7vw, 36px);
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.035em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.game-idle-kick-dialog__body {
+  padding: 20px 22px;
+}
+
+.game-idle-kick-dialog__body p {
+  margin: 0;
+  color: var(--game-muted, #667085);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.5;
+}
+
+.game-idle-kick-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 13px 22px;
+  border-top: 1px solid #d8dbe0;
+  background: #fafafa;
+}
+
+.game-idle-kick-dialog__actions .game-shell-button {
+  min-height: 40px;
+  padding-inline: 18px;
+  font-size: 10px;
+}
+
+@keyframes game-idle-kick-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes game-idle-kick-dialog-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
 .game-controls-hint {
   position: static;
   z-index: 35;
@@ -410,6 +661,40 @@
     padding-bottom: 48px;
   }
 
+  .game-idle-warning {
+    top: 6px;
+    right: 6px;
+    left: 6px;
+    min-height: 48px;
+    grid-template-columns: 24px minmax(0, 1fr) 42px auto;
+    gap: 6px;
+    padding: 6px 6px 9px;
+  }
+
+  .game-idle-warning__flag {
+    width: 22px;
+    height: 22px;
+    font-size: 14px;
+  }
+
+  .game-idle-warning__copy strong {
+    font-size: 8px;
+  }
+
+  .game-idle-warning__copy > span {
+    font-size: 9px;
+  }
+
+  .game-idle-warning__countdown {
+    font-size: 20px;
+  }
+
+  .game-idle-warning__action {
+    min-height: 29px;
+    padding-inline: 8px;
+    font-size: 8px;
+  }
+
   .game-controls-hint {
     position: fixed;
     bottom: 10px;
@@ -461,6 +746,30 @@
 
   .boost-input-mode__text {
     font-size: 7.5px;
+  }
+}
+
+@media (max-width: 380px) {
+  .game-idle-warning__copy > span {
+    display: none;
+  }
+
+  .game-idle-warning__action {
+    padding-inline: 6px;
+  }
+
+  .game-idle-kick-backdrop {
+    padding: 8px;
+  }
+
+  .game-idle-kick-dialog__header {
+    padding: 16px 16px 15px 22px;
+  }
+
+  .game-idle-kick-dialog__body,
+  .game-idle-kick-dialog__actions {
+    padding-right: 16px;
+    padding-left: 16px;
   }
 }
 
@@ -532,8 +841,34 @@
 @media (prefers-reduced-motion: reduce) {
   .game-boost-hud,
   .game-boost-meter,
-  .game-boost-meter__fill {
+  .game-boost-meter__fill,
+  .game-idle-warning,
+  .game-idle-warning__action,
+  .game-idle-warning__rail > span,
+  .game-idle-kick-backdrop,
+  .game-idle-kick-dialog {
+    animation: none;
     transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .game-idle-warning,
+  .game-idle-warning__flag,
+  .game-idle-warning__action,
+  .game-idle-kick-dialog,
+  .game-idle-kick-dialog__header,
+  .game-idle-kick-dialog__actions {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .game-idle-warning__rail,
+  .game-idle-warning__rail > span,
+  .game-idle-kick-dialog__header::before {
+    background: Highlight;
   }
 }
 

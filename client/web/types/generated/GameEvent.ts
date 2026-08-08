@@ -8,7 +8,7 @@ import type { GameStatus } from "./GameStatus";
 import type { Position } from "./Position";
 import type { TeamId } from "./TeamId";
 
-export type GameEvent = { "SnakeTurned": { snake_id: number, direction: Direction, } } | { "SnakeDied": { snake_id: number, } } | { "FoodSpawned": { position: Position, } } | { "FoodEaten": { snake_id: number, position: Position, } } | { "BoostPacketCollected": { pad_id: number, snake_id: number, charge_ms_after: number, respawn_at_tick: number, } } | { "Snapshot": { game_state: GameState, } } | { "CommandScheduled": { command_message: GameCommandMessage, } } | { "CommandScheduledV2": { command_id: ClientCommandIdentityV2, command_message: GameCommandMessage,
+export type GameEvent = { "SnakeTurned": { snake_id: number, direction: Direction, } } | { "SnakeDied": { snake_id: number, } } | { "PlayerIdleKicked": { user_id: number, snake_id: number, } } | { "FoodSpawned": { position: Position, } } | { "FoodEaten": { snake_id: number, position: Position, } } | { "BoostPacketCollected": { pad_id: number, snake_id: number, charge_ms_after: number, respawn_at_tick: number, } } | { "Snapshot": { game_state: GameState, } } | { "CommandScheduled": { command_message: GameCommandMessage, } } | { "CommandScheduledV2": { command_id: ClientCommandIdentityV2, command_message: GameCommandMessage,
 /**
  * True when the executor is returning a previously recorded outcome;
  * replicas must not schedule the same logical command again.

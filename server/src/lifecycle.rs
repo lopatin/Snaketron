@@ -12,7 +12,15 @@ const PHASE_STOPPING: u8 = 3;
 /// Capabilities advertised only after the server has actually authenticated a
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
-pub const WS_PROTOCOL_VERSION: u16 = 6;
+///
+/// Version 7 carries the pre-match readiness gate and the inactivity protocol
+/// together. Each shipped a wire change and each independently claimed version
+/// 6, so 6 would now name two mutually unintelligible protocols: a client
+/// built for either one would pass this hard-cutover equality check and then
+/// fail to understand half the messages it receives. This must stay in lockstep
+/// with `GAMEPLAY_PROTOCOL_VERSION` in client/web/constants.ts; the bot and
+/// loadtest clients import this constant directly so they cannot drift at all.
+pub const WS_PROTOCOL_VERSION: u16 = 7;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",

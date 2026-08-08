@@ -53,8 +53,12 @@ pub(crate) fn authorize_game_command(
     match command.command {
         GameCommand::Turn { snake_id, .. }
         | GameCommand::ActivateBoost { snake_id }
-        | GameCommand::DeactivateBoost { snake_id } => match state.players.get(&user_id) {
+        | GameCommand::DeactivateBoost { snake_id }
+        | GameCommand::PlayerActivity { snake_id } => match state.players.get(&user_id) {
             None => return Err("user is not a player in this game"),
+            Some(_) if state.is_player_idle_kicked(user_id) => {
+                return Err("player was removed for inactivity");
+            }
             Some(player) if player.snake_id != snake_id => {
                 return Err("snake is not owned by the submitting user");
             }
@@ -131,6 +135,22 @@ mod tests {
             },
             command_id_server: None,
             command: GameCommand::DeactivateBoost { snake_id },
+        }
+    }
+
+    fn player_activity_command(claimed_user_id: u32, snake_id: u32) -> GameCommandMessage {
+        GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 5,
+                user_id: claimed_user_id,
+                sequence_number: 0,
+            },
+            command_id_server: Some(CommandId {
+                tick: 99,
+                user_id: claimed_user_id,
+                sequence_number: 9,
+            }),
+            command: GameCommand::PlayerActivity { snake_id },
         }
     }
 
@@ -223,6 +243,41 @@ mod tests {
     fn spectator_boost_deactivation_is_rejected() {
         let (state, snake_a, _) = two_player_state();
         assert!(authorize_game_command(&state, 99, deactivate_boost_command(99, snake_a)).is_err());
+    }
+
+    #[test]
+    fn own_player_activity_is_authorized_with_authenticated_identity() {
+        let (state, snake_a, _) = two_player_state();
+        let authorized =
+            authorize_game_command(&state, USER_A, player_activity_command(USER_B, snake_a))
+                .unwrap();
+
+        assert_eq!(authorized.command_id_client.user_id, USER_A);
+        assert_eq!(authorized.command_id_server, None);
+        assert_eq!(
+            authorized.command,
+            GameCommand::PlayerActivity { snake_id: snake_a }
+        );
+    }
+
+    #[test]
+    fn player_activity_for_another_users_snake_is_rejected() {
+        let (state, _, snake_b) = two_player_state();
+        assert!(
+            authorize_game_command(&state, USER_A, player_activity_command(USER_A, snake_b),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn idle_kicked_players_cannot_send_player_activity() {
+        let (mut state, snake_a, _) = two_player_state();
+        state.idle_kicked_user_ids.push(USER_A);
+
+        assert!(
+            authorize_game_command(&state, USER_A, player_activity_command(USER_A, snake_a),)
+                .is_err()
+        );
     }
 
     #[test]

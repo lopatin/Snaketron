@@ -322,6 +322,23 @@ impl GameEngine {
         Ok(command_message)
     }
 
+    /// Retract a command that never made it into the browser's durable
+    /// delivery outbox. This is deliberately separate from an authoritative
+    /// rejection: no server outcome exists yet, but prediction must still be
+    /// rebuilt so a failed local enqueue cannot manufacture player activity.
+    pub fn discard_local_command(&mut self, command_id_client: &CommandId) -> bool {
+        let before = self.speculative_commands.len();
+        self.speculative_commands
+            .retain(|command| &command.command_id_client != command_id_client);
+        let removed = self.speculative_commands.len() != before;
+        // Even an already-absent identity should re-anchor prediction. The
+        // browser calls this only after delivery admission fails, and the safe
+        // fallback is to rebuild from committed state plus whatever commands
+        // remain durably queued.
+        self.prediction_needs_rebuild = true;
+        removed
+    }
+
     /// Process a server event and reconcile with local predictions
     pub fn process_server_event(&mut self, event_message: &GameEventMessage) -> Result<()> {
         let is_snapshot = matches!(&event_message.event, GameEvent::Snapshot { .. });
@@ -682,7 +699,11 @@ impl GameEngine {
     /// The server ID and scheduled tick are preserved exactly; recomputing them
     /// from the successor's older checkpoint would make the same client command
     /// resolve differently after failover.
-    pub fn replay_scheduled_command(&mut self, command_message: GameCommandMessage) -> Result<()> {
+    pub fn replay_scheduled_command(
+        &mut self,
+        command_message: GameCommandMessage,
+        scheduled_at_tick: u32,
+    ) -> Result<()> {
         let server_id = command_message
             .command_id_server
             .as_ref()
@@ -706,6 +727,37 @@ impl GameEngine {
                 self.committed_state.current_tick()
             ));
         }
+        if scheduled_at_tick < self.committed_state.current_tick()
+            || scheduled_at_tick > server_id.tick
+        {
+            return Err(anyhow::anyhow!(
+                "replayed command activity tick {} must be between checkpoint tick {} and scheduled tick {}",
+                scheduled_at_tick,
+                self.committed_state.current_tick(),
+                server_id.tick
+            ));
+        }
+
+        // Replay the old checkpoint up to the instant at which the original
+        // actor accepted this command before recording its activity. Writing a
+        // future activity tick into the checkpoint first would let a later
+        // input retroactively protect the player from a deadline crossed
+        // during catch-up.
+        while self.committed_state.current_tick() < scheduled_at_tick {
+            if self.committed_state.is_complete() {
+                return Err(anyhow::anyhow!(
+                    "replayed command was accepted after the recovered game completed"
+                ));
+            }
+            self.committed_state.tick_forward(false)?;
+        }
+
+        // Recovery has no speculative local input. Re-anchor prediction to the
+        // exact recovered state after each temporal catch-up so queued commands
+        // and inactivity metadata cannot diverge inside the server engine.
+        let mut recovered_predicted_state = self.committed_state.clone();
+        recovered_predicted_state.rng = None;
+        self.predicted_state = Some(recovered_predicted_state);
 
         self.command_counter = self
             .command_counter
@@ -1013,6 +1065,204 @@ mod tests {
             cmd1.command_id_client, cmd2.command_id_client,
             "same-tick local commands must have distinct ids"
         );
+    }
+
+    #[test]
+    fn recovery_replay_preserves_the_authoritative_activity_tick() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = state.add_player(7, None).unwrap().snake_id;
+        state.add_player(8, None).unwrap();
+        state.tick = 5;
+
+        let mut engine = GameEngine::try_new_from_state_with_command_counter(99, state, 3)
+            .expect("restore checkpoint");
+        let recovered_command = GameCommandMessage {
+            command_id_client: CommandId {
+                tick: 20,
+                user_id: 7,
+                sequence_number: 4,
+            },
+            command_id_server: Some(CommandId {
+                tick: 20,
+                user_id: 7,
+                sequence_number: 3,
+            }),
+            command: GameCommand::PlayerActivity { snake_id },
+        };
+
+        engine
+            .replay_scheduled_command(recovered_command, 12)
+            .expect("replay authoritative decision");
+
+        assert_eq!(
+            engine.committed_state().player_last_activity_ticks.get(&7),
+            Some(&12),
+            "recovery must retain when the server originally received the command"
+        );
+        assert_eq!(
+            engine
+                .predicted_state()
+                .unwrap()
+                .player_last_activity_ticks
+                .get(&7),
+            Some(&12),
+            "committed and predicted recovery states must share the same activity anchor"
+        );
+        assert_eq!(engine.next_server_command_sequence(), 4);
+    }
+
+    #[test]
+    fn started_recovery_replay_cannot_write_future_activity_or_revive_an_expired_player() {
+        fn checkpoint_near_deadline() -> (GameState, u32, u32) {
+            let mut state = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                QueueMode::Quickmatch,
+                None,
+                0,
+            );
+            let idle_snake_id = state.add_player(7, None).unwrap().snake_id;
+            let active_snake_id = state.add_player(8, None).unwrap().snake_id;
+            state.status = GameStatus::Started { server_id: 1 };
+            // No RNG suppresses food on its own; the mode's food target is a
+            // validated invariant and must keep its constructed value or
+            // snapshot admission rejects this checkpoint.
+            state.rng = None;
+
+            let timeout_ticks =
+                state.properties.player_idle_timeout_ms / state.properties.tick_duration_ms;
+            state.tick = timeout_ticks - 2;
+            state.player_last_activity_ticks.insert(7, 0);
+            state.player_last_activity_ticks.insert(8, state.tick);
+            state.validate_boost_invariants().unwrap();
+            (state, idle_snake_id, active_snake_id)
+        }
+
+        fn activity_command(
+            snake_id: u32,
+            server_tick: u32,
+            sequence_number: u32,
+        ) -> GameCommandMessage {
+            GameCommandMessage {
+                command_id_client: CommandId {
+                    tick: server_tick,
+                    user_id: 7,
+                    sequence_number: 1,
+                },
+                command_id_server: Some(CommandId {
+                    tick: server_tick,
+                    user_id: 7,
+                    sequence_number,
+                }),
+                command: GameCommand::PlayerActivity { snake_id },
+            }
+        }
+
+        let (near_state, idle_snake_id, _) = checkpoint_near_deadline();
+        let deadline_tick = near_state.tick + 2;
+        let accepted_tick = deadline_tick - 1;
+        let mut accepted = GameEngine::try_new_from_state_with_command_counter(99, near_state, 0)
+            .expect("restore live checkpoint");
+        accepted
+            .replay_scheduled_command(
+                activity_command(idle_snake_id, deadline_tick + 5, 0),
+                accepted_tick,
+            )
+            .expect("replay activity accepted just before expiry");
+
+        let accepted_state = accepted.committed_state();
+        assert_eq!(accepted_state.tick, accepted_tick);
+        assert_eq!(
+            accepted_state.player_last_activity_ticks.get(&7),
+            Some(&accepted_tick)
+        );
+        assert!(!accepted_state.is_player_idle_kicked(7));
+        accepted_state.validate_boost_invariants().unwrap();
+
+        let (crossing_state, idle_snake_id, active_snake_id) = checkpoint_near_deadline();
+        let mut crossing =
+            GameEngine::try_new_from_state_with_command_counter(100, crossing_state, 0)
+                .expect("restore expiring checkpoint");
+        crossing
+            .replay_scheduled_command(
+                activity_command(idle_snake_id, deadline_tick + 5, 0),
+                deadline_tick,
+            )
+            .expect("replay must retain terminal catch-up state");
+
+        let crossing_state = crossing.committed_state();
+        assert_eq!(crossing_state.tick, deadline_tick);
+        assert_eq!(
+            crossing_state.player_last_activity_ticks.get(&7),
+            Some(&0),
+            "a decision observed after expiry must not write activity into the future"
+        );
+        assert!(crossing_state.is_player_idle_kicked(7));
+        assert!(!crossing_state.arena.snakes[idle_snake_id as usize].is_alive);
+        assert!(matches!(
+            crossing_state.status,
+            GameStatus::Complete {
+                winning_snake_id: Some(winner)
+            } if winner == active_snake_id
+        ));
+        crossing_state.validate_boost_invariants().unwrap();
+    }
+
+    #[test]
+    fn replicated_idle_kick_is_idempotent_after_client_fast_forward() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        for user_id in 1..=4 {
+            state.add_player(user_id, None).expect("add team player");
+        }
+        state.status = GameStatus::Started { server_id: 1 };
+        // No RNG suppresses food; the mode's food target stays as constructed
+        // so the restored snapshot passes gameplay-invariant admission.
+        state.rng = None;
+        state.properties.player_idle_timeout_ms = 1_000;
+        state.properties.player_idle_warning_ms = 500;
+        state.tick = 8;
+        state.player_last_activity_ticks.insert(1, 0);
+        for user_id in 2..=4 {
+            state.player_last_activity_ticks.insert(user_id, 8);
+        }
+        let snake_id = state.players[&1].snake_id;
+        let mut engine = GameEngine::new_from_state(91, state);
+
+        engine
+            .process_server_event(&GameEventMessage {
+                game_id: 91,
+                tick: 10,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::PlayerIdleKicked {
+                    user_id: 1,
+                    snake_id,
+                },
+            })
+            .expect("exact already-derived kick must be accepted");
+
+        let committed = engine.committed_state();
+        assert_eq!(committed.idle_kicked_user_ids, vec![1]);
+        assert!(!committed.arena.snakes[snake_id as usize].is_alive);
+        assert!(matches!(committed.status, GameStatus::Started { .. }));
+        assert!(!engine.sync_status().needs_resync);
+        committed.validate_boost_invariants().unwrap();
     }
 
     #[test]

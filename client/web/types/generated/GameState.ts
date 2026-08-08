@@ -24,6 +24,24 @@ is_stress_test: boolean, properties: GameProperties, players: { [key in number]?
  */
 player_action_counts: { [key in number]?: number },
 /**
+ * Tick of the most recent authenticated gameplay input for each player.
+ * Unlike `player_action_counts`, legal no-op inputs count as activity: the
+ * player is demonstrably present even when the requested state is already
+ * active. Transport retries never reach this map twice because command
+ * outcomes are deduplicated before scheduling.
+ */
+player_last_activity_ticks: { [key in number]?: number },
+/**
+ * Players removed from this match for inactivity. They remain in the
+ * roster so results, MMR, and spectators can explain what happened.
+ */
+idle_kicked_user_ids: Array<number>,
+/**
+ * True only when inactivity, rather than the mode's ordinary score/death
+ * condition, produced the terminal result.
+ */
+completed_by_inactivity: boolean,
+/**
  * Pre-match readiness gate. Present from match creation until every
  * player has confirmed or the deadline lapses, then cleared for good.
  * `None` also covers matches created before this protocol existed, which

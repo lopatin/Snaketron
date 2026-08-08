@@ -6,7 +6,9 @@ export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // Hard-cutover gameplay protocol. The server accepts this exact version only;
 // stale tabs receive "client update required" and must reload.
-export const GAMEPLAY_PROTOCOL_VERSION = 6;
+// Must equal WS_PROTOCOL_VERSION in server/src/lifecycle.rs, which explains
+// why the readiness gate and the inactivity protocol share version 7.
+export const GAMEPLAY_PROTOCOL_VERSION = 7;
 export const CLIENT_UPDATE_REQUIRED_REASON = 'Client update required';
 export const isClientUpdateRequiredReason = (reason: unknown): boolean => (
   typeof reason === 'string' &&

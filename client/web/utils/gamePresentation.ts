@@ -16,6 +16,7 @@ export interface MatchPlayerPresentation {
   name: string;
   isCurrentPlayer: boolean;
   isAlive: boolean;
+  isIdleKicked: boolean;
   teamId: number | null;
   /**
    * The inputs the shared Rust renderer needs to paint this snake. Carrying
@@ -187,6 +188,7 @@ export const buildMatchPresentation = (
   queueMode: QueueMode = gameState.queue_mode,
 ): MatchPresentation => {
   const mode = modeDetails(gameState, queueMode);
+  const idleKickedUserIds = new Set(gameState.idle_kicked_user_ids ?? []);
   const playerBySnake = new Map<number, number>();
   for (const [rawUserId, player] of Object.entries(gameState.players ?? {})) {
     if (player) {
@@ -237,9 +239,10 @@ export const buildMatchPresentation = (
       local_team_id: currentTeamId,
     };
     const score = valueAt(gameState.scores, snakeId);
-    const isWinner = mode.isTeam && winningTeamId !== null
+    const isIdleKicked = userId !== null && idleKickedUserIds.has(userId);
+    const isWinner = !isIdleKicked && mode.isTeam && winningTeamId !== null
       ? snake.team_id === winningTeamId
-      : snakeId === winningSnakeId;
+      : !isIdleKicked && snakeId === winningSnakeId;
 
     return {
       snakeId,
@@ -249,6 +252,7 @@ export const buildMatchPresentation = (
         : (userId === null ? null : gameState.usernames?.[userId]) ?? `Player ${snakeId + 1}`,
       isCurrentPlayer,
       isAlive: snake.is_alive,
+      isIdleKicked,
       teamId: snake.team_id,
       skin,
       score,
@@ -292,7 +296,29 @@ export const buildMatchPresentation = (
   let resultSummary = 'Final scores are in.';
   let resultTone: MatchResultTone = 'complete';
   let resultArtwork: MatchResultArtwork = 'neutral';
-  if (mode.isSolo) {
+  if (gameState.completed_by_inactivity === true) {
+    if (currentPlayer?.isIdleKicked) {
+      resultTitle = 'Removed';
+      resultSummary = 'You were removed for inactivity.';
+      resultTone = 'defeat';
+      resultArtwork = 'ruby-shatter';
+    } else if (winningSnakeId === null) {
+      resultTitle = 'Match ended';
+      resultSummary = 'Every active player was removed for inactivity.';
+      resultTone = 'draw';
+      resultArtwork = 'topaz-cut';
+    } else if (currentPlayer) {
+      const didWin = currentPlayer.isWinner;
+      resultTitle = didWin ? 'Victory' : 'Match complete';
+      resultSummary = didWin
+        ? 'The other side was removed for inactivity.'
+        : 'Inactivity ended the match.';
+      resultTone = didWin ? 'victory' : 'complete';
+      resultArtwork = didWin ? 'azure-cut' : 'neutral';
+    } else {
+      resultSummary = 'Inactivity ended the match.';
+    }
+  } else if (mode.isSolo) {
     resultTitle = 'Run complete';
     resultSummary = `You finished with ${soloScore} point${soloScore === 1 ? '' : 's'}.`;
     resultArtwork = 'jade-fracture';

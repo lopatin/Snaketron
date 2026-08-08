@@ -8,6 +8,7 @@ use common::{
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use server::lifecycle::WS_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use std::pin::Pin;
 use tokio::sync::watch;
@@ -22,7 +23,6 @@ use uuid::Uuid;
 
 const GAME_OVER_TIMEOUT: Duration = Duration::from_secs(120);
 const MATCHMAKING_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const CLIENT_PROTOCOL_VERSION: u16 = 6;
 const NORMAL_MOVEMENT_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser, Debug)]
