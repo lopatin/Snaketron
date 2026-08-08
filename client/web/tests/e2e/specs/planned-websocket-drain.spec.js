@@ -459,7 +459,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -511,7 +511,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -563,7 +563,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -1221,7 +1221,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -3857,7 +3857,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -3897,7 +3897,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -4025,7 +4025,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 6,
+      protocol_version: 7,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

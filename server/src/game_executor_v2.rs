@@ -6161,8 +6161,10 @@ mod tests {
             let snake_id = state.add_player(77, Some("player-77".into()))?.snake_id;
             state.add_player(88, Some("player-88".into()))?;
             state.status = GameStatus::Started { server_id: 1 };
+            // No RNG is all the food suppression these idle tests need. The
+            // mode's food target is a validated gameplay invariant, so zeroing
+            // it would make recovery reject the checkpoint outright.
             state.rng = None;
-            state.properties.available_food_target = 0;
             checkpoint.game_state = state;
             checkpoint.checkpointed_at_ms = start_ms;
 
@@ -6297,8 +6299,10 @@ mod tests {
             state.add_player(77, Some("player-77".into()))?;
             state.add_player(88, Some("player-88".into()))?;
             state.status = GameStatus::Started { server_id: 1 };
+            // No RNG is all the food suppression these idle tests need. The
+            // mode's food target is a validated gameplay invariant, so zeroing
+            // it would make recovery reject the checkpoint outright.
             state.rng = None;
-            state.properties.available_food_target = 0;
 
             let mut envelope = harness.recovery().await?;
             envelope.game_state = state;
@@ -6424,8 +6428,10 @@ mod tests {
                 state.add_player(user_id, Some(format!("player-{user_id}")))?;
             }
             state.status = GameStatus::Started { server_id: 1 };
+            // No RNG is all the food suppression these idle tests need. The
+            // mode's food target is a validated gameplay invariant, so zeroing
+            // it would make recovery reject the checkpoint outright.
             state.rng = None;
-            state.properties.available_food_target = 0;
 
             let tick_ms = state.properties.tick_duration_ms;
             let timeout_ticks = state.properties.player_idle_timeout_ms / tick_ms;

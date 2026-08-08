@@ -7,11 +7,11 @@ import {
 } from '../../constants.ts';
 
 test('gameplay authentication carries the exact hard-cutover protocol', () => {
-  assert.equal(GAMEPLAY_PROTOCOL_VERSION, 6);
+  assert.equal(GAMEPLAY_PROTOCOL_VERSION, 7);
   assert.deepEqual(buildGameplayAuthentication('test-token'), {
     Authenticate: {
       token: 'test-token',
-      protocol_version: 6,
+      protocol_version: 7,
     },
   });
 });

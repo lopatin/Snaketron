@@ -16,9 +16,16 @@
 use crate::{GameCommandMessage, GameEventMessage, GameState};
 use serde::{Deserialize, Serialize};
 
-/// Version 2 fingerprints the readiness, score-race, latched-intent and
+/// Version 2 fingerprinted the readiness, score-race, latched-intent and
 /// mode-specific Boost fields added by the current gameplay generation.
-pub const TRACE_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 adds the inactivity fields — per-player activity ticks, the kick
+/// roster, the inactivity completion flag, the idle policy, and the
+/// `PlayerActivity` command tag. This is a layout change, not an additive one:
+/// a version-2 trace replayed against this fingerprint would pass the version
+/// guard and then report divergence at every tick, which is precisely what the
+/// guard exists to prevent.
+pub const TRACE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceSide {

@@ -1132,8 +1132,10 @@ mod tests {
             let idle_snake_id = state.add_player(7, None).unwrap().snake_id;
             let active_snake_id = state.add_player(8, None).unwrap().snake_id;
             state.status = GameStatus::Started { server_id: 1 };
+            // No RNG suppresses food on its own; the mode's food target is a
+            // validated invariant and must keep its constructed value or
+            // snapshot admission rejects this checkpoint.
             state.rng = None;
-            state.properties.available_food_target = 0;
 
             let timeout_ticks =
                 state.properties.player_idle_timeout_ms / state.properties.tick_duration_ms;
@@ -1228,8 +1230,9 @@ mod tests {
             state.add_player(user_id, None).expect("add team player");
         }
         state.status = GameStatus::Started { server_id: 1 };
+        // No RNG suppresses food; the mode's food target stays as constructed
+        // so the restored snapshot passes gameplay-invariant admission.
         state.rng = None;
-        state.properties.available_food_target = 0;
         state.properties.player_idle_timeout_ms = 1_000;
         state.properties.player_idle_warning_ms = 500;
         state.tick = 8;

@@ -5298,8 +5298,10 @@ mod tests {
                 .expect("add inactivity test player");
         }
         game.status = GameStatus::Started { server_id: 7 };
+        // No RNG is the only food suppression these tests need, and the only
+        // one available: the mode's food target is a validated invariant, so
+        // zeroing it would make every snapshot round trip fail admission.
         game.rng = None;
-        game.properties.available_food_target = 0;
 
         // Pin the shipped policy as well as the lower-level tick behavior.
         assert_eq!(game.properties.player_idle_timeout_ms, 60_000);
@@ -5323,8 +5325,8 @@ mod tests {
                 .expect("add FFA inactivity test player");
         }
         game.status = GameStatus::Started { server_id: 7 };
+        // See `started_inactivity_team_game`: no RNG, mode-default food target.
         game.rng = None;
-        game.properties.available_food_target = 0;
         game
     }
 
