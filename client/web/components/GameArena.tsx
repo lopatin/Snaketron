@@ -1464,7 +1464,12 @@ export default function GameArena() {
 
               {/* Countdown Overlay */}
               {showCountdown && countdownState && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10">
+                <div
+                  className="absolute inset-0 flex flex-col items-center justify-center bg-black/30 z-10"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
                   <div className="text-white font-bold text-3xl mb-4" style={{
                     textShadow: '0 2px 4px rgba(0,0,0,0.5)'
                   }}>

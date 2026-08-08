@@ -625,11 +625,18 @@
   right: 14px;
 }
 
+.tutorial-progress-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin: 0 22px 14px;
+}
+
 .tutorial-progress {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
-  margin: 0 22px 14px;
 }
 
 .tutorial-progress-segment {
@@ -648,24 +655,80 @@
   border-radius: 999px;
   background: var(--game-rule);
   content: "";
-  transition: background-color 140ms ease, transform 140ms ease;
+  transition: background-color 140ms ease;
 }
 
-.tutorial-progress-segment.is-complete::before {
-  background: color-mix(in srgb, var(--game-graphite) 56%, var(--game-paper));
-}
-
-.tutorial-progress-segment.is-active::before {
+.tutorial-progress-fill {
+  position: absolute;
+  z-index: 1;
+  inset: 6px 0;
+  border-radius: 999px;
   background: var(--game-blue);
-  transform: scaleY(1.5);
+  pointer-events: none;
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+.tutorial-progress-segment.is-complete .tutorial-progress-fill {
+  background: color-mix(in srgb, var(--game-graphite) 56%, var(--game-paper));
+  transform: scaleX(1);
+}
+
+.tutorial-progress-segment.is-active .tutorial-progress-fill {
+  inset-block: 5px;
+}
+
+.tutorial-card[data-variant="briefing"][data-reduced-motion="false"]
+  .tutorial-progress-segment.is-active .tutorial-progress-fill {
+  animation-name: tutorial-progress-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+.tutorial-card[data-variant="reference"]
+  .tutorial-progress-segment.is-active .tutorial-progress-fill,
+.tutorial-card[data-reduced-motion="true"]
+  .tutorial-progress-segment.is-active .tutorial-progress-fill {
+  transform: scaleX(1);
 }
 
 .tutorial-progress-segment:hover::before {
-  background: var(--game-blue);
+  background: color-mix(in srgb, var(--game-blue) 18%, var(--game-rule));
 }
 
 .tutorial-progress-segment:focus-visible {
   border-radius: 3px;
+  outline: 2px solid var(--game-blue);
+  outline-offset: 1px;
+}
+
+.tutorial-autoplay-toggle {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  appearance: none;
+  background: transparent;
+  color: var(--game-muted);
+  cursor: pointer;
+  place-items: center;
+  transition: border-color 140ms ease, color 140ms ease;
+}
+
+.tutorial-autoplay-toggle svg {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+}
+
+.tutorial-autoplay-toggle:hover {
+  border-color: var(--game-rule);
+  color: var(--game-blue);
+}
+
+.tutorial-autoplay-toggle:focus-visible {
   outline: 2px solid var(--game-blue);
   outline-offset: 1px;
 }
@@ -737,49 +800,23 @@
 }
 
 .tutorial-copy {
-  min-height: 94px;
-  padding-top: 17px;
+  min-height: 58px;
+  padding-top: 16px;
 }
 
 .tutorial-copy-inner {
   animation: tutorial-step-in 160ms ease-out both;
 }
 
-.tutorial-step-index {
-  margin: 0 0 5px;
-  color: var(--game-muted);
-  font-size: 9px;
-  font-style: normal;
-  font-weight: 900;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.11em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.tutorial-step-index span {
-  color: color-mix(in srgb, var(--game-muted) 68%, var(--game-paper));
-}
-
-.tutorial-step-title {
+.tutorial-step-instruction {
+  max-width: 44ch;
   margin: 0;
   color: var(--game-graphite);
-  font-size: 19px;
-  font-style: italic;
-  font-weight: 950;
-  letter-spacing: -0.01em;
-  line-height: 1.1;
-  text-transform: uppercase;
-}
-
-.tutorial-step-body {
-  max-width: 46ch;
-  margin: 7px 0 0;
-  color: var(--game-graphite);
-  font-size: 14px;
+  font-size: 17px;
   font-style: normal;
-  font-weight: 450;
-  line-height: 1.45;
+  font-weight: 800;
+  letter-spacing: -0.012em;
+  line-height: 1.35;
 }
 
 .tutorial-step-navigation {
@@ -862,9 +899,14 @@
 }
 
 .tutorial-status {
+  display: flex;
   min-width: 0;
+  max-width: 220px;
   margin: 0;
+  flex: 1 1 auto;
+  align-items: stretch;
   color: var(--game-muted);
+  flex-direction: column;
   font-size: 11px;
   font-style: normal;
   font-weight: 700;
@@ -873,27 +915,56 @@
   line-height: 1.35;
 }
 
-/* Readiness marks in the live roster. The check rides on the snake glyph so
-   the roster stays a single row at the arena's narrowest widths. */
-.game-roster-player {
-  position: relative;
+.tutorial-ready-status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.game-roster-ready-mark {
-  position: absolute;
-  top: -2px;
-  right: 2px;
-  display: grid;
-  width: 13px;
-  height: 13px;
-  border: 1px solid rgb(63 63 65 / 34%);
-  border-radius: 999px;
-  background: #fff;
-  color: #1f8a4c;
+.tutorial-auto-start {
+  display: block;
+  width: min(180px, 100%);
+  margin-top: 4px;
+}
+
+.tutorial-auto-start-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--game-muted);
   font-size: 9px;
   font-weight: 900;
+  letter-spacing: 0.08em;
   line-height: 1;
-  place-items: center;
+  text-transform: uppercase;
+}
+
+.tutorial-auto-start-copy strong {
+  color: var(--game-graphite);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.tutorial-auto-start-track {
+  display: block;
+  height: 3px;
+  margin-top: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--game-rule);
+}
+
+.tutorial-auto-start-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--game-blue);
+  transform: scaleX(var(--tutorial-auto-start-progress));
+  transform-origin: left center;
+  transition: transform 1s linear;
 }
 
 .game-roster-player.is-awaiting-ready {
@@ -941,6 +1012,11 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes tutorial-progress-countdown {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
 @media (width <= 480px) {
   .tutorial-backdrop {
     padding: 12px;
@@ -968,7 +1044,7 @@
     right: 11px;
   }
 
-  .tutorial-progress {
+  .tutorial-progress-row {
     margin: 0 16px 10px;
   }
 
@@ -977,16 +1053,12 @@
   }
 
   .tutorial-copy {
-    min-height: 88px;
+    min-height: 54px;
     padding-top: 14px;
   }
 
-  .tutorial-step-title {
-    font-size: 18px;
-  }
-
-  .tutorial-step-body {
-    font-size: 13px;
+  .tutorial-step-instruction {
+    font-size: 15px;
   }
 
   .tutorial-footer {
@@ -1034,7 +1106,7 @@
     right: 10px;
   }
 
-  .tutorial-progress {
+  .tutorial-progress-row {
     margin: 0 18px 4px;
   }
 
@@ -1044,6 +1116,14 @@
 
   .tutorial-progress-segment::before {
     inset: 5px 0;
+  }
+
+  .tutorial-progress-fill {
+    inset: 5px 0;
+  }
+
+  .tutorial-progress-segment.is-active .tutorial-progress-fill {
+    inset-block: 4px;
   }
 
   .tutorial-step {
@@ -1065,13 +1145,8 @@
     padding-top: 0;
   }
 
-  .tutorial-step-title {
-    font-size: 17px;
-  }
-
-  .tutorial-step-body {
-    margin-top: 6px;
-    font-size: 13px;
+  .tutorial-step-instruction {
+    font-size: 15px;
   }
 
   .tutorial-step-navigation {
@@ -1091,6 +1166,7 @@
 
 @media (pointer: coarse) {
   .tutorial-progress-segment,
+  .tutorial-autoplay-toggle,
   .tutorial-step-button,
   .tutorial-ready-button {
     min-height: 44px;
@@ -1100,6 +1176,19 @@
     inset: 20px 0;
   }
 
+  .tutorial-autoplay-toggle {
+    width: 44px;
+    min-width: 44px;
+  }
+
+  .tutorial-progress-fill {
+    inset: 20px 0;
+  }
+
+  .tutorial-progress-segment.is-active .tutorial-progress-fill {
+    inset-block: 19px;
+  }
+
   .tutorial-replay {
     height: 44px;
     min-width: 88px;
@@ -1107,7 +1196,7 @@
 }
 
 @media (pointer: coarse) and (height <= 600px) and (width >= 640px) {
-  .tutorial-progress {
+  .tutorial-progress-row {
     position: relative;
     z-index: 2;
   }
@@ -1119,6 +1208,14 @@
 
   .tutorial-progress-segment::before {
     inset: 5px 0;
+  }
+
+  .tutorial-progress-fill {
+    inset: 5px 0;
+  }
+
+  .tutorial-progress-segment.is-active .tutorial-progress-fill {
+    inset-block: 4px;
   }
 
   .tutorial-progress-segment::after {
@@ -1158,6 +1255,9 @@
   }
 
   .tutorial-progress-segment::before,
+  .tutorial-progress-fill,
+  .tutorial-autoplay-toggle,
+  .tutorial-auto-start-fill,
   .tutorial-step-button,
   .tutorial-ready-button {
     transition: none;

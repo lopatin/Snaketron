@@ -18,6 +18,7 @@ const StaredownSnake: React.FC<{
     name={player.name}
     skin={player.skin}
     facing={faces}
+    isReady={player.isReady === true}
   />
 );
 
@@ -40,16 +41,6 @@ const PlayerLegend: React.FC<{
       title={player.name}
     >
       <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
-      {player.isReady !== null && (
-        <span
-          className="game-roster-ready-mark"
-          aria-hidden="true"
-          data-testid="roster-ready-mark"
-          data-ready={player.isReady ? 'true' : 'false'}
-        >
-          {player.isReady ? '✓' : ''}
-        </span>
-      )}
     </span>
   );
 };

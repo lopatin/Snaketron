@@ -86,7 +86,7 @@ test('every mode names the boost key, and only collectible modes mention NOS', (
     // objectives the map does not contain.
     const solo = tutorialContent('solo', queueMode).steps.map((step) => step.body).join(' ');
     assert.doesNotMatch(solo, /NOS|canister/i, 'solo has no boost pickups');
-    assert.match(solo, /never empties|never runs out/i, 'solo must say the tank is unlimited');
+    assert.match(solo, /unlimited/i, 'solo must say the boost is unlimited');
   }
 });
 
@@ -95,13 +95,13 @@ test('Boost instructions follow the configured hold or toggle input mode', () =>
     const hold = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold')
       .steps.map((step) => step.body)
       .join(' ');
-    assert.match(hold, /hold Space to boost/i);
+    assert.match(hold, /hold Space.*boost/i);
     assert.doesNotMatch(hold, /toggle boost/);
 
     const toggle = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'toggle')
       .steps.map((step) => step.body)
       .join(' ');
-    assert.match(toggle, /press Space to toggle boost/i);
+    assert.match(toggle, /press Space to toggle .*boost/i);
     assert.doesNotMatch(toggle, /hold Space to boost/i);
   }
 
@@ -116,7 +116,7 @@ test('Boost instructions follow the configured hold or toggle input mode', () =>
   assert.ok(toggleGame);
   assert.match(
     toggleGame.steps.map((step) => step.body).join(' '),
-    /press Space to toggle boost/i,
+    /press Space to toggle .*boost/i,
   );
 });
 
@@ -138,8 +138,8 @@ test('no mode claims a clock, because no mode has one', () => {
 test('FFA teaches its score-based result rather than a last-survivor win', () => {
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
     const text = tutorialContent('ffa', queueMode).steps.map((step) => step.body).join(' ');
-    assert.match(text, /when all snakes are out/i);
     assert.match(text, /highest score wins/i);
+    assert.match(text, /crash once.*you’re out/i);
     assert.doesNotMatch(text, /last snake standing/i);
   }
 });
@@ -228,16 +228,23 @@ test('progressive steps stay concise enough to scan one at a time', () => {
         0,
       );
 
-      assert.ok(totalBodyWords <= 34, `${content.key} has ${totalBodyWords} body words`);
+      assert.ok(totalBodyWords <= 25, `${content.key} has ${totalBodyWords} body words`);
       for (const step of content.steps) {
         assert.ok(wordCount(step.title) <= 3, `${content.key}/${step.title} title is too long`);
         assert.ok(
-          wordCount(step.body) <= 17,
+          wordCount(step.body) <= 10,
           `${content.key}/${step.title} has ${wordCount(step.body)} body words`,
         );
       }
     }
   }
+});
+
+test('duel opens with the exact glanceable scoring instruction', () => {
+  assert.equal(
+    tutorialContent('duel', 'Quickmatch').steps[0].body,
+    'Return food to base to score points.',
+  );
 });
 
 test('the persistence key distinguishes ranked from casual for the same mode', () => {

@@ -16,9 +16,9 @@ export type TutorialKey = `${TutorialMode}:${'ranked' | 'casual'}`;
 export interface TutorialStep {
   /** Scene id understood by `TutorialScenePlayer` in the WASM renderer. */
   scene: string;
-  /** Short action-led heading shown above the instruction. */
+  /** Short action label used by replay and progress controls. */
   title: string;
-  /** One focused gameplay instruction. */
+  /** The single visible, glanceable gameplay instruction. */
   body: string;
   /** Describes the meaningful motion in the scene without relying on colour. */
   visualLabel: string;
@@ -114,8 +114,8 @@ const teamSteps = (
       title: mode === 'duel' ? 'BANK POINTS' : 'SCORE TOGETHER',
       body:
         mode === 'duel'
-          ? 'Eat, then return through your gate to bank points.'
-          : 'Eat, then return through your gate. Your team shares the score.',
+          ? 'Return food to base to score points.'
+          : 'Return food to base to score for your team.',
       visualLabel:
         mode === 'duel'
           ? 'A snake returns through the gate labeled YOU; the team score increases.'
@@ -125,7 +125,7 @@ const teamSteps = (
     {
       scene: 'team-danger',
       title: 'STAY OUT',
-      body: `${race}—no clock. The rival base kills you.`,
+      body: `Avoid the rival base. ${race}.`,
       visualLabel: 'A snake enters the base labeled RIVAL and crashes.',
     },
   ];
@@ -137,14 +137,14 @@ const ffaSteps = (
   {
     scene: 'ffa-food',
     title: 'GROW',
-    body: 'Eat food. Each bite adds 2 points.',
+    body: 'Eat food to grow and score.',
     visualLabel: 'A snake eats food, grows two segments, and gains two points.',
   },
   { ...collectibleBoostStep(inputMode), scene: 'ffa-boost' },
   {
     scene: 'ffa-crash',
     title: 'ONE LIFE',
-    body: 'Crash and you’re out. Highest score wins when all snakes are out.',
+    body: 'Crash once and you’re out. Highest score wins.',
     visualLabel: 'A snake hits a rival and is eliminated.',
   },
 ];
@@ -153,7 +153,7 @@ const soloSteps = (inputMode: BoostInputMode): [TutorialStep, TutorialStep, Tuto
   {
     scene: 'solo-food',
     title: 'MOVE & GROW',
-    body: 'Steer with the arrow keys. Each bite adds 2 points.',
+    body: 'Use arrow keys to eat, grow, and score.',
     visualLabel: 'The solo snake turns toward food and grows.',
   },
   {
@@ -161,14 +161,14 @@ const soloSteps = (inputMode: BoostInputMode): [TutorialStep, TutorialStep, Tuto
     title: 'UNLIMITED BOOST',
     body:
       inputMode === 'toggle'
-        ? 'Press Space to toggle boost. Your tank never runs out.'
-        : 'Hold Space to boost. Your tank never runs out.',
+        ? 'Press Space to toggle unlimited boost.'
+        : 'Hold Space for unlimited boost.',
     visualLabel: 'The solo snake boosts while its full fuel meter stays full.',
   },
   {
     scene: 'solo-run',
     title: 'BEAT YOUR BEST',
-    body: 'No clock. Your run ends when you crash.',
+    body: 'Avoid crashing and beat your high score.',
     visualLabel: 'The solo snake hits its tail, ending the run.',
   },
 ];

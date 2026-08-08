@@ -740,18 +740,44 @@ test('logout explicitly leaves the lobby before retiring the authenticated socke
 });
 
 test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {
-  const socketIndex = await establishActiveGame(page, tutorialSnapshot());
+  await page.addInitScript(() => {
+    window.__tutorialScoreReadouts = [];
+    const originalFillText = CanvasRenderingContext2D.prototype.fillText;
+    CanvasRenderingContext2D.prototype.fillText = function recordTutorialScore(text, ...args) {
+      if (text === '+1') window.__tutorialScoreReadouts.push(text);
+      return originalFillText.call(this, text, ...args);
+    };
+  });
+  const initialTutorialFrame = tutorialSnapshot();
+  initialTutorialFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [8];
+  const socketIndex = await establishActiveGame(page, initialTutorialFrame);
   const modal = page.getByTestId('tutorial-modal');
   const canvas = page.getByTestId('tutorial-scene-canvas');
+  const readyButton = page.getByTestId('tutorial-ready');
+  const localRoster = page.locator(
+    '.game-roster-snake-canvas[data-player-name="You"]',
+  );
+  const rivalRoster = page.locator('.game-roster-snake-canvas[data-player-name="Tron"]');
 
   await expect(modal).toBeVisible();
   await expect(modal).toHaveAttribute('data-step', '1');
   await expect(modal.getByRole('heading', { name: 'Duel' })).toBeVisible();
-  await expect(modal.getByRole('heading', { name: 'BANK POINTS' })).toBeVisible();
-  await expect(modal).toContainText('Eat, then return through your gate to bank points.');
+  await expect(modal).toContainText('Return food to base to score points.');
+  await expect(modal.locator('.tutorial-step-index')).toHaveCount(0);
+  await expect(modal.locator('.tutorial-step-title')).toHaveCount(0);
+  await expect(modal.locator('.tutorial-step-instruction')).toHaveCount(1);
   await expect(page.getByTestId('tutorial-visual')).toHaveAccessibleName(
     'A snake returns through the gate labeled YOU; the team score increases.',
   );
+  await expect(modal).toHaveAccessibleDescription(
+    /Each lesson advances automatically after five seconds.*match starts automatically/i,
+  );
+  await expect(page.getByTestId('tutorial-auto-start')).toHaveAccessibleName(
+    /Automatic match start in 1[5-8] seconds/,
+  );
+  await expect(page.locator('.game-roster-ready-mark')).toHaveCount(0);
+  await expect(localRoster).toHaveAttribute('data-ready', 'false');
+  await expect(rivalRoster).toHaveAttribute('data-ready', 'true');
   await expect(canvas).toHaveCount(1);
   await expect(canvas).toHaveAttribute('data-scene', 'team-carry');
   await expect(canvas).toHaveAttribute('data-motion', 'animated');
@@ -759,38 +785,81 @@ test('the pre-match guide reveals one animated real-arena step at a time', async
     element.width > 1 && element.height > 1 && element.dataset.playback
   ))).toMatch(/playing|complete/);
 
-  // The scene is a deterministic gameplay-renderer timeline, not a CSS pan of
-  // a still. Replay it and verify that the canvas pixels actually change.
-  await modal.getByRole('button', { name: /Replay bank points animation/i }).click();
-  await page.waitForTimeout(100);
-  const earlyFrame = await canvas.evaluate((element) => element.toDataURL());
-  await page.waitForTimeout(650);
-  const laterFrame = await canvas.evaluate((element) => element.toDataURL());
-  expect(laterFrame).not.toBe(earlyFrame);
+  const stepTimer = page.getByTestId('tutorial-step-timer');
+  await expect(stepTimer).toHaveCSS('animation-duration', '5s');
+
+  // The scoring beat uses the production +1 renderer, and the step changes at
+  // the exact end of the progress rail without stealing control focus.
+  await expect.poll(() => page.evaluate(() => window.__tutorialScoreReadouts.length), {
+    timeout: 3_500,
+  }).toBeGreaterThan(0);
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/duel-briefing.jpg`,
+      fullPage: true,
+    });
+  }
+  await readyButton.focus();
+  await expect.poll(() => modal.getAttribute('data-step'), { timeout: 6_500 }).toBe('2');
+  await expect(readyButton).toBeFocused();
+  await expect(modal).toContainText('Collect NOS, then hold Space to boost.');
+  await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
 
   await page.keyboard.press('Escape');
   await expect(modal).toBeVisible();
 
-  await modal.getByRole('button', { name: 'Next' }).click();
+  const autoplayToggle = page.getByTestId('tutorial-autoplay-toggle');
+  await stepTimer.evaluate((element) => {
+    const [animation] = element.getAnimations();
+    if (!animation) throw new Error('Active tutorial timer has no animation');
+    animation.currentTime = 4_700;
+  });
+  await autoplayToggle.click();
+  await expect(modal).toHaveAttribute('data-autoplay', 'paused');
+  await expect(stepTimer).toHaveCSS('animation-play-state', 'paused');
+  await expect(autoplayToggle).toHaveAccessibleName('Resume tutorial');
+  await expect(autoplayToggle).not.toHaveAttribute('aria-pressed', /.+/);
+  await page.waitForTimeout(700);
   await expect(modal).toHaveAttribute('data-step', '2');
-  await expect.poll(() => page.evaluate(() => (
-    document.activeElement?.getAttribute('data-tutorial-step-control')
-  ))).toBe('1');
-  await expect(modal.getByRole('heading', { name: 'BOOST' })).toBeVisible();
-  await expect(canvas).toHaveCount(1);
-  await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
+  await autoplayToggle.click();
+  await expect(modal).toHaveAttribute('data-autoplay', 'playing');
+  await expect.poll(() => modal.getAttribute('data-step'), { timeout: 1_500 }).toBe('3');
+  await expect(autoplayToggle).toBeFocused();
+  await expect(modal).toContainText('Avoid the rival base. First to 25 wins.');
 
   // Arrow navigation belongs to the guide while it is open and must not leak
   // a turn or a Boost edge into the match beneath it.
+  await page.keyboard.press('ArrowLeft');
+  await expect(modal).toHaveAttribute('data-step', '2');
   await page.keyboard.press('ArrowRight');
   await expect(modal).toHaveAttribute('data-step', '3');
-  await expect(modal.getByRole('heading', { name: 'STAY OUT' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('2');
   await page.keyboard.press('Space');
   await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(0);
 
-  await page.getByTestId('tutorial-ready').click();
-  await expect(page.getByTestId('tutorial-ready')).toBeDisabled();
-  await expect(page.getByTestId('tutorial-status')).toContainText('Waiting for 1 player');
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await modal.getByRole('button', { name: /Step 2 of 3: BOOST/i }).click();
+    await page.waitForTimeout(650);
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/mobile-duel-briefing.jpg`,
+      fullPage: true,
+    });
+  }
+  const rosterBeforeReady = await localRoster.evaluate((element) => element.toDataURL());
+  await readyButton.click();
+  await expect(readyButton).toBeDisabled();
+  await expect(page.getByTestId('tutorial-status')).toContainText('All players ready');
+  await expect(page.getByTestId('tutorial-auto-start')).toBeVisible();
+  const readyFrame = tutorialSnapshot(11);
+  readyFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [7, 8];
+  await emitServerMessage(page, socketIndex, readyFrame);
+  await expect(localRoster).toHaveAttribute('data-ready', 'true');
+  await expect(rivalRoster).toHaveAttribute('data-ready', 'true');
+  await expect.poll(() => localRoster.evaluate((element) => element.toDataURL()))
+    .not.toBe(rosterBeforeReady);
   await page.keyboard.press('Tab');
   await expect.poll(() => page.evaluate(() => {
     const tutorialModal = document.querySelector('[data-testid="tutorial-modal"]');
@@ -810,13 +879,19 @@ test('reduced motion holds tutorial scenes on their authored poster frame', asyn
   const modal = page.getByTestId('tutorial-modal');
   const canvas = page.getByTestId('tutorial-scene-canvas');
   await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-autoplay', 'off');
+  await expect(modal).toHaveAttribute('data-step', '1');
+  await expect(modal).toContainText('Return food to base to score points.');
   await expect(canvas).toHaveAttribute('data-motion', 'reduced');
   await expect(canvas).toHaveAttribute('data-playback', 'complete');
   await expect(modal.locator('.tutorial-replay')).toBeHidden();
+  await expect(modal.getByTestId('tutorial-autoplay-toggle')).toHaveCount(0);
   await expect(modal.getByTestId('tutorial-ready')).toBeVisible();
   const poster = await canvas.evaluate((element) => element.toDataURL());
   await page.waitForTimeout(350);
   expect(await canvas.evaluate((element) => element.toDataURL())).toBe(poster);
+  await page.waitForTimeout(5_000);
+  await expect(modal).toHaveAttribute('data-step', '1');
 
   const bounds = await modal.evaluate((element) => {
     const rect = element.getBoundingClientRect();

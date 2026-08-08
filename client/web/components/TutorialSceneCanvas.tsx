@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { getWasm, initWasm } from '../wasm';
+import {
+  DEFAULT_SCORE_EFFECT_ID,
+  goalImpactWaveRenderer,
+} from '../utils/scoreEffects';
 
 export interface TutorialSceneCanvasProps {
   /** Scene id from `tutorialSceneIds()` in the WASM module. */
@@ -9,6 +13,17 @@ export interface TutorialSceneCanvasProps {
 }
 
 const FRAME_QUANTUM_MS = 50;
+const REDUCED_MOTION_CELEBRATION_FRAME_MS = 120;
+
+interface TutorialScoreEffect {
+  startMs: number;
+  teamId: number;
+  snakeId: number;
+  points: number;
+  origin: { x: number; y: number };
+  arenaWidth: number;
+  arenaHeight: number;
+}
 
 /**
  * Plays one focused tutorial beat through the production Rust arena renderer.
@@ -48,6 +63,7 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
     let player: InstanceType<
       NonNullable<ReturnType<typeof getWasm>>['TutorialScenePlayer']
     > | null = null;
+    let scoreEffect: TutorialScoreEffect | null = null;
     let startedAt = 0;
     let elapsedMs = 0;
     let lastFrameMs = -1;
@@ -93,7 +109,44 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
 
       if (forceDraw || quantizedMs !== lastFrameMs) {
         try {
-          player.renderFrame(quantizedMs, canvas);
+          player.renderFrameWithCelebration(
+            quantizedMs,
+            canvas,
+            (scratchCanvas: HTMLCanvasElement, scratchCellSize: number) => {
+              if (!scoreEffect) {
+                return;
+              }
+              const context = scratchCanvas.getContext('2d');
+              if (!context) {
+                return;
+              }
+              const effectNowMs = reducedMotion
+                ? scoreEffect.startMs + REDUCED_MOTION_CELEBRATION_FRAME_MS
+                : quantizedMs;
+              goalImpactWaveRenderer.draw(
+                context,
+                {
+                  eventId: `tutorial:${scene}:score`,
+                  effectId: DEFAULT_SCORE_EFFECT_ID,
+                  teamId: scoreEffect.teamId,
+                  snakeId: scoreEffect.snakeId,
+                  points: scoreEffect.points,
+                  tick: Math.floor(scoreEffect.startMs / FRAME_QUANTUM_MS),
+                  origin: scoreEffect.origin,
+                  startedAtMs: scoreEffect.startMs,
+                },
+                {
+                  nowMs: effectNowMs,
+                  cellSize: scratchCellSize,
+                  arenaWidth: scoreEffect.arenaWidth,
+                  arenaHeight: scoreEffect.arenaHeight,
+                  rotation: 0,
+                  localTeamId: 0,
+                  reducedMotion,
+                },
+              );
+            },
+          );
         } catch (error) {
           renderFailed = true;
           canvas.dataset.playback = 'error';
@@ -132,6 +185,10 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
         return;
       }
       player = new wasm.TutorialScenePlayer(scene);
+      const scoreEffectJson = player.scoreEffectJson();
+      scoreEffect = scoreEffectJson
+        ? JSON.parse(scoreEffectJson) as TutorialScoreEffect
+        : null;
       startedAt = performance.now();
       schedule();
     }).catch((error) => {

@@ -8,6 +8,13 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
+const STEP_DURATION_MS = 5_000;
+const READY_WINDOW_SECONDS = 15;
+// The readiness deadline hands off to the arena's existing 3-2-1 countdown.
+const MATCH_START_COUNTDOWN_SECONDS = 3;
+const AUTO_START_HORIZON_SECONDS =
+  READY_WINDOW_SECONDS + MATCH_START_COUNTDOWN_SECONDS;
+
 const isRenderedFocusTarget = (control: HTMLElement): boolean => {
   if (control.closest('[hidden], [inert]')) {
     return false;
@@ -53,48 +60,83 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
   const activeStepRef = useRef(0);
   const variantRef = useRef(variant);
   const pendingStepFocusRef = useRef(false);
-  const showStepRef = useRef<(nextStep: number) => void>(() => {});
+  const showStepRef = useRef<(nextStep: number, focusStepControl?: boolean) => void>(() => {});
   const titleId = useId();
   const stepBodyId = useId();
+  const autoStartDescriptionId = useId();
   const [activeStep, setActiveStep] = useState(0);
   const [replayToken, setReplayToken] = useState(0);
-  const [visitedSteps, setVisitedSteps] = useState<Set<number>>(() => new Set([0]));
+  const [progressCycle, setProgressCycle] = useState(0);
+  const [isUserPaused, setIsUserPaused] = useState(false);
+  const [isDocumentHidden, setIsDocumentHidden] = useState(() => (
+    typeof document !== 'undefined' && document.hidden
+  ));
+  const [reducedMotion, setReducedMotion] = useState(() => (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  ));
 
   const lastStepIndex = content.steps.length - 1;
   const step = content.steps[activeStep] ?? content.steps[0];
   const activeStepBodyId = `${stepBodyId}-${activeStep}`;
   const isBriefing = variant === 'briefing';
   const waitingOnOthers = isBriefing && isReady;
+  const autoplayEnabled = isBriefing && !reducedMotion;
+  const autoplayPaused = isUserPaused || isDocumentHidden;
+  const autoStartSeconds = autoReadySeconds === null
+    ? null
+    : autoReadySeconds + MATCH_START_COUNTDOWN_SECONDS;
+  const autoStartProgress = autoReadySeconds === null
+    ? 0
+    : Math.max(0, Math.min(1, autoStartSeconds! / AUTO_START_HORIZON_SECONDS));
 
   onCloseRef.current = onClose;
   activeStepRef.current = activeStep;
   variantRef.current = variant;
 
-  const showStep = useCallback((nextStep: number) => {
+  const showStep = useCallback((nextStep: number, focusStepControl = true) => {
     const boundedStep = Math.max(0, Math.min(lastStepIndex, nextStep));
-    if (boundedStep !== activeStep) {
+    if (focusStepControl && boundedStep !== activeStep) {
       pendingStepFocusRef.current = true;
     }
     setActiveStep(boundedStep);
-    setVisitedSteps((current) => {
-      if (current.has(boundedStep)) {
-        return current;
-      }
-      const next = new Set(current);
-      next.add(boundedStep);
-      return next;
-    });
     setReplayToken(0);
+    setProgressCycle((cycle) => cycle + 1);
   }, [activeStep, lastStepIndex]);
   showStepRef.current = showStep;
+
+  const replayStep = useCallback(() => {
+    setReplayToken((token) => token + 1);
+    setProgressCycle((cycle) => cycle + 1);
+  }, []);
 
   useEffect(() => {
     if (open) {
       setActiveStep(0);
       setReplayToken(0);
-      setVisitedSteps(new Set([0]));
+      setProgressCycle((cycle) => cycle + 1);
+      setIsUserPaused(false);
     }
   }, [content.key, open]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') {
+      return undefined;
+    }
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const handleChange = () => setReducedMotion(query.matches);
+    handleChange();
+    query.addEventListener('change', handleChange);
+    return () => query.removeEventListener('change', handleChange);
+  }, []);
+
+  useEffect(() => {
+    const handleVisibility = () => setIsDocumentHidden(document.hidden);
+    handleVisibility();
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
 
   useEffect(() => {
     if (!open || !pendingStepFocusRef.current) {
@@ -203,12 +245,16 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        aria-describedby={activeStepBodyId}
+        aria-describedby={isBriefing
+          ? `${activeStepBodyId} ${autoStartDescriptionId}`
+          : activeStepBodyId}
         tabIndex={-1}
         data-testid="tutorial-modal"
         data-tutorial-key={content.key}
         data-variant={variant}
         data-step={activeStep + 1}
+        data-autoplay={autoplayEnabled ? (autoplayPaused ? 'paused' : 'playing') : 'off'}
+        data-reduced-motion={reducedMotion ? 'true' : 'false'}
       >
         <header className="tutorial-header">
           <div className="tutorial-heading">
@@ -231,19 +277,62 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
         </header>
 
         <div className="tutorial-content">
-          <nav className="tutorial-progress" aria-label="Tutorial steps">
-            {content.steps.map((tutorialStep, index) => (
+          <div className="tutorial-progress-row">
+            <nav className="tutorial-progress" aria-label="Tutorial steps">
+              {content.steps.map((tutorialStep, index) => (
+                <button
+                  type="button"
+                  className={`tutorial-progress-segment${index === activeStep ? ' is-active' : ''}${index < activeStep ? ' is-complete' : ''}`}
+                  onClick={() => showStep(index)}
+                  aria-current={index === activeStep ? 'step' : undefined}
+                  aria-label={`Step ${index + 1} of ${content.steps.length}: ${tutorialStep.title}`}
+                  data-tutorial-step-control={index}
+                  key={tutorialStep.scene}
+                >
+                  <span
+                    className="tutorial-progress-fill"
+                    data-testid={index === activeStep ? 'tutorial-step-timer' : undefined}
+                    key={`${tutorialStep.scene}-${index === activeStep ? progressCycle : 0}`}
+                    onAnimationEnd={(event) => {
+                      if (
+                        index === activeStep &&
+                        autoplayEnabled &&
+                        !autoplayPaused &&
+                        event.animationName === 'tutorial-progress-countdown' &&
+                        activeStep < lastStepIndex
+                      ) {
+                        showStep(activeStep + 1, false);
+                      }
+                    }}
+                    style={{
+                      animationDuration: `${STEP_DURATION_MS}ms`,
+                      animationPlayState: autoplayPaused ? 'paused' : 'running',
+                    }}
+                    aria-hidden="true"
+                  />
+                </button>
+              ))}
+            </nav>
+            {autoplayEnabled && (
               <button
                 type="button"
-                className={`tutorial-progress-segment${index === activeStep ? ' is-active' : ''}${visitedSteps.has(index) && index !== activeStep ? ' is-complete' : ''}`}
-                onClick={() => showStep(index)}
-                aria-current={index === activeStep ? 'step' : undefined}
-                aria-label={`Step ${index + 1} of ${content.steps.length}: ${tutorialStep.title}`}
-                data-tutorial-step-control={index}
-                key={tutorialStep.scene}
-              />
-            ))}
-          </nav>
+                className="tutorial-autoplay-toggle"
+                onClick={() => setIsUserPaused((paused) => !paused)}
+                aria-label={isUserPaused ? 'Resume tutorial' : 'Pause tutorial'}
+                data-testid="tutorial-autoplay-toggle"
+              >
+                {isUserPaused ? (
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M5 3.5v9l7-4.5-7-4.5Z" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M4.5 3.5h2.5v9H4.5zM9 3.5h2.5v9H9z" />
+                  </svg>
+                )}
+              </button>
+            )}
+          </div>
 
           <div className="tutorial-step" data-testid="tutorial-step">
             <div className="tutorial-visual-shell" key={`visual-${step.scene}`}>
@@ -258,7 +347,7 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
               <button
                 type="button"
                 className="tutorial-replay"
-                onClick={() => setReplayToken((token) => token + 1)}
+                onClick={replayStep}
                 aria-label={`Replay ${step.title.toLowerCase()} animation`}
               >
                 <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -274,12 +363,7 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
                 id={activeStepBodyId}
                 key={`copy-${step.scene}`}
               >
-                <p className="tutorial-step-index">
-                  Step {String(activeStep + 1).padStart(2, '0')}
-                  <span aria-hidden="true"> / {String(content.steps.length).padStart(2, '0')}</span>
-                </p>
-                <h3 className="tutorial-step-title">{step.title}</h3>
-                <p className="tutorial-step-body">{step.body}</p>
+                <p className="tutorial-step-instruction">{step.body}</p>
               </div>
             </div>
 
@@ -305,24 +389,46 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
         </div>
 
         <footer className="tutorial-footer">
+          {isBriefing && (
+            <span className="sr-only" id={autoStartDescriptionId}>
+              {reducedMotion
+                ? 'Use the step controls to review each lesson. '
+                : 'Each lesson advances automatically after five seconds; use Pause to stop it. '}
+              The match starts automatically after the readiness timer and a three-second countdown.
+            </span>
+          )}
           <div className="tutorial-status" data-testid="tutorial-status">
             {isBriefing ? (
               waitingOnOthers ? (
-                <span role="status">
+                <span className="tutorial-ready-status" role="status">
                   {pendingCount > 0
                     ? `Waiting for ${pendingCount} ${pendingCount === 1 ? 'player' : 'players'}`
                     : 'All players ready'}
                 </span>
-              ) : autoReadySeconds !== null ? (
-                <>
-                  <span aria-hidden="true">Match starts in {autoReadySeconds}s</span>
-                  <span className="sr-only">The match will start automatically soon.</span>
-                </>
               ) : (
-                <span>Review at your pace</span>
+                <span className="tutorial-ready-status">Ready when you are</span>
               )
             ) : (
               <span>Use ← and → to move between steps</span>
+            )}
+            {isBriefing && autoStartSeconds !== null && (
+              <span
+                className="tutorial-auto-start"
+                role="timer"
+                aria-label={`Automatic match start in ${autoStartSeconds} seconds`}
+                style={{
+                  '--tutorial-auto-start-progress': autoStartProgress,
+                } as React.CSSProperties}
+                data-testid="tutorial-auto-start"
+              >
+                <span className="tutorial-auto-start-copy" aria-hidden="true">
+                  <span>Auto-start</span>
+                  <strong>{autoStartSeconds}s</strong>
+                </span>
+                <span className="tutorial-auto-start-track" aria-hidden="true">
+                  <span className="tutorial-auto-start-fill" />
+                </span>
+              </span>
             )}
           </div>
 

@@ -8,6 +8,7 @@ export interface RosterSnakeCanvasProps {
   name: string;
   skin: SnakeSkinInputs;
   facing: RosterSnakeFacing;
+  isReady?: boolean;
 }
 
 /**
@@ -23,6 +24,7 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
   name,
   skin,
   facing,
+  isReady = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLSpanElement>(null);
@@ -52,6 +54,7 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
         ...(JSON.parse(skinKey) as SnakeSkinInputs),
         facing,
         name,
+        is_ready: isReady,
         font_family: window.getComputedStyle(canvas).fontFamily,
       });
 
@@ -120,7 +123,7 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
       window.visualViewport?.removeEventListener('resize', scheduleDraw);
       resolutionQuery?.removeEventListener('change', handleResolutionChange);
     };
-  }, [facing, name, skinKey]);
+  }, [facing, isReady, name, skinKey]);
 
   return (
     <span
@@ -128,6 +131,7 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
       className={`game-roster-snake is-facing-${facing}`}
       data-player-name={name}
       data-facing={facing}
+      data-ready={isReady ? 'true' : 'false'}
       aria-hidden="true"
     >
       <canvas
@@ -137,6 +141,7 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
         height={1}
         data-player-name={name}
         data-facing={facing}
+        data-ready={isReady ? 'true' : 'false'}
         aria-hidden="true"
         style={{
           display: 'block',

@@ -14,7 +14,7 @@
 use crate::render;
 use common::{
     BOOST_TICK_INTERVAL_MS, Direction, GameState, GameType, Player, Position, QueueMode, Snake,
-    SnakeCrash, TeamId,
+    SnakeCrash, TeamGoal, TeamId,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -26,6 +26,10 @@ const SCENE_DURATION_MS: u32 = 2_400;
 const SCENE_POSTER_MS: u32 = SCENE_DURATION_MS;
 const CAMERA_WIDTH: f64 = 24.0;
 const CAMERA_HEIGHT: f64 = 15.0;
+const TEAM_CARRY_BANK_MS: u32 = 1_500;
+// Let the production 1.2s score treatment finish instead of freezing its
+// fading readout on the authored poster frame.
+const TEAM_CARRY_DURATION_MS: u32 = 2_800;
 
 /// Any fixed seed produces the same constructor state every time. Tutorial
 /// frames replace food explicitly, but retaining an RNG keeps construction on
@@ -230,17 +234,23 @@ fn solo_scene_with_snake(
 /// Team carry: a food-laden snake approaches its own gate, crosses it, and is
 /// reset to starting length as the banked team score increases.
 fn frame_team_carry(elapsed_ms: u32) -> GameState {
-    const BANK_MS: u32 = 1_550;
     let mut state = team_scene_state(elapsed_ms);
-    let banked = elapsed_ms >= BANK_MS;
+    let banked = elapsed_ms >= TEAM_CARRY_BANK_MS;
 
     let snake = if banked {
         if let Some(scores) = state.team_scores.as_mut() {
             scores.insert(TeamId(0), 1);
         }
+        state.recent_goals.push(TeamGoal {
+            tick: TEAM_CARRY_BANK_MS / BOOST_TICK_INTERVAL_MS,
+            team_id: TeamId(0),
+            snake_id: 0,
+            position: position(8, 20),
+            points: 1,
+        });
         Snake::for_illustration(
-            vec![position(4, 20), position(7, 20)],
-            Direction::Left,
+            vec![position(8, 20), position(5, 20)],
+            Direction::Right,
             Some(TeamId(0)),
             0,
             true,
@@ -592,8 +602,8 @@ fn frame_solo_run(elapsed_ms: u32) -> GameState {
 const SCENES: &[SceneDefinition] = &[
     SceneDefinition {
         id: "team-carry",
-        duration_ms: SCENE_DURATION_MS,
-        poster_ms: SCENE_POSTER_MS,
+        duration_ms: TEAM_CARRY_DURATION_MS,
+        poster_ms: TEAM_CARRY_DURATION_MS,
         camera: Camera::focused(0.0, 13.0),
         build_frame: frame_team_carry,
     },
@@ -657,6 +667,30 @@ const SCENES: &[SceneDefinition] = &[
 
 fn scene_index(scene_id: &str) -> Option<usize> {
     SCENES.iter().position(|scene| scene.id == scene_id)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TutorialScoreEffect {
+    start_ms: u32,
+    team_id: u32,
+    snake_id: u32,
+    points: u32,
+    origin: Position,
+    arena_width: u16,
+    arena_height: u16,
+}
+
+fn score_effect_for(scene_id: &str) -> Option<TutorialScoreEffect> {
+    (scene_id == "team-carry").then_some(TutorialScoreEffect {
+        start_ms: TEAM_CARRY_BANK_MS,
+        team_id: 0,
+        snake_id: 0,
+        points: 1,
+        origin: position(8, 20),
+        arena_width: TEAM_ARENA_WIDTH,
+        arena_height: TEAM_ARENA_HEIGHT,
+    })
 }
 
 #[cfg(test)]
@@ -783,6 +817,19 @@ impl TutorialScenePlayer {
         SCENES[self.scene_index].poster_ms
     }
 
+    /// Metadata for the production score effect used by a scoring scene. An
+    /// empty string means this scene has no scoring beat.
+    #[wasm_bindgen(js_name = scoreEffectJson)]
+    pub fn score_effect_json(&self) -> Result<String, JsValue> {
+        score_effect_for(SCENES[self.scene_index].id)
+            .map(|effect| {
+                serde_json::to_string(&effect)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))
+            })
+            .transpose()
+            .map(|effect| effect.unwrap_or_default())
+    }
+
     #[wasm_bindgen(js_name = renderFrame)]
     pub fn render_frame(
         &self,
@@ -796,6 +843,19 @@ impl TutorialScenePlayer {
             target,
             self.draw_celebration.as_ref().unchecked_ref(),
         )
+    }
+
+    /// Render with a JavaScript-owned cosmetic layer in the same production
+    /// slot used by the live arena: after the field, before snakes and walls.
+    #[wasm_bindgen(js_name = renderFrameWithCelebration)]
+    pub fn render_frame_with_celebration(
+        &self,
+        elapsed_ms: u32,
+        target: &web_sys::HtmlCanvasElement,
+        draw_celebration: &js_sys::Function,
+    ) -> Result<(), JsValue> {
+        let scene = SCENES[self.scene_index].frame(elapsed_ms);
+        render_scene(&scene, &self.scratch, target, draw_celebration)
     }
 }
 
@@ -942,6 +1002,9 @@ mod tests {
                 .copied(),
             Some(1)
         );
+        assert_eq!(carry_poster.recent_goals.len(), 1);
+        assert_eq!(carry_poster.recent_goals[0].position, position(8, 20));
+        assert_eq!(carry_poster.recent_goals[0].points, 1);
 
         for scene_id in ["team-boost", "ffa-boost"] {
             let early = scene(scene_id, 0).state;
@@ -1001,6 +1064,29 @@ mod tests {
             run_early.arena.snakes[0].body[0],
             run_poster.arena.snakes[0].body[0]
         );
+    }
+
+    #[test]
+    fn banking_crosses_once_and_resets_without_teleporting() {
+        let before = scene("team-carry", TEAM_CARRY_BANK_MS - BOOST_TICK_INTERVAL_MS).state;
+        let banked = scene("team-carry", TEAM_CARRY_BANK_MS).state;
+        let before_head = before.arena.snakes[0].body[0];
+        let banked_snake = &banked.arena.snakes[0];
+
+        assert_eq!(before_head, position(9, 20));
+        assert_eq!(banked_snake.body, vec![position(8, 20), position(5, 20)]);
+        assert_eq!(banked_snake.direction, Direction::Right);
+        assert_eq!(before_head.x.abs_diff(banked_snake.body[0].x), 1);
+        assert_eq!(before_head.y.abs_diff(banked_snake.body[0].y), 0);
+        assert_eq!(banked.recent_goals.len(), 1);
+        assert_eq!(banked.recent_goals[0].tick, banked.tick);
+
+        let effect = score_effect_for("team-carry").expect("banking has a score effect");
+        assert_eq!(effect.start_ms, TEAM_CARRY_BANK_MS);
+        assert_eq!(effect.origin, banked.recent_goals[0].position);
+        assert_eq!(effect.points, banked.recent_goals[0].points);
+        assert!(TEAM_CARRY_DURATION_MS - effect.start_ms >= 1_200);
+        assert!(score_effect_for("team-boost").is_none());
     }
 
     #[test]
