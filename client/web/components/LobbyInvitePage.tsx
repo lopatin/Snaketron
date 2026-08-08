@@ -152,7 +152,7 @@ const LobbyInvitePage: React.FC = () => {
   return (
     <div className="min-h-screen flex items-center justify-center px-6">
       <div className="max-w-md w-full text-center space-y-6">
-        <img src="/SnaketronLogo.png" alt="Snaketron" className="h-10 mx-auto opacity-80" />
+        <img src="SnaketronLogo.png" alt="Snaketron" className="h-10 mx-auto opacity-80" />
         <div className="space-y-1">
           <h1 className="text-2xl font-black italic uppercase tracking-1 text-black-70">Joining Lobby</h1>
           <p className="text-sm text-black-70 opacity-70">{statusMessage}</p>

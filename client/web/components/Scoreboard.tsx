@@ -22,7 +22,7 @@ const Scoreboard: React.FC<ScoreboardProps> = ({
     : null;
   const leftSide = presentation?.sides[0];
   const rightSide = presentation?.sides[1];
-  const brand = <img src="/SnaketronLogo.png" alt="Snaketron" />;
+  const brand = <img src="SnaketronLogo.png" alt="Snaketron" />;
 
   return (
     <header

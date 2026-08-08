@@ -91,9 +91,9 @@ const formatRankLabel = (rank: Rank): string => {
 };
 
 const getRankImage = (tier: RankTier | 'unranked'): string => {
-  if (tier === 'unranked') return '/images/unranked.png';
+  if (tier === 'unranked') return 'images/unranked.png';
   const imageTier = tier === 'master' ? 'grandmaster' : tier;
-  return `/images/${imageTier}.png`;
+  return `images/${imageTier}.png`;
 };
 
 const parseSeasonParam = (value: string | null): number | null => {
