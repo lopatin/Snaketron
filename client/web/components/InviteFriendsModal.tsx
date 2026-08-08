@@ -44,7 +44,12 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     if (!lobbyCode || typeof window === 'undefined') {
       return '';
     }
-    return `${window.location.origin}/lobby/${encodeURIComponent(lobbyCode)}`;
+    // The itch.io embed lives on itch's static host, so a link to its own
+    // origin would strand invitees; send them to the canonical site instead.
+    const origin = process.env.ITCH_BUILD === 'true'
+      ? 'https://snaketron.io'
+      : window.location.origin;
+    return `${origin}/lobby/${encodeURIComponent(lobbyCode)}`;
   }, [lobbyCode]);
 
   const clearResetTimer = (target: CopyTarget) => {

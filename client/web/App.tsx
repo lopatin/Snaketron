@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BrowserRouter, Navigate, Route, matchPath, useLocation } from 'react-router-dom';
+import { BrowserRouter, HashRouter, Navigate, Route, matchPath, useLocation } from 'react-router-dom';
 import './index.css';
 import { AccountModal } from './components/AccountModal';
 import type { AccountModalView } from './components/AccountModal';
@@ -124,9 +124,14 @@ function AppContent() {
   );
 }
 
+// The itch.io build is served from a static path with no History-API
+// fallback, so client routes live in the URL hash there. The regular build
+// keeps clean History-API URLs.
+const Router = process.env.ITCH_BUILD === 'true' ? HashRouter : BrowserRouter;
+
 function App() {
   return (
-    <BrowserRouter>
+    <Router>
       <AuthProvider>
         <UIProvider>
           <LatencyProvider>
@@ -136,7 +141,7 @@ function App() {
           </LatencyProvider>
         </UIProvider>
       </AuthProvider>
-    </BrowserRouter>
+    </Router>
   );
 }
 

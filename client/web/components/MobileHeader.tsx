@@ -46,7 +46,7 @@ export const MobileHeader: React.FC<MobileHeaderProps> = ({
 
           {/* Logo */}
           <Link to="/">
-            <img src="/SnaketronLogo.png" alt="Snaketron" className="h-6 w-auto opacity-80" />
+            <img src="SnaketronLogo.png" alt="Snaketron" className="h-6 w-auto opacity-80" />
           </Link>
 
           {/* User/Login */}

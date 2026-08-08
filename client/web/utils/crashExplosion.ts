@@ -1,6 +1,6 @@
 import type { ArenaRotation, Position } from '../types';
 
-export const CRASH_EXPLOSION_SPRITE_URL = '/images/crash-explosion.png';
+export const CRASH_EXPLOSION_SPRITE_URL = 'images/crash-explosion.png';
 export const CRASH_EXPLOSION_COLUMNS = 8;
 export const CRASH_EXPLOSION_ROWS = 8;
 export const CRASH_EXPLOSION_FRAME_COUNT =

@@ -5,6 +5,12 @@ const HtmlWebpackPlugin = require('html-webpack-plugin');
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Optional itch.io HTML5 target (ITCH_BUILD=true): the bundle is served from
+// a deep, unknown path on itch's static host (html-classic.itch.zone), so
+// asset URLs must resolve relative to the page ('auto' publicPath + base
+// href "./" in index.html) and routing must not rely on the History API.
+const isItchBuild = process.env.ITCH_BUILD === 'true';
+
 module.exports = {
   entry: "./bootstrap.ts",
   output: {
@@ -12,7 +18,7 @@ module.exports = {
     filename: isProduction ? "[name].[contenthash].js" : "[name].js",
     chunkFilename: isProduction ? "[name].[contenthash].js" : "[name].js",
     assetModuleFilename: isProduction ? "[name].[contenthash][ext]" : "[name][ext]",
-    publicPath: '/',
+    publicPath: isItchBuild ? 'auto' : '/',
     clean: true,
   },
   resolve: {
@@ -51,11 +57,15 @@ module.exports = {
       filename: 'index.html',
       scriptLoading: 'defer',
       inject: 'body',
+      templateParameters: {
+        itchBuild: isItchBuild,
+      },
     }),
     new webpack.DefinePlugin({
       'process.env.REACT_APP_WS_URL': JSON.stringify(process.env.REACT_APP_WS_URL || ''),
       'process.env.REACT_APP_API_URL': JSON.stringify(process.env.REACT_APP_API_URL || ''),
       'process.env.REACT_APP_ENVIRONMENT': JSON.stringify(process.env.REACT_APP_ENVIRONMENT || 'development'),
+      'process.env.ITCH_BUILD': JSON.stringify(isItchBuild ? 'true' : ''),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
     })
   ],
