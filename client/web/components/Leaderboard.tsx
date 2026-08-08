@@ -7,9 +7,11 @@ import { LobbyChat } from './LobbyChat';
 import { RegionSelector } from './RegionSelector';
 import { InviteFriendsModal } from './InviteFriendsModal';
 import JoinGameModal from './JoinGameModal';
+import { ConnectionStatusRack } from './ConnectionStatusRack';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
+import { isConnectionReady } from '../utils/connectionBanner';
 import { LobbyGameMode, RankTier, RankDivision, Rank, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry, GameType } from '../types';
 import { api } from '../services/api';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
@@ -588,6 +590,7 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   const {
     connectToRegion,
     isConnected,
+    isSessionAuthenticated,
     onMessage,
     currentRegionUrl,
     currentLobby,
@@ -773,12 +776,11 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
     }
   };
 
-  const shouldShowRegionReminder = !regionsLoading && !regionsError && currentRegionId === '';
-  const shouldShowRegionError = Boolean(regionsError);
-  const shouldShowConnectionBanner = !isConnected;
-  const shouldShowRegionLoading = regionsLoading;
-  const shouldShowStatusBanner =
-    shouldShowRegionLoading || shouldShowRegionError || shouldShowRegionReminder || shouldShowConnectionBanner;
+  const isReady = isConnectionReady({
+    isConnected,
+    isSessionAuthenticated,
+    hasIdentity: user !== null,
+  });
 
   return (
     <>
@@ -797,33 +799,12 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
           onLogout={logout}
         />
 
-        {shouldShowStatusBanner && (
-          <div className="home-status-rack" aria-live="polite" aria-label="Connection status">
-            {shouldShowRegionLoading && (
-              <div className="home-status-badge">
-                <span className="home-status-spinner" aria-hidden="true" />
-                <span>Loading region data…</span>
-              </div>
-            )}
-            {shouldShowRegionError && !shouldShowRegionLoading && (
-              <div className="home-status-badge is-warning">
-                <span className="home-status-spinner" aria-hidden="true" />
-                <span>Retrying region data…</span>
-              </div>
-            )}
-            {shouldShowRegionReminder && (
-              <div className="home-status-badge is-warning">
-                <span>Select a region to continue</span>
-              </div>
-            )}
-            {shouldShowConnectionBanner && (
-              <div className="home-status-badge is-warning">
-                <span className="home-status-dot" aria-hidden="true" />
-                <span>Connecting to game server…</span>
-              </div>
-            )}
-          </div>
-        )}
+        <ConnectionStatusRack
+          isReady={isReady}
+          regionsLoading={regionsLoading}
+          regionsError={regionsError}
+          hasSelectedRegion={currentRegionId !== ''}
+        />
 
         <main className="leaderboard-main">
           <LeaderboardContent

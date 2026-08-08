@@ -2876,6 +2876,7 @@ a.home-social-icon:hover {
   font-weight: 700;
   letter-spacing: 0.45px;
   text-transform: uppercase;
+  animation: home-status-badge-in 180ms ease-out both;
 }
 
 .home-status-badge.is-error {
@@ -3229,6 +3230,19 @@ a.home-social-icon:hover {
   }
 }
 
+/* Enter only: React unmounts the badge on recovery, and after the hysteresis
+   floor an instant disappearance reads as the connection snapping back. */
+@keyframes home-status-badge-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 /* Players-online tag --------------------------------------------------------
    A tag notched into a break in the nickname field's top border, the way a
    legend sits in a fieldset, binding the live population to the form as one
@@ -3563,6 +3577,7 @@ a.home-social-icon:hover {
 
   .home-social-trigger svg,
   .home-account-trigger svg,
+  .home-status-badge,
   .home-status-dot,
   .home-status-spinner,
   .players-online-readout,

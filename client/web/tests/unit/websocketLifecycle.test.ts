@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  AUTHENTICATION_TIMEOUT_MS,
   MATCHMAKING_ADMISSION_RETRY_DELAYS_MS,
   PLANNED_HANDOFF_MAX_MS,
   RECONNECT_MAX_MS,
   advanceCandidateGameWatermark,
   activeGameIdFromPath,
+  authenticationTimeoutMs,
   candidateDeadlineDelayMs,
   candidateCoversActiveWatermark,
   isFreshSnapshotForGame,
@@ -362,4 +364,13 @@ test('an authoritative completed snapshot can replace a higher live watermark', 
     expectsGame: true,
     gameStreamWatermark: 0,
   }, 900), true);
+});
+
+// A socket that never sent `Authenticate` has no reply to wait for. Arming the
+// watchdog there made every anonymous visitor close its own healthy socket
+// after five seconds and reconnect forever, flashing the connecting banner.
+test('the authentication watchdog is armed only when Authenticate is sent', () => {
+  assert.equal(authenticationTimeoutMs(null), null);
+  assert.equal(authenticationTimeoutMs(''), null);
+  assert.equal(authenticationTimeoutMs('a.jwt.token'), AUTHENTICATION_TIMEOUT_MS);
 });
