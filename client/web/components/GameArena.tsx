@@ -970,7 +970,10 @@ export default function GameArena() {
     isGameInteractionActive &&
     !gameOver,
   );
-  const showHelp = Boolean(tutorial && helpOpen && !showBriefing);
+  // `!localWasIdleKicked` is what the effect below cannot do on its own: state
+  // set from an effect lands a frame late, and that frame is one in which the
+  // help backdrop covers the removal dialog explaining why the match ended.
+  const showHelp = Boolean(tutorial && helpOpen && !showBriefing && !localWasIdleKicked);
 
   // A briefing supersedes the help screen rather than hiding it. Without this
   // the suppressed help modal would spring back over live gameplay the moment
