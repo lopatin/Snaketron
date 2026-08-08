@@ -1,4 +1,5 @@
 import React, { useEffect, useId, useRef } from 'react';
+import { lockBodyScroll } from '../utils/bodyScrollLock';
 
 export interface IdleKickDialogProps {
   open: boolean;
@@ -19,8 +20,9 @@ const IdleKickDialog: React.FC<IdleKickDialogProps> = ({ open, onMenu }) => {
     const previouslyFocused = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    // Counted, because a removal can land in the same commit as an open help
+    // screen: two independent save/restore pairs would leave the page locked.
+    const releaseBodyScroll = lockBodyScroll();
     const focusFrame = window.requestAnimationFrame(() => {
       (menuButtonRef.current ?? dialogRef.current)?.focus();
     });
@@ -42,7 +44,7 @@ const IdleKickDialog: React.FC<IdleKickDialogProps> = ({ open, onMenu }) => {
     return () => {
       window.cancelAnimationFrame(focusFrame);
       document.removeEventListener('keydown', keepFocusInDialog);
-      document.body.style.overflow = previousOverflow;
+      releaseBodyScroll();
       if (previouslyFocused?.isConnected) {
         previouslyFocused.focus();
       }

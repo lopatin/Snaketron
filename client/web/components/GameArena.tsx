@@ -1016,6 +1016,20 @@ export default function GameArena() {
       : null;
   const showIdleKickDialog = localWasIdleKicked && !isGameComplete && !gameOver;
 
+  // The help screen is the same modal surface as the briefing: it suppresses
+  // every steering and Boost command, which are exactly the inputs the
+  // inactivity clock reads as presence, and its backdrop covers both the
+  // warning banner and the removal dialog. A player reading it would be warned
+  // invisibly, lose the "I'm still here" button behind the backdrop, and then
+  // be removed into an explanation they could not see. Yield the screen the
+  // moment inactivity has something to say — the same way the briefing does.
+  const inactivityNeedsTheScreen = Boolean(idleWarning) || localWasIdleKicked;
+  useEffect(() => {
+    if (helpOpen && inactivityNeedsTheScreen) {
+      setHelpOpen(false);
+    }
+  }, [helpOpen, inactivityNeedsTheScreen]);
+
   // HUD state is read from predicted Rust state so Space/touch activation is
   // immediate and still retracts naturally if the authoritative server
   // rejects or reschedules the command.
@@ -1545,7 +1559,12 @@ export default function GameArena() {
             showBoost={Boolean(boostConfig)}
             boostInputMode={boostInputMode}
             onBoostInputModeChange={handleBoostInputModeChange}
-            onOpenHelp={tutorial ? () => setHelpOpen(true) : undefined}
+            // Withheld while inactivity owns the screen: the help modal would
+            // be closed again on the next commit, so offering it reads as a
+            // broken button rather than a deliberate refusal.
+            onOpenHelp={tutorial && !inactivityNeedsTheScreen
+              ? () => setHelpOpen(true)
+              : undefined}
           />
         </div>
 
