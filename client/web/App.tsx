@@ -15,7 +15,7 @@ import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
-import { WebSocketProvider, useWebSocket } from './contexts/WebSocketContext';
+import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
@@ -23,7 +23,6 @@ import { LatencyProvider } from './contexts/LatencyContext';
 function AppContent() {
   const location = useLocation();
   const { user } = useAuth();
-  const { clientUpdateRequired } = useWebSocket();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
@@ -40,30 +39,6 @@ function AppContent() {
       setAccountModalView(null);
     }
   }, [user]);
-
-  if (clientUpdateRequired) {
-    return (
-      <main
-        className="relative z-50 flex min-h-screen items-center justify-center bg-white px-6 text-center"
-        role="alert"
-        data-testid="client-update-required"
-      >
-        <div className="max-w-md border-4 border-black p-8 shadow-[8px_8px_0_#000]">
-          <h1 className="text-3xl font-black uppercase">Client update required</h1>
-          <p className="mt-4 text-sm font-semibold">
-            Snaketron was updated. Reload to use the current gameplay protocol.
-          </p>
-          <button
-            type="button"
-            className="mt-6 border-2 border-black bg-black px-5 py-3 font-black uppercase text-white"
-            onClick={() => window.location.reload()}
-          >
-            Reload now
-          </button>
-        </div>
-      </main>
-    );
-  }
 
   return (
     <div className="min-h-screen flex flex-col">

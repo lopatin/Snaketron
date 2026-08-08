@@ -27,8 +27,6 @@ use futures_util::SinkExt;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::error::Error as StdError;
-use std::fmt;
 use std::future::{Future, pending};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,39 +38,22 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const CLIENT_UPDATE_REQUIRED_REASON: &str = "Client update required";
-
-#[derive(Debug)]
-struct ClientProtocolMismatch {
-    detail: String,
-}
-
-impl fmt::Display for ClientProtocolMismatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.detail)
+/// The gameplay protocol version a client reports is advisory. No client is
+/// ever turned away for reporting an old, newer, or missing version: a shipped
+/// build cannot update itself — an itch.io bundle has no reload-to-upgrade
+/// path at all — so an "update required" dead end would strand the player with
+/// nothing to do. Every gameplay protocol change must therefore stay backwards
+/// compatible, and a mismatch is only ever logged so a rollout stays visible.
+fn log_client_protocol_version(protocol_version: Option<u16>) {
+    match protocol_version {
+        Some(version) if version == WS_PROTOCOL_VERSION => {}
+        Some(version) => warn!(
+            "Admitting client on gameplay protocol version {version}; this server speaks {WS_PROTOCOL_VERSION}"
+        ),
+        None => warn!(
+            "Admitting legacy client that reported no gameplay protocol version; this server speaks {WS_PROTOCOL_VERSION}"
+        ),
     }
-}
-
-impl StdError for ClientProtocolMismatch {}
-
-async fn queue_client_update_required(ws_tx: &mpsc::Sender<Message>) -> Result<()> {
-    let denial = WSMessage::AccessDenied {
-        reason: CLIENT_UPDATE_REQUIRED_REASON.to_owned(),
-    };
-    ws_tx
-        .send(Message::Text(serde_json::to_string(&denial)?.into()))
-        .await
-        .context("WebSocket closed before protocol rejection")?;
-    // FIFO after the denial. The connection cleanup waits for the forwarding
-    // task to send this close frame instead of aborting that task immediately.
-    ws_tx
-        .send(Message::Close(None))
-        .await
-        .context("WebSocket closed before protocol close frame")
-}
-
-fn ws_protocol_version_is_supported(protocol_version: u16) -> bool {
-    protocol_version == WS_PROTOCOL_VERSION
 }
 
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
@@ -81,12 +62,11 @@ fn ws_protocol_version_is_supported(protocol_version: u16) -> bool {
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum WSMessage {
-    /// Legacy authentication shape retained only so the server can return a
-    /// clear update-required error before closing a stale client's socket.
+    /// Legacy authentication shape. Still honored: it authenticates exactly
+    /// like `Authenticate`, just without a reported protocol version.
     Token(String),
-    /// Client -> server authentication. The version is checked before token
-    /// verification so a maintenance cutover cannot admit an old gameplay
-    /// protocol into a current executor fleet.
+    /// Client -> server authentication. The reported version is advisory —
+    /// see `log_client_protocol_version`; it never gates admission.
     Authenticate {
         token: String,
         protocol_version: u16,
@@ -696,7 +676,6 @@ async fn handle_websocket_connection(
     let shutdown_timeout = tokio::time::sleep(Duration::from_secs(u64::MAX));
     tokio::pin!(shutdown_timeout);
     let mut shutdown_started = false;
-    let mut graceful_protocol_close = false;
 
     // Will be used to track Redis stream subscription for game events
     let mut game_event_handle: Option<JoinHandle<()>> = None;
@@ -716,7 +695,7 @@ async fn handle_websocket_connection(
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
     // Spawn task to forward messages from channel to WebSocket
-    let mut forward_task = tokio::spawn(async move {
+    let forward_task = tokio::spawn(async move {
         let mut drain_open = true;
         let mut ws_open = true;
         while let Some(msg) = next_outbound_message(
@@ -1258,9 +1237,6 @@ async fn handle_websocket_connection(
                                         Err(e) => {
                                             crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
-                                            graceful_protocol_close = e
-                                                .downcast_ref::<ClientProtocolMismatch>()
-                                                .is_some();
                                             // State was consumed, need to reset
                                             state = ConnectionState::Unauthenticated;
                                             break;
@@ -1316,16 +1292,7 @@ async fn handle_websocket_connection(
     if let Some(handle) = game_chat_handle {
         handle.abort();
     }
-    if graceful_protocol_close {
-        if tokio::time::timeout(Duration::from_secs(1), &mut forward_task)
-            .await
-            .is_err()
-        {
-            forward_task.abort();
-        }
-    } else {
-        forward_task.abort();
-    }
+    forward_task.abort();
 
     info!("WebSocket connection closed");
     Ok(())
@@ -3318,6 +3285,105 @@ async fn subscribe_to_lobby_chat(
     Ok(())
 }
 
+/// Shared admission path for both authentication shapes. `protocol_version` is
+/// `None` for the legacy `Token` shape and is never a reason to refuse the
+/// connection — see `log_client_protocol_version`.
+#[allow(clippy::too_many_arguments)]
+async fn authenticate_ws_connection(
+    jwt_token: String,
+    protocol_version: Option<u16>,
+    jwt_verifier: &Arc<dyn JwtVerifier>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+    game_bus: &Arc<GameBus>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    websocket_id: &str,
+    lifecycle: &TaskLifecycle,
+    socket_generation: u64,
+    cluster_namespace: &ClusterNamespace,
+) -> Result<ConnectionState> {
+    log_client_protocol_version(protocol_version);
+    debug!("Received WebSocket authentication request");
+    match jwt_verifier.verify(&jwt_token).await {
+        Ok(user_token) => {
+            info!(
+                "Token verified successfully, user_id: {}",
+                user_token.user_id
+            );
+
+            let user = db
+                .get_user_by_id(user_token.user_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+
+            if user.is_guest != user_token.is_guest {
+                return Err(anyhow::anyhow!(
+                    "Authentication failed: guest claim does not match user record"
+                ));
+            }
+
+            let database_pool = if user.is_stress_test {
+                MatchmakingPool::Stress
+            } else {
+                MatchmakingPool::Public
+            };
+            if database_pool != user_token.matchmaking_pool {
+                return Err(anyhow::anyhow!(
+                    "Authentication failed: matchmaking pool claim does not match user record"
+                ));
+            }
+
+            let metadata = PlayerMetadata {
+                user_id: user_token.user_id,
+                username: user.username.clone(),
+                token: jwt_token.clone(),
+                is_guest: user.is_guest,
+                matchmaking_pool: database_pool,
+            };
+
+            info!(
+                "User authenticated: {} (id: {})",
+                metadata.username, metadata.user_id
+            );
+
+            let authenticated = WSMessage::Authenticated {
+                task_boot_id: lifecycle.task_boot_id().to_owned(),
+                protocol_version: WS_PROTOCOL_VERSION,
+                capabilities: lifecycle.protocol_capabilities(),
+                socket_generation,
+            };
+            ws_tx
+                .send(Message::Text(serde_json::to_string(&authenticated)?.into()))
+                .await
+                .context("WebSocket closed before authentication acknowledgement")?;
+            if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                notify_durable_active_game_after_auth(
+                    user_id,
+                    metadata.matchmaking_pool,
+                    ws_tx,
+                    matchmaking_manager,
+                    replication_manager,
+                    game_bus,
+                    cluster_namespace,
+                    db,
+                )
+                .await?;
+            }
+            Ok(ConnectionState::Authenticated {
+                metadata,
+                lobby_handle: None,
+                game_id: None,
+                websocket_id: websocket_id.to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Failed to verify token: {}", e);
+            Err(anyhow::anyhow!("Authentication failed"))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: ConnectionState,
@@ -3381,104 +3447,42 @@ async fn process_ws_message(
     match state {
         ConnectionState::Unauthenticated => {
             match ws_message {
-                WSMessage::Token(_) => {
-                    queue_client_update_required(ws_tx).await?;
-                    Err(anyhow::Error::new(ClientProtocolMismatch {
-                        detail: "legacy WebSocket authentication protocol rejected".into(),
-                    }))
+                WSMessage::Token(jwt_token) => {
+                    authenticate_ws_connection(
+                        jwt_token,
+                        None,
+                        jwt_verifier,
+                        db,
+                        ws_tx,
+                        game_bus,
+                        matchmaking_manager,
+                        replication_manager,
+                        websocket_id,
+                        lifecycle,
+                        socket_generation,
+                        cluster_namespace,
+                    )
+                    .await
                 }
                 WSMessage::Authenticate {
                     token: jwt_token,
                     protocol_version,
                 } => {
-                    if !ws_protocol_version_is_supported(protocol_version) {
-                        queue_client_update_required(ws_tx).await?;
-                        return Err(anyhow::Error::new(ClientProtocolMismatch {
-                            detail: format!(
-                                "WebSocket protocol version {protocol_version} rejected; expected {WS_PROTOCOL_VERSION}"
-                            ),
-                        }));
-                    }
-                    debug!("Received WebSocket authentication request");
-                    match jwt_verifier.verify(&jwt_token).await {
-                        Ok(user_token) => {
-                            info!(
-                                "Token verified successfully, user_id: {}",
-                                user_token.user_id
-                            );
-
-                            let user = db
-                                .get_user_by_id(user_token.user_id)
-                                .await?
-                                .ok_or_else(|| anyhow::anyhow!("User not found"))?;
-
-                            if user.is_guest != user_token.is_guest {
-                                return Err(anyhow::anyhow!(
-                                    "Authentication failed: guest claim does not match user record"
-                                ));
-                            }
-
-                            let database_pool = if user.is_stress_test {
-                                MatchmakingPool::Stress
-                            } else {
-                                MatchmakingPool::Public
-                            };
-                            if database_pool != user_token.matchmaking_pool {
-                                return Err(anyhow::anyhow!(
-                                    "Authentication failed: matchmaking pool claim does not match user record"
-                                ));
-                            }
-
-                            let metadata = PlayerMetadata {
-                                user_id: user_token.user_id,
-                                username: user.username.clone(),
-                                token: jwt_token.clone(),
-                                is_guest: user.is_guest,
-                                matchmaking_pool: database_pool,
-                            };
-
-                            info!(
-                                "User authenticated: {} (id: {})",
-                                metadata.username, metadata.user_id
-                            );
-
-                            let authenticated = WSMessage::Authenticated {
-                                task_boot_id: lifecycle.task_boot_id().to_owned(),
-                                protocol_version: WS_PROTOCOL_VERSION,
-                                capabilities: lifecycle.protocol_capabilities(),
-                                socket_generation,
-                            };
-                            ws_tx
-                                .send(Message::Text(serde_json::to_string(&authenticated)?.into()))
-                                .await
-                                .context(
-                                    "WebSocket closed before authentication acknowledgement",
-                                )?;
-                            if let Ok(user_id) = u32::try_from(metadata.user_id) {
-                                notify_durable_active_game_after_auth(
-                                    user_id,
-                                    metadata.matchmaking_pool,
-                                    ws_tx,
-                                    matchmaking_manager,
-                                    replication_manager,
-                                    game_bus,
-                                    cluster_namespace,
-                                    db,
-                                )
-                                .await?;
-                            }
-                            Ok(ConnectionState::Authenticated {
-                                metadata,
-                                lobby_handle: None,
-                                game_id: None,
-                                websocket_id: websocket_id.to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            error!("Failed to verify token: {}", e);
-                            Err(anyhow::anyhow!("Authentication failed"))
-                        }
-                    }
+                    authenticate_ws_connection(
+                        jwt_token,
+                        Some(protocol_version),
+                        jwt_verifier,
+                        db,
+                        ws_tx,
+                        game_bus,
+                        matchmaking_manager,
+                        replication_manager,
+                        websocket_id,
+                        lifecycle,
+                        socket_generation,
+                        cluster_namespace,
+                    )
+                    .await
                 }
                 WSMessage::Ping { client_time } => {
                     // Respond with Pong even in unauthenticated state to keep connection alive
@@ -4712,17 +4716,16 @@ fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        CLIENT_UPDATE_REQUIRED_REASON, CommandOutcomeReplay, GameJoinAuthorizationError,
-        GameSubscriptionInput, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
-        abort_and_join_game_event_forwarder, canonical_command_identity, command_outcomes_for_user,
-        ensure_custom_game_access, game_join_denied, game_join_failure_message,
+        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
+        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
+        canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
+        game_join_denied, game_join_failure_message, log_client_protocol_version,
         missing_game_join_failure, next_game_subscription_input, next_outbound_message,
-        queue_client_update_required, queue_planned_drain_notice, recovery_bridge_snapshot,
-        require_game_command_publication, send_command_outcomes_from_resolved,
-        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
-        slow_command_publish_wait_ms, snapshot_requires_command_outcomes,
-        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
-        validate_game_matchmaking_pool, ws_protocol_version_is_supported,
+        queue_planned_drain_notice, recovery_bridge_snapshot, require_game_command_publication,
+        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
+        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
+        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
+        take_lobby_update_receiver, unsent_lobby_match, validate_game_matchmaking_pool,
     };
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -4912,7 +4915,7 @@ mod lifecycle_protocol_tests {
     }
 
     #[test]
-    fn authentication_request_requires_the_exact_protocol_version() {
+    fn authentication_request_reports_an_advisory_protocol_version() {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
@@ -4923,29 +4926,29 @@ mod lifecycle_protocol_tests {
             value["Authenticate"]["protocol_version"],
             WS_PROTOCOL_VERSION
         );
-        assert!(ws_protocol_version_is_supported(WS_PROTOCOL_VERSION));
-        assert!(!ws_protocol_version_is_supported(
-            WS_PROTOCOL_VERSION.saturating_sub(1)
-        ));
-        assert_eq!(CLIENT_UPDATE_REQUIRED_REASON, "Client update required");
     }
 
-    #[tokio::test]
-    async fn protocol_mismatch_queues_denial_before_close() {
-        let (tx, mut rx) = mpsc::channel(2);
-        queue_client_update_required(&tx).await.unwrap();
+    /// A stale, newer, or version-less client must never be refused: a shipped
+    /// build (an itch.io bundle above all) cannot update itself, so refusing it
+    /// would strand the player. Reporting a version only produces a log line.
+    #[test]
+    fn every_reported_protocol_version_is_admitted() {
+        log_client_protocol_version(Some(WS_PROTOCOL_VERSION));
+        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_sub(1)));
+        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_add(1)));
+        log_client_protocol_version(Some(0));
+        log_client_protocol_version(None);
+    }
 
-        let denial = rx.recv().await.expect("denial frame");
-        let Message::Text(text) = denial else {
-            panic!("first protocol-mismatch frame must be text");
-        };
-        let parsed: WSMessage = serde_json::from_str(&text).unwrap();
-        assert!(matches!(
-            parsed,
-            WSMessage::AccessDenied { reason }
-                if reason == CLIENT_UPDATE_REQUIRED_REASON
-        ));
-        assert!(matches!(rx.recv().await, Some(Message::Close(_))));
+    /// The legacy version-less shape still authenticates rather than being
+    /// answered with a denial the player cannot act on.
+    #[test]
+    fn the_legacy_token_shape_is_still_accepted() {
+        let value = serde_json::to_value(WSMessage::Token("jwt".to_owned())).unwrap();
+        assert_eq!(value["Token"], "jwt");
+
+        let parsed: WSMessage = serde_json::from_value(value).unwrap();
+        assert!(matches!(parsed, WSMessage::Token(token) if token == "jwt"));
     }
 
     #[tokio::test]

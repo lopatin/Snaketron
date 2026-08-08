@@ -115,7 +115,6 @@ export interface LobbyPreferences {
 export interface WebSocketContextType {
   isConnected: boolean;
   isSessionAuthenticated: boolean;
-  clientUpdateRequired: boolean;
   serverCapabilities: ReadonlySet<string>;
   sendMessage: (message: OutboundMessage) => boolean;
   waitForSessionReady: (timeoutMs?: number) => Promise<void>;

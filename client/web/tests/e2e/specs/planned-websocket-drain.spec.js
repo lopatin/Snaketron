@@ -3770,33 +3770,57 @@ test('window blur releases default Hold Boost once', async ({ page }) => {
   ]);
 });
 
-test('hard-cutover denial closes every socket and permanently suppresses reconnect', async ({ page }) => {
+// A shipped build cannot update itself — an itch.io bundle has no
+// reload-to-upgrade path at all — so no protocol disagreement may ever strand
+// the player behind a screen they have no way to act on. Every one of these
+// mismatches has to degrade to a console warning and keep playing.
+test('a mismatched server protocol and missing capabilities still authenticate', async ({ page }) => {
+  await page.goto('/');
+  await expect.poll(() => page.evaluate(() => (
+    window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
+  ))).toBeGreaterThanOrEqual(0);
+  const socketIndex = await page.evaluate(() => window.__mockSockets.indexOf(window.__wsInstance));
+  await expect.poll(() => socketMessages(page, socketIndex, 'Authenticate')).toHaveLength(1);
+
+  await emitServerMessage(page, socketIndex, {
+    Authenticated: {
+      task_boot_id: 'mismatched-task',
+      protocol_version: 999,
+      capabilities: [],
+      socket_generation: 1,
+    },
+  });
+
+  // Reaching JoinLobby proves the handshake was accepted despite both mismatches.
+  await expect.poll(() => socketMessages(page, socketIndex, 'JoinLobby')).toHaveLength(2);
+  await expect(page.getByTestId('client-update-required')).toHaveCount(0);
+  expect(await page.evaluate((index) => window.__mockSockets[index].closeCalls, socketIndex))
+    .toEqual([]);
+});
+
+test('a legacy client-update denial no longer strands the player', async ({ page }) => {
   const socketIndex = await establishAuthenticatedLobby(page);
   const socketCount = await page.evaluate(() => window.__mockSockets.length);
 
   await emitServerMessage(page, socketIndex, {
     AccessDenied: { reason: 'Client update required' },
   });
-
-  await expect(page.getByRole('alert')).toContainText('Client update required');
-  await expect.poll(() => page.evaluate((index) => ({
-    updateRequired: window.__wsContext?.clientUpdateRequired,
-    connected: window.__wsContext?.isConnected,
-    activeSocket: window.__wsInstance ?? null,
-    closeCalls: window.__mockSockets[index].closeCalls,
-  }), socketIndex)).toEqual({
-    updateRequired: true,
-    connected: false,
-    activeSocket: null,
-    closeCalls: [{ code: 4002, reason: 'client update required' }],
-  });
-
-  await page.evaluate(() => {
-    window.__wsContext.connect('ws://snaketron.test/ws');
-    window.__wsContext.connectToRegion('ws://another-region.test/ws', { forceReconnect: true });
-  });
   await page.waitForTimeout(250);
-  expect(await page.evaluate(() => window.__mockSockets.length)).toBe(socketCount);
+
+  await expect(page.getByTestId('client-update-required')).toHaveCount(0);
+  expect(await page.evaluate((index) => ({
+    connected: window.__wsContext?.isConnected,
+    activeSocketIndex: window.__wsInstance
+      ? window.__mockSockets.indexOf(window.__wsInstance)
+      : -1,
+    closeCalls: window.__mockSockets[index].closeCalls,
+    socketCount: window.__mockSockets.length,
+  }), socketIndex)).toEqual({
+    connected: true,
+    activeSocketIndex: socketIndex,
+    closeCalls: [],
+    socketCount,
+  });
 });
 
 test('terminal cutoff rejects a command crossed by buffered completion', async ({ page }) => {
