@@ -13,6 +13,15 @@ const REQUIRED_CAPABILITIES = [
 const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
   'Failed to queue lobby: Failed to add lobby to matchmaking queue';
 
+// Comfortably past the 5s authentication watchdog plus a saturated 2s back-off,
+// so a socket that survives this window is not merely between churn cycles.
+const ANONYMOUS_SOCKET_OBSERVATION_MS = 8_000;
+
+// Mirrors utils/connectionBanner.ts, which this CommonJS spec cannot import.
+// The values themselves are pinned by tests/unit/connectionBanner.test.ts.
+const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
+const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
+
 const gameState = (tick = 5) => ({
   tick,
   status: { Started: { server_id: 1 } },
@@ -737,6 +746,149 @@ test('logout explicitly leaves the lobby before retiring the authenticated socke
       typeof message === 'object' &&
       ('Authenticate' in message || 'JoinLobby' in message)
     )).length, socketCountBeforeLogout)).toBe(0);
+
+  // The post-logout socket carries no token, so it is the same shape as an
+  // anonymous visitor's. It must simply stay open rather than being torn down
+  // by a handshake deadline for a handshake it never started.
+  const socketCountAfterLogout = await page.evaluate(() => window.__mockSockets.length);
+  await page.waitForTimeout(ANONYMOUS_SOCKET_OBSERVATION_MS);
+  expect(await page.evaluate((index) => ({
+    socketsOpenedSince: window.__mockSockets.length - index,
+    lastSocketCloseCalls: window.__mockSockets[index - 1].closeCalls,
+    lastSocketReadyState: window.__mockSockets[index - 1].readyState,
+  }), socketCountAfterLogout)).toEqual({
+    socketsOpenedSince: 0,
+    lastSocketCloseCalls: [],
+    lastSocketReadyState: 1,
+  });
+});
+
+// Regression: the client armed its 5s authentication watchdog on every socket
+// but sent `Authenticate` only when a token existed, so a visitor with no
+// account waited for a reply to a message it never sent, closed its own healthy
+// socket with 4013, reconnected, and flashed the connecting banner forever.
+test('an anonymous visitor keeps one socket open and never shows the connecting banner', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('snaketron:lastLobby');
+  });
+
+  await page.goto('/');
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(true);
+  // Startup opens more than one socket while region detection settles. That
+  // race is separate and pre-existing; what matters here is that it settles.
+  const settledSocketCount = await page.evaluate(() => window.__mockSockets.length);
+
+  // Long enough to have covered the old 5s watchdog plus a full back-off cycle.
+  await page.waitForTimeout(ANONYMOUS_SOCKET_OBSERVATION_MS);
+
+  expect(await page.evaluate((baseline) => {
+    const live = window.__mockSockets[baseline - 1];
+    return {
+      socketsOpenedSince: window.__mockSockets.length - baseline,
+      closeCalls: live.closeCalls,
+      readyState: live.readyState,
+      authenticateFrames: live.sent
+        .map((raw) => JSON.parse(raw))
+        .filter((message) => message && typeof message === 'object' && 'Authenticate' in message)
+        .length,
+      connected: window.__wsContext?.isConnected,
+    };
+  }, settledSocketCount)).toEqual({
+    socketsOpenedSince: 0,
+    closeCalls: [],
+    readyState: 1,
+    authenticateFrames: 0,
+    connected: true,
+  });
+  await expect(page.getByText('Connecting to game server…')).toHaveCount(0);
+});
+
+// The badge explains a problem the player can act on. A gap short enough to be
+// invisible is not one, and painting it is the flicker itself.
+test('a brief transport gap stays silent while a sustained one is announced', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('snaketron:lastLobby');
+  });
+
+  await page.goto('/');
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(true);
+  const banner = page.getByText('Connecting to game server…');
+  await expect(banner).toHaveCount(0);
+
+  // Watch continuously: a badge that appears and vanishes between polls is
+  // exactly the flicker being fixed, so sampling from the test is not enough.
+  await page.evaluate(() => {
+    window.__bannerEverShown = false;
+    new MutationObserver(() => {
+      if (document.body.innerText.toUpperCase().includes('CONNECTING TO GAME SERVER')) {
+        window.__bannerEverShown = true;
+      }
+    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  });
+
+  // A real gap, held open below the show delay, then closed.
+  await page.evaluate(() => {
+    window.__autoOpenSockets = false;
+    window.__mockSockets[window.__mockSockets.length - 1].serverClose(1012, 'brief blip');
+  });
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(false);
+  await page.waitForTimeout(CONNECTION_BANNER_SHOW_DELAY_MS / 2);
+  await page.evaluate(() => {
+    window.__autoOpenSockets = true;
+    window.__mockSockets[window.__mockSockets.length - 1].serverOpen();
+  });
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(true);
+
+  await page.waitForTimeout(CONNECTION_BANNER_SHOW_DELAY_MS + 400);
+  expect(await page.evaluate(() => window.__bannerEverShown)).toBe(false);
+  await expect(banner).toHaveCount(0);
+
+  // A gap that does not close: the replacement socket is left connecting.
+  await page.evaluate(() => {
+    window.__autoOpenSockets = false;
+    window.__mockSockets[window.__mockSockets.length - 1].serverClose(1012, 'sustained outage');
+  });
+  await expect(banner).toHaveCount(1, { timeout: 5_000 });
+
+  // Recovery takes the badge down, but only after it has been readable.
+  const shownAtMs = Date.now();
+  await page.evaluate(() => {
+    window.__autoOpenSockets = true;
+    window.__mockSockets[window.__mockSockets.length - 1].serverOpen();
+  });
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(true);
+  await expect(banner).toHaveCount(0, { timeout: 5_000 });
+  expect(Date.now() - shownAtMs).toBeGreaterThanOrEqual(CONNECTION_BANNER_MIN_VISIBLE_MS);
+});
+
+// The watchdog still has to cover the handshake a visitor reaches by pressing
+// Play: an anonymous socket that only now has an identity to present.
+test('an identity acquired on an open anonymous socket still gets a handshake deadline', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('snaketron:lastLobby');
+  });
+
+  await page.goto('/');
+  await expect.poll(() => page.evaluate(() => window.__wsContext?.isConnected)).toBe(true);
+  const liveSocketIndex = await page.evaluate(() => window.__mockSockets.length - 1);
+  expect(await socketMessages(page, liveSocketIndex, 'Authenticate')).toHaveLength(0);
+
+  // A guest session appears while the socket is already open.
+  await page.evaluate(() => {
+    localStorage.setItem('token', 'late-guest-token');
+    window.__wsContext?.waitForSessionReady().catch(() => {});
+  });
+  await expect.poll(() => socketMessages(page, liveSocketIndex, 'Authenticate')).toHaveLength(1);
+
+  // The server never answers, so the socket must be retired for retry rather
+  // than left hanging on a handshake that will never complete.
+  await expect.poll(
+    () => page.evaluate((index) => window.__mockSockets[index].closeCalls, liveSocketIndex),
+    { timeout: 10_000 },
+  ).toEqual([{ code: 4013, reason: 'authentication timed out' }]);
 });
 
 test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {

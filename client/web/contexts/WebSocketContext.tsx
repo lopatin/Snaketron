@@ -39,6 +39,7 @@ import {
 } from '../utils/lobbyPreferencesStorage';
 import {
   advanceCandidateGameWatermark,
+  authenticationTimeoutMs,
   candidateDeadlineDelayMs,
   activeGameIdFromPath,
   isCommandOwner,
@@ -111,7 +112,6 @@ const MAX_CHAT_HISTORY = 200;
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
-const AUTHENTICATION_TIMEOUT_MS = 5_000;
 // RFC close codes in the 1001-2999 range are reserved for the protocol and
 // servers; browsers reject them when passed to WebSocket.close(). Preserve
 // their semantic suffixes in the application-private 4000 range whenever the
@@ -1227,6 +1227,31 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     shutdownForClientUpdate,
   ]);
 
+  // Arm the handshake watchdog for a socket that has just sent `Authenticate`.
+  // Every `Authenticate` send site must call this, and nothing else may: the
+  // deadline belongs to an in-flight handshake, not to the transport. Arming it
+  // where no frame was sent makes an anonymous visitor's healthy socket close
+  // itself every AUTHENTICATION_TIMEOUT_MS and reconnect forever.
+  const armAuthenticationTimeout = useCallback((slot: SocketSlot, token: string | null) => {
+    clearAuthenticationTimeout(slot);
+    const timeoutMs = authenticationTimeoutMs(token);
+    if (timeoutMs === null) {
+      return;
+    }
+    slot.authTimeoutId = setTimeout(() => {
+      if (
+        slot.authenticated ||
+        slot.role === 'retired' ||
+        (slot.role === 'active' && activeSlotRef.current !== slot) ||
+        (slot.role === 'candidate' && candidateSlotRef.current !== slot)
+      ) {
+        return;
+      }
+      slot.authTimeoutId = null;
+      slot.socket.close(CLIENT_RETRY_CLOSE_CODE, 'authentication timed out');
+    }, timeoutMs);
+  }, []);
+
   const attachSocketHandlers = useCallback((slot: SocketSlot, onConnect?: () => void) => {
     slot.socket.onopen = () => {
       if (
@@ -1239,23 +1264,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
       const token = getToken();
       clearAuthenticationTimeout(slot);
-      slot.authTimeoutId = setTimeout(() => {
-        if (
-          slot.authenticated ||
-          slot.role === 'retired' ||
-          (slot.role === 'active' && activeSlotRef.current !== slot) ||
-          (slot.role === 'candidate' && candidateSlotRef.current !== slot)
-        ) {
-          return;
-        }
-        slot.authTimeoutId = null;
-        slot.socket.close(CLIENT_RETRY_CLOSE_CODE, 'authentication timed out');
-      }, AUTHENTICATION_TIMEOUT_MS);
       if (token) {
         slot.authStartedAtMs = Date.now();
         slot.authTokenSent = token;
         slot.socket.send(JSON.stringify(buildGameplayAuthentication(token)));
         lastAuthTokenRef.current = token;
+        armAuthenticationTimeout(slot, token);
       }
 
       if (slot.role === 'active') {
@@ -1355,7 +1369,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         openActiveRef.current(slot.url, onConnect);
       }, delay);
     };
-  }, [configureClockSync, getToken, handleParsedMessage, promoteCandidate, recordPlannedHandoffFailure, recoverAfterCandidateFailure, setAuthHandshakeState]);
+  }, [armAuthenticationTimeout, configureClockSync, getToken, handleParsedMessage, promoteCandidate, recordPlannedHandoffFailure, recoverAfterCandidateFailure, setAuthHandshakeState]);
 
   const createSlot = useCallback((url: string, role: SocketRole): SocketSlot => {
     const socket = new WebSocket(url);
@@ -1667,9 +1681,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         return false;
       }
       lastAuthTokenRef.current = token;
+      // This is the handshake a visitor reaches by pressing Play: the socket
+      // was opened anonymously and only now has an identity to present. It is
+      // an in-flight `Authenticate` like any other, so it gets the same
+      // recovery deadline instead of hanging until a caller's own timeout.
+      armAuthenticationTimeout(slot, token);
     }
     return slot.authenticated;
-  }, [getToken, setAuthHandshakeState]);
+  }, [armAuthenticationTimeout, getToken, setAuthHandshakeState]);
 
   const waitForSessionReady = useCallback(async (timeoutMs = 10_000): Promise<void> => {
     const deadline = Date.now() + timeoutMs;

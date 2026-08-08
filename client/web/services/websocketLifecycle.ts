@@ -1,5 +1,6 @@
 export const RECONNECT_BASE_MS = 100;
 export const RECONNECT_MAX_MS = 2000;
+export const AUTHENTICATION_TIMEOUT_MS = 5_000;
 export const MATCHMAKING_ADMISSION_RETRY_DELAYS_MS = [250, 500, 1000] as const;
 export const PLANNED_HANDOFF_MAX_MS = 20_000;
 export const PLANNED_HANDOFF_MIN_MS = 2_000;
@@ -64,6 +65,22 @@ export function reconnectDelayMs(attempt: number, random: () => number = Math.ra
   const exponential = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * (2 ** (attempt - 1)));
   const jitter = 0.5 + Math.max(0, Math.min(1, random()));
   return Math.min(RECONNECT_MAX_MS, Math.round(exponential * jitter));
+}
+
+/**
+ * How long to wait for `Authenticated` after sending `Authenticate`, or `null`
+ * when no handshake is in flight.
+ *
+ * The watchdog exists to recover a socket that *asked* to authenticate and got
+ * no answer. A socket that never sent `Authenticate` — an anonymous visitor
+ * with no token — has nothing to wait for: the server keeps unauthenticated
+ * sockets open by design (it answers `Ping` with `Pong` before authentication
+ * and applies no auth deadline), and still pushes `UserCountUpdate` over them.
+ * Arming a watchdog there makes the client kill its own healthy socket every
+ * five seconds and reconnect forever.
+ */
+export function authenticationTimeoutMs(token: string | null): number | null {
+  return typeof token === 'string' && token.length > 0 ? AUTHENTICATION_TIMEOUT_MS : null;
 }
 
 /** Decide recovery without ever leaving a connectionless client idle. */
