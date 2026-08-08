@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildBoostHudView } from '../../utils/boostHud.ts';
 
-const config = { speed_milli: 1500, capacity_ms: 3000 };
+const config = { speed_milli: 1500, capacity_ms: 3000, unlimited: false };
 
 test('Boost HUD reports empty, partial, and full predicted charge', () => {
   const empty = buildBoostHudView(
@@ -100,7 +100,7 @@ test('Boost HUD defensively clamps malformed snapshot charge', () => {
 
 test('Boost HUD reports the supported 2x edge and funded final quantum', () => {
   const finalQuantum = buildBoostHudView(
-    { speed_milli: 2000, capacity_ms: 3000 },
+    { speed_milli: 2000, capacity_ms: 3000, unlimited: false },
     { is_alive: true, boost: { charge_ms: 50, active: true } },
     true,
     false,
@@ -112,4 +112,47 @@ test('Boost HUD reports the supported 2x edge and funded final quantum', () => {
   assert.equal(finalQuantum.active, true);
   assert.equal(finalQuantum.ready, false);
   assert.equal(finalQuantum.buttonDisabled, false);
+});
+
+test('an unlimited tank reads as full and ready regardless of stored charge', () => {
+  // A solo run's meter is a state indicator, not a resource gauge: there is
+  // nothing on the map to refuel from, so a bar that could drop toward empty
+  // would be telling the player about a constraint that does not exist.
+  const unlimitedConfig = { speed_milli: 1500, capacity_ms: 3000, unlimited: true };
+
+  for (const chargeMs of [0, 1500, 3000]) {
+    const idle = buildBoostHudView(
+      unlimitedConfig,
+      { is_alive: true, boost: { charge_ms: chargeMs, active: false } },
+      true,
+      false,
+    );
+    assert.equal(idle.unlimited, true);
+    assert.equal(idle.percent, 100, `charge ${chargeMs} must still read full`);
+    assert.equal(idle.fillRatio, 1);
+    assert.equal(idle.ready, true, 'an idle unlimited tank is always ready');
+    assert.equal(idle.buttonDisabled, false);
+  }
+
+  const running = buildBoostHudView(
+    unlimitedConfig,
+    { is_alive: true, boost: { charge_ms: 3000, active: true } },
+    true,
+    false,
+  );
+  assert.equal(running.active, true);
+  assert.equal(running.ready, false, 'already running is not "ready to run"');
+  assert.equal(running.percent, 100);
+});
+
+test('a collectible tank still drains, so unlimited is not leaking into other modes', () => {
+  const partial = buildBoostHudView(
+    config,
+    { is_alive: true, boost: { charge_ms: 750, active: false } },
+    true,
+    false,
+  );
+  assert.equal(partial.unlimited, false);
+  assert.equal(partial.percent, 25);
+  assert.equal(partial.ready, false);
 });

@@ -59,6 +59,7 @@ interface UseGameWebSocketReturn {
   spectateGame: (gameId: string, gameCode?: string | null) => void;
   sendGameCommand: (command: GameCommand) => boolean;
   sendRequestResync: (gameId: string) => void;
+  sendPlayerReady: (gameId: string) => void;
   connected: boolean;
 }
 
@@ -668,6 +669,20 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     });
   }, [sendMessage]);
 
+  // Confirm the pre-match briefing, matching WSMessage::PlayerReady. The
+  // server canonicalizes the identity from the connection, so the game id here
+  // is only routing. Safe to call repeatedly: the executor drops a readiness
+  // it has already recorded, which is what lets the arena resend after a
+  // resync without the player pressing anything again.
+  const sendPlayerReady = useCallback((gameId: string) => {
+    const numericGameId = parseInt(gameId, 10);
+    if (!Number.isFinite(numericGameId)) {
+      console.error('Cannot send readiness for invalid game ID:', gameId);
+      return;
+    }
+    sendMessage({ PlayerReady: { game_id: numericGameId } });
+  }, [sendMessage]);
+
   const createSoloGame = useCallback(() => {
     console.log('Queueing for a solo game');
     serverAssignedGameRef.current = null;
@@ -797,6 +812,7 @@ export const useGameWebSocket = (): UseGameWebSocketReturn => {
     spectateGame,
     sendGameCommand,
     sendRequestResync,
+    sendPlayerReady,
     connected: isConnected,
   };
 };

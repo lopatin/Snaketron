@@ -1,7 +1,7 @@
 /// Default tick interval in milliseconds for game loops
 pub const DEFAULT_TICK_INTERVAL_MS: u32 = 100;
 
-/// Fixed simulation quantum for Boost-enabled duel and 2v2 team matches.
+/// Fixed simulation quantum for every Boost-enabled matchmade mode.
 pub const BOOST_TICK_INTERVAL_MS: u32 = 50;
 
 /// Snake speed is represented in milli-normal units.
@@ -16,7 +16,18 @@ pub const DEFAULT_BOOST_CAPACITY_MS: u32 = 3_000;
 /// Inner 1x1 packets hold exactly one quarter of the configured tank.
 pub const DEFAULT_BOOST_PACKET_CHARGE_MS: u32 = DEFAULT_BOOST_CAPACITY_MS / 4;
 pub const DEFAULT_BOOST_PAD_RESPAWN_MS: u32 = 8_000;
-pub const BOOST_SPOT_LAYOUT_VERSION: u16 = 3;
+/// Boost pad layouts are identified, not ranked: the version selects which
+/// geometry a match was built with, so several can coexist and a persisted
+/// match keeps the map it started on. A layout's number is never reused for a
+/// different shape — that is what lets validation reject a state whose pads do
+/// not match the layout it claims.
+///
+/// v3 — the canonical 60x40 team map, drawn inside the end-zone-inset field.
+/// v4 — the teamless 40x40 free-for-all map, drawn on the whole arena.
+pub const BOOST_SPOT_LAYOUT_VERSION_TEAM: u16 = 3;
+pub const BOOST_SPOT_LAYOUT_VERSION_FIELD: u16 = 4;
+/// Layout carried by an unlimited tank, which has no pickups to place.
+pub const BOOST_SPOT_LAYOUT_VERSION_NONE: u16 = 0;
 pub const BOOST_RULES_VERSION: u16 = 2;
 
 /// Production v2 actor poll interval in milliseconds.
@@ -40,6 +51,17 @@ pub const DEFAULT_PLAYER_IDLE_WARNING_MS: u32 = 10_000;
 
 /// Default available food target
 pub const DEFAULT_FOOD_TARGET: usize = 10;
+
+/// Countdown between the moment a match is cleared to begin and its first
+/// simulated tick. Matchmaking uses it to anchor `GameState::start_ms`, and the
+/// executor reuses it when the pre-match readiness gate resolves, so both
+/// paths present the same "Starting in 3..." countdown to players.
+pub const GAME_START_COUNTDOWN_MS: i64 = 3_000;
+
+/// How long the pre-match readiness gate waits for every player to confirm
+/// before starting anyway. A player who never answers — closed tab, lost
+/// focus, walked away — must not be able to hold a match hostage.
+pub const MATCH_READY_WINDOW_MS: i64 = 15_000;
 
 /// Team matches are raced to a score rather than played against a clock, so
 /// they have no time limit and no maximum duration; the match clock counts up.

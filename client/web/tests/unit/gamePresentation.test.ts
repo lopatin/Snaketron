@@ -7,6 +7,7 @@ import {
   formatMatchClock,
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
+  simulationStartMs,
 } from '../../utils/gamePresentation.ts';
 
 const snake = (teamId: number, alive = true) => ({
@@ -62,6 +63,17 @@ const duelState = (): GameState => ({
   player_last_activity_ticks: { 7: 6, 8: 6, 9: 6, 10: 6 },
   idle_kicked_user_ids: [],
   completed_by_inactivity: false,
+  readiness: null,
+  simulation_epoch_ms: null,
+});
+
+const gatedDuelState = (readyUserIds: number[]): GameState => ({
+  ...duelState(),
+  tick: 0,
+  status: { Started: { server_id: 1 } },
+  start_ms: 1_000,
+  readiness: { deadline_ms: 16_000, ready_user_ids: readyUserIds },
+  simulation_epoch_ms: null,
 });
 
 test('team presentation puts the local side first and hands the renderer real skin selectors', () => {
@@ -233,4 +245,51 @@ test('Space plays again only for an open score card without stealing focused con
   assert.equal(getPlayAgainShortcutAction(event(), true, true), 'suppress');
   assert.equal(getPlayAgainShortcutAction(event(false, 'input'), true, false), 'ignore');
   assert.equal(getPlayAgainShortcutAction(event(false, 'button'), true, false), 'ignore');
+});
+
+test('the roster marks who is ready while the gate is pending', () => {
+  const presentation = buildMatchPresentation(gatedDuelState([7, 9]), 7);
+
+  assert.equal(presentation.isAwaitingReadiness, true);
+  assert.equal(presentation.readyDeadlineMs, 16_000);
+  assert.equal(presentation.pendingReadyCount, 2);
+  assert.deepEqual(
+    presentation.players.map((player) => [player.userId, player.isReady]),
+    [
+      [7, true],
+      [8, false],
+      [9, true],
+      [10, false],
+    ],
+  );
+});
+
+test('readiness disappears from the roster once the gate resolves', () => {
+  // `isReady: null` is what tells the roster to stop drawing checks, rather
+  // than showing a live match with everyone marked unready.
+  const presentation = buildMatchPresentation(duelState(), 7);
+
+  assert.equal(presentation.isAwaitingReadiness, false);
+  assert.equal(presentation.readyDeadlineMs, null);
+  assert.equal(presentation.pendingReadyCount, 0);
+  assert.ok(presentation.players.every((player) => player.isReady === null));
+});
+
+test('the countdown follows the simulation epoch, never the immutable start_ms', () => {
+  // A gated match has no epoch at all: nothing may count down yet.
+  assert.equal(simulationStartMs(gatedDuelState([])), null);
+
+  // Once the gate resolves the epoch is authoritative, and start_ms — the
+  // durable runtime game identity — is deliberately left behind in the past.
+  assert.equal(
+    simulationStartMs({ readiness: null, simulation_epoch_ms: 90_000, start_ms: 1_000 }),
+    90_000,
+  );
+
+  // Matches created before the readiness protocol have neither field and must
+  // keep starting off start_ms exactly as they used to.
+  assert.equal(
+    simulationStartMs({ readiness: null, simulation_epoch_ms: null, start_ms: 4_200 }),
+    4_200,
+  );
 });

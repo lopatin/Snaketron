@@ -10,9 +10,9 @@
 
 use anyhow::Result;
 use common::{
-    BoostConfig, CommandId, Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent,
-    GameEventMessage, GameState, GameStatus, GameType, MAX_PREDICTION_AHEAD_MS, Position,
-    PseudoRandom, QueueMode,
+    BOOST_TICK_INTERVAL_MS, BoostConfig, CommandId, Direction, GameCommand, GameCommandMessage,
+    GameEngine, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
+    MAX_PREDICTION_AHEAD_MS, Position, PseudoRandom, QueueMode,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -249,6 +249,41 @@ struct SimWorld {
 }
 
 impl SimWorld {
+    /// Build a world for any matchmade mode on its canonical map.
+    ///
+    /// Solo and free-for-all carry Boost too now, which puts them on the same
+    /// 50ms quantum as team matches — so the transport, reconciliation and
+    /// fingerprint paths they exercise are the same ones a duel exercises, and
+    /// leaving them out of this suite would leave that surface unguarded.
+    fn new_for(game_type: GameType, game_seed: u64, cfg: TransportConfig) -> Self {
+        let (width, height) = match &game_type {
+            GameType::TeamMatch { .. } => (60, 40),
+            _ => (40, 40),
+        };
+        let mut state = GameState::new(
+            width,
+            height,
+            game_type.clone(),
+            QueueMode::Quickmatch,
+            Some(game_seed),
+            0,
+        );
+        state
+            .add_player(1, Some("alice".to_string()))
+            .expect("add player 1");
+        // Solo is a one-snake mode by definition; every other mode gets a
+        // rival so collisions and respawns are in play.
+        if !matches!(game_type, GameType::Solo) {
+            state
+                .add_player(2, Some("bob".to_string()))
+                .expect("add player 2");
+        }
+        state.status = GameStatus::Started { server_id: 7 };
+        state.spawn_initial_food();
+
+        Self::from_state(state, cfg)
+    }
+
     fn new(game_seed: u64, cfg: TransportConfig) -> Self {
         // Mirror the production game-creation path (matchmaking + executor):
         // players join a Stopped tick-0 state, initial food is spawned from
@@ -514,6 +549,24 @@ impl SimWorld {
         cmd
     }
 
+    /// Latch or release the local player's Boost intent, the way the real
+    /// client's held control does.
+    fn client_send_boost(&mut self, held: bool) -> GameCommandMessage {
+        let command = if held {
+            GameCommand::ActivateBoost { snake_id: 0 }
+        } else {
+            GameCommand::DeactivateBoost { snake_id: 0 }
+        };
+        let cmd = self
+            .client
+            .as_mut()
+            .expect("client joined")
+            .process_local_command(command)
+            .expect("process_local_command");
+        self.transport.send_to_server(self.now_ms, cmd.clone());
+        cmd
+    }
+
     fn client_send_turn_with_latency(
         &mut self,
         direction: Direction,
@@ -610,7 +663,7 @@ fn boost_sync_state() -> GameState {
         .add_player(2, Some("bob".to_string()))
         .expect("add player 2");
     state.status = GameStatus::Started { server_id: 7 };
-    state.properties.available_food_target = 0;
+    state.rng = None;
     state.arena.food.clear();
 
     let first_full_pad = state
@@ -650,8 +703,9 @@ fn boost_sync_state() -> GameState {
 }
 
 /// A team-0 snake four movement steps outside its own goal mouth, carrying
-/// three points' worth of food. Food spawning is disabled so the carried
-/// amount, and therefore the goal's value, is fixed.
+/// three points' worth of food. The RNG is removed so food spawning is
+/// disabled without violating the mode's authoritative food-target contract;
+/// the carried amount, and therefore the goal's value, stays fixed.
 fn goal_sync_state() -> GameState {
     let mut state = GameState::new(
         60,
@@ -668,7 +722,7 @@ fn goal_sync_state() -> GameState {
         .add_player(2, Some("bob".to_string()))
         .expect("add player 2");
     state.status = GameStatus::Started { server_id: 7 };
-    state.properties.available_food_target = 0;
+    state.rng = None;
     state.arena.food.clear();
 
     // Team 0 banks through the goal mouth at x = 9, inside the opening.
@@ -797,6 +851,107 @@ async fn lossless_transport_stays_in_sync() -> Result<()> {
             world.server.committed_sync_hash(),
             "final committed states must be identical"
         );
+        Ok(())
+    })
+    .await
+}
+
+/// Every matchmade mode, not just the duel the rest of this suite drives.
+///
+/// Solo and free-for-all gained Boost — and with it the 50ms simulation
+/// quantum, a per-mode pad layout (or none at all, for Solo's unlimited tank)
+/// and a doubled food target in the crowded modes. All of those feed
+/// `sync_hash`, so a client and server that disagree about any of them would
+/// diverge exactly the way this suite exists to catch. Before this test the
+/// barrier only ever built `TeamMatch { per_team: 1 }`.
+#[tokio::test]
+async fn every_matchmade_mode_stays_in_sync() -> Result<()> {
+    with_timeout(async {
+        for (label, game_type) in [
+            ("solo", GameType::Solo),
+            ("ffa", GameType::FreeForAll { max_players: 4 }),
+            ("2v2", GameType::TeamMatch { per_team: 2 }),
+            ("duel", GameType::TeamMatch { per_team: 1 }),
+        ] {
+            // Lossless: loss recovery is already covered on the duel fixture,
+            // and Solo ends the moment its one snake dies — a gap opened after
+            // that has no traffic left to heal it, which would test the
+            // scenario rather than the mode. What is unguarded here is whether
+            // each mode's own rules survive a full run in lockstep.
+            let cfg = TransportConfig {
+                seed: 4_242,
+                ..TransportConfig::lossless()
+            };
+            let mut world = SimWorld::new_for(game_type.clone(), 0x5A17ED, cfg);
+
+            // Boost is held down for a stretch so the fuel model itself is
+            // exercised: a collectible tank drains and refills from pads, an
+            // unlimited one must stay pinned at capacity forever.
+            world.run_for(4_000);
+            world.client_send_boost(true);
+            world.run_for(8_000);
+            world.client_send_boost(false);
+            world.run_for(18_000);
+            world.drain_and_probe();
+
+            let status = world.client().sync_status();
+            assert!(
+                status.total_probes > 0,
+                "{label}: expected fingerprint probes to run"
+            );
+            assert_eq!(
+                status.total_mismatches, 0,
+                "{label}: lossless transport must never diverge; probe log: {:?}",
+                world.probe_log
+            );
+            assert!(
+                !status.needs_resync,
+                "{label}: no resync on lossless transport"
+            );
+            assert_eq!(
+                world.client().committed_sync_hash(),
+                world.server.committed_sync_hash(),
+                "{label}: final committed states must be identical; probe log: {:?}",
+                world.probe_log
+            );
+
+            // The mode's own rules must survive a full run unchanged.
+            let server_state = world.server.get_committed_state();
+            let boost = server_state
+                .properties
+                .boost
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: every matchmade mode carries Boost"));
+            assert_eq!(
+                server_state.properties.tick_duration_ms, BOOST_TICK_INTERVAL_MS,
+                "{label}: Boost implies the 50ms quantum"
+            );
+            server_state
+                .validate_boost_invariants()
+                .unwrap_or_else(|e| panic!("{label}: invariants must hold after a full run: {e}"));
+
+            if boost.unlimited {
+                assert!(
+                    server_state.arena.boost_pads.is_empty(),
+                    "{label}: an unlimited tank places no pickups"
+                );
+                assert!(
+                    server_state
+                        .arena
+                        .snakes
+                        .iter()
+                        .filter(|snake| snake.is_alive)
+                        .all(|snake| snake.boost().charge_ms == boost.capacity_ms),
+                    "{label}: an unlimited tank must never drain"
+                );
+            } else {
+                assert_eq!(
+                    server_state.arena.boost_pads.len(),
+                    12,
+                    "{label}: collectible modes keep their twelve pads"
+                );
+            }
+        }
         Ok(())
     })
     .await

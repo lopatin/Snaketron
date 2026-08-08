@@ -226,7 +226,7 @@ fn deserialize_stored_snapshot(bytes: &[u8]) -> Result<GameState> {
     let game_state: GameState =
         serde_json::from_slice(bytes).context("Failed to deserialize snapshot")?;
     if let Err(strict_error) = game_state.validate_boost_invariants()
-        && !game_state.is_legacy_completed_team_snapshot()
+        && !game_state.is_legacy_completed_snapshot()
     {
         return Err(strict_error).context("Stored snapshot failed gameplay invariants");
     }
@@ -404,6 +404,50 @@ impl GameBus {
         {
             anyhow::bail!("completed-game command gate identity mismatch");
         }
+        self.publish_unless_completed(namespace, partition_id, game_id, command)
+            .await
+    }
+
+    /// Publishes a pre-match readiness confirmation under the same
+    /// completed-game gate as gameplay commands. Readiness can only matter
+    /// before the first tick, so a confirmation racing a completion record is
+    /// pure noise and must not be appended behind it.
+    pub async fn publish_player_ready_unless_completed(
+        &self,
+        namespace: &ClusterNamespace,
+        partition_id: u32,
+        game_id: u32,
+        command: &StreamEvent,
+    ) -> Result<bool> {
+        if game_id % PARTITION_COUNT != partition_id {
+            anyhow::bail!("readiness confirmation does not belong to its target partition");
+        }
+        let StreamEvent::PlayerReadySubmitted {
+            game_id: payload_game_id,
+            ..
+        } = command
+        else {
+            anyhow::bail!("readiness gate accepts only readiness confirmations");
+        };
+        if *payload_game_id != game_id {
+            anyhow::bail!("readiness confirmation identity mismatch");
+        }
+        self.publish_unless_completed(namespace, partition_id, game_id, command)
+            .await
+    }
+
+    /// Append to the partition command stream unless the game already has an
+    /// immutable completion record. The completion key and the stream share
+    /// the partition hash slot, so one atomic Valkey transaction orders
+    /// completion against ingress even when the WebSocket and the executor
+    /// live on different ECS tasks.
+    async fn publish_unless_completed(
+        &self,
+        namespace: &ClusterNamespace,
+        partition_id: u32,
+        game_id: u32,
+        command: &StreamEvent,
+    ) -> Result<bool> {
         let payload = serde_json::to_vec(command).context("Failed to serialize game command")?;
         let mut redis = self.partition_connection(partition_id)?;
         let script = redis::Script::new(
@@ -2876,11 +2920,16 @@ mod tests {
         assert!(stream_cursor_fell_behind("10-0", None));
     }
 
-    fn stored_pre_boost_team_snapshot(status: GameStatus) -> Vec<u8> {
+    fn stored_pre_expansion_snapshot(
+        width: u16,
+        height: u16,
+        game_type: GameType,
+        status: GameStatus,
+    ) -> Vec<u8> {
         let mut state = GameState::new(
-            60,
-            40,
-            GameType::TeamMatch { per_team: 1 },
+            width,
+            height,
+            game_type.clone(),
             QueueMode::Quickmatch,
             Some(1),
             0,
@@ -2898,29 +2947,80 @@ mod tests {
         ] {
             value.as_object_mut().unwrap().remove(field);
         }
+        value["properties"]["available_food_target"] = serde_json::json!(10);
         value["properties"]["tick_duration_ms"] = serde_json::json!(100);
-        for field in ["boost", "player_idle_timeout_ms", "player_idle_warning_ms"] {
+        value["properties"]["time_limit_ms"] =
+            if matches!(game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+                serde_json::json!(90_000)
+            } else {
+                serde_json::Value::Null
+            };
+        for field in [
+            "score_limit",
+            "boost",
+            "player_idle_timeout_ms",
+            "player_idle_warning_ms",
+        ] {
             value["properties"].as_object_mut().unwrap().remove(field);
         }
         value["arena"].as_object_mut().unwrap().remove("boost_pads");
         serde_json::to_vec(&value).unwrap()
     }
 
+    fn stored_timed_boost_team_snapshot(status: GameStatus) -> Vec<u8> {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Quickmatch,
+            Some(1),
+            0,
+        );
+        state.status = status;
+        state.properties.available_food_target = 10;
+        state.properties.time_limit_ms = Some(90_000);
+        state.properties.score_limit = None;
+        serde_json::to_vec(&state).unwrap()
+    }
+
     #[test]
     fn stored_snapshot_admission_allows_legacy_completion_but_rejects_legacy_active_game() {
-        let completed = stored_pre_boost_team_snapshot(GameStatus::Complete {
+        for (width, height, game_type) in [
+            (60, 40, GameType::TeamMatch { per_team: 1 }),
+            (40, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::Solo),
+        ] {
+            let completed = stored_pre_expansion_snapshot(
+                width,
+                height,
+                game_type.clone(),
+                GameStatus::Complete {
+                    winning_snake_id: None,
+                },
+            );
+            assert!(deserialize_stored_snapshot(&completed).is_ok());
+
+            let active = stored_pre_expansion_snapshot(
+                width,
+                height,
+                game_type,
+                GameStatus::Started { server_id: 1 },
+            );
+            let error = deserialize_stored_snapshot(&active)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Stored snapshot failed gameplay invariants"),
+                "unexpected admission error: {error}"
+            );
+        }
+
+        let completed = stored_timed_boost_team_snapshot(GameStatus::Complete {
             winning_snake_id: None,
         });
         assert!(deserialize_stored_snapshot(&completed).is_ok());
-
-        let active = stored_pre_boost_team_snapshot(GameStatus::Started { server_id: 1 });
-        let error = deserialize_stored_snapshot(&active)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("Stored snapshot failed gameplay invariants"),
-            "unexpected admission error: {error}"
-        );
+        let active = stored_timed_boost_team_snapshot(GameStatus::Started { server_id: 1 });
+        assert!(deserialize_stored_snapshot(&active).is_err());
     }
 
     #[test]

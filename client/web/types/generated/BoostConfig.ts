@@ -5,4 +5,13 @@ export type BoostConfig = { speed_milli: number, capacity_ms: number,
  * Charge carried by each inner 1x1 packet. Layout v3 requires this to be
  * exactly 25% of capacity; outer 2x2 pads snapshot full capacity.
  */
-packet_charge_ms: number, pad_respawn_ms: number, spot_layout_version: number, rules_version: number, };
+packet_charge_ms: number, pad_respawn_ms: number, spot_layout_version: number, rules_version: number,
+/**
+ * A tank that never empties: no pickups are placed, the meter starts and
+ * stays full, and a funded quantum costs nothing. Solo runs use it so a
+ * lone player can hold Boost freely with nothing to contest.
+ *
+ * This is the only Boost fuel model that does not require a pad layout,
+ * so it pairs with `BOOST_SPOT_LAYOUT_VERSION_NONE`.
+ */
+unlimited: boolean, };

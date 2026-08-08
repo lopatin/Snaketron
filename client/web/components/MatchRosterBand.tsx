@@ -18,25 +18,42 @@ const StaredownSnake: React.FC<{
     name={player.name}
     skin={player.skin}
     facing={faces}
+    isReady={player.isReady === true}
   />
 );
 
 const PlayerLegend: React.FC<{
   player: MatchPlayerPresentation;
   side?: 'left' | 'right';
-}> = ({ player, side = 'right' }) => (
-  <span
-    className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${player.isIdleKicked ? ' is-idle-kicked' : ''}`}
-    role="img"
-    aria-label={`${player.name}${player.isIdleKicked ? ', removed for inactivity' : player.isAlive ? '' : ', out'}`}
-    title={player.isIdleKicked ? `${player.name} — removed for inactivity` : player.name}
-  >
-    <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
-    {player.isIdleKicked && (
-      <span className="game-roster-idle-badge" aria-hidden="true">Idle</span>
-    )}
-  </span>
-);
+}> = ({ player, side = 'right' }) => {
+  // `isReady` is null once the gate has resolved, which is how the roster
+  // knows to stop showing readiness rather than showing everyone as unready.
+  const readyState =
+    player.isReady === null ? '' : player.isReady ? ' is-ready' : ' is-awaiting-ready';
+  const readyLabel =
+    player.isReady === null ? '' : player.isReady ? ', ready' : ', not ready yet';
+  // An idle kick can only land after the gate has resolved, so readiness and
+  // inactivity never annotate the same player at the same time.
+  const statusLabel = player.isIdleKicked
+    ? ', removed for inactivity'
+    : player.isAlive
+      ? ''
+      : ', out';
+
+  return (
+    <span
+      className={`game-roster-player${player.isCurrentPlayer ? ' is-current' : ''}${player.isAlive ? '' : ' is-out'}${player.isIdleKicked ? ' is-idle-kicked' : ''}${readyState}`}
+      role="img"
+      aria-label={`${player.name}${readyLabel}${statusLabel}`}
+      title={player.isIdleKicked ? `${player.name} — removed for inactivity` : player.name}
+    >
+      <StaredownSnake player={player} faces={side === 'left' ? 'right' : 'left'} />
+      {player.isIdleKicked && (
+        <span className="game-roster-idle-badge" aria-hidden="true">Idle</span>
+      )}
+    </span>
+  );
+};
 
 const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   presentation,

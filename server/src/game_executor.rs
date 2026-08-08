@@ -29,6 +29,16 @@ pub enum StreamEvent {
         game_id: u32,
         status: GameStatus,
     },
+    /// A player confirmed the pre-match briefing. Readiness rides the durable
+    /// partition command stream rather than a side channel because the owning
+    /// executor is the only process that may release the start gate, and it is
+    /// routinely a different task from the gateway holding the player's socket.
+    /// `user_id` is canonicalized from the authenticated connection before
+    /// publication; the payload is never trusted.
+    PlayerReadySubmitted {
+        game_id: u32,
+        user_id: u32,
+    },
 }
 
 /// Validates a client command against the authenticated WebSocket identity.

@@ -17,18 +17,18 @@ const gameState = (tick = 5) => ({
   tick,
   status: { Started: { server_id: 1 } },
   arena: {
-    width: 10,
-    height: 10,
+    width: 40,
+    height: 40,
     snakes: [
       {
-        body: [{ x: 5, y: 5 }, { x: 4, y: 5 }],
+        body: [{ x: 20, y: 20 }, { x: 19, y: 20 }],
         direction: 'Right',
         is_alive: true,
         food: 0,
         team_id: null,
         speed_milli: 1000,
         movement_credit: 0,
-        boost: { charge_ms: 0, active: false },
+        boost: { charge_ms: 3000, active: false, intent: false },
       },
     ],
     food: [],
@@ -38,10 +38,19 @@ const gameState = (tick = 5) => ({
   game_type: 'Solo',
   queue_mode: 'Quickmatch',
   properties: {
-    available_food_target: 1,
-    tick_duration_ms: 100,
+    available_food_target: 10,
+    tick_duration_ms: 50,
     time_limit_ms: null,
-    boost: null,
+    score_limit: null,
+    boost: {
+      speed_milli: 1500,
+      capacity_ms: 3000,
+      packet_charge_ms: 750,
+      pad_respawn_ms: 8000,
+      spot_layout_version: 0,
+      rules_version: 2,
+      unlimited: true,
+    },
   },
   command_queue: {
     queue: [],
@@ -60,6 +69,8 @@ const gameState = (tick = 5) => ({
   team_scores: null,
   player_xp: { 7: 0 },
   player_action_counts: { 7: 0 },
+  readiness: null,
+  simulation_epoch_ms: null,
 });
 
 const snapshot = (streamSequence, tick = 5) => ({
@@ -101,7 +112,7 @@ const boostSnapshot = (streamSequence, tick = 5) => {
   // merely serializing a command against a pre-start fixture.
   state.start_ms = Date.now() - tick * 50;
   state.properties = {
-    available_food_target: 1,
+    available_food_target: 10,
     tick_duration_ms: 50,
     // Team matches are raced to a score, never against a clock; the target
     // must match the queue this snapshot claims (Quickmatch).
@@ -114,6 +125,7 @@ const boostSnapshot = (streamSequence, tick = 5) => {
       pad_respawn_ms: 8000,
       spot_layout_version: 3,
       rules_version: 2,
+      unlimited: false,
     },
   };
 
@@ -143,7 +155,7 @@ const completedBoostSnapshot = (streamSequence, tick = 7) => {
       team_id: 1,
       speed_milli: 1000,
       movement_credit: 0,
-      boost: { charge_ms: 0, active: false },
+      boost: { charge_ms: 0, active: false, intent: false },
     },
   ];
   state.players = {
@@ -159,6 +171,21 @@ const completedBoostSnapshot = (streamSequence, tick = 7) => {
   return frame;
 };
 
+const tutorialSnapshot = (streamSequence = 10) => {
+  const frame = completedBoostSnapshot(streamSequence, 0);
+  const state = frame.GameEvent.event.Snapshot.game_state;
+  const now = Date.now();
+  state.tick = 0;
+  state.status = { Started: { server_id: 1 } };
+  state.start_ms = now;
+  state.readiness = { deadline_ms: now + 15_000, ready_user_ids: [] };
+  state.simulation_epoch_ms = null;
+  state.scores = { 0: 0, 1: 0 };
+  state.team_scores = { 0: 0, 1: 0 };
+  frame.GameEvent.tick = 0;
+  return frame;
+};
+
 const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
   const frame = completedBoostSnapshot(streamSequence, tick);
   const state = frame.GameEvent.event.Snapshot.game_state;
@@ -170,7 +197,7 @@ const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
       7: { user_id: 7, snake_id: 1 },
       8: { user_id: 8, snake_id: 0 },
     };
-    state.arena.snakes[1].boost = { charge_ms: 1000, active: false };
+    state.arena.snakes[1].boost = { charge_ms: 1000, active: false, intent: false };
   }
 
   return frame;
@@ -179,6 +206,7 @@ const liveBoostSnapshotForLocalTeam = (streamSequence, tick, teamId) => {
 const fourSnakeBoostState = (tick = 6) => {
   const state = boostSnapshot(1, tick).GameEvent.event.Snapshot.game_state;
   state.game_type = { TeamMatch: { per_team: 2 } };
+  state.properties.available_food_target = 20;
   state.properties.boost.speed_milli = 2000;
   state.start_ms = 0;
   state.arena.snakes = [
@@ -192,7 +220,7 @@ const fourSnakeBoostState = (tick = 6) => {
     food: 0,
     speed_milli: 2000,
     movement_credit: 0,
-    boost: { charge_ms: 3000, active: true },
+    boost: { charge_ms: 3000, active: true, intent: true },
   }));
   state.players = {
     7: { user_id: 7, snake_id: 0 },
@@ -547,6 +575,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('token', 'drain-test-token');
+    localStorage.removeItem('snaketron:tutorial-seen:v1');
     localStorage.setItem('snaketron:lastLobby', JSON.stringify({ id: 1, code: 'LOBBY1' }));
     localStorage.setItem('snaketron_selected_region', JSON.stringify({
       regionId: 'test-region',
@@ -697,7 +726,7 @@ test('logout explicitly leaves the lobby before retiring the authenticated socke
     storedLobby: null,
   });
 
-  await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__mockSockets.length))
     .toBeGreaterThan(socketCountBeforeLogout);
   await expect.poll(() => page.evaluate((index) => window.__mockSockets
@@ -708,6 +737,190 @@ test('logout explicitly leaves the lobby before retiring the authenticated socke
       typeof message === 'object' &&
       ('Authenticate' in message || 'JoinLobby' in message)
     )).length, socketCountBeforeLogout)).toBe(0);
+});
+
+test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__tutorialScoreReadouts = [];
+    const originalFillText = CanvasRenderingContext2D.prototype.fillText;
+    CanvasRenderingContext2D.prototype.fillText = function recordTutorialScore(text, ...args) {
+      if (text === '+1') window.__tutorialScoreReadouts.push(text);
+      return originalFillText.call(this, text, ...args);
+    };
+  });
+  const initialTutorialFrame = tutorialSnapshot();
+  initialTutorialFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [8];
+  const socketIndex = await establishActiveGame(page, initialTutorialFrame);
+  const modal = page.getByTestId('tutorial-modal');
+  const canvas = page.getByTestId('tutorial-scene-canvas');
+  const readyButton = page.getByTestId('tutorial-ready');
+  const localRoster = page.locator(
+    '.game-roster-snake-canvas[data-player-name="You"]',
+  );
+  const rivalRoster = page.locator('.game-roster-snake-canvas[data-player-name="Tron"]');
+
+  await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-step', '1');
+  await expect(modal.getByRole('heading', { name: 'Duel' })).toBeVisible();
+  await expect(modal).toContainText('Return food to base to score points.');
+  await expect(modal.locator('.tutorial-step-index')).toHaveCount(0);
+  await expect(modal.locator('.tutorial-step-title')).toHaveCount(0);
+  await expect(modal.locator('.tutorial-step-instruction')).toHaveCount(1);
+  await expect(page.getByTestId('tutorial-visual')).toHaveAccessibleName(
+    'A snake returns through the gate labeled YOU; the team score increases.',
+  );
+  await expect(modal).toHaveAccessibleDescription(
+    /Each lesson advances automatically after five seconds.*match starts automatically/i,
+  );
+  await expect(page.getByTestId('tutorial-auto-start')).toHaveAccessibleName(
+    /Automatic match start in 1[5-8] seconds/,
+  );
+  await expect(page.locator('.game-roster-ready-mark')).toHaveCount(0);
+  await expect(localRoster).toHaveAttribute('data-ready', 'false');
+  await expect(rivalRoster).toHaveAttribute('data-ready', 'true');
+  await expect(canvas).toHaveCount(1);
+  await expect(canvas).toHaveAttribute('data-scene', 'team-carry');
+  await expect(canvas).toHaveAttribute('data-motion', 'animated');
+  await expect.poll(() => canvas.evaluate((element) => (
+    element.width > 1 && element.height > 1 && element.dataset.playback
+  ))).toMatch(/playing|complete/);
+
+  const stepTimer = page.getByTestId('tutorial-step-timer');
+  await expect(stepTimer).toHaveCSS('animation-duration', '5s');
+
+  // The scoring beat uses the production +1 renderer, and the step changes at
+  // the exact end of the progress rail without stealing control focus.
+  await expect.poll(() => page.evaluate(() => window.__tutorialScoreReadouts.length), {
+    timeout: 3_500,
+  }).toBeGreaterThan(0);
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/duel-briefing.jpg`,
+      fullPage: true,
+    });
+  }
+  await readyButton.focus();
+  await expect.poll(() => modal.getAttribute('data-step'), { timeout: 6_500 }).toBe('2');
+  await expect(readyButton).toBeFocused();
+  await expect(modal).toContainText('Collect NOS, then hold Space to boost.');
+  await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
+
+  await page.keyboard.press('Escape');
+  await expect(modal).toBeVisible();
+
+  const autoplayToggle = page.getByTestId('tutorial-autoplay-toggle');
+  await stepTimer.evaluate((element) => {
+    const [animation] = element.getAnimations();
+    if (!animation) throw new Error('Active tutorial timer has no animation');
+    animation.currentTime = 4_700;
+  });
+  await autoplayToggle.click();
+  await expect(modal).toHaveAttribute('data-autoplay', 'paused');
+  await expect(stepTimer).toHaveCSS('animation-play-state', 'paused');
+  await expect(autoplayToggle).toHaveAccessibleName('Resume tutorial');
+  await expect(autoplayToggle).not.toHaveAttribute('aria-pressed', /.+/);
+  await page.waitForTimeout(700);
+  await expect(modal).toHaveAttribute('data-step', '2');
+  await autoplayToggle.click();
+  await expect(modal).toHaveAttribute('data-autoplay', 'playing');
+  await expect.poll(() => modal.getAttribute('data-step'), { timeout: 1_500 }).toBe('3');
+  await expect(autoplayToggle).toBeFocused();
+  await expect(modal).toContainText('Avoid the rival base. First to 25 wins.');
+
+  // Arrow navigation belongs to the guide while it is open and must not leak
+  // a turn or a Boost edge into the match beneath it.
+  await page.keyboard.press('ArrowLeft');
+  await expect(modal).toHaveAttribute('data-step', '2');
+  await page.keyboard.press('ArrowRight');
+  await expect(modal).toHaveAttribute('data-step', '3');
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('2');
+  await page.keyboard.press('Space');
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2')).toHaveLength(0);
+
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await modal.getByRole('button', { name: /Step 2 of 3: BOOST/i }).click();
+    await page.waitForTimeout(650);
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/mobile-duel-briefing.jpg`,
+      fullPage: true,
+    });
+  }
+  const rosterBeforeReady = await localRoster.evaluate((element) => element.toDataURL());
+  await readyButton.click();
+  await expect(readyButton).toBeDisabled();
+  await expect(page.getByTestId('tutorial-status')).toContainText('All players ready');
+  await expect(page.getByTestId('tutorial-auto-start')).toBeVisible();
+  const readyFrame = tutorialSnapshot(11);
+  readyFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [7, 8];
+  await emitServerMessage(page, socketIndex, readyFrame);
+  await expect(localRoster).toHaveAttribute('data-ready', 'true');
+  await expect(rivalRoster).toHaveAttribute('data-ready', 'true');
+  await expect.poll(() => localRoster.evaluate((element) => element.toDataURL()))
+    .not.toBe(rosterBeforeReady);
+  await page.keyboard.press('Tab');
+  await expect.poll(() => page.evaluate(() => {
+    const tutorialModal = document.querySelector('[data-testid="tutorial-modal"]');
+    return Boolean(tutorialModal?.contains(document.activeElement));
+  })).toBe(true);
+  await expect.poll(() => socketMessages(page, socketIndex, 'PlayerReady')).toHaveLength(1);
+  await expect.poll(() => page.evaluate(() => (
+    JSON.parse(localStorage.getItem('snaketron:tutorial-seen:v1') || '{}')['duel:casual']
+  ))).toBe(true);
+});
+
+test('reduced motion holds tutorial scenes on their authored poster frame', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.setViewportSize({ width: 320, height: 568 });
+  await establishActiveGame(page, tutorialSnapshot());
+
+  const modal = page.getByTestId('tutorial-modal');
+  const canvas = page.getByTestId('tutorial-scene-canvas');
+  await expect(modal).toBeVisible();
+  await expect(modal).toHaveAttribute('data-autoplay', 'off');
+  await expect(modal).toHaveAttribute('data-step', '1');
+  await expect(modal).toContainText('Return food to base to score points.');
+  await expect(canvas).toHaveAttribute('data-motion', 'reduced');
+  await expect(canvas).toHaveAttribute('data-playback', 'complete');
+  await expect(modal.locator('.tutorial-replay')).toBeHidden();
+  await expect(modal.getByTestId('tutorial-autoplay-toggle')).toHaveCount(0);
+  await expect(modal.getByTestId('tutorial-ready')).toBeVisible();
+  const poster = await canvas.evaluate((element) => element.toDataURL());
+  await page.waitForTimeout(350);
+  expect(await canvas.evaluate((element) => element.toDataURL())).toBe(poster);
+  await page.waitForTimeout(5_000);
+  await expect(modal).toHaveAttribute('data-step', '1');
+
+  const bounds = await modal.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const visualRect = element.querySelector('[data-testid="tutorial-visual"]')
+      .getBoundingClientRect();
+    const footerRect = element.querySelector('.tutorial-footer').getBoundingClientRect();
+    return {
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      left: rect.left,
+      visualBottom: visualRect.bottom,
+      footerTop: footerRect.top,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(bounds.top).toBeGreaterThanOrEqual(0);
+  expect(bounds.left).toBeGreaterThanOrEqual(0);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth);
+  expect(bounds.bottom).toBeLessThanOrEqual(bounds.viewportHeight);
+  expect(bounds.visualBottom).toBeLessThanOrEqual(bounds.footerTop);
+
+  await modal.getByRole('button', { name: 'Next' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    document.activeElement?.getAttribute('data-tutorial-step-control')
+  ))).toBe('1');
+  await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
+  await expect(canvas).toHaveAttribute('data-playback', 'complete');
 });
 
 test('planned drain keeps the old game socket usable until the replacement is fully ready', async ({ page }) => {
@@ -1254,7 +1467,9 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   await expect(hud).toHaveAttribute('data-location', 'arena-bottom');
   await expect(hud).toHaveAttribute('data-ready', 'false');
   await expect(hud).not.toHaveClass(/is-ready/);
-  await expect(button).toBeDisabled();
+  // Empty charge still accepts held intent so the next NOS packet can resume
+  // Boost without requiring the player to release and press again.
+  await expect(button).toBeEnabled();
   await expect(button.locator('.game-boost-meter__canister-dock')).toHaveCount(1);
   await expect(bottle).toHaveAttribute('viewBox', '0 0 34 24');
   await expect(bottle).toHaveAttribute('aria-hidden', 'true');
@@ -1505,11 +1720,16 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
     });
   }
 
+  // Toggle mode must own the active state this visual fixture is about; an
+  // unsolicited active snapshot is correctly repaired back to the local
+  // toggle latch instead of remaining active by accident.
+  await button.click();
+  await page.mouse.move(0, 0);
   const activeFrame = boostSnapshot(13, 8);
   const activeState = activeFrame.GameEvent.event.Snapshot.game_state;
   activeState.properties.boost.speed_milli = 2000;
   activeState.arena.snakes[0].speed_milli = 2000;
-  activeState.arena.snakes[0].boost = { charge_ms: 3000, active: true };
+  activeState.arena.snakes[0].boost = { charge_ms: 3000, active: true, intent: true };
   await emitServerMessage(page, socketIndex, activeFrame);
   await expect(hud).toHaveClass(/is-active/);
   await expect(hud).not.toHaveClass(/is-ready/);
@@ -2232,9 +2452,10 @@ test('Snaketron game shell restores the original scoreboard language and free-fl
   await page.mouse.move(0, 0);
   // Programmatic focus verifies the same visible keyboard treatment without
   // depending on the host OS's WebKit full-keyboard-access preference.
+  await page.keyboard.press('Tab');
   await menuButton.focus();
   await expect(menuButton).toBeFocused();
-  expect(await menuButton.evaluate((button) => {
+  await expect.poll(() => menuButton.evaluate((button) => {
     const style = getComputedStyle(button);
     return [style.backgroundColor, style.borderTopColor, style.fontStyle];
   })).toEqual(['rgb(239, 246, 255)', 'rgb(59, 130, 246)', 'normal']);
@@ -2400,7 +2621,6 @@ test('game report uses the four specified jewel designs for their exact outcomes
         state.team_scores = null;
         state.player_xp = { 7: 110 };
         state.player_action_counts = { 7: 36 };
-        state.properties.boost = null;
         state.status = { Complete: { winning_snake_id: 0 } };
       },
     },
@@ -2416,6 +2636,9 @@ test('game report uses the four specified jewel designs for their exact outcomes
       soloInitial.GameEvent.event.Snapshot.game_state.status = { Started: { server_id: 1 } };
       matchStart = soloInitial.GameEvent.event.Snapshot.game_state.start_ms;
       socketIndex = await establishActiveGame(page, soloInitial);
+      await expect(page.getByTestId('boost-hud').locator('.game-boost-meter__value'))
+        .toHaveText('∞');
+      await expect(page.getByTestId('boost-button')).toHaveAccessibleName(/unlimited/i);
       await expect(page.getByTestId('game-roster-band').locator('.game-roster-field-label'))
         .toHaveCount(0);
       await expect(page.getByTestId('game-roster-band')
@@ -3232,13 +3455,13 @@ test('actual WASM round-trips every authoritative Boost field from a snapshot', 
   expect(result.snake).toEqual({
     speed_milli: 1000,
     movement_credit: 0,
-    boost: { charge_ms: 1000, active: false },
+    boost: { charge_ms: 1000, active: false, intent: false },
   });
   expect(result.activation).toEqual({ ActivateBoost: { snake_id: 0 } });
   expect(result.activeSnake).toEqual({
     speed_milli: 1500,
     movement_credit: 75000,
-    boost: { charge_ms: 950, active: true },
+    boost: { charge_ms: 950, active: true, intent: true },
   });
   expect(result.activeHashAgain).toBe(result.activeHash);
 });
@@ -3252,12 +3475,14 @@ test('actual WASM admits only legacy-compatible completed TeamMatch snapshots', 
     const legacyState = legacyFrame.GameEvent.event.Snapshot.game_state;
     legacyState.status = { Complete: { winning_snake_id: 0 } };
     legacyState.properties.tick_duration_ms = 100;
+    legacyState.properties.time_limit_ms = 90_000;
+    legacyState.properties.score_limit = null;
     legacyState.properties.boost = null;
     legacyState.arena.boost_pads = [];
     for (const snake of legacyState.arena.snakes) {
       snake.speed_milli = 1000;
       snake.movement_credit = 0;
-      snake.boost = { charge_ms: 0, active: false };
+      snake.boost = { charge_ms: 0, active: false, intent: false };
     }
 
     const completed = window.wasm.GameClient.newFromSnapshotFrame(
@@ -3396,6 +3621,8 @@ test('a rejected predicted Boost activation retracts immediately to authoritativ
       speed_milli: snake.speed_milli,
     };
   })).toEqual({ active: false, charge_ms: 1000, speed_milli: 1000 });
+  await expect.poll(() => socketMessages(page, socketIndex, 'GameCommandV2'))
+    .toHaveLength(1);
   await expect(page.getByTestId('boost-hud')).toContainText('33%');
   await expect(page.getByTestId('boost-button')).toBeEnabled();
 });
@@ -3460,6 +3687,7 @@ test('an uninterrupted Space Hold resumes Boost after depletion and recharge', a
   active.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 50,
     active: true,
+    intent: true,
   };
   active.GameEvent.event.Snapshot.game_state.arena.snakes[0].speed_milli = 1500;
   await emitServerMessage(page, socketIndex, active);
@@ -3468,30 +3696,33 @@ test('an uninterrupted Space Hold resumes Boost after depletion and recharge', a
   depleted.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 0,
     active: false,
+    intent: true,
   };
   await emitServerMessage(page, socketIndex, depleted);
-  await expect(page.getByTestId('boost-button')).toBeDisabled();
+  await expect(page.getByTestId('boost-button')).toBeEnabled();
   expect(await logicalBoostCommands()).toHaveLength(1);
 
   const recharged = boostSnapshot(14, 9);
   recharged.GameEvent.event.Snapshot.game_state.arena.snakes[0].boost = {
     charge_ms: 750,
-    active: false,
+    active: true,
+    intent: true,
   };
+  recharged.GameEvent.event.Snapshot.game_state.arena.snakes[0].speed_milli = 1500;
   await emitServerMessage(page, socketIndex, recharged);
 
+  // Intent is latched in the engine across depletion, so recharge resumes
+  // without another activation edge from the browser.
   await expect.poll(logicalBoostCommands)
-    .toHaveLength(2);
+    .toHaveLength(1);
   expect(await logicalBoostCommands()).toEqual([
-    { ActivateBoost: { snake_id: 0 } },
     { ActivateBoost: { snake_id: 0 } },
   ]);
 
   await page.keyboard.up('Space');
   await expect.poll(logicalBoostCommands)
-    .toHaveLength(3);
+    .toHaveLength(2);
   expect(await logicalBoostCommands()).toEqual([
-    { ActivateBoost: { snake_id: 0 } },
     { ActivateBoost: { snake_id: 0 } },
     { DeactivateBoost: { snake_id: 0 } },
   ]);

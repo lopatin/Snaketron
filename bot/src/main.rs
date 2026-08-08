@@ -379,7 +379,7 @@ where
     wait_for_setup_response(
         socket,
         "WebSocket authentication",
-        "Authenticated protocol v5",
+        "Authenticated current gameplay protocol",
         |message| {
             matches!(
                 message,
@@ -514,6 +514,9 @@ where
             info!("Bot {} matched to game {}", idx + 1, id);
             *game_id = Some(id);
             send_ws(ws_writer, WSMessage::JoinGame(id)).await?;
+            // A bot has no briefing to read, and a human waiting on it would
+            // sit through the whole readiness window for nothing.
+            send_ws(ws_writer, WSMessage::PlayerReady { game_id: id }).await?;
             send_status(
                 status_tx,
                 game_idx,
@@ -525,6 +528,7 @@ where
             info!("Bot {} received MatchFound {}", idx + 1, found_id);
             *game_id = Some(found_id);
             send_ws(ws_writer, WSMessage::JoinGame(found_id)).await?;
+            send_ws(ws_writer, WSMessage::PlayerReady { game_id: found_id }).await?;
             send_status(
                 status_tx,
                 game_idx,
@@ -623,9 +627,11 @@ async fn handle_game_event(
                 .get(&user_id)
                 .map(|player| player.snake_id);
 
-            if let Some(interval) = build_interval(game_state) {
-                *tick_interval = Some(interval);
-            }
+            // A gated snapshot has no simulation epoch yet. Replacing the
+            // option unconditionally also clears an interval left over from a
+            // pre-gate/resync snapshot, so the bot cannot issue commands while
+            // the authoritative engine is intentionally parked.
+            *tick_interval = build_interval(game_state);
 
             info!(
                 "Bot {} received snapshot for game {}, tick {}, snake {:?}",
@@ -686,6 +692,16 @@ async fn handle_game_event(
                     total_games
                 );
                 return Ok(true);
+            }
+        }
+        GameEvent::MatchStartScheduled { .. } => {
+            if let Some(engine) = engine {
+                engine.process_server_event(&event_msg)?;
+                // `process_server_event` installs the authoritative epoch in
+                // committed state. Rebuild from that state rather than the
+                // immutable legacy `start_ms`, which can be many seconds old
+                // after the readiness briefing.
+                *tick_interval = build_interval(engine.get_committed_state());
             }
         }
         _ => {
@@ -873,18 +889,8 @@ fn parse_queue_mode(mode: &str) -> Result<QueueMode> {
 }
 
 fn build_interval(game_state: &GameState) -> Option<Interval> {
-    let tick_ms = game_state.properties.tick_duration_ms as u64;
-    if tick_ms == 0 {
-        return None;
-    }
-    let decision_ms = decision_interval_ms(game_state);
-
     let now_ms = Utc::now().timestamp_millis();
-    let start_ms = game_state.start_ms;
-    let elapsed_ms = (now_ms - start_ms).max(0) as u64;
-    let decisions_elapsed = elapsed_ms / decision_ms;
-    let next_decision_ms = start_ms + ((decisions_elapsed + 1) * decision_ms) as i64;
-    let delay_ms = (next_decision_ms - now_ms).max(0) as u64;
+    let (decision_ms, delay_ms) = decision_schedule_ms(game_state, now_ms)?;
 
     let mut interval = tokio::time::interval_at(
         Instant::now() + Duration::from_millis(delay_ms),
@@ -892,6 +898,24 @@ fn build_interval(game_state: &GameState) -> Option<Interval> {
     );
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     Some(interval)
+}
+
+/// Return the decision period and delay to its next epoch-aligned boundary.
+/// A readiness-gated match deliberately has no schedule until the server
+/// publishes `MatchStartScheduled`; legacy ungated states fall back to their
+/// immutable `start_ms` through `GameState::simulation_start_ms`.
+fn decision_schedule_ms(game_state: &GameState, now_ms: i64) -> Option<(u64, u64)> {
+    let tick_ms = game_state.properties.tick_duration_ms as u64;
+    if tick_ms == 0 {
+        return None;
+    }
+    let start_ms = game_state.simulation_start_ms()?;
+    let decision_ms = decision_interval_ms(game_state);
+    let elapsed_ms = (now_ms - start_ms).max(0) as u64;
+    let decisions_elapsed = elapsed_ms / decision_ms;
+    let next_decision_ms = start_ms + ((decisions_elapsed + 1) * decision_ms) as i64;
+    let delay_ms = (next_decision_ms - now_ms).max(0) as u64;
+    Some((decision_ms, delay_ms))
 }
 
 fn decision_interval_ms(game_state: &GameState) -> u64 {
@@ -961,10 +985,163 @@ mod tests {
         boost_game.properties.tick_duration_ms = 150;
         assert_eq!(decision_interval_ms(&boost_game), 150);
 
-        let mut non_boost_game =
-            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        // Solo and free-for-all carry Boost now, so their decision cadence is
+        // also the normal movement interval rather than their (halved) tick.
+        for game_type in [GameType::Solo, GameType::FreeForAll { max_players: 4 }] {
+            let field_game = GameState::new(40, 40, game_type, QueueMode::Quickmatch, None, 0);
+            assert!(field_game.properties.boost.is_some());
+            assert_eq!(field_game.properties.tick_duration_ms, 50);
+            assert_eq!(decision_interval_ms(&field_game), 100);
+        }
+
+        // A Custom game is the only remaining boostless shape: there the bot
+        // decides once per tick, whatever the tick is.
+        let mut non_boost_game = GameState::new(
+            40,
+            40,
+            GameType::Custom {
+                settings: common::CustomGameSettings::default(),
+            },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        assert!(non_boost_game.properties.boost.is_none());
         non_boost_game.properties.tick_duration_ms = 50;
         assert_eq!(decision_interval_ms(&non_boost_game), 50);
+    }
+
+    #[test]
+    fn decision_schedule_waits_for_readiness_and_uses_the_released_epoch() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            1_000,
+        );
+
+        // States from before the readiness protocol remain anchored to their
+        // original start time.
+        assert_eq!(decision_schedule_ms(&game, 1_050), Some((100, 50)));
+
+        game.arm_readiness_gate(9_000);
+        assert_eq!(decision_schedule_ms(&game, 8_000), None);
+
+        game.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 10_000,
+            },
+            None,
+        );
+        // The old start was nine seconds earlier. A schedule based on it would
+        // fire immediately here; the released epoch correctly waits until the
+        // first 100 ms decision boundary after simulation begins.
+        assert_eq!(decision_schedule_ms(&game, 9_900), Some((100, 200)));
+        assert_eq!(decision_schedule_ms(&game, 10_050), Some((100, 50)));
+    }
+
+    #[tokio::test]
+    async fn gated_snapshot_clears_the_timer_until_match_start_is_scheduled() {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            now_ms - 10_000,
+        );
+        let player = state.add_player(7, Some("ready-bot".to_owned())).unwrap();
+
+        // Model a timer installed from an earlier ungated snapshot. Receiving
+        // the gated authoritative snapshot must remove it, not leave it live.
+        let mut tick_interval = build_interval(&state);
+        assert!(tick_interval.is_some());
+        state.arm_readiness_gate(now_ms + 15_000);
+
+        let mut engine = None;
+        let mut snake_id = None;
+        let mut game_started = false;
+        let mut game_completed = false;
+        let (status_tx, _status_rx) = watch::channel(String::new());
+        let hang_timer = tokio::time::sleep(GAME_OVER_TIMEOUT);
+        tokio::pin!(hang_timer);
+
+        handle_game_event(
+            0,
+            GameEventMessage {
+                game_id: 42,
+                tick: 0,
+                sequence: 1,
+                stream_seq: 1,
+                user_id: None,
+                event: GameEvent::Snapshot { game_state: state },
+            },
+            &mut engine,
+            &mut snake_id,
+            &mut tick_interval,
+            7,
+            &mut game_started,
+            &mut game_completed,
+            &mut hang_timer,
+            &status_tx,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snake_id, Some(player.snake_id));
+        assert!(tick_interval.is_none());
+        assert!(
+            engine
+                .as_ref()
+                .unwrap()
+                .get_committed_state()
+                .is_awaiting_readiness()
+        );
+
+        let simulation_epoch_ms = now_ms + 5_000;
+        handle_game_event(
+            0,
+            GameEventMessage {
+                game_id: 42,
+                tick: 0,
+                sequence: 2,
+                stream_seq: 2,
+                user_id: None,
+                event: GameEvent::MatchStartScheduled {
+                    simulation_epoch_ms,
+                },
+            },
+            &mut engine,
+            &mut snake_id,
+            &mut tick_interval,
+            7,
+            &mut game_started,
+            &mut game_completed,
+            &mut hang_timer,
+            &status_tx,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .as_ref()
+                .unwrap()
+                .get_committed_state()
+                .simulation_start_ms(),
+            Some(simulation_epoch_ms)
+        );
+        assert_eq!(
+            tick_interval.as_ref().map(Interval::period),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[test]

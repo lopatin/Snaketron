@@ -1,11 +1,12 @@
 use crate::util::PseudoRandom;
 use crate::{
-    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION, BOOST_TICK_INTERVAL_MS, BoostResolution,
+    BOOST_RULES_VERSION, BOOST_SPOT_LAYOUT_VERSION_FIELD, BOOST_SPOT_LAYOUT_VERSION_NONE,
+    BOOST_SPOT_LAYOUT_VERSION_TEAM, BOOST_TICK_INTERVAL_MS, BoostResolution,
     DEFAULT_BOOST_CAPACITY_MS, DEFAULT_BOOST_PACKET_CHARGE_MS, DEFAULT_BOOST_PAD_RESPAWN_MS,
     DEFAULT_BOOST_SPEED_MILLI, DEFAULT_COMPETITIVE_TEAM_SCORE_LIMIT, DEFAULT_CUSTOM_GAME_TICK_MS,
     DEFAULT_FOOD_TARGET, DEFAULT_PLAYER_IDLE_TIMEOUT_MS, DEFAULT_PLAYER_IDLE_WARNING_MS,
     DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
-    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake,
+    MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake, SnakeBoost,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -232,6 +233,21 @@ pub enum GameEvent {
     StatusUpdated {
         status: GameStatus,
     },
+    /// A player confirmed they have read the pre-match briefing and are ready.
+    /// Idempotent: re-delivery of an already-recorded readiness is a no-op, so
+    /// the at-least-once transport cannot corrupt the gate.
+    PlayerReady {
+        user_id: u32,
+    },
+    /// The pre-match readiness gate resolved — every player confirmed, or the
+    /// deadline lapsed — and the simulation is now scheduled to begin at
+    /// `simulation_epoch_ms`. `start_ms` is deliberately left untouched: it is
+    /// the durable runtime game identity that join authorization compares
+    /// against, so it must never move once a match exists.
+    MatchStartScheduled {
+        #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+        simulation_epoch_ms: i64,
+    },
     ScoreUpdated {
         snake_id: u32,
         score: u32,
@@ -329,6 +345,14 @@ pub struct BoostConfig {
     pub pad_respawn_ms: u32,
     pub spot_layout_version: u16,
     pub rules_version: u16,
+    /// A tank that never empties: no pickups are placed, the meter starts and
+    /// stays full, and a funded quantum costs nothing. Solo runs use it so a
+    /// lone player can hold Boost freely with nothing to contest.
+    ///
+    /// This is the only Boost fuel model that does not require a pad layout,
+    /// so it pairs with `BOOST_SPOT_LAYOUT_VERSION_NONE`.
+    #[serde(default)]
+    pub unlimited: bool,
 }
 
 /// An internal, authoritative Boost state transition produced while advancing
@@ -343,14 +367,36 @@ pub enum BoostLifecycleTransition {
 }
 
 impl Default for BoostConfig {
+    /// The collectible tank on the canonical team map.
     fn default() -> Self {
         Self {
             speed_milli: DEFAULT_BOOST_SPEED_MILLI,
             capacity_ms: DEFAULT_BOOST_CAPACITY_MS,
             packet_charge_ms: DEFAULT_BOOST_PACKET_CHARGE_MS,
             pad_respawn_ms: DEFAULT_BOOST_PAD_RESPAWN_MS,
-            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION,
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_TEAM,
             rules_version: BOOST_RULES_VERSION,
+            unlimited: false,
+        }
+    }
+}
+
+impl BoostConfig {
+    /// The collectible tank on the teamless free-for-all map. Same balance as
+    /// the team default; only the pad geometry differs.
+    pub fn field() -> Self {
+        Self {
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_FIELD,
+            ..Self::default()
+        }
+    }
+
+    /// A tank that never empties and has nothing to collect.
+    pub fn unlimited() -> Self {
+        Self {
+            spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_NONE,
+            unlimited: true,
+            ..Self::default()
         }
     }
 }
@@ -384,11 +430,30 @@ impl BoostConfig {
                 BOOST_TICK_INTERVAL_MS
             ));
         }
-        if self.spot_layout_version != BOOST_SPOT_LAYOUT_VERSION {
+        let known_layout = matches!(
+            self.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_TEAM
+                | BOOST_SPOT_LAYOUT_VERSION_FIELD
+                | BOOST_SPOT_LAYOUT_VERSION_NONE
+        );
+        if !known_layout {
             return Err(anyhow::anyhow!(
-                "unsupported Boost spot layout version {}, expected {}",
+                "unsupported Boost spot layout version {}, expected one of {}, {} or {}",
                 self.spot_layout_version,
-                BOOST_SPOT_LAYOUT_VERSION
+                BOOST_SPOT_LAYOUT_VERSION_NONE,
+                BOOST_SPOT_LAYOUT_VERSION_TEAM,
+                BOOST_SPOT_LAYOUT_VERSION_FIELD
+            ));
+        }
+        // The padless layout and the unlimited tank imply one another: pickups
+        // with nothing to fill, or an unlimited tank with objectives that do
+        // nothing, are both states the renderer and the player would misread.
+        if self.unlimited != (self.spot_layout_version == BOOST_SPOT_LAYOUT_VERSION_NONE) {
+            return Err(anyhow::anyhow!(
+                "unlimited Boost requires spot layout {} and vice versa, got unlimited={} layout={}",
+                BOOST_SPOT_LAYOUT_VERSION_NONE,
+                self.unlimited,
+                self.spot_layout_version
             ));
         }
         if self.rules_version != BOOST_RULES_VERSION {
@@ -480,16 +545,50 @@ impl Arena {
         self.boost_pads.iter().any(|pad| pad.contains(position))
     }
 
-    fn v3_boost_pad_layout(&self, config: &BoostConfig) -> Vec<BoostPad> {
-        let Some((left, right)) = self.main_field_bounds() else {
-            return Vec::new();
-        };
-        // Layout v3 is a canonical-map contract. Eligible games on any other
-        // geometry fail closed during creation/validation rather than moving
-        // objectives or producing asymmetric footprints.
-        if self.width != 60 || self.height != 40 || (left, right) != (10, 49) {
+    /// The playable span a Boost layout is drawn inside, by layout version.
+    ///
+    /// Team layouts inset the field by the end zones so no pad can sit in a
+    /// goal; the free-for-all layout has no zones and uses the whole arena.
+    /// `None` means this arena cannot host the requested layout, and callers
+    /// treat that as "no pads" — validation then rejects it loudly.
+    fn boost_field_bounds(&self, spot_layout_version: u16) -> Option<(i16, i16)> {
+        match spot_layout_version {
+            BOOST_SPOT_LAYOUT_VERSION_TEAM => {
+                let (left, right) = self.main_field_bounds()?;
+                // Layout v3 is a canonical-map contract. Eligible games on any
+                // other geometry fail closed during creation/validation rather
+                // than moving objectives or producing asymmetric footprints.
+                (self.width == 60 && self.height == 40 && (left, right) == (10, 49))
+                    .then_some((left, right))
+            }
+            BOOST_SPOT_LAYOUT_VERSION_FIELD => {
+                // The teamless layout is the same geometry drawn on the whole
+                // arena. It is deliberately restricted to the square canonical
+                // free-for-all map: the ring's quarter-turn symmetry only
+                // closes when the field is square, and an asymmetric map would
+                // hand one spawn a shorter path to a full tank.
+                (self.team_zone_config.is_none() && self.width == 40 && self.height == 40)
+                    .then_some((0, self.width as i16 - 1))
+            }
+            _ => None,
+        }
+    }
+
+    /// Pad geometry for a config, dispatched on its layout version.
+    ///
+    /// The arithmetic below is written against `(left, right)` and `height`
+    /// alone, so the canonical 40-cell team field and the 40x40 free-for-all
+    /// arena produce the same shape from the same code — the inset, octagon
+    /// radius and bevel are all field-relative fractions.
+    fn boost_pad_layout(&self, config: &BoostConfig) -> Vec<BoostPad> {
+        if config.unlimited {
+            // An unlimited tank is never refuelled, so placing pickups would
+            // put objectives on the map that do nothing.
             return Vec::new();
         }
+        let Some((left, right)) = self.boost_field_bounds(config.spot_layout_version) else {
+            return Vec::new();
+        };
 
         let field_width = right - left + 1;
         let arena_bottom = self.height as i16 - 1;
@@ -822,6 +921,44 @@ pub fn team_score_limit(queue_mode: &QueueMode) -> u32 {
     }
 }
 
+/// Which Boost fuel model a mode gets on a given map, if any.
+///
+/// The two collectible models place a fixed pad geometry, and a geometry only
+/// exists for that mode's canonical map — so a match on any other size gets no
+/// Boost rather than a half-drawn one. That keeps `GameState::new` total: it is
+/// called with arbitrary dimensions by tests, previews and Custom games, and
+/// none of those should fail to construct.
+///
+/// Solo is unlimited because a lone runner has nobody to contest pads with, so
+/// a meter would only ration a mechanic that exists to feel fast. Needing no
+/// geometry, it works on every map.
+pub fn boost_config_for(game_type: &GameType, width: u16, height: u16) -> Option<BoostConfig> {
+    match game_type {
+        GameType::TeamMatch { per_team: 1 | 2 } if (width, height) == (60, 40) => {
+            Some(BoostConfig::default())
+        }
+        GameType::FreeForAll { .. } if (width, height) == (40, 40) => Some(BoostConfig::field()),
+        GameType::Solo => Some(BoostConfig::unlimited()),
+        _ => None,
+    }
+}
+
+/// How much food a mode keeps on the field. The crowded modes — 2v2 and
+/// free-for-all — carry double, because four snakes competing over one
+/// ten-pellet field spend most of the match travelling rather than eating.
+/// Duel and Solo keep the baseline: two snakes, or one, do not need the help.
+///
+/// Read by construction and by the fingerprint, so this is the only place the
+/// per-mode value is decided.
+pub fn food_target_for(game_type: &GameType) -> usize {
+    match game_type {
+        GameType::TeamMatch { per_team: 2 } | GameType::FreeForAll { .. } => {
+            DEFAULT_FOOD_TARGET * 2
+        }
+        _ => DEFAULT_FOOD_TARGET,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
@@ -1083,6 +1220,38 @@ pub struct GameState {
     /// condition, produced the terminal result.
     #[serde(default)]
     pub completed_by_inactivity: bool,
+
+    /// Pre-match readiness gate. Present from match creation until every
+    /// player has confirmed or the deadline lapses, then cleared for good.
+    /// `None` also covers matches created before this protocol existed, which
+    /// therefore start straight off `start_ms` exactly as they used to.
+    #[serde(default)]
+    pub readiness: Option<MatchReadiness>,
+
+    /// Wall clock at which simulation actually begins, once the readiness gate
+    /// has resolved. `None` means "use `start_ms`" — either the gate is still
+    /// holding the match (in which case nothing may advance at all) or the
+    /// match never had a gate.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(type = "number | null"))]
+    pub simulation_epoch_ms: Option<i64>,
+}
+
+/// The pre-match readiness gate: who still has to confirm, and when the match
+/// gives up waiting.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct MatchReadiness {
+    /// Absolute wall clock after which the gate resolves regardless of who is
+    /// still missing.
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub deadline_ms: i64,
+    /// Users who have confirmed. Serialized sorted so two servers holding the
+    /// same logical state produce byte-identical snapshots.
+    #[serde(default, serialize_with = "sorted_hash_set::serialize")]
+    #[cfg_attr(feature = "ts-gen", ts(type = "Array<number>"))]
+    pub ready_user_ids: HashSet<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -1163,32 +1332,32 @@ impl GameState {
         rng_seed: Option<u64>,
         start_ms: i64,
     ) -> Self {
-        let boost = if matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
-            let config = BoostConfig::default();
-            debug_assert!(config.validate().is_ok());
-            Some(config)
-        } else {
-            None
-        };
+        let boost = boost_config_for(&game_type, width, height);
+        debug_assert!(boost.as_ref().is_none_or(|c| c.validate().is_ok()));
 
         // Team matches are raced to a score, never against a clock: no time
         // limit, no maximum duration, and the target depends on the queue.
+        // Boost needs the 50ms quantum in every mode that has it: at a 100ms
+        // tick a boosted snake would earn two moves in one quantum, which
+        // `accrue_movement_credit` refuses. Snakes still cross a cell every
+        // 100ms at normal speed — only the simulation granularity changes.
+        let boost_tick_ms = if boost.is_some() {
+            BOOST_TICK_INTERVAL_MS
+        } else {
+            DEFAULT_TICK_INTERVAL_MS
+        };
         let (tick_duration_ms, time_limit_ms, score_limit) = match &game_type {
             GameType::Custom { settings } => (settings.tick_duration_ms, None, None),
-            GameType::TeamMatch { .. } => (
-                if boost.is_some() {
-                    BOOST_TICK_INTERVAL_MS
-                } else {
-                    DEFAULT_TICK_INTERVAL_MS
-                },
-                None,
-                Some(team_score_limit(&queue_mode)),
-            ),
-            _ => (DEFAULT_TICK_INTERVAL_MS, None, None),
+            GameType::TeamMatch { .. } => {
+                (boost_tick_ms, None, Some(team_score_limit(&queue_mode)))
+            }
+            // Solo and free-for-all run until every snake is dead: no clock,
+            // and no score target to race to.
+            _ => (boost_tick_ms, None, None),
         };
 
         let properties = GameProperties {
-            available_food_target: DEFAULT_FOOD_TARGET,
+            available_food_target: food_target_for(&game_type),
             tick_duration_ms,
             time_limit_ms,
             score_limit,
@@ -1235,7 +1404,7 @@ impl GameState {
             team_zone_config,
         };
         if let Some(config) = properties.boost.as_ref() {
-            arena.boost_pads = arena.v3_boost_pad_layout(config);
+            arena.boost_pads = arena.boost_pad_layout(config);
         }
 
         let state = GameState {
@@ -1265,6 +1434,8 @@ impl GameState {
             player_last_activity_ticks: HashMap::new(),
             idle_kicked_user_ids: Vec::new(),
             completed_by_inactivity: false,
+            readiness: None,
+            simulation_epoch_ms: None,
         };
 
         // `new` predates fallible match construction. Keep its API stable but
@@ -1346,10 +1517,10 @@ impl GameState {
         }
     }
 
-    /// Construct an eligible team match with an explicitly resolved,
-    /// snapshotted Boost balance. This is the configuration seam for staging,
-    /// soak tests, and future server-side balance selection; active games never
-    /// re-read live configuration.
+    /// Construct an eligible match with an explicitly resolved, snapshotted
+    /// Boost balance. This is the configuration seam for staging, soak tests,
+    /// and future server-side balance selection; active games never re-read
+    /// live configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_boost_config(
         width: u16,
@@ -1361,15 +1532,12 @@ impl GameState {
         boost_config: BoostConfig,
     ) -> Result<Self> {
         boost_config.validate()?;
-        if !matches!(&game_type, GameType::TeamMatch { per_team: 1 | 2 }) {
+        if !matches!(
+            &game_type,
+            GameType::TeamMatch { per_team: 1 | 2 } | GameType::FreeForAll { .. } | GameType::Solo
+        ) {
             return Err(anyhow::anyhow!(
-                "explicit Boost configuration requires duel or 2v2 TeamMatch"
-            ));
-        }
-        if width != 60 || height != 40 {
-            return Err(anyhow::anyhow!(
-                "Boost layout v{} requires the canonical 60x40 arena",
-                BOOST_SPOT_LAYOUT_VERSION
+                "explicit Boost configuration requires duel, 2v2, free-for-all or Solo"
             ));
         }
 
@@ -1377,28 +1545,76 @@ impl GameState {
         state.properties.boost = Some(boost_config);
         state.arena.boost_pads = state
             .arena
-            .v3_boost_pad_layout(state.properties.boost.as_ref().expect("Boost config"));
+            .boost_pad_layout(state.properties.boost.as_ref().expect("Boost config"));
         state.validate_boost_invariants()?;
         Ok(state)
     }
 
-    /// Whether this is the one persisted pre-Boost terminal shape retained
-    /// for durable history compatibility. Every active or current-protocol
-    /// snapshot must satisfy the strict Boost invariants instead.
-    pub fn is_legacy_completed_team_snapshot(&self) -> bool {
-        matches!(self.status, GameStatus::Complete { .. })
-            && matches!(self.game_type, GameType::TeamMatch { per_team: 1 | 2 })
-            && self.arena.width == 60
-            && self.arena.height == 40
-            && self.properties.tick_duration_ms == DEFAULT_TICK_INTERVAL_MS
-            && self.properties.boost.is_none()
-            && self.arena.boost_pads.is_empty()
-            && self.arena.snakes.iter().all(|snake| {
-                snake.speed_milli() == NORMAL_SNAKE_SPEED_MILLI
-                    && snake.movement_credit() == 0
-                    && snake.boost().charge_ms == 0
-                    && !snake.boost().active
-            })
+    /// Whether this is an immutable terminal snapshot from either gameplay
+    /// generation immediately preceding the current rules.
+    ///
+    /// Completed history remains viewable across the coordinated cutover, but
+    /// active recovery stays fail-closed. Two exact historical shapes exist:
+    ///
+    /// - boostless 100ms duel/2v2/Solo/FFA games from before those modes gained
+    ///   their current Boost model; and
+    /// - 50ms Boost team games that ended on the old 90-second clock before
+    ///   team matches changed to a score race.
+    ///
+    /// Current-protocol snapshots and every nonterminal state must satisfy the
+    /// strict invariants instead of entering through this compatibility seam.
+    pub fn is_legacy_completed_snapshot(&self) -> bool {
+        if !matches!(self.status, GameStatus::Complete { .. }) {
+            return false;
+        }
+
+        if self.properties.boost.is_none() {
+            let legacy_time_limit_ms = match &self.game_type {
+                GameType::TeamMatch { per_team: 1 | 2 } => Some(90_000),
+                GameType::Solo | GameType::FreeForAll { .. } => None,
+                _ => return false,
+            };
+            return boost_config_for(&self.game_type, self.arena.width, self.arena.height)
+                .is_some()
+                && self.properties.available_food_target == DEFAULT_FOOD_TARGET
+                && self.properties.tick_duration_ms == DEFAULT_TICK_INTERVAL_MS
+                && self.properties.time_limit_ms == legacy_time_limit_ms
+                && self.properties.score_limit.is_none()
+                && self.arena.boost_pads.is_empty()
+                && self.arena.snakes.iter().all(|snake| {
+                    snake.speed_milli() == NORMAL_SNAKE_SPEED_MILLI
+                        && snake.movement_credit() == 0
+                        && snake.boost() == &SnakeBoost::default()
+                });
+        }
+
+        if !matches!(self.game_type, GameType::TeamMatch { per_team: 1 | 2 })
+            || self.properties.time_limit_ms != Some(90_000)
+            || self.properties.score_limit.is_some()
+        {
+            return false;
+        }
+
+        // The previous Boost-team state is otherwise byte-for-byte governed
+        // by today's strict invariants. Rewrite only its obsolete completion
+        // condition on a clone, then reuse that validator rather than growing
+        // a second, weaker copy of the pad/snake rules.
+        let mut migrated = self.clone();
+        migrated.properties.available_food_target = food_target_for(&migrated.game_type);
+        migrated.properties.time_limit_ms = None;
+        migrated.properties.score_limit = Some(team_score_limit(&migrated.queue_mode));
+        migrated.validate_boost_invariants().is_ok()
+    }
+
+    /// The tank size to hand a snake starting a new life, in modes whose Boost
+    /// never empties. `None` everywhere else, where a new life starts dry and
+    /// the player refuels from the map.
+    fn unlimited_boost_capacity_ms(&self) -> Option<u32> {
+        self.properties
+            .boost
+            .as_ref()
+            .filter(|config| config.unlimited)
+            .map(|config| config.capacity_ms)
     }
 
     /// Validate every cross-field Boost invariant at a serialized tick
@@ -1406,7 +1622,23 @@ impl GameState {
     /// creation, preventing malformed state from producing permanent speed or
     /// movement divergence.
     pub fn validate_boost_invariants(&self) -> Result<()> {
-        let eligible = matches!(&self.game_type, GameType::TeamMatch { per_team: 1 | 2 });
+        // A mode is Boost-eligible only on a map that can host its layout, so
+        // this asks exactly the question construction answered. Custom games
+        // are player-defined and never carry Boost.
+        let expected_config =
+            boost_config_for(&self.game_type, self.arena.width, self.arena.height);
+        let eligible = expected_config.is_some();
+        if !matches!(self.game_type, GameType::Custom { .. }) {
+            let expected_food_target = food_target_for(&self.game_type);
+            if self.properties.available_food_target != expected_food_target {
+                return Err(anyhow::anyhow!(
+                    "{:?} requires food target {}, got {}",
+                    self.game_type,
+                    expected_food_target,
+                    self.properties.available_food_target
+                ));
+            }
+        }
         let normal_interval_ms = self.normal_movement_interval_ms();
         let movement_threshold =
             u64::from(NORMAL_SNAKE_SPEED_MILLI) * u64::from(normal_interval_ms);
@@ -1415,10 +1647,24 @@ impl GameState {
             Some(config) => {
                 if !eligible {
                     return Err(anyhow::anyhow!(
-                        "Boost configuration is only valid for duel and 2v2 TeamMatch"
+                        "Boost configuration is only valid for duel, 2v2, free-for-all and Solo"
                     ));
                 }
                 config.validate()?;
+                // The fuel model is a property of the mode, so a state cannot
+                // claim (say) an unlimited tank in a contested match.
+                let expected_layout_version = expected_config
+                    .as_ref()
+                    .map(|expected| expected.spot_layout_version)
+                    .unwrap_or(BOOST_SPOT_LAYOUT_VERSION_NONE);
+                if config.spot_layout_version != expected_layout_version {
+                    return Err(anyhow::anyhow!(
+                        "{:?} requires Boost spot layout {}, got {}",
+                        self.game_type,
+                        expected_layout_version,
+                        config.spot_layout_version
+                    ));
+                }
                 if self.properties.tick_duration_ms != BOOST_TICK_INTERVAL_MS {
                     return Err(anyhow::anyhow!(
                         "Boost match tick must be {}ms, got {}ms",
@@ -1432,17 +1678,24 @@ impl GameState {
                         self.properties.time_limit_ms
                     ));
                 }
-                let expected_score_limit = team_score_limit(&self.queue_mode);
-                if self.properties.score_limit != Some(expected_score_limit) {
+                // Only team matches race to a score. Solo and free-for-all end
+                // when every snake is dead, so a target there would be a win
+                // condition nothing in the engine ever tests.
+                let expected_score_limit = match &self.game_type {
+                    GameType::TeamMatch { .. } => Some(team_score_limit(&self.queue_mode)),
+                    _ => None,
+                };
+                if self.properties.score_limit != expected_score_limit {
                     return Err(anyhow::anyhow!(
-                        "Boost match score limit must be exactly {} for {:?}, got {:?}",
+                        "Boost match score limit must be exactly {:?} for {:?} in {:?}, got {:?}",
                         expected_score_limit,
+                        self.game_type,
                         self.queue_mode,
                         self.properties.score_limit
                     ));
                 }
 
-                let expected_layout = self.arena.v3_boost_pad_layout(config);
+                let expected_layout = self.arena.boost_pad_layout(config);
                 let expected: Vec<(u8, Position, u32, u8)> = expected_layout
                     .iter()
                     .map(|pad| (pad.id, pad.position, pad.charge_ms, pad.size_cells))
@@ -1453,17 +1706,37 @@ impl GameState {
                     .iter()
                     .map(|pad| (pad.id, pad.position, pad.charge_ms, pad.size_cells))
                     .collect();
-                if expected.len() != 12 || actual != expected {
+                // An unlimited tank places no pads; every collectible layout
+                // places exactly the canonical twelve.
+                let expected_pad_count = if config.unlimited { 0 } else { 12 };
+                if expected.len() != expected_pad_count || actual != expected {
                     return Err(anyhow::anyhow!(
-                        "Boost layout v{} requires twelve canonical value/footprint pads",
-                        config.spot_layout_version
+                        "Boost layout v{} requires {} canonical value/footprint pads, got {} (expected geometry produced {})",
+                        config.spot_layout_version,
+                        expected_pad_count,
+                        actual.len(),
+                        expected.len()
                     ));
                 }
 
                 let mut pad_ids = HashSet::new();
                 let mut footprint_cells = HashSet::new();
-                let Some((field_left, field_right)) = self.arena.main_field_bounds() else {
-                    return Err(anyhow::anyhow!("Boost pads require team main-field bounds"));
+                // Pads must stay inside the span their own layout is drawn in:
+                // the end-zone-inset field for team maps, the whole arena for
+                // the teamless one. An unlimited config has no pads to place,
+                // so it needs no span.
+                let field_bounds = self.arena.boost_field_bounds(config.spot_layout_version);
+                let (field_left, field_right) = match field_bounds {
+                    Some(bounds) => bounds,
+                    None if config.unlimited => (0, self.arena.width as i16 - 1),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Boost layout v{} is not drawable on this {}x{} arena",
+                            config.spot_layout_version,
+                            self.arena.width,
+                            self.arena.height
+                        ));
+                    }
                 };
                 for pad in &self.arena.boost_pads {
                     if !pad_ids.insert(pad.id) {
@@ -1475,7 +1748,7 @@ impl GameState {
                         || !pad.charge_ms.is_multiple_of(BOOST_TICK_INTERVAL_MS)
                     {
                         return Err(anyhow::anyhow!(
-                            "Boost pad footprint and charge must satisfy layout v3"
+                            "Boost pad footprint and charge must satisfy the configured layout"
                         ));
                     }
                     let cells = pad.footprint_cells();
@@ -1531,11 +1804,27 @@ impl GameState {
                     } else if snake.speed_milli != NORMAL_SNAKE_SPEED_MILLI {
                         return Err(anyhow::anyhow!("inactive snake must have normal speed"));
                     }
-                    if !snake.is_alive
-                        && (snake.boost != Default::default() || snake.movement_credit != 0)
+                    if config.unlimited
+                        && snake.is_alive
+                        && snake.boost.charge_ms != config.capacity_ms
                     {
                         return Err(anyhow::anyhow!(
-                            "dead snake must have cleared Boost and movement credit"
+                            "living snake in an unlimited Boost match must retain full charge"
+                        ));
+                    }
+                    // Latched intent is deliberately excluded: it describes what
+                    // the player is physically doing, not simulation state, and
+                    // it survives death by design so a held control resumes on
+                    // the new life without a re-press. Comparing the whole
+                    // struct against `Default` would reject every snapshot taken
+                    // while somebody is holding Boost through a death.
+                    if !snake.is_alive
+                        && (snake.boost.charge_ms != 0
+                            || snake.boost.active
+                            || snake.movement_credit != 0)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "dead snake must have cleared Boost charge, activation and movement credit"
                         ));
                     }
                     if u64::from(snake.movement_credit) >= movement_threshold {
@@ -1548,7 +1837,10 @@ impl GameState {
             None => {
                 if eligible {
                     return Err(anyhow::anyhow!(
-                        "duel and 2v2 TeamMatch require Boost configuration"
+                        "{:?} on a {}x{} arena requires Boost configuration",
+                        self.game_type,
+                        self.arena.width,
+                        self.arena.height
                     ));
                 }
                 if !self.arena.boost_pads.is_empty() {
@@ -1753,9 +2045,21 @@ impl GameState {
                 }
                 Ok(())
             }
+            // A replicated readiness confirmation must name a real player of
+            // this match. Accepting an arbitrary user id would let a corrupted
+            // or spoofed delta pad the ready set and release the gate early.
+            GameEvent::PlayerReady { user_id } => {
+                if !self.players.contains_key(user_id) {
+                    return Err(anyhow::anyhow!(
+                        "replicated readiness references user {user_id}, who is not a player"
+                    ));
+                }
+                Ok(())
+            }
             GameEvent::FoodSpawned { .. }
             | GameEvent::CommandRejected { .. }
             | GameEvent::StatusUpdated { .. }
+            | GameEvent::MatchStartScheduled { .. }
             | GameEvent::XPAwarded { .. }
             | GameEvent::TickHash { .. } => Ok(()),
         }
@@ -1892,7 +2196,12 @@ impl GameState {
 
                 // Calculate vertical spacing
                 let vertical_margin = 2;
-                let usable_height = arena_height - 2 * vertical_margin;
+                // Coordinates run through `height - 1`. Subtracting from the
+                // dimension itself put the lower row at y=38 on a 40-cell map
+                // while the upper row was y=2, giving bottom spawns a longer
+                // path to their mirrored Boost pad. Use the inclusive span so
+                // the rows are exactly mirrored (2 and 37).
+                let usable_height = arena_height - 1 - 2 * vertical_margin;
 
                 // Left column (facing right) - use main field boundaries
                 let x_left = left_boundary + snake_length;
@@ -2158,7 +2467,12 @@ impl GameState {
             team_id,
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
-            boost: Default::default(),
+            // A mode whose tank never empties has no pickups, so a snake that
+            // spawned dry could never boost at all.
+            boost: SnakeBoost {
+                charge_ms: self.unlimited_boost_capacity_ms().unwrap_or(0),
+                ..Default::default()
+            },
         };
 
         let snake_id = self.arena.add_snake(snake)?;
@@ -2175,6 +2489,77 @@ impl GameState {
 
     pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
         self.add_player_with_team(user_id, username, None)
+    }
+
+    /// Arm the pre-match readiness gate. Called once at match creation, before
+    /// the state is ever published, so no caller can retro-fit a gate onto a
+    /// running match.
+    pub fn arm_readiness_gate(&mut self, deadline_ms: i64) {
+        self.readiness = Some(MatchReadiness {
+            deadline_ms,
+            ready_user_ids: HashSet::new(),
+        });
+        self.simulation_epoch_ms = None;
+    }
+
+    /// Wall clock at which the simulation starts, or `None` while the
+    /// readiness gate still holds the match. Both the authoritative executor
+    /// and every client engine read the epoch through this one accessor, so a
+    /// held match cannot advance on one side and not the other.
+    pub fn simulation_start_ms(&self) -> Option<i64> {
+        if self.readiness.is_some() {
+            return None;
+        }
+        Some(self.simulation_epoch_ms.unwrap_or(self.start_ms))
+    }
+
+    /// Whether the match is still waiting on the readiness gate.
+    pub fn is_awaiting_readiness(&self) -> bool {
+        self.readiness.is_some()
+    }
+
+    /// Whether `user_id` has confirmed readiness. Always false once the gate
+    /// has resolved — readiness is a pre-match concept and is not retained.
+    pub fn is_user_ready(&self, user_id: u32) -> bool {
+        self.readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.ready_user_ids.contains(&user_id))
+    }
+
+    /// Players who have not yet confirmed. Spectators are never included: they
+    /// have no snake and must not be able to hold a match.
+    pub fn players_pending_ready(&self) -> Vec<u32> {
+        let Some(readiness) = self.readiness.as_ref() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<u32> = self
+            .players
+            .keys()
+            .copied()
+            .filter(|user_id| !readiness.ready_user_ids.contains(user_id))
+            .collect();
+        pending.sort_unstable();
+        pending
+    }
+
+    /// Whether the gate may resolve now: everyone confirmed, the deadline
+    /// lapsed, or (defensively) the match somehow has no players at all.
+    pub fn readiness_gate_resolves_at(&self, now_ms: i64) -> bool {
+        match self.readiness.as_ref() {
+            None => false,
+            Some(readiness) => {
+                now_ms >= readiness.deadline_ms || self.players_pending_ready().is_empty()
+            }
+        }
+    }
+
+    /// Whether recording `user_id` as ready would change anything. Guards the
+    /// executor against republishing an event for a duplicate delivery.
+    pub fn accepts_ready_from(&self, user_id: u32) -> bool {
+        self.readiness
+            .as_ref()
+            .is_some_and(|readiness| !readiness.ready_user_ids.contains(&user_id))
+            && self.players.contains_key(&user_id)
     }
 
     pub fn add_spectator(&mut self, user_id: u32, username: Option<String>) {
@@ -2516,8 +2901,13 @@ impl GameState {
             }
         }
 
+        let unlimited_boost = self
+            .properties
+            .boost
+            .as_ref()
+            .is_some_and(|config| config.unlimited);
         for snake in &mut self.arena.snakes {
-            snake.reserve_boost_quantum();
+            snake.reserve_boost_quantum(unlimited_boost);
         }
 
         let normal_movement_interval_ms = self.normal_movement_interval_ms();
@@ -3156,9 +3546,12 @@ impl GameState {
             }
 
             GameEvent::SnakeDied { snake_id } => {
+                // A dead snake holds nothing — the invariants require a cleared
+                // meter. An unlimited tank is refilled by the *respawn*, which
+                // is where a new life actually begins.
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.is_alive = false;
-                    snake.reset_boost_and_movement();
+                    snake.reset_boost_and_movement(None);
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -3170,7 +3563,9 @@ impl GameState {
                 }
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.is_alive = false;
-                    snake.reset_boost_and_movement();
+                    // `None`: an idle removal is permanent, so there is no new
+                    // life to hand a full unlimited tank to.
+                    snake.reset_boost_and_movement(None);
                     // Ordinary team deaths preserve a physically-held Boost
                     // intent for respawn. An idle removal is permanent, so no
                     // input latch may survive on the dead snake.
@@ -3251,6 +3646,25 @@ impl GameState {
                 self.status = status;
             }
 
+            // Both readiness events are idempotent by construction: inserting
+            // into a set and clearing an `Option`. A duplicate delivery from
+            // the at-least-once transport therefore cannot corrupt the gate,
+            // and a late one cannot reopen a match that already started.
+            GameEvent::PlayerReady { user_id } => {
+                if let Some(readiness) = self.readiness.as_mut() {
+                    readiness.ready_user_ids.insert(user_id);
+                }
+            }
+
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms,
+            } => {
+                if self.readiness.is_some() {
+                    self.readiness = None;
+                    self.simulation_epoch_ms = Some(simulation_epoch_ms);
+                }
+            }
+
             GameEvent::ScoreUpdated { snake_id, score } => {
                 self.scores.insert(snake_id, score);
             }
@@ -3289,12 +3703,13 @@ impl GameState {
                 };
 
                 // Now update the snake
+                let refill = self.unlimited_boost_capacity_ms();
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.body = vec![position, tail_pos];
                     snake.direction = direction;
                     snake.is_alive = true;
                     snake.food = 0;
-                    snake.reset_boost_and_movement();
+                    snake.reset_boost_and_movement(refill);
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -3307,6 +3722,205 @@ impl GameState {
             // Pure observability signal; state is never mutated by it.
             GameEvent::TickHash { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    const DEADLINE_MS: i64 = 10_000;
+
+    fn gated_duel(player_count: u32) -> GameState {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            1_000,
+        );
+        for user_id in 1..=player_count {
+            state
+                .add_player(user_id, Some(format!("player-{user_id}")))
+                .expect("add player");
+        }
+        state.arm_readiness_gate(DEADLINE_MS);
+        state
+    }
+
+    #[test]
+    fn an_ungated_match_starts_off_its_immutable_start_ms() {
+        let state = gated_duel(0);
+        let mut ungated = state.clone();
+        ungated.readiness = None;
+
+        assert_eq!(ungated.simulation_start_ms(), Some(ungated.start_ms));
+        assert!(!ungated.is_awaiting_readiness());
+    }
+
+    #[test]
+    fn a_gated_match_has_no_simulation_epoch_until_the_gate_resolves() {
+        let mut state = gated_duel(2);
+
+        assert!(state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), None);
+        assert_eq!(state.players_pending_ready(), vec![1, 2]);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(state.is_user_ready(1));
+        assert_eq!(state.players_pending_ready(), vec![2]);
+        assert_eq!(state.simulation_start_ms(), None);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        assert!(state.players_pending_ready().is_empty());
+        // Everyone has confirmed, but the epoch is stamped by the executor's
+        // explicit MatchStartScheduled — never inferred by a replica.
+        assert_eq!(state.simulation_start_ms(), None);
+
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 25_000,
+            },
+            None,
+        );
+        assert!(!state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), Some(25_000));
+    }
+
+    /// `start_ms` is the durable runtime game identity: join authorization
+    /// denies a game whose `start_ms` moved, and completion records key off
+    /// it. Releasing the gate must therefore never touch it.
+    #[test]
+    fn resolving_the_gate_leaves_start_ms_untouched() {
+        let mut state = gated_duel(1);
+        let original_start_ms = state.start_ms;
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: original_start_ms + 60_000,
+            },
+            None,
+        );
+
+        assert_eq!(state.start_ms, original_start_ms);
+        assert_eq!(
+            state.simulation_start_ms(),
+            Some(original_start_ms + 60_000)
+        );
+    }
+
+    #[test]
+    fn readiness_events_are_idempotent_under_at_least_once_delivery() {
+        let mut state = gated_duel(2);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert_eq!(state.players_pending_ready(), vec![2]);
+        assert!(!state.accepts_ready_from(1));
+        assert!(state.accepts_ready_from(2));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 30_000,
+            },
+            None,
+        );
+        // A late duplicate must not reopen a match that already started.
+        state.apply_event(
+            GameEvent::MatchStartScheduled {
+                simulation_epoch_ms: 90_000,
+            },
+            None,
+        );
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+
+        assert!(!state.is_awaiting_readiness());
+        assert_eq!(state.simulation_start_ms(), Some(30_000));
+    }
+
+    #[test]
+    fn the_deadline_resolves_the_gate_even_with_players_still_missing() {
+        let state = gated_duel(2);
+
+        assert!(!state.readiness_gate_resolves_at(DEADLINE_MS - 1));
+        assert!(state.readiness_gate_resolves_at(DEADLINE_MS));
+        assert!(state.readiness_gate_resolves_at(DEADLINE_MS + 5_000));
+    }
+
+    #[test]
+    fn the_gate_resolves_early_once_every_player_confirms() {
+        let mut state = gated_duel(2);
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(!state.readiness_gate_resolves_at(0));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 2 }, None);
+        assert!(state.readiness_gate_resolves_at(0));
+    }
+
+    /// Spectators have no snake. Letting one confirm — or, worse, counting one
+    /// as pending — would either be meaningless or would hold every match
+    /// containing a spectator until the deadline lapsed.
+    #[test]
+    fn spectators_neither_hold_nor_release_the_gate() {
+        let mut state = gated_duel(1);
+        state.add_spectator(99, Some("watcher".into()));
+
+        assert_eq!(state.players_pending_ready(), vec![1]);
+        assert!(!state.accepts_ready_from(99));
+
+        state.apply_event(GameEvent::PlayerReady { user_id: 1 }, None);
+        assert!(state.readiness_gate_resolves_at(0));
+    }
+
+    #[test]
+    fn a_replicated_readiness_for_a_non_player_is_rejected() {
+        let mut state = gated_duel(1);
+
+        assert!(
+            state
+                .try_apply_replicated_event(GameEvent::PlayerReady { user_id: 1 })
+                .is_ok()
+        );
+        let error = state
+            .try_apply_replicated_event(GameEvent::PlayerReady { user_id: 4_242 })
+            .expect_err("a non-player must not be able to pad the ready set");
+        assert!(error.to_string().contains("not a player"));
+        assert!(state.is_awaiting_readiness());
+    }
+
+    /// Games persisted before this protocol existed deserialize with no gate
+    /// and must keep starting exactly as they did.
+    #[test]
+    fn states_without_readiness_fields_deserialize_ungated() {
+        let mut state = gated_duel(1);
+        state.readiness = None;
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("readiness");
+        object.remove("simulation_epoch_ms");
+
+        let restored: GameState = serde_json::from_value(json).unwrap();
+        assert!(!restored.is_awaiting_readiness());
+        assert_eq!(restored.simulation_start_ms(), Some(restored.start_ms));
+    }
+
+    #[test]
+    fn the_ready_set_serializes_in_a_stable_order() {
+        let mut state = gated_duel(3);
+        for user_id in [3, 1, 2] {
+            state.apply_event(GameEvent::PlayerReady { user_id }, None);
+        }
+
+        let json = serde_json::to_string(&state.readiness).unwrap();
+        assert!(
+            json.contains("[1,2,3]"),
+            "ready set must serialize sorted so replicas agree byte-for-byte: {json}"
+        );
     }
 }
 
@@ -3402,9 +4016,19 @@ mod tests {
             boost: Default::default(),
         });
 
-        let events = game
-            .tick_forward(true)
-            .expect("tick_forward should succeed");
+        // Solo runs a 50ms quantum, so the wall is reached on the quantum that
+        // actually moves the snake rather than on the first one.
+        let mut events = Vec::new();
+        let crash_tick = loop {
+            events.extend(
+                game.tick_forward(true)
+                    .expect("tick_forward should succeed"),
+            );
+            if !game.arena.snakes[0].is_alive {
+                break game.current_tick();
+            }
+            assert!(game.current_tick() < 8, "snake should have hit the wall");
+        };
 
         assert!(
             events
@@ -3415,13 +4039,16 @@ mod tests {
         assert_eq!(
             game.recent_crashes,
             vec![SnakeCrash {
-                tick: 1,
+                tick: crash_tick,
                 snake_id: 0,
                 position: Position { x: 0, y: 5 },
             }]
         );
 
-        while game.current_tick() < 12 {
+        // Retention is wall-clock, not tick-counted, so the boundary is derived
+        // from the mode's own quantum and holds at either simulation rate.
+        let retention_ticks = RECENT_CRASH_RETENTION_MS / game.properties.tick_duration_ms;
+        while game.current_tick() <= crash_tick + retention_ticks {
             game.tick_forward(true).expect("advance crash history");
         }
         assert_eq!(
@@ -3492,8 +4119,8 @@ mod tests {
         let snake_id = player.snake_id;
 
         // Let the snake travel for a couple of ticks.
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3516,7 +4143,7 @@ mod tests {
         }
 
         // Tick 1: only the first turn applies; the second is deferred.
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive, "snake must survive a same-tick double turn");
@@ -3531,7 +4158,7 @@ mod tests {
         );
 
         // Tick 2: the deferred second turn applies — intent preserved.
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive, "snake must survive the deferred turn");
@@ -3559,8 +4186,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3586,7 +4213,7 @@ mod tests {
         }
 
         for turn in turns {
-            game.tick_forward(true).expect("tick");
+            advance_one_cell(&mut game);
             expected_head = step(expected_head, turn);
             let snake = &game.arena.snakes[snake_id as usize];
             assert!(snake.is_alive, "snake must survive the maneuver");
@@ -3609,8 +4236,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3641,7 +4268,7 @@ mod tests {
         }
 
         for turn in turns {
-            game.tick_forward(true).expect("tick");
+            advance_one_cell(&mut game);
             expected_head = step(expected_head, turn);
             let snake = &game.arena.snakes[snake_id as usize];
             assert!(snake.is_alive, "snake must survive the maneuver");
@@ -3650,6 +4277,23 @@ mod tests {
                 "input order must be preserved across deferrals"
             );
             assert_eq!(*snake.head().expect("head"), expected_head);
+        }
+    }
+
+    /// Advance exactly one cell of normal-speed travel, whatever the mode's
+    /// simulation quantum is.
+    ///
+    /// Boost modes run a 50ms quantum but still move a snake every 100ms, so
+    /// in tests about *turn* semantics a "step" means a movement, not a tick.
+    /// At a 100ms quantum this is a single `tick_forward`, so the tests read
+    /// identically in modes that have no Boost.
+    fn advance_one_cell(game: &mut GameState) {
+        let quanta = game
+            .normal_movement_interval_ms()
+            .div_ceil(game.properties.tick_duration_ms.max(1))
+            .max(1);
+        for _ in 0..quanta {
+            game.tick_forward(true).expect("tick");
         }
     }
 
@@ -3663,8 +4307,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3685,8 +4329,8 @@ mod tests {
             });
         }
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive);
@@ -3710,8 +4354,8 @@ mod tests {
         let player = game.add_player(1, None).expect("add player");
         let snake_id = player.snake_id;
 
-        game.tick_forward(true).expect("tick");
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         let travel = snake.direction;
@@ -3732,7 +4376,7 @@ mod tests {
             });
         }
 
-        game.tick_forward(true).expect("tick");
+        advance_one_cell(&mut game);
 
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(snake.is_alive);
@@ -4816,9 +5460,19 @@ mod tests {
         assert_eq!(team.player_action_count(1), 2);
 
         // A match without Boost configured discards the request entirely; that
-        // is a fixed property of the match, not a transient condition.
-        let mut solo_boostless =
-            GameState::new(30, 30, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        // is a fixed property of the match, not a transient condition. Every
+        // matchmade mode now carries Boost, so the boostless case is a Custom
+        // game, which is player-defined and never does.
+        let mut solo_boostless = GameState::new(
+            30,
+            30,
+            GameType::Custom {
+                settings: CustomGameSettings::default(),
+            },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
         let boostless_player = solo_boostless.add_player(7, None).expect("add player");
         solo_boostless
             .exec_command(GameCommand::ActivateBoost {
@@ -4966,11 +5620,23 @@ mod tests {
             }
         }
 
+        // Solo carries an unlimited tank: nothing to collect, so no pads, but
+        // it is still a Boost match and still runs the 50ms quantum.
         let solo = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
-        assert!(solo.properties.boost.is_none());
+        let solo_boost = solo.properties.boost.as_ref().expect("solo Boost config");
+        assert!(solo_boost.unlimited);
+        assert_eq!(
+            solo_boost.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_NONE
+        );
         assert!(solo.arena.boost_pads.is_empty());
-        assert_eq!(solo.properties.tick_duration_ms, DEFAULT_TICK_INTERVAL_MS);
+        assert_eq!(solo.properties.tick_duration_ms, BOOST_TICK_INTERVAL_MS);
+        assert_eq!(solo.properties.score_limit, None);
+        assert_eq!(solo.properties.available_food_target, DEFAULT_FOOD_TARGET);
+        solo.validate_boost_invariants()
+            .expect("solo Boost invariants");
 
+        // Free-for-all collects from the teamless layout on its own square map.
         let free_for_all = GameState::new(
             40,
             40,
@@ -4979,8 +5645,126 @@ mod tests {
             None,
             0,
         );
-        assert!(free_for_all.properties.boost.is_none());
-        assert!(free_for_all.arena.boost_pads.is_empty());
+        let ffa_boost = free_for_all
+            .properties
+            .boost
+            .as_ref()
+            .expect("free-for-all Boost config");
+        assert!(!ffa_boost.unlimited);
+        assert_eq!(
+            ffa_boost.spot_layout_version,
+            BOOST_SPOT_LAYOUT_VERSION_FIELD
+        );
+        assert_eq!(free_for_all.arena.boost_pads.len(), 12);
+        assert_eq!(free_for_all.properties.score_limit, None);
+        assert_eq!(
+            free_for_all.properties.available_food_target,
+            DEFAULT_FOOD_TARGET * 2,
+            "the crowded modes carry double food"
+        );
+        free_for_all
+            .validate_boost_invariants()
+            .expect("free-for-all Boost invariants");
+
+        // The teamless layout keeps the same four-fold symmetry the team map
+        // has, measured on the full 40x40 arena rather than an inset field.
+        // Nothing about a free-for-all spawn quadrant may reach a richer pad.
+        let ffa_footprint: HashSet<Position> = free_for_all
+            .arena
+            .boost_pads
+            .iter()
+            .flat_map(|pad| pad.footprint_cells())
+            .collect();
+        assert_eq!(ffa_footprint.len(), 24);
+        assert!(ffa_footprint.iter().all(|cell| {
+            ffa_footprint.contains(&Position {
+                x: 39 - cell.x,
+                y: cell.y,
+            }) && ffa_footprint.contains(&Position {
+                x: cell.x,
+                y: 39 - cell.y,
+            }) && ffa_footprint.contains(&Position {
+                x: 39 - cell.y,
+                y: cell.x,
+            })
+        }));
+
+        let mut spawned_ffa = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 4 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        for user_id in 1..=4 {
+            spawned_ffa.add_player(user_id, None).unwrap();
+        }
+        let heads: HashSet<Position> = spawned_ffa
+            .arena
+            .snakes
+            .iter()
+            .map(|snake| snake.body[0])
+            .collect();
+        assert_eq!(
+            heads,
+            HashSet::from([
+                Position { x: 4, y: 2 },
+                Position { x: 4, y: 37 },
+                Position { x: 35, y: 2 },
+                Position { x: 35, y: 37 },
+            ]),
+            "FFA starts must mirror across both arena axes"
+        );
+        let nearest_pad_distances: HashSet<u16> = spawned_ffa
+            .arena
+            .snakes
+            .iter()
+            .map(|snake| {
+                let head = snake.body[0];
+                spawned_ffa
+                    .arena
+                    .boost_pads
+                    .iter()
+                    .flat_map(BoostPad::footprint_cells)
+                    .map(|cell| head.x.abs_diff(cell.x) + head.y.abs_diff(cell.y))
+                    .min()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            nearest_pad_distances,
+            HashSet::from([2]),
+            "no stable player slot may start closer to a full-tank pad"
+        );
+
+        // A 2v2 also carries double food; a duel does not.
+        for (per_team, expected_food) in [(1, DEFAULT_FOOD_TARGET), (2, DEFAULT_FOOD_TARGET * 2)] {
+            let team = GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team },
+                QueueMode::Quickmatch,
+                None,
+                0,
+            );
+            assert_eq!(team.properties.available_food_target, expected_food);
+        }
+
+        // Off-canonical maps get no Boost rather than a half-drawn layout, so
+        // `GameState::new` stays total for previews, tests and Custom games.
+        for (width, height, game_type) in [
+            (20, 20, GameType::FreeForAll { max_players: 4 }),
+            (60, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::TeamMatch { per_team: 1 }),
+        ] {
+            let odd = GameState::new(width, height, game_type, QueueMode::Quickmatch, None, 0);
+            assert!(odd.properties.boost.is_none());
+            assert!(odd.arena.boost_pads.is_empty());
+            assert_eq!(odd.properties.tick_duration_ms, DEFAULT_TICK_INTERVAL_MS);
+            odd.validate_boost_invariants()
+                .expect("a boostless off-canonical map is valid");
+        }
 
         let unsupported_team = GameState::new(
             60,
@@ -5198,11 +5982,11 @@ mod tests {
                 ..BoostConfig::default()
             },
             BoostConfig {
-                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION - 1,
+                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_TEAM - 1,
                 ..BoostConfig::default()
             },
             BoostConfig {
-                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION + 1,
+                spot_layout_version: BOOST_SPOT_LAYOUT_VERSION_FIELD + 1,
                 ..BoostConfig::default()
             },
             BoostConfig {
@@ -6548,6 +7332,10 @@ mod tests {
         let baseline = boost_test_game(1);
 
         let mut invalid = baseline.clone();
+        invalid.properties.available_food_target += 1;
+        assert!(invalid.validate_boost_invariants().is_err());
+
+        let mut invalid = baseline.clone();
         invalid.properties.tick_duration_ms = DEFAULT_TICK_INTERVAL_MS;
         assert!(invalid.validate_boost_invariants().is_err());
 
@@ -6592,6 +7380,21 @@ mod tests {
         let mut invalid = baseline;
         invalid.properties.score_limit = Some(DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT + 1);
         assert!(invalid.validate_boost_invariants().is_err());
+    }
+
+    #[test]
+    fn unlimited_boost_requires_full_charge_for_every_living_snake() {
+        let mut solo = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let snake_id = solo.add_player(1, None).unwrap().snake_id as usize;
+        let capacity = solo.properties.boost.as_ref().unwrap().capacity_ms;
+        assert_eq!(solo.arena.snakes[snake_id].boost.charge_ms, capacity);
+
+        solo.arena.snakes[snake_id].boost.charge_ms = 0;
+        assert!(solo.validate_boost_invariants().is_err());
+
+        solo.arena.snakes[snake_id].is_alive = false;
+        solo.validate_boost_invariants()
+            .expect("a dead unlimited snake must be empty");
     }
 
     #[test]
@@ -6710,7 +7513,13 @@ mod tests {
             persisted.as_object_mut().unwrap().remove(field);
         }
         persisted["properties"]["tick_duration_ms"] = serde_json::json!(100);
-        for field in ["boost", "player_idle_timeout_ms", "player_idle_warning_ms"] {
+        persisted["properties"]["time_limit_ms"] = serde_json::json!(90_000);
+        for field in [
+            "score_limit",
+            "boost",
+            "player_idle_timeout_ms",
+            "player_idle_warning_ms",
+        ] {
             persisted["properties"]
                 .as_object_mut()
                 .unwrap()
@@ -6761,6 +7570,7 @@ mod tests {
         assert_eq!(snake.speed_milli(), NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit(), 0);
         assert_eq!(*snake.boost(), Default::default());
+        assert!(decoded.is_legacy_completed_snapshot());
 
         // The WebSocket completed-game path clones and serializes this state
         // directly, so prove the compatibility defaults also produce a full
@@ -6780,13 +7590,56 @@ mod tests {
         );
     }
 
+    /// A player holding Boost when their snake dies keeps the latched intent —
+    /// that is what makes the control resume on the new life without a
+    /// re-press. Snapshot admission must therefore accept a dead snake whose
+    /// intent is still set, while still rejecting one that kept fuel, speed or
+    /// movement phase.
+    #[test]
+    fn a_dead_snake_may_keep_latched_intent_but_nothing_else() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        let snake_id = game.add_player(1, None).expect("add player").snake_id;
+        game.add_player(2, None).expect("add rival");
+
+        {
+            let snake = &mut game.arena.snakes[snake_id as usize];
+            snake.set_boost_intent(true);
+            snake.is_alive = false;
+            snake.reset_boost_and_movement(None);
+        }
+        assert!(game.arena.snakes[snake_id as usize].boost().intent);
+        game.validate_boost_invariants()
+            .expect("a dead snake holding the control is a legal state");
+
+        // Fuel, activation and movement phase are all still forbidden.
+        for corrupt in [
+            (|s: &mut Snake| s.boost.charge_ms = 1_000) as fn(&mut Snake),
+            |s: &mut Snake| s.boost.active = true,
+            |s: &mut Snake| s.movement_credit = 1,
+        ] {
+            let mut broken = game.clone();
+            corrupt(&mut broken.arena.snakes[snake_id as usize]);
+            assert!(
+                broken.validate_boost_invariants().is_err(),
+                "a dead snake must not retain fuel, activation or movement phase"
+            );
+        }
+    }
+
     #[test]
     fn pre_boost_active_team_payload_is_rejected_by_recovery_invariants() {
         let persisted = pre_boost_team_payload(GameStatus::Started { server_id: 9 });
         let decoded: GameState = serde_json::from_value(persisted).unwrap();
         let error = decoded.validate_boost_invariants().unwrap_err().to_string();
         assert!(
-            error.contains("require Boost configuration"),
+            error.contains("requires Boost configuration"),
             "unexpected fail-closed error: {error}"
         );
     }
@@ -6814,7 +7667,7 @@ mod tests {
             game.add_player(user_id, None).expect("add stress player");
         }
         game.status = GameStatus::Started { server_id: 1 };
-        game.properties.available_food_target = 1;
+        game.rng = None;
         game.arena.food = vec![Position { x: 22, y: 20 }];
 
         // Four disjoint clockwise circuits keep ordinary movement, turn,
@@ -6835,7 +7688,7 @@ mod tests {
             ];
             snake.direction = Direction::Right;
             snake.food = 0;
-            snake.reset_boost_and_movement();
+            snake.reset_boost_and_movement(None);
         }
 
         let config = game.properties.boost.clone().unwrap();

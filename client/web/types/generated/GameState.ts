@@ -3,6 +3,7 @@ import type { Arena } from "./Arena";
 import type { GameProperties } from "./GameProperties";
 import type { GameStatus } from "./GameStatus";
 import type { GameType } from "./GameType";
+import type { MatchReadiness } from "./MatchReadiness";
 import type { Player } from "./Player";
 import type { QueueMode } from "./QueueMode";
 import type { SnakeCrash } from "./SnakeCrash";
@@ -39,4 +40,18 @@ idle_kicked_user_ids: Array<number>,
  * True only when inactivity, rather than the mode's ordinary score/death
  * condition, produced the terminal result.
  */
-completed_by_inactivity: boolean, };
+completed_by_inactivity: boolean,
+/**
+ * Pre-match readiness gate. Present from match creation until every
+ * player has confirmed or the deadline lapses, then cleared for good.
+ * `None` also covers matches created before this protocol existed, which
+ * therefore start straight off `start_ms` exactly as they used to.
+ */
+readiness: MatchReadiness | null,
+/**
+ * Wall clock at which simulation actually begins, once the readiness gate
+ * has resolved. `None` means "use `start_ms`" — either the gate is still
+ * holding the match (in which case nothing may advance at all) or the
+ * match never had a gate.
+ */
+simulation_epoch_ms: number | null, };
