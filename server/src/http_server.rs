@@ -399,6 +399,11 @@ async fn upload_client_trace(
     }
 }
 
+// Authentication and gameplay commands are small JSON messages. Bound frames
+// before Axum buffers and deserializes them so oversized unauthenticated input
+// cannot allocate tungstenite's much larger default allowance.
+const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// WebSocket upgrade handler
 async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -417,44 +422,46 @@ async fn websocket_handler(
     let connection_count = state.connection_count.clone();
     let lifecycle = state.lifecycle.clone();
 
-    ws.on_upgrade(move |socket| async move {
-        // Count only upgrades that actually became WebSockets. Incrementing in
-        // the HTTP handler leaks the drain counter when a client disappears
-        // after the 101 response is prepared but before Axum runs this future.
-        let count = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
-        lifecycle.websocket_opened();
-        crate::resilience_metrics::record_websocket_opened(1);
-        tracing::debug!("WebSocket connection opened, total connections: {}", count);
+    ws.max_message_size(MAX_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            // Count only upgrades that actually became WebSockets. Incrementing in
+            // the HTTP handler leaks the drain counter when a client disappears
+            // after the 101 response is prepared but before Axum runs this future.
+            let count = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+            lifecycle.websocket_opened();
+            crate::resilience_metrics::record_websocket_opened(1);
+            tracing::debug!("WebSocket connection opened, total connections: {}", count);
 
-        // Handle the WebSocket connection
-        let session_started_at = Instant::now();
-        handle_websocket(
-            socket,
-            state.db,
-            state.user_cache,
-            state.jwt_verifier,
-            state.redis,
-            state.redis_url,
-            state.pubsub_manager,
-            state.game_bus,
-            state.matchmaking_manager,
-            state.replication_manager,
-            state.cancellation_token,
-            state.lobby_manager,
-            state.region,
-            lifecycle.clone(),
-            state.cluster_namespace,
-        )
-        .await;
-        crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());
+            // Handle the WebSocket connection
+            let session_started_at = Instant::now();
+            handle_websocket(
+                socket,
+                state.db,
+                state.user_cache,
+                state.jwt_verifier,
+                state.redis,
+                state.redis_url,
+                state.pubsub_manager,
+                state.game_bus,
+                state.matchmaking_manager,
+                state.replication_manager,
+                state.cancellation_token,
+                state.lobby_manager,
+                state.region,
+                lifecycle.clone(),
+                state.cluster_namespace,
+            )
+            .await;
+            crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());
 
-        // Decrement connection count when connection closes
-        let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
-        lifecycle.websocket_closed();
-        crate::resilience_metrics::record_websocket_closed(1);
-        tracing::debug!("WebSocket connection closed, total connections: {}", count);
-    })
-    .into_response()
+            // Decrement connection count when connection closes
+            let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;
+            lifecycle.websocket_closed();
+            crate::resilience_metrics::record_websocket_closed(1);
+            tracing::debug!("WebSocket connection closed, total connections: {}", count);
+        })
+        .into_response()
 }
 
 /// ECS liveness: a Valkey outage must not create a task replacement storm.

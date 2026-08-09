@@ -1586,6 +1586,195 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
 }
 
 #[tokio::test]
+async fn chat_filter_masks_live_persisted_and_legacy_history_messages() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut env = TestEnvironment::new("chat_content_filtering").await?;
+    env.add_server().await?;
+    let host_user_id = env.create_user().await?;
+    let follower_user_id = env.create_user().await?;
+    let server_addr = env.ws_addr(0).expect("server should exist");
+
+    let mut host = TestClient::connect(&server_addr).await?;
+    host.authenticate(host_user_id).await?;
+    let lobby_code = host.create_lobby().await?;
+
+    let mut follower = TestClient::connect(&server_addr).await?;
+    follower.authenticate(follower_user_id).await?;
+    follower
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: lobby_code.clone(),
+            preferences: None,
+        })
+        .await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::JoinedLobby {
+                lobby_code: joined_lobby_code,
+            } = follower.receive_message().await?
+                && joined_lobby_code == lobby_code
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    timeout(
+        Duration::from_secs(5),
+        await_lobby_roster_without_forbidden_member(
+            &mut host,
+            &lobby_code,
+            &[host_user_id as u32, follower_user_id as u32],
+            u32::MAX,
+        ),
+    )
+    .await??;
+
+    // This phrase regresses if already-filtered text is accidentally run
+    // through the detector again at publish or subscriber boundaries.
+    let raw_message = "so many a^s hole sin this server";
+    let expected_message = "so many ******** sin this server";
+    host.send_message(WSMessage::Chat(raw_message.to_owned()))
+        .await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LobbyChatMessage {
+                lobby_code: message_lobby_code,
+                message,
+                ..
+            } = host.receive_message().await?
+                && message_lobby_code == lobby_code
+            {
+                assert_eq!(message, expected_message);
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let history_key = RedisKeys::lobby_chat_history_key(&lobby_code);
+    let stored_entries: Vec<String> = redis.lrange(&history_key, 0, -1).await?;
+    let stored_message: serde_json::Value = serde_json::from_str(
+        stored_entries
+            .last()
+            .expect("published chat should be retained in lobby history"),
+    )?;
+    assert_eq!(stored_message["message"], expected_message);
+    assert_ne!(stored_message["message"], raw_message);
+    assert_eq!(stored_message["content_filter_version"], 1);
+
+    // During a rolling deployment, a new subscriber can still receive flat
+    // payloads published by an older server. Sanitize those before WebSocket
+    // delivery as well as when replaying history.
+    let legacy_live_message_id = "legacy-unfiltered-live-message";
+    let legacy_live_entry = serde_json::json!({
+        "lobby_code": lobby_code.clone(),
+        "message_id": legacy_live_message_id,
+        "user_id": host_user_id,
+        "username": "legacy-user",
+        "message": "fuck",
+        "timestamp_ms": Utc::now().timestamp_millis(),
+    })
+    .to_string();
+    let subscribers: i64 = redis
+        .publish(
+            RedisKeys::lobby_chat_channel(&lobby_code),
+            legacy_live_entry,
+        )
+        .await?;
+    assert!(
+        subscribers > 0,
+        "the lobby chat subscriber should be active"
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LobbyChatMessage {
+                message_id,
+                message,
+                ..
+            } = host.receive_message().await?
+                && message_id == legacy_live_message_id
+            {
+                assert_eq!(message, "****");
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    // Simulate an entry written before filtering was deployed. History reads
+    // must still sanitize it before sending it to a client.
+    let legacy_entry = serde_json::json!({
+        "lobby_code": lobby_code,
+        "message_id": "legacy-unfiltered-message",
+        "user_id": host_user_id,
+        "username": "legacy-user",
+        "message": "fuck",
+        "timestamp_ms": Utc::now().timestamp_millis(),
+    })
+    .to_string();
+    redis.rpush::<_, _, ()>(&history_key, legacy_entry).await?;
+
+    follower.send_message(WSMessage::LeaveLobby).await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(follower.receive_message().await?, WSMessage::LeftLobby) {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    follower
+        .send_message(WSMessage::JoinLobby {
+            lobby_code: lobby_code.clone(),
+            preferences: None,
+        })
+        .await?;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LobbyChatHistory {
+                lobby_code: history_lobby_code,
+                messages,
+            } = follower.receive_message().await?
+                && history_lobby_code == lobby_code
+            {
+                let history = serde_json::to_value(messages)?;
+                let legacy = history
+                    .as_array()
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .find(|message| message["message_id"] == "legacy-unfiltered-message")
+                    })
+                    .expect("legacy history entry should be replayed");
+                assert_eq!(legacy["message"], "****");
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
+    let repaired_entries: Vec<String> = redis.lrange(&history_key, 0, -1).await?;
+    let repaired_legacy = repaired_entries
+        .iter()
+        .map(|entry| serde_json::from_str::<serde_json::Value>(entry))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|entry| entry["message_id"] == "legacy-unfiltered-message")
+        .expect("legacy history entry should remain after atomic read repair");
+    assert_eq!(repaired_legacy["message"], "****");
+    assert_eq!(repaired_legacy["content_filter_version"], 1);
+
+    follower.disconnect().await?;
+    host.disconnect().await?;
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn direct_lobby_switch_is_denied_without_restarting_current_scope() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let mut env = TestEnvironment::new("lobby_switch_denial").await?;

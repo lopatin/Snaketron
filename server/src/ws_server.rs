@@ -1,4 +1,5 @@
 use crate::api::auth::validate_username;
+use crate::chat_filter::filter_chat_message;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::game_bus::GameBus;
@@ -271,6 +272,24 @@ pub struct PlayerMetadata {
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
 const CHAT_HISTORY_LIMIT: usize = 200;
+const CHAT_CONTENT_FILTER_VERSION: u8 = 1;
+const REPAIR_LEGACY_CHAT_HISTORY_SCRIPT: &str = r#"
+local replacements = {}
+for i = 1, #ARGV, 2 do
+    replacements[ARGV[i]] = ARGV[i + 1]
+end
+
+local entries = redis.call('LRANGE', KEYS[1], 0, -1)
+local changed = 0
+for index, entry in ipairs(entries) do
+    local replacement = replacements[entry]
+    if replacement then
+        redis.call('LSET', KEYS[1], index - 1, replacement)
+        changed = changed + 1
+    end
+end
+return changed
+"#;
 const LOBBY_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
 const LOBBY_MATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -315,6 +334,166 @@ pub struct GameChatBroadcast {
     message: String,
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     timestamp_ms: i64,
+}
+
+/// Redis-only envelopes let rolling deployments distinguish messages that
+/// were filtered at ingress from legacy payloads that still need filtering.
+/// The flattened chat fields preserve compatibility with older servers.
+#[derive(Debug, Serialize, Deserialize)]
+struct RedisLobbyChatPayload {
+    #[serde(flatten)]
+    chat: LobbyChatBroadcast,
+    #[serde(default)]
+    content_filter_version: u8,
+}
+
+impl RedisLobbyChatPayload {
+    fn from_filtered(chat: LobbyChatBroadcast) -> Self {
+        Self {
+            chat,
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION,
+        }
+    }
+
+    fn filter_legacy(&mut self) -> bool {
+        // Version zero is the only unfiltered legacy format. Any positive
+        // version has already been sanitized and must not be run through a
+        // non-idempotent detector again during future filter upgrades.
+        if self.content_filter_version == 0 {
+            self.chat.message = filter_chat_message(&self.chat.message);
+            self.content_filter_version = CHAT_CONTENT_FILTER_VERSION;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn into_filtered(mut self) -> LobbyChatBroadcast {
+        self.filter_legacy();
+        self.chat
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RedisGameChatPayload {
+    #[serde(flatten)]
+    chat: GameChatBroadcast,
+    #[serde(default)]
+    content_filter_version: u8,
+}
+
+impl RedisGameChatPayload {
+    fn from_filtered(chat: GameChatBroadcast) -> Self {
+        Self {
+            chat,
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION,
+        }
+    }
+
+    fn filter_legacy(&mut self) -> bool {
+        if self.content_filter_version == 0 {
+            self.chat.message = filter_chat_message(&self.chat.message);
+            self.content_filter_version = CHAT_CONTENT_FILTER_VERSION;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn into_filtered(mut self) -> GameChatBroadcast {
+        self.filter_legacy();
+        self.chat
+    }
+}
+
+#[cfg(test)]
+mod chat_payload_tests {
+    use super::*;
+
+    const RAW_MESSAGE: &str = "so many a^s hole sin this server";
+
+    fn lobby_chat(message: String) -> LobbyChatBroadcast {
+        LobbyChatBroadcast {
+            lobby_code: "ABC123".to_owned(),
+            message_id: "lobby-message".to_owned(),
+            user_id: 7,
+            username: "player".to_owned(),
+            message,
+            timestamp_ms: 1,
+        }
+    }
+
+    fn game_chat(message: String) -> GameChatBroadcast {
+        GameChatBroadcast {
+            game_id: 42,
+            message_id: "game-message".to_owned(),
+            user_id: 7,
+            username: "player".to_owned(),
+            message,
+            timestamp_ms: 1,
+        }
+    }
+
+    #[test]
+    fn current_lobby_and_game_payloads_are_not_filtered_twice() {
+        let filtered = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&RedisLobbyChatPayload::from_filtered(lobby_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let lobby: RedisLobbyChatPayload = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(lobby.content_filter_version, CHAT_CONTENT_FILTER_VERSION);
+        assert_eq!(lobby.into_filtered().message, filtered);
+
+        let game_json = serde_json::to_string(&RedisGameChatPayload::from_filtered(game_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let game: RedisGameChatPayload = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(game.content_filter_version, CHAT_CONTENT_FILTER_VERSION);
+        assert_eq!(game.into_filtered().message, filtered);
+
+        let future = RedisLobbyChatPayload {
+            chat: lobby_chat(filtered.clone()),
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION + 1,
+        };
+        assert_eq!(future.into_filtered().message, filtered);
+    }
+
+    #[test]
+    fn legacy_lobby_and_game_payloads_are_filtered_on_read() {
+        let expected = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&lobby_chat(RAW_MESSAGE.to_owned())).unwrap();
+        let lobby: RedisLobbyChatPayload = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(lobby.content_filter_version, 0);
+        assert_eq!(lobby.into_filtered().message, expected);
+
+        let game_json = serde_json::to_string(&game_chat(RAW_MESSAGE.to_owned())).unwrap();
+        let game: RedisGameChatPayload = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(game.content_filter_version, 0);
+        assert_eq!(game.into_filtered().message, expected);
+    }
+
+    #[test]
+    fn current_envelopes_remain_readable_by_legacy_servers() {
+        let filtered = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&RedisLobbyChatPayload::from_filtered(lobby_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let legacy_lobby: LobbyChatBroadcast = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(legacy_lobby.message, filtered);
+
+        let game_json = serde_json::to_string(&RedisGameChatPayload::from_filtered(game_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let legacy_game: GameChatBroadcast = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(legacy_game.message, filtered);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1313,11 +1492,11 @@ async fn handle_websocket_connection(
 
 async fn publish_lobby_chat_message(
     mut redis: RedisConnection,
-    mut payload: LobbyChatBroadcast,
+    payload: LobbyChatBroadcast,
 ) -> Result<()> {
-    payload.message = crate::chat_moderation::censor_chat_message(&payload.message);
-    let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
-    let history_key = RedisKeys::lobby_chat_history_key(&payload.lobby_code);
+    let payload = RedisLobbyChatPayload::from_filtered(payload);
+    let channel = RedisKeys::lobby_chat_channel(&payload.chat.lobby_code);
+    let history_key = RedisKeys::lobby_chat_history_key(&payload.chat.lobby_code);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize lobby chat payload")?;
 
@@ -1340,11 +1519,11 @@ async fn publish_lobby_chat_message(
 
 async fn publish_game_chat_message(
     mut redis: RedisConnection,
-    mut payload: GameChatBroadcast,
+    payload: GameChatBroadcast,
 ) -> Result<()> {
-    payload.message = crate::chat_moderation::censor_chat_message(&payload.message);
-    let channel = RedisKeys::game_chat_channel(payload.game_id);
-    let history_key = RedisKeys::game_chat_history_key(payload.game_id);
+    let payload = RedisGameChatPayload::from_filtered(payload);
+    let channel = RedisKeys::game_chat_channel(payload.chat.game_id);
+    let history_key = RedisKeys::game_chat_history_key(payload.chat.game_id);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize game chat payload")?;
 
@@ -1483,9 +1662,21 @@ async fn load_lobby_chat_history(
         .context("Failed to load lobby chat history")?;
 
     let mut messages = Vec::with_capacity(entries.len());
+    let mut repairs = Vec::new();
     for entry in entries {
-        match serde_json::from_str::<LobbyChatBroadcast>(&entry) {
-            Ok(chat) => messages.push(chat),
+        match serde_json::from_str::<RedisLobbyChatPayload>(&entry) {
+            Ok(mut payload) => {
+                if payload.filter_legacy() {
+                    match serde_json::to_string(&payload) {
+                        Ok(replacement) => repairs.push((entry, replacement)),
+                        Err(error) => warn!(
+                            "Failed to serialize repaired lobby chat history entry for lobby '{}': {}",
+                            lobby_code, error
+                        ),
+                    }
+                }
+                messages.push(payload.chat);
+            }
             Err(e) => {
                 warn!(
                     "Failed to deserialize lobby chat history entry for lobby '{}': {}",
@@ -1493,6 +1684,15 @@ async fn load_lobby_chat_history(
                 );
             }
         }
+    }
+
+    if let Err(error) = repair_legacy_chat_history(&mut redis, &key, &repairs).await {
+        warn!(
+            "Failed to repair {} legacy lobby chat history entries for lobby '{}': {}",
+            repairs.len(),
+            lobby_code,
+            error
+        );
     }
 
     Ok(messages)
@@ -1509,9 +1709,21 @@ async fn load_game_chat_history(
         .context("Failed to load game chat history")?;
 
     let mut messages = Vec::with_capacity(entries.len());
+    let mut repairs = Vec::new();
     for entry in entries {
-        match serde_json::from_str::<GameChatBroadcast>(&entry) {
-            Ok(chat) => messages.push(chat),
+        match serde_json::from_str::<RedisGameChatPayload>(&entry) {
+            Ok(mut payload) => {
+                if payload.filter_legacy() {
+                    match serde_json::to_string(&payload) {
+                        Ok(replacement) => repairs.push((entry, replacement)),
+                        Err(error) => warn!(
+                            "Failed to serialize repaired game chat history entry for game {}: {}",
+                            game_id, error
+                        ),
+                    }
+                }
+                messages.push(payload.chat);
+            }
             Err(e) => {
                 warn!(
                     "Failed to deserialize game chat history entry for game {}: {}",
@@ -1521,7 +1733,38 @@ async fn load_game_chat_history(
         }
     }
 
+    if let Err(error) = repair_legacy_chat_history(&mut redis, &key, &repairs).await {
+        warn!(
+            "Failed to repair {} legacy game chat history entries for game {}: {}",
+            repairs.len(),
+            game_id,
+            error
+        );
+    }
+
     Ok(messages)
+}
+
+async fn repair_legacy_chat_history(
+    redis: &mut RedisConnection,
+    key: &str,
+    repairs: &[(String, String)],
+) -> Result<()> {
+    if repairs.is_empty() {
+        return Ok(());
+    }
+
+    let script = redis::Script::new(REPAIR_LEGACY_CHAT_HISTORY_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation.key(key);
+    for (legacy, replacement) in repairs {
+        invocation.arg(legacy).arg(replacement);
+    }
+    invocation
+        .invoke_async::<i64>(redis)
+        .await
+        .context("Failed to atomically repair legacy chat history")?;
+    Ok(())
 }
 
 fn game_state_records_user(game_state: &GameState, user_id: u32) -> bool {
@@ -3299,13 +3542,14 @@ async fn subscribe_to_game_chat(
         .context("Failed to subscribe to game chat channel")?;
 
     loop {
-        let chat_payload: GameChatBroadcast = match receiver.recv().await {
+        let chat_payload: RedisGameChatPayload = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
                 warn!("Failed to receive game chat payload: {}", e);
                 break;
             }
         };
+        let chat_payload = chat_payload.into_filtered();
 
         let ws_message = WSMessage::GameChatMessage {
             game_id: chat_payload.game_id,
@@ -3352,13 +3596,14 @@ async fn subscribe_to_lobby_chat(
         .context("Failed to subscribe to lobby chat channel")?;
 
     loop {
-        let chat_payload: LobbyChatBroadcast = match receiver.recv().await {
+        let chat_payload: RedisLobbyChatPayload = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
                 warn!("Failed to receive lobby chat payload: {}", e);
                 break;
             }
         };
+        let chat_payload = chat_payload.into_filtered();
 
         let ws_message = WSMessage::LobbyChatMessage {
             lobby_code: chat_payload.lobby_code.clone(),
@@ -3544,10 +3789,19 @@ async fn process_ws_message(
         }
         ConnectionState::Authenticated { .. } => "Authenticated",
     };
-    debug!(
-        "Processing message: {:?} in state: {}",
-        ws_message, state_str
-    );
+    match &ws_message {
+        WSMessage::Chat(_)
+        | WSMessage::LobbyChatMessage { .. }
+        | WSMessage::GameChatMessage { .. }
+        | WSMessage::LobbyChatHistory { .. }
+        | WSMessage::GameChatHistory { .. } => {
+            debug!("Processing chat-bearing message: <redacted> in state: {state_str}")
+        }
+        _ => debug!(
+            "Processing message: {:?} in state: {}",
+            ws_message, state_str
+        ),
+    }
 
     match state {
         ConnectionState::Unauthenticated => {
@@ -4274,6 +4528,16 @@ async fn process_ws_message(
                         });
                     }
 
+                    let filtered_message = filter_chat_message(trimmed);
+                    if filtered_message.trim().is_empty() {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+
                     let mut publish_error = false;
                     if let Some(current_game_id) = game_id {
                         let payload = GameChatBroadcast {
@@ -4281,7 +4545,7 @@ async fn process_ws_message(
                             message_id: uuid::Uuid::new_v4().to_string(),
                             user_id: metadata.user_id,
                             username: metadata.username.clone(),
-                            message: trimmed.to_string(),
+                            message: filtered_message,
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
@@ -4298,7 +4562,7 @@ async fn process_ws_message(
                             message_id: uuid::Uuid::new_v4().to_string(),
                             user_id: metadata.user_id,
                             username: metadata.username.clone(),
-                            message: trimmed.to_string(),
+                            message: filtered_message,
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
@@ -4848,17 +5112,20 @@ fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput, PlayerMetadata,
-        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
-        acknowledge_lobby_match_handoff, canonical_command_identity, command_outcomes_for_user,
-        ensure_custom_game_access, game_join_denied, game_join_failure_message,
+        CommandOutcomeReplay, GameChatBroadcast, GameJoinAuthorizationError, GameSubscriptionInput,
+        PlayerMetadata, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
+        abort_and_join_game_event_forwarder, acknowledge_lobby_match_handoff,
+        canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
+        game_join_denied, game_join_failure_message, load_game_chat_history,
         log_client_protocol_version, missing_game_join_failure, next_game_subscription_input,
-        next_lobby_match, next_outbound_message, queue_planned_drain_notice,
-        recovery_bridge_snapshot, refresh_connection_username, require_game_command_publication,
+        next_lobby_match, next_outbound_message, publish_game_chat_message,
+        queue_planned_drain_notice, recovery_bridge_snapshot, refresh_connection_username,
+        repair_legacy_chat_history, require_game_command_publication,
         send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
         send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
-        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        take_lobby_update_receiver, validate_game_matchmaking_pool,
+        snapshot_requires_command_outcomes, subscribe_to_game_chat,
+        subscribe_to_lobby_match_notifications, take_lobby_update_receiver,
+        validate_game_matchmaking_pool,
     };
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -5477,6 +5744,150 @@ mod lifecycle_protocol_tests {
             .del::<_, ()>((mapping_key, pending_key))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_game_chat_envelope_persists_replays_and_forwards_live() {
+        let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
+        let client = Client::open(redis_url).unwrap();
+        let (pubsub_tx, _pubsub_rx) = broadcast::channel(128);
+        let redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
+        let mut control = client.get_multiplexed_async_connection().await.unwrap();
+        let game_id = uuid::Uuid::new_v4().as_u128() as u32;
+        let history_key = RedisKeys::game_chat_history_key(game_id);
+        let channel = RedisKeys::game_chat_channel(game_id);
+        control.del::<_, ()>(&history_key).await.unwrap();
+
+        let filtered_message = "so many ******** sin this server";
+        let message_id = "game-chat-filter-regression";
+        publish_game_chat_message(
+            redis.clone().into(),
+            GameChatBroadcast {
+                game_id,
+                message_id: message_id.to_owned(),
+                user_id: 7,
+                username: "player".to_owned(),
+                message: filtered_message.to_owned(),
+                timestamp_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored_entries: Vec<String> = control.lrange(&history_key, 0, -1).await.unwrap();
+        let stored = stored_entries
+            .last()
+            .expect("published game chat should be retained");
+        let stored_json: serde_json::Value = serde_json::from_str(stored).unwrap();
+        assert_eq!(stored_json["game_id"], game_id);
+        assert_eq!(stored_json["message"], filtered_message);
+        assert_eq!(stored_json["content_filter_version"], 1);
+
+        let legacy_message_id = "legacy-game-chat-filter-regression";
+        let legacy_entry = serde_json::json!({
+            "game_id": game_id,
+            "message_id": legacy_message_id,
+            "user_id": 7,
+            "username": "legacy-player",
+            "message": "fuck",
+            "timestamp_ms": 2,
+        })
+        .to_string();
+        control
+            .rpush::<_, _, ()>(&history_key, legacy_entry)
+            .await
+            .unwrap();
+
+        let history = load_game_chat_history(redis.clone().into(), game_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].message, filtered_message);
+        assert_eq!(history[1].message_id, legacy_message_id);
+        assert_eq!(history[1].message, "****");
+
+        let repaired_entries: Vec<String> = control.lrange(&history_key, 0, -1).await.unwrap();
+        let repaired_legacy = repaired_entries
+            .iter()
+            .map(|entry| serde_json::from_str::<serde_json::Value>(entry).unwrap())
+            .find(|entry| entry["message_id"] == legacy_message_id)
+            .expect("legacy game chat should remain after atomic read repair");
+        assert_eq!(repaired_legacy["message"], "****");
+        assert_eq!(repaired_legacy["content_filter_version"], 1);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel(4);
+        let listener = tokio::spawn(subscribe_to_game_chat(game_id, pubsub_manager, ws_tx));
+
+        let live = timeout(Duration::from_secs(2), async {
+            loop {
+                control.publish::<_, _, ()>(&channel, stored).await.unwrap();
+                if let Ok(Some(message)) = timeout(Duration::from_millis(50), ws_rx.recv()).await {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("game chat subscriber did not forward the current envelope");
+        assert!(matches!(
+            decode_ws_message(live),
+            WSMessage::GameChatMessage {
+                game_id: delivered_game_id,
+                message_id: delivered_message_id,
+                message,
+                ..
+            } if delivered_game_id == game_id
+                && delivered_message_id == message_id
+                && message == filtered_message
+        ));
+
+        listener.abort();
+        let _ = listener.await;
+        control.del::<_, ()>(&history_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_chat_read_repair_compares_current_entries_before_replacing() {
+        let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
+        let client = Client::open(redis_url).unwrap();
+        let (pubsub_tx, _pubsub_rx) = broadcast::channel(8);
+        let redis = create_connection_manager(client.clone(), pubsub_tx)
+            .await
+            .unwrap();
+        let mut control = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "chat-history-repair-race:{}",
+            uuid::Uuid::new_v4().as_u128()
+        );
+        control.del::<_, ()>(&key).await.unwrap();
+        control
+            .rpush::<_, _, ()>(&key, &["legacy-a", "legacy-b"])
+            .await
+            .unwrap();
+        control.expire::<_, ()>(&key, 120).await.unwrap();
+
+        let stale_repairs = vec![
+            ("legacy-a".to_owned(), "filtered-a".to_owned()),
+            ("legacy-b".to_owned(), "filtered-b".to_owned()),
+        ];
+        control.rpush::<_, _, ()>(&key, "current-c").await.unwrap();
+        control.ltrim::<_, ()>(&key, -2, -1).await.unwrap();
+
+        let mut repair_redis = redis.into();
+        repair_legacy_chat_history(&mut repair_redis, &key, &stale_repairs)
+            .await
+            .unwrap();
+
+        let repaired: Vec<String> = control.lrange(&key, 0, -1).await.unwrap();
+        assert_eq!(repaired, ["filtered-b", "current-c"]);
+        let ttl: i64 = control.ttl(&key).await.unwrap();
+        assert!(ttl > 0, "read repair should preserve the existing TTL");
+        control.del::<_, ()>(&key).await.unwrap();
     }
 
     #[test]
