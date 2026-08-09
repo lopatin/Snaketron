@@ -11,20 +11,32 @@ export type ScreenDirection = 'Up' | 'Down' | 'Left' | 'Right';
  * Viewport room the arena sizing must leave free for the touch clusters.
  * GameArena's `calculateSizes` subtracts these and GameArena.css pads the
  * stage by the same values (via --touch-portrait-reserve/--touch-side-reserve
- * set on the arena root), so the canvas never slides under a d-pad. The
- * numbers cover the largest cluster footprint: 158px d-pad + edge margins.
+ * set on the arena root), so the canvas never slides under a cluster.
+ *
+ * Portrait: one cluster row (Boost beside the 158px d-pad) hugging the bottom
+ * edge (18px) with a 12px gap to the arena. Landscape: each side column is
+ * 158px wide with a 14px edge margin and a 16px gap to the arena.
  */
-export const TOUCH_PORTRAIT_BOTTOM_RESERVE_PX = 196;
+export const TOUCH_PORTRAIT_BOTTOM_RESERVE_PX = 188;
 export const TOUCH_LANDSCAPE_SIDE_RESERVE_PX = 188;
+
+interface BoostPointerHandlers {
+  onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  onPointerRelease: (event: React.PointerEvent<HTMLButtonElement>) => void;
+}
 
 export interface TouchBoostBinding {
   hud: BoostHudView;
   inputMode: BoostInputMode;
   /** Toggle-mode activation; the controller ignores it in hold mode. */
   onTap: () => void;
-  /** Hold-mode pointer edges; the controller ignores them in toggle mode. */
-  onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
-  onPointerRelease: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  /**
+   * Hold-mode pointer edges, one independent binding per rendered button so
+   * both landscape Boost buttons can be held at once — the shared controller
+   * counts holds and ends Boost on the last release.
+   */
+  primary: BoostPointerHandlers;
+  secondary: BoostPointerHandlers;
 }
 
 interface TouchControlsProps {
@@ -123,74 +135,94 @@ function DPad({ onSteer, side }: DPadProps) {
   );
 }
 
-/**
- * On-screen gameplay controls for touch surfaces.
- *
- * Portrait shows one d-pad near the bottom-right (right-thumb steering) with
- * the NOS Boost button adjacent on its left. Landscape shows a d-pad at each
- * top corner so either thumb can steer, with the Boost button under the left
- * pad. Which clusters are visible is pure CSS (orientation media queries), so
- * rotating the device never remounts a control mid-hold.
- */
-export function TouchControls({ onSteer, boost, fullscreen }: TouchControlsProps) {
-  const boostHud = boost?.hud ?? null;
-  const chargeDegrees = boostHud ? Math.round(boostHud.fillRatio * 360) : 0;
-
-  const boostButton = boost && boostHud ? (
+function BoostButton({
+  boost,
+  handlers,
+  testId,
+}: {
+  boost: TouchBoostBinding;
+  handlers: BoostPointerHandlers;
+  testId: string;
+}) {
+  const { hud } = boost;
+  const chargeDegrees = Math.round(hud.fillRatio * 360);
+  return (
     <button
       type="button"
       className={
         'touch-boost' +
-        (boostHud.active ? ' is-active' : '') +
-        (boostHud.ready ? ' is-ready' : '')
+        (hud.active ? ' is-active' : '') +
+        (hud.ready ? ' is-ready' : '')
       }
       style={{ '--touch-boost-charge': `${chargeDegrees}deg` } as React.CSSProperties}
-      disabled={boostHud.buttonDisabled}
+      disabled={hud.buttonDisabled}
       aria-label={boost.inputMode === 'hold'
-        ? (boostHud.active
-            ? `Release Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
-            : `Hold to Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)
-        : (boostHud.active
-            ? `Stop Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
-            : `Activate Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)}
-      data-testid="touch-boost-button"
+        ? (hud.active
+            ? `Release Boost, ${hud.unlimited ? 'unlimited' : `${hud.percent}% remaining`}`
+            : `Hold to Boost, ${hud.unlimited ? 'unlimited' : `${hud.percent}% charged`}`)
+        : (hud.active
+            ? `Stop Boost, ${hud.unlimited ? 'unlimited' : `${hud.percent}% remaining`}`
+            : `Activate Boost, ${hud.unlimited ? 'unlimited' : `${hud.percent}% charged`}`)}
+      data-testid={testId}
       onClick={boost.onTap}
-      onPointerDown={boost.onPointerDown}
-      onPointerUp={boost.onPointerRelease}
-      onPointerCancel={boost.onPointerRelease}
-      onLostPointerCapture={boost.onPointerRelease}
+      onPointerDown={handlers.onPointerDown}
+      onPointerUp={handlers.onPointerRelease}
+      onPointerCancel={handlers.onPointerRelease}
+      onLostPointerCapture={handlers.onPointerRelease}
       onContextMenu={(event) => event.preventDefault()}
     >
       <BoostCanisterMark className="touch-boost__canister" />
     </button>
-  ) : null;
+  );
+}
 
-  const fullscreenButton = fullscreen ? (
-    <button
-      type="button"
-      className="touch-fullscreen"
-      aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'}
-      data-testid="touch-fullscreen-button"
-      onClick={fullscreen.onToggle}
-    >
-      {fullscreen.active
-        ? <FullscreenExitIcon className="touch-fullscreen__icon" />
-        : <FullscreenEnterIcon className="touch-fullscreen__icon" />}
-    </button>
-  ) : null;
-
+/**
+ * On-screen gameplay controls for touch surfaces.
+ *
+ * Portrait shows one cluster near the bottom-right: the NOS Boost button
+ * beside the d-pad. Landscape shows a mirrored cluster on each side — a d-pad
+ * at each top corner with a Boost button beneath it — so either hand can
+ * steer and boost. The fullscreen toggle is not part of the clusters; it
+ * pairs with the chat dock as a second rectangular utility button. Which
+ * clusters are visible is pure CSS (orientation media queries), so rotating
+ * the device never remounts a control mid-hold.
+ */
+export function TouchControls({ onSteer, boost, fullscreen }: TouchControlsProps) {
   return (
     <div className="touch-controls" data-testid="touch-controls">
       <div className="touch-controls__cluster touch-controls__cluster--left">
         <DPad onSteer={onSteer} side="left" />
+        {boost && (
+          <BoostButton
+            boost={boost}
+            handlers={boost.secondary}
+            testId="touch-boost-button-left"
+          />
+        )}
       </div>
       <div className="touch-controls__cluster touch-controls__cluster--right">
         <DPad onSteer={onSteer} side="right" />
+        {boost && (
+          <BoostButton
+            boost={boost}
+            handlers={boost.primary}
+            testId="touch-boost-button"
+          />
+        )}
       </div>
-      <div className="touch-controls__aux">
-        {boostButton}
-        {fullscreenButton}
-      </div>
+      {fullscreen && (
+        <button
+          type="button"
+          className="touch-fullscreen"
+          aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'}
+          data-testid="touch-fullscreen-button"
+          onClick={fullscreen.onToggle}
+        >
+          {fullscreen.active
+            ? <FullscreenExitIcon className="touch-fullscreen__icon" />
+            : <FullscreenEnterIcon className="touch-fullscreen__icon" />}
+        </button>
+      )}
     </div>
   );
 }

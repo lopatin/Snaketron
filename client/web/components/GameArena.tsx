@@ -535,36 +535,48 @@ export default function GameArena() {
       
       // Read the responsive chrome budget from CSS so arena sizing stays in
       // lockstep with the scoreboard, arena-owned utility rail, and controls.
+      const rootStyle = getComputedStyle(document.documentElement);
       const hudHeight = Number.parseFloat(
-        getComputedStyle(document.documentElement)
-          .getPropertyValue('--game-hud-top-footprint'),
+        rootStyle.getPropertyValue('--game-hud-top-footprint'),
       ) || 128;
       const boostIndicatorHeight = state.properties.boost
         ? Number.parseFloat(
-            getComputedStyle(document.documentElement)
-              .getPropertyValue('--game-boost-indicator-height'),
+            rootStyle.getPropertyValue('--game-boost-indicator-height'),
           ) || 40
         : 0;
-      // On touch surfaces the on-screen controls own part of the viewport:
-      // the portrait d-pad sits under the arena, the landscape d-pads flank
-      // it. These reserves mirror the stage padding in GameArena.css —
-      // including the safe-area insets, which are only ever non-zero on
-      // notched phones in fullscreen — so the canvas can never end up
-      // underneath a control cluster.
-      const rootStyle = getComputedStyle(document.documentElement);
       const safeAreaInset = (side: 'bottom' | 'left' | 'right'): number =>
         Number.parseFloat(rootStyle.getPropertyValue(`--safe-area-inset-${side}`)) || 0;
       // Strict comparison to match CSS: `orientation: portrait` matches when
       // height >= width, so an exactly-square viewport is portrait there too.
       const isLandscapeViewport = vw > vh;
-      const touchBottomReserve = isTouchSurface && !isLandscapeViewport
-        ? TOUCH_PORTRAIT_BOTTOM_RESERVE_PX + safeAreaInset('bottom')
-        : 0;
-      const touchSideReserve = isTouchSurface && isLandscapeViewport
-        ? TOUCH_LANDSCAPE_SIDE_RESERVE_PX * 2 + safeAreaInset('left') + safeAreaInset('right')
-        : 0;
-      const availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10 - touchBottomReserve;
-      const availableWidth = vw - 32 - 10 - touchSideReserve;
+
+      let availableHeight: number;
+      let availableWidth: number;
+      if (isTouchSurface) {
+        // Touch layouts budget the real in-flow chrome instead of the legacy
+        // desktop slack: the fixed scoreboard band, the roster anchor row, the
+        // charge strip, and the control-cluster reserves that mirror the stage
+        // padding in GameArena.css (safe-area insets included, which are only
+        // non-zero on notched phones in fullscreen). Every unspent pixel here
+        // is arena, which matters on a phone.
+        const scoreboardFootprint = Number.parseFloat(
+          rootStyle.getPropertyValue('--game-scoreboard-footprint'),
+        ) || 64;
+        const anchorFootprint = vw <= 760 ? 58 : 68;
+        const touchBottomReserve = isLandscapeViewport
+          ? 0
+          : TOUCH_PORTRAIT_BOTTOM_RESERVE_PX + safeAreaInset('bottom');
+        const touchSideReserve = isLandscapeViewport
+          ? TOUCH_LANDSCAPE_SIDE_RESERVE_PX * 2 + safeAreaInset('left') + safeAreaInset('right')
+          : 0;
+        availableHeight = vh - scoreboardFootprint - anchorFootprint -
+          boostIndicatorHeight - touchBottomReserve -
+          (isLandscapeViewport ? 22 : 16);
+        availableWidth = vw - 28 - touchSideReserve;
+      } else {
+        availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
+        availableWidth = vw - 32 - 10;
+      }
       
       // For vertical orientations (90° and 270°), we need to swap dimensions
       const isVertical = rotation === 90 || rotation === 270;
@@ -1283,7 +1295,14 @@ export default function GameArena() {
     boostInputContextRef,
     sendBoostDecision,
   );
+  // One binding per touch Boost button (right and left landscape clusters);
+  // the controller counts concurrent holds so Boost ends on the last release.
   const touchBoostPointer = useBoostPointerBinding(
+    boostInputControllerRef,
+    boostInputContextRef,
+    sendBoostDecision,
+  );
+  const touchBoostPointerLeft = useBoostPointerBinding(
     boostInputControllerRef,
     boostInputContextRef,
     sendBoostDecision,
@@ -1509,8 +1528,8 @@ export default function GameArena() {
         hud: boostHud,
         inputMode: boostInputMode,
         onTap: handleBoostButtonPress,
-        onPointerDown: touchBoostPointer.onPointerDown,
-        onPointerRelease: touchBoostPointer.onPointerRelease,
+        primary: touchBoostPointer,
+        secondary: touchBoostPointerLeft,
       } : null}
       fullscreen={showFullscreenControl
         ? { active: fullscreen.active, onToggle: fullscreen.toggle }
