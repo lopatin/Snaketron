@@ -1824,8 +1824,9 @@
   }
 
   /* The cluster owns the bottom-right corner; the chat dock and fullscreen
-     toggle sit as a pair of rectangular buttons at the bottom left, above
-     the controls legend. */
+     toggle run as a vertical stack along the left (long) edge, above the
+     controls legend — mirroring how landscape lays the pair along its own
+     long edge at the bottom. */
   .game-arena-screen.is-touch-surface .home-lobby-chat {
     right: auto;
     left: max(12px, env(safe-area-inset-left, 0px));
@@ -1833,8 +1834,8 @@
   }
 
   .touch-fullscreen {
-    left: calc(max(12px, env(safe-area-inset-left, 0px)) + 56px);
-    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+    left: max(12px, env(safe-area-inset-left, 0px));
+    bottom: calc(120px + env(safe-area-inset-bottom, 0px));
   }
 
   /* The small-screen hint normally stretches to the chat trigger's old spot
@@ -1906,6 +1907,27 @@
 @media (orientation: landscape) and (max-height: 400px) {
   .game-arena-screen.is-touch-surface .game-controls-hint.is-touch .game-controls-hint__group.is-boost {
     display: none;
+  }
+}
+
+/* Short landscape: the roster band's 19px snake pills sit in a 44px row
+   built for desktop air. Compacting the row (and the post-match Menu /
+   Score card buttons living in it) hands the arena a taller canvas —
+   calculateSizes budgets the same 30px total. */
+@media (orientation: landscape) and (max-height: 560px) {
+  .game-arena-screen.is-touch-surface .game-arena-utility-anchor {
+    height: 26px;
+    flex: 0 0 26px;
+    margin-block: 2px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-roster-band {
+    height: 26px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-roster-band .game-shell-button {
+    min-height: 24px;
+    padding: 0 8px;
   }
 }
 

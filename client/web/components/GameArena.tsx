@@ -562,7 +562,11 @@ export default function GameArena() {
         const scoreboardFootprint = Number.parseFloat(
           rootStyle.getPropertyValue('--game-scoreboard-footprint'),
         ) || 64;
-        const anchorFootprint = vw <= 760 ? 58 : 68;
+        // Short landscape compacts the roster band (GameArena.css) — its
+        // 19px snake pills never needed a 44px row, and on a phone the
+        // difference is a whole cell-size step for the arena.
+        const compactLandscape = isLandscapeViewport && vh <= 560;
+        const anchorFootprint = compactLandscape ? 30 : vw <= 760 ? 58 : 68;
         const touchBottomReserve = isLandscapeViewport
           ? 0
           : TOUCH_PORTRAIT_BOTTOM_RESERVE_PX + safeAreaInset('bottom');
@@ -571,7 +575,7 @@ export default function GameArena() {
           : 0;
         availableHeight = vh - scoreboardFootprint - anchorFootprint -
           boostIndicatorHeight - touchBottomReserve -
-          (isLandscapeViewport ? 22 : 16);
+          (isLandscapeViewport ? (compactLandscape ? 14 : 22) : 16);
         availableWidth = vw - 28 - touchSideReserve;
       } else {
         availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
