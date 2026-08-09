@@ -17,6 +17,7 @@ use common::{
 use futures_util::{SinkExt, StreamExt, future::join_all, stream::SplitSink};
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use server::game_executor::PARTITION_COUNT;
 use server::lifecycle::WS_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 use server::lobby_manager::LobbyPreferences;
 use server::recovery::CommandOutcome;
@@ -5278,7 +5279,7 @@ impl LiveSession {
                 session_id: self.record.session_id.clone(),
                 user_id: self.user_id,
                 game_id,
-                partition_id: game_id % 10,
+                partition_id: game_id % PARTITION_COUNT,
                 client_game_session_id: self.client_game_session_id.clone(),
                 command_sequence: sequence,
                 sent_at_unix_ms: resolution.sent_at_unix_ms,
@@ -6756,7 +6757,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             user_id: 7,
             game_id: 42,
-            partition_id: 2,
+            partition_id: 42 % PARTITION_COUNT,
             client_game_session_id: "game-session-1".to_owned(),
             command_sequence: sequence,
             sent_at_unix_ms: 1_000 + sequence,

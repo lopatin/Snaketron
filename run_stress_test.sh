@@ -204,14 +204,16 @@ jq -e '
   (.ScalableTargets | length) == 1
   and (.ScalableTargets[0] as $target
     | $target.MinCapacity == 1
-    and $target.MaxCapacity == 10
+    and $target.MaxCapacity == 25
     and ($target.SuspendedState.DynamicScalingInSuspended // false) == false
     and ($target.SuspendedState.DynamicScalingOutSuspended // false) == false
     and ($target.SuspendedState.ScheduledScalingSuspended // false) == false)
 ' "$report_dir/scalable-targets.json" >/dev/null || {
-  echo "Stress testing requires enabled ECS autoscaling with bounds 1..10" >&2
+  echo "Stress testing requires enabled ECS autoscaling with bounds 1..25" >&2
   exit 1
 }
+max_capacity="$(jq -er '.ScalableTargets[0].MaxCapacity' \
+  "$report_dir/scalable-targets.json")"
 
 aws application-autoscaling describe-scaling-policies \
   --region "$SNAKETRON_AWS_REGION" \
@@ -244,13 +246,13 @@ aws ecs describe-services \
   --cluster "$SNAKETRON_ECS_CLUSTER" \
   --services "$SNAKETRON_ECS_SERVICE" \
   >"$report_dir/baseline-service.json"
-jq -e '
+jq -e --argjson max_capacity "$max_capacity" '
   (.failures | length) == 0
   and (.services | length) == 1
   and (.services[0] as $service
     | $service.status == "ACTIVE"
     and $service.desiredCount >= 1
-    and $service.desiredCount < 10
+    and $service.desiredCount < $max_capacity
     and $service.runningCount == $service.desiredCount
     and $service.pendingCount == 0
     and ($service.deployments | length) == 1

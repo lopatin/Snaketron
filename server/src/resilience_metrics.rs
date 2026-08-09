@@ -2104,9 +2104,12 @@ mod tests {
 
         assert_eq!(
             summarize_partition_leases(Some(&assignment), &leases),
-            (9, 1, 2),
+            (u64::from(PARTITION_COUNT - 1), 1, 2),
         );
-        assert_eq!(summarize_partition_leases(None, &leases), (9, 0, 0));
+        assert_eq!(
+            summarize_partition_leases(None, &leases),
+            (u64::from(PARTITION_COUNT - 1), 0, 0),
+        );
         Ok(())
     }
 

@@ -16,7 +16,7 @@ impl RedisKeys {
     pub const MATCHMAKING_LOBBY_ACTIVE_GAME_PREFIX: &'static str =
         "matchmaking:{snaketron:mm}:lobby:";
     pub const MATCHMAKING_ACTIVE_GAME_SUFFIX: &'static str = ":active-game";
-    const EXECUTOR_PARTITION_COUNT: u32 = 10;
+    const EXECUTOR_PARTITION_COUNT: u32 = crate::game_executor::PARTITION_COUNT;
 
     fn executor_tag(partition_id: u32) -> String {
         format!("{{snaketron:exec:{partition_id}}}")
@@ -462,10 +462,14 @@ mod tests {
             "snaketron:readiness:use1:task:boot"
         );
         assert_eq!(hash_tag(&RedisKeys::stream_events(0)), "snaketron:exec:0");
-        assert_eq!(hash_tag(&RedisKeys::game_snapshot(123)), "snaketron:exec:3");
+        let game_partition_tag = format!(
+            "snaketron:exec:{}",
+            123 % crate::game_executor::PARTITION_COUNT,
+        );
+        assert_eq!(hash_tag(&RedisKeys::game_snapshot(123)), game_partition_tag);
         assert_eq!(
             hash_tag(&RedisKeys::cluster_planned_handoff_watermark("use1", 123)),
-            "snaketron:exec:3"
+            game_partition_tag
         );
 
         // Test game type hashing

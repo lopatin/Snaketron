@@ -71,7 +71,7 @@ checkpoint APIs: it SIGKILLs one incumbent and SIGSTOP/SIGCONTs another after
 each has claimed a durable command, then requires a successor process to take
 the expired lease, reclaim the pending entry, checkpoint and ACK it in under
 five seconds. The successor acquires the production coordinator lease and
-reconciles the complete ten-partition assignment before acquiring the
+reconciles the complete fifty-partition assignment before acquiring the
 partition; only the initial incumbent assignment is seeded by the harness. It
 also checkpoints two live games with a test-configured
 60-second retention, SIGKILLs both incumbents, recovers one through a successor
@@ -116,18 +116,31 @@ aws application-autoscaling register-scalable-target \
   --resource-id service/SNAKETRON_CLUSTER/SNAKETRON_SERVICE \
   --scalable-dimension ecs:service:DesiredCount \
   --min-capacity 1 \
-  --max-capacity 10 \
+  --max-capacity 25 \
   --suspended-state \
 DynamicScalingInSuspended=false,DynamicScalingOutSuspended=false,ScheduledScalingSuspended=false
 ```
 
-Development and production both allow a maximum of ten so the non-production
-service can run the release-blocking `1 -> 10 -> 1` certification staircase.
+Development and production both allow a maximum of 25 while the non-production
+service retains the release-blocking `1 -> 10 -> 1` certification staircase.
 Both retain a minimum of one. The application task uses two vCPU and four GiB
 so the one-task floor has takeover and burst headroom while target tracking is
 still observing load. CPU is targeted at 15%, memory at 80%, and both scale-in
 and scale-out cooldowns are 60 seconds. Development and production use the
 same policy.
+
+### One-time partition-count cutover
+
+The change from ten to fifty partitions changes `game_id % PARTITION_COUNT`
+and therefore the Redis hash-tag family for most existing games. It must not be
+released through the routine overlapping ECS rollout: the executor protocol
+version prevents mixed owners, but it does not move streams, active-game
+indexes, or checkpoints to their new partition keys, and old gateways still
+publish with the old mapping. Before production rollout, choose and certify
+either a maintenance cutover that drains games and fully stops the old task set
+before admitting traffic on the new build, or an explicit live-data migration
+with dual-version routing. Do not treat the protocol-version bump as a data
+migration.
 
 `QueueForMatch` uses the authoritative lobby state as its semantic
 acknowledgement. The browser and certification client retain only the single
@@ -281,7 +294,7 @@ which remains ready and resolves every command inside budget.
 
 Gate B must prove no active-socket hard reconnect, zero measured usable-session
 gap, terminal command outcomes, nonterminal game handoffs with
-command-outcome barriers, and exactly nine partition moves in each direction.
+command-outcome barriers, and exactly 45 partition moves in each direction.
 No game completion is awaited before either desired-count change. Its steady
 population is 128 command-bearing game sockets plus 23 context probes. The
 open-loop admission sessions are bounded transient traffic rather than another
@@ -1103,7 +1116,7 @@ Pub/Sub. Subscription confirmations must never share the reply queue used by
 matchmaking, executor, or recovery commands; this role separation is required
 for Serverless certification.
 
-Before declaring ready, each task independently bootstraps exactly ten
+Before declaring ready, each task independently bootstraps exactly fifty
 partition-hot `redis-rs` cluster connections, one deterministic lane for each
 fixed executor partition. Partition-scoped `GameBus` command publication and
 consumption, ordinary events, snapshot anchors, acknowledgements, and fenced
@@ -1147,7 +1160,7 @@ it cannot hold the partition command reader or amplify one join across every
 game. Partition startup and detected stream-gap repair remain partition-scoped.
 
 The durable `GameCreated` scanner groups each validated scan page by partition
-and uses nonblocking sends to ten delivery workers, one per fixed partition.
+and uses nonblocking sends to fifty delivery workers, one per fixed partition.
 Each lane holds one active and at most one queued batch. Its worker preserves
 publish, compare-delete, and marker-expiry order while continuing through the
 batch after a record-specific error. A full worker leaves the batch's records
@@ -1161,7 +1174,7 @@ Fenced partition-hot scripts execute through their partition lane and validate
 the live lease key atomically there; moving lease liveness traffic onto a busy
 data lane would weaken takeover timing. Full-state periodic checkpoints and
 terminal completion commits keep one independently bootstrapped checkpoint-write
-dispatcher per task. Independently bootstrap exactly ten partition-scoped
+dispatcher per task. Independently bootstrap exactly fifty partition-scoped
 recovery-read connections and route takeover journal/envelope loads,
 stored-snapshot and recovery-failure loads, reconnect outcome reads, and
 immutable completion-record loads by partition. Regional resilience metrics

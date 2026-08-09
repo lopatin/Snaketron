@@ -741,7 +741,8 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
-        // These correctness paths require a real executor partition (0..10).
+        // These correctness paths require a real executor partition
+        // (0..PARTITION_COUNT).
         // Give each such test a fixed, distinct partition so parallel tests
         // cannot delete one another's shared partition stream.
         let partition = 7;

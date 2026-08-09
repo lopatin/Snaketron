@@ -14,8 +14,8 @@ report_dir=""
 scaling_resource=""
 original_desired=""
 scaling_state=""
-canonical_scaling_state=$'1\t10\tFalse\tFalse\tFalse'
-suspended_scaling_state=$'1\t10\tTrue\tTrue\tTrue'
+canonical_scaling_state=$'1\t25\tFalse\tFalse\tFalse'
+suspended_scaling_state=$'1\t25\tTrue\tTrue\tTrue'
 gate_a_post_ready_required_full_seconds=60
 load_pid=""
 capacity_pid=""
@@ -457,7 +457,7 @@ select_hard_crash_authoritative_output_sample() {
                 <= .redis_observation_completed_at_ms
               and .first_scheduled_output.stream_unix_ms
                 <= .redis_observation_completed_at_ms
-              and .first_scheduled_output.game_id % 10 == $partition
+              and .first_scheduled_output.game_id % 50 == $partition
               and .first_scheduled_output.command_id.game_id
                 == .first_scheduled_output.game_id
               and .first_scheduled_output.command_id.sequence > 0
@@ -539,7 +539,7 @@ write_capacity_acceptance_report() {
               [($second | tostring)] // 0) as $command_outcomes
           | ($r.metrics.command_outcome_max_latency_ms_by_sent_unix_second
               [($second | tostring)] // null) as $max_outcome_latency_ms
-          | ([range(0; 10)
+          | ([range(0; 50)
               | . as $partition
               | select(
                   ($r.metrics
@@ -561,7 +561,7 @@ write_capacity_acceptance_report() {
                 and $command_outcomes == $commands_sent
                 and $max_outcome_latency_ms != null
                 and $max_outcome_latency_ms <= $max_latency_ms
-                and $productive_partitions == 10)
+                and $productive_partitions == 50)
             }] as $seconds
       | longest_streak($seconds) as $streak
       | {
@@ -814,7 +814,7 @@ write_gate_a_acceptance_report() {
                 == ($report.metrics.traffic.commands_sent // -1)
               and (($report.metrics
                 .scheduled_command_counts_by_partition_and_unix_second // {})
-                | length) == 10)
+                | length) == 50)
         } as $outcomes
       | (($report.missing // false) | not) as $summary_available
       | {
@@ -1336,7 +1336,7 @@ test_command_outcome_window_gate() {
       command_counts_by_unix_second: {"10": 5, "11": 6},
       scheduled_command_counts_by_sent_unix_second: {"10": 4, "11": 5},
       scheduled_command_counts_by_partition_and_unix_second:
-        (reduce range(0; 10) as $partition
+        (reduce range(0; 50) as $partition
           ({}; .[($partition | tostring)] = {"10": 1, "11": 1})),
       command_outcome_counts_by_sent_unix_second: {"10": 5, "11": 6},
       command_outcome_max_latency_ms_by_sent_unix_second: {"10": 999, "11": 1000}
@@ -1454,7 +1454,7 @@ test_command_outcome_window_gate() {
     and .duration_ms == 2000
   ' "$post_ready_window" >/dev/null || result=1
   command_outcome_window_diagnostics \
-    "$summary" "$post_ready_window" 1000 10 >"$post_ready_steady"
+    "$summary" "$post_ready_window" 1000 50 >"$post_ready_steady"
   jq -e '
     .passed
     and .required_full_seconds == 1
@@ -1463,8 +1463,17 @@ test_command_outcome_window_gate() {
     and .after_last_full_second == 12
     and .full_second_count == 1
   ' "$post_ready_steady" >/dev/null || result=1
+  jq 'del(
+    .metrics.scheduled_command_counts_by_partition_and_unix_second["49"]
+  )' "$summary" >"$invalid"
   command_outcome_window_diagnostics \
-    "$summary" "$post_ready_window" 1000 10 2 \
+    "$invalid" "$post_ready_window" 1000 50 \
+    | jq -e '
+        .passed == false
+        and .partition_coverage.uncovered_partitions == [49]
+      ' >/dev/null || result=1
+  command_outcome_window_diagnostics \
+    "$summary" "$post_ready_window" 1000 50 2 \
     >"$insufficient_post_ready_steady"
   jq -e '
     .passed == false
@@ -1585,7 +1594,7 @@ test_capacity_continuous_window_contract() {
         | {key: (. | tostring), value: $value}]
       | from_entries;
     def per_partition:
-      [range(0; 10)
+      [range(0; 50)
         | . as $partition
         | {
             key: ($partition | tostring),
@@ -2095,9 +2104,9 @@ test_hard_crash_evidence_selectors() {
         first_scheduled_output: {
           stream_id: (($stopped + 3000 | tostring) + "-0"),
           stream_unix_ms: ($stopped + 3000),
-          game_id: (10 + $partition),
+          game_id: (50 + $partition),
           command_id: {
-            game_id: (10 + $partition),
+            game_id: (50 + $partition),
             user_id: 77,
             client_game_session_id: "fixture-session",
             sequence: 1
@@ -5363,7 +5372,7 @@ assert_hard_crash_report() {
                 <= $authoritative_output[0].redis_observation_completed_at_ms
               and $authoritative_output[0].first_scheduled_output.stream_unix_ms
                 <= $authoritative_output[0].redis_observation_completed_at_ms
-              and $authoritative_output[0].first_scheduled_output.game_id % 10
+              and $authoritative_output[0].first_scheduled_output.game_id % 50
                 == $partition
               and $authoritative_output[0].first_scheduled_output
                 .command_id.game_id
@@ -5502,7 +5511,7 @@ run_staging_suite() {
       --resource-id "$scaling_resource" \
       --scalable-dimension ecs:service:DesiredCount \
       --min-capacity 1 \
-      --max-capacity 10 \
+      --max-capacity 25 \
       --suspended-state \
 "DynamicScalingInSuspended=$value,DynamicScalingOutSuspended=$value,ScheduledScalingSuspended=$value" \
       >/dev/null
@@ -5605,7 +5614,7 @@ run_staging_suite() {
     fi
     if ! staging_entry_state_is_valid \
       planned "$observed_desired" "$observed_scaling_state"; then
-      echo "Staging autoscaling must be min=1, max=10, and fully enabled; found: $observed_scaling_state" >&2
+      echo "Staging autoscaling must be min=1, max=25, and fully enabled; found: $observed_scaling_state" >&2
       exit 1
     fi
     trap restore_and_verify EXIT
@@ -5714,7 +5723,7 @@ run_staging_suite() {
             (.ecs_task_id // "") | length > 0)
           and (.assignment.eligible_members | unique | sort) == $active_boot_ids
           and ([.assignment.owners[]] | unique | sort) == $active_boot_ids
-          and (.assignment.owners | length) == 10
+          and (.assignment.owners | length) == 50
           and (
             [.assignment.eligible_members[] as $member
               | [.assignment.owners[] | select(. == $member)] | length
@@ -5730,7 +5739,7 @@ run_staging_suite() {
               or (.consumer_group_exists | not)
             )
           ] | length) == 0
-          and ([.runtime_partitions[].lease_token] | unique | length) == 10
+          and ([.runtime_partitions[].lease_token] | unique | length) == 50
         ' "$candidate" >/dev/null; then
         mv "$candidate" "$snapshot"
         return 0
@@ -5753,7 +5762,7 @@ run_staging_suite() {
         && jq -e --argjson expected "$expected_tasks" '
           ([.live_members[] | select(.lifecycle == "ACTIVE")] | length) == $expected
           and .assignment != null
-          and (.runtime_partitions | length) == 10
+          and (.runtime_partitions | length) == 50
           and all(.runtime_partitions[];
             .consumer_group_exists
             and .owner_matches
@@ -6229,7 +6238,7 @@ run_staging_suite() {
     --query 'services[0].desiredCount' \
     --output text)"
   if [[ ! "$automatic_scale_out_count" =~ ^[0-9]+$ ]] \
-    || (( automatic_scale_out_count < 2 || automatic_scale_out_count > 10 )); then
+    || (( automatic_scale_out_count < 2 || automatic_scale_out_count > 25 )); then
     echo "Target tracking did not leave a valid added-capacity count: $automatic_scale_out_count" >&2
     exit 1
   fi
@@ -6283,11 +6292,11 @@ run_staging_suite() {
     command_outcome_window_diagnostics \
       "$gate_a_summary" \
       "$report_dir/automatic-scale-out-baseline-window.json" \
-      1000 10 >"$gate_a_baseline_diagnostics"
+      1000 50 >"$gate_a_baseline_diagnostics"
     command_outcome_window_diagnostics \
       "$gate_a_summary" \
       "$report_dir/automatic-scale-out-window.json" \
-      1000 10 >"$gate_a_movement_diagnostics"
+      1000 50 >"$gate_a_movement_diagnostics"
     # Once every new task is healthy and visible through Traefik/control-plane
     # readiness, keep enforcing the same strict command budget through the
     # load stage's recorded finish. The shared window helper evaluates only
@@ -6298,7 +6307,7 @@ run_staging_suite() {
     command_outcome_window_diagnostics \
       "$gate_a_summary" \
       "$gate_a_post_ready_window" \
-      1000 10 "$gate_a_post_ready_required_full_seconds" \
+      1000 50 "$gate_a_post_ready_required_full_seconds" \
       >"$gate_a_post_ready_steady_diagnostics"
   else
     gate_a_summary="$report_dir/gate-a-missing-load-summary.json"
@@ -6328,7 +6337,7 @@ run_staging_suite() {
     exit 1
   }
 
-  # Automatic scale-out may have stopped at any count from two through ten.
+  # Automatic scale-out may have stopped at any count from two through 25.
   # Return without load to one healthy task, then start the independent
   # capacity-valid planned-transition cohort.
   local reset_to_one_started_ms
@@ -6556,7 +6565,7 @@ run_staging_suite() {
     --slurpfile ten "$report_dir/control-plane-scale-10.json" \
     --slurpfile final "$report_dir/control-plane-final-1.json" '
       def moved($left; $right):
-        [range(0; 10) as $partition
+        [range(0; 50) as $partition
           | ($partition | tostring) as $key
           | select($left.assignment.owners[$key] != $right.assignment.owners[$key])]
         | length;
@@ -6571,8 +6580,8 @@ run_staging_suite() {
   jq -e '
     .initial_version < .scale_10_version
     and .scale_10_version < .final_version
-    and .scale_out_moved_partitions == 9
-    and .scale_in_moved_partitions == 9
+    and .scale_out_moved_partitions == 45
+    and .scale_in_moved_partitions == 45
   ' "$report_dir/assignment-movement.json" >/dev/null || {
     echo "Assignment versions or minimum 1 -> 10 -> 1 movement invariants failed" >&2
     exit 1
@@ -6640,9 +6649,9 @@ run_staging_suite() {
           . >= $scale_in[0].started_at_unix_ms
           and . <= $scale_in[0].finished_at_unix_ms))
       and ($scale_in[0].duration_ms >= 1000 and $scale_in[0].duration_ms <= 45000)
-      and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 10
+      and (.metrics.scheduled_command_counts_by_partition_and_unix_second | length) == 50
       and ([.metrics.scheduled_command_counts_by_partition_and_unix_second[] | .[]] | add) > 0
-      and all(range(0; 10);
+      and all(range(0; 50);
         . as $partition
         | any(
           ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
@@ -6650,7 +6659,7 @@ run_staging_suite() {
           | to_entries[];
           (.key | tonumber) < (($scale_out[0].started_at_unix_ms / 1000) | ceil)
           and .value > 0))
-      and all(range(0; 10);
+      and all(range(0; 50);
         . as $partition
         | any(
           ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
@@ -6660,7 +6669,7 @@ run_staging_suite() {
           and ((.key | tonumber) < $scale_in_first_second)
           and .value > 0))
       and $scale_in_after_last_second > $scale_in_first_second
-      and all(range(0; 10);
+      and all(range(0; 50);
         . as $partition
         | any(
           ($report.metrics.scheduled_command_counts_by_partition_and_unix_second
