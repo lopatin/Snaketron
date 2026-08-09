@@ -3121,6 +3121,7 @@ dependencies = [
  "chrono",
  "common",
  "dotenv",
+ "finl_unicode",
  "flate2",
  "futures-util",
  "gethostname",
@@ -3155,6 +3156,8 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "tungstenite 0.26.2",
+ "unicode-normalization",
+ "unicode-segmentation",
  "url",
  "uuid",
 ]

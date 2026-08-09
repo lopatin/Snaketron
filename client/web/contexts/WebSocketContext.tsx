@@ -120,6 +120,24 @@ const CLIENT_POLICY_CLOSE_CODE = 4008;
 const CLIENT_FAILURE_CLOSE_CODE = 4011;
 const CLIENT_RESTART_CLOSE_CODE = 4012;
 const CLIENT_RETRY_CLOSE_CODE = 4013;
+const CHAT_MESSAGE_TAGS = new Set([
+  'Chat',
+  'LobbyChatMessage',
+  'GameChatMessage',
+  'LobbyChatHistory',
+  'GameChatHistory',
+]);
+
+const redactChatPayloadForLogging = (message: any): any => {
+  if (
+    message &&
+    typeof message === 'object' &&
+    Object.keys(message).some((key) => CHAT_MESSAGE_TAGS.has(key))
+  ) {
+    return '<chat payload redacted>';
+  }
+  return message;
+};
 
 const isMatchmakingQueueIntent = (message: any): boolean =>
   Boolean(
@@ -517,7 +535,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
-    console.log('WebSocket message received:', rawMessage);
+    console.log('WebSocket message received:', redactChatPayloadForLogging(rawMessage));
     const gameId = Number(rawMessage?.GameEvent?.game_id);
     if (Number.isSafeInteger(gameId)) {
       const nextWatermark = advanceCandidateGameWatermark(
@@ -601,7 +619,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
     }
     if (!messageType) {
-      console.warn('Unexpected WebSocket message shape', rawMessage);
+      console.warn('Unexpected WebSocket message shape', redactChatPayloadForLogging(rawMessage));
       return;
     }
     // `raw` carries the exact frame text so game-event consumers can hand it
@@ -1586,7 +1604,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       ) {
         try {
           target.socket.send(JSON.stringify(message));
-          console.log('WebSocket message sent:', message, 'generation:', target.generation);
+          const loggedMessage = redactChatPayloadForLogging(message);
+          console.log('WebSocket message sent:', loggedMessage, 'generation:', target.generation);
           return true;
         } catch (error) {
           console.error('Failed to send WebSocket message:', error);
@@ -1704,7 +1723,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
-    console.log(`Sending ${scope} chat message`, trimmed);
+    console.log(`Sending ${scope} chat message`);
     sendMessage({ Chat: trimmed });
   }, [disableChat, sendMessage]);
 
