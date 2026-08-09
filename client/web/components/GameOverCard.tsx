@@ -6,7 +6,9 @@ import {
   getPlayAgainShortcutAction,
 } from '../utils/gamePresentation';
 import { resolveSnakeSkinColors } from '../utils/snakeSkin';
+import type { MatchRatingState } from '../utils/ratingReveal';
 import GameOverJewel from './GameOverJewel';
+import RatingReveal from './RatingReveal';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -20,6 +22,7 @@ const FOCUSABLE_SELECTOR = [
 export interface GameOverCardProps {
   open: boolean;
   presentation: MatchPresentation;
+  rating?: MatchRatingState;
   onDismiss: () => void;
   onMenu: () => void;
   onPlayAgain: () => void;
@@ -59,6 +62,7 @@ const MetricLabel: React.FC<MetricLabelProps> = ({
 const GameOverCard: React.FC<GameOverCardProps> = ({
   open,
   presentation,
+  rating,
   onDismiss,
   onMenu,
   onPlayAgain,
@@ -220,6 +224,8 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             <span aria-hidden="true">✕</span>
           </button>
         </header>
+
+        {rating && <RatingReveal state={rating} />}
 
         <div className="game-over-statline" aria-label="Your match statistics">
           <div>
