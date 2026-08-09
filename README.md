@@ -8,7 +8,7 @@
   <a href="https://snaketron.io"><b>▶ Play now at snaketron.io</b></a>
 </p>
 
-SnakeTron is a competitive online multiplayer Snake game. Jump in as a guest or make an account, queue up for casual or ranked matches, and outmaneuver other players in real time — solo practice, 1v1 duels, 2v2 team battles, and free-for-alls. The backend is Rust; the browser client runs the same Rust game engine compiled to WebAssembly, so what you see is exactly what the server simulates.
+What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snake game. The core engine and the auto scalable game server architecture is open source and written in Rust and is available in this repository.
 
 ## Features
 
