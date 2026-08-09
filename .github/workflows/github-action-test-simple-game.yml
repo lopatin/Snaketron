@@ -64,7 +64,10 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full suite currently takes ~29-30 minutes on a good runner; recent
+    # green runs finished within seconds of a 30-minute limit, so slower
+    # runners were timing out. Keep real headroom here.
+    timeout-minutes: 45
 
     services:
       postgres:

@@ -1,11 +1,19 @@
-# SnakeTron
+<p align="center">
+  <a href="https://snaketron.io">
+    <img src="client/web/SnaketronLogo.png" alt="SnakeTron" width="500">
+  </a>
+</p>
 
-A competitive online multiplayer Snake game built with Rust (backend + WebAssembly frontend).
+<p align="center">
+  <a href="https://snaketron.io"><b>▶ Play now at snaketron.io</b></a>
+</p>
+
+SnakeTron is a competitive online multiplayer Snake game. Jump in as a guest or make an account, queue up for casual or ranked matches, and outmaneuver other players in real time — solo practice, 1v1 duels, 2v2 team battles, and free-for-alls. The backend is Rust; the browser client runs the same Rust game engine compiled to WebAssembly, so what you see is exactly what the server simulates.
 
 ## Features
 
 - **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
-- **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with chat and invite links
+- **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
 - **Boost**: hold-to-boost speed bursts fueled by collectible Boost pads (unlimited fuel in Solo)
 - **Accounts**: register/login with JWT auth, or play instantly as a guest
 - **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP
@@ -126,6 +134,10 @@ cargo run --bin snaketron -- replays/
 
 `ITCH_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle suitable for uploading to itch.io.
 
+### CrazyGames Build
+
+`CRAZYGAMES_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle that loads the CrazyGames v3 SDK before the game bundle and omits third-party analytics. Ads and CrazyGames cloud-data storage stay off unless `CRAZYGAMES_ADS_ENABLED=true` / `CRAZYGAMES_DATA_ENABLED=true` are also set at build time. See [CRAZYGAMES.md](CRAZYGAMES.md) for portal settings and the QA checklist.
+
 ### Run a coordinated autoscaling load test
 ```bash
 cargo run --release -p loadtest -- \
@@ -156,6 +168,7 @@ The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-pa
 ### Further Documentation
 
 - [DEBUGGING.md](DEBUGGING.md) - Runbook for diagnosing state-synchronization bugs (traces, TickHash, replaying to a local repro)
+- [CRAZYGAMES.md](CRAZYGAMES.md) - CrazyGames portal integration: build flags, pilot scope, and QA checklist
 - [loadtest/README.md](loadtest/README.md) - Load test profiles, safety controls, and report semantics
 
 ## Production Deployment
