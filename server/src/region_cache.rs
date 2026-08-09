@@ -204,6 +204,9 @@ fn merge_refresh(state: &mut CacheState, fresh: HashMap<String, RegionMetadata>)
 /// Format region ID into human-readable name
 fn format_region_name(region_id: &str) -> String {
     match region_id {
+        "use1" => "North America".to_string(),
+        "euw1" => "Europe".to_string(),
+        "ane1" => "Asia".to_string(),
         "us" => "US".to_string(),
         "europe" => "Europe".to_string(),
         "asia" => "Asia".to_string(),
@@ -232,6 +235,13 @@ mod tests {
         let mut ids: Vec<String> = state.regions.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn formats_production_region_names_for_display() {
+        assert_eq!(format_region_name("use1"), "North America");
+        assert_eq!(format_region_name("euw1"), "Europe");
+        assert_eq!(format_region_name("ane1"), "Asia");
     }
 
     #[test]
